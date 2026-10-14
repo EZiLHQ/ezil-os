@@ -22,142 +22,77 @@ const BOUNDARY = `arn:aws:iam::${A}:policy/ezil/identity/ezil-pilot-boundary`, E
 const json = (s: { toStatementJson(): unknown }[]) => s.map(x => x.toStatementJson());
 const opsCfg = OpsConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R, monthlyBudgetUsd: 100, egressBytesPer5Min: 3_000_000_000 });
 
-const ROLES = `arn:aws:iam::${A}:role/ezil/pilot/*`, BUCKET = `arn:aws:s3:::ezil-pilot-deploy-assets-${A}`;
+const ROLES = `arn:aws:iam::${A}:role/ezil/pilot/*`;
 const BASIC = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole';
 const EC2 = (kind: string) => `arn:aws:ec2:${R}:${A}:${kind}/*`;
 const NS = (k: string) => ({ [`aws:${k}Tag/ezil:namespace`]: 'pilot' });
 const COMPUTE = (k: string) => ({ [`aws:${k}Tag/ezil:managed-by`]: 'app-computer-platform', [`aws:${k}Tag/ezil:stage`]: 'pilot' });
 function expectedBoundary(killSwitch: boolean, userData = false) {
-    const roleWrites = ['iam:CreateRole', 'iam:DeleteRole', 'iam:UpdateRole', 'iam:UpdateRoleDescription', 'iam:UpdateAssumeRolePolicy',
-        'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:AttachRolePolicy', 'iam:DetachRolePolicy', 'iam:PutRolePermissionsBoundary',
-        'iam:TagRole', 'iam:UntagRole'];
-    const stacks = `arn:aws:cloudformation:${R}:${A}:stack/ezil-pilot-*/*`;
     return [
-        { Sid: 'AllowNamespacedWorkloadResources', Effect: 'Allow', Action: ['states:*', 'lambda:*', 'logs:*', 'sqs:*', 'events:*', 'cloudwatch:*'],
-            Resource: [`arn:aws:lambda:${R}:${A}:function:ezil-pilot-*`, `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-*`,
-                `arn:aws:states:${R}:${A}:execution:ezil-pilot-*`, `arn:aws:logs:${R}:${A}:log-group:ezil-pilot-*`, `arn:aws:sqs:${R}:${A}:ezil-pilot-*`,
-                `arn:aws:events:${R}:${A}:rule/ezil-pilot-*`, `arn:aws:cloudwatch:${R}:${A}:alarm:ezil-pilot-*`] },
-        { Sid: 'AllowUnscopableReadsAndLogDelivery', Effect: 'Allow', Resource: '*', Action: ['ec2:Describe*', 'iam:Get*', 'iam:List*',
-            'kms:ListAliases', 'logs:DescribeLogGroups', 'logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
-            'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies',
-            'cloudformation:ValidateTemplate'] },
-        { Sid: 'AllowNamespaceSecrets', Effect: 'Allow', Action: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
-            Resource: `arn:aws:secretsmanager:${R}:${A}:secret:ezil/pilot/*` },
-        { Sid: 'AllowNamespaceRepositories', Effect: 'Allow', Action: ['ecr:CreateRepository', 'ecr:DescribeRepositories',
-            'ecr:PutImageScanningConfiguration', 'ecr:PutImageTagMutability', 'ecr:TagResource', 'ecr:ListTagsForResource'],
-            Resource: `arn:aws:ecr:${R}:${A}:repository/ezil-pilot-*` },
-        { Sid: 'AllowNamespaceStacks', Effect: 'Allow', Resource: stacks, Action: ['cloudformation:DescribeChangeSet',
-            'cloudformation:ExecuteChangeSet', 'cloudformation:DeleteChangeSet', 'cloudformation:DescribeStacks', 'cloudformation:DescribeStackEvents',
-            'cloudformation:GetTemplate', 'cloudformation:GetTemplateSummary', 'cloudformation:ListStackResources'] },
-        { Sid: 'AllowChangeSetsOnlyViaExec', Effect: 'Allow', Action: 'cloudformation:CreateChangeSet', Resource: stacks,
-            Condition: { ArnEquals: { 'cloudformation:RoleArn': EXEC } } },
-        { Sid: 'AllowKmsCreateTagged', Effect: 'Allow', Action: 'kms:CreateKey', Resource: '*', Condition: { StringEquals: NS('Request') } },
-        { Sid: 'AllowKmsOnNamespaceKeys', Effect: 'Allow', Resource: `arn:aws:kms:${R}:${A}:key/*`, Condition: { StringEquals: NS('Resource') },
-            Action: ['kms:DescribeKey', 'kms:GetKeyPolicy', 'kms:PutKeyPolicy', 'kms:EnableKeyRotation', 'kms:GetKeyRotationStatus',
-                'kms:TagResource', 'kms:ListResourceTags', 'kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:CreateGrant'] },
-        { Sid: 'AllowEc2TopLevelCreateTagged', Effect: 'Allow', Action: ['ec2:CreateVpc', 'ec2:CreateInternetGateway', 'ec2:CreateLaunchTemplate'],
-            Resource: [EC2('vpc'), EC2('internet-gateway'), EC2('launch-template')], Condition: { StringEquals: NS('Request') } },
-        { Sid: 'AllowEc2InVpcCreateTagged', Effect: 'Allow', Action: ['ec2:CreateSubnet', 'ec2:CreateRouteTable', 'ec2:CreateSecurityGroup'],
-            Resource: [EC2('subnet'), EC2('route-table'), EC2('security-group')], Condition: { StringEquals: NS('Request') } },
-        { Sid: 'AllowEc2CreateOnlyInNamespaceVpc', Effect: 'Allow', Action: ['ec2:CreateSubnet', 'ec2:CreateRouteTable', 'ec2:CreateSecurityGroup'],
-            Resource: EC2('vpc'), Condition: { StringEquals: NS('Resource') } },
-        { Sid: 'AllowEc2NetworkMutateTagged', Effect: 'Allow', Resource: '*', Condition: { StringEquals: NS('Resource') },
-            Action: ['ec2:ModifyVpcAttribute', 'ec2:DeleteVpc', 'ec2:AttachInternetGateway', 'ec2:DetachInternetGateway', 'ec2:DeleteInternetGateway',
-                'ec2:CreateRoute', 'ec2:ReplaceRoute', 'ec2:DeleteRoute', 'ec2:DeleteRouteTable', 'ec2:AssociateRouteTable', 'ec2:DisassociateRouteTable',
-                'ec2:ModifySubnetAttribute', 'ec2:DeleteSubnet', 'ec2:AuthorizeSecurityGroupEgress', 'ec2:RevokeSecurityGroupEgress',
-                'ec2:DeleteSecurityGroup', 'ec2:CreateLaunchTemplateVersion', 'ec2:ModifyLaunchTemplate', 'ec2:DeleteLaunchTemplate'] },
-        { Sid: 'AllowLaunchAllowlistedTypes', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('instance'),
+        { Effect: 'Allow', Action: 'lambda:InvokeFunction', Resource: `arn:aws:lambda:${R}:${A}:function:ezil-pilot-*` },
+        { Effect: 'Allow', Action: ['states:StartExecution', 'states:ListExecutions'], Resource: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-*` },
+        { Effect: 'Allow', Action: ['states:DescribeExecution', 'states:GetExecutionHistory'], Resource: `arn:aws:states:${R}:${A}:execution:ezil-pilot-*` },
+        { Effect: 'Allow', Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'], Resource: `arn:aws:logs:${R}:${A}:log-group:ezil-pilot-*` },
+        { Effect: 'Allow', Action: 'sqs:SendMessage', Resource: `arn:aws:sqs:${R}:${A}:ezil-pilot-*` },
+        { Effect: 'Allow', Resource: '*', Action: ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeImages',
+            'ec2:DescribeLaunchTemplateVersions', 'ec2:DescribeAvailabilityZones', 'logs:DescribeLogGroups', 'logs:CreateLogDelivery',
+            'logs:GetLogDelivery', 'logs:UpdateLogDelivery', 'logs:DeleteLogDelivery', 'logs:ListLogDeliveries',
+            'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies'] },
+        { Effect: 'Allow', Action: 'secretsmanager:GetSecretValue', Resource: `arn:aws:secretsmanager:${R}:${A}:secret:ezil/pilot/*` },
+        { Effect: 'Allow', Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncryptFrom', 'kms:ReEncryptTo', 'kms:GenerateDataKey',
+            'kms:GenerateDataKeyWithoutPlaintext', 'kms:DescribeKey', 'kms:CreateGrant'], Resource: `arn:aws:kms:${R}:${A}:key/*`,
+            Condition: { StringEquals: NS('Resource') } },
+        { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('instance'),
             Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:InstanceType': ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'] } } },
-        { Sid: 'AllowCappedEncryptedGp3Volumes', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: EC2('volume'),
+        { Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: EC2('volume'),
             Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
                 NumericLessThanEquals: { 'ec2:VolumeSize': '100' } } },
-        { Sid: 'AllowLaunchInterfacesTagged', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('network-interface'),
-            Condition: { StringEquals: COMPUTE('Request') } },
-        { Sid: 'AllowLaunchIntoNamespaceNetwork', Effect: 'Allow', Action: 'ec2:RunInstances',
-            Resource: [EC2('subnet'), EC2('security-group'), EC2('launch-template')], Condition: { StringEquals: NS('Resource') } },
-        { Sid: 'AllowLaunchImages', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${R}::image/*` },
-        { Sid: 'AllowRestoreNamespaceSnapshots', Effect: 'Allow', Action: 'ec2:CreateVolume', Resource: `arn:aws:ec2:${R}::snapshot/*`,
-            Condition: { StringEquals: { 'aws:ResourceTag/ezil:backup': 'pilot' } } },
-        { Sid: 'AllowComputeOnManaged', Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances',
-            'ec2:AttachVolume'], Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
-        ...(userData ? [{ Sid: 'AllowUserDataOnlyOnManaged', Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: EC2('instance'),
+        { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('network-interface'), Condition: { StringEquals: COMPUTE('Request') } },
+        { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: [EC2('subnet'), EC2('security-group'), EC2('launch-template')],
+            Condition: { StringEquals: NS('Resource') } },
+        { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${R}::image/*` },
+        { Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags'],
+            Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
+        ...(userData ? [{ Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: EC2('instance'),
             Condition: { StringEquals: { ...COMPUTE('Resource'), 'ec2:Attribute': 'userData' } } }] : []),
-        { Sid: 'AllowTagOnCreate', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: { 'ec2:CreateAction': [
-            'CreateVpc', 'CreateSubnet', 'CreateInternetGateway', 'CreateRouteTable', 'CreateSecurityGroup', 'CreateLaunchTemplate',
-            'RunInstances', 'CreateVolume'] } } },
-        { Sid: 'AllowRetagNamespaceNetwork', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: NS('Resource') } },
-        { Sid: 'AllowRetagManagedCompute', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume')],
-            Condition: { StringEquals: COMPUTE('Resource') } },
-        { Sid: 'AllowOwnBucket', Effect: 'Allow', Action: ['s3:GetObject', 's3:PutObject', 's3:ListBucket', 's3:GetBucketLocation'],
-            Resource: [BUCKET, `${BUCKET}/*`] },
-        { Sid: 'AllowRoleWritesUnderWorkloadPath', Effect: 'Allow', Action: roleWrites, Resource: ROLES },
-        { Sid: 'AllowPassWorkloadAndExecRoles', Effect: 'Allow', Action: 'iam:PassRole', Resource: [ROLES, EXEC] },
-        { Sid: 'RegionLock', Effect: 'Deny', NotAction: 'iam:*', Resource: '*', Condition: { StringNotEquals: { 'aws:RequestedRegion': R } } },
-        { Sid: 'NoUsersGroupsKeysOrBoundaryRemoval', Effect: 'Deny', Resource: '*', Action: ['iam:*User*', 'iam:*Group*', 'iam:*MFADevice*',
-            'iam:*LoginProfile*', 'iam:*AccessKey*', 'iam:*SSHPublicKey*', 'iam:*ServiceSpecificCredential*', 'iam:*SigningCertificate*',
-            'iam:DeleteRolePermissionsBoundary'] },
-        { Sid: 'RolesCarryThisBoundary', Effect: 'Deny', Resource: '*', Action: ['iam:CreateRole', 'iam:PutRolePermissionsBoundary',
-            'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:AttachRolePolicy', 'iam:DetachRolePolicy', 'iam:UpdateAssumeRolePolicy',
-            'iam:UpdateRole', 'iam:DeleteRole'], Condition: { StringNotEquals: { 'iam:PermissionsBoundary': BOUNDARY } } },
-        { Sid: 'OnlyLambdaBasicManagedPolicy', Effect: 'Deny', Resource: '*', Action: ['iam:AttachRolePolicy', 'iam:DetachRolePolicy'],
-            Condition: { ArnNotEquals: { 'iam:PolicyARN': BASIC } } },
-        { Sid: 'IamWritesOnlyUnderWorkloadPath', Effect: 'Deny', NotResource: ROLES, Action: [...roleWrites, 'iam:CreatePolicy',
-            'iam:DeletePolicy', 'iam:CreatePolicyVersion', 'iam:DeletePolicyVersion', 'iam:SetDefaultPolicyVersion', 'iam:TagPolicy',
-            'iam:UntagPolicy', 'iam:CreateInstanceProfile', 'iam:AddRoleToInstanceProfile'] },
-        { Sid: 'PassOnlyWorkloadAndExecRoles', Effect: 'Deny', Action: 'iam:PassRole', NotResource: [ROLES, EXEC] },
-        { Sid: 'AssumeOnlyWorkloadRoles', Effect: 'Deny', Action: 'sts:AssumeRole', NotResource: ROLES },
-        { Sid: 'NoIdentityProviderWrites', Effect: 'Deny', Resource: '*', Action: ['iam:CreateOpenIDConnectProvider',
-            'iam:DeleteOpenIDConnectProvider', 'iam:UpdateOpenIDConnectProviderThumbprint', 'iam:AddClientIDToOpenIDConnectProvider',
-            'iam:RemoveClientIDFromOpenIDConnectProvider', 'iam:TagOpenIDConnectProvider', 'iam:UntagOpenIDConnectProvider',
-            'iam:CreateSAMLProvider', 'iam:UpdateSAMLProvider', 'iam:DeleteSAMLProvider', 'iam:TagSAMLProvider', 'iam:UntagSAMLProvider'] },
-        { Sid: 'NoStorageDeletionOrDetach', Effect: 'Deny', Resource: '*',
-            Action: ['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume', 'ec2:DeleteTags'] },
-        { Sid: 'BackupTagOnlyAtCreation', Effect: 'Deny', Resource: '*', Action: 'ec2:CreateTags',
+        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume')],
+            Condition: { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } } },
+        { Effect: 'Deny', Resource: '*', Action: ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2:CreateCapacityReservation*',
+            'ec2:CreateReservedInstancesListing', 'ec2:AcceptReservedInstancesExchangeQuote', 'ec2:RequestSpot*', 'ec2:CreateFleet',
+            'savingsplans:*', 'rds:*', 'elasticache:*', 'redshift:*', 'es:*', 'dynamodb:*', 'aws-marketplace:*',
+            'ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume', 'ec2:DeleteTags',
+            ...(!userData ? ['ec2:ModifyInstanceAttribute'] : []),
+            ...(killSwitch ? ['ec2:RunInstances', 'ec2:StartInstances', 'ec2:AttachVolume', 'ec2:CreateVolume',
+                'states:StartExecution', 'states:StartSyncExecution', 'states:RedriveExecution', 'lambda:InvokeFunction', 'events:PutTargets'] : []),
+            'iam:*', 'sts:*', 'organizations:*', 'account:*', 'aws-portal:*', 'billing:*', 'payments:*', 'tax:*', 'ce:*',
+            'route53:*', 'route53domains:*', 'cloudfront:*', 'budgets:*', 'cloudwatch:*'] },
+        { Effect: 'Deny', NotAction: 'iam:*', Resource: '*', Condition: { StringNotEquals: { 'aws:RequestedRegion': R } } },
+        { Effect: 'Deny', Resource: '*', Action: 'ec2:CreateTags',
             Condition: { 'ForAnyValue:StringEquals': { 'aws:TagKeys': ['ezil:backup'] }, Null: { 'ec2:CreateAction': 'true' } } },
-        { Sid: 'NoOrgAccountBillingWrites', Effect: 'Deny', Resource: '*', Action: ['organizations:*', 'account:Accept*', 'account:Close*',
-            'account:Delete*', 'account:Disable*', 'account:Enable*', 'account:Put*', 'account:Start*', 'aws-portal:Modify*',
-            'billing:Create*', 'billing:Delete*', 'billing:Put*', 'billing:Update*', 'payments:*', 'tax:Batch*', 'tax:Delete*', 'tax:Put*',
-            'ce:Create*', 'ce:Delete*', 'ce:Update*'] },
-        { Sid: 'NoEdgeOrBudgetWrites', Effect: 'Deny', Resource: '*', Action: ['route53:Associate*', 'route53:Change*', 'route53:Create*',
-            'route53:Delete*', 'route53:Disassociate*', 'route53:Update*', 'route53domains:*', 'cloudfront:Associate*', 'cloudfront:Create*',
-            'cloudfront:Delete*', 'cloudfront:Update*', 'budgets:Create*', 'budgets:Delete*', 'budgets:Execute*', 'budgets:Modify*',
-            'budgets:Update*'] },
-        { Sid: 'NoPurchasesOrReservations', Effect: 'Deny', Resource: '*', Action: ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts',
-            'ec2:CreateCapacityReservation*', 'ec2:CreateReservedInstancesListing', 'ec2:AcceptReservedInstancesExchangeQuote',
-            'ec2:RequestSpot*', 'ec2:CreateFleet', 'savingsplans:*', 'rds:PurchaseReserved*', 'elasticache:PurchaseReserved*',
-            'redshift:PurchaseReserved*', 'es:PurchaseReserved*', 'dynamodb:PurchaseReserved*', 'aws-marketplace:Subscribe',
-            'aws-marketplace:AcceptAgreement*'] },
-        { Sid: 'NoAlarmAutomation', Effect: 'Deny', Resource: '*', Action: ['cloudwatch:PutMetricAlarm', 'cloudwatch:PutCompositeAlarm'],
-            Condition: { 'ForAnyValue:StringLike': { 'cloudwatch:AlarmActions': ['arn:aws:automate:*', 'arn:aws:ssm*'] } } },
-        { Sid: 'NoAlarmActions', Effect: 'Deny', Resource: '*', Action: ['cloudwatch:PutMetricAlarm', 'cloudwatch:PutCompositeAlarm'],
-            Condition: { Null: { 'cloudwatch:AlarmActions': 'false' } } },
-        { Sid: 'NoForeignInstanceAttributes', Effect: 'Deny', Action: 'ec2:DescribeInstanceAttribute', Resource: EC2('instance'),
+        { Effect: 'Deny', Action: 'ec2:DescribeInstanceAttribute', Resource: EC2('instance'),
             Condition: { StringNotEquals: { 'aws:ResourceTag/ezil:stage': 'pilot' } } },
         ...(userData ? [
-            { Sid: 'ModifyAttributeOnlyUserData', Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute',
+            { Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute',
                 Condition: { 'ForAnyValue:StringNotEquals': { 'ec2:Attribute': 'userData' } } },
-            { Sid: 'ModifyAttributeKeyRequired', Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute',
-                Condition: { Null: { 'ec2:Attribute': 'true' } } },
-        ] : [{ Sid: 'NoModifyInstanceAttribute', Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute' }]),
-        ...(killSwitch ? [{ Sid: 'KillSwitch', Effect: 'Deny', Resource: '*', Action: ['ec2:RunInstances', 'ec2:StartInstances',
-            'ec2:AttachVolume', 'ec2:CreateVolume', 'ec2:CreateFleet', 'ec2:RequestSpot*', 'states:StartExecution', 'states:StartSyncExecution',
-            'states:RedriveExecution', 'lambda:InvokeFunction', 'events:PutTargets'] }] : []),
+            { Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute', Condition: { Null: { 'ec2:Attribute': 'true' } } },
+        ] : []),
     ];
 }
 test('I5 boundary: every allow is scoped by name, namespace tag or compute tag; explicit denies; kill switch off', () => {
     assert.deepEqual(json(boundaryStatements(cfg)), expectedBoundary(false));
     assert.equal(cfg.killSwitch, false, 'kill switch defaults off');
     assert.deepEqual([...GLOBAL_SERVICES], ['iam:*']);
-    // The only `*` allows are the enumerated unscopable reads/log deliveries, and creates/retags gated by tag or CreateAction.
-    for (const s of expectedBoundary(false).filter(s => s.Effect === 'Allow' && s.Resource === '*' && !('Condition' in s)))
-        assert.equal(s.Sid, 'AllowUnscopableReadsAndLogDelivery');
+    for (const s of json(boundaryStatements(cfg)) as any[]) {
+        assert.equal(s.Sid, undefined);
+        if (s.Effect === 'Allow') for (const a of [s.Action].flat()) assert.doesNotMatch(a, /[*?]/);
+    }
 });
-test('I5 boundary: the founder kill switch adds one deny covering every bounded role', () => {
+test('I5 boundary: the founder kill switch merges compute and invocation denies', () => {
     const on = IdentityConfigSchema.parse({ ...cfg, killSwitch: true });
     assert.deepEqual(json(boundaryStatements(on)), expectedBoundary(true));
     // The volume cap follows the identity config.
     const capped = json(boundaryStatements(IdentityConfigSchema.parse({ ...cfg, maxVolumeGiB: 50 }))) as any[];
-    assert.equal(capped.find(s => s.Sid === 'AllowCappedEncryptedGp3Volumes').Condition.NumericLessThanEquals['ec2:VolumeSize'], '50');
+    assert.equal(capped.find(s => s.Effect === 'Allow' && s.Condition?.NumericLessThanEquals?.['ec2:VolumeSize']).Condition.NumericLessThanEquals['ec2:VolumeSize'], '50');
 });
 
 test('R-ID F1: no bounded role may change an instance type after launch; only the flagged userData write is carved out', () => {
@@ -172,14 +107,14 @@ test('R-ID F1: no bounded role may change an instance type after launch; only th
     for (const config of [cfg, on]) {
         const statements = json(boundaryStatements(config)) as any[];
         for (const st of statements.filter(x => x.Effect === 'Allow' && [x.Action].flat().some((a: string) => matches(a)))) {
-            assert.equal(st.Condition?.StringEquals?.['ec2:Attribute'], 'userData', `${st.Sid} grants ModifyInstanceAttribute beyond userData`);
-            assert.deepEqual([st.Resource].flat(), [EC2('instance')], `${st.Sid} must be instance-only`);
+            assert.equal(st.Condition?.StringEquals?.['ec2:Attribute'], 'userData', 'grants ModifyInstanceAttribute beyond userData');
+            assert.deepEqual([st.Resource].flat(), [EC2('instance')], 'must be instance-only');
         }
         const denies = statements.filter(x => x.Effect === 'Deny' && [x.Action].flat().includes('ec2:ModifyInstanceAttribute'));
         if (config.userDataAttributeKeyVerified) {
             assert.deepEqual(denies.map(d => d.Condition), [{ 'ForAnyValue:StringNotEquals': { 'ec2:Attribute': 'userData' } },
                 { Null: { 'ec2:Attribute': 'true' } }]);
-        } else assert.deepEqual(denies.map(d => [d.Sid, d.Condition]), [['NoModifyInstanceAttribute', undefined]]);
+        } else assert.deepEqual(denies.map(d => d.Condition), [undefined]);
     }
 });
 test('item 1: namespaces are lowercase alphanumeric, never reserved, never identity', () => {
@@ -225,13 +160,17 @@ function identityStack() {
     const app = new App();
     return new DeployIdentityStack(app, 'ezil-identity-pilot', { config: cfg, synthesizer: new BootstraplessSynthesizer(), env: { account: A, region: R } });
 }
-test('I5 identity stack: both roles carry the boundary, live under /ezil/identity/, short sessions; nothing else is trusted', () => {
+test('I5 identity stack: founder identities use deny-only guardrails, retain trust and /ezil/identity/ path', () => {
     const t = assertions.Template.fromStack(identityStack()), roles = Object.values(t.findResources('AWS::IAM::Role')) as any[];
     assert.equal(roles.length, 2);
     for (const r of roles) {
         assert.equal(r.Properties.Path, '/ezil/identity/');
-        assert.ok(JSON.stringify(r.Properties.PermissionsBoundary).includes('Boundary'));
-        assert.equal(r.Properties.ManagedPolicyArns, undefined, 'no AdministratorAccess or other managed policy');
+        assert.equal(r.Properties.PermissionsBoundary, undefined);
+        const attached = r.Properties.ManagedPolicyArns;
+        assert.equal(attached.length, 1);
+        const policy = t.toJSON().Resources[attached[0].Ref];
+        assert.equal(policy.Properties.ManagedPolicyName, 'ezil-pilot-identity-guardrails');
+        assert.ok(policy.Properties.PolicyDocument.Statement.every((s: any) => s.Effect === 'Deny'));
     }
     const exec = roles.find(r => r.Properties.RoleName === 'ezil-pilot-cfn-exec'), deploy = roles.find(r => r.Properties.RoleName === 'ezil-pilot-deploy');
     assert.deepEqual(exec.Properties.AssumeRolePolicyDocument.Statement, [{ Effect: 'Allow', Action: 'sts:AssumeRole',

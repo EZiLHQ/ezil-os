@@ -293,7 +293,7 @@ These cannot be proven offline:
   statement and close the `aws/ebs` gap described above.
 - **Tag on create.** CloudFormation must create the VPC, subnet, IGW, route table, security
   group and launch template with tags in the create call, so that `aws:RequestTag` and
-  `ec2:CreateAction` are present. Otherwise the scoped boundary denies the create; the fix
+  `ec2:CreateAction` are present. Otherwise the execution policy denies the create; the fix
   would be explicit `TagSpecifications`, never a wider grant.
 - **CMK-encrypted state machine.** `CreateStateMachine` with a CMK needs `kms:GenerateDataKey`
   and `Decrypt` on the namespace-tagged history key, both for the execution role and for the
@@ -304,7 +304,7 @@ These cannot be proven offline:
   INSUFFICIENT_DATA action lists. Otherwise, add explicit denies for those lists once the
   matching keys are confirmed.
 - **Unscopable reads.** Confirm no further read action turns out unscopable. Add any that do to
-  `UNSCOPABLE` with a reason.
+  `WORKLOAD_UNSCOPABLE` (workload) or the execution policy (deployment), with a reason.
 - **Live allow proofs.** `IfExists` was removed, so a key that is absent from a correct
   request now denies it. The canary must show that a correct provision, attach, retag,
   start, stop and terminate are *allowed*, not only that bad requests are denied. The
@@ -378,87 +378,85 @@ Workload stacks are deployed with `aws cloudformation deploy --role-arn <exec ro
 a namespace called `identity` would make the workload path equal `/ezil/identity/`. State
 machines must be named `ezil-<ns>-*`.
 
-**Boundary: a resource-scoped allowlist.** It is attached to:
-- the deploy role
-- the execution role
-- every workload role (an aspect puts them under `/ezil/<ns>/` with the boundary and tags every
-  resource `ezil:namespace=<ns>`)
+**Boundary: a workload-only allowlist (Design A).** Every lifecycle/recovery Lambda,
+state machine and app caller carries the one `ezil-<ns>-boundary` managed policy. An aspect
+puts these roles under `/ezil/<ns>/` and tags workload resources `ezil:namespace=<ns>`.
+The founder-created deploy and execution roles under `/ezil/identity/` **do not carry this
+boundary**. They keep their unchanged inline policies and each attaches the same
+`ezil-<ns>-identity-guardrails` customer-managed policy, which contains only denies.
+Neither identity can edit or detach its guardrails.
 
-A role CI plants under `/ezil/<ns>/` inherits exactly this ceiling, so every allow is scoped:
-- **By name.** `states`, `lambda`, `logs`, `sqs`, `events`, `cloudwatch`, ECR and CloudFormation
-  apply only to `ezil-<ns>-*` resources. `CreateChangeSet` additionally requires
-  `cloudformation:RoleArn` = the execution role.
-- **By name, for secrets.** `secretsmanager` reads cover only `secret:ezil/<ns>/*`; the
-  lifecycle schema enforces that the authority secret is named that way. There is no `sns`.
-- **By tag, for KMS.** `CreateKey` needs `aws:RequestTag/ezil:namespace=<ns>`. Every other key
-  action, including `PutKeyPolicy`, `CreateGrant`, `Decrypt` and `TagResource`, needs the key to
-  already carry that tag. **The data key and the authority key, which are created outside
-  these stacks, must be tagged `ezil:namespace=<ns>`.**
-- **By tag, for EC2 networks.**
-  - A top-level create needs the request tag.
-  - A subnet, route table or security group create needs the request tag *and* a parent VPC
-    already tagged for the namespace.
-  - A mutation needs the resource tag.
-- **By tag, for EC2 compute.**
-  - A launch or `CreateVolume` needs the compute request tags (`ezil:managed-by` and
-    `ezil:stage=<ns>`).
-  - A launch may go only into namespace-tagged subnets, security groups and launch templates.
-    AMIs are not tag-scoped; the controller pins the AMI ID.
-  - A volume can be restored only from a snapshot tagged `ezil:backup=<ns>`.
-  - Start, stop, terminate and attach need the compute resource tags.
-  - **No attribute change after launch.** `ec2:ModifyInstanceAttribute` is denied outright
-    (`NoModifyInstanceAttribute`), so no bounded role can stop a computer, change its instance
-    type and start it past the launch-time type cap. With `userDataAttributeKeyVerified: true`
-    in the identity config (set it only together with the lifecycle's `userDataNonce` and
-    `userDataAttributeKeyVerified`, after the staging proof below), the only carve-out is
-    `ec2:Attribute` = `userData` on compute-tagged instances (`AllowUserDataOnlyOnManaged`);
-    any other or missing attribute is denied (`ModifyAttributeOnlyUserData`,
-    `ModifyAttributeKeyRequired`).
-  - **Cost caps**, duplicated from the controller so a planted role is bounded too:
-    - launches only with `ec2:InstanceType` in {t3a.medium, t3.medium, m6i.large, c6i.xlarge}
-    - volumes only gp3, encrypted, and at most `maxVolumeGiB` (identity config, default 100)
-- **No alarm actions (alarm-action list only, verified in code; OK and INSUFFICIENT_DATA
-  lists UNVERIFIED).** `NoAlarmAutomation` denies `PutMetricAlarm` and `PutCompositeAlarm`
-  when `cloudwatch:AlarmActions` names `arn:aws:automate:*` or `arn:aws:ssm*`, and
-  `NoAlarmActions` denies any request that carries `cloudwatch:AlarmActions`. Both key only on
-  `cloudwatch:AlarmActions`. Whether AWS also populates that key for `OKActions` and
-  `InsufficientDataActions` is not yet proven: an alarm whose only actions are OK or
-  INSUFFICIENT_DATA actions may not be denied. That is the "Alarm-action key" staging proof
-  below; until it passes, do not rely on these denies for those two lists. Alarms with actions
-  live only in the founder-deployed ops stack.
-- **No adoption.** `CreateTags` is allowed only on create (`ec2:CreateAction`) or on resources
-  that already carry the namespace or compute tags, so a foreign resource can never be tagged
-  into the namespace.
-- **The asset bucket**, role writes under `/ezil/<ns>/`, and `PassRole` on workload roles and
-  the execution role.
+This removes the oversized deployment allowlist from the workload ceiling. There are no
+new Allow action wildcards. The existing execution-role `ec2:Describe*` grant is unchanged.
+Policy statements omit Sids and merge only when effect, resources and conditions match.
+Historical fence names below describe semantics; they are no longer emitted as Sids.
 
-**`*` allows.**
-- **Read-only wildcards.** `ec2:Describe*`, `iam:Get*` and `iam:List*`. Some of the actions they
-  match are resource-typed; listing them one by one buys nothing for reads.
-- **The one secret-bearing read is excluded.** `ec2:DescribeInstanceAttribute` exposes
-  `userData`, which carries the enrollment nonce. It is denied on every instance whose
-  `ezil:stage` is not this namespace (`NoForeignInstanceAttributes`).
-- **No resource type at all** (IAM service reference), so these cannot be scoped:
-  - `kms:ListAliases`
-- `logs:DescribeLogGroups` and the log-delivery and Logs resource-policy actions: Step Functions
-  execution logging needs them. Their blast radius is CloudWatch Logs delivery.
-- `cloudformation:ValidateTemplate`: no side effects.
+The workload boundary allows only:
+- Namespace-named Lambda invocation, state-machine start/list, execution description/history,
+  log group/stream creation and log writes, and SQS dead-letter sends.
+- `GetSecretValue` on `secret:ezil/<ns>/*`.
+- Symmetric KMS encryption/decryption, data-key generation, description and grants, only on
+  keys already tagged `ezil:namespace=<ns>`. **The externally created data and authority
+  keys must carry that tag.** Workloads cannot create keys, edit key policies or retag keys.
+- EC2 instance/volume/image/launch-template/AZ description and the eight account-level Logs
+  discovery/delivery/resource-policy actions required by Step Functions logging.
+- Compute creates with `ezil:managed-by=app-computer-platform` and `ezil:stage=<ns>` request
+  tags. Launches require an allowlisted instance type and namespace-tagged subnet, security
+  group and launch template; AMIs remain pinned by the controller, not the boundary.
+  Volumes must be encrypted gp3 and at most `maxVolumeGiB` (default 100).
+- Start, stop, terminate, attach and retag on already compute-tagged resources; create-time
+  tags only on instances/volumes during `RunInstances` or `CreateVolume`.
+- With `userDataAttributeKeyVerified: true`, only `ModifyInstanceAttribute` with
+  `ec2:Attribute=userData` on compute-tagged instances. Every other or missing attribute is
+  denied. With the flag off, all attribute modification is denied. Set the flag only after
+  the existing staging proof and together with the lifecycle flags.
 
-It **denies**, explicitly:
-- any region but the configured one (`iam:*` is the only exemption)
-- users, groups, MFA devices, login profiles, access keys and other credentials
-- boundary removal
-- role writes whose role lacks this boundary
-- attaching any managed policy except `AWSLambdaBasicExecutionRole`
-- every IAM policy write
-- `PassRole` and `sts:AssumeRole` outside the namespace
-- OIDC and SAML provider writes
-- volume or snapshot deletion, detach and `DeleteTags`
-- the `ezil:backup` tag except at creation
-- `organizations:*`, and account and billing writes
-- route53, cloudfront and budgets writes
-- purchases and reservations
-- **the kill switch**, when the founder sets it
+Workloads no longer receive deployment, network mutation, asset-bucket, snapshot-restore,
+IAM, STS or KMS administration permissions. Snapshot restore is unused by the shipped
+lifecycle. Broader service wildcards occur only in workload Deny statements: IAM, STS,
+account/billing/edge/budget services and CloudWatch alarms. The synthesized workload action
+audit checks that these services are unused by the roles; deployment retains its separate
+policies. These broader denies also retain every historical workload deny.
+Both policies shorten purchase bans to service-wide denies for Savings Plans, RDS,
+ElastiCache, Redshift, OpenSearch, DynamoDB and Marketplace; neither deployment nor workload
+roles use these services, as checked against their grants.
+
+Both workload and identity policies explicitly retain the region lock (`iam:*` is the
+only exemption), purchase/reservation bans, storage deletion/detach/`DeleteTags` bans,
+backup-tag creation-only rule, foreign-instance userData read fence, attribute-modification
+fence and optional kill switch. The identity guardrails additionally retain **every** old
+boundary deny: principal/provider writes, boundary removal, `RolesCarryThisBoundary`,
+`OnlyLambdaBasicManagedPolicy`, `IamWritesOnlyUnderWorkloadPath`, PassRole/AssumeRole scope,
+account/billing/edge restrictions and the two alarm-action fences.
+
+**Non-widening proof.** `test/fixtures/identity-before-design-a.json` freezes the old policies
+and optional fences; it is not regenerated by the snapshot command.
+`test/identity-containment.test.ts` checks the actual synthesized role attachments and
+proves, for all kill-switch/userData combinations:
+- Every exec/deploy inline allow is unchanged, and each action/resource pair is contained
+  in an old boundary allow with equal or stronger conditions.
+- Every old boundary deny still applies to each identity through its attached policy.
+- Every new workload allow is contained in the old boundary, and every old workload deny
+  is retained or strengthened.
+
+The proof checks policy structure, not live IAM evaluation. The existing staging caveats
+still apply, particularly whether `cloudwatch:AlarmActions` covers OK and INSUFFICIENT_DATA
+lists for the execution role. Workloads now have an unconditional CloudWatch deny.
+`iam-size.test.ts` enforces 5,600 characters for the workload boundary, 6,144 for each managed
+policy, 10,240 for each role's aggregate inline policies, and at most ten managed-policy
+attachments. Each identity currently has one managed-policy attachment.
+
+Non-whitespace policy-document sizes for `identity.example.json`:
+
+| Policy | Default flags | Kill switch + userData enabled | Limit |
+|---|---:|---:|---:|
+| Workload boundary (managed) | 4,583 | 5,287 | 5,600 test target; 6,144 AWS |
+| Identity guardrails (managed, shared by exec/deploy) | 3,882 | 4,315 | 6,144 |
+| Exec (inline) | 7,161 | 7,161 | 10,240 aggregate per role |
+| Deploy (inline) | 1,298 | 1,298 | 10,240 aggregate per role |
+
+With the longest permitted namespace and region, maximum volume cap and both flags on,
+the boundary is 5,597 characters; the size test also covers that configuration.
 
 A role **trust policy naming an external principal** cannot be blocked by a condition key: IAM
 exposes no key for the principals in `CreateRole` or `UpdateAssumeRolePolicy`. What contains
@@ -498,33 +496,34 @@ Each row gives the ceiling of two principals:
 - **planted:** a role CI creates under `/ezil/<ns>/` with any inline policy, passed to a
   namespace Lambda or state machine
 
-Both are capped by the boundary. Today the account is empty in the pilot region, so the
-"planted" rows matter once another workload shares the region.
+Exec is limited by its unchanged inline grants plus the attached identity guardrails.
+Planted roles are capped by the smaller workload boundary. The deploy role has its own
+unchanged inline grants and the same identity guardrails as exec.
 
 | Path | exec | planted role |
 |---|---|---|
-| A namespace named `identity` aliases `/ezil/identity/` | BLOCKED (`NamespaceSchema` reserved names) | n/a |
+| A namespace named `identity` aliases `/ezil/identity/` | BLOCKED (reserved namespace) | n/a |
 | `ezil-pilot-*` matches another namespace | BLOCKED (no `-` in namespaces) | BLOCKED (same) |
-| Edit the boundary or the deploy/exec roles | BLOCKED (`IamWritesOnlyUnderWorkloadPath`; no policy writes) | BLOCKED (same) |
-| Create or edit a role without the boundary, or attach Administrator | BLOCKED (`RolesCarryThisBoundary`, `OnlyLambdaBasicManagedPolicy`) | BLOCKED (same) |
-| Pass or assume a role outside the namespace | BLOCKED (`PassOnlyWorkloadAndExecRoles`, `AssumeOnlyWorkloadRoles`) | BLOCKED (same) |
-| Users, keys, OIDC/SAML providers | BLOCKED (explicit denies) | BLOCKED (same) |
-| Read another workload's secret | BLOCKED (exec has no secrets) | Only `secret:ezil/<ns>/*` (`AllowNamespaceSecrets`) |
-| Use, re-policy or grant on a foreign KMS key | BLOCKED (tag-conditioned) | Only keys tagged `ezil:namespace=<ns>` (`AllowKmsOnNamespaceKeys`) |
-| Change foreign Lambda code, state machines, queues, rules, alarms | BLOCKED (`ezil-<ns>-*` names) | Only `ezil-<ns>-*` (`AllowNamespacedWorkloadResources`) |
-| Change sets on a foreign stack, or with another role | BLOCKED (deploy-role conditions) | Only `ezil-<ns>-*` stacks, only with the exec role (`AllowChangeSetsOnlyViaExec`) |
-| Terminate or start a foreign instance | n/a (exec has no compute) | Only `managed-by` + `stage=<ns>` (`AllowComputeOnManaged`) |
-| Stop a managed instance, change its type (or any attribute) and start it | n/a | BLOCKED (`NoModifyInstanceAttribute`; with the userData flag on, only `ec2:Attribute=userData` is allowed) |
-| Mutate a foreign VPC, or create inside it | BLOCKED (tag conditions) | Only namespace-tagged network (`AllowEc2NetworkMutateTagged`, `AllowEc2CreateOnlyInNamespaceVpc`) |
-| Restore a volume from a foreign snapshot | n/a | Only `ezil:backup=<ns>` snapshots (`AllowRestoreNamespaceSnapshots`) |
-| Adopt a foreign resource by tagging it | BLOCKED (tag on create only) | BLOCKED (`AllowTagOnCreate`, retag only already-tagged; `BackupTagOnlyAtCreation`) |
-| Attach EC2 terminate/stop automation to an alarm on any instance | n/a (lifecycle alarms carry no actions) | BLOCKED for the alarm-action list (`NoAlarmAutomation`, `NoAlarmActions`); OK / INSUFFICIENT_DATA lists unverified (staging proof) |
-| Launch large instances or huge volumes | n/a | BLOCKED (`AllowLaunchAllowlistedTypes`, `AllowCappedEncryptedGp3Volumes`) |
-| Read a foreign instance's userData | BLOCKED (`NoForeignInstanceAttributes`) | BLOCKED (same) |
-| Launch inside the namespace with any AMI | n/a | **Residual:** AMIs are not tag-scoped. The instance is still namespace-tagged, namespace-networked and bounded. |
-| Change DLM, budgets, or the boundary kill switch | BLOCKED (founder-only ops and identity; no `dlm`, `budgets` or policy writes) | BLOCKED (same) |
-| Account-wide CloudWatch Logs resource policy | `logs:PutResourcePolicy` on `*` (unscopable; Step Functions logging) | **Residual:** same; it only affects Logs delivery |
-| Trust policy naming an outside principal | **Residual:** not expressible as a condition. Contained by exec-only role writes, the boundary, and the snapshot test. | Same |
+| Edit/detach the boundary, identity guardrails or deploy/exec roles | BLOCKED (attached IAM path deny; no managed-policy writes) | BLOCKED (`iam:*` deny) |
+| Create/edit a role without the boundary, or attach Administrator | BLOCKED (attached boundary-required and managed-policy denies) | BLOCKED (`iam:*` deny) |
+| Pass or assume another role | Pass only workload roles to Lambda/States; attached PassRole/AssumeRole limits | BLOCKED (`iam:*`, `sts:*` denies) |
+| Users, keys, OIDC/SAML providers | BLOCKED (attached explicit denies) | BLOCKED (`iam:*` deny) |
+| Read another workload's secret | BLOCKED (no secret grants) | Only `secret:ezil/<ns>/*` |
+| Use, re-policy or grant on a foreign KMS key | BLOCKED (namespace tag conditions) | Use/grant only namespace-tagged keys; no key-policy edits |
+| Change Lambda code, state machines, queues, rules, alarms | Only `ezil-<ns>-*` names | BLOCKED (runtime actions only; alarms denied) |
+| Change sets on a foreign stack, or with another role | Deploy-role stack scope and RoleArn condition | BLOCKED (no CloudFormation or PassRole allow) |
+| Terminate or start a foreign instance | n/a (no compute grants) | Only compute-tagged instances in this stage |
+| Change a managed instance's type or disk flags | n/a | BLOCKED (only verified userData may be modified) |
+| Mutate a VPC, or create inside it | Only namespace-tagged networks | BLOCKED (no network mutation allows) |
+| Restore a volume from a snapshot | n/a | BLOCKED (no snapshot-resource allow) |
+| Adopt a foreign resource by tagging it | BLOCKED (create-time tags only) | BLOCKED (create-time tags or already compute-tagged resources) |
+| Attach EC2/SSM alarm automation | Attached alarm-action denies; OK/INSUFFICIENT_DATA key coverage still unverified | BLOCKED (`cloudwatch:*` deny) |
+| Launch large instances or huge volumes | n/a | BLOCKED (type allowlist, encrypted gp3 size cap) |
+| Read a foreign instance's userData | BLOCKED (attached foreign-stage deny) | BLOCKED (same deny; no DescribeInstanceAttribute allow) |
+| Launch inside the namespace with any AMI | n/a | **Residual:** AMIs are not tag-scoped; launch tags, network and cost caps still apply |
+| Change DLM, budgets, or the kill switch | BLOCKED (founder-only identity/ops; no policy writes) | BLOCKED (no DLM allow; budget/IAM denies) |
+| Account-wide CloudWatch Logs resource policy | `logs:PutResourcePolicy` on `*` for Step Functions logging | **Residual:** same account-level Logs delivery permission |
+| Trust policy naming an outside principal | **Residual:** no condition key for trust contents; workload boundary still caps the created role | Cannot edit trust (`iam:*` deny); an outside assumer remains bounded |
 
 ## Founder bootstrap (run once, not by CI)
 
@@ -631,9 +630,10 @@ aws cloudformation execute-change-set --region ap-south-1 \
 
 ### Kill-switch drill (§4)
 
-**Authoritative switch.** It lives in the boundary. Set `"killSwitch": true` in the identity
-config and update the identity stack through a founder change set. The boundary then denies
-these to **every bounded role, including roles created later**:
+**Authoritative switch.** It lives in both the workload boundary and the attached identity
+guardrails. Set `"killSwitch": true` in the identity config and update the identity stack
+through a founder change set. The policies then deny these to **exec, deploy and every
+workload role, including roles created later**:
 - `RunInstances`, `StartInstances`, `AttachVolume`, `CreateVolume`, `CreateFleet` and
   `RequestSpot*`
 - `states:StartExecution`, `StartSyncExecution` and `RedriveExecution`

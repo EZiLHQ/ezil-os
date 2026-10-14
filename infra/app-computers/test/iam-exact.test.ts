@@ -8,6 +8,7 @@ import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { AppCaller, AppCallerConfigSchema, appCallerStatements } from '../lib/app-caller.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
+import { IdentityConfigSchema, boundaryStatements } from '../lib/identity.js';
 
 /** Exact equality: every action, resource, condition and effect is spelled out
  * here as the reviewed specification. Any IAM drift, in either direction, fails. */
@@ -155,6 +156,29 @@ test('every role, key, queue and invoke policy in the synthesized stacks equals 
     if (process.env.UPDATE_IAM_SNAPSHOT === '1') writeFileSync(file, JSON.stringify(actual, null, 2) + '\n');
     assert.ok(existsSync(file), 'snapshot missing: run UPDATE_IAM_SNAPSHOT=1 npm test and review it');
     assert.deepEqual(actual, JSON.parse(readFileSync(file, 'utf8')));
+    // Audit the workload service-wide denies against the actual synthesized
+    // role grants. CDK's symmetric-key grants use these two action wildcards;
+    // the boundary explicitly names only the operations this workload uses.
+    const boundary = boundaryStatements(IdentityConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R,
+        githubOidcProviderArn: GITHUB.providerArn, deploySubject: 'repo:example-org@1000/ezil-os@2000:environment:aws-pilot',
+        assetBucketName: `ezil-pilot-deploy-assets-${A}` })).map(s => s.toStatementJson());
+    const expanded: Record<string, string[]> = {
+        'kms:ReEncrypt*': ['kms:ReEncryptFrom', 'kms:ReEncryptTo'],
+        'kms:GenerateDataKey*': ['kms:GenerateDataKey', 'kms:GenerateDataKeyWithoutPlaintext'],
+    };
+    const grants = Object.values(actual).flatMap((r: any) => r.Type === 'AWS::IAM::Policy'
+        ? r.PolicyDocument.Statement : (r.Policies ?? []).flatMap((p: any) => p.PolicyDocument.Statement));
+    // AWSLambdaBasicExecutionRole is the only external managed policy.
+    grants.push({ Effect: 'Allow', Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'] });
+    for (const grant of grants.filter((s: any) => s.Effect === 'Allow')) for (const pattern of [grant.Action].flat()) {
+        assert.ok(!pattern.includes('*') || expanded[pattern], `unreviewed workload action wildcard: ${pattern}`);
+        for (const action of expanded[pattern] ?? [pattern]) {
+            assert.ok(boundary.some(s => s.Effect === 'Allow' && [s.Action].flat().includes(action)), `boundary omits ${action}`);
+            assert.ok(!boundary.some(s => s.Effect === 'Deny' && s.Resource === '*' && !s.Condition
+                && [s.Action].flat().some((a: string) => a === action || (a.endsWith('*') && action.startsWith(a.slice(0, -1))))),
+            `blanket workload deny blocks ${action}`);
+        }
+    }
     // No grant to a service principal is unconditioned (confused deputy).
     for (const [id, r] of Object.entries(actual) as [string, any][]) {
         const statements = r.KeyPolicy?.Statement ?? r.PolicyDocument?.Statement ?? [];

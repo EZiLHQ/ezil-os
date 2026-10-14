@@ -114,6 +114,8 @@ function checkStack(stack: Stack): string[] {
         switch (resource.Type) {
             case 'AWS::IAM::ManagedPolicy':
                 limit(id + '/managed', documentSize(p.PolicyDocument, resources), 6144);
+                if (p.ManagedPolicyName?.endsWith('-boundary'))
+                    limit(id + '/boundary headroom', documentSize(p.PolicyDocument, resources), 5600);
                 break;
             case 'AWS::IAM::Role':
                 limit(id + '/trust', documentSize(p.AssumeRolePolicyDocument, resources), 2048);
@@ -128,6 +130,15 @@ function checkStack(stack: Stack): string[] {
         }
     }
     for (const [role, size] of totals) limit(role + '/inline aggregate', size, 10240);
+    for (const [id, role] of roles) {
+        const attached = new Set((role.Properties?.ManagedPolicyArns ?? []).map((arn: unknown) => JSON.stringify(arn)));
+        for (const [policyId, policy] of Object.entries(resources)) {
+            if (policy.Type === 'AWS::IAM::ManagedPolicy'
+                && policy.Properties?.Roles?.some((r: unknown) => roleKey(r) === id))
+                attached.add(JSON.stringify({ Ref: policyId }));
+        }
+        limit(id + '/managed attachments', attached.size, 10);
+    }
     return failures;
 }
 
@@ -169,5 +180,19 @@ for (const killSwitch of [false, true]) for (const userDataNonce of [false, true
             });
             const failures = [identityStack, foundationStack, opsStack, lifecycleStack].flatMap(checkStack);
             assert.deepEqual(failures, [], 'IAM documents exceed their non-whitespace character quotas');
+            for (const role of Object.values(assertions.Template.fromStack(lifecycleStack).findResources('AWS::IAM::Role'))) {
+                assert.equal(role.Properties.Path, `/ezil/${settings.deployment.namespace}/`);
+                assert.equal(role.Properties.PermissionsBoundary,
+                    `arn:aws:iam::${env.account}:policy/ezil/identity/ezil-${settings.deployment.namespace}-boundary`);
+            }
         });
     }
+
+test('identity policies retain headroom with the longest accepted namespace/region and largest volume cap', () => {
+    const config = IdentityConfigSchema.parse({ ...identity, namespace: 'a'.repeat(21), region: 'ap-northeast-1',
+        maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true });
+    const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'IdentityMaximumSize', {
+        config, env: { account: config.accountId, region: config.region }, synthesizer: new BootstraplessSynthesizer(),
+    });
+    assert.deepEqual(checkStack(stack), []);
+});

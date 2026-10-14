@@ -2,38 +2,53 @@
   "BoundaryEA298153": {
     "Type": "AWS::IAM::ManagedPolicy",
     "Properties": {
-      "Description": "EZiL permission boundary (AWS-COMPUTERS.md §5)",
+      "Description": "EZiL workload permission boundary (AWS-COMPUTERS.md §5)",
       "ManagedPolicyName": "ezil-pilot-boundary",
       "Path": "/ezil/identity/",
       "PolicyDocument": {
         "Statement": [
           {
-            "Action": [
-              "states:*",
-              "lambda:*",
-              "logs:*",
-              "sqs:*",
-              "events:*",
-              "cloudwatch:*"
-            ],
+            "Action": "lambda:InvokeFunction",
             "Effect": "Allow",
-            "Resource": [
-              "arn:aws:lambda:ap-south-1:123456789012:function:ezil-pilot-*",
-              "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-*",
-              "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-*",
-              "arn:aws:logs:ap-south-1:123456789012:log-group:ezil-pilot-*",
-              "arn:aws:sqs:ap-south-1:123456789012:ezil-pilot-*",
-              "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-*",
-              "arn:aws:cloudwatch:ap-south-1:123456789012:alarm:ezil-pilot-*"
-            ],
-            "Sid": "AllowNamespacedWorkloadResources"
+            "Resource": "arn:aws:lambda:ap-south-1:123456789012:function:ezil-pilot-*"
           },
           {
             "Action": [
-              "ec2:Describe*",
-              "iam:Get*",
-              "iam:List*",
-              "kms:ListAliases",
+              "states:StartExecution",
+              "states:ListExecutions"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-*"
+          },
+          {
+            "Action": [
+              "states:DescribeExecution",
+              "states:GetExecutionHistory"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-*"
+          },
+          {
+            "Action": [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:logs:ap-south-1:123456789012:log-group:ezil-pilot-*"
+          },
+          {
+            "Action": "sqs:SendMessage",
+            "Effect": "Allow",
+            "Resource": "arn:aws:sqs:ap-south-1:123456789012:ezil-pilot-*"
+          },
+          {
+            "Action": [
+              "ec2:DescribeInstances",
+              "ec2:DescribeVolumes",
+              "ec2:DescribeImages",
+              "ec2:DescribeLaunchTemplateVersions",
+              "ec2:DescribeAvailabilityZones",
               "logs:DescribeLogGroups",
               "logs:CreateLogDelivery",
               "logs:GetLogDelivery",
@@ -41,85 +56,25 @@
               "logs:DeleteLogDelivery",
               "logs:ListLogDeliveries",
               "logs:PutResourcePolicy",
-              "logs:DescribeResourcePolicies",
-              "cloudformation:ValidateTemplate"
+              "logs:DescribeResourcePolicies"
             ],
             "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "AllowUnscopableReadsAndLogDelivery"
+            "Resource": "*"
+          },
+          {
+            "Action": "secretsmanager:GetSecretValue",
+            "Effect": "Allow",
+            "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/*"
           },
           {
             "Action": [
-              "secretsmanager:GetSecretValue",
-              "secretsmanager:DescribeSecret"
-            ],
-            "Effect": "Allow",
-            "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/*",
-            "Sid": "AllowNamespaceSecrets"
-          },
-          {
-            "Action": [
-              "ecr:CreateRepository",
-              "ecr:DescribeRepositories",
-              "ecr:PutImageScanningConfiguration",
-              "ecr:PutImageTagMutability",
-              "ecr:TagResource",
-              "ecr:ListTagsForResource"
-            ],
-            "Effect": "Allow",
-            "Resource": "arn:aws:ecr:ap-south-1:123456789012:repository/ezil-pilot-*",
-            "Sid": "AllowNamespaceRepositories"
-          },
-          {
-            "Action": [
-              "cloudformation:DescribeChangeSet",
-              "cloudformation:ExecuteChangeSet",
-              "cloudformation:DeleteChangeSet",
-              "cloudformation:DescribeStacks",
-              "cloudformation:DescribeStackEvents",
-              "cloudformation:GetTemplate",
-              "cloudformation:GetTemplateSummary",
-              "cloudformation:ListStackResources"
-            ],
-            "Effect": "Allow",
-            "Resource": "arn:aws:cloudformation:ap-south-1:123456789012:stack/ezil-pilot-*/*",
-            "Sid": "AllowNamespaceStacks"
-          },
-          {
-            "Action": "cloudformation:CreateChangeSet",
-            "Condition": {
-              "ArnEquals": {
-                "cloudformation:RoleArn": "arn:aws:iam::123456789012:role/ezil/identity/ezil-pilot-cfn-exec"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "arn:aws:cloudformation:ap-south-1:123456789012:stack/ezil-pilot-*/*",
-            "Sid": "AllowChangeSetsOnlyViaExec"
-          },
-          {
-            "Action": "kms:CreateKey",
-            "Condition": {
-              "StringEquals": {
-                "aws:RequestTag/ezil:namespace": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "AllowKmsCreateTagged"
-          },
-          {
-            "Action": [
-              "kms:DescribeKey",
-              "kms:GetKeyPolicy",
-              "kms:PutKeyPolicy",
-              "kms:EnableKeyRotation",
-              "kms:GetKeyRotationStatus",
-              "kms:TagResource",
-              "kms:ListResourceTags",
               "kms:Encrypt",
               "kms:Decrypt",
-              "kms:ReEncrypt*",
-              "kms:GenerateDataKey*",
+              "kms:ReEncryptFrom",
+              "kms:ReEncryptTo",
+              "kms:GenerateDataKey",
+              "kms:GenerateDataKeyWithoutPlaintext",
+              "kms:DescribeKey",
               "kms:CreateGrant"
             ],
             "Condition": {
@@ -128,92 +83,7 @@
               }
             },
             "Effect": "Allow",
-            "Resource": "arn:aws:kms:ap-south-1:123456789012:key/*",
-            "Sid": "AllowKmsOnNamespaceKeys"
-          },
-          {
-            "Action": [
-              "ec2:CreateVpc",
-              "ec2:CreateInternetGateway",
-              "ec2:CreateLaunchTemplate"
-            ],
-            "Condition": {
-              "StringEquals": {
-                "aws:RequestTag/ezil:namespace": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": [
-              "arn:aws:ec2:ap-south-1:123456789012:vpc/*",
-              "arn:aws:ec2:ap-south-1:123456789012:internet-gateway/*",
-              "arn:aws:ec2:ap-south-1:123456789012:launch-template/*"
-            ],
-            "Sid": "AllowEc2TopLevelCreateTagged"
-          },
-          {
-            "Action": [
-              "ec2:CreateSubnet",
-              "ec2:CreateRouteTable",
-              "ec2:CreateSecurityGroup"
-            ],
-            "Condition": {
-              "StringEquals": {
-                "aws:RequestTag/ezil:namespace": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": [
-              "arn:aws:ec2:ap-south-1:123456789012:subnet/*",
-              "arn:aws:ec2:ap-south-1:123456789012:route-table/*",
-              "arn:aws:ec2:ap-south-1:123456789012:security-group/*"
-            ],
-            "Sid": "AllowEc2InVpcCreateTagged"
-          },
-          {
-            "Action": [
-              "ec2:CreateSubnet",
-              "ec2:CreateRouteTable",
-              "ec2:CreateSecurityGroup"
-            ],
-            "Condition": {
-              "StringEquals": {
-                "aws:ResourceTag/ezil:namespace": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "arn:aws:ec2:ap-south-1:123456789012:vpc/*",
-            "Sid": "AllowEc2CreateOnlyInNamespaceVpc"
-          },
-          {
-            "Action": [
-              "ec2:ModifyVpcAttribute",
-              "ec2:DeleteVpc",
-              "ec2:AttachInternetGateway",
-              "ec2:DetachInternetGateway",
-              "ec2:DeleteInternetGateway",
-              "ec2:CreateRoute",
-              "ec2:ReplaceRoute",
-              "ec2:DeleteRoute",
-              "ec2:DeleteRouteTable",
-              "ec2:AssociateRouteTable",
-              "ec2:DisassociateRouteTable",
-              "ec2:ModifySubnetAttribute",
-              "ec2:DeleteSubnet",
-              "ec2:AuthorizeSecurityGroupEgress",
-              "ec2:RevokeSecurityGroupEgress",
-              "ec2:DeleteSecurityGroup",
-              "ec2:CreateLaunchTemplateVersion",
-              "ec2:ModifyLaunchTemplate",
-              "ec2:DeleteLaunchTemplate"
-            ],
-            "Condition": {
-              "StringEquals": {
-                "aws:ResourceTag/ezil:namespace": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "AllowEc2NetworkMutateTagged"
+            "Resource": "arn:aws:kms:ap-south-1:123456789012:key/*"
           },
           {
             "Action": "ec2:RunInstances",
@@ -230,8 +100,7 @@
               }
             },
             "Effect": "Allow",
-            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*",
-            "Sid": "AllowLaunchAllowlistedTypes"
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
           },
           {
             "Action": [
@@ -252,8 +121,7 @@
               }
             },
             "Effect": "Allow",
-            "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*",
-            "Sid": "AllowCappedEncryptedGp3Volumes"
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*"
           },
           {
             "Action": "ec2:RunInstances",
@@ -264,8 +132,7 @@
               }
             },
             "Effect": "Allow",
-            "Resource": "arn:aws:ec2:ap-south-1:123456789012:network-interface/*",
-            "Sid": "AllowLaunchInterfacesTagged"
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
           },
           {
             "Action": "ec2:RunInstances",
@@ -279,32 +146,20 @@
               "arn:aws:ec2:ap-south-1:123456789012:subnet/*",
               "arn:aws:ec2:ap-south-1:123456789012:security-group/*",
               "arn:aws:ec2:ap-south-1:123456789012:launch-template/*"
-            ],
-            "Sid": "AllowLaunchIntoNamespaceNetwork"
+            ]
           },
           {
             "Action": "ec2:RunInstances",
             "Effect": "Allow",
-            "Resource": "arn:aws:ec2:ap-south-1::image/*",
-            "Sid": "AllowLaunchImages"
-          },
-          {
-            "Action": "ec2:CreateVolume",
-            "Condition": {
-              "StringEquals": {
-                "aws:ResourceTag/ezil:backup": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "arn:aws:ec2:ap-south-1::snapshot/*",
-            "Sid": "AllowRestoreNamespaceSnapshots"
+            "Resource": "arn:aws:ec2:ap-south-1::image/*"
           },
           {
             "Action": [
               "ec2:StartInstances",
               "ec2:StopInstances",
               "ec2:TerminateInstances",
-              "ec2:AttachVolume"
+              "ec2:AttachVolume",
+              "ec2:CreateTags"
             ],
             "Condition": {
               "StringEquals": {
@@ -316,96 +171,63 @@
             "Resource": [
               "arn:aws:ec2:ap-south-1:123456789012:instance/*",
               "arn:aws:ec2:ap-south-1:123456789012:volume/*"
-            ],
-            "Sid": "AllowComputeOnManaged"
+            ]
           },
           {
             "Action": "ec2:CreateTags",
             "Condition": {
               "StringEquals": {
                 "ec2:CreateAction": [
-                  "CreateVpc",
-                  "CreateSubnet",
-                  "CreateInternetGateway",
-                  "CreateRouteTable",
-                  "CreateSecurityGroup",
-                  "CreateLaunchTemplate",
                   "RunInstances",
                   "CreateVolume"
                 ]
               }
             },
             "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "AllowTagOnCreate"
-          },
-          {
-            "Action": "ec2:CreateTags",
-            "Condition": {
-              "StringEquals": {
-                "aws:ResourceTag/ezil:namespace": "pilot"
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "AllowRetagNamespaceNetwork"
-          },
-          {
-            "Action": "ec2:CreateTags",
-            "Condition": {
-              "StringEquals": {
-                "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
-                "aws:ResourceTag/ezil:stage": "pilot"
-              }
-            },
-            "Effect": "Allow",
             "Resource": [
               "arn:aws:ec2:ap-south-1:123456789012:instance/*",
               "arn:aws:ec2:ap-south-1:123456789012:volume/*"
-            ],
-            "Sid": "AllowRetagManagedCompute"
+            ]
           },
           {
             "Action": [
-              "s3:GetObject",
-              "s3:PutObject",
-              "s3:ListBucket",
-              "s3:GetBucketLocation"
+              "ec2:Purchase*",
+              "ec2:AllocateHosts",
+              "ec2:ModifyHosts",
+              "ec2:CreateCapacityReservation*",
+              "ec2:CreateReservedInstancesListing",
+              "ec2:AcceptReservedInstancesExchangeQuote",
+              "ec2:RequestSpot*",
+              "ec2:CreateFleet",
+              "savingsplans:*",
+              "rds:*",
+              "elasticache:*",
+              "redshift:*",
+              "es:*",
+              "dynamodb:*",
+              "aws-marketplace:*",
+              "ec2:DeleteVolume",
+              "ec2:DeleteSnapshot",
+              "ec2:DetachVolume",
+              "ec2:DeleteTags",
+              "ec2:ModifyInstanceAttribute",
+              "iam:*",
+              "sts:*",
+              "organizations:*",
+              "account:*",
+              "aws-portal:*",
+              "billing:*",
+              "payments:*",
+              "tax:*",
+              "ce:*",
+              "route53:*",
+              "route53domains:*",
+              "cloudfront:*",
+              "budgets:*",
+              "cloudwatch:*"
             ],
-            "Effect": "Allow",
-            "Resource": [
-              "arn:aws:s3:::ezil-pilot-deploy-assets-123456789012",
-              "arn:aws:s3:::ezil-pilot-deploy-assets-123456789012/*"
-            ],
-            "Sid": "AllowOwnBucket"
-          },
-          {
-            "Action": [
-              "iam:CreateRole",
-              "iam:DeleteRole",
-              "iam:UpdateRole",
-              "iam:UpdateRoleDescription",
-              "iam:UpdateAssumeRolePolicy",
-              "iam:PutRolePolicy",
-              "iam:DeleteRolePolicy",
-              "iam:AttachRolePolicy",
-              "iam:DetachRolePolicy",
-              "iam:PutRolePermissionsBoundary",
-              "iam:TagRole",
-              "iam:UntagRole"
-            ],
-            "Effect": "Allow",
-            "Resource": "arn:aws:iam::123456789012:role/ezil/pilot/*",
-            "Sid": "AllowRoleWritesUnderWorkloadPath"
-          },
-          {
-            "Action": "iam:PassRole",
-            "Effect": "Allow",
-            "Resource": [
-              "arn:aws:iam::123456789012:role/ezil/pilot/*",
-              "arn:aws:iam::123456789012:role/ezil/identity/ezil-pilot-cfn-exec"
-            ],
-            "Sid": "AllowPassWorkloadAndExecRoles"
+            "Effect": "Deny",
+            "Resource": "*"
           },
           {
             "NotAction": "iam:*",
@@ -415,11 +237,68 @@
               }
             },
             "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "RegionLock"
+            "Resource": "*"
           },
           {
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "ForAnyValue:StringEquals": {
+                "aws:TagKeys": [
+                  "ezil:backup"
+                ]
+              },
+              "Null": {
+                "ec2:CreateAction": "true"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "*"
+          },
+          {
+            "Action": "ec2:DescribeInstanceAttribute",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:ResourceTag/ezil:stage": "pilot"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+          }
+        ],
+        "Version": "2012-10-17"
+      }
+    }
+  },
+  "IdentityGuardrails6DFB1696": {
+    "Type": "AWS::IAM::ManagedPolicy",
+    "Properties": {
+      "Description": "Historical boundary denies for founder-created deployment identities; grants nothing",
+      "ManagedPolicyName": "ezil-pilot-identity-guardrails",
+      "Path": "/ezil/identity/",
+      "PolicyDocument": {
+        "Statement": [
+          {
             "Action": [
+              "ec2:Purchase*",
+              "ec2:AllocateHosts",
+              "ec2:ModifyHosts",
+              "ec2:CreateCapacityReservation*",
+              "ec2:CreateReservedInstancesListing",
+              "ec2:AcceptReservedInstancesExchangeQuote",
+              "ec2:RequestSpot*",
+              "ec2:CreateFleet",
+              "savingsplans:*",
+              "rds:*",
+              "elasticache:*",
+              "redshift:*",
+              "es:*",
+              "dynamodb:*",
+              "aws-marketplace:*",
+              "ec2:DeleteVolume",
+              "ec2:DeleteSnapshot",
+              "ec2:DetachVolume",
+              "ec2:DeleteTags",
+              "ec2:ModifyInstanceAttribute",
               "iam:*User*",
               "iam:*Group*",
               "iam:*MFADevice*",
@@ -428,11 +307,93 @@
               "iam:*SSHPublicKey*",
               "iam:*ServiceSpecificCredential*",
               "iam:*SigningCertificate*",
-              "iam:DeleteRolePermissionsBoundary"
+              "iam:DeleteRolePermissionsBoundary",
+              "iam:CreateOpenIDConnectProvider",
+              "iam:DeleteOpenIDConnectProvider",
+              "iam:UpdateOpenIDConnectProviderThumbprint",
+              "iam:AddClientIDToOpenIDConnectProvider",
+              "iam:RemoveClientIDFromOpenIDConnectProvider",
+              "iam:TagOpenIDConnectProvider",
+              "iam:UntagOpenIDConnectProvider",
+              "iam:CreateSAMLProvider",
+              "iam:UpdateSAMLProvider",
+              "iam:DeleteSAMLProvider",
+              "iam:TagSAMLProvider",
+              "iam:UntagSAMLProvider",
+              "organizations:*",
+              "account:Accept*",
+              "account:Close*",
+              "account:Delete*",
+              "account:Disable*",
+              "account:Enable*",
+              "account:Put*",
+              "account:Start*",
+              "aws-portal:Modify*",
+              "billing:Create*",
+              "billing:Delete*",
+              "billing:Put*",
+              "billing:Update*",
+              "payments:*",
+              "tax:Batch*",
+              "tax:Delete*",
+              "tax:Put*",
+              "ce:Create*",
+              "ce:Delete*",
+              "ce:Update*",
+              "route53:Associate*",
+              "route53:Change*",
+              "route53:Create*",
+              "route53:Delete*",
+              "route53:Disassociate*",
+              "route53:Update*",
+              "route53domains:*",
+              "cloudfront:Associate*",
+              "cloudfront:Create*",
+              "cloudfront:Delete*",
+              "cloudfront:Update*",
+              "budgets:Create*",
+              "budgets:Delete*",
+              "budgets:Execute*",
+              "budgets:Modify*",
+              "budgets:Update*"
             ],
             "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoUsersGroupsKeysOrBoundaryRemoval"
+            "Resource": "*"
+          },
+          {
+            "NotAction": "iam:*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:RequestedRegion": "ap-south-1"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "*"
+          },
+          {
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "ForAnyValue:StringEquals": {
+                "aws:TagKeys": [
+                  "ezil:backup"
+                ]
+              },
+              "Null": {
+                "ec2:CreateAction": "true"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "*"
+          },
+          {
+            "Action": "ec2:DescribeInstanceAttribute",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:ResourceTag/ezil:stage": "pilot"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
           },
           {
             "Action": [
@@ -452,8 +413,7 @@
               }
             },
             "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "RolesCarryThisBoundary"
+            "Resource": "*"
           },
           {
             "Action": [
@@ -466,8 +426,7 @@
               }
             },
             "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "OnlyLambdaBasicManagedPolicy"
+            "Resource": "*"
           },
           {
             "Action": [
@@ -491,11 +450,11 @@
               "iam:TagPolicy",
               "iam:UntagPolicy",
               "iam:CreateInstanceProfile",
-              "iam:AddRoleToInstanceProfile"
+              "iam:AddRoleToInstanceProfile",
+              "sts:AssumeRole"
             ],
             "Effect": "Deny",
-            "NotResource": "arn:aws:iam::123456789012:role/ezil/pilot/*",
-            "Sid": "IamWritesOnlyUnderWorkloadPath"
+            "NotResource": "arn:aws:iam::123456789012:role/ezil/pilot/*"
           },
           {
             "Action": "iam:PassRole",
@@ -503,133 +462,7 @@
             "NotResource": [
               "arn:aws:iam::123456789012:role/ezil/pilot/*",
               "arn:aws:iam::123456789012:role/ezil/identity/ezil-pilot-cfn-exec"
-            ],
-            "Sid": "PassOnlyWorkloadAndExecRoles"
-          },
-          {
-            "Action": "sts:AssumeRole",
-            "Effect": "Deny",
-            "NotResource": "arn:aws:iam::123456789012:role/ezil/pilot/*",
-            "Sid": "AssumeOnlyWorkloadRoles"
-          },
-          {
-            "Action": [
-              "iam:CreateOpenIDConnectProvider",
-              "iam:DeleteOpenIDConnectProvider",
-              "iam:UpdateOpenIDConnectProviderThumbprint",
-              "iam:AddClientIDToOpenIDConnectProvider",
-              "iam:RemoveClientIDFromOpenIDConnectProvider",
-              "iam:TagOpenIDConnectProvider",
-              "iam:UntagOpenIDConnectProvider",
-              "iam:CreateSAMLProvider",
-              "iam:UpdateSAMLProvider",
-              "iam:DeleteSAMLProvider",
-              "iam:TagSAMLProvider",
-              "iam:UntagSAMLProvider"
-            ],
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoIdentityProviderWrites"
-          },
-          {
-            "Action": [
-              "ec2:DeleteVolume",
-              "ec2:DeleteSnapshot",
-              "ec2:DetachVolume",
-              "ec2:DeleteTags"
-            ],
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoStorageDeletionOrDetach"
-          },
-          {
-            "Action": "ec2:CreateTags",
-            "Condition": {
-              "ForAnyValue:StringEquals": {
-                "aws:TagKeys": [
-                  "ezil:backup"
-                ]
-              },
-              "Null": {
-                "ec2:CreateAction": "true"
-              }
-            },
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "BackupTagOnlyAtCreation"
-          },
-          {
-            "Action": [
-              "organizations:*",
-              "account:Accept*",
-              "account:Close*",
-              "account:Delete*",
-              "account:Disable*",
-              "account:Enable*",
-              "account:Put*",
-              "account:Start*",
-              "aws-portal:Modify*",
-              "billing:Create*",
-              "billing:Delete*",
-              "billing:Put*",
-              "billing:Update*",
-              "payments:*",
-              "tax:Batch*",
-              "tax:Delete*",
-              "tax:Put*",
-              "ce:Create*",
-              "ce:Delete*",
-              "ce:Update*"
-            ],
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoOrgAccountBillingWrites"
-          },
-          {
-            "Action": [
-              "route53:Associate*",
-              "route53:Change*",
-              "route53:Create*",
-              "route53:Delete*",
-              "route53:Disassociate*",
-              "route53:Update*",
-              "route53domains:*",
-              "cloudfront:Associate*",
-              "cloudfront:Create*",
-              "cloudfront:Delete*",
-              "cloudfront:Update*",
-              "budgets:Create*",
-              "budgets:Delete*",
-              "budgets:Execute*",
-              "budgets:Modify*",
-              "budgets:Update*"
-            ],
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoEdgeOrBudgetWrites"
-          },
-          {
-            "Action": [
-              "ec2:Purchase*",
-              "ec2:AllocateHosts",
-              "ec2:ModifyHosts",
-              "ec2:CreateCapacityReservation*",
-              "ec2:CreateReservedInstancesListing",
-              "ec2:AcceptReservedInstancesExchangeQuote",
-              "ec2:RequestSpot*",
-              "ec2:CreateFleet",
-              "savingsplans:*",
-              "rds:PurchaseReserved*",
-              "elasticache:PurchaseReserved*",
-              "redshift:PurchaseReserved*",
-              "es:PurchaseReserved*",
-              "dynamodb:PurchaseReserved*",
-              "aws-marketplace:Subscribe",
-              "aws-marketplace:AcceptAgreement*"
-            ],
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoPurchasesOrReservations"
+            ]
           },
           {
             "Action": [
@@ -645,8 +478,7 @@
               }
             },
             "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoAlarmAutomation"
+            "Resource": "*"
           },
           {
             "Action": [
@@ -659,25 +491,7 @@
               }
             },
             "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoAlarmActions"
-          },
-          {
-            "Action": "ec2:DescribeInstanceAttribute",
-            "Condition": {
-              "StringNotEquals": {
-                "aws:ResourceTag/ezil:stage": "pilot"
-              }
-            },
-            "Effect": "Deny",
-            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*",
-            "Sid": "NoForeignInstanceAttributes"
-          },
-          {
-            "Action": "ec2:ModifyInstanceAttribute",
-            "Effect": "Deny",
-            "Resource": "*",
-            "Sid": "NoModifyInstanceAttribute"
+            "Resource": "*"
           }
         ],
         "Version": "2012-10-17"
@@ -704,10 +518,12 @@
         ],
         "Version": "2012-10-17"
       },
+      "ManagedPolicyArns": [
+        {
+          "Ref": "IdentityGuardrails6DFB1696"
+        }
+      ],
       "Path": "/ezil/identity/",
-      "PermissionsBoundary": {
-        "Ref": "BoundaryEA298153"
-      },
       "Policies": [
         {
           "PolicyDocument": {
@@ -1125,11 +941,13 @@
         "Version": "2012-10-17"
       },
       "Description": "GitHub OIDC deploy (environment aws-pilot): change sets via the execution role",
+      "ManagedPolicyArns": [
+        {
+          "Ref": "IdentityGuardrails6DFB1696"
+        }
+      ],
       "MaxSessionDuration": 3600,
       "Path": "/ezil/identity/",
-      "PermissionsBoundary": {
-        "Ref": "BoundaryEA298153"
-      },
       "Policies": [
         {
           "PolicyDocument": {
