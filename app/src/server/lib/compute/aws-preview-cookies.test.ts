@@ -18,7 +18,7 @@ const ELSEWHERE = 'https://elsewhere.example';
 const BOOTSTRAP = `${ORIGIN}/preview-bootstrap?token=good&path=%2F`;
 const COOKIE = 'ezil_preview=c1';
 
-interface Seen { url: string; method: string; cookie: string | null }
+interface Seen { url: string; method: string; cookie: string | null; redirect: RequestRedirect | undefined }
 let seen: Seen[];
 let bootstrapTarget: string;
 
@@ -26,7 +26,7 @@ function server(input: RequestInfo | URL, init?: RequestInit): Response {
     const url = new URL(String(input));
     const headers = new Headers(init?.headers);
     const method = init?.method ?? 'GET';
-    seen.push({ url: url.toString(), method, cookie: headers.get('cookie') });
+    seen.push({ url: url.toString(), method, cookie: headers.get('cookie'), redirect: init?.redirect });
     if (url.origin === ELSEWHERE) return new Response('elsewhere', { status: 200 });
     if (url.pathname === '/preview-bootstrap') {
         if (url.searchParams.get('token') !== 'good') return Response.json({ ok: false, error: 'invalid_token' }, { status: 401 });
@@ -70,12 +70,22 @@ describe('frame probe through an AWS bootstrap', () => {
         expect(seen[0]).toMatchObject({ url: BOOTSTRAP, cookie: null });
     });
 
-    it('never forwards the cookie to another origin', async () => {
+    it('never requests another origin: a cross-origin redirect ends the probe (no cookie, no SSRF)', async () => {
         bootstrapTarget = `${ELSEWHERE}/landing`;
-        await expect(probeDesktopFrame(BOOTSTRAP)).resolves.toEqual({ alive: true, status: 200 });
-        const hop = seen.find((s) => originOf(s.url) === ELSEWHERE);
-        expect(hop).toBeDefined();
-        expect(hop!.cookie).toBeNull();
+        // The origin answered, so the frame is alive; its redirect target is never fetched.
+        await expect(probeDesktopFrame(BOOTSTRAP)).resolves.toEqual({ alive: true, status: 302 });
+        expect(seen.some((s) => originOf(s.url) === ELSEWHERE)).toBe(false);
+    });
+
+    it.each([
+        'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+        'http://127.0.0.1:5432/',
+        'http://10.0.0.5/internal',
+        'https://aws-8181-guac-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-aws.preview.example.evil/',
+    ])('SSRF: a redirect from the validated origin to %s is never followed', async (target) => {
+        bootstrapTarget = target;
+        await probeDesktopFrame(BOOTSTRAP);
+        expect(seen.map((s) => originOf(s.url))).toEqual([ORIGIN]);
     });
 
     it('a bad bootstrap token is still a dead frame', async () => {
@@ -97,6 +107,12 @@ describe('display probe through an AWS bootstrap', () => {
         const api = seen.filter((s) => originOf(s.url) === ORIGIN && new URL(s.url).pathname.startsWith('/api/'));
         expect(api.map((s) => new URL(s.url).pathname)).toEqual(['/api/login', '/api/sessions']);
         for (const s of api) expect(s.cookie).toBe(COOKIE);
+    });
+
+    it('SSRF: every server-side request it makes refuses to follow redirects', async () => {
+        await probeDesktopDisplay(BOOTSTRAP, 'admin-pass');
+        expect(seen.length).toBeGreaterThan(0);
+        for (const s of seen) expect(s.redirect, s.url).toBe('manual');
     });
 
     it('a refused bootstrap is unknown (login_failed), never a verdict', async () => {

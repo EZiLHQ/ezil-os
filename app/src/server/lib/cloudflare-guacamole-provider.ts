@@ -2117,6 +2117,7 @@ export async function probeDesktopDisplay(
     /** Mint a fresh admin session and remember it. `null` = the login failed. */
     const login = async (): Promise<{ token: string } | { status?: number }> => {
         const loginRes = await fetch(`${origin}/api/login`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             method: 'POST',
             headers: withCookie({ 'Content-Type': 'application/json' }),
             // A distinct username from `enableImplicitHosting`'s so the two
@@ -2152,6 +2153,7 @@ export async function probeDesktopDisplay(
         }
 
         let listRes = await fetch(`${origin}/api/sessions`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             headers: withCookie({ Authorization: `Bearer ${token}`, Accept: 'application/json' }),
             cache: 'no-store',
             signal: deadline,
@@ -2169,6 +2171,7 @@ export async function probeDesktopDisplay(
             }
             token = fresh.token;
             listRes = await fetch(`${origin}/api/sessions`, {
+                redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
                 headers: withCookie({ Authorization: `Bearer ${token}`, Accept: 'application/json' }),
                 cache: 'no-store',
                 signal: deadline,
@@ -2450,6 +2453,7 @@ export async function enableImplicitHosting(
 
     try {
         const loginRes = await fetch(`${origin}/api/login`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username: 'ezil-os-control', password: adminPassword }),
@@ -3058,6 +3062,7 @@ export async function readDesktopScreen(
 
     const login = async (): Promise<string | null> => {
         const res = await fetch(`${origin}/api/login`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username: 'ezil-os-screen', password: adminPassword }),

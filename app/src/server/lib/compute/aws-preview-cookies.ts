@@ -9,8 +9,8 @@
  * judged a working AWS desktop as dead.
  *
  * 🔴 A cookie is only ever sent back to the EXACT origin (scheme, host, port)
- * that set it. `Domain=` is ignored (every cookie is host-only), so a redirect
- * to any other host — a sibling preview host included — carries none.
+ * that set it. `Domain=` is ignored (every cookie is host-only), and a redirect
+ * to any other origin is never followed at all (see `getFollowingSameOriginCookies`).
  */
 
 export type ProbeCookieJar = Map<string, Map<string, string>>;
@@ -55,6 +55,13 @@ export function cookieHeaderFor(jar: ProbeCookieJar, url: URL): string | undefin
  * origin only, at most `maxRedirects` hops are followed, and the final
  * response (any status) is returned. Throws on a hop limit or a non-HTTP
  * redirect target, as `fetch` itself throws on a redirect loop.
+ *
+ * 🔴 SSRF: only SAME-ORIGIN redirects are followed. The caller validated the
+ * starting origin (`isOwnDesktopOrigin`); a server there (an app preview the
+ * user controls, or a desktop the user is root on) must not be able to point
+ * this server-side request at a private service or a metadata endpoint. A
+ * redirect to any other origin ends the walk: that 3xx is returned as the
+ * final response, and nothing is ever requested from its target.
  */
 export async function getFollowingSameOriginCookies(
     rawUrl: string,
@@ -74,10 +81,11 @@ export async function getFollowingSameOriginCookies(
         storeSetCookies(jar, url, response.headers);
         const location = response.headers.get('location');
         if (response.status < 300 || response.status >= 400 || !location) return { response, url, jar };
-        await response.body?.cancel().catch(() => undefined);
         if (hop >= maxRedirects) throw new Error('too_many_redirects');
         const next = new URL(location, url);
         if (next.protocol !== 'https:' && next.protocol !== 'http:') throw new Error('unsupported_redirect');
+        if (next.origin !== url.origin) return { response, url, jar };
+        await response.body?.cancel().catch(() => undefined);
         url = next;
     }
 }
