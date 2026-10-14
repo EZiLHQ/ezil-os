@@ -199,6 +199,80 @@ describe('verifyOrigin (C-6 step 5)', () => {
     expect(s.map.has('tunnel')).toBe(false);
     expect(s.map.get('fenced_epoch')).toBe(2);
   });
+  it('caches for 60 seconds across restart and serializes refreshes at the exact boundary', async () => {
+    const s = memStorage(); const { api, calls } = fakeApi();
+    let now = 0;
+    let svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => now });
+    await svc.create(claims(), body());
+    expect(await svc.verifyOrigin()).toBe('verified');
+    expect((s.map.get('tunnel') as AwsTunnelRecord).originVerifiedAt).toBe(0);
+    svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => now });
+    now = 59_999;
+    expect((await svc.get())?.originVerifiedAt).toBe(0);
+    expect(await svc.verifyOrigin()).toBe('verified');
+    expect(calls.filter((c) => c === 'list tun-1').length).toBe(1);
+    now = 60_000;
+    const [first, verdict, last] = await Promise.all([svc.get(), svc.verifyOrigin(), svc.get()]);
+    expect(first?.originVerifiedAt).toBe(60_000);
+    expect(verdict).toBe('verified');
+    expect(last?.originVerifiedAt).toBe(60_000);
+    expect(calls.filter((c) => c === 'list tun-1').length).toBe(2);
+    now = 120_000;
+    api.listConnectorOrigins = async () => ['13.200.1.2', '203.0.113.9'];
+    expect(await svc.verifyOrigin()).toBe('mismatch');
+    expect(calls.slice(-2)).toEqual(['deleteDns dns-1', 'deleteTunnel tun-1']);
+    expect(s.map.has('tunnel')).toBe(false);
+    expect(s.map.get('fenced_epoch')).toBe(2);
+  });
+  it('rechecks legacy records and timestamps ahead of the clock', async () => {
+    for (const originVerifiedAt of [undefined, 1001]) {
+      const s = memStorage(); const { api } = fakeApi();
+      const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => 1000 });
+      await svc.create(claims(), body());
+      await s.put('tunnel', { ...(s.map.get('tunnel') as AwsTunnelRecord), originVerified: true, originVerifiedAt });
+      api.listConnectorOrigins = async () => ['203.0.113.9'];
+      expect(await svc.get()).toBeNull();
+      expect(s.map.get('fenced_epoch')).toBe(2);
+    }
+  });
+  it('expired checks with no connections or an API failure fail closed without renewing the cache', async () => {
+    for (const failure of ['empty', 'error']) {
+      const s = memStorage(); const { api } = fakeApi();
+      let now = 0;
+      const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => now });
+      await svc.create(claims(), body());
+      expect(await svc.verifyOrigin()).toBe('verified');
+      now = 60_000;
+      api.listConnectorOrigins = async () => {
+        if (failure === 'error') throw new Error('cf down');
+        return [];
+      };
+      expect(await svc.verifyOrigin()).toBe('not_connected');
+      expect(await svc.get()).toBeNull();
+      expect((s.map.get('tunnel') as AwsTunnelRecord).originVerifiedAt).toBe(0);
+      api.listConnectorOrigins = async () => ['13.200.1.2'];
+      expect((await svc.get())?.originVerifiedAt).toBe(60_000);
+    }
+  });
+  it('an expired mismatch fences before teardown even when DNS or tunnel deletion fails', async () => {
+    for (const operation of ['deleteDnsRecord', 'deleteTunnel'] as const) {
+      const s = memStorage(); const { api } = fakeApi();
+      let now = 0;
+      let svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => now });
+      await svc.create(claims(), body());
+      expect(await svc.verifyOrigin()).toBe('verified');
+      now = 60_000;
+      api.listConnectorOrigins = async () => ['13.200.1.2', '203.0.113.9'];
+      const fences: unknown[] = [];
+      api[operation] = async () => { fences.push(s.map.get('fenced_epoch')); throw new Error('cf down'); };
+      expect(await svc.get()).toBeNull();
+      expect(fences).toEqual([2]);
+      svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => now });
+      expect(await svc.get()).toBeNull();
+      expect(await svc.verifyOrigin()).toBe('not_connected');
+      expect((await svc.create(claims(), body())).body.error).toBe('stale_epoch');
+    }
+  });
 });
 
 describe('Cloudflare REST client (fake fetch only)', () => {

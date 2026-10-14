@@ -17,9 +17,9 @@ mock.module('cloudflare:workers', () => ({
 }));
 
 import vectors from './aws-gateway.vectors.json';
-import { decodeControlKey, verifyGatewayHeader } from './aws-origin';
+import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-origin';
 import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
-import { deriveNekoCredentials, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { deriveNekoCredentials, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 import { sha256Hex } from './aws-ice';
 
 const worker = (await import('./index')).default;
@@ -47,7 +47,7 @@ const cfApiFetch = async (url: string): Promise<Response> => {
   return new Response(JSON.stringify({ success: true, result }), { status: 200 });
 };
 
-function env(over: Record<string, unknown> = {}) {
+function env(over: Record<string, unknown> = {}, tunnelFetch: FetchLike = cfApiFetch, nowMs: () => number = Date.now) {
   const registries = new Map<string, AwsTunnelRegistry>();
   const base = {
     SANDBOX_HMAC_SECRET: SECRET,
@@ -59,7 +59,7 @@ function env(over: Record<string, unknown> = {}) {
   const ns = {
     idFromName: (n: string) => n,
     get: (id: string) => {
-      if (!registries.has(id)) registries.set(id, new AwsTunnelRegistry({ storage: memStorage() }, base, cfApiFetch));
+      if (!registries.has(id)) registries.set(id, new AwsTunnelRegistry({ storage: memStorage() }, base, tunnelFetch, undefined, nowMs));
       return registries.get(id)!;
     },
   };
@@ -194,6 +194,70 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     expect(seen[0]!.url).toBe(`https://c-${SID}-g1-e2.${ORIGIN_ZONE}/__p/8181/index.html?usr=EZiL&pwd=ezil-preview&embed=1`);
     const v = await verifyGatewayHeader(seen[0]!.headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, 'GET', '/__p/8181/index.html', now);
     expect(v).toEqual({ ok: true });
+    expect(seen[0]!.headers.get('x-forwarded-host')).toBe(boot.hostname);
+    const codeHost = `aws-8443-${SID}.ezil.work`;
+    for (const upgrade of [false, true]) {
+      const headers = new Headers({
+        cookie, origin: `https://${codeHost}`, host: 'evil.example',
+        'x-forwarded-host': 'evil.example, other.example', 'x-forwarded-proto': 'http',
+        forwarded: 'host=evil.example;proto=http',
+      });
+      if (upgrade) headers.set('upgrade', 'websocket');
+      expect((await worker.fetch(new Request(`https://${codeHost}/vscode`, { headers }), e)).status).toBe(200);
+      const forwarded = seen[seen.length - 1]!.headers;
+      expect(forwarded.get('x-forwarded-host')).toBe(codeHost);
+      expect(forwarded.get('x-forwarded-proto')).toBeNull();
+      expect(forwarded.get('forwarded')).toBeNull();
+      expect(forwarded.get('origin')).toBe(`https://${codeHost}`);
+      expect(forwarded.get('upgrade')).toBe(upgrade ? 'websocket' : null);
+    }
+  });
+
+  it('preview, HTTP and WebSocket requests recheck expired origins and fence mismatches', async () => {
+    for (const target of ['preview', 'http', 'websocket']) {
+      let now = Date.now();
+      let origins = ['13.200.1.2'];
+      let checks = 0;
+      const deleted: string[] = [];
+      const tunnelFetch: FetchLike = async (url, init) => {
+        if (init.method === 'DELETE') {
+          deleted.push(url.split('/client/v4')[1]!);
+          return new Response(JSON.stringify({ success: true, result: null }));
+        }
+        if (url.endsWith('/connections')) {
+          checks++;
+          return new Response(JSON.stringify({ success: true, result: [{ conns: origins.map((origin_ip) => ({ origin_ip })) }] }));
+        }
+        return cfApiFetch(url);
+      };
+      const e = env({ AWS_ROUTING_ENABLED: '1' }, tunnelFetch, () => now);
+      expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+      const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+      expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+      expect(host.bad).toEqual([]);
+      expect(checks).toBe(1);
+      const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+      let forwarded = 0;
+      globalThis.fetch = (async () => { forwarded++; return new Response('origin'); }) as typeof fetch;
+      origins = ['13.200.1.2', '203.0.113.9'];
+      now += 60_000;
+      const headers = new Headers({ cookie });
+      if (target === 'websocket') headers.set('upgrade', 'websocket');
+      const request = target === 'preview'
+        ? await signed('POST', '/sandbox/preview', previewBody)
+        : new Request(`https://aws-8443-${SID}.ezil.work/vscode`, { headers });
+      expect((await worker.fetch(request, e)).status).toBe(502);
+      expect(checks).toBe(2);
+      expect(forwarded).toBe(0);
+      expect(deleted).toEqual([
+        '/zones/zone/dns_records/tid',
+        '/accounts/acct/cfd_tunnel/tid/connections',
+        '/accounts/acct/cfd_tunnel/tid',
+      ]);
+      const retry = await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
+      expect(retry.status).toBe(409);
+      expect(await retry.json()).toEqual({ ok: false, error: 'stale_epoch' });
+    }
   });
 
   it('a Cloudflare bridge hostname still reaches its own dispatcher (not claimed by the AWS hook)', async () => {

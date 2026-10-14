@@ -38,7 +38,7 @@ function record(over: Partial<AwsTunnelRecord> = {}): AwsTunnelRecord {
     computerId: CID, sandboxId: SID, generation: 1, leaseEpoch: 2, instanceId: 'i-0123456789abcdef0',
     region: 'ap-south-1', publicIp: '13.200.1.2', tunnelId: 't-1', dnsRecordId: 'd-1',
     hostname: `c-${SID}-g1-e2.${ZONE}`, controlKey: vectors.controlKeyBase64, createdAt: 1, originVerified: true,
-    ...over,
+    originVerifiedAt: Date.now(), ...over,
   };
 }
 
@@ -133,7 +133,12 @@ describe('proxyToAwsOrigin', () => {
     const f = captureFetch();
     const req = new Request(`https://aws-8443-${SID}.${ROOT}/vscode/a?folder=/root`, {
       method: 'POST', body: 'payload',
-      headers: { [AWS_GATEWAY_HEADER]: 'gw1.1.forged', 'x-ezil-auth': 'v2.x.y', cookie: `ezil_preview=abc; vscode-tkn=keep` },
+      headers: {
+        [AWS_GATEWAY_HEADER]: 'gw1.1.forged', 'x-ezil-auth': 'v2.x.y', cookie: `ezil_preview=abc; vscode-tkn=keep`,
+        host: 'evil.example', 'x-forwarded-host': 'evil.example, another.example',
+        'x-forwarded-proto': 'http', forwarded: 'host=evil.example;proto=http',
+        origin: `https://aws-8443-${SID}.${ROOT}`,
+      },
     });
     const now = 1791964800;
     await proxyToAwsOrigin(req, new URL(req.url), record(), ZONE, 8443, f.fetch, now);
@@ -142,6 +147,11 @@ describe('proxyToAwsOrigin', () => {
     expect(url).toBe(`https://c-${SID}-g1-e2.${ZONE}/__p/8443/vscode/a?folder=/root`);
     const h = new Headers(init.headers);
     expect(h.get('x-ezil-auth')).toBeNull();
+    expect(h.get('host')).toBeNull();
+    expect(h.get('x-forwarded-host')).toBe(`aws-8443-${SID}.${ROOT}`);
+    expect(h.get('x-forwarded-proto')).toBeNull();
+    expect(h.get('forwarded')).toBeNull();
+    expect(h.get('origin')).toBe(`https://aws-8443-${SID}.${ROOT}`);
     expect(h.get('cookie')).toBe('vscode-tkn=keep');
     expect(await verifyGatewayHeader(h.get(AWS_GATEWAY_HEADER), KEY, record(), 'POST', '/__p/8443/vscode/a', now)).toEqual({ ok: true });
     expect(init.redirect).toBe('manual');
@@ -153,6 +163,7 @@ describe('proxyToAwsOrigin', () => {
     await proxyToAwsOrigin(req, new URL(req.url), record(), ZONE, 8181, f.fetch, 1791964800);
     const h = new Headers(f.calls[0]!.init.headers);
     expect(h.get('upgrade')).toBe('websocket');
+    expect(h.get('x-forwarded-host')).toBe(`aws-8181-${SID}.${ROOT}`);
     expect(f.calls[0]!.init.body).toBeUndefined();
   });
   it('a port outside the edge set or a bad control key fails closed without fetching', async () => {
@@ -212,6 +223,19 @@ describe('handleAwsBrowserHost', () => {
       expect(f.calls.length).toBe(0);
     }
   });
+  it('stale, legacy and future verification snapshots never forward HTTP or WebSockets', async () => {
+    const now = Date.now();
+    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    for (const originVerifiedAt of [undefined, now - 60_000, now + 1]) {
+      for (const upgrade of [false, true]) {
+        const { f, d } = deps({ nowMs: () => now, lookup: async () => record({ originVerifiedAt }) });
+        const headers = new Headers({ cookie });
+        if (upgrade) headers.set('upgrade', 'websocket');
+        expect((await call('/api/ws', d, { headers }))!.status).toBe(502);
+        expect(f.calls.length).toBe(0);
+      }
+    }
+  });
   it('auto-connects across tunnel epochs without a credential in the browser URL', async () => {
     let epoch = 2;
     const { f, d } = deps({ lookup: async () => record({ leaseEpoch: epoch }) });
@@ -258,6 +282,33 @@ describe('handleAwsPreview', () => {
     expect((await handleAwsPreview(claims(), deps({ lookup: async () => r, verifyOrigin: async () => 'mismatch' }))).status).toBe(502);
     expect((await handleAwsPreview(claims(), deps({ lookup: async () => r, verifyOrigin: async () => 'not_connected' }))).status).toBe(503);
     expect((await handleAwsPreview(claims(), deps({ lookup: async () => r }))).status).toBe(200);
+  });
+  it('rechecks expired, legacy and future snapshots before preparing the desktop', async () => {
+    const now = Date.now();
+    for (const originVerifiedAt of [undefined, now - 60_000, now + 1]) {
+      for (const verdict of ['mismatch', 'not_connected'] as const) {
+        const checked: string[] = [];
+        let prepared = 0;
+        const res = await handleAwsPreview(claims(), deps({
+          nowMs: () => now, lookup: async () => record({ originVerifiedAt }),
+          verifyOrigin: async (sid) => { checked.push(sid); return verdict; },
+          ensureDesktop: async () => { prepared++; throw new Error('must not prepare an unverified desktop'); },
+        }));
+        expect(res.status).toBe(verdict === 'mismatch' ? 502 : 503);
+        expect(await res.json()).toEqual({ ok: false, error: verdict === 'mismatch' ? 'tunnel_origin_mismatch' : 'aws_origin_starting' });
+        expect(checked).toEqual([SID]);
+        expect(prepared).toBe(0);
+      }
+    }
+    let checked = 0;
+    for (const age of [59_999, 60_000]) {
+      const res = await handleAwsPreview(claims(), deps({
+        nowMs: () => now, lookup: async () => record({ originVerifiedAt: now - age }),
+        verifyOrigin: async () => { checked++; return 'verified'; },
+      }));
+      expect(res.status).toBe(200);
+      expect(checked).toBe(age === 59_999 ? 0 : 1);
+    }
   });
   it('success: browser URLs on the AWS hostnames with a sandbox-bound bootstrap token; no key in the body', async () => {
     const res = await handleAwsPreview(claims(), deps());

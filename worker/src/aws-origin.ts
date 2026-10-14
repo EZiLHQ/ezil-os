@@ -42,6 +42,8 @@ export const AWS_EDGE_PORTS: readonly number[] = [AWS_DESKTOP_PORT, portFor('gua
 export const AWS_EDGE_PORT_DEFAULT = 18080;
 /** How long the bootstrap-minted browser URLs are good for (the cookie TTL). */
 export const AWS_PREVIEW_TTL_MS = PREVIEW_COOKIE_TTL_S * 1000;
+/** Maximum age of a successful connector-origin check. */
+export const AWS_ORIGIN_VERIFY_TTL_MS = 60_000;
 
 const COMPUTER_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 /** `deriveSandboxId` output for a lowercase user and computer id; anything else is unroutable (DNS is case-folding). */
@@ -67,8 +69,16 @@ export interface AwsTunnelRecord {
   /** base64 of exactly 32 bytes; never logged or returned. */
   controlKey: string;
   createdAt: number;
-  /** Set once the connector's origin IP was seen to equal `publicIp` (C-6 step 5). */
+  /** Whether a connector-origin check has succeeded (C-6 step 5). */
   originVerified: boolean;
+  /** Check time in milliseconds; legacy records without it must be rechecked. */
+  originVerifiedAt?: number;
+}
+
+export function isAwsOriginFresh(record: AwsTunnelRecord, nowMs: number): boolean {
+  return record.originVerified && typeof record.originVerifiedAt === 'number'
+    && record.originVerifiedAt <= nowMs
+    && nowMs - record.originVerifiedAt < AWS_ORIGIN_VERIFY_TTL_MS;
 }
 
 export interface GatewayBinding {
@@ -256,6 +266,10 @@ export async function proxyToAwsOrigin(
   headers.delete(AWS_GATEWAY_HEADER);
   headers.delete('x-ezil-auth');
   headers.delete('host');
+  headers.delete('x-forwarded-proto');
+  headers.delete('forwarded');
+  // code-server checks Origin against the authenticated browser hostname.
+  headers.set('x-forwarded-host', url.hostname);
   const cookie = stripPreviewCookie(request.headers.get('cookie'));
   if (cookie === null) headers.delete('cookie');
   else headers.set('cookie', cookie);
@@ -271,6 +285,7 @@ export interface AwsBrowserDeps {
   /** The primary preview secret only; empty = fail closed. */
   secrets: string[];
   zoneRoot: string;
+  /** The registry rechecks expired verified records before returning them. */
   lookup: (sandboxId: string) => Promise<AwsTunnelRecord | null>;
   fetch: FetchLike;
   nowMs: () => number;
@@ -304,7 +319,7 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   if (!cookieOk) return json({ ok: false, error: 'aws_preview_auth_required' }, 401);
   if (!deps.zone) return unavailable();
   const record = await deps.lookup(sandboxId);
-  if (!record || record.sandboxId !== sandboxId || !record.originVerified) return unavailable();
+  if (!record || record.sandboxId !== sandboxId || !isAwsOriginFresh(record, deps.nowMs())) return unavailable();
   if (port === AWS_DESKTOP_PORT && request.method === 'GET') {
     // Reuse CF's usr/pwd/embed auto-connect, but keep the real password
     // out of browser URLs, history and client-side WebSocket diagnostics.
@@ -344,7 +359,7 @@ export interface AwsPreviewDeps {
   secrets: string[];
   zoneRoot: string;
   lookup: (sandboxId: string) => Promise<AwsTunnelRecord | null>;
-  /** GW-1's connector check; called only while the record is not yet origin-verified. */
+  /** GW-1's connector check; the registry caches successful checks for a bounded TTL. */
   verifyOrigin: (sandboxId: string) => Promise<'verified' | 'mismatch' | 'not_connected'>;
   /**
    * The desktop's WebRTC relay (`./aws-ice` `ensureAwsDesktop`), once the origin is verified:
@@ -374,7 +389,7 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
   ) {
     return unavailable();
   }
-  if (!record.originVerified) {
+  if (!isAwsOriginFresh(record, deps.nowMs())) {
     const verdict = await deps.verifyOrigin(claims.sandboxId);
     if (verdict === 'mismatch') return json({ ok: false, error: 'tunnel_origin_mismatch' }, 502);
     if (verdict !== 'verified') return json({ ok: false, error: 'aws_origin_starting' }, 503);

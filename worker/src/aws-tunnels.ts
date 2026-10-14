@@ -18,6 +18,7 @@ import {
   awsOriginHostname,
   decodeControlKey,
   isComputerId,
+  isAwsOriginFresh,
   isRoutableSandboxId,
   resolveAwsOriginZone,
   type AwsTunnelRecord,
@@ -226,8 +227,27 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
     await deps.storage.delete(RECORD_KEY);
   }
 
+  async function verifyOrigin(rec: AwsTunnelRecord): Promise<'verified' | 'mismatch' | 'not_connected'> {
+    if (!deps.api) return 'not_connected';
+    const checkedAt = now();
+    if (isAwsOriginFresh(rec, checkedAt)) return 'verified';
+    const origins = await deps.api.listConnectorOrigins(rec.tunnelId).catch(() => null);
+    if (!origins || origins.length === 0) return 'not_connected';
+    if (origins.every((ip) => ip === rec.publicIp)) {
+      await deps.storage.put(RECORD_KEY, { ...rec, originVerified: true, originVerifiedAt: checkedAt });
+      return 'verified';
+    }
+    await destroy(deps.api, rec).catch(() => undefined);
+    return 'mismatch';
+  }
+
   return {
-    get: (): Promise<AwsTunnelRecord | null> => serial(liveRecord),
+    // Browser forwarding uses this lookup, so it must never return a stale verified record.
+    get: (): Promise<AwsTunnelRecord | null> => serial(async () => {
+      const rec = await liveRecord();
+      if (!rec || !rec.originVerified) return rec;
+      return await verifyOrigin(rec) === 'verified' ? liveRecord() : null;
+    }),
 
     create: (claims: PreviewTokenV2Claims | undefined, text: string): Promise<TunnelResult> => serial(async () => {
       const body = parseCreateBody(text);
@@ -293,16 +313,7 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
     /** C-6 step 5: the connector must come from the instance's public address. */
     verifyOrigin: (): Promise<'verified' | 'mismatch' | 'not_connected'> => serial(async () => {
       const rec = await liveRecord();
-      if (!rec || !deps.api) return 'not_connected';
-      if (rec.originVerified) return 'verified';
-      const origins = await deps.api.listConnectorOrigins(rec.tunnelId).catch(() => null);
-      if (!origins || origins.length === 0) return 'not_connected';
-      if (origins.every((ip) => ip === rec.publicIp)) {
-        await deps.storage.put(RECORD_KEY, { ...rec, originVerified: true });
-        return 'verified';
-      }
-      await destroy(deps.api, rec).catch(() => undefined);
-      return 'mismatch';
+      return rec ? verifyOrigin(rec) : 'not_connected';
     }),
   };
 }
@@ -331,6 +342,7 @@ export class AwsTunnelRegistry {
     env: AwsTunnelEnv,
     fetchFn: FetchLike = (u, i) => fetch(u, i),
     resolveZone: (env: AwsTunnelEnv) => string | null = resolveAwsOriginZone,
+    nowMs: () => number = Date.now,
   ) {
     const configured = env.AWS_TUNNEL_CF_ACCOUNT_ID && env.AWS_TUNNEL_CF_ZONE_ID && env.AWS_TUNNEL_CF_API_TOKEN;
     const port = Number(env.AWS_EDGE_PORT ?? AWS_EDGE_PORT_DEFAULT);
@@ -340,6 +352,7 @@ export class AwsTunnelRegistry {
         : null,
       storage: state.storage,
       zone: resolveZone(env),
+      nowMs,
       edgePort: Number.isSafeInteger(port) && port > 1024 && port < 65536 ? port : AWS_EDGE_PORT_DEFAULT,
     });
   }
