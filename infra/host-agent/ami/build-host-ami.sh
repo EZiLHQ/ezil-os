@@ -34,9 +34,9 @@ PINS=(
   "python3=${PIN_PYTHON3:-3.12.3-0ubuntu2.1}"
   "util-linux=${PIN_UTIL_LINUX:-2.39.3-9ubuntu6.6}"
   "e2fsprogs=${PIN_E2FSPROGS:-1.47.0-2.4~exp1ubuntu4.1}"
-  "apparmor=${PIN_APPARMOR:-4.0.1really4.0.1-0ubuntu0.24.04.6}"
+  "apparmor=${PIN_APPARMOR:-4.0.1really4.0.1-0ubuntu0.24.04.9}"
   "jq=${PIN_JQ:-1.7.1-3ubuntu0.24.04.2}"
-  "iproute2=${PIN_IPROUTE2:-6.1.0-1ubuntu6.3}"
+  "iproute2=${PIN_IPROUTE2:-6.1.0-1ubuntu6.4}"
   "iptables=${PIN_IPTABLES:-1.8.10-3ubuntu2}"
   "nvme-cli=${PIN_NVME_CLI:-2.8-1ubuntu0.1}"
 )
