@@ -62,6 +62,8 @@ import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@clou
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
 import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, resolveAwsOriginZone } from './aws-origin';
 import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, type RegistryFor } from './aws-tunnels';
+// The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
+import { awsRelayRefresh, ensureAwsDesktop, type RelayMint } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
 // Separate value import of the SAME class (under a local alias) so the
@@ -3859,6 +3861,15 @@ function awsRegistryFor(env: Env): RegistryFor | null {
   return ns ? (sandboxId) => ns.get(ns.idFromName(sandboxId)) : null;
 }
 
+/** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
+function awsRelayMint(env: Env): RelayMint {
+  return async (signal) => {
+    const issuedAt = Date.now();
+    const servers = await generateTurnCredentials(env, signal);
+    return servers ? { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 } : null;
+  };
+}
+
 /**
  * Turn the raw exposed-port base URL into the embeddable Apache Guacamole client
  * URL.
@@ -4227,6 +4238,13 @@ async function handlePreview(
           zoneRoot: resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT),
           lookup: (sid) => lookupAwsTunnel(registry, sid),
           verifyOrigin: (sid) => verifyAwsTunnelOrigin(registry, sid),
+          // The desktop's TURN relay: per-epoch config push, then in-place renewal (./aws-ice).
+          ensureDesktop: async (record) => {
+            const zone = resolveAwsOriginZone(env);
+            if (!zone) throw new RelayFailure('aws_origin_unavailable');
+            return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
+              neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
+          },
           nowMs: Date.now,
         });
       }
@@ -7009,6 +7027,19 @@ export default {
           try { body = await request.json(); } catch { return json({ok:false,error:'relay_bad_request'},400); }
           if (!body || typeof body !== 'object' || typeof body.runtimeId !== 'string' || !/^[a-f0-9]{32}$/.test(body.runtimeId)) return json({ ok:false,error:'relay_bad_request' },400);
           runtimeId = body.runtimeId;
+        }
+        // An AWS computer (GW-4): the same read/renew, through its gateway (./aws-ice).
+        const awsRegistry = awsRoutingEnabled(env.AWS_ROUTING_ENABLED) ? awsRegistryFor(env) : null;
+        const awsZone = awsRegistry ? resolveAwsOriginZone(env) : null;
+        const awsRecord = awsRegistry && awsZone ? await lookupAwsTunnel(awsRegistry, name) : null;
+        if (awsRecord && awsZone) {
+          // v2 claims bind the computer: never renew another sandbox's relay with them.
+          const v2c = verifiedV2Claims.get(request);
+          if (v2c && (v2c.sandboxId !== name || v2c.provider !== 'aws-ec2')) return json({ ok:false, error:'relay_claims_mismatch' }, 401);
+          if (!awsRecord.originVerified) return json({ ok:false, error:'aws_origin_starting' }, 503);
+          const state = await awsRelayRefresh({ record: awsRecord, zone: awsZone, fetch: (input, init) => fetch(input, init),
+            nowMs: Date.now, admin: (await deriveNekoCredentials(env, name)).admin, runtimeId, mint: awsRelayMint(env) });
+          return json({ ok: true, ...state });
         }
         const result = await openSandbox(env,name).relayRefresh(name,runtimeId);
         return result.ok ? json(result) : json({ ok:false, error:result.error }, result.status);

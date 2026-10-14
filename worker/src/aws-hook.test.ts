@@ -19,7 +19,8 @@ mock.module('cloudflare:workers', () => ({
 import vectors from './aws-gateway.vectors.json';
 import { decodeControlKey, verifyGatewayHeader } from './aws-origin';
 import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
-import { mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { deriveNekoCredentials, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { sha256Hex } from './aws-ice';
 
 const worker = (await import('./index')).default;
 const SECRET = 'aws-hook-test-secret';
@@ -83,6 +84,53 @@ const previewBody = JSON.stringify({ userId: USER, projectId: CID });
 const realFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = realFetch; });
 
+/**
+ * A fake AWS host behind the origin (gw1 verified on every call: status, ice push, neko admin
+ * API) plus a fake Cloudflare Realtime TURN API. Records what the Worker sent.
+ */
+interface FakeHost {
+  configured: boolean; desktop: string; ice: string; relayExpiresAt: number;
+  pushed?: { neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
+  turnCalls: number; bad: string[]; paths: string[];
+}
+function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
+  const h: FakeHost = { configured: false, desktop: 'absent', ice: 'none', relayExpiresAt: Date.now() + 1_200_000, turnCalls: 0, bad: [], paths: [], ...over };
+  const runtimeId = 'c'.repeat(32);
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const headers = new Headers(init?.headers);
+    const body = typeof init?.body === 'string' ? init.body : '';
+    const j = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s });
+    if (url.hostname === 'rtc.live.cloudflare.com') {
+      h.turnCalls++;
+      if (headers.get('authorization') !== 'Bearer turn-api-token') h.bad.push('turn auth');
+      return j({ iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] },
+        { urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'], username: 'tu', credential: 'tp' }] }, 201);
+    }
+    h.paths.push(`${method} ${url.pathname}`);
+    if (url.hostname !== `c-${SID}-g1-e2.${ORIGIN_ZONE}`) h.bad.push(`host ${url.hostname}`);
+    const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, method, url.pathname, Math.floor(Date.now() / 1000));
+    if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
+    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice });
+    if (url.pathname.startsWith('/__ezil/control/ice/')) {
+      if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
+      h.pushed = JSON.parse(body);
+      return j({ ok: true, state: 'accepted' });
+    }
+    const neko = await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID);
+    if (url.pathname === '/__p/8181/api/login') return (JSON.parse(body) as { password: string }).password === neko.admin ? j({ token: 't' }) : j({}, 401);
+    if (url.pathname === '/__p/8181/api/relay' && method === 'GET') return j({ runtimeId, expiresAt: h.relayExpiresAt });
+    if (url.pathname === '/__p/8181/api/relay' && method === 'POST') {
+      h.relayExpiresAt = (JSON.parse(body) as { expiresAt: number }).expiresAt;
+      return j({ runtimeId, expiresAt: h.relayExpiresAt });
+    }
+    if (url.pathname === '/__p/8181/api/logout') return j({});
+    return j({ ok: false }, 404);
+  }) as typeof fetch;
+  return h;
+}
+
 describe('AWS routing disabled (the default): behaviour unchanged', () => {
   const e = () => env();
   it('the tunnel API answers 404', async () => {
@@ -115,10 +163,14 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     expect(t.status).toBe(200);
     expect(await t.json()).toEqual({ tunnelToken: 'tunnel-token-0123456789' });
 
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
     const p = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
     expect(p.status).toBe(200);
     const pv = (await p.json()) as Record<string, string>;
     expect(pv.provider).toBe('aws-ec2');
+    expect(pv.relay).toEqual({ runtimeId: 'c'.repeat(32), expiresAt: host.relayExpiresAt } as never);
+    expect(host.bad).toEqual([]);
+    globalThis.fetch = realFetch;
     const boot = new URL(pv.guacamoleUrl!);
     expect(boot.hostname).toBe(`aws-8181-${SID}.ezil.work`);
 
@@ -148,5 +200,66 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     expect(res.status).toBe(401);
     expect(((await res.json()) as { error: string }).error).toMatch(/^preview_bootstrap_token/);
     expect(called).toBe(0);
+  });
+});
+
+describe('AWS desktop relay through the hook (aws-ice)', () => {
+  const relayEnv = (over: Record<string, unknown> = {}) => env({
+    AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token', ...over,
+  });
+  async function withTunnel(e: never) {
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+  }
+
+  it('a host without a config: TURN minted once, relay-only config with the DERIVED neko values pushed, 503 starting', async () => {
+    const e = relayEnv();
+    await withTunnel(e);
+    const host = installAwsHost();
+    const res = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ ok: false, error: 'aws_desktop_starting', reason: 'config_pushed' });
+    expect(host.turnCalls).toBe(1);
+    expect(host.pushed!.neko).toEqual(await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID));
+    expect(host.pushed!.backend.flatMap((s) => s.urls).every((u) => /^turns?:/.test(u))).toBe(true);
+    expect(host.bad).toEqual([]);
+  });
+
+  it('no TURN provider configured: fail closed (502 turn_unavailable), nothing pushed', async () => {
+    const e = relayEnv({ SANDBOX_NEKO_TURN_KEY_ID: undefined, SANDBOX_NEKO_TURN_API_TOKEN: undefined });
+    await withTunnel(e);
+    const host = installAwsHost();
+    const res = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, error: 'turn_unavailable' });
+    expect(host.pushed).toBeUndefined();
+  });
+
+  it('relay-refresh for an AWS computer: read, then renew in place through the gateway', async () => {
+    const e = relayEnv();
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+    // origin verification happens on the first preview
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+    const path = `/sandbox/${SID}/relay-refresh`;
+    const got = await worker.fetch(await signed('GET', path, ''), e);
+    expect(got.status).toBe(200);
+    const state = (await got.json()) as { ok: boolean; runtimeId: string; expiresAt: number };
+    expect(state.ok).toBe(true);
+    const renewBody = JSON.stringify({ runtimeId: state.runtimeId });
+    const renewed = await worker.fetch(await signed('POST', path, renewBody), e);
+    expect(renewed.status).toBe(200);
+    expect(((await renewed.json()) as { expiresAt: number }).expiresAt).toBe(host.relayExpiresAt);
+    expect(host.paths).toContain('POST /__p/8181/api/relay');
+    expect(host.bad).toEqual([]);
+  });
+
+  it('relay-refresh with v2 claims for ANOTHER sandbox is refused before any host call', async () => {
+    const e = relayEnv();
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+    const other = 'guac-u0a0a0a0a0a0a0a0-1b0b0b0b0b0b4b0b';
+    const res = await worker.fetch(await signed('GET', `/sandbox/${SID}/relay-refresh`, '', claims({ sandboxId: other })), e);
+    expect(res.status).toBe(401);
+    expect(host.paths).toEqual([]);
   });
 });
