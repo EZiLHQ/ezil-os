@@ -67,7 +67,7 @@ const RUNNING_EXCLUDED = new Set(['STOPPED', 'RETIRED', 'PURGE_ELIGIBLE']);
 export interface FakeSeed {
     placements?: Row[];
     usage?: Row[];
-    computers?: { id: string; user_id: string; deleted_at?: Date | null }[];
+    computers?: { id: string; user_id: string; deleted_at?: Date | null; created_at?: Date }[];
 }
 
 export interface FakeOptions {
@@ -162,6 +162,11 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 const c = computers.find((x) => uuidEq(x.id, params[0]));
                 if (!c) return { rows: [] };
                 return { rows: [{ user_id: c.user_id, deleted: c.deleted_at != null }] };
+            }
+            case 'canary-computer': {
+                const c = computers.find((x) => uuidEq(x.id, params[0]));
+                if (!c) return { rows: [] };
+                return { rows: [{ user_id: c.user_id, deleted: c.deleted_at != null, created_at: c.created_at ?? clock() }] };
             }
             case 'usage-foreign': {
                 const [computerId, userId] = params as string[];

@@ -24,10 +24,10 @@
  * `ComputeProvider`'s result types.
  */
 
-import { isPlacementReadEnabled, type Env } from './aws-config';
+import { awsCanaryConfig, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
-import { PlacementOwnerError, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
@@ -76,5 +76,22 @@ export async function resolveComputeProvider(
     if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) {
         throw new PlacementOwnerError(placement.record.computerId);
     }
-    return providerForPlacement(placement, env, isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined);
+    // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
+    const effective = !placement.record && (await isAwsCanary(db, computer, env)) ? { provider: 'aws-ec2' as const } : placement;
+    return providerForPlacement(effective, env, isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined);
+}
+
+/**
+ * A computer with no placement row joins AWS only when AWS is on, its user is in
+ * `EZIL_AWS_CANARY_USER_IDS`, and its live row is the caller's and was created at or
+ * after `EZIL_AWS_CANARY_SINCE` (aws-config.ts `awsCanaryConfig`). The computer row is
+ * read only once the cheap checks pass, so other users cost no query. A failed read throws.
+ */
+async function isAwsCanary(db: PlacementExecutor, computer: ComputerRef, env: Env): Promise<boolean> {
+    if (!isAwsComputersEnabled(env)) return false;
+    const canary = awsCanaryConfig(env);
+    const userId = computer.userId.toLowerCase();
+    if (!canary || !canary.userIds.has(userId)) return false;
+    const row = await readCanaryComputer(db, computer.computerId);
+    return row !== null && !row.deleted && row.userId === userId && row.createdAt.getTime() >= canary.since.getTime();
 }

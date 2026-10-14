@@ -45,6 +45,13 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
 2. `EZIL_AWS_COMPUTERS_ENABLED=1` gates AWS admission and the aws-ec2 provider. It
    implies placement reads. With reads on and AWS off, an `aws-ec2` computer refuses
    with `aws_disabled`.
+3. `EZIL_AWS_CANARY_USER_IDS` + `EZIL_AWS_CANARY_SINCE` choose which computers reach AWS.
+   Without them no computer ever does: a computer with no placement row resolves to
+   Cloudflare, and only AWS admission writes an `aws-ec2` row. Set both together with
+   `EZIL_AWS_COMPUTERS_ENABLED`, after the tables exist. SINCE should be the moment you
+   set them, so only computers the listed users create from then on go to AWS (older
+   ones may hold an R2 workspace). Deleting an AWS computer is refused until retire is
+   implemented (`terminate` answers `aws_not_supported`).
 
 ## Ownership (`owner_user_id`)
 

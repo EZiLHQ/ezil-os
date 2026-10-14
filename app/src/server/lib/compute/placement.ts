@@ -783,6 +783,30 @@ export interface AdmissionCounters {
     usage: UsageRow[];
 }
 
+/**
+ * The canary precondition (`select.ts`): the computer row's owner, deletion and
+ * creation time. ezil_computers is user-writable, so this only gates a rollout
+ * for allowlisted users; ownership is the placement's owner_user_id, written at
+ * admission. A row it cannot parse throws: never AWS or Cloudflare by accident.
+ */
+export async function readCanaryComputer(
+    db: PlacementExecutor,
+    rawComputerId: string,
+): Promise<{ userId: string; deleted: boolean; createdAt: Date } | null> {
+    const rows = rowsOf(
+        await db.execute(sql`/* placement:canary-computer */ SELECT c.user_id::text AS user_id, (c.deleted_at IS NOT NULL) AS deleted, c.created_at
+            FROM public.ezil_computers c
+            WHERE c.id = ${canonicalId(rawComputerId)}::uuid`),
+    );
+    if (rows.length === 0) return null;
+    const [row] = rows;
+    const createdAt = timestamp(row!.created_at);
+    if (rows.length > 1 || typeof row!.user_id !== 'string' || typeof row!.deleted !== 'boolean' || !createdAt) {
+        throw new PlacementIntegrityError('invalid_row', canonicalId(rawComputerId));
+    }
+    return { userId: canonicalId(row!.user_id), deleted: row!.deleted, createdAt };
+}
+
 /** Read every admission input, inside `withAdmission`. */
 export async function readAdmissionCounters(
     tx: PlacementExecutor,

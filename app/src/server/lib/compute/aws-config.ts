@@ -29,6 +29,38 @@ export function isPlacementReadEnabled(env: Env = process.env): boolean {
     return env.EZIL_COMPUTE_PLACEMENT_READS === '1' || isAwsComputersEnabled(env);
 }
 
+/**
+ * The AWS canary cohort: which computers WITHOUT a placement row go to AWS.
+ *
+ * With no row a computer resolves to Cloudflare, and only AWS admission writes
+ * an aws-ec2 row, so without a cohort no computer would ever reach AWS. A
+ * computer joins only when its user is listed AND it was created at or after
+ * `EZIL_AWS_CANARY_SINCE`: an older computer may hold a Cloudflare/R2
+ * workspace, and sending it to AWS would open an empty disk.
+ *
+ * 🔴 FAIL CLOSED: a missing or malformed value (any bad list entry, or a
+ * SINCE without an explicit zone) means no cohort. This is a rollout gate,
+ * not a security boundary: ownership stays the placement's owner_user_id.
+ */
+export interface AwsCanaryConfig {
+    userIds: ReadonlySet<string>;
+    since: Date;
+}
+
+const CANARY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CANARY_SINCE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null {
+    const list = env.EZIL_AWS_CANARY_USER_IDS?.trim();
+    const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
+    if (!list || !sinceText || !CANARY_SINCE.test(sinceText)) return null;
+    const ids = list.split(',').map((id) => id.trim().toLowerCase());
+    if (!ids.every((id) => CANARY_UUID.test(id))) return null;
+    const since = new Date(sinceText);
+    if (!Number.isFinite(since.getTime())) return null;
+    return { userIds: new Set(ids), since };
+}
+
 export interface AwsAdmissionCaps {
     maxRunning: number;
     userMonthlyHours: number;

@@ -3,6 +3,7 @@
  * the production path today and must not touch the database at all.
  */
 
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 
 import { AwsProviderNotImplementedError, createAwsEc2StubProvider } from './aws-ec2';
@@ -136,5 +137,85 @@ describe('aws-ec2 stub', () => {
         for (const [name, op] of ops(createAwsEc2StubProvider(() => ON))) {
             await expect(op(), name).rejects.toBeInstanceOf(AwsProviderNotImplementedError);
         }
+    });
+});
+
+describe('resolveComputeProvider: AWS canary cohort (no placement row)', () => {
+    const SINCE = '2026-10-14T00:00:00Z';
+    const after = new Date('2026-10-14T12:00:00Z');
+    const before = new Date('2026-10-13T23:59:59Z');
+    const other = '33333333-3333-4333-8333-333333333333';
+    const CANARY = { ...ON, EZIL_AWS_CANARY_USER_IDS: ` ${other}, ${userId.toUpperCase()} `, EZIL_AWS_CANARY_SINCE: SINCE };
+    const seeded = (c: Partial<{ user_id: string; deleted_at: Date | null; created_at: Date }> = {}) =>
+        createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: after, ...c }] });
+    const canaryReads = (statements: { sql: string }[]) => statements.filter((s) => s.sql.includes('placement:canary-computer'));
+
+    it('listed user, computer created after SINCE, AWS on: the aws-ec2 provider', async () => {
+        const { db, statements } = seeded();
+        expect((await resolveComputeProvider(db, computer, CANARY)).kind).toBe('aws-ec2');
+        expect(canaryReads(statements)).toHaveLength(1);
+    });
+
+    it('computer created before SINCE stays on Cloudflare (it may hold an R2 workspace)', async () => {
+        const { db } = seeded({ created_at: before });
+        expect(await resolveComputeProvider(db, computer, CANARY)).toBe(cloudflareComputeProvider);
+    });
+
+    it('unlisted user: Cloudflare, and the computer row is never read', async () => {
+        const { db, statements } = seeded();
+        expect(await resolveComputeProvider(db, computer, { ...CANARY, EZIL_AWS_CANARY_USER_IDS: other })).toBe(cloudflareComputeProvider);
+        expect(canaryReads(statements)).toEqual([]);
+    });
+
+    it('placement reads on but AWS off: Cloudflare, no canary read', async () => {
+        const { db, statements } = seeded();
+        const env = { ...CANARY, EZIL_AWS_COMPUTERS_ENABLED: undefined, EZIL_COMPUTE_PLACEMENT_READS: '1' };
+        expect(await resolveComputeProvider(db, computer, env)).toBe(cloudflareComputeProvider);
+        expect(canaryReads(statements)).toEqual([]);
+    });
+
+    it.each([`${userId},not-a-uuid`, `${userId},`, ''])('malformed list (%j): no cohort', async (list) => {
+        const { db, statements } = seeded();
+        expect(await resolveComputeProvider(db, computer, { ...CANARY, EZIL_AWS_CANARY_USER_IDS: list })).toBe(cloudflareComputeProvider);
+        expect(canaryReads(statements)).toEqual([]);
+    });
+
+    it.each([undefined, '', '2026-10-14', '2026-10-14T00:00:00', 'yesterday', '2026-13-40T00:00:00Z'])('SINCE %j: no cohort', async (since) => {
+        const { db, statements } = seeded();
+        expect(await resolveComputeProvider(db, computer, { ...CANARY, EZIL_AWS_CANARY_SINCE: since })).toBe(cloudflareComputeProvider);
+        expect(canaryReads(statements)).toEqual([]);
+    });
+
+    it('an existing cloudflare row wins over the cohort', async () => {
+        const { db, statements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: computerId, provider: 'cloudflare', workspace_store: 'r2' })],
+            computers: [{ id: computerId, user_id: userId, created_at: after }],
+        });
+        expect(await resolveComputeProvider(db, computer, CANARY)).toBe(cloudflareComputeProvider);
+        expect(canaryReads(statements)).toEqual([]);
+    });
+
+    it('computer row owned by another user: Cloudflare', async () => {
+        const { db } = seeded({ user_id: other });
+        expect(await resolveComputeProvider(db, computer, CANARY)).toBe(cloudflareComputeProvider);
+    });
+
+    it('deleted or missing computer row: Cloudflare', async () => {
+        expect(await resolveComputeProvider(seeded({ deleted_at: after }).db, computer, CANARY)).toBe(cloudflareComputeProvider);
+        expect(await resolveComputeProvider(createFakePlacementDb().db, computer, CANARY)).toBe(cloudflareComputeProvider);
+    });
+
+    it('a failed or unparsable canary read rejects (never AWS or Cloudflare by accident)', async () => {
+        const failing = { execute: async (q: Parameters<typeof db.execute>[0]) => {
+            const text = new PgDialect().sqlToQuery(q).sql;
+            if (text.includes('placement:canary-computer')) throw new Error('connection reset');
+            return db.execute(q);
+        } };
+        const { db } = createFakePlacementDb();
+        await expect(resolveComputeProvider(failing, computer, CANARY)).rejects.toThrow('connection reset');
+        const garbled = { execute: async (q: Parameters<typeof db.execute>[0]) =>
+            new PgDialect().sqlToQuery(q).sql.includes('placement:canary-computer')
+                ? { rows: [{ user_id: userId, deleted: false, created_at: 'not a date' }] } : db.execute(q) };
+        await expect(resolveComputeProvider(garbled, computer, CANARY)).rejects.toBeInstanceOf(PlacementIntegrityError);
     });
 });
