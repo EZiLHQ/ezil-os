@@ -36,6 +36,8 @@ phases:
         inputs:
           commands:
             - test -x /usr/local/bin/cloudflared && test -x /usr/sbin/runc
-            - test -s /etc/ezil-host/lower-image-digest && test -d "/var/lib/ezil/lowers/$(cut -d: -f2 /etc/ezil-host/lower-image-digest)/usr"
+            # Quoted: an unquoted ": " (as in cut -d: -f2) makes YAML parse the line as a map,
+            # which Image Builder rejects ("cannot unmarshal map into string").
+            - 'test -s /etc/ezil-host/lower-image-digest && test -d "/var/lib/ezil/lowers/$(cut -d: -f2 /etc/ezil-host/lower-image-digest)/usr"'
             - test "$(systemctl is-enabled ezil-host.target)" = enabled
             - apparmor_parser -Q -K /etc/apparmor.d/ezil-desktop
