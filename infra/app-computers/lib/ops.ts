@@ -62,7 +62,8 @@ export class OpsStack extends Stack {
         // R3: 12-hourly snapshots, 14 kept, of data volumes carrying this
         // namespace's backup tag (set only at creation; root disks lack it).
         new dlm.CfnLifecyclePolicy(this, 'DataSnapshots', {
-            description: `ezil ${c.namespace} data volumes: 12-hourly, retain ${SNAPSHOT_RETAIN_COUNT}`,
+            // DLM accepts only [0-9A-Za-z _-] in descriptions (a colon or comma fails the live create).
+            description: `ezil ${c.namespace} data volumes 12-hourly retain ${SNAPSHOT_RETAIN_COUNT}`,
             state: 'ENABLED', executionRoleArn: dlmRoleArn(a),
             policyDetails: { policyType: 'EBS_SNAPSHOT_MANAGEMENT', resourceTypes: ['VOLUME'],
                 targetTags: [{ key: BACKUP_TAG, value: c.namespace }],
