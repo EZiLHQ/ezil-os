@@ -171,6 +171,20 @@ describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fen
         expect(placements[0]).toMatchObject({ state: 'STARTING', lease_epoch: calls[1]!.intent.leaseEpoch });
     });
 
+    it('provision → receipt RUNNING (boots straight in) → user stop → receipt STOPPED → wake leases above the provision', async () => {
+        const { provider, placements, calls, db } = setup();
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        await receipt(db, 'RUNNING', { instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111' });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: true });
+        expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ outcome: 'stopping' });
+        expect(calls[1]!.intent).toMatchObject({ operation: 'stop', leaseEpoch: calls[0]!.intent.leaseEpoch });
+        await receipt(db, 'STOPPED');
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(calls[2]!.intent.operation).toBe('start');
+        expect(calls[2]!.intent.leaseEpoch).toBeGreaterThan(calls[0]!.intent.leaseEpoch);
+        expect(placements[0]).toMatchObject({ state: 'STARTING' });
+    });
+
     it('every later wake leases above the previous boot (stop → wake → stop → wake)', async () => {
         const { provider, calls, db } = setup();
         await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);

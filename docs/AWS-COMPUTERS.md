@@ -129,6 +129,8 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 ### C-3 Lifecycle states
 
 - Main path: `PROVISIONING → STOPPED → LEASED → STARTING → MOUNTING → RUNNING → DRAINING → STOPPING → STOPPED`.
+- First boot: `PROVISIONING → RUNNING`. The infra provision launches and boots the instance, so the user's first open
+  goes straight in, and the receipt lands RUNNING. `PROVISIONING → STOPPED` stays for a provision that ends stopped.
 - Failure path: `UNCONFIRMED → RECOVERING → STOPPED`.
 - Retirement: `RETIRING → RETIRED → PURGE_ELIGIBLE`. The purge itself is a separate operator action (§6).
 - Stage B slots: `WARMING → READY → CLAIMED → terminated`.

@@ -91,11 +91,14 @@ export const RUNNING_CLASS_STATES: readonly PlacementState[] = PLACEMENT_STATES.
  * edge list; this is the module's reading of it (reported as a contract gap):
  * every active state may fall to UNCONFIRMED ("every error is recorded on
  * UNCONFIRMED"), a lease may lapse back to STOPPED before start, and only a
- * STOPPED computer is retired. `STOPPED → LEASED` is NOT here: it exists only
+ * STOPPED computer is retired. A provision may land RUNNING (first boot).
+ * `STOPPED → LEASED` is NOT here: it exists only
  * through `leasePlacement`, under the admission lock.
  */
 export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly PlacementState[]>> = {
-    PROVISIONING: ['STOPPED', 'UNCONFIRMED'],
+    // The infra provision launches AND boots the instance, so its receipt lands RUNNING
+    // (first open boots straight in). STOPPED stays for a provision that ends stopped.
+    PROVISIONING: ['RUNNING', 'STOPPED', 'UNCONFIRMED'],
     STOPPED: ['RETIRING'],
     LEASED: ['STARTING', 'STOPPED', 'UNCONFIRMED'],
     STARTING: ['MOUNTING', 'UNCONFIRMED'],

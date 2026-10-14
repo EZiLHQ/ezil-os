@@ -277,6 +277,14 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         for (const from of PLACEMENT_STATES) expect(PLACEMENT_TRANSITIONS[from]).not.toContain('LEASED');
     });
 
+    it('a provision receipt may land RUNNING (the infra provision boots the instance); the epoch does not move', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, state: 'PROVISIONING', lease_epoch: 1 })] });
+        const r = await transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 1, state: 'PROVISIONING' }, to: 'RUNNING', fields: { instanceId: 'i-1' } });
+        expect(r.ok && r.placement).toMatchObject({ state: 'RUNNING', generation: 1, leaseEpoch: 1, instanceId: 'i-1' });
+        expect(PLACEMENT_TRANSITIONS.PROVISIONING).toEqual(['RUNNING', 'STOPPED', 'UNCONFIRMED']);
+        expect(await transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 1, state: 'RUNNING' }, to: 'PROVISIONING' })).toEqual({ ok: false, reason: 'illegal_transition' });
+    });
+
     it('the CAS SQL carries all four guards and RETURNING', async () => {
         const { db, statements } = at();
         await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
