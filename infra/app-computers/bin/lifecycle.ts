@@ -10,7 +10,9 @@ try {
     const path=process.env.EZIL_LIFECYCLE_CONFIG;if(!path)throw new Error();
     const bytes=readFileSync(path);if(bytes.length>16384)throw new Error();
     const config=z.object({settings:SettingsSchema,authorityKeyArn:z.string(),notificationsEnabled:z.boolean().default(false),
-        recoveryVersionArn:z.string().optional(),recoveryEnabled:z.boolean().default(false),appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional()}).strict().parse(JSON.parse(bytes.toString()));
+        recoveryVersionArn:z.string().optional(),recoveryEnabled:z.boolean().default(false),appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional(),
+        // null omits the reservation: a new account's whole Lambda pool is 10, and any reservation then breaks the 10-unreserved minimum.
+        lambdaReservedConcurrency:z.number().int().min(1).max(100).nullable().default(2)}).strict().parse(JSON.parse(bytes.toString()));
     const app=new App(),d=config.settings.deployment;
     // With `deploy`, the stack deploys under the I5 identity: roles under the
     // workload path with the boundary, assets in the identity bucket, no bootstrap.

@@ -14,7 +14,7 @@ export class ComputerLifecycle extends Construct {
     readonly machine:states.CfnStateMachine;
     readonly version:states.CfnStateMachineVersion;
     readonly historyKey:kms.IKey;
-    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean}){
+    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this),r=d.region;
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
@@ -26,7 +26,7 @@ export class ComputerLifecycle extends Construct {
             conditions:{ArnLike:{'kms:EncryptionContext:aws:logs:arn':`arn:aws:logs:${r}:${d.accountId}:log-group:*`}}}));
         const helperLogs=new logs.LogGroup(this,'HelperLogs',{encryptionKey:key,retention:logs.RetentionDays.ONE_WEEK,removalPolicy:RemovalPolicy.RETAIN});
         const helper=new nodejs.NodejsFunction(this,'Observer',{entry:join(__dirname,'lifecycle/helper.ts'),handler:'handler',runtime:lambda.Runtime.NODEJS_24_X,
-            timeout:Duration.seconds(55),memorySize:256,reservedConcurrentExecutions:2,logGroup:helperLogs,
+            timeout:Duration.seconds(55),memorySize:256,...(props.lambdaReservedConcurrency===null?{}:{reservedConcurrentExecutions:props.lambdaReservedConcurrency??2}),logGroup:helperLogs,
             depsLockFilePath:join(__dirname,'../package-lock.json'),bundling:{minify:true,sourceMap:false,externalModules:[]},
             environment:{EZIL_LIFECYCLE_SETTINGS:JSON.stringify(s)}});
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['ec2:DescribeInstances','ec2:DescribeVolumes','ec2:DescribeImages','ec2:DescribeLaunchTemplateVersions'],
