@@ -372,16 +372,21 @@ export interface AwsSdkCollaborators {
 }
 
 /**
- * The SDK-backed collaborators for `env`. With the AWS flag off, or no valid
- * region list, nothing is built and `{}` is returned (the provider then
- * refuses `aws_lifecycle_unconfigured`; enrollment answers 503). Clients are
- * built lazily, per region, on first use; a region with no caller role is
- * `aws_config` at that call, never another region's role.
+ * The SDK-backed collaborators for `env`. With the AWS flag off, no valid
+ * region list, or any configured region without a valid caller role
+ * (`EZIL_AWS_APP_CALLER_ROLE_ARN_<REGION>`), nothing is built and `{}` is
+ * returned (the provider then refuses `aws_lifecycle_unconfigured`; enrollment
+ * answers 503). Clients are built lazily, per region, on first use, each with
+ * that region's own role; a region outside `AWS_REGIONS` is `aws_config`.
  */
 export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): AwsSdkCollaborators {
     if (!isAwsComputersEnabled(env)) return {};
     const regions = readAwsRegions(env);
     if (!regions.ok) return {};
+    // A half-configured caller is no caller: every region a computer may live in
+    // needs its own role, or nothing is built and the provider refuses BEFORE any
+    // placement write (`aws_lifecycle_unconfigured`) instead of failing mid-way.
+    if (!regions.regions.every((r) => ROLE_ARN.test(env[appCallerRoleEnv(r.name)]?.trim() ?? ''))) return {};
     const configured = new Set(regions.regions.map((r) => r.name));
     const token = f.token ?? (() => readVercelOidcToken(env));
     // `requestHandler` is spread only when a test supplies it; production uses the SDK's own HTTP handler.

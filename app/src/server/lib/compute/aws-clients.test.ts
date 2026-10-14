@@ -269,9 +269,10 @@ describe('EC2 enrollment describer', () => {
     });
 });
 
+const ROLE_MUMBAI = `arn:aws:iam::${A}:role/ezil/pilot/ezil-app-caller-aps1`;
 const ENV_ON = {
     EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_REGIONS: `ap-south-1,${R}`, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
-    [appCallerRoleEnv(R)]: ROLE,
+    [appCallerRoleEnv(R)]: ROLE, [appCallerRoleEnv('ap-south-1')]: ROLE_MUMBAI,
 };
 
 describe('wiring from the environment', () => {
@@ -300,13 +301,28 @@ describe('wiring from the environment', () => {
         // The SFN and EC2 clients get the SAME credentials function (one cache per region).
         expect(ec2.mock.calls[0]![1]).toBe(sfn.mock.calls[0]![1]);
     });
-    it('a configured region without its own caller role is aws_config: never another region\'s role', async () => {
-        const sfn = vi.fn(() => fakeSender(() => ({})));
-        const c = createAwsSdkCollaborators(ENV_ON, { sts: vi.fn(), sfn, token: () => 't' });
+    it('any configured region without its own (valid) caller role: nothing is built — no half-configured caller', () => {
+        const f = { sts: vi.fn(), sfn: vi.fn(), ec2: vi.fn(), token: vi.fn() };
+        expect(createAwsSdkCollaborators({ ...ENV_ON, [appCallerRoleEnv('ap-south-1')]: undefined }, f)).toEqual({});
+        expect(createAwsSdkCollaborators({ ...ENV_ON, [appCallerRoleEnv('ap-south-1')]: 'arn:aws:iam::1:role/x' }, f)).toEqual({});
+        for (const fn of Object.values(f)) expect(fn).not.toHaveBeenCalled();
+    });
+    it('each region uses its OWN role; a region outside AWS_REGIONS is aws_config', async () => {
+        const stsSenders: (Sender & { calls: unknown[] })[] = [];
+        const sts = vi.fn(() => {
+            const s = fakeSender(() => STS_OK(new Date(NOW.getTime() + 3600_000)));
+            stsSenders.push(s);
+            return s;
+        });
+        // Like the SDK: resolve the credentials before sending.
+        const sfn = vi.fn((_region: string, credentials: () => Promise<unknown>) => fakeSender(async () => (await credentials(), {})));
+        const c = createAwsSdkCollaborators(ENV_ON, { sts, sfn, token: () => 't', now: () => NOW });
         const mumbai = `arn:aws:states:ap-south-1:${A}:stateMachine:ezil-pilot-lifecycle:1`;
-        await expect(c.starter!.start('ap-south-1', { stateMachineArn: mumbai, name: NAME, input: '{}' })).rejects.toMatchObject({ code: 'aws_config', awsName: 'AppCallerRoleUnset' });
-        await expect(c.starter!.start('eu-west-1', { stateMachineArn: VERSION.replace(R, 'eu-west-1'), name: NAME, input: '{}' })).rejects.toMatchObject({ awsName: 'RegionNotConfigured' });
-        expect(sfn).not.toHaveBeenCalled();
+        await c.starter!.start('ap-south-1', { stateMachineArn: mumbai, name: NAME, input: '{}' });
+        await c.starter!.start(R, { stateMachineArn: VERSION, name: NAME, input: '{}' });
+        expect(stsSenders.map((s) => input(s.calls[0]).RoleArn)).toEqual([ROLE_MUMBAI, ROLE]);
+        await expect(c.starter!.start('eu-west-1', { stateMachineArn: VERSION.replace(R, 'eu-west-1'), name: NAME, input: '{}' })).rejects.toMatchObject({ code: 'aws_config', awsName: 'RegionNotConfigured' });
+        expect(sfn).toHaveBeenCalledTimes(2);
     });
     it('the shared collaborators survive across calls and are rebuilt when the settings change', () => {
         const a = sharedAwsSdkCollaborators(ENV_ON);
