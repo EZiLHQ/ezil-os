@@ -257,3 +257,56 @@ describe('defaults', () => {
         expect(DEFAULT_STALE_AFTER_MS).toBe(24 * 60 * 60 * 1000);
     });
 });
+
+describe('P3: the Cloudflare sweep never addresses a non-Cloudflare computer', () => {
+    const secret = 'x'.repeat(32);
+    const stale = (id: string) => ({ id, user_id: `u-${id}`, last_opened_at: new Date('2026-01-01T00:00:00Z') });
+    const sqlText = (db: SandboxReapDb) => {
+        const q = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { queryChunks?: unknown[] };
+        return JSON.stringify(q);
+    };
+
+    it('an aws-ec2 (or unknown) placement is skipped BEFORE the status check; cloudflare is reaped as before', async () => {
+        const db = makeDb([stale('aws'), stale('cf'), stale('odd')]);
+        const checkRunning = vi.fn().mockResolvedValue(true);
+        const terminate = vi.fn().mockResolvedValue({ ok: true, terminated: true });
+        const providerOf = vi.fn(async (id: string) => (id === 'aws' ? 'aws-ec2' : id === 'odd' ? 'gcp' : 'cloudflare'));
+        const res = await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, checkRunning, terminate, providerOf }));
+        const body = await res.json();
+        expect(body.results.map((r: { computerId: string; outcome: string }) => [r.computerId, r.outcome])).toEqual([
+            ['aws', 'skipped_not_cloudflare'],
+            ['cf', 'terminated'],
+            ['odd', 'skipped_not_cloudflare'],
+        ]);
+        expect(checkRunning).toHaveBeenCalledTimes(1);
+        expect(checkRunning).toHaveBeenCalledWith('guac-u-cf-cf');
+        expect(terminate).toHaveBeenCalledTimes(1);
+        expect(terminate).toHaveBeenCalledWith('guac-u-cf-cf');
+    });
+
+    it('a placement read that throws is check_failed and never terminated', async () => {
+        const db = makeDb([stale('dup')]);
+        const checkRunning = vi.fn().mockResolvedValue(true);
+        const terminate = vi.fn().mockResolvedValue({ ok: true, terminated: true });
+        const providerOf = vi.fn(async () => { throw new Error('duplicate_placement'); });
+        const body = await (await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, checkRunning, terminate, providerOf }))).json();
+        expect(body.results).toEqual([{ computerId: 'dup', sandboxName: 'guac-u-dup-dup', outcome: 'check_failed', error: 'duplicate_placement' }]);
+        expect(checkRunning).not.toHaveBeenCalled();
+        expect(terminate).not.toHaveBeenCalled();
+    });
+
+    it('without providerOf (placement reads off) every candidate is treated exactly as before P3', async () => {
+        const db = makeDb([stale('a')]);
+        const checkRunning = vi.fn().mockResolvedValue(true);
+        const body = await (await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, checkRunning }))).json();
+        expect(body.results).toEqual([{ computerId: 'a', sandboxName: 'guac-u-a-a', outcome: 'terminated' }]);
+    });
+
+    it('SQL assertion: the candidate query never names a placement table (C-2 single writer)', async () => {
+        const db = makeDb([]);
+        await findStaleComputers(db, new Date('2026-01-01T00:00:00Z'), 5);
+        const text = sqlText(db);
+        expect(text).toMatch(/FROM ezil_computers/);
+        expect(text).not.toMatch(/placement/i);
+    });
+});

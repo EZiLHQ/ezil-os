@@ -66,7 +66,7 @@ import {
     fitScreenRequest,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
-import { selectComputeProvider } from '@/server/lib/compute/select';
+import { awsPreviewAnswer, awsStatusAnswer, routeComputer } from './compute-dispatch';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -167,22 +167,24 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const result = await selectComputeProvider(computer).ensure(
-                { correlationId },
-                computer,
-                {
-                    sessionId: input.sessionId,
-                    desktopMode: 'neko',
-                    // 🔴 OMITTED, not defaulted, when nothing usable was asked
-                    // for. The Worker only injects `NEKO_SCREEN` when this
-                    // field is present, so a `default` resolution produces a
-                    // byte-for-byte identical container to the one this
-                    // codebase booted before the field existed.
-                    ...(screen.source === 'default'
-                        ? {}
-                        : { screen: { width: screen.width, height: screen.height } }),
-                },
-            );
+            const ensureOptions = {
+                sessionId: input.sessionId,
+                desktopMode: 'neko' as const,
+                // 🔴 OMITTED, not defaulted, when nothing usable was asked
+                // for. The Worker only injects `NEKO_SCREEN` when this
+                // field is present, so a `default` resolution produces a
+                // byte-for-byte identical container to the one this
+                // codebase booted before the field existed.
+                ...(screen.source === 'default'
+                    ? {}
+                    : { screen: { width: screen.width, height: screen.height } }),
+            };
+            // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') {
+                return awsPreviewAnswer(await routed.provider.ensure({ correlationId }, computer, ensureOptions));
+            }
+            const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -420,13 +422,15 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const result = await selectComputeProvider(computer).ensure({ correlationId }, computer, {
-                // Same correlation convention as `../desktop/route.ts`'s
-                // POST handler: defaulting sessionId to the computer id
-                // when the shell has no separate session concept for it.
-                sessionId: input.computerId,
-                desktopMode: 'neko',
-            });
+            // Same correlation convention as `../desktop/route.ts`'s
+            // POST handler: defaulting sessionId to the computer id
+            // when the shell has no separate session concept for it.
+            const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') {
+                return awsPreviewAnswer(await routed.provider.ensure({ correlationId }, computer, ensureOptions));
+            }
+            const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -591,10 +595,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const result = await selectComputeProvider(computer).ensure({ correlationId }, computer, {
-                sessionId: input.computerId,
-                desktopMode: 'neko',
-            });
+            const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') {
+                return awsPreviewAnswer(await routed.provider.ensure({ correlationId }, computer, ensureOptions));
+            }
+            const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -854,7 +860,14 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const status = await selectComputeProvider(computer).status({ correlationId }, computer);
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') {
+                // `guacamoleRunning` is the Cloudflare container's flag; an AWS computer
+                // reports its lifecycle state instead (`starting`/`running`/`stopped`/...).
+                const aws = awsStatusAnswer(await routed.provider.status({ correlationId }, computer));
+                return { ...aws, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
+            }
+            const status = await routed.provider.status({ correlationId }, computer);
 
             return { ...status, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
         }),
@@ -873,7 +886,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const result = await selectComputeProvider(computer).terminate({ correlationId }, computer);
+            const routed = await routeComputer(ctx.db, computer);
+            // A user stop of an AWS computer STOPS the instance (data and root disks kept;
+            // reopen is a cold boot). It never retires: retire is the computer delete.
+            const result = routed.kind === 'aws-ec2'
+                ? await routed.provider.stop({ correlationId }, computer, 'user')
+                : await routed.provider.terminate({ correlationId }, computer);
             // Report what the Worker actually confirmed, not a hardcoded
             // success — `result.ok` is false for still_running/destroy_failed,
             // a rejected signature, or an unreachable Worker.
@@ -1146,7 +1164,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const result = await selectComputeProvider(computer).activity({ correlationId }, computer, {
+            const routed = await routeComputer(ctx.db, computer);
+            const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,
             });
 
@@ -1189,7 +1208,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const result = await selectComputeProvider(computer).restart({ correlationId }, computer);
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') {
+                // No in-place desktop restart on AWS yet; a refusal the UI renders, never Cloudflare.
+                const aws = await routed.provider.restart({ correlationId }, computer);
+                return { ok: false as const, errorCode: aws.outcome ?? 'aws_not_supported', correlationId, provider: 'cloudflare-guacamole' as const };
+            }
+            const result = await routed.provider.restart({ correlationId }, computer);
 
             if (!result.ok) {
                 return {

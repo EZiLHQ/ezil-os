@@ -5,7 +5,9 @@ import {
     newCorrelationId,
     resolveCloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { createCloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
+import { readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import { handleSandboxReap } from './handler';
 
@@ -120,6 +122,12 @@ export async function GET(req: Request): Promise<Response> {
         cronSecret: env.CRON_SECRET,
         db,
         killSwitch: process.env.SANDBOX_REAP_CRON,
+        // P3: with placement reads on, only Cloudflare computers are reap candidates
+        // (an AWS host idle-stops itself). Reads go through placement.ts, the one
+        // module that names the placement table (C-2). Off: no read, as before.
+        ...(isPlacementReadEnabled(process.env)
+            ? { providerOf: async (computerId: string) => (await readPlacement(db as unknown as PlacementExecutor, computerId)).provider }
+            : {}),
         deriveSandboxName: (userId, computerId) => {
             const sandboxName = deriveGuacamoleSandboxId(userId, computerId);
             refs.set(sandboxName, { userId, computerId });
