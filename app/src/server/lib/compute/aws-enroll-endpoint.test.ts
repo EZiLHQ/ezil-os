@@ -131,13 +131,17 @@ function workerBackedTunnels(clockMs: () => number = () => NOW.getTime()) {
     };
     let n = 0;
     const created: string[] = [];
+    const named = new Map<string, string>(); // tunnel name -> id, as Cloudflare would keep it
+    const cnames = new Map<string, { id: string; content: string }>();
     const api: CloudflareTunnelApi = {
-        async createTunnel(name) { created.push(name); return { id: `tun-${++n}` }; },
+        async createTunnel(name) { created.push(name); const id = `tun-${++n}`; named.set(name, id); return { id }; },
+        async findTunnelByName(name) { const id = named.get(name); return id ? { id } : null; },
         async getTunnelToken(id) { return `token-for-${id}-${'x'.repeat(24)}`; },
         async putTunnelIngress() {},
-        async createDnsCname() { return { id: `dns-${n}` }; },
-        async deleteDnsRecord() {},
-        async deleteTunnel() {},
+        async createDnsCname(host, target) { const r = { id: `dns-${n}`, content: target }; cnames.set(host, r); return { id: r.id }; },
+        async findDnsCname(host) { return cnames.get(host) ?? null; },
+        async deleteDnsRecord(id) { for (const [h, r] of cnames) if (r.id === id) cnames.delete(h); },
+        async deleteTunnel(id) { for (const [k, v] of named) if (v === id) named.delete(k); },
         async listConnectorOrigins() { return []; },
     };
     const service = createAwsTunnelService({ api, storage, zone: 'origin.example.net', nowMs: clockMs });
@@ -162,7 +166,9 @@ describe('a valid enrollment', () => {
         const { enroll, placements, tunnels, described } = setup();
         const r = await enroll();
         expect(r).toEqual({ status: 200, body: { tunnelToken: TOKEN, controlKey: KEY.toString('base64'), sandboxId: SID, zone: 'ezil.org' } });
-        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING', last_error: placement.ENROLLMENT_SUCCEEDED });
+        // Single use: the nonce hash moved to the consumed proof; its deadline stays as that proof's window.
+        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING', last_error: placement.ENROLLMENT_SUCCEEDED });
+        expect(placements[0]!.enroll_expires_at).toEqual(booting().enroll_expires_at);
         expect(described).toEqual([{ region: 'ap-south-1', instanceId: DOC.instanceId }]);
         expect(tunnels).toEqual([
             {
@@ -185,7 +191,8 @@ describe('a valid enrollment', () => {
         const { enroll } = setup([booting()], { tunnels: w.client });
         expect((await enroll()).status).toBe(200);
         const other = Buffer.alloc(32, 6).toString('base64url');
-        expect(await enroll(hostBody({ nonce: other }))).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        // Refused by the consumed-nonce proof before any Worker call (C-6).
+        expect(await enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
         expect(w.created).toHaveLength(1);
     });
 
@@ -429,6 +436,117 @@ describe('after the nonce is consumed', () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
         expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
         expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
+    });
+
+    /** Make the Nth database transaction fail (1 = the consume, 2 = the completion); `commitFirst` loses only the answer. */
+    function failTransaction(db: unknown, nth: number, commitFirst = false) {
+        const d = db as { transaction: (fn: (tx: unknown) => Promise<unknown>) => Promise<unknown> };
+        const real = d.transaction.bind(d);
+        let n = 0;
+        d.transaction = async (fn) => {
+            n++;
+            if (n !== nth) return real(fn);
+            if (commitFirst) await real(fn);
+            throw new Error('connection terminated unexpectedly');
+        };
+    }
+
+    it('Codex PR #200: the completion write fails after the tunnel exists → retryable 503; the retry finishes on the SAME tunnel', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        failTransaction(s.deps.db, 2);
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
+        // The host kept its nonce (retryable) and re-sends it.
+        const again = await s.enroll();
+        expect(again.status).toBe(200);
+        expect(again.body).toMatchObject({ controlKey: KEY.toString('base64'), tunnelToken: expect.stringContaining('token-for-tun-1') });
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
+    });
+
+    it('Codex PR #200: tunnel create AND completion write both fail → retryable; the retry creates the tunnel once and finishes', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        const real = w.client.createTunnel.bind(w.client);
+        let first = true;
+        w.client.createTunnel = async (owner, req) => { if (first) { first = false; throw new Error('socket'); } return real(owner, req); };
+        failTransaction(s.deps.db, 2);
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(w.created).toHaveLength(0);
+        const again = await s.enroll();
+        expect(again.status).toBe(200);
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
+    });
+
+    it('Codex PR #200: the consume committed but its answer was lost → the retry completes (pending path, one tunnel)', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        failTransaction(s.deps.db, 1, true);
+        await expect(s.enroll()).rejects.toThrow('connection terminated'); // the route answers this retryable (route.test.ts)
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
+        const again = await s.enroll();
+        expect(again.status).toBe(200);
+        expect(w.created).toHaveLength(1);
+    });
+
+    it('a pending enrollment with ANOTHER nonce while the tunnel exists: final 409, no second tunnel, nothing written', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        failTransaction(s.deps.db, 2);
+        expect((await s.enroll()).status).toBe(503);
+        const before = { ...s.placements[0] };
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toEqual(before);
+    });
+
+    // Lead review of 1b0b070: recovery is bound to the consumed NONCE, not just the (replayable)
+    // identity document. The proof is checked before ANY Worker call, create or replay.
+    it('C-6: pending + valid identity document + WRONG nonce never reaches the Worker (neither create nor replay)', async () => {
+        const s = setup([booting({ enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_PENDING })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
+        expect(calls).toEqual([]);
+        expect(s.described).toEqual([]); // refused before the describe too
+    });
+
+    it('C-6: a pending recovery after the window (enroll_expires_at) is refused before any Worker call', async () => {
+        const s = setup([booting({
+            enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_PENDING,
+            enroll_expires_at: new Date(NOW.getTime() - 1),
+        })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'enroll_nonce_expired' } });
+        expect(calls).toEqual([]);
+    });
+
+    it('C-6: a pending row without the consumed proof (legacy/cleared) cannot be recovered', async () => {
+        const s = setup([booting({ enroll_nonce_hash: null, enroll_consumed_hash: null, instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_PENDING })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        expect(calls).toEqual([]);
+    });
+
+    it('C-6: a SUCCEEDED replay with the wrong nonce is refused before any Worker call too', async () => {
+        const s = setup([booting({ enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_SUCCEEDED })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
+        expect(calls).toEqual([]);
+    });
+
+    it('a failed finish clears the consumed proof (a failed enrollment is never recoverable)', async () => {
+        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 502, code: 'tunnel_create_failed' }) });
+        expect((await s.enroll()).status).toBe(502);
+        expect(s.placements[0]).toMatchObject({ enroll_consumed_hash: null, enroll_expires_at: null, last_error: placement.ENROLLMENT_FAILED });
     });
 
     it.each(['generation', 'lease_epoch'] as const)('GW-1 completion cannot mark a newer %s successful', async (counter) => {

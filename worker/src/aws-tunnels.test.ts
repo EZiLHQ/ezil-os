@@ -33,20 +33,30 @@ function memStorage(): TunnelStorage & { map: Map<string, unknown> } {
   };
 }
 
+/**
+ * A stateful fake of the Cloudflare API: tunnels by name and CNAMEs by hostname exist until
+ * deleted, so the by-name lookups (which recover an id whose create response was lost) see
+ * exactly what earlier calls left. Mutations are logged in `calls`; lookups in `lookups`.
+ */
 function fakeApi(over: Partial<CloudflareTunnelApi> = {}) {
   const calls: string[] = [];
+  const lookups: string[] = [];
+  const tunnels = new Map<string, string>(); // name -> id
+  const dns = new Map<string, { id: string; content: string }>(); // hostname -> record
   let n = 0;
   const api: CloudflareTunnelApi = {
-    async createTunnel(name) { calls.push(`createTunnel ${name}`); return { id: `tun-${++n}` }; },
+    async createTunnel(name) { calls.push(`createTunnel ${name}`); const id = `tun-${++n}`; tunnels.set(name, id); return { id }; },
+    async findTunnelByName(name) { lookups.push(`findTunnel ${name}`); const id = tunnels.get(name); return id ? { id } : null; },
     async getTunnelToken(id) { calls.push(`getTunnelToken ${id}`); return `token-for-${id}-0123456789`; },
     async putTunnelIngress(id, host, service) { calls.push(`ingress ${id} ${host} ${service}`); },
-    async createDnsCname(host, target) { calls.push(`dns ${host} -> ${target}`); return { id: `dns-${n}` }; },
-    async deleteDnsRecord(id) { calls.push(`deleteDns ${id}`); },
-    async deleteTunnel(id) { calls.push(`deleteTunnel ${id}`); },
+    async createDnsCname(host, target) { calls.push(`dns ${host} -> ${target}`); const r = { id: `dns-${n}`, content: target }; dns.set(host, r); return { id: r.id }; },
+    async findDnsCname(host) { lookups.push(`findDns ${host}`); return dns.get(host) ?? null; },
+    async deleteDnsRecord(id) { calls.push(`deleteDns ${id}`); for (const [h, r] of dns) if (r.id === id) dns.delete(h); },
+    async deleteTunnel(id) { calls.push(`deleteTunnel ${id}`); for (const [k, v] of tunnels) if (v === id) tunnels.delete(k); },
     async listConnectorOrigins(id) { calls.push(`list ${id}`); return ['13.200.1.2']; },
     ...over,
   };
-  return { api, calls };
+  return { api, calls, lookups, tunnels, dns };
 }
 
 const claims = (over: Partial<PreviewTokenV2Claims> = {}): PreviewTokenV2Claims => ({
@@ -90,7 +100,8 @@ describe('replay of a completed create (Codex PR #200: enrollment 200 lost)', ()
     const s = memStorage(); const { api, calls } = fakeApi();
     let t = 1_000;
     const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => t });
-    expect((await svc.create(claims(), replay())).body.error).toBe('tunnel_replay_refused');
+    // No record for this epoch: 404 tunnel_absent (the app may then create it), still no Cloudflare mutation.
+    expect(await svc.create(claims(), replay())).toEqual({ status: 404, body: { ok: false, error: 'tunnel_absent' } });
     expect(calls).toEqual([]);
     await svc.create(claims(), body());
     t += TUNNEL_REPLAY_WINDOW_MS + 1;
@@ -164,12 +175,95 @@ describe('create (fence-first, once per epoch)', () => {
     expect(calls.some((c) => c.startsWith('createTunnel'))).toBe(false);
     expect((s.map.get('tunnel') as AwsTunnelRecord).leaseEpoch).toBe(2);
   });
-  it('a partial create is rolled back and no record is written', async () => {
-    const s = memStorage(); const { api, calls } = fakeApi({ async createDnsCname() { throw new Error('dns'); } });
-    const svc = createAwsTunnelService({ api, storage: s, zone: ZONE });
+  it('a partial create keeps a pending marker and no record; the retry ADOPTS the tunnel by name (one tunnel)', async () => {
+    const s = memStorage();
+    let failDns = true;
+    const f = fakeApi();
+    const realDns = f.api.createDnsCname;
+    f.api.createDnsCname = async (h, t) => { if (failDns) throw new Error('dns'); return realDns(h, t); };
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
     expect((await svc.create(claims(), body())).body.error).toBe('tunnel_create_failed');
-    expect(calls).toContain('deleteTunnel tun-1');
-    expect(s.map.size).toBe(0);
+    expect(s.map.has('tunnel')).toBe(false);
+    expect(s.map.get('pending_create')).toMatchObject({ computerId: CID, generation: 1, leaseEpoch: 2, tunnelName: `ezil-c-${SID}-g1-e2` });
+    failDns = false;
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    expect(f.calls.filter((c) => c.startsWith('createTunnel'))).toEqual([`createTunnel ezil-c-${SID}-g1-e2`]);
+    expect((s.map.get('tunnel') as AwsTunnelRecord).tunnelId).toBe('tun-1');
+    expect(s.map.has('pending_create')).toBe(false);
+  });
+
+  it('Codex PR #200: a LOST createTunnel response (committed, then threw) is adopted by name, never duplicated', async () => {
+    const s = memStorage();
+    const f = fakeApi();
+    const real = f.api.createTunnel;
+    f.api.createTunnel = async (name) => { await real(name); throw new Error('socket hang up'); };
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    // The re-lookup after the ambiguous failure finds the committed tunnel inside the same call.
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    expect(f.tunnels.size).toBe(1);
+    expect((s.map.get('tunnel') as AwsTunnelRecord).tunnelId).toBe('tun-1');
+  });
+
+  it('Codex PR #200: a LOST CNAME response is adopted when it points at this tunnel; an orphan pointing elsewhere is replaced', async () => {
+    const s = memStorage();
+    const f = fakeApi();
+    const real = f.api.createDnsCname;
+    let lose = true;
+    f.api.createDnsCname = async (h, t) => { const r = await real(h, t); if (lose) { lose = false; throw new Error('timeout'); } return r; };
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    expect(f.dns.size).toBe(1);
+    expect(f.calls.filter((c) => c.startsWith('dns '))).toHaveLength(1);
+
+    // An orphan CNAME for this epoch's hostname, left pointing at a rolled-back tunnel id.
+    const s2 = memStorage();
+    const g = fakeApi();
+    const host = `c-${SID}-g1-e2.${ZONE}`;
+    g.dns.set(host, { id: 'dns-orphan', content: 'tun-old.cfargotunnel.com' });
+    const svc2 = createAwsTunnelService({ api: g.api, storage: s2, zone: ZONE });
+    expect((await svc2.create(claims(), body())).status).toBe(200);
+    expect(g.calls).toContain('deleteDns dns-orphan');
+    expect(g.dns.get(host)).toEqual({ id: expect.any(String), content: 'tun-1.cfargotunnel.com' });
+  });
+
+  it('never adopts another epoch: a tunnel named for epoch 1 is not this create for epoch 2', async () => {
+    const s = memStorage();
+    const f = fakeApi();
+    f.tunnels.set(`ezil-c-${SID}-g1-e1`, 'tun-foreign');
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    expect((s.map.get('tunnel') as AwsTunnelRecord).tunnelId).not.toBe('tun-foreign');
+    expect(f.lookups).toContain(`findTunnel ezil-c-${SID}-g1-e2`);
+  });
+
+  it('remove and the next epoch delete, by name, what an unfinished create left behind', async () => {
+    const s = memStorage();
+    const f = fakeApi();
+    const realToken = f.api.getTunnelToken;
+    let failToken = true;
+    f.api.getTunnelToken = async (id) => { if (failToken) throw new Error('token'); return realToken(id); };
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    expect((await svc.create(claims(), body())).status).toBe(502);
+    expect(f.tunnels.size).toBe(1);
+    expect(f.dns.size).toBe(1);
+    // The epoch is removed: its leftovers go too, and the marker is forgotten.
+    expect((await svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }))).body).toEqual({ deleted: true });
+    expect(f.tunnels.size).toBe(0);
+    expect(f.dns.size).toBe(0);
+    expect(s.map.has('pending_create')).toBe(false);
+
+    // A newer epoch cleans an older unfinished create before creating its own (fence-first).
+    const s2 = memStorage();
+    const g = fakeApi();
+    const realToken2 = g.api.getTunnelToken;
+    let fail2 = true;
+    g.api.getTunnelToken = async (id) => { if (fail2) throw new Error('token'); return realToken2(id); };
+    const svc2 = createAwsTunnelService({ api: g.api, storage: s2, zone: ZONE });
+    expect((await svc2.create(claims(), body())).status).toBe(502);
+    fail2 = false;
+    expect((await svc2.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).status).toBe(200);
+    expect([...g.tunnels.keys()]).toEqual([`ezil-c-${SID}-g1-e3`]);
+    expect([...g.dns.keys()]).toEqual([`c-${SID}-g1-e3.${ZONE}`]);
   });
   it('claims that do not name exactly this AWS computer and epoch: 401; none: 401', async () => {
     const svc = createAwsTunnelService({ api: fakeApi().api, storage: memStorage(), zone: ZONE });
@@ -351,6 +445,17 @@ describe('Cloudflare REST client (fake fetch only)', () => {
     expect(JSON.parse(calls[0]!.init.body as string)).toEqual({ name: 'ezil-c-x', config_src: 'cloudflare' });
     expect(JSON.parse(calls[1]!.init.body as string).config.ingress.at(-1)).toEqual({ service: 'http_status:404' });
     expect(JSON.parse(calls[2]!.init.body as string)).toEqual({ type: 'CNAME', name: 'h.example', content: 'tid.cfargotunnel.com', proxied: true });
+  });
+  it('lookups by deterministic name: exact-name GETs; deleted or other names ignored; a duplicate refuses', async () => {
+    const t = capture([{ id: 't-1', name: 'ezil-c-x' }, { id: 't-2', name: 'ezil-c-xy' }, { id: 't-3', name: 'ezil-c-x', deleted_at: '2026-10-14T00:00:00Z' }]);
+    expect(await t.api.findTunnelByName('ezil-c-x')).toEqual({ id: 't-1' });
+    expect(`${t.calls[0]!.init.method} ${t.calls[0]!.url.split('/v4')[1]}`).toBe('GET /accounts/acct/cfd_tunnel?name=ezil-c-x&is_deleted=false');
+    expect(await capture([]).api.findTunnelByName('ezil-c-x')).toBeNull();
+    expect(await capture([{ id: 'a', name: 'n' }, { id: 'b', name: 'n' }]).api.findTunnelByName('n').catch((e: Error) => e.message)).toBe('cf_api_duplicate_tunnel');
+    const d = capture([{ id: 'd-1', name: 'h.example', content: 'tid.cfargotunnel.com' }, { id: 'd-2', name: 'other.example', content: 'x' }]);
+    expect(await d.api.findDnsCname('h.example')).toEqual({ id: 'd-1', content: 'tid.cfargotunnel.com' });
+    expect(`${d.calls[0]!.init.method} ${d.calls[0]!.url.split('/v4')[1]}`).toBe('GET /zones/zone/dns_records?type=CNAME&name=h.example');
+    expect(await capture([]).api.findDnsCname('h.example')).toBeNull();
   });
   it('deleting removes connections first and tolerates 404; a refusal error never carries the token', async () => {
     const c404 = capture(null, 404);

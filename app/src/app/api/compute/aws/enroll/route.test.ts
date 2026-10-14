@@ -36,6 +36,14 @@ describe('POST /api/compute/aws/enroll', () => {
         expect(handle.mock.calls[0]![1]).toEqual({ computerId: 'x' });
     });
 
+    it('Codex PR #200: an unexpected throw is a STRUCTURED retryable 503, never an unstructured 500', async () => {
+        handle.mockRejectedValue(new Error('connection terminated unexpectedly'));
+        const r = await post('{}');
+        expect(r.status).toBe(503);
+        expect(await r.json()).toEqual({ error: 'enroll_unavailable', retryable: true });
+        expect(r.headers.get('cache-control')).toBe('no-store');
+    });
+
     it('AWS off (this test environment): the handler receives no describer, so it answers 503 and consumes nothing', async () => {
         handle.mockResolvedValue({ status: 503, body: { error: 'enroll_unavailable' } });
         await post('{}');

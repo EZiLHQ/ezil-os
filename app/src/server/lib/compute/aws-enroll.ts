@@ -20,7 +20,7 @@ import { isAwsComputersEnabled, type Env as AwsEnv } from './aws-config';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
-import { consumeEnrollmentNonce, ENROLLABLE_STATES, ENROLLMENT_SUCCEEDED, finishEnrollment, readPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { consumeEnrollmentNonce, ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, finishEnrollment, readPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
@@ -345,9 +345,20 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     // and the host is retrying because the 200 never reached it. Its nonce can no longer be checked
     // here; the Worker checks it instead, through the derived key (`deriveControlKey`).
     const replay = !p.enrollNonceHash && p.lastError === ENROLLMENT_SUCCEEDED && p.instanceId !== null;
+    // The nonce was consumed but completion was never recorded (the completion write failed after
+    // the Worker created the tunnel, or the consume's own response was lost). The consuming
+    // instance, authenticated below by its AWS-signed identity and the live describe, may finish it.
+    const pending = !p.enrollNonceHash && p.lastError === ENROLLMENT_PENDING && p.instanceId !== null;
     if (!(replay ? REPLAYABLE_STATES : ENROLLABLE_STATES).includes(p.state)) return refuse(403, 'enroll_state');
     if (p.generation !== body.generation || p.leaseEpoch !== body.leaseEpoch) return refuse(403, 'enroll_stale_epoch');
-    if (!replay) {
+    if (replay || pending) {
+        // C-6: the nonce binds enrollment to the one boot that received it. Consume moved its hash to
+        // `enrollConsumedHash`; recovery still requires that nonce, inside its window, before ANY
+        // Worker call. The identity document alone (replayable by whoever holds a copy) never suffices.
+        if (!p.enrollConsumedHash || !p.enrollExpiresAt) return refuse(409, 'enroll_nonce_consumed');
+        if (!sameHash(nonceHash, p.enrollConsumedHash)) return refuse(403, 'enroll_nonce_invalid');
+        if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
+    } else {
         if (!p.enrollNonceHash || !p.enrollExpiresAt) return refuse(403, 'enroll_nonce_invalid');
         if (!sameHash(nonceHash, p.enrollNonceHash)) return refuse(403, 'enroll_nonce_invalid');
         if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
@@ -436,8 +447,45 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
             replayed = { ok: false, status: 0, code: 'tunnel_transport' };
         }
         if (replayed.ok) return success(replayed.tunnelToken);
-        // 409: not this epoch's key (another nonce), no such tunnel, or past the window. Final.
-        return replayed.status === 409 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable');
+        // 409: not this epoch's key (another nonce) or past the window; 404: no tunnel for this
+        // epoch any more (stopped, fenced). Final either way.
+        return replayed.status === 409 || replayed.status === 404 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable');
+    }
+
+    if (pending) {
+        // 1. The tunnel the first attempt created, by EXACT replay: the key derived from the nonce the
+        //    host presents must equal the one the Worker stored, so a wrong nonce gets nothing here.
+        // 2. Only when the Worker has NO tunnel for this epoch (404, its create never completed) is it
+        //    created now; the Worker adopts by name whatever a lost create left, and answers 409 if
+        //    any record already holds the epoch, so an epoch never gets a second tunnel.
+        const call = async (request: TunnelRequest): Promise<TunnelResult> => {
+            try {
+                return await deps.tunnels!.createTunnel({ userId: p.ownerUserId }, request);
+            } catch {
+                return { ok: false, status: 0, code: 'tunnel_transport' };
+            }
+        };
+        const request = tunnelRequest(doc.instanceId, view.publicIp);
+        let t = await call({ ...request, replay: true });
+        if (!t.ok && t.status === 404) {
+            t = await call(request);
+            // A concurrent completion of this same pending enrollment won the create: replay it.
+            if (!t.ok && t.status === 409) t = await call({ ...request, replay: true });
+        }
+        if (!t.ok) return t.status === 409 || t.status === 404 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable');
+        let done: Awaited<ReturnType<typeof finishEnrollment>>;
+        try {
+            done = await finishEnrollment(deps.db, { computerId: p.computerId, expected: p, success: true });
+        } catch {
+            return retryLater(503, 'enroll_finish_unavailable');
+        }
+        if (!done.ok) {
+            // A concurrent completion may already have recorded this epoch's success.
+            const { record: current } = await readPlacement(deps.db, p.computerId);
+            const recorded = current && current.generation === p.generation && current.leaseEpoch === p.leaseEpoch && current.lastError === ENROLLMENT_SUCCEEDED;
+            if (!recorded) return refuse(409, 'enroll_conflict');
+        }
+        return success(t.tunnelToken);
     }
 
     let expected = p;
@@ -468,7 +516,16 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     } catch {
         tunnel = { ok: false, status: 0, code: 'tunnel_transport' };
     }
-    const finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
+    let finished: Awaited<ReturnType<typeof finishEnrollment>>;
+    try {
+        finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
+    } catch {
+        // The completion write failed (a transient database error) after the nonce was consumed:
+        // the placement keeps ENROLLMENT_PENDING. A structured retryable answer keeps the host's
+        // nonce (enroll.py), and its retry finishes through `pending` above, against the exact
+        // tunnel this call created (or creating it, if this call's create failed too).
+        return retryLater(503, 'enroll_finish_unavailable');
+    }
     if (!tunnel.ok) return refuse(502, 'tunnel_unavailable');
     if (!finished.ok) return refuse(409, 'enroll_conflict');
     return success(tunnel.tunnelToken);

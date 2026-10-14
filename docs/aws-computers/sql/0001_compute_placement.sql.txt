@@ -29,6 +29,7 @@ CREATE TABLE public.ezil_computer_placements (
   tunnel_id text NULL,
   enroll_nonce_hash text NULL,
   enroll_expires_at timestamptz NULL,
+  enroll_consumed_hash text NULL,
   lease_until timestamptz NULL,
   presence_at timestamptz NULL,
   fence_token uuid NULL,

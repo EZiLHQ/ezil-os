@@ -30,9 +30,13 @@ export class TunnelApiError extends Error {}
 
 export interface CloudflareTunnelApi {
   createTunnel(name: string): Promise<{ id: string }>;
+  /** The live (not deleted) tunnel with exactly this name, or null. Recovers an id whose create response was lost. */
+  findTunnelByName(name: string): Promise<{ id: string } | null>;
   getTunnelToken(id: string): Promise<string>;
   putTunnelIngress(id: string, hostname: string, service: string): Promise<void>;
   createDnsCname(hostname: string, target: string): Promise<{ id: string }>;
+  /** The CNAME with exactly this name, or null. Recovers an id whose create response was lost. */
+  findDnsCname(hostname: string): Promise<{ id: string; content: string } | null>;
   deleteDnsRecord(id: string): Promise<void>;
   deleteTunnel(id: string): Promise<void>;
   /** Origin IPs of the tunnel's active connector connections. */
@@ -65,6 +69,13 @@ export function createCloudflareTunnelApi(cfg: { accountId: string; zoneId: stri
       if (typeof r?.id !== 'string' || !r.id) throw new TunnelApiError('cf_api_bad_result');
       return { id: r.id };
     },
+    async findTunnelByName(name) {
+      const r = await call('GET', `${acct}?name=${encodeURIComponent(name)}&is_deleted=false`);
+      const hits = (Array.isArray(r) ? r : []).filter((t) => (t as { name?: unknown }).name === name
+        && !(t as { deleted_at?: unknown }).deleted_at && typeof (t as { id?: unknown }).id === 'string');
+      if (hits.length > 1) throw new TunnelApiError('cf_api_duplicate_tunnel');
+      return hits.length === 1 ? { id: (hits[0] as { id: string }).id } : null;
+    },
     async getTunnelToken(id) {
       const r = await call('GET', `${acct}/${encodeURIComponent(id)}/token`);
       if (typeof r !== 'string' || r.length < 16) throw new TunnelApiError('cf_api_bad_result');
@@ -81,6 +92,13 @@ export function createCloudflareTunnelApi(cfg: { accountId: string; zoneId: stri
       })) as { id?: unknown };
       if (typeof r?.id !== 'string' || !r.id) throw new TunnelApiError('cf_api_bad_result');
       return { id: r.id };
+    },
+    async findDnsCname(hostname) {
+      const r = await call('GET', `/zones/${encodeURIComponent(cfg.zoneId)}/dns_records?type=CNAME&name=${encodeURIComponent(hostname)}`);
+      const hits = (Array.isArray(r) ? r : []).filter((d) => (d as { name?: unknown }).name === hostname
+        && typeof (d as { id?: unknown }).id === 'string' && typeof (d as { content?: unknown }).content === 'string');
+      if (hits.length > 1) throw new TunnelApiError('cf_api_duplicate_dns');
+      return hits.length === 1 ? { id: (hits[0] as { id: string }).id, content: (hits[0] as { content: string }).content } : null;
     },
     async deleteDnsRecord(id) {
       await call('DELETE', `/zones/${encodeURIComponent(cfg.zoneId)}/dns_records/${encodeURIComponent(id)}`, undefined, [404]);
@@ -113,6 +131,15 @@ export interface TunnelStorage {
 
 const RECORD_KEY = 'tunnel';
 const FENCE_KEY = 'fenced_epoch';
+/**
+ * Written BEFORE a create's first Cloudflare call and deleted once the record is stored. The
+ * tunnel name and hostname are deterministic for (sandbox, generation, epoch), so a retry, a
+ * removal or the next epoch can find by NAME whatever a create left behind when its response
+ * was lost, and adopt or delete it.
+ */
+const PENDING_KEY = 'pending_create';
+interface PendingCreate { computerId: string; sandboxId: string; generation: number; leaseEpoch: number; tunnelName: string; hostname: string }
+export const tunnelNameFor = (sandboxId: string, generation: number, leaseEpoch: number) => `ezil-c-${sandboxId}-g${generation}-e${leaseEpoch}`;
 const INSTANCE_ID = /^i-[0-9a-f]{8,17}$/;
 const REGION = /^[a-z]{2}(?:-[a-z]+)+-\d$/;
 const CREATE_KEYS = 'computerId,controlKey,generation,instanceId,leaseEpoch,publicIp,region,sandboxId';
@@ -246,6 +273,45 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
     await deps.storage.delete(RECORD_KEY);
   }
 
+  /** Delete, by name, whatever an unfinished create left behind; then forget it. */
+  async function cleanupPending(api: CloudflareTunnelApi, pending: PendingCreate): Promise<void> {
+    const dns = await api.findDnsCname(pending.hostname);
+    if (dns) await api.deleteDnsRecord(dns.id);
+    const tunnel = await api.findTunnelByName(pending.tunnelName);
+    if (tunnel) await api.deleteTunnel(tunnel.id);
+    await deps.storage.delete(PENDING_KEY);
+  }
+
+  /** This epoch's tunnel: adopt the one a lost create response left (same deterministic name), else create. */
+  async function ensureTunnel(api: CloudflareTunnelApi, name: string): Promise<string> {
+    const found = await api.findTunnelByName(name);
+    if (found) return found.id;
+    try {
+      return (await api.createTunnel(name)).id;
+    } catch (err) {
+      // Ambiguous: Cloudflare may have committed the create before the response was lost.
+      const after = await api.findTunnelByName(name).catch(() => null);
+      if (after) return after.id;
+      throw err;
+    }
+  }
+
+  /** This epoch's CNAME: adopt one already pointing at the tunnel; replace one pointing elsewhere. */
+  async function ensureDns(api: CloudflareTunnelApi, hostname: string, target: string): Promise<string> {
+    const found = await api.findDnsCname(hostname);
+    if (found && found.content === target) return found.id;
+    // The hostname is this sandbox+generation+epoch's own name: a record pointing elsewhere is an
+    // orphan of a rolled-back attempt for this same epoch, never another computer's.
+    if (found) await api.deleteDnsRecord(found.id);
+    try {
+      return (await api.createDnsCname(hostname, target)).id;
+    } catch (err) {
+      const after = await api.findDnsCname(hostname).catch(() => null);
+      if (after && after.content === target) return after.id;
+      throw err;
+    }
+  }
+
   async function verifyOrigin(rec: AwsTunnelRecord): Promise<'verified' | 'mismatch' | 'not_connected'> {
     if (!deps.api) return 'not_connected';
     const checkedAt = now();
@@ -280,7 +346,12 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         // Read-only replay of THIS epoch's completed create: the app re-derives the same control key
         // when a host retries an enrollment whose 200 was lost. Only the exact record, key included,
         // inside the window, gets the SAME tunnel's token; a replay never creates or replaces anything.
-        if (!existing || !isExactReplay(existing, body) || now() - existing.createdAt > TUNNEL_REPLAY_WINDOW_MS) {
+        // No record for THIS epoch at all (its create never completed): 404, so the app may create it.
+        // A record that is not this exact key/instance/address, or is past the window: 409, final.
+        if (!existing || existing.leaseEpoch !== body.leaseEpoch || existing.generation !== body.generation) {
+          return fail(404, 'tunnel_absent');
+        }
+        if (!isExactReplay(existing, body) || now() - existing.createdAt > TUNNEL_REPLAY_WINDOW_MS) {
           return fail(409, 'tunnel_replay_refused');
         }
         try {
@@ -300,13 +371,23 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
           return fail(502, 'tunnel_fence_failed');
         }
       }
-      let tunnelId: string | null = null;
-      let dnsRecordId: string | null = null;
+      const hostname = awsOriginHostname(body.sandboxId, body.generation, body.leaseEpoch, deps.zone);
+      const pending: PendingCreate = {
+        computerId: body.computerId, sandboxId: body.sandboxId, generation: body.generation, leaseEpoch: body.leaseEpoch,
+        tunnelName: tunnelNameFor(body.sandboxId, body.generation, body.leaseEpoch), hostname,
+      };
       try {
-        const hostname = awsOriginHostname(body.sandboxId, body.generation, body.leaseEpoch, deps.zone);
-        tunnelId = (await api.createTunnel(`ezil-c-${body.sandboxId}-g${body.generation}-e${body.leaseEpoch}`)).id;
+        // An older epoch's unfinished create: fence-first, delete its leftovers before this one exists.
+        const prior = (await deps.storage.get<PendingCreate>(PENDING_KEY)) ?? null;
+        if (prior && (prior.leaseEpoch !== pending.leaseEpoch || prior.generation !== pending.generation || prior.computerId !== pending.computerId)) {
+          if (prior.leaseEpoch > pending.leaseEpoch) return fail(409, 'stale_epoch');
+          await cleanupPending(api, prior);
+        }
+        // Before the first Cloudflare call, so a lost response is always recoverable by name.
+        await deps.storage.put(PENDING_KEY, pending);
+        const tunnelId = await ensureTunnel(api, pending.tunnelName);
         await api.putTunnelIngress(tunnelId, hostname, `http://127.0.0.1:${edgePort}`);
-        dnsRecordId = (await api.createDnsCname(hostname, `${tunnelId}.cfargotunnel.com`)).id;
+        const dnsRecordId = await ensureDns(api, hostname, `${tunnelId}.cfargotunnel.com`);
         const tunnelToken = await api.getTunnelToken(tunnelId);
         const record: AwsTunnelRecord = {
           computerId: body.computerId, sandboxId: body.sandboxId, generation: body.generation, leaseEpoch: body.leaseEpoch,
@@ -314,11 +395,11 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
           controlKey: body.controlKey, createdAt: now(), originVerified: false,
         };
         await deps.storage.put(RECORD_KEY, record);
+        await deps.storage.delete(PENDING_KEY);
         return { status: 200, body: { tunnelToken } };
       } catch {
-        // Best-effort rollback of whatever this call created; the record was never written.
-        if (dnsRecordId) await api.deleteDnsRecord(dnsRecordId).catch(() => undefined);
-        if (tunnelId) await api.deleteTunnel(tunnelId).catch(() => undefined);
+        // No blind rollback: an id whose response was lost cannot be deleted by id anyway. The pending
+        // marker stays, so a retry ADOPTS by name, and a removal or the next epoch deletes by name.
         return fail(502, 'tunnel_create_failed');
       }
     }),
@@ -333,9 +414,12 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       }
       try {
         await fenceThrough(body.leaseEpoch);
-        if (!existing) return { status: 200, body: { deleted: false } };
+        const pending = (await deps.storage.get<PendingCreate>(PENDING_KEY)) ?? null;
+        const cleanable = pending && pending.computerId === body.computerId && pending.leaseEpoch <= body.leaseEpoch;
+        if (!existing && !cleanable) return { status: 200, body: { deleted: false } };
         if (!deps.api) return fail(503, 'tunnel_api_not_configured');
-        await destroy(deps.api, existing);
+        if (existing) await destroy(deps.api, existing);
+        if (cleanable) await cleanupPending(deps.api, pending);
       } catch {
         return fail(502, 'tunnel_fence_failed');
       }

@@ -199,7 +199,15 @@ export interface Placement {
     fsUuid: string | null;
     tunnelId: string | null;
     enrollNonceHash: string | null;
+    /** The nonce's deadline. Kept after consume as the bounded window of `enrollConsumedHash`. */
     enrollExpiresAt: Date | null;
+    /**
+     * Proof of the CONSUMED nonce (C-6): consume moves the hash here and nulls `enrollNonceHash`
+     * (single use). A host recovering its own enrollment (completion not recorded, or its 200
+     * lost) must still present that nonce, before `enrollExpiresAt`; an identity document alone
+     * never reaches the Worker. Cleared on a failed finish, on stop/retire, and at the next lease.
+     */
+    enrollConsumedHash: string | null;
     leaseUntil: Date | null;
     presenceAt: Date | null;
     /**
@@ -238,6 +246,7 @@ const MUTABLE_COLUMNS = {
     tunnelId: ['tunnel_id', 'text'],
     enrollNonceHash: ['enroll_nonce_hash', 'text'],
     enrollExpiresAt: ['enroll_expires_at', 'timestamptz'],
+    enrollConsumedHash: ['enroll_consumed_hash', 'text'],
     leaseUntil: ['lease_until', 'timestamptz'],
     presenceAt: ['presence_at', 'timestamptz'],
     fenceToken: ['fence_token', 'uuid'],
@@ -253,7 +262,7 @@ const SELECT_COLUMNS = sql.raw(
     [
         'computer_id::text AS computer_id', 'owner_user_id::text AS owner_user_id', 'provider', 'workspace_store', 'generation::text AS generation',
         'lease_epoch::text AS lease_epoch', 'state', 'region', 'zone_id', 'instance_id', 'instance_type',
-        'volume_id', 'fs_uuid::text AS fs_uuid', 'tunnel_id', 'enroll_nonce_hash', 'enroll_expires_at',
+        'volume_id', 'fs_uuid::text AS fs_uuid', 'tunnel_id', 'enroll_nonce_hash', 'enroll_expires_at', 'enroll_consumed_hash',
         'lease_until', 'presence_at', 'fence_token::text AS fence_token', 'lifecycle_job_id::text AS lifecycle_job_id',
         'lifecycle_digest', 'last_error', 'updated_at',
     ].join(', '),
@@ -308,7 +317,8 @@ export function parsePlacementRow(row: Record<string, unknown>, computerId: stri
         region: text('region'), zoneId: text('zone_id'), instanceId: text('instance_id'),
         instanceType: text('instance_type'), volumeId: text('volume_id'), fsUuid: text('fs_uuid'),
         tunnelId: text('tunnel_id'), enrollNonceHash: text('enroll_nonce_hash'),
-        enrollExpiresAt: time('enroll_expires_at'), leaseUntil: time('lease_until'), presenceAt: time('presence_at'),
+        enrollExpiresAt: time('enroll_expires_at'), enrollConsumedHash: text('enroll_consumed_hash'),
+        leaseUntil: time('lease_until'), presenceAt: time('presence_at'),
         fenceToken: text('fence_token'), lifecycleJobId: text('lifecycle_job_id'), lifecycleDigest: text('lifecycle_digest'),
         lastError: text('last_error'),
         updatedAt,
@@ -932,7 +942,8 @@ export async function consumeEnrollmentNonce(
             input.expected,
             input.expected.state,
             { generation: 0, leaseEpoch: 0 },
-            { ...input.fields, enrollNonceHash: null, enrollExpiresAt: null, lastError: ENROLLMENT_PENDING },
+            // Single use: the nonce hash moves to the consumed proof; its deadline stays as that proof's window.
+            { ...input.fields, enrollNonceHash: null, enrollConsumedHash: input.nonceHash, lastError: ENROLLMENT_PENDING },
             {
                 provider: 'aws-ec2', enrollNonceHash: input.nonceHash, enrollUnexpired: true,
                 states: ENROLLABLE_STATES, preserveState: true, availableInstanceId: input.fields.instanceId,
@@ -948,7 +959,9 @@ export async function finishEnrollment(
 ): Promise<TransitionResult> {
     return db.transaction((tx) => casInTx(
         tx, input.computerId, input.expected, input.success ? input.expected.state : 'UNCONFIRMED',
-        { generation: 0, leaseEpoch: 0 }, { lastError: input.success ? ENROLLMENT_SUCCEEDED : ENROLLMENT_FAILED },
+        { generation: 0, leaseEpoch: 0 },
+        // Success keeps the consumed proof for the replay window; a failure can never be recovered.
+        input.success ? { lastError: ENROLLMENT_SUCCEEDED } : { lastError: ENROLLMENT_FAILED, enrollConsumedHash: null, enrollExpiresAt: null },
         {
             provider: 'aws-ec2', states: ENROLLABLE_STATES, preserveState: input.success,
             instanceId: input.expected.instanceId, lastError: ENROLLMENT_PENDING, nonceConsumed: true,
