@@ -57,6 +57,15 @@ export type WorkspaceStore = (typeof WORKSPACE_STORES)[number];
 const STORES_FOR_PROVIDER: Record<PlacementProvider, readonly WorkspaceStore[]> = { cloudflare: ['r2', 's3'], 'aws-ec2': ['ebs'] };
 /** The store a newly created row records. */
 const DEFAULT_STORE: Record<PlacementProvider, WorkspaceStore> = { cloudflare: 'r2', 'aws-ec2': 'ebs' };
+/**
+ * The lease_epoch a newly created row records. An AWS provision IS the
+ * computer's first lease: its intent carries leaseEpoch 1 and the host writes
+ * disk-marker epoch 1 (C-4). The row must say 1 too, so the first wake leases
+ * 2. A row left at 0 would lease 1 on the first wake, and the host guard
+ * refuses a lease epoch that is not above the marker's: the computer could
+ * never wake. Cloudflare rows never lease and stay at 0.
+ */
+const INITIAL_LEASE_EPOCH: Record<PlacementProvider, 0 | 1> = { cloudflare: 0, 'aws-ec2': 1 };
 
 /** C-3. Stage B's "terminated" is the end of a slot, not a stored state. */
 export const PLACEMENT_STATES = [
@@ -82,11 +91,14 @@ export const RUNNING_CLASS_STATES: readonly PlacementState[] = PLACEMENT_STATES.
  * edge list; this is the module's reading of it (reported as a contract gap):
  * every active state may fall to UNCONFIRMED ("every error is recorded on
  * UNCONFIRMED"), a lease may lapse back to STOPPED before start, and only a
- * STOPPED computer is retired. `STOPPED → LEASED` is NOT here: it exists only
+ * STOPPED computer is retired. A provision may land RUNNING (first boot).
+ * `STOPPED → LEASED` is NOT here: it exists only
  * through `leasePlacement`, under the admission lock.
  */
 export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly PlacementState[]>> = {
-    PROVISIONING: ['STOPPED', 'UNCONFIRMED'],
+    // The infra provision launches AND boots the instance, so its receipt lands RUNNING
+    // (first open boots straight in). STOPPED stays for a provision that ends stopped.
+    PROVISIONING: ['RUNNING', 'STOPPED', 'UNCONFIRMED'],
     STOPPED: ['RETIRING'],
     LEASED: ['STARTING', 'STOPPED', 'UNCONFIRMED'],
     STARTING: ['MOUNTING', 'UNCONFIRMED'],
@@ -392,6 +404,66 @@ function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
     }
 }
 
+declare const TICKET_BRAND: unique symbol;
+
+/**
+ * Proof that admission ADMITTED one exact request (computer, user, create or
+ * lease) inside THIS transaction, after `readAdmissionCounters` read that
+ * computer's counters under the same lock. Opaque and single use, kept in a
+ * module-private WeakMap like `AdmissionLock`. Holding the lock alone no
+ * longer creates or leases an AWS placement (review R-PL F3): a caller that
+ * skips the decision cannot get past the per-user and running caps.
+ */
+export interface AdmissionTicket {
+    readonly [TICKET_BRAND]: true;
+}
+
+interface TicketRecord {
+    tx: PlacementExecutor;
+    computerId: string;
+    userId: string;
+    kind: 'create' | 'lease';
+    used: boolean;
+}
+
+const MINTED_TICKETS = new WeakMap<object, TicketRecord>();
+/** Lock → the computer whose admission counters were read under it. */
+const COUNTED = new WeakMap<object, string>();
+
+/**
+ * ADMISSION ONLY: `admission.ts` calls this once `decideAdmission` has admitted
+ * the request. No other non-test module may name it; `placement.test.ts` scans
+ * the repository for that. It refuses unless the lock is this transaction's
+ * and the counters for this very computer were read under it.
+ */
+export function mintAdmissionTicket(
+    tx: PlacementExecutor,
+    lock: AdmissionLock,
+    input: { computerId: string; userId: string; kind: 'create' | 'lease' },
+): AdmissionTicket {
+    assertAdmissionLock(tx, lock);
+    const computerId = canonicalId(input.computerId);
+    if (COUNTED.get(lock) !== computerId) throw new Error('admission counters were not read for this computer under this lock');
+    const ticket = Object.freeze({}) as AdmissionTicket;
+    MINTED_TICKETS.set(ticket, { tx, computerId, userId: canonicalId(input.userId), kind: input.kind, used: false });
+    return ticket;
+}
+
+function consumeTicket(tx: PlacementExecutor, ticket: AdmissionTicket, expected: { computerId: string; userId: string; kind: 'create' | 'lease' }): void {
+    const record = ticket && typeof ticket === 'object' ? MINTED_TICKETS.get(ticket) : undefined;
+    if (
+        !record ||
+        record.tx !== tx ||
+        record.used ||
+        record.kind !== expected.kind ||
+        record.computerId !== canonicalId(expected.computerId) ||
+        record.userId !== canonicalId(expected.userId)
+    ) {
+        throw new Error('admission ticket is not valid for this request');
+    }
+    record.used = true;
+}
+
 // ── Create ───────────────────────────────────────────────────────────────
 
 export interface CreatePlacementInput {
@@ -418,7 +490,7 @@ async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput)
         sql`${input.provider}`,
         sql`${DEFAULT_STORE[input.provider]}`,
         sql`1`,
-        sql`0`,
+        sql.raw(String(INITIAL_LEASE_EPOCH[input.provider])),
         sql`${input.state}`,
         sql`now()`,
         ...keys.map((k) => valueSql(k, fields[k] ?? null)),
@@ -447,13 +519,18 @@ export async function createPlacement(db: PlacementDb, input: CreatePlacementInp
     return db.transaction((tx) => createInTx(tx, input));
 }
 
-/** AWS creation, inside the admission transaction. Starts at PROVISIONING, generation 1, lease_epoch 0. */
+/**
+ * AWS creation, inside the admission transaction, with that admission's ticket.
+ * Starts at PROVISIONING, generation 1, lease_epoch 1 (the provision is the first lease).
+ */
 export async function createAwsPlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
+    ticket: AdmissionTicket,
     input: { computerId: string; ownerUserId: string; fields?: PlacementFields },
 ): Promise<CreatePlacementResult> {
     assertAdmissionLock(tx, lock);
+    consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'create' });
     return createInTx(tx, { computerId: input.computerId, ownerUserId: input.ownerUserId, provider: 'aws-ec2', state: 'PROVISIONING', fields: input.fields });
 }
 
@@ -476,7 +553,7 @@ async function casInTx(
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
-    lease?: { provider: PlacementProvider; ownerUserId: string },
+    guard: { provider?: PlacementProvider; ownerUserId?: string } = {},
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
@@ -494,7 +571,7 @@ async function casInTx(
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
-            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${lease ? sql` AND provider = ${lease.provider} AND owner_user_id = ${canonicalId(lease.ownerUserId)}::uuid` : sql``}
+            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -503,8 +580,32 @@ async function casInTx(
     return { ok: true, placement: parsePlacementRow(rows[0]!, computerId) };
 }
 
-/** Any C-3 transition except leasing. Zero rows = someone else moved first. */
+/**
+ * A USER-TRIGGERED C-3 transition, except leasing: open, stop, or the undo of a
+ * failed start. `ownerUserId` is the AUTHENTICATED caller and is required: the
+ * CAS also matches `owner_user_id`, so another user's placement never moves
+ * (zero rows → `cas_conflict`). Zero rows otherwise means someone else moved first.
+ */
 export async function transitionPlacement(
+    db: PlacementDb,
+    input: { computerId: string; ownerUserId: string; expected: CasExpectation; to: PlacementState; fields?: PlacementFields },
+): Promise<TransitionResult> {
+    // Checked before anything else: a missing owner must never become an unguarded write.
+    if (typeof input.ownerUserId !== 'string' || !UUID.test(input.ownerUserId)) throw new Error('transitionPlacement requires the caller ownerUserId');
+    if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
+    return db.transaction((tx) =>
+        casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {}, { ownerUserId: input.ownerUserId }),
+    );
+}
+
+/**
+ * RECONCILER ONLY: a C-3 transition with NO owner predicate, for the lifecycle
+ * receipt path (execution results, EC2 observations), which moves a placement
+ * whoever owns it. The same legal-edge table and CAS guards apply. A user-facing
+ * path must never name it: `placement.test.ts` scans the user-path modules and
+ * routers and fails if any of them does.
+ */
+export async function transitionPlacementAsReconciler(
     db: PlacementDb,
     input: { computerId: string; expected: CasExpectation; to: PlacementState; fields?: PlacementFields },
 ): Promise<TransitionResult> {
@@ -516,14 +617,17 @@ export async function transitionPlacement(
 
 /**
  * `STOPPED → LEASED`, reserving `lease_epoch + 1` (and `generation + 1` for a
- * replace or recovery, C-3). Only inside the admission transaction.
+ * replace or recovery, C-3). Only inside the admission transaction, with that
+ * admission's ticket.
  */
 export async function leasePlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
+    ticket: AdmissionTicket,
     input: { computerId: string; ownerUserId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean },
 ): Promise<TransitionResult> {
     assertAdmissionLock(tx, lock);
+    consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'lease' });
     return casInTx(
         tx,
         input.computerId,
@@ -558,6 +662,13 @@ export interface AdmissionCounters {
     targetForeignUsage: number;
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
+    /**
+     * The same running-class rows, per region (only regions that have any). A
+     * region absent here has none. Rows without a region are `runningUnplaced`
+     * and count against EVERY region (the safe direction).
+     */
+    runningByRegion: Readonly<Record<string, number>>;
+    runningUnplaced: number;
     /**
      * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE: counted by
      * `owner_user_id` (or usage metered to the user), never through
@@ -596,6 +707,12 @@ export async function readAdmissionCounters(
             FROM public.ezil_computer_placements
             WHERE provider = 'aws-ec2' AND state IN (${running})`),
     );
+    const regionRows = rowsOf(
+        await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n
+            FROM public.ezil_computer_placements
+            WHERE provider = 'aws-ec2' AND state IN (${running})
+            GROUP BY region`),
+    );
     // No `deleted_at IS NULL`: soft-deleting a computer must not free the per-user slot
     // while its volume still exists.
     const userRows = rowsOf(
@@ -618,13 +735,26 @@ export async function readAdmissionCounters(
         if (n === null) throw new Error('admission counter query returned no count');
         return n;
     };
+    const runningByRegion: Record<string, number> = {};
+    let runningUnplaced = 0;
+    for (const r of regionRows) {
+        const n = counter(r.n);
+        if (n === null) throw new Error('admission region counter returned no count');
+        if (r.region === null || r.region === undefined) runningUnplaced += n;
+        else if (typeof r.region === 'string' && !Object.prototype.hasOwnProperty.call(runningByRegion, r.region)) runningByRegion[r.region] = n;
+        else throw new Error('admission region counter returned a duplicate or invalid region');
+    }
     const owner = ownerRows[0];
+    // Every read above succeeded for this computer under this lock: admission may now mint a ticket for it.
+    COUNTED.set(lock, input.computerId);
     return {
         targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
         targetPlacementOwnerId: target.record?.ownerUserId ?? null,
         targetDeleted: owner?.deleted === true,
         targetForeignUsage: count(foreignRows),
         runningCount: count(runningRows),
+        runningByRegion,
+        runningUnplaced,
         userOtherAwsComputers: count(userRows),
         duplicates,
         usage: usageRows.map((r) => {

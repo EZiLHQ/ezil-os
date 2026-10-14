@@ -27,7 +27,7 @@ pre-booted hosts.
 
 | # | Decision |
 |---|---|
-| R1 | One region per deployment, configured. Zones are addressed only by **ZoneId** (for example `aps1-az1`), never by account-mapped zone names. A pilot uses one ZoneId. |
+| R1 | One region per deployment, configured. Zones are addressed only by **ZoneId** (for example `aps1-az1`), never by account-mapped zone names. A pilot uses one ZoneId. Several regions mean several deployments (identity, lifecycle, AMI per region). The app orders them in `AWS_REGIONS`; a computer's region is chosen **once, at creation** (the first region with room) and is sticky: its volume lives there, every wake runs there, and a full home region refuses (`capacity_unavailable`), it never moves the computer. |
 | R2 | **Stage A:** one VM per user, stopped and started in place. **Stage B:** a bounded single-use pool of running blank hosts. Stage B ships default-off and stays off until Stage A acceptance (§7). |
 | R3 | **State of record = one retained encrypted gp3 data volume per computer.** It holds the desktop container's overlay upper layer (system installs), `/workspace`, HOME, and the browser and editor profiles. The host root volume is disposable: OS plus pre-pulled image. Backups are scheduled EBS snapshots. Periodic checkpoints to object storage are **off** for AWS computers. Export to S3 happens only for migration, rollback or explicit export, through short-lived per-key presigned URLs. |
 | R4 | The desktop runs as one container on the host. **Decided by the S1 spike: overlay rootfs.** The image rootfs is the read-only lower layer on the disposable root volume; the upper and work directories sit on the data volume. runc runs it from a host-generated OCI spec that reuses the image's entrypoint and environment, as local mode's `run-spec.ts` does; it is not built by that argv builder. No ports are published. Docker with `data-root` on the data volume was rejected: it copies the full image (~4.5 GB) onto every user volume and cannot be rebased. Section 3a lists the host-agent rules that must hold before user traffic. |
@@ -36,7 +36,7 @@ pre-booted hosts.
 | R7 | A Step Functions lifecycle workflow owns EC2/EBS mutations. The app may only start executions of exact workflow versions and describe resources. The Cloudflare Worker holds no EC2 or IAM rights; it keeps only its existing workspace-store S3 scope, and mints presigned URLs from it. EC2 state-change events are reconciled into the database. |
 | R8 | Single writer per computer, enforced by compare-and-swap on a generation number under a per-computer advisory lock. EBS single-attach is the physical fence. A reviewed migration-grammar extension adds UNIQUE indexes (required before Stage B). The engine copies in sibling repositories have diverged, so the extension is ported to each one separately with shared test vectors. |
 | R9 | Idle stop may be guest-initiated, but caps are not. Lease renewal comes only from gateway-observed, authenticated user presence. Hour, egress and lease limits are enforced by the control plane: warn, then flush, then stop, regardless of what the guest reports. |
-| R10 | Instance types come from a closed allowlist. Pilot: one standard 2 vCPU / 8 GiB type; one 4 vCPU / 8 GiB type for benchmarks only. No burstable-credit types. |
+| R10 | Instance types come from a closed allowlist, chosen by the computer's **tier** (2026-10-14, superseding "no burstable types"): **free** = 2 vCPU / 4 GiB (`t3a.medium`, then `t3.medium`), launched with *standard* CPU credits so it throttles to its baseline instead of billing surplus CPU; **plus** = 2 vCPU / 8 GiB (`m6i.large`). One 4 vCPU / 8 GiB type stays for benchmarks only. The app records the tier's first type at creation (`AWS_TIERS`, app `aws-config.ts`); the region deployment's allowlist must contain it or the intent is refused. |
 | R11 | Volume sizes come from an allowlist or range, with capped online growth. Automation never deletes volumes or snapshots and never force-detaches. Purge is a separate operator action. |
 | R12 | Hibernation is off. |
 | R13 | Provider and store are chosen **per computer**. No global store flip is used to migrate a subset of computers. An unknown value fails closed. |
@@ -107,6 +107,9 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - **Writing.** Every write goes through one module.
   - Creation takes `pg_advisory_xact_lock` on the computer.
   - Every transition is `UPDATE … WHERE computer_id = $1 AND generation = $g AND lease_epoch = $e RETURNING`.
+  A user-triggered transition (open, stop, a failed start's undo) also matches `owner_user_id` = the authenticated
+  caller, so another user's placement never moves. Only the lifecycle receipt path (the reconciler) transitions without
+  an owner, through a separate entry point that no user-facing module may name (a source-scan test enforces this).
   - **Two counters.** `generation` is the *writer* generation: it changes only when the instance is replaced or recovered, and it matches the lifecycle tags on the instance and volume. `lease_epoch` increases on every lease (each start or claim) without retagging AWS resources.
   - A periodic duplicate check (`HAVING count(*) > 1`) alarms and closes admission.
 
@@ -129,18 +132,27 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 ### C-3 Lifecycle states
 
 - Main path: `PROVISIONING → STOPPED → LEASED → STARTING → MOUNTING → RUNNING → DRAINING → STOPPING → STOPPED`.
+- First boot: `PROVISIONING → RUNNING`. The infra provision launches and boots the instance, so the user's first open
+  goes straight in, and the receipt lands RUNNING. `PROVISIONING → STOPPED` stays for a provision that ends stopped.
 - Failure path: `UNCONFIRMED → RECOVERING → STOPPED`.
 - Retirement: `RETIRING → RETIRED → PURGE_ELIGIBLE`. The purge itself is a separate operator action (§6).
 - Stage B slots: `WARMING → READY → CLAIMED → terminated`.
 
 **Leasing and admission**
 - `LEASED` reserves `lease_epoch + 1`. A replace or recovery also reserves `generation + 1`.
+- An AWS placement is created at `lease_epoch` 1, because the provision is the computer's first lease. Its intent carries
+  epoch 1 and the host writes disk-marker epoch 1, so the first wake leases 2. A row created at 0 would lease 1 on its
+  first wake, the C-4 guard would refuse it (the marker epoch is not below it), and the computer could never wake.
+  Cloudflare rows never lease and start at 0.
 - Admission runs in the same transaction, under one global advisory lock. All of these must hold:
   - running-class count < `AWS_MAX_RUNNING`
   - one AWS computer per user
   - per-user and global monthly instance-hours under their caps
   - per-user and global monthly egress under their caps
 - Refusals carry a machine-readable reason.
+- Holding the admission lock is not enough to write. An admitted decision mints a single-use ticket bound to this
+  transaction, computer, user and kind (create or lease), and only after that computer's counters were read under the
+  lock. AWS creation and leasing refuse without it. Only the admission module mints tickets (a repository scan test).
 
 **Errors**
 - Capacity and quota errors fail fast.
@@ -320,7 +332,9 @@ volume as hostile input.
 |---|---|
 | Placement reads | `EZIL_COMPUTE_PLACEMENT_READS=1` turns on per-computer placement reads. It is **one-way**: once on (or once AWS has been enabled) it must never be turned off, or computers on EBS would start on Cloudflare. Absent means no placement statements at all |
 | AWS enable | `EZIL_AWS_COMPUTERS_ENABLED=1` gates AWS admission and the AWS provider, and implies placement reads. Absent means an `aws-ec2` computer refuses (`aws_disabled`); it never falls back to Cloudflare |
-| Running computers | `AWS_MAX_RUNNING`; pilot value 2 |
+| Running computers | `AWS_MAX_RUNNING`; pilot value 2 (all regions together) |
+| Running per region | `EZIL_AWS_MAX_RUNNING_<REGION>` (e.g. `_AP_SOUTH_1`) for each region in `AWS_REGIONS`; required, no default. Set it from the region's **verified** Running On-Demand Standard vCPU quota minus every other workload in that quota, divided by 2 vCPU. Admission counts running-class rows per region under the admission lock. A region with no rows counts 0, and a running row without a region counts against every region |
+| Region deployments | `EZIL_AWS_LIFECYCLE_DEPLOYMENTS`: JSON keyed by region, each the lifecycle stack's deployment record (`stateMachineVersionArn` pinned to a version). A configured region without one disables AWS |
 | Computers per user | 1 |
 | Instance-hours | monthly aggregate cap, including idle running and pool hours; per-user cap |
 | Egress | monthly GB caps per user and aggregate, measured outside the guest (CloudWatch `NetworkOut`) |
