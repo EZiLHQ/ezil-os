@@ -138,7 +138,9 @@ export type SandboxReapOutcome =
     | 'not_running'
     | 'check_failed'
     | 'terminate_failed'
-    | 'skipped_cap';
+    | 'skipped_cap'
+    /** P3: the computer's placement is not Cloudflare (an AWS host idle-stops itself). Never checked, never terminated. */
+    | 'skipped_not_cloudflare';
 
 export interface SandboxReapResultRow {
     computerId: string;
@@ -166,6 +168,14 @@ export interface SandboxReapDeps {
     staleAfterMs?: number;
     maxCandidates?: number;
     maxReapPerRun?: number;
+    /**
+     * P3, set only when placement reads are on: the provider a computer lives on.
+     * Anything but `cloudflare` is skipped BEFORE the status check, so an AWS
+     * computer is never addressed by this Cloudflare-only sweep. A throw (missing
+     * table, duplicate or unknown placement) is `check_failed`: never terminated.
+     * Unset = every candidate is Cloudflare, exactly as before P3.
+     */
+    providerOf?(computerId: string): Promise<string>;
     /** Derive the sandbox name for a (userId, computerId) pair — MUST match
      * `deriveGuacamoleSandboxId`/`deriveSandboxId`. Injected rather than
      * imported directly so tests never need a real HMAC/Worker config. */
@@ -222,6 +232,25 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
             if (reaped >= maxReapPerRun) {
                 results.push({ computerId: candidate.id, sandboxName, outcome: 'skipped_cap' });
                 continue;
+            }
+
+            if (deps.providerOf) {
+                let provider: string;
+                try {
+                    provider = await deps.providerOf(candidate.id);
+                } catch (err) {
+                    results.push({
+                        computerId: candidate.id,
+                        sandboxName,
+                        outcome: 'check_failed',
+                        error: err instanceof Error ? err.message : String(err),
+                    });
+                    continue;
+                }
+                if (provider !== 'cloudflare') {
+                    results.push({ computerId: candidate.id, sandboxName, outcome: 'skipped_not_cloudflare' });
+                    continue;
+                }
             }
 
             let running: boolean;

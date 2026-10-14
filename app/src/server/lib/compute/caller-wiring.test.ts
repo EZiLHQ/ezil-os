@@ -205,3 +205,13 @@ describe('sandbox-reap route maps handler sandbox names back to computers', () =
         vi.useRealTimers();
     });
 });
+
+describe('P3: sandbox-reap asks each candidate\'s placement only when placement reads are on', () => {
+    it('reads OFF → no providerOf (every candidate Cloudflare, as before); reads ON → providerOf wired', async () => {
+        await reapGET(new Request('https://app.example/api/cron/sandbox-reap'));
+        expect((captured.reapDeps as { providerOf?: unknown }).providerOf).toBeUndefined();
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        await reapGET(new Request('https://app.example/api/cron/sandbox-reap'));
+        expect(typeof (captured.reapDeps as { providerOf?: unknown }).providerOf).toBe('function');
+    });
+});
