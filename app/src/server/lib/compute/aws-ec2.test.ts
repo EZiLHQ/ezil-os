@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
+import { AWS_RETIREMENT_UNDERWAY, AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
 import type { AwsTier } from './aws-config';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
@@ -524,11 +524,27 @@ describe('Codex #3: computer.delete retires an AWS computer before it is soft-de
         expect(calls).toHaveLength(1);
     });
 
-    it('a RUNNING computer is stopped first, never retired while it runs', async () => {
+    it('a RUNNING computer starts its retire at once (the retire job stops it gracefully, then terminates): one delete', async () => {
         const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] });
-        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'stopping' });
-        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
-        expect(placements[0]).toMatchObject({ state: 'STOPPING' });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'retiring' });
+        expect(AWS_RETIREMENT_UNDERWAY).toContain('retiring');
+        expect(calls.map((c) => c.intent.operation)).toEqual(['retire']);
+        expect(placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: calls[0]!.intent.jobId });
+    });
+
+    it('a refused retire StartExecution of a RUNNING computer goes back to RUNNING (nothing ran) and is not "underway"', async () => {
+        const { provider, placements } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 2 })] }, { failStart: true });
+        const r = await provider.terminate(ctx, me);
+        expect(r).toMatchObject({ ok: false, outcome: 'aws_lifecycle_start_failed' });
+        expect(AWS_RETIREMENT_UNDERWAY).not.toContain(r.outcome);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it.each(['DRAINING', 'STOPPING'] as const)('%s with a recorded stop job answers retire_after_stop (the reconcile retires it once STOPPED)', async (state) => {
+        const { provider, calls } = setup({ placements: [stopped({ state, lifecycle_job_id: '99999999-9999-4999-8999-999999999999', lifecycle_digest: 'd'.repeat(64) })] });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'retire_after_stop' });
+        expect(AWS_RETIREMENT_UNDERWAY).toContain('retire_after_stop');
+        expect(calls).toEqual([]);
     });
 
     it('a refused retire StartExecution goes back to STOPPED (nothing ran)', async () => {
@@ -538,7 +554,7 @@ describe('Codex #3: computer.delete retires an AWS computer before it is soft-de
     });
 
     it.each([
-        ['UNCONFIRMED', 'computer_recovering'], ['RECOVERING', 'computer_recovering'], ['STARTING', 'computer_starting'], ['STOPPING', 'stopping'],
+        ['UNCONFIRMED', 'computer_recovering'], ['RECOVERING', 'computer_recovering'], ['STARTING', 'computer_starting'], ['STOPPING', 'stopping'], ['RETIRING', 'computer_unavailable'],
     ] as const)('%s refuses the delete with %s and starts nothing', async (state, outcome) => {
         const { provider, calls } = setup({ placements: [stopped({ state })] });
         expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome });

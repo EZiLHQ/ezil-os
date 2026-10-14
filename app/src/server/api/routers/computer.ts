@@ -32,6 +32,7 @@ import { z } from 'zod';
 import { computers } from '@/server/db/schema';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
+import { AWS_RETIREMENT_UNDERWAY } from '@/server/lib/compute/aws-ec2';
 import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
 import { routeComputer } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
@@ -74,14 +75,17 @@ async function terminateComputerSandbox(provider: CloudflareComputeProvider, com
 }
 
 /**
- * An AWS computer is RETIRED before its row is soft-deleted: the provider's
- * `terminate` is retire (C-3: the data volume is kept for the 14-day retention
- * window, §6 / F6 — nothing is deleted). Unlike the Cloudflare teardown above,
- * a refusal here REFUSES THE DELETE: soft-deleting the row while the instance
- * and volume live on would leave AWS resources no user flow can reach, and
- * falling back to the Cloudflare teardown would address a sandbox that does
- * not exist. Ownership of the live row is checked first, so a foreign id is
- * NOT_FOUND before any provider call.
+ * An AWS computer's retirement is under way before its row is soft-deleted: the
+ * provider's `terminate` is retire (C-3: the data volume is kept for the 14-day
+ * retention window, §6 / F6 — nothing is deleted). One user delete is enough:
+ * once a lifecycle job that ends the instance is durably recorded on the placement
+ * (`AWS_RETIREMENT_UNDERWAY`), or the computer is already RETIRED, the row is
+ * soft-deleted and the sandbox-reap cron's background reconcile drives the
+ * placement to RETIRED. Any other answer REFUSES THE DELETE: soft-deleting while
+ * nothing will end the instance would leave AWS resources no flow can reach, and
+ * falling back to the Cloudflare teardown would address a sandbox that does not
+ * exist. Ownership of the live row is checked first, so a foreign id is NOT_FOUND
+ * before any provider call.
  */
 async function retireAwsComputerBeforeDelete(
     db: Parameters<typeof softDeleteComputer>[0],
@@ -94,7 +98,7 @@ async function retireAwsComputerBeforeDelete(
     });
     if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
     const result = await provider.terminate({ correlationId: newCorrelationId() }, computer);
-    if (!result.ok) {
+    if (!result.ok && !AWS_RETIREMENT_UNDERWAY.includes(result.outcome ?? '')) {
         throw new TRPCError({
             code: 'PRECONDITION_FAILED',
             message: `aws_retire_unavailable: ${result.outcome ?? result.error ?? 'unknown'}`,

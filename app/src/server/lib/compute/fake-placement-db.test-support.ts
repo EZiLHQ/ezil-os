@@ -246,6 +246,22 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                         .map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })),
                 };
             }
+            case 'retire-pending': {
+                // LEFT JOIN ezil_computers: the computer row is gone or soft-deleted.
+                const limit = Number(params.at(-1));
+                const states = new Set(params.slice(0, -1) as string[]);
+                const gone = (id: unknown) => {
+                    const c = computers.find((x) => uuidEq(x.id, id));
+                    return !c || c.deleted_at != null;
+                };
+                return {
+                    rows: placements
+                        .filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)) && gone(r.computer_id))
+                        .sort((a, b) => new Date(a.updated_at as Date).getTime() - new Date(b.updated_at as Date).getTime())
+                        .slice(0, limit)
+                        .map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })),
+                };
+            }
             case 'retention':
                 return { rows: placements.filter((r) => r.state === 'STOPPED' || r.state === 'RETIRED').map((r) => ({ computer_id: r.computer_id, state: r.state, updated_at: r.updated_at })) };
             case 'insert': {

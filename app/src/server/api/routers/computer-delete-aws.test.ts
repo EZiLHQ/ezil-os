@@ -70,3 +70,23 @@ describe('computer.delete: a confirmed AWS retire', () => {
         expect(order).toEqual(['retire', 'soft-delete']);
     });
 });
+
+describe('computer.delete: ONE delete completes while the retirement runs in the background (Codex 4275269627)', () => {
+    it.each(['retiring', 'retire_after_stop'])('a durably recorded job (%s) → the row is soft-deleted now', async (outcome) => {
+        h.terminate.mockResolvedValue({ ok: false, terminated: false, outcome });
+        const caller = computerRouter.createCaller({ user: { id: U1 }, db } as never);
+        await expect(caller.delete({ id: C1 })).resolves.toMatchObject({ id: C1 });
+        expect(h.softDelete).toHaveBeenCalledTimes(1);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['aws_lifecycle_start_failed', 'stopping', 'computer_starting', 'computer_recovering', 'cas_conflict', 'aws_lifecycle_unconfigured'])(
+        'nothing durably recorded (%s) → REFUSED, never soft-deleted',
+        async (outcome) => {
+            h.terminate.mockResolvedValue({ ok: false, terminated: false, outcome });
+            const caller = computerRouter.createCaller({ user: { id: U1 }, db } as never);
+            await expect(caller.delete({ id: C1 })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+            expect(h.softDelete).not.toHaveBeenCalled();
+        },
+    );
+});

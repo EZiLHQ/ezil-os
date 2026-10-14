@@ -28,7 +28,7 @@
  * separated from its route: keeping `@/env` (throws on a missing DB URL) and
  * a live Postgres connection out of the import graph a unit test exercises.
  */
-import { sql } from 'drizzle-orm';
+import { sql, type SQL } from 'drizzle-orm';
 
 export type SandboxReapKillSwitchFlag = string | undefined;
 
@@ -111,18 +111,31 @@ interface RawStaleComputerRow {
  * `terminateComputerSandbox()` (`@/server/api/routers/computer.ts`) as part
  * of the delete flow, so a deleted-and-still-running sandbox is a different
  * failure (that call not being confirmed) than the one this backstop targets.
+ *
+ * 🔴 `staleBefore` goes in as an ISO string cast to timestamptz, never a raw `Date`:
+ * drizzle's postgres-js driver installs pass-through timestamp serializers, so a
+ * `Date` in a raw `sql` template throws ("Received an instance of Date") on every
+ * run. Found on real Postgres 16; placement.ts binds timestamps the same way.
  */
 export async function findStaleComputers(
     db: SandboxReapDb,
     staleBefore: Date,
     limit: number,
+    /**
+     * P3, placement reads on: a predicate over `ezil_computers.id` that keeps only
+     * Cloudflare computers (placement.ts `noNonCloudflarePlacement`). Applied BEFORE
+     * the LIMIT, so AWS rows — skipped by this sweep — can never fill the window and
+     * starve the Cloudflare rows behind them.
+     */
+    candidateFilter?: SQL,
 ): Promise<StaleComputerRow[]> {
     const result = await db.execute(sql`
         SELECT id, user_id, last_opened_at
         FROM ezil_computers
         WHERE deleted_at IS NULL
           AND last_opened_at IS NOT NULL
-          AND last_opened_at < ${staleBefore}
+          AND last_opened_at < ${staleBefore.toISOString()}::timestamptz
+          ${candidateFilter ? sql`AND ${candidateFilter}` : sql``}
         ORDER BY last_opened_at ASC
         LIMIT ${limit}
     `);
@@ -157,6 +170,8 @@ export interface SandboxReapResponseBody {
     reaped?: number;
     results?: SandboxReapResultRow[];
     error?: string;
+    /** The AWS background reconcile's summary, when it ran. */
+    aws?: unknown;
 }
 
 export interface SandboxReapDeps {
@@ -176,6 +191,15 @@ export interface SandboxReapDeps {
      * Unset = every candidate is Cloudflare, exactly as before P3.
      */
     providerOf?(computerId: string): Promise<string>;
+    /** P3, set with `providerOf`: the SQL that keeps non-Cloudflare computers out of the candidate window. */
+    candidateFilter?: SQL;
+    /**
+     * The AWS background reconcile (aws-receipts.ts `runAwsBackgroundReconcile`): drives
+     * deleted AWS computers to RETIRED and settles the live fleet. Its own job: it runs
+     * after the bearer check whatever the reap kill switch says (that switch governs
+     * Cloudflare reaping only), and a failure is reported in `aws`, never blocking the reap.
+     */
+    awsReconcile?(): Promise<unknown>;
     /** Derive the sandbox name for a (userId, computerId) pair — MUST match
      * `deriveGuacamoleSandboxId`/`deriveSandboxId`. Injected rather than
      * imported directly so tests never need a real HMAC/Worker config. */
@@ -210,8 +234,18 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
     const authHeader = req.headers.get('authorization');
     if (authHeader !== `Bearer ${deps.cronSecret}`) return NOT_FOUND();
 
+    let aws: SandboxReapResponseBody['aws'];
+    if (deps.awsReconcile) {
+        try {
+            aws = await deps.awsReconcile();
+        } catch (err) {
+            console.error('[sandbox-reap] aws reconcile failed', { m: String((err as Error)?.message ?? err) });
+            aws = { ok: false, error: 'aws_reconcile_failed' };
+        }
+    }
+
     if (reapCronDisabled(deps.killSwitch)) {
-        const body: SandboxReapResponseBody = { ok: true, skipped: true, reason: 'kill_switch_disabled' };
+        const body: SandboxReapResponseBody = { ok: true, skipped: true, reason: 'kill_switch_disabled', ...(aws !== undefined ? { aws } : {}) };
         return Response.json(body);
     }
 
@@ -222,7 +256,7 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
     const staleBefore = new Date(now.getTime() - staleAfterMs);
 
     try {
-        const candidates = await findStaleComputers(deps.db, staleBefore, maxCandidates);
+        const candidates = await findStaleComputers(deps.db, staleBefore, maxCandidates, deps.candidateFilter);
         const results: SandboxReapResultRow[] = [];
         let reaped = 0;
 
@@ -294,11 +328,12 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
             candidates: candidates.length,
             reaped,
             results,
+            ...(aws !== undefined ? { aws } : {}),
         };
         return Response.json(body);
     } catch (err) {
         console.error('[sandbox-reap] cron run failed', { m: String((err as Error)?.message ?? err) });
-        const body: SandboxReapResponseBody = { ok: false, error: 'internal_error' };
+        const body: SandboxReapResponseBody = { ok: false, error: 'internal_error', ...(aws !== undefined ? { aws } : {}) };
         return Response.json(body, { status: 500 });
     }
 }

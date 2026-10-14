@@ -90,8 +90,9 @@ export const RUNNING_CLASS_STATES: readonly PlacementState[] = PLACEMENT_STATES.
  * Legal transitions for `transitionPlacement`. C-3 gives paths, not a full
  * edge list; this is the module's reading of it (reported as a contract gap):
  * every active state may fall to UNCONFIRMED ("every error is recorded on
- * UNCONFIRMED"), a lease may lapse back to STOPPED before start, and only a
- * STOPPED computer is retired. A provision may land RUNNING (first boot).
+ * UNCONFIRMED"), a lease may lapse back to STOPPED before start, and a STOPPED
+ * or RUNNING computer is retired (the lifecycle's retire stops a running instance
+ * gracefully, then terminates it). A provision may land RUNNING (first boot).
  * `STOPPED → LEASED` is NOT here: it exists only
  * through `leasePlacement`, under the admission lock.
  */
@@ -103,13 +104,14 @@ export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly Pla
     LEASED: ['STARTING', 'STOPPED', 'UNCONFIRMED'],
     STARTING: ['MOUNTING', 'UNCONFIRMED'],
     MOUNTING: ['RUNNING', 'UNCONFIRMED'],
-    RUNNING: ['DRAINING', 'UNCONFIRMED'],
+    RUNNING: ['DRAINING', 'RETIRING', 'UNCONFIRMED'],
     DRAINING: ['STOPPING', 'UNCONFIRMED'],
     STOPPING: ['STOPPED', 'UNCONFIRMED'],
     UNCONFIRMED: ['RECOVERING'],
     RECOVERING: ['STOPPED', 'UNCONFIRMED'],
-    // RETIRING → STOPPED is the undo of a retire whose StartExecution was refused: nothing ran.
-    RETIRING: ['RETIRED', 'STOPPED', 'UNCONFIRMED'],
+    // RETIRING → STOPPED / RUNNING is the undo of a retire whose StartExecution was refused:
+    // nothing ran, so the placement returns to the state the retire started from.
+    RETIRING: ['RETIRED', 'STOPPED', 'RUNNING', 'UNCONFIRMED'],
     RETIRED: ['PURGE_ELIGIBLE'],
     PURGE_ELIGIBLE: [],
     WARMING: ['READY', 'UNCONFIRMED'],
@@ -717,6 +719,45 @@ export async function listAwsPlacementsToReconcile(db: PlacementExecutor, limit:
         if (!UUID.test(computerId) || typeof r.owner_user_id !== 'string' || !UUID.test(r.owner_user_id)) throw new PlacementIntegrityError('invalid_row', computerId);
         return { computerId, ownerUserId: r.owner_user_id };
     });
+}
+
+/** States a deleted computer's placement is driven out of, toward RETIRED (`listAwsPlacementsPendingRetire`). */
+export const RETIRE_PENDING_STATES: readonly PlacementState[] = ['RUNNING', 'DRAINING', 'STOPPING', 'STOPPED', 'RETIRING'];
+
+/**
+ * Background retirement input (aws-receipts.ts `reconcileDeletedAwsComputers`): aws-ec2
+ * placements that can still hold an instance while their computer row is soft-deleted
+ * (`computer.delete` succeeds once the retire, or the stop before it, is durably
+ * recorded) or gone (an account deletion cascades the row away). Oldest change first,
+ * bounded. The placement's owner is unchanged; the computer row only says "retire".
+ */
+export async function listAwsPlacementsPendingRetire(db: PlacementExecutor, limit: number): Promise<{ computerId: string; ownerUserId: string }[]> {
+    const states = sql.join(RETIRE_PENDING_STATES.map((s) => sql`${s}`), sql`, `);
+    const rows = rowsOf(
+        await db.execute(sql`/* placement:retire-pending */ SELECT p.computer_id::text AS computer_id, p.owner_user_id::text AS owner_user_id
+            FROM public.ezil_computer_placements p
+            LEFT JOIN public.ezil_computers c ON c.id = p.computer_id
+            WHERE p.provider = 'aws-ec2' AND p.state IN (${states})
+              AND (c.id IS NULL OR c.deleted_at IS NOT NULL)
+            ORDER BY p.updated_at ASC
+            LIMIT ${Math.max(1, Math.min(Math.trunc(limit), 100))}`),
+    );
+    return rows.map((r) => {
+        const computerId = String(r.computer_id);
+        if (!UUID.test(computerId) || typeof r.owner_user_id !== 'string' || !UUID.test(r.owner_user_id)) throw new PlacementIntegrityError('invalid_row', computerId);
+        return { computerId, ownerUserId: r.owner_user_id };
+    });
+}
+
+/**
+ * For the Cloudflare reaper's candidate query (cron/sandbox-reap): true for a computer
+ * with no placement or only a `cloudflare` one. Applied in SQL BEFORE the candidate
+ * LIMIT, so AWS rows can never fill the window and starve Cloudflare reaping. Any
+ * other placement (aws-ec2, unknown, a duplicate including one) excludes the computer:
+ * the reaper never addresses it. Only with placement reads on (the table exists).
+ */
+export function noNonCloudflarePlacement(computerId: SQL): SQL {
+    return sql`NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = ${computerId} AND p.provider <> 'cloudflare')`;
 }
 
 /** States `listAwsPlacementsToReconcile` returns: RUNNING plus every state waiting on a receipt. */

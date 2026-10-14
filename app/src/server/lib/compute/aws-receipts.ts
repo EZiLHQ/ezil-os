@@ -14,12 +14,13 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
-import { AWS_TIERS, type AwsTier } from './aws-config';
+import { AWS_TIERS, isAwsComputersEnabled, readAwsRegions, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
-import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
+import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    listAwsPlacementsPendingRetire,
     listAwsPlacementsToReconcile,
     PlacementIntegrityError,
     readPlacement,
@@ -159,10 +160,21 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     const done: PlacementFields = {
         instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null, lastError: stopping || retiring ? null : p.lastError,
     };
-    // The retire terminated the instance and kept the volume (R11). It starts only from
-    // STOPPED, whose stop already fenced the tunnel and closed the usage row; the close
-    // here is idempotent belt and braces.
+    // Fence GW-1 before a stop or retire is final: the tunnel must not outlive the instance.
+    // Pending until the Worker confirms, so a failure is retried on the next look. No tunnel
+    // client = nothing to fence. Idempotent: a stopped computer's tunnel is already gone.
+    const fence = async (x: Placement): Promise<boolean> => {
+        if (!deps.tunnels) return true;
+        const fenced = await deps.tunnels
+            .deleteTunnel({ userId: x.ownerUserId }, { computerId: x.computerId.toLowerCase(), sandboxId: awsSandboxId(x.ownerUserId, x.computerId), generation: x.generation, leaseEpoch: x.leaseEpoch })
+            .catch(() => ({ ok: false }));
+        return fenced.ok;
+    };
+    // The retire terminated the instance and kept the volume (R11). It may start from
+    // RUNNING (the retire stops the instance first), so it fences the tunnel and closes
+    // the usage row here; both are idempotent after a stop already did them.
     if (retiring) {
+        if (!(await fence(p))) return;
         await step(p, 'RETIRED', done, close);
         return;
     }
@@ -174,14 +186,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     if (stopping) {
         if (p.state === 'DRAINING') p = await step(p, 'STOPPING');
         if (!p) return;
-        // Keep the stop pending until GW-1 confirms fencing, so failures can be retried.
-        // No tunnel client = nothing to fence: the stop still completes.
-        if (deps.tunnels) {
-            const fenced = await deps.tunnels
-                .deleteTunnel({ userId: p.ownerUserId }, { computerId: p.computerId.toLowerCase(), sandboxId: awsSandboxId(p.ownerUserId, p.computerId), generation: p.generation, leaseEpoch: p.leaseEpoch })
-                .catch(() => ({ ok: false }));
-            if (!fenced.ok) return;
-        }
+        if (!(await fence(p))) return;
         await step(p, 'STOPPED', done, close);
         return;
     }
@@ -281,4 +286,91 @@ export async function reconcileAwsFleet(
         }
     }
     return { checked, stopsStarted };
+}
+
+// ── Background retirement of deleted computers (§6, R11) ─────────────────
+
+/**
+ * Start the lifecycle `retire` of a RUNNING or STOPPED placement as the reconciler (no
+ * session: the computer is deleted). Same order as a user retire: the job is recorded
+ * by the CAS first, so the authority check finds it; a refused StartExecution returns
+ * the placement to the state it came from. Returns true when a retire was started.
+ */
+export async function startRetireAsReconciler(deps: GuestStopDeps, p: Placement, deployment: LifecycleDeployment): Promise<boolean> {
+    if ((p.state !== 'RUNNING' && p.state !== 'STOPPED') || p.provider !== 'aws-ec2' || !deps.starter) return false;
+    if (!p.region || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return false;
+    let work: LifecycleWork;
+    try {
+        work = buildLifecycleWork(currentGenerationIntent(p, 'retire', deployment, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
+    } catch (error) {
+        if (error instanceof LifecycleIntentInvalidError) return false;
+        throw error;
+    }
+    const retiring = await transitionPlacementAsReconciler(deps.db, {
+        computerId: p.computerId, expected: p, to: 'RETIRING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+    });
+    if (!retiring.ok) return false;
+    try {
+        await deps.starter.start(p.region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
+    } catch {
+        await transitionPlacementAsReconciler(deps.db, {
+            computerId: p.computerId, expected: retiring.placement, to: p.state, fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: 'retire_start_failed' },
+        });
+        return false;
+    }
+    return true;
+}
+
+/** Most deleted computers one background pass settles. */
+export const RETIRE_RECONCILE_LIMIT = 20;
+
+/**
+ * Drive every deleted computer's placement to RETIRED: apply its current receipt (a
+ * recorded stop or retire), then start the retire of one that is RUNNING or STOPPED.
+ * `computer.delete` soft-deletes as soon as such a job is recorded, so one user delete
+ * completes without the user returning. One bad row never blocks the rest.
+ */
+export async function reconcileDeletedAwsComputers(
+    deps: GuestStopDeps,
+    deployments: Readonly<Record<string, LifecycleDeployment>>,
+    limit = RETIRE_RECONCILE_LIMIT,
+): Promise<{ checked: number; retiresStarted: number; retired: number }> {
+    let checked = 0;
+    let retiresStarted = 0;
+    let retired = 0;
+    for (const { computerId } of await listAwsPlacementsPendingRetire(deps.db, limit)) {
+        try {
+            const { record } = await readPlacement(deps.db, computerId);
+            const deployment = record && record.provider === 'aws-ec2' ? deployments[record.region ?? ''] : undefined;
+            if (!record || !deployment) continue;
+            checked += 1;
+            await applyLifecycleReceipt(deps, record, deployment);
+            const { record: now } = await readPlacement(deps.db, computerId);
+            if (!now) continue;
+            if (now.state === 'RETIRED') retired += 1;
+            else if (await startRetireAsReconciler(deps, now, deployment)) retiresStarted += 1;
+        } catch (error) {
+            if (!(error instanceof PlacementIntegrityError)) throw error;
+        }
+    }
+    return { checked, retiresStarted, retired };
+}
+
+/**
+ * The cron job (cron/sandbox-reap): with AWS on and every configured region's
+ * deployment readable, settle deleted computers, then the live fleet (receipts and
+ * guest idle stops, `reconcileAwsFleet`). AWS off answers `skipped`, no statement.
+ */
+export async function runAwsBackgroundReconcile(
+    env: Env,
+    deps: GuestStopDeps,
+): Promise<{ ok: true; skipped: string } | { ok: true; deleted: Awaited<ReturnType<typeof reconcileDeletedAwsComputers>>; fleet: Awaited<ReturnType<typeof reconcileAwsFleet>> }> {
+    if (!isAwsComputersEnabled(env)) return { ok: true, skipped: 'aws_disabled' };
+    const regions = readAwsRegions(env);
+    if (!regions.ok) return { ok: true, skipped: 'aws_config_invalid' };
+    const d = readLifecycleDeployments(env, regions.regions.map((r) => r.name));
+    if (!d.ok) return { ok: true, skipped: 'aws_config_invalid' };
+    const deleted = await reconcileDeletedAwsComputers(deps, d.deployments);
+    const fleet = await reconcileAwsFleet(deps, d.deployments);
+    return { ok: true, deleted, fleet };
 }

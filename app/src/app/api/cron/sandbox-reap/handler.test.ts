@@ -1,4 +1,8 @@
+import { sql } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
+
+import { noNonCloudflarePlacement } from '@/server/lib/compute/placement';
 
 import {
     DEFAULT_MAX_REAP_PER_RUN,
@@ -308,5 +312,84 @@ describe('P3: the Cloudflare sweep never addresses a non-Cloudflare computer', (
         const text = sqlText(db);
         expect(text).toMatch(/FROM ezil_computers/);
         expect(text).not.toMatch(/placement/i);
+    });
+});
+
+describe('P3: AWS rows never starve Cloudflare reaping (Codex 4275269660)', () => {
+    const rendered = (db: SandboxReapDb) => {
+        const q = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+        return new PgDialect().sqlToQuery(q).sql.replace(/\s+/g, ' ');
+    };
+
+    it('with placement reads on, the non-Cloudflare filter is IN the candidate query, before ORDER BY / LIMIT', async () => {
+        const db = makeDb([]);
+        await findStaleComputers(db, new Date(), 200, noNonCloudflarePlacement(sql`ezil_computers.id`));
+        const text = rendered(db);
+        const filter = text.indexOf("NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = ezil_computers.id AND p.provider <> 'cloudflare')");
+        expect(filter).toBeGreaterThan(text.indexOf('WHERE deleted_at IS NULL'));
+        expect(filter).toBeLessThan(text.indexOf('ORDER BY'));
+        expect(text.indexOf('ORDER BY')).toBeLessThan(text.indexOf('LIMIT'));
+    });
+
+    it('placement reads off: no placement table is named (the table may not exist)', async () => {
+        const db = makeDb([]);
+        await findStaleComputers(db, new Date(), 200);
+        expect(rendered(db)).not.toMatch(/placements|NOT EXISTS/);
+    });
+
+    it('the handler passes its candidateFilter to the candidate query', async () => {
+        const secret = 'x'.repeat(32);
+        const db = makeDb([]);
+        await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, candidateFilter: noNonCloudflarePlacement(sql`ezil_computers.id`) }));
+        expect(rendered(db)).toMatch(/AND NOT EXISTS \(SELECT 1 FROM public\.ezil_computer_placements p/);
+    });
+});
+
+describe('the AWS background reconcile rides this cron as its own job', () => {
+    const secret = 'x'.repeat(32);
+
+    it('runs after the bearer check, reports its summary, and the reap still runs', async () => {
+        const awsReconcile = vi.fn().mockResolvedValue({ ok: true, deleted: { checked: 1, retiresStarted: 1, retired: 0 } });
+        const db = makeDb([]);
+        const body = await (await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, awsReconcile }))).json();
+        expect(awsReconcile).toHaveBeenCalledTimes(1);
+        expect(body).toMatchObject({ ok: true, aws: { ok: true, deleted: { retiresStarted: 1 } } });
+        expect(db.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('never runs for an unauthenticated caller', async () => {
+        const awsReconcile = vi.fn();
+        expect((await handleSandboxReap(req('Bearer nope'), baseDeps({ cronSecret: secret, awsReconcile }))).status).toBe(404);
+        expect(awsReconcile).not.toHaveBeenCalled();
+    });
+
+    it('a failure is reported in `aws` and never blocks the Cloudflare reap', async () => {
+        const awsReconcile = vi.fn().mockRejectedValue(new Error('throttled'));
+        const db = makeDb([]);
+        const res = await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, awsReconcile }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ ok: true, aws: { ok: false, error: 'aws_reconcile_failed' } });
+        expect(db.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('the reap kill switch stops reaping only: retirement still runs', async () => {
+        const awsReconcile = vi.fn().mockResolvedValue({ ok: true, skipped: 'aws_disabled' });
+        const db = makeDb([]);
+        const body = await (await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, db, killSwitch: 'off', awsReconcile }))).json();
+        expect(body).toMatchObject({ skipped: true, reason: 'kill_switch_disabled', aws: { ok: true } });
+        expect(awsReconcile).toHaveBeenCalledTimes(1);
+        expect(db.execute).not.toHaveBeenCalled();
+    });
+});
+
+describe('the stale cutoff is bound as an ISO timestamptz, never a raw Date', () => {
+    it('drizzle + postgres-js reject a raw Date param ("Received an instance of Date"); the query binds a string', async () => {
+        const db = makeDb([]);
+        const cutoff = new Date('2026-10-13T04:08:00.000Z');
+        await findStaleComputers(db, cutoff, 200);
+        const { sql: text, params } = new PgDialect().sqlToQuery((db.execute as ReturnType<typeof vi.fn>).mock.calls[0]![0]);
+        expect(params[0]).toBe('2026-10-13T04:08:00.000Z');
+        expect(params.some((p) => p instanceof Date)).toBe(false);
+        expect(text).toMatch(/last_opened_at < \$1::timestamptz/);
     });
 });
