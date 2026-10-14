@@ -184,9 +184,14 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
       return new Response('desktop', { status: 200 });
     }) as typeof fetch;
     const now = Math.floor(Date.now() / 1000);
-    const d = await worker.fetch(new Request(`https://aws-8181-${SID}.ezil.work/index.html`, { headers: { cookie } }), e);
+    // First visit: the auto-connect redirect adds neko's usr/embed and a non-secret pwd placeholder.
+    const r = await worker.fetch(new Request(`https://aws-8181-${SID}.ezil.work/index.html`, { headers: { cookie } }), e);
+    expect(r.status).toBe(302);
+    expect(r.headers.get('location')).toBe('/index.html?usr=EZiL&pwd=ezil-preview&embed=1');
+    expect(seen.length).toBe(0);
+    const d = await worker.fetch(new Request(`https://aws-8181-${SID}.ezil.work/index.html?usr=EZiL&pwd=ezil-preview&embed=1`, { headers: { cookie } }), e);
     expect(d.status).toBe(200);
-    expect(seen[0]!.url).toBe(`https://c-${SID}-g1-e2.${ORIGIN_ZONE}/__p/8181/index.html`);
+    expect(seen[0]!.url).toBe(`https://c-${SID}-g1-e2.${ORIGIN_ZONE}/__p/8181/index.html?usr=EZiL&pwd=ezil-preview&embed=1`);
     const v = await verifyGatewayHeader(seen[0]!.headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, 'GET', '/__p/8181/index.html', now);
     expect(v).toEqual({ ok: true });
   });

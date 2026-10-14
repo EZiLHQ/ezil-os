@@ -202,6 +202,9 @@ def relay_env(c):
         "EZIL_RELAY_EXPIRES_AT": str(c["expiresAt"]),
         "NEKO_MEMBER_MULTIUSER_USER_PASSWORD": c["neko"]["user"],
         "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD": c["neko"]["admin"],
+        # Legacy mode overrides the V3 keys; match the CF launch env.
+        "NEKO_PASSWORD": c["neko"]["user"],
+        "NEKO_PASSWORD_ADMIN": c["neko"]["admin"],
     }
 
 

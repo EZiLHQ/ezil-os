@@ -212,11 +212,28 @@ describe('handleAwsBrowserHost', () => {
       expect(f.calls.length).toBe(0);
     }
   });
-  it('valid cookie and verified record: forwarded to the record epoch origin', async () => {
-    const { f, d } = deps();
+  it('auto-connects across tunnel epochs without a credential in the browser URL', async () => {
+    let epoch = 2;
+    const { f, d } = deps({ lookup: async () => record({ leaseEpoch: epoch }) });
     const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
-    expect((await call('/', d, { headers: { cookie } }))!.status).toBe(200);
-    expect(f.calls[0]!.url).toBe(`https://c-${SID}-g1-e2.${ZONE}/__p/8181/`);
+    const redirect = (await call('/', d, { headers: { cookie } }))!;
+    expect(redirect.status).toBe(302);
+    const path = '/?usr=EZiL&pwd=ezil-preview&embed=1';
+    expect(redirect.headers.get('location')).toBe(path);
+    expect(redirect.headers.get('cache-control')).toBe('no-store');
+    expect(f.calls.length).toBe(0);
+    expect((await call(path, d, { headers: { cookie } }))!.status).toBe(200);
+    const { deriveNekoCredentials } = await import('./hmac');
+    const { user } = await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID);
+    expect(path).not.toContain(user);
+    const ws = '/ws?password=ezil-preview&username=EZiL';
+    for (epoch of [2, 3]) {
+      await call(ws, d, { headers: { cookie, upgrade: 'websocket' } });
+      const target = new URL(f.calls[f.calls.length - 1]!.url);
+      expect(target.hostname).toBe(`c-${SID}-g1-e${epoch}.${ZONE}`);
+      expect(target.searchParams.get('password')).toBe(user);
+      expect(target.searchParams.get('username')).toBe('EZiL');
+    }
   });
 });
 

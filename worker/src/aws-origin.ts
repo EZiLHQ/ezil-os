@@ -25,6 +25,7 @@ import { relayFailureResult, type RelayState } from './relay-refresh';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
+  deriveNekoCredentials,
   mintPreviewBootstrapToken,
   mintPreviewCookie,
   timingSafeEqualHex,
@@ -304,6 +305,37 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   if (!deps.zone) return unavailable();
   const record = await deps.lookup(sandboxId);
   if (!record || record.sandboxId !== sandboxId || !record.originVerified) return unavailable();
+  if (port === AWS_DESKTOP_PORT && request.method === 'GET') {
+    // Reuse CF's usr/pwd/embed auto-connect, but keep the real password
+    // out of browser URLs, history and client-side WebSocket diagnostics.
+    const placeholder = 'ezil-preview';
+    const upgrade = request.headers.get('upgrade')?.toLowerCase() === 'websocket';
+    if (!upgrade && (url.pathname === '/' || url.pathname === '/index.html')) {
+      const dest = new URL(url);
+      dest.searchParams.set('usr', 'EZiL');
+      dest.searchParams.set('pwd', placeholder);
+      dest.searchParams.set('embed', '1');
+      if (dest.search !== url.search) {
+        return new Response(null, { status: 302, headers: {
+          location: dest.pathname + dest.search,
+          'cache-control': 'no-store', 'referrer-policy': 'no-referrer',
+        } });
+      }
+    }
+    if (upgrade && url.searchParams.get('password') === placeholder) {
+      // The cookie above authorizes this login; the placeholder is not a credential.
+      try {
+        const { user } = await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: secrets[0] }, sandboxId);
+        const upstream = new URL(url);
+        upstream.searchParams.set('password', user);
+        upstream.searchParams.set('username', 'EZiL');
+        return await proxyToAwsOrigin(request, upstream, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
+      } catch {
+        // A fetch exception may contain its URL: never propagate or log it.
+        return unavailable();
+      }
+    }
+  }
   return proxyToAwsOrigin(request, url, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
 }
 
