@@ -17,7 +17,8 @@
         "c6i.xlarge"
       ],
       "storage": {
-        "rootGiB": 20,
+        "rootDeviceName": "/dev/sda1",
+        "rootGiB": 30,
         "dataMinGiB": 20,
         "dataMaxGiB": 100
       },

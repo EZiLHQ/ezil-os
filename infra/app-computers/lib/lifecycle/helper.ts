@@ -14,7 +14,7 @@ const fail=(code='lifecycle_unconfirmed'):never=>{throw new Error(code)};
 const wait=(phase:Phase)=>({decision:'wait',phase});
 const instanceId=(v:string|undefined):v is string=>/^i-[a-f0-9]{17}$/.test(v??'');
 const volumeId=(v:string|undefined):v is string=>/^vol-[a-f0-9]{17}$/.test(v??'');
-const ROOT_DEVICE='/dev/xvda',DATA_DEVICE='/dev/sdf';
+const DATA_DEVICE='/dev/sdf';
 const dataSizeValid=(size:number|undefined,d:Settings['deployment'])=>
     Number.isInteger(size)&&size!>=d.storage.dataMinGiB&&size!<=d.storage.dataMaxGiB;
 
@@ -91,7 +91,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
                     }
                     if(!['initial','stopped'].includes(phase))return wait(phase);
                     assertAttached(source,v,sourceId!);
-                    assertOnlyExpectedDisks(source,v);
+                    assertOnlyExpectedDisks(source,v,d.storage.rootDeviceName);
                     return action('terminateInstances',{InstanceIds:[sourceId]});
                 }
                 if(status==='stopping')return wait(phase);
@@ -167,11 +167,11 @@ function assertIdentity(instance:Instance,tags:Record<string,string>,i:Lifecycle
 }
 /** Terminate guard: an instance carrying anything beyond its root disk and
  * this computer's data disk is never terminated; the extra disk may be data. */
-export function assertOnlyExpectedDisks(instance:Instance,v:Volume){
+export function assertOnlyExpectedDisks(instance:Instance,v:Volume,rootDeviceName:Settings['deployment']['storage']['rootDeviceName']){
     const mappings=instance.BlockDeviceMappings;
-    if(!Array.isArray(mappings)||instance.RootDeviceName!==ROOT_DEVICE
-        ||mappings.filter(m=>m.DeviceName===ROOT_DEVICE).length>1
-        ||mappings.some(m=>m.DeviceName!==ROOT_DEVICE&&!(m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===v.VolumeId)))return fail('lifecycle_unexpected_disk');
+    if(!Array.isArray(mappings)||instance.RootDeviceName!==rootDeviceName
+        ||mappings.filter(m=>m.DeviceName===rootDeviceName).length>1
+        ||mappings.some(m=>m.DeviceName!==rootDeviceName&&!(m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===v.VolumeId)))return fail('lifecycle_unexpected_disk');
 }
 async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies){
     const rows=await deps.instances([id]);if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
@@ -185,6 +185,7 @@ function assertAttached(instance:Instance,v:Volume,id:string){
 function assertEffectiveInstance(v:Instance,i:LifecycleIntent){
     const d=i.deployment;
     if(v.ImageId!==d.amiId||v.InstanceType!==i.instanceType||!d.instanceTypes.includes(v.InstanceType)||v.Architecture!=='x86_64'||v.RootDeviceType!=='ebs'||v.SubnetId!==d.subnetId
+        ||v.RootDeviceName!==d.storage.rootDeviceName
         ||v.IamInstanceProfile!==undefined||v.SecurityGroups?.length!==1||v.SecurityGroups[0]?.GroupId!==d.securityGroupId
         ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1
         ||v.MetadataOptions.InstanceMetadataTags!=='disabled'||v.HibernationOptions?.Configured===true)return fail('lifecycle_instance_invalid');
@@ -193,9 +194,9 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
     const d=i.deployment;
     const [image,template]=await Promise.all([deps.image(d.amiId),deps.template(d.launchTemplateId,d.launchTemplateVersion)]);
     const t=template?.LaunchTemplateData;
-    if(image?.ImageId!==d.amiId||image.Architecture!=='x86_64'||image.RootDeviceType!=='ebs'||image.RootDeviceName!=='/dev/xvda'
+    if(image?.ImageId!==d.amiId||image.Architecture!=='x86_64'||image.RootDeviceType!=='ebs'||image.RootDeviceName!==d.storage.rootDeviceName
         ||image.State!=='available'||image.VirtualizationType!=='hvm'||image.BlockDeviceMappings?.length!==1
-        ||image.BlockDeviceMappings[0]?.DeviceName!=='/dev/xvda'||!image.BlockDeviceMappings[0]?.Ebs?.VolumeSize
+        ||image.BlockDeviceMappings[0]?.DeviceName!==d.storage.rootDeviceName||!image.BlockDeviceMappings[0]?.Ebs?.VolumeSize
         ||image.BlockDeviceMappings[0].Ebs.VolumeSize>d.storage.rootGiB||!t||template?.LaunchTemplateId!==d.launchTemplateId
         ||String(template.VersionNumber)!==d.launchTemplateVersion)return fail('lifecycle_launch_invalid');
     const allowed=['ImageId','InstanceType','SecurityGroupIds','EbsOptimized','Monitoring','MetadataOptions','BlockDeviceMappings','TagSpecifications',
@@ -203,7 +204,7 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
     if(Object.keys(t).some(k=>!allowed.includes(k))||t.ImageId!==d.amiId||(t.InstanceType!==undefined&&!d.instanceTypes.includes(t.InstanceType as never))
         ||t.HibernationOptions?.Configured===true
         ||!equal(t.SecurityGroupIds,[d.securityGroupId])
-        ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!=='/dev/xvda')return fail('lifecycle_launch_invalid');
+        ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!==d.storage.rootDeviceName)return fail('lifecycle_launch_invalid');
     return {LaunchTemplate:{LaunchTemplateId:d.launchTemplateId,Version:d.launchTemplateVersion},ImageId:d.amiId,
         InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),UserData:i.userData!,
         SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],
@@ -211,7 +212,7 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
         HibernationOptions:{Configured:false},
         EbsOptimized:true,Monitoring:{Enabled:false},
         // R3: the root disk is disposable (OS + pre-pulled image); the data disk is retained.
-        BlockDeviceMappings:[{DeviceName:ROOT_DEVICE,Ebs:{VolumeType:'gp3',VolumeSize:d.storage.rootGiB,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
+        BlockDeviceMappings:[{DeviceName:d.storage.rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:d.storage.rootGiB,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
         TagSpecifications:[{ResourceType:'instance',Tags:tagList(tagsFor(i))},{ResourceType:'volume',Tags:tagList({...tagsFor(i),'ezil:disk-kind':'root'})}]};
 }
 let helper:ReturnType<typeof createLifecycleHelper>|undefined;

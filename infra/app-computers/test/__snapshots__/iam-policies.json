@@ -224,7 +224,7 @@
               "ec2:Encrypted": "true"
             },
             "NumericLessThanEquals": {
-              "ec2:VolumeSize": "20"
+              "ec2:VolumeSize": "30"
             },
             "ArnEquals": {
               "ec2:LaunchTemplate": "arn:aws:ec2:ap-south-1:123456789012:launch-template/lt-11111111111111111"

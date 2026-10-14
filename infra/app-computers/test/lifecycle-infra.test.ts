@@ -65,7 +65,7 @@ test('item 4/6: RunInstances requires IMDSv2, hop limit <= 1, metadata tags off,
     const root = allows(all, 'ec2:RunInstances', /:volume\/\*/);
     assert.equal(root.length, 1);
     assert.equal(root[0]!.Condition!.Bool!['ec2:Encrypted'], 'true');
-    assert.equal(root[0]!.Condition!.NumericLessThanEquals!['ec2:VolumeSize'], '20');
+    assert.equal(root[0]!.Condition!.NumericLessThanEquals!['ec2:VolumeSize'], '30');
 });
 
 test('item 5/6: CreateVolume is pinned to the ZoneId, encrypted, gp3 and the configured size range', () => {

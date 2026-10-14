@@ -266,7 +266,7 @@ const CREATE_ACTION: Record<string, string> = {
 function stacks() {
     const f = lifecycleFixture(), app = new App();
     const foundationStack = new AppComputerFoundationStack(app, 'ezil-pilot-foundation', { env: { region: R }, synthesizer: new BootstraplessSynthesizer(),
-        config: { stage: 'pilot', region: R, zoneIds: ['aps1-az1'], instanceType: 'm6i.large', rootVolumeGiB: 20 } });
+        config: { stage: 'pilot', region: R, zoneIds: ['aps1-az1'], instanceType: 'm6i.large', rootDeviceName: '/dev/sda1', rootVolumeGiB: 30 } });
     tagWorkload(foundationStack, 'pilot');
     const lifecycleStack = new Stack(app, 'ezil-pilot-lifecycle', { env: { account: A, region: R }, synthesizer: workloadSynthesizer({ assetBucketName: cfg.assetBucketName }) });
     const lifecycle = new ComputerLifecycle(lifecycleStack, 'Lifecycle', { settings: f.settings, authorityKeyArn: `arn:aws:kms:${R}:${A}:key/22222222-2222-4222-8222-222222222222` });

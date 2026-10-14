@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { App, BootstraplessSynthesizer, assertions } from 'aws-cdk-lib';
 import { AmiConfigSchema, AmiPipelineStack, type AmiConfig } from '../lib/ami-pipeline.js';
+import { DEFAULT_STORAGE, LifecycleDeploymentSchema } from '../lib/lifecycle/deployment.js';
+import { FoundationConfigSchema } from '../lib/foundation.js';
 
 const config: AmiConfig = { namespace: 'pilot', accountId: '123456789012', region: 'ap-south-1', version: '1.0.0' };
 const tags = { 'ezil:namespace': 'pilot' };
@@ -36,7 +38,10 @@ test('AMI role and profile equal the complete reviewed IAM specification', () =>
             ] } },
             { Effect: 'Allow', Action: 'ecr:GetAuthorizationToken', Resource: '*' },
             { Effect: 'Allow', Action: ['ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability'],
-                Resource: { Ref: 'ApplicationImageRepositoryArn' } },
+                Resource: { 'Fn::Sub': [
+                    'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryName}',
+                    { RepositoryName: { 'Fn::Select': [1, { 'Fn::Split': ['.amazonaws.com/', { Ref: 'ApplicationImageRepositoryUri' }] }] } },
+                ] } },
         ] } }],
         Tags: [{ Key: 'ezil:namespace', Value: 'pilot' }],
     });
@@ -75,18 +80,33 @@ test('AMI component embeds the checked-in YAML; recipe resolves Ubuntu via SSM a
     }
     assert.equal(t.Parameters.SubnetId.Type, 'AWS::EC2::Subnet::Id');
     assert.equal(t.Parameters.SecurityGroupId.Type, 'AWS::EC2::SecurityGroup::Id');
-    const inputs = ['AgentSrcS3Uri', 'DesktopImageRef', 'DesktopImageId', 'CloudflaredVersion', 'CloudflaredSha256', 'EnrollUrl'];
-    for (const key of inputs) {
+    const inputs = ['AgentSrcS3Uri', 'DesktopImageId', 'CloudflaredVersion', 'CloudflaredSha256', 'EnrollUrl'];
+    for (const key of [...inputs, 'ApplicationImageRepositoryUri', 'DesktopImageDigest']) {
         assert.equal(t.Parameters[key].Type, 'String');
         assert.equal(t.Parameters[key].Default, undefined, `${key} must be explicit`);
     }
     assert.deepEqual(t.Resources.Recipe.Properties, {
         Name: 'ezil-host-pilot', Version: '1.0.0', ParentImage: { Ref: 'UbuntuAmiId' }, Tags: tags,
         Components: [{ ComponentArn: { Ref: 'Component' },
-            Parameters: inputs.map(Name => ({ Name, Value: [{ Ref: Name }] })) }],
+            Parameters: [...inputs.map(Name => ({ Name, Value: [{ Ref: Name }] })),
+                { Name: 'DesktopImageRef', Value: [{ 'Fn::Sub': ['${RepositoryUri}@${Digest}', {
+                    RepositoryUri: { Ref: 'ApplicationImageRepositoryUri' }, Digest: { Ref: 'DesktopImageDigest' },
+                }] }] }] }],
         BlockDeviceMappings: [{ DeviceName: '/dev/sda1',
             Ebs: { VolumeType: 'gp3', VolumeSize: 30, Encrypted: true, DeleteOnTermination: true } }],
     });
+});
+
+test('Ubuntu recipe root fits lifecycle and foundation defaults and example configurations', () => {
+    const root = template().toJSON().Resources.Recipe.Properties.BlockDeviceMappings[0];
+    const lifecycle = LifecycleDeploymentSchema.parse(JSON.parse(readFileSync(join(__dirname, '../config/lifecycle.example.json'), 'utf8')).settings.deployment);
+    const foundation = FoundationConfigSchema.parse(JSON.parse(readFileSync(join(__dirname, '../config/foundation.example.json'), 'utf8')));
+    for (const storage of [DEFAULT_STORAGE, lifecycle.storage]) {
+        assert.equal(root.DeviceName, storage.rootDeviceName);
+        assert.ok(root.Ebs.VolumeSize <= storage.rootGiB);
+    }
+    assert.equal(root.DeviceName, foundation.rootDeviceName);
+    assert.ok(root.Ebs.VolumeSize <= foundation.rootVolumeGiB);
 });
 
 test('AMI distribution stays private in the configured region; pipeline has no schedule or deploy-time bake', () => {
@@ -114,14 +134,23 @@ test('AMI inputs reject unpinned images, foreign repositories, broad tarball pat
     const accepts = (key: string, value: string) => new RegExp(`^(?:${parameters[key].AllowedPattern})$`).test(value);
     const digest = 'a'.repeat(64);
     assert.ok(accepts('AgentSrcS3Uri', `s3://deploy-assets/ami/host-agent-${'b'.repeat(40)}.tgz`));
-    assert.ok(accepts('DesktopImageRef', `123456789012.dkr.ecr.ap-south-1.amazonaws.com/desktop@sha256:${digest}`));
-    assert.ok(accepts('ApplicationImageRepositoryArn', 'arn:aws:ecr:ap-south-1:123456789012:repository/desktop'));
+    assert.ok(accepts('DesktopImageDigest', `sha256:${digest}`));
+    assert.ok(accepts('ApplicationImageRepositoryUri', '123456789012.dkr.ecr.ap-south-1.amazonaws.com/team/desktop'));
+    assert.equal(parameters.DesktopImageDigest.AllowedPattern, '^sha256:[0-9a-f]{64}$');
+    assert.equal(parameters.DesktopImageRef, undefined, 'the image reference must be derived');
+    assert.equal(parameters.ApplicationImageRepositoryArn, undefined, 'pull permission must be derived');
     assert.ok(accepts('EnrollUrl', 'https://os.ezil.work/api/compute/aws/enroll'));
     for (const [key, value] of [
         ['AssetBucketName', '*'], ['AgentSrcS3Uri', 's3://deploy-assets/other/source.tgz'],
-        ['ApplicationImageRepositoryArn', 'arn:aws:ecr:ap-south-1:123456789012:repository/*'],
-        ['ApplicationImageRepositoryArn', 'arn:aws:ecr:ap-south-1:210987654321:repository/desktop'],
-        ['DesktopImageRef', '123456789012.dkr.ecr.ap-south-1.amazonaws.com/desktop:latest'],
+        ['ApplicationImageRepositoryUri', '123456789012.dkr.ecr.ap-south-1.amazonaws.com/*'],
+        ['ApplicationImageRepositoryUri', '210987654321.dkr.ecr.ap-south-1.amazonaws.com/desktop'],
+        ['ApplicationImageRepositoryUri', '123456789012.dkr.ecr.eu-west-2.amazonaws.com/desktop'],
+        ['ApplicationImageRepositoryUri', '123456789012.dkr.ecr.ap-south-1.amazonaws.com/desktop:latest'],
+        ['ApplicationImageRepositoryUri', '123456789012.dkr.ecr.ap-south-1.amazonaws.com/team.amazonaws.com/desktop'],
+        ['ApplicationImageRepositoryUri', `123456789012.dkr.ecr.ap-south-1.amazonaws.com/desktop@sha256:${digest}`],
+        ['DesktopImageDigest', 'latest'], ['DesktopImageDigest', `sha256:${'a'.repeat(63)}`],
+        ['DesktopImageDigest', `sha256:${'a'.repeat(65)}`], ['DesktopImageDigest', `sha256:${'A'.repeat(64)}`],
+        ['DesktopImageDigest', `sha512:${digest}`], ['DesktopImageDigest', `sha256:${digest}; echo bad`],
         ['DesktopImageId', 'sha256:short'], ['CloudflaredSha256', 'latest'],
         ['CloudflaredVersion', "2026.1.1'; echo bad"], ['EnrollUrl', "https://example.com/'; echo bad"],
     ]) assert.equal(accepts(key!, value!), false, `${key}: ${value}`);

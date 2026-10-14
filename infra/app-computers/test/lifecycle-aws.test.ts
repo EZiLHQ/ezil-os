@@ -57,7 +57,8 @@ test('the actual EC2 SDK accepts allocation parameters and omits any invented St
         assert.equal(requests[1]!.get('LaunchTemplate.Version'),'1');assert.equal(requests[1]!.get('ClientToken'),token(f.digest,'instance'));
         assert.equal(requests[0]!.get('AvailabilityZoneId'),'aps1-az1');assert.equal(requests[0]!.get('AvailabilityZone'),null);
         assert.equal(requests[0]!.get('Size'),'20');
-        assert.equal(requests[1]!.get('BlockDeviceMapping.1.Ebs.VolumeSize'),'20');assert.equal(requests[1]!.get('InstanceType'),'m6i.large');
+        assert.equal(requests[1]!.get('BlockDeviceMapping.1.DeviceName'),'/dev/sda1');
+        assert.equal(requests[1]!.get('BlockDeviceMapping.1.Ebs.VolumeSize'),'30');assert.equal(requests[1]!.get('InstanceType'),'m6i.large');
         assert.equal(requests[1]!.get('MetadataOptions.InstanceMetadataTags'),'disabled');assert.equal(requests[1]!.get('HibernationOptions.Configured'),'false');
         assert.equal(requests[1]!.get('IamInstanceProfile.Arn'),null);
         assert.equal(requests[2]!.get('ClientToken'),null);assert.equal(requests[3]!.get('SkipOsShutdown'),'false');

@@ -65,6 +65,9 @@ const machineName = (versionArn: string) => versionArn.slice(0, versionArn.lastI
 
 const StorageSchema = z
     .object({
+        // Infra parity (deployment.ts StorageSchema): optional here and passed through
+        // unchanged; infra applies its '/dev/sda1' default when it is absent.
+        rootDeviceName: z.enum(['/dev/sda1', '/dev/xvda']).optional(),
         rootGiB: z.number().int().min(8).max(64),
         dataMinGiB: z.number().int().min(1).max(16384),
         dataMaxGiB: z.number().int().min(1).max(16384),

@@ -42,11 +42,12 @@ The example files in `config/` hold public placeholders only.
 | `region` | string | commercial region, e.g. `ap-south-1` |
 | `zoneIds` | string[1..3] | each matches `^[a-z]{2,4}\d-az\d+$` and belongs to `region` (e.g. `aps1-az1`). One subnet per ZoneId. |
 | `instanceType` | `t3a.medium` \| `t3.medium` \| `m6i.large` \| `c6i.xlarge` | launch-template default; the workflow sets the per-computer type (and, for T types, the credit option) |
-| `rootVolumeGiB` | int 8..64 | default 20 |
+| `rootDeviceName` | `/dev/sda1` or `/dev/xvda` | default `/dev/sda1`; must match lifecycle storage |
+| `rootVolumeGiB` | int 8..64 | default 30 |
 
 ```json
 { "stage": "pilot", "region": "ap-south-1", "zoneIds": ["aps1-az1"],
-  "instanceType": "m6i.large", "rootVolumeGiB": 20 }
+  "instanceType": "m6i.large", "rootDeviceName": "/dev/sda1", "rootVolumeGiB": 30 }
 ```
 
 ### Lifecycle: `EZIL_LIFECYCLE_CONFIG`
@@ -63,7 +64,8 @@ app copy fails that test.
 | `region`, `zoneId` | same rules as the foundation; one ZoneId per lifecycle deployment |
 | `subnetId` | the foundation subnet for that ZoneId |
 | `instanceTypes` | a non-empty subset of the closed allowlist `{t3a.medium, t3.medium, m6i.large, c6i.xlarge}`. A deployment can narrow it, never extend it. To serve the free tier it must list `t3a.medium` (and `t3.medium` as the fallback); `config/lifecycle.example.json` lists both tiers' types plus the benchmark type. |
-| `storage.rootGiB` | root disk size (default 20) |
+| `storage.rootDeviceName` | `/dev/sda1` (default) or `/dev/xvda`; must match the AMI and launch template |
+| `storage.rootGiB` | root disk size (default 30); must be at least the AMI root snapshot size |
 | `storage.dataMinGiB`, `storage.dataMaxGiB` | allowed data-volume range (defaults 20 and 100) |
 | ARNs | must name the configured region and account |
 
@@ -617,11 +619,12 @@ role has the two required AWS-managed policies plus inline read access to
 `ami/host-agent-*.tgz` and the foundation ECR repository. Runtime hosts have no role.
 AMI distribution stays private in the configured region.
 
-**Known launch blocker:** Canonical Ubuntu uses `/dev/sda1` and this recipe makes
-a 30 GiB root. The current lifecycle requires `/dev/xvda` and defaults to 20 GiB
-(`lib/lifecycle/helper.ts` and `deployment.ts`); the foundation also maps `/dev/xvda`.
-Step (f) updates the AMI parameter only. Align those launch contracts in a separate
-reviewed change before attempting lifecycle launches.
+Canonical Ubuntu uses `/dev/sda1` and this recipe makes a 30 GiB root. Foundation
+and lifecycle defaults match: set foundation `rootDeviceName` and lifecycle
+`storage.rootDeviceName` to `/dev/sda1`, and both root sizes to at least 30 GiB.
+For existing deployments, apply those configuration changes and pin the resulting
+launch-template version in lifecycle before launching. Step (f) updates the AMI
+parameter only.
 
 **(a) Select the founder session, read the existing outputs, archive and upload.**
 
@@ -648,8 +651,6 @@ for value in "$ASSET_BUCKET" "$SUBNET_ID" "$SECURITY_GROUP_ID" "$REPOSITORY_URI"
   [[ -n "$value" && "$value" != None ]]
 done
 REPOSITORY_NAME="${REPOSITORY_URI#*/}"
-REPOSITORY_ARN="$(aws ecr describe-repositories --region "$AWS_REGION" \
-  --repository-names "$REPOSITORY_NAME" --query 'repositories[0].repositoryArn' --output text)"
 AGENT_SHA="$(git rev-parse HEAD)"
 RELEASE_DIR="$(mktemp -d "/tmp/ezil-ami-${AGENT_SHA:0:12}.XXXXXX")"
 git archive --format=tar.gz --output "$RELEASE_DIR/host-agent-$AGENT_SHA.tgz" \
@@ -660,6 +661,9 @@ aws s3 cp --region "$AWS_REGION" "$RELEASE_DIR/host-agent-$AGENT_SHA.tgz" "$AGEN
 
 **(b) Push the local amd64 desktop image and record both digests.** The ECR manifest
 digest pins the pull; the image configuration digest is the expected image ID.
+The template derives `DesktopImageRef` and the build role's ECR repository ARN
+from `ApplicationImageRepositoryUri`, binding pull permissions to the image
+repository. Supply `DesktopImageDigest` as `sha256:` followed by 64 lowercase hex digits.
 Use a fresh tag because the foundation repository has immutable tags.
 
 ```sh
@@ -678,7 +682,8 @@ DESKTOP_DIGEST="$(aws ecr describe-images --region "$AWS_REGION" \
 DESKTOP_IMAGE_REF="$REPOSITORY_URI@$DESKTOP_DIGEST"
 docker pull "$DESKTOP_IMAGE_REF"
 [[ "$(docker image inspect --format '{{.Id}}' "$DESKTOP_IMAGE_REF")" == "$DESKTOP_IMAGE_ID" ]]
-printf 'DesktopImageRef=%s\nDesktopImageId=%s\n' "$DESKTOP_IMAGE_REF" "$DESKTOP_IMAGE_ID" |
+printf 'ApplicationImageRepositoryUri=%s\nDesktopImageDigest=%s\nDesktopImageId=%s\n' \
+  "$REPOSITORY_URI" "$DESKTOP_DIGEST" "$DESKTOP_IMAGE_ID" |
   tee "$RELEASE_DIR/desktop.txt"
 ```
 
@@ -714,13 +719,13 @@ jq -n --arg namespace "$NS" --arg accountId "$ACCOUNT_ID" --arg region "$AWS_REG
   cd infra/app-computers
   EZIL_AMI_CONFIG="config/ami.$NS.json" npm run synth:ami
 )
-jq -n --arg bucket "$ASSET_BUCKET" --arg repo "$REPOSITORY_ARN" \
+jq -n --arg bucket "$ASSET_BUCKET" --arg repo "$REPOSITORY_URI" \
   --arg subnet "$SUBNET_ID" --arg sg "$SECURITY_GROUP_ID" \
-  --arg src "$AGENT_SRC_S3_URI" --arg image "$DESKTOP_IMAGE_REF" --arg id "$DESKTOP_IMAGE_ID" \
+  --arg src "$AGENT_SRC_S3_URI" --arg digest "$DESKTOP_DIGEST" --arg id "$DESKTOP_IMAGE_ID" \
   --arg version "$CLOUDFLARED_VERSION" --arg sha "$CLOUDFLARED_SHA256" \
-  '{AssetBucketName:$bucket, ApplicationImageRepositoryArn:$repo, SubnetId:$subnet, SecurityGroupId:$sg,
+  '{AssetBucketName:$bucket, ApplicationImageRepositoryUri:$repo, SubnetId:$subnet, SecurityGroupId:$sg,
     UbuntuAmiId:"/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
-    AgentSrcS3Uri:$src, DesktopImageRef:$image, DesktopImageId:$id,
+    AgentSrcS3Uri:$src, DesktopImageDigest:$digest, DesktopImageId:$id,
     CloudflaredVersion:$version, CloudflaredSha256:$sha,
     EnrollUrl:"https://os.ezil.work/api/compute/aws/enroll"}
    | to_entries | map({ParameterKey:.key, ParameterValue:.value})' \

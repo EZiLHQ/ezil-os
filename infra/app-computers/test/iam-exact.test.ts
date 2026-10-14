@@ -39,7 +39,7 @@ function expectedController(userDataOpen: boolean) {
             NumericLessThanEquals: { 'ec2:MetadataHttpPutResponseHopLimit': '1' }, Null: { 'ec2:InstanceProfile': 'true' }, ...LT } },
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('volume/*'), Condition: {
             StringEquals: { ...REGION_EQ, ...REQUEST, 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
-            NumericLessThanEquals: { 'ec2:VolumeSize': '20' }, ...LT } },
+            NumericLessThanEquals: { 'ec2:VolumeSize': '30' }, ...LT } },
         { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [ec2('instance/*'), ec2('volume/*')],
             Condition: { StringEquals: { ...REGION_EQ, 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } } },
         { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: ec2('volume/*'), Condition: { StringEquals: { ...REGION_EQ, ...MANAGED },

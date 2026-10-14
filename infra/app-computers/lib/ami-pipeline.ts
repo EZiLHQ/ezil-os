@@ -33,10 +33,20 @@ export class AmiPipelineStack extends Stack {
             type: 'String', allowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]',
             description: 'AssetBucketName output of the deploy identity stack',
         });
-        const repository = new CfnParameter(this, 'ApplicationImageRepositoryArn', {
+        const repository = new CfnParameter(this, 'ApplicationImageRepositoryUri', {
             type: 'String',
-            allowedPattern: `arn:aws:ecr:${c.region}:${c.accountId}:repository/[a-z0-9][a-z0-9._/-]*`,
-            description: 'ARN of the foundation application image repository',
+            allowedPattern: `${c.accountId}\\.dkr\\.ecr\\.${c.region}\\.amazonaws\\.com/(?!.*\\.amazonaws\\.com/)[a-z0-9][a-z0-9._/-]*`,
+            description: 'URI of the foundation application image repository (without a tag or digest)',
+        });
+        // Bind pull permission and the pinned image to the same repository,
+        // including repository names containing slashes. Validation excludes a
+        // second split delimiter in the name so the ARN cannot be truncated.
+        const repositoryArn = Fn.sub('arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryName}', {
+            RepositoryName: Fn.select(1, Fn.split('.amazonaws.com/', repository.valueAsString)),
+        });
+        const desktopDigest = new CfnParameter(this, 'DesktopImageDigest', {
+            type: 'String', allowedPattern: '^sha256:[0-9a-f]{64}$',
+            description: 'ECR manifest digest of the desktop image',
         });
         const subnet = new CfnParameter(this, 'SubnetId', {
             type: 'AWS::EC2::Subnet::Id', description: 'Foundation SubnetId0 (public subnet with outbound internet)',
@@ -54,7 +64,6 @@ export class AmiPipelineStack extends Stack {
         // Restrict shell-interpolated component inputs to their expected formats.
         const inputs = {
             AgentSrcS3Uri: 's3://[a-z0-9][a-z0-9-]{1,61}[a-z0-9]/ami/host-agent-[a-f0-9]{40}\\.tgz',
-            DesktopImageRef: `${c.accountId}\\.dkr\\.ecr\\.${c.region}\\.amazonaws\\.com/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}`,
             DesktopImageId: 'sha256:[a-f0-9]{64}',
             CloudflaredVersion: '[0-9]{4}\\.[0-9]+\\.[0-9]+',
             CloudflaredSha256: '[a-f0-9]{64}',
@@ -63,6 +72,9 @@ export class AmiPipelineStack extends Stack {
         const parameters = Object.entries(inputs).map(([key, allowedPattern]) => ({
             name: key, value: [new CfnParameter(this, key, { type: 'String', allowedPattern }).valueAsString],
         }));
+        parameters.push({ name: 'DesktopImageRef', value: [Fn.sub('${RepositoryUri}@${Digest}', {
+            RepositoryUri: repository.valueAsString, Digest: desktopDigest.valueAsString,
+        })] });
 
         const role = new iam.CfnRole(this, 'BuildRole', {
             roleName: `ezil-${c.namespace}-ami-build`, path: workloadPath(c.namespace),
@@ -78,7 +90,7 @@ export class AmiPipelineStack extends Stack {
                     Resource: Fn.sub('arn:${AWS::Partition}:s3:::${Bucket}/ami/host-agent-*.tgz', { Bucket: bucket.valueAsString }) },
                 { Effect: 'Allow', Action: 'ecr:GetAuthorizationToken', Resource: '*' },
                 { Effect: 'Allow', Action: ['ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability'],
-                    Resource: repository.valueAsString },
+                    Resource: repositoryArn },
             ] } }],
             tags: [{ key: NAMESPACE_TAG, value: c.namespace }],
         });
