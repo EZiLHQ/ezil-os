@@ -40,6 +40,13 @@
         "issuerHost": "token.actions.githubusercontent.com",
         "audience": "sts.amazonaws.com",
         "subject": "repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>"
+      },
+      {
+        "name": "vercel",
+        "providerArn": "arn:aws:iam::123456789012:oidc-provider/oidc.vercel.com/example-team",
+        "issuerHost": "oidc.vercel.com/example-team",
+        "audience": "https://vercel.com/example-team",
+        "subject": "owner:example-team:project:ezil-os:environment:production"
       }
     ]
   },

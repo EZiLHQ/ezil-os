@@ -262,3 +262,10 @@ clients `@aws-sdk/client-ec2`, `client-sfn` and `client-secrets-manager` at
 to bundle its Lambda handlers, and tsx 4.23.15 (MIT) to run TypeScript.
 Versions and licenses were checked in the installed packages' `package.json`
 files. No third-party application source is included in these artifacts.
+
+The application (`app/`) calls AWS for the same computers through
+[AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3) clients
+`@aws-sdk/client-sfn`, `@aws-sdk/client-ec2` and `@aws-sdk/client-sts` at
+3.1140.0 (Apache-2.0), pinned exactly in `app/package.json` and `app/bun.lock`
+(`app/src/server/lib/compute/aws-clients.ts`). Versions and licenses were
+checked in the installed packages' `package.json` files; no SDK source is copied.

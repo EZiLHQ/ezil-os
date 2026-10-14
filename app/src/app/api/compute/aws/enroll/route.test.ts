@@ -36,10 +36,17 @@ describe('POST /api/compute/aws/enroll', () => {
         expect(handle.mock.calls[0]![1]).toEqual({ computerId: 'x' });
     });
 
-    it('the EC2 describer is NOT wired yet: the handler receives null, so it answers 503 and consumes nothing', async () => {
+    it('AWS off (this test environment): the handler receives no describer, so it answers 503 and consumes nothing', async () => {
         handle.mockResolvedValue({ status: 503, body: { error: 'enroll_unavailable' } });
         await post('{}');
-        expect(awsEnrollmentDescriber()).toBeNull();
+        expect(awsEnrollmentDescriber({})).toBeNull();
         expect(handle.mock.calls[0]![0]).toMatchObject({ describer: null });
+    });
+
+    it('the describer exists only with AWS on AND a caller role for every configured region', () => {
+        const on = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2' };
+        expect(awsEnrollmentDescriber(on)).toBeNull();
+        const wired = awsEnrollmentDescriber({ ...on, EZIL_AWS_APP_CALLER_ROLE_ARN_US_EAST_1: 'arn:aws:iam::123456789012:role/ezil/pilot/app-caller' });
+        expect(typeof wired?.describeForEnrollment).toBe('function');
     });
 });

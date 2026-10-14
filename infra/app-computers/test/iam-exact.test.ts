@@ -79,16 +79,44 @@ test('controller policy with userData delivery verified: allow userData only, de
 const GITHUB = { name: 'github' as const, providerArn: `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`,
     issuerHost: 'token.actions.githubusercontent.com', audience: 'sts.amazonaws.com', subject: 'repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>' };
 const VERSION = `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle:1`;
-test('item 9: app caller can only start the exact lifecycle version and describe EC2 in region', () => {
+const VERCEL = { name: 'vercel' as const, providerArn: `arn:aws:iam::${A}:oidc-provider/oidc.vercel.com/ezil-team`,
+    issuerHost: 'oidc.vercel.com/ezil-team', audience: 'https://vercel.com/ezil-team', subject: 'owner:ezil-team:project:ezil-os:environment:production' };
+test('item 9: app caller can only start the exact lifecycle version, read its computer executions, and describe EC2 in region', () => {
     assert.deepEqual(json(appCallerStatements(R, [VERSION])), [
         { Effect: 'Allow', Action: 'states:StartExecution', Resource: VERSION },
-        { Effect: 'Allow', Action: 'ec2:Describe*', Resource: '*', Condition: { StringEquals: { 'aws:RequestedRegion': R } } },
+        { Effect: 'Allow', Action: 'states:DescribeExecution', Resource: `arn:aws:states:${R}:${A}:execution:ezil-pilot-lifecycle:computer-*` },
+        { Effect: 'Allow', Action: ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeAvailabilityZones'], Resource: '*',
+            Condition: { StringEquals: { 'aws:RequestedRegion': R } } },
     ]);
     assert.throws(() => appCallerStatements(R, [VERSION.replace(/:1$/, '')]), /invalid_version_arn/);
+    assert.throws(() => appCallerStatements(R, [VERSION.replace(R, 'us-east-1')]), /version_arn_region/);
     assert.equal(AppCallerConfigSchema.parse({}).enabled, false, 'disabled by default');
-    for (const bad of [{ ...GITHUB, subject: 'repo:<org>/*' }, { ...GITHUB, issuerHost: 'oidc.vercel.com/team' }])
+    for (const bad of [{ ...GITHUB, subject: 'repo:<org>/*' }, { ...GITHUB, issuerHost: 'oidc.vercel.com/team' }, { ...GITHUB, audience: 'https://vercel.com/x' }])
         assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [bad] }).success, false);
     assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [] }).success, false);
+});
+test('item 9: a Vercel caller trusts one exact team/project/environment, never development or a wildcard', () => {
+    assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [VERCEL] }).success, true);
+    const globalMode = { ...VERCEL, providerArn: `arn:aws:iam::${A}:oidc-provider/oidc.vercel.com`, issuerHost: 'oidc.vercel.com' };
+    assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [globalMode] }).success, true, 'global issuer mode');
+    assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [{ ...VERCEL, audience: 'sts.amazonaws.com' }] }).success, true, 'custom audience');
+    const refused: [string, object][] = [
+        ['wildcard project', { ...VERCEL, subject: 'owner:ezil-team:project:*:environment:production' }],
+        ['development tokens', { ...VERCEL, subject: 'owner:ezil-team:project:ezil-os:environment:development' }],
+        ['another team in the subject', { ...VERCEL, subject: 'owner:other:project:ezil-os:environment:production' }],
+        // With a custom audience only the issuer/subject team check can catch it.
+        ['another team in the subject, custom audience', { ...VERCEL, audience: 'sts.amazonaws.com', subject: 'owner:other:project:ezil-os:environment:production' }],
+        ['another team in the audience', { ...VERCEL, audience: 'https://vercel.com/other' }],
+        ['a foreign issuer', { ...VERCEL, providerArn: `arn:aws:iam::${A}:oidc-provider/oidc.example.com/ezil-team`, issuerHost: 'oidc.example.com/ezil-team' }],
+        ['a malformed subject', { ...VERCEL, subject: 'repo:ezil/ezil-os:environment:production' }],
+    ];
+    for (const [why, bad] of refused) assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [bad] }).success, false, why);
+    const app = new App(), stack = new Stack(app, 'VercelCaller', { env: { account: A, region: R } });
+    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [VERCEL] }, region: R, versionArns: [VERSION] });
+    const role = Object.values(assertions.Template.fromStack(stack).findResources('AWS::IAM::Role'))[0] as any;
+    assert.deepEqual(role.Properties.AssumeRolePolicyDocument.Statement, [{ Effect: 'Allow', Action: 'sts:AssumeRoleWithWebIdentity',
+        Principal: { Federated: VERCEL.providerArn }, Condition: { StringEquals: {
+            'oidc.vercel.com/ezil-team:aud': 'https://vercel.com/ezil-team', 'oidc.vercel.com/ezil-team:sub': VERCEL.subject } } }]);
 });
 test('item 9: app caller trust is web identity on the exact audience and subject', () => {
     const app = new App(), stack = new Stack(app, 'Caller', { env: { account: A, region: R } });

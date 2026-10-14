@@ -21,7 +21,9 @@
 
 import { TRPCError } from '@trpc/server';
 
-import { isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
+import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
+import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
+import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
@@ -34,22 +36,26 @@ export type RoutedComputer =
     | { kind: 'aws-ec2'; provider: ComputeProvider };
 
 /**
- * The AWS provider's runtime collaborators that are not built yet: the Step
- * Functions starter, the execution reader and the GW-1 tunnel client (L-ENR). Until they
- * land, an AWS computer's `ensure`/`stop` refuse BEFORE any write
- * (`aws_lifecycle_unconfigured`, `aws_enrollment_unavailable`) — never Cloudflare.
- * This is the ONE place the routers get them from, so wiring them in touches no
- * router.
+ * The AWS provider's runtime collaborators: the Step Functions starter and
+ * execution reader (aws-clients.ts: Vercel OIDC → the region's app-caller
+ * role, no stored keys) and the GW-1 tunnel client (the Worker). With the AWS
+ * flag off nothing is built. With it on but the caller unconfigured (any
+ * region without its role), there is no starter, so an AWS computer's
+ * `ensure`/`stop` refuse BEFORE any write (`aws_lifecycle_unconfigured`) —
+ * never Cloudflare. This is the ONE place the routers get them from.
  */
-export function defaultAwsCollaborators(): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels'> {
-    return {};
+export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels'> {
+    if (!isAwsComputersEnabled(env)) return {};
+    const { starter, executions } = sharedAwsSdkCollaborators(env);
+    const tunnels = workerTunnelClientFromEnv(env) ?? undefined;
+    return { ...(starter ? { starter } : {}), ...(executions ? { executions } : {}), ...(tunnels ? { tunnels } : {}) };
 }
 
 export interface RouteOptions {
     env?: Env;
     /** Where a user's paid entitlement is read from. None in this app today → every AWS computer is `free`. */
     entitlements?: EntitlementReader;
-    /** Overrides `defaultAwsCollaborators()` (tests; the later wiring). */
+    /** Overrides `defaultAwsCollaborators(env)` (tests). */
     aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
 }
 
@@ -65,7 +71,7 @@ export function awsDepsFor(env: Env, entitlements: EntitlementReader | undefined
 export async function routeComputer(
     db: unknown,
     computer: ComputerRef,
-    { env = process.env, entitlements, aws = defaultAwsCollaborators() }: RouteOptions = {},
+    { env = process.env, entitlements, aws = defaultAwsCollaborators(env) }: RouteOptions = {},
 ): Promise<RoutedComputer> {
     // Flag off: no database read at all — the pre-P3 call, unchanged.
     if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };

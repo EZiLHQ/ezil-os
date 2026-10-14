@@ -9,7 +9,16 @@
           "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
         },
         {
-          "Action": "ec2:Describe*",
+          "Action": "states:DescribeExecution",
+          "Effect": "Allow",
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+        },
+        {
+          "Action": [
+            "ec2:DescribeInstances",
+            "ec2:DescribeVolumes",
+            "ec2:DescribeAvailabilityZones"
+          ],
           "Condition": {
             "StringEquals": {
               "aws:RequestedRegion": "ap-south-1"

@@ -402,8 +402,74 @@ Budget alarms are alerts, not enforcement. Cost figures in public documents desc
   - no boundary removal
   - no volume or snapshot deletion
 - **The app** uses a federated role with execution-start on exact workflow versions only.
+  It holds no AWS keys (details below).
 - **Purge** is an operator role behind MFA, outside the boundary, and audited.
 - The account root user is never used for deploys.
+
+### App caller (Vercel OIDC, no stored keys)
+
+The app calls AWS only through `app/src/server/lib/compute/aws-clients.ts`:
+
+- **Token.** Every call uses the Vercel OIDC token of the current request. The
+  token is read in this order:
+  1. the request context's `x-vercel-oidc-token`;
+  2. else the file in `VERCEL_OIDC_TOKEN_FILE`;
+  3. else `VERCEL_OIDC_TOKEN`.
+
+  The token is never cached. Vercel function tokens for preview/production last
+  two hours.
+- **Exchange.** The token goes to STS `AssumeRoleWithWebIdentity` on the region's
+  app-caller role (`EZIL_AWS_APP_CALLER_ROLE_ARN_<REGION>`). The resulting
+  credentials are cached until 5 minutes before they expire.
+- **No ambient credentials.** Every SDK client gets an explicit credentials
+  function. The default chain (env keys, shared files, instance metadata) is
+  never used. A missing token is `aws_caller_unavailable`.
+- **Gating.** With `EZIL_AWS_COMPUTERS_ENABLED` off, nothing is built. With it
+  on, every region in `AWS_REGIONS` must have its own role, or no client is
+  built at all:
+  - `ensure`/`stop` then refuse before any write (`aws_lifecycle_unconfigured`);
+  - enrollment answers 503.
+- **What the role can do** (`infra/app-computers/lib/app-caller.ts`, exact-spec
+  tested):
+  - `states:StartExecution` on the stack's exact lifecycle version ARN(s) in its
+    region;
+  - `states:DescribeExecution` on `execution:<machine>:computer-*` only;
+  - `ec2:DescribeInstances`, `DescribeVolumes` and `DescribeAvailabilityZones`
+    with `aws:RequestedRegion` = that region.
+- **Calls are pinned.** A call is refused before it is sent if its ARN names
+  another region, or an account other than the caller role's.
+- **Errors** map to these codes:
+
+  | Code | Retryable | Meaning |
+  |---|---|---|
+  | `aws_throttled` | yes | throttling |
+  | `aws_capacity` | no | capacity or quota |
+  | `aws_config` | no | denied, wrong ARN or setting |
+  | `aws_caller_unavailable` | no | caller unavailable |
+  | `aws_error` | no | anything else |
+
+  AWS messages are never carried.
+- **Trust.** It comes from Vercel's documented token shape: issuer
+  `oidc.vercel.com/<team>` (team issuer mode), audience `https://vercel.com/<team>`,
+  subject `owner:<team>:project:<project>:environment:production`.
+  - Each role trusts ONE exact subject.
+  - `development` tokens are refused.
+  - Preview never gets the production role, because preview shares the
+    production database.
+
+**Founder setup per region** (CI cannot do this: the boundary denies identity-provider writes):
+1. Vercel project → Settings → Security → Secure backend access with OIDC federation → enable it, issuer mode **Team**.
+2. AWS IAM → Identity providers → add OpenID Connect:
+   - provider URL `https://oidc.vercel.com/<team-slug>`
+   - audience `https://vercel.com/<team-slug>`
+
+   This is done once per account.
+3. Lifecycle config `appCaller`: `enabled: true`, plus a `vercel` provider with that
+   provider ARN and the production subject. Deploy the lifecycle stack, then copy
+   its `AppCaller/RoleArn` output.
+4. Vercel production env:
+   - `EZIL_AWS_APP_CALLER_ROLE_ARN_<REGION>` = that ARN, for every region in `AWS_REGIONS`;
+   - the matching `EZIL_AWS_LIFECYCLE_DEPLOYMENTS`.
 
 ## 6. Retention, cancellation, rollback
 

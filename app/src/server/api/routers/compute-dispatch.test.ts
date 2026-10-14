@@ -45,7 +45,8 @@ import type { LifecycleStarter } from '@/server/lib/compute/aws-ec2';
 import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 
-import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
+import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
+import { appCallerRoleEnv } from '@/server/lib/compute/aws-clients';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -169,6 +170,27 @@ describe('routeComputer', () => {
         expect(routed.kind).toBe('aws-ec2');
         await expect(routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).resolves.toEqual({ ok: true });
         expect(calls).toEqual([]);
+    });
+});
+
+describe('defaultAwsCollaborators: the real AWS clients, gated', () => {
+    const ROLES = {
+        [appCallerRoleEnv('ap-south-1')]: 'arn:aws:iam::123456789012:role/ezil/pilot/app-caller-aps1',
+        [appCallerRoleEnv('us-east-1')]: 'arn:aws:iam::123456789012:role/ezil/pilot/app-caller-use1',
+    };
+    it('AWS off: nothing at all', () => {
+        expect(defaultAwsCollaborators({})).toEqual({});
+        expect(defaultAwsCollaborators({ ...ROLES, AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2' })).toEqual({});
+    });
+    it('AWS on but the caller unconfigured for some region: no starter or reader, so ensure/stop refuse before any write', () => {
+        const half = defaultAwsCollaborators({ ...AWS_ENV, [appCallerRoleEnv('us-east-1')]: ROLES[appCallerRoleEnv('us-east-1')]! });
+        expect(half.starter).toBeUndefined();
+        expect(half.executions).toBeUndefined();
+    });
+    it('AWS on with a caller role for every region: the SDK starter and reader (built lazily; nothing is sent here)', () => {
+        const all = defaultAwsCollaborators({ ...AWS_ENV, ...ROLES });
+        expect(typeof all.starter?.start).toBe('function');
+        expect(typeof all.executions?.describe).toBe('function');
     });
 });
 
