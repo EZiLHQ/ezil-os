@@ -173,14 +173,15 @@ export function readAwsBrowserZone(env: AwsEnv): string | null {
  */
 export function createWorkerTunnelClient(cfg: { workerUrl: string; secret: string; fetch?: typeof fetch; now?: () => Date }): TunnelClient {
     const doFetch = cfg.fetch ?? fetch;
-    const nowSeconds = () => Math.floor((cfg.now?.() ?? new Date()).getTime() / 1000);
+    // Milliseconds, like every other v2 minter: the Worker checks |Date.now() - ts| (hmac.ts).
+    const nowMs = () => (cfg.now?.() ?? new Date()).getTime();
     const call = async (method: 'POST' | 'DELETE', owner: { userId: string }, body: Record<string, unknown> & { computerId: string; sandboxId: string; generation: number; leaseEpoch: number }) => {
         const text = JSON.stringify(method === 'DELETE'
             ? { computerId: body.computerId, generation: body.generation, leaseEpoch: body.leaseEpoch }
             : body);
         const auth = mintPreviewTokenV2(
             cfg.secret,
-            { ts: nowSeconds(), sandboxId: body.sandboxId, computerId: body.computerId, userId: owner.userId, provider: 'aws-ec2', store: '', generation: body.generation, leaseEpoch: body.leaseEpoch },
+            { ts: nowMs(), sandboxId: body.sandboxId, computerId: body.computerId, userId: owner.userId, provider: 'aws-ec2', store: '', generation: body.generation, leaseEpoch: body.leaseEpoch },
             { method, path: TUNNELS_PATH, body: text },
         );
         return doFetch(`${cfg.workerUrl.replace(/\/$/, '')}${TUNNELS_PATH}`, {
@@ -265,6 +266,12 @@ export interface EnrollResponse {
 }
 
 const refuse = (status: number, error: string): EnrollResponse => ({ status, body: { error } });
+/**
+ * A refusal that consumed NOTHING and may clear on its own (configuration, a describe
+ * outage, a lost race before the swap, EC2's eventually consistent view of a fresh boot).
+ * The host keeps its nonce and retries, bounded (enroll.py); every other answer is final.
+ */
+const retryLater = (status: number, error: string): EnrollResponse => ({ status, body: { error, retryable: true } });
 
 const sameHash = (a: string, b: string) => {
     const x = Buffer.from(a, 'utf8');
@@ -288,12 +295,14 @@ const carries = (tags: Readonly<Record<string, string>>, want: Record<string, st
  * POST /api/compute/aws/enroll (C-6 steps 3-5). Every check passes, or the
  * request is refused and NOTHING changes; the nonce is consumed by one
  * compare-and-swap only after all of them. A failure after the swap is still
- * non-200: the host never re-sends a nonce that got an answer (enroll.py).
+ * non-200 and final. Before the swap, a refusal that may clear on its own carries
+ * `retryable: true` (`retryLater`): the host keeps that nonce and retries, bounded;
+ * on any other answer it wipes the nonce and never re-sends it (enroll.py).
  * 🔴 Never logs or echoes the nonce, the control key or the tunnel token.
  */
 export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promise<EnrollResponse> {
-    if (!isAwsComputersEnabled(deps.env)) return refuse(404, 'not_found');
-    if (!deps.describer || !deps.tunnels) return refuse(503, 'enroll_unavailable');
+    if (!isAwsComputersEnabled(deps.env)) return retryLater(404, 'not_found');
+    if (!deps.describer || !deps.tunnels) return retryLater(503, 'enroll_unavailable');
     const parsed = EnrollBodySchema.safeParse(raw);
     if (!parsed.success) return refuse(400, 'enroll_request_invalid');
     const body = parsed.data;
@@ -312,7 +321,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     const cert = readIdentityCertificate(deps.env, p.region);
     const deployments = readLifecycleDeployments(deps.env, [p.region]);
     const browserZone = readAwsBrowserZone(deps.env);
-    if (!cert || !deployments.ok || !browserZone) return refuse(503, 'enroll_unavailable');
+    if (!cert || !deployments.ok || !browserZone) return retryLater(503, 'enroll_unavailable');
     const deployment = deployments.deployments[p.region]!;
     const signature = verifyIdentitySignature(body.identityDocument, body.signature, cert, now);
     if (!signature.ok) return refuse(403, signature.reason);
@@ -333,9 +342,11 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     try {
         view = await deps.describer.describeForEnrollment(p.region, doc.instanceId);
     } catch {
-        return refuse(503, 'enroll_describe_unavailable');
+        return retryLater(503, 'enroll_describe_unavailable');
     }
     if (!view || view.instanceId !== doc.instanceId) return refuse(403, 'enroll_instance_unknown');
+    // A host is already running code, so `pending` is only EC2's lagging view of this boot.
+    if (view.state === 'pending') return retryLater(403, 'enroll_instance_not_running');
     if (view.state !== 'running') return refuse(403, 'enroll_instance_not_running');
     if (view.availabilityZone !== doc.availabilityZone || view.availabilityZoneId !== p.zoneId) return refuse(403, 'enroll_zone_mismatch');
     const tags = expectedTags(p, deployment.namespace);
@@ -344,11 +355,14 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     let volumeId: string;
     if (p.volumeId) {
         const v = view.volumes.filter((x) => x.volumeId === p.volumeId);
+        // The workflow attaches the data volume after the instance runs (helper.ts): not seen yet ≠ wrong.
+        if (v.length === 0) return retryLater(403, 'enroll_volume_mismatch');
         if (v.length !== 1 || v[0]!.deleteOnTermination !== false) return refuse(403, 'enroll_volume_mismatch');
         volumeId = p.volumeId;
     } else {
         // Provision: the data volume is the one non-root, retained volume tagged for this computer.
         const data = view.volumes.filter((x) => x.deleteOnTermination === false && x.tags['ezil:disk-kind'] === undefined && x.tags['ezil:computer-id'] === tags['ezil:computer-id']);
+        if (data.length === 0) return retryLater(403, 'enroll_volume_mismatch');
         if (data.length !== 1) return refuse(403, 'enroll_volume_mismatch');
         volumeId = data[0]!.volumeId;
     }
@@ -359,7 +373,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         controlKey = (deps.randomBytes ?? nodeRandomBytes)(32);
         if (!Buffer.isBuffer(controlKey) || controlKey.length !== 32) throw new Error('invalid control key');
     } catch {
-        return refuse(500, 'enroll_failed');
+        return retryLater(500, 'enroll_failed');
     }
 
     let expected = p;
@@ -373,7 +387,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
             consumed = result.placement;
             break;
         }
-        // The host discards its nonce on any HTTP answer. Resolve receipt races here.
+        // Resolve receipt races here; only a swap lost twice with the nonce intact is retryable.
         const { record: current } = await readPlacement(deps.db, p.computerId);
         if (!current || current.generation !== p.generation || current.leaseEpoch !== p.leaseEpoch) return refuse(409, 'enroll_stale_epoch');
         if (!current.enrollNonceHash) return refuse(409, 'enroll_nonce_consumed');
@@ -383,7 +397,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         if (!ENROLLABLE_STATES.includes(current.state)) return refuse(409, 'enroll_state');
         expected = current;
     }
-    if (!consumed) return refuse(503, 'enroll_conflict');
+    if (!consumed) return retryLater(503, 'enroll_conflict');
     const keyB64 = controlKey.toString('base64');
     const sandboxId = awsSandboxId(p.ownerUserId, p.computerId);
     let tunnel: TunnelResult;

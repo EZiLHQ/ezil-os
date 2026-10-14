@@ -7,14 +7,19 @@
                tunnel token (and the control-channel key); store both under stateDir
                (0700 dir, 0600 files) on the HOST root volume — never in the container's
                view and never on the data volume; then WIPE the nonce from local state.
-The nonce is single-use (the app clears it by compare-and-swap): the client never
-retries an enrollment with a nonce that was already sent and got an answer.
+The nonce is single-use (the app clears it by compare-and-swap). The client re-sends it
+only after an answer that proves nothing was consumed and the failure may clear: a
+transport error, the app's `retryable: true` (aws-enroll.ts `retryLater`), or a 5xx the
+app did not author (a platform error page; if the app had consumed the nonce, the retry
+gets a final refusal). Retries are bounded (enrollRetrySeconds, inside the nonce's
+600 s TTL); every other answer wipes the nonce and is final.
 """
 import base64
 import glob
 import json
 import os
 import re
+import time
 
 from . import guard, http, lease as leasemod
 from .fsops import Refused
@@ -75,11 +80,24 @@ def wipe(path):
     return True
 
 
+def _imds_lease_and_identity(cfg):
+    """IMDS answers locally, but early in boot a connection can still fail: retry transport
+    errors, bounded (imdsRetrySeconds). An IMDS HTTP refusal is final (LeaseError)."""
+    deadline = time.monotonic() + float(cfg.get("imdsRetrySeconds", 60))
+    while True:
+        try:
+            return leasemod.Imds(cfg).lease_and_identity()
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
+
+
 def fetch_lease(cfg):
-    raw, doc, sig = leasemod.Imds(cfg).lease_and_identity()
+    raw, doc, sig = _imds_lease_and_identity(cfg)
     lease = leasemod.parse(raw)
     if lease.get("volumeId") is None:  # parse permits this only for PROVISION
-        lease["volumeId"] = guard.provision_volume(cfg)
+        lease["volumeId"] = guard.wait_provision_volume(cfg)
     _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
     _write_private(os.path.join(cfg.runDir, "identity.json"), json.dumps({"document": doc, "signature": sig}).encode())
     return lease
@@ -101,6 +119,21 @@ def wipe_nonce(cfg, lease):
     return lease
 
 
+def retryable(status, resp):
+    """True when the answer proves the app consumed nothing and the failure may clear: the
+    app's own `retryable: true`, or a 5xx the app did not author (no JSON `error`). A 200,
+    and every refusal the app authored without `retryable: true`, settle the nonce."""
+    if status == 200:
+        return False
+    try:
+        answer = json.loads(resp)
+    except (ValueError, UnicodeDecodeError):
+        answer = None
+    if isinstance(answer, dict) and isinstance(answer.get("error"), str):
+        return answer.get("retryable") is True
+    return status >= 500
+
+
 def enroll(cfg, lease):
     if lease.get("nonceConsumed") or not lease.get("nonce"):
         raise Refused("enroll_nonce_absent", "nonce already used for this epoch")
@@ -111,13 +144,27 @@ def enroll(cfg, lease):
     body = json.dumps({"computerId": lease["computerId"], "generation": lease["generation"],
                        "leaseEpoch": lease["leaseEpoch"], "nonce": lease["nonce"],
                        "identityDocument": ident["document"], "signature": ident["signature"]}).encode()
-    try:
-        status, resp = http.request("POST", cfg.enrollUrl, body=body,
-                                    headers={"Content-Type": "application/json"}, timeout=20,
-                                    ca_file=cfg.caFile, server_name=cfg.tlsServerName)
-    except OSError as e:   # transport failure before an answer: the nonce may be retried
-        raise Refused("enroll_transport", str(e))
-    # Any HTTP answer means the app saw the nonce: never send it again.
+    # Bounded retries in this one oneshot activation, so the units that require enrollment
+    # simply wait for it (a systemd Restart= would fail their start jobs first).
+    deadline = time.monotonic() + float(cfg.get("enrollRetrySeconds", 540))
+    delay = float(cfg.get("enrollRetryInitialSeconds", 2))
+    while True:
+        try:
+            status, resp = http.request("POST", cfg.enrollUrl, body=body,
+                                        headers={"Content-Type": "application/json"}, timeout=20,
+                                        ca_file=cfg.caFile, server_name=cfg.tlsServerName)
+        except OSError as e:   # no answer: nothing can have been decided
+            why = f"transport: {type(e).__name__}"
+        else:
+            if not retryable(status, resp):
+                break
+            why = f"HTTP {status}"
+        if time.monotonic() + delay > deadline:   # the nonce stays: a later run may retry
+            raise Refused("enroll_retry_exhausted", why)
+        print(f"[enroll] not enrolled yet ({why}); retrying in {delay:g}s", flush=True)
+        time.sleep(delay)
+        delay = min(delay * 2, 30.0)
+    # A settled answer: the app consumed the nonce or refused it for good. Never send it again.
     wipe_nonce(cfg, lease)
     if status != 200:
         raise Refused("enroll_refused", f"HTTP {status}: {resp[:200]!r}")

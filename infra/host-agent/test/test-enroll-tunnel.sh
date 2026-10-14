@@ -28,7 +28,10 @@ cp "$H/stub/user-data" "$H/cloud/user-data.txt"      # what cloud-init would hav
 mkdir -p "$H/cloud/instances/i-0abc/sem" "$H/cloud/run"
 for f in user-data.txt user-data.txt.i obj.pkl; do cp "$H/stub/user-data" "$H/cloud/instances/i-0abc/$f"; done
 cp "$H/stub/user-data" "$H/cloud/run/instance-data-sensitive.json"; echo keep > "$H/cloud/instances/i-0abc/sem/config_x"; echo keep > "$H/cloud/instances/i-0abc/datasource"
+touch "$H/stub/retry-once" "$H/stub/platform-502-once"   # 'retryable' 503, then a platform 502 page, then 200
 check "enroll succeeds over verified TLS (test CA, SNI app.ezil.test)" agent e enroll
+check "...after re-sending the same nonce through a 'retryable' 503 and a platform 502" \
+    bash -c "[ \$(wc -l < '$H/stub/enroll-requests.jsonl') -eq 3 ] && [ \$(jq -r .nonce '$H/stub/enroll-requests.jsonl' | sort -u | wc -l) -eq 1 ]"
 REQ="$(tail -n 1 "$H/stub/enroll-requests.jsonl")"
 check "request = {computerId, generation, leaseEpoch, nonce, identityDocument, signature}" \
     jq -e --arg c "$CID_COMPUTER" '(keys == ["computerId","generation","identityDocument","leaseEpoch","nonce","signature"]) and .computerId==$c and .generation==1 and .leaseEpoch==2 and (.identityDocument|fromjson|.instanceId=="i-0abc") and (.signature|startswith("MIAG"))' <<<"$REQ"
@@ -126,4 +129,13 @@ check "stop: overlay and data volume were unmounted BEFORE shutdown" test "$(sed
 check "stop: warn logged, flush not blockable" bash -c "grep -q 'warn: stopping in 1s (cap)' '$H/run/agent.out' && grep -q 'shutdown: stop:cap flush=' '$H/run/agent.out'"
 check "stop: fence file written (cloudflared would stop and wipe)" test -e "$H/run/fence"
 cp "$H/run/agent.out" "$T/agent-e.out" 2>/dev/null
+# --- an answer that consumed nothing: the nonce is kept and re-sent, bounded (Codex PR #200)
+agent e data-down >/dev/null 2>&1   # a fresh epoch (3): the marker is at epoch 2 now
+userdata e 1 3 false; agent e lease >/dev/null; agent e guard >/dev/null; : > "$H/stub/enroll-requests.jsonl"
+touch "$H/stub/retry-always"
+t0=$(date +%s); expect_refuse "always 'retryable': refused once the bounded retry ends" enroll_retry_exhausted agent e enroll; t1=$(date +%s)
+check "...within the bound (enrollRetrySeconds=3)" test $((t1 - t0)) -le 10
+check "...the nonce is KEPT in local state (nothing was consumed)" jq -e 'has("nonce") and (.nonceConsumed|not)' "$H/run/lease.json"
+check "...re-sent several times, always the same nonce" bash -c "[ \$(wc -l < '$H/stub/enroll-requests.jsonl') -ge 3 ] && [ \$(jq -r .nonce '$H/stub/enroll-requests.jsonl' | sort -u | wc -l) -eq 1 ]"
+rm -f "$H/stub/retry-always"; agent e data-down >/dev/null
 summary "enrollment + tunnel + control channel"

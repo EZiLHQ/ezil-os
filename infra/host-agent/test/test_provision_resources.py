@@ -71,6 +71,7 @@ class LeaseParsing(unittest.TestCase):
 class ProvisionVolume(unittest.TestCase):
     def setUp(self):
         self.cfg = config.Config(dict(config.DEFAULTS))
+        self.cfg["volumeWaitSeconds"] = 0     # the bounded attach wait is test_boot_retries'
         self.links, self.targets, self.stats, self.controllers = [], {}, {}, {}
         self.stats["/"] = SimpleNamespace(st_dev=os.makedev(259, 1))
         self.root_devices = "259:1\n259:0\n"
