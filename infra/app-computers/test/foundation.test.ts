@@ -115,7 +115,9 @@ test('item 1/2: no region or legacy instance-type literal anywhere in shipped so
     const files = ['bin', 'lib', 'config'].flatMap(dir => {
         const walk = (path: string): string[] => statSync(path).isDirectory() ? readdirSync(path).flatMap(f => walk(join(path, f))) : [path];
         return walk(join(root, dir));
-    });
+    // Only shipped files: local deploy configs (config/*.pilot.json etc.) are gitignored
+    // and legitimately name a real region; the committed examples must not.
+    }).filter(f => !f.includes(`${join(root, 'config')}`) || f.endsWith('.example.json'));
     assert.ok(files.length > 10);
     for (const file of files) assert.doesNotMatch(readFileSync(file, 'utf8'), /us-east-1|m7i\.|availabilityZone:|writerProfile|instanceProfileArn/, file);
 });
