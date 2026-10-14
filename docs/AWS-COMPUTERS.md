@@ -107,6 +107,9 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - **Writing.** Every write goes through one module.
   - Creation takes `pg_advisory_xact_lock` on the computer.
   - Every transition is `UPDATE … WHERE computer_id = $1 AND generation = $g AND lease_epoch = $e RETURNING`.
+  A user-triggered transition (open, stop, a failed start's undo) also matches `owner_user_id` = the authenticated
+  caller, so another user's placement never moves. Only the lifecycle receipt path (the reconciler) transitions without
+  an owner, through a separate entry point that no user-facing module may name (a source-scan test enforces this).
   - **Two counters.** `generation` is the *writer* generation: it changes only when the instance is replaced or recovered, and it matches the lifecycle tags on the instance and volume. `lease_epoch` increases on every lease (each start or claim) without retagging AWS resources.
   - A periodic duplicate check (`HAVING count(*) > 1`) alarms and closes admission.
 

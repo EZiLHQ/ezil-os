@@ -170,20 +170,20 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     });
 
     /** Build and start; on any failure undo the placement step that preceded it. */
-    const launch = async (p: Placement, intent: LifecycleIntent, undo: PlacementState): Promise<'started' | 'invalid' | 'failed'> => {
+    const launch = async (owner: string, p: Placement, intent: LifecycleIntent, undo: PlacementState): Promise<'started' | 'invalid' | 'failed'> => {
         const region = p.region!;
         let work;
         try {
             work = buildLifecycleWork(intent);
         } catch (error) {
             if (!(error instanceof LifecycleIntentInvalidError)) throw error;
-            await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: undo });
+            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
             return 'invalid';
         }
         try {
             await deps.starter!.start(region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
         } catch {
-            await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: undo });
+            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
             return 'failed';
         }
         return 'started';
@@ -217,13 +217,13 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 try {
                     ({ userData } = await deps.enrollment.issue(p));
                 } catch {
-                    await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: 'UNCONFIRMED' });
+                    await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
                     return notReady('aws_enrollment_unavailable');
                 }
                 // A provision is the computer's first lease: the row was created at epoch 1 and the
                 // intent carries exactly the row's epoch, so the first wake leases 2 (C-3/C-4).
                 const intent = intentFor(p, 'provision', cfg.deployments[p.region!]!, { userData, dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: p.leaseEpoch });
-                const r = await launch(p, intent, 'UNCONFIRMED');
+                const r = await launch(c.userId, p, intent, 'UNCONFIRMED');
                 return r === 'started' ? notReady('computer_starting', true) : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
             }
 
@@ -249,12 +249,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // Region is sticky: the deployment is the placement's own region, never another.
                     const deployment = cfg.deployments[p.region!];
                     if (!deployment) {
-                        await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: 'STOPPED' });
+                        await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STOPPED' });
                         return notReady('region_not_configured');
                     }
-                    const r = await launch(p, intentFor(p, 'start', deployment, { userData: null, dataVolumeGiB: null, leaseEpoch: p.leaseEpoch }), 'STOPPED');
+                    const r = await launch(c.userId, p, intentFor(p, 'start', deployment, { userData: null, dataVolumeGiB: null, leaseEpoch: p.leaseEpoch }), 'STOPPED');
                     if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
-                    await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: 'STARTING' });
+                    await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STARTING' });
                     return notReady('computer_starting', true);
                 }
                 default: {
@@ -285,12 +285,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (p.state !== 'RUNNING') return { ok: false, terminated: false, outcome: `placement_${p.state.toLowerCase()}` };
             const deployment = cfg.deployments[p.region ?? ''];
             if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
-            const draining = await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: 'DRAINING' });
+            const draining = await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'DRAINING' });
             if (!draining.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
             const d = draining.placement;
-            const r = await launch(d, intentFor(d, 'stop', deployment, { userData: null, dataVolumeGiB: null, leaseEpoch: d.leaseEpoch }), 'UNCONFIRMED');
+            const r = await launch(c.userId, d, intentFor(d, 'stop', deployment, { userData: null, dataVolumeGiB: null, leaseEpoch: d.leaseEpoch }), 'UNCONFIRMED');
             if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
-            await transitionPlacement(deps.db, { computerId: d.computerId, expected: d, to: 'STOPPING' });
+            await transitionPlacement(deps.db, { computerId: d.computerId, ownerUserId: c.userId, expected: d, to: 'STOPPING' });
             // Not confirmed until the execution's receipt marks the placement STOPPED.
             return { ok: false, terminated: false, outcome: 'stopping' };
         },

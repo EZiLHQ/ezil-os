@@ -7,8 +7,12 @@
  * backends; the SQL text the races depend on is pinned below as well.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import { drizzle } from 'drizzle-orm/pg-proxy';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 import type * as schema from '@/server/db/schema';
@@ -32,6 +36,7 @@ import {
     withAdmission,
     PlacementIsolationError,
     transitionPlacement,
+    transitionPlacementAsReconciler,
     type PlacementDb,
 } from './placement';
 
@@ -205,28 +210,28 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
 
     it('a matching expectation moves the state and stamps updated_at', async () => {
         const { db, placements } = at();
-        const r = await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING', fields: { instanceId: 'i-1' } });
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING', fields: { instanceId: 'i-1' } });
         expect(r.ok && r.placement).toMatchObject({ state: 'STARTING', generation: 2, leaseEpoch: 5, instanceId: 'i-1' });
         expect(placements[0]!.updated_at).toEqual(new Date('2026-10-13T12:00:00Z'));
     });
 
     it('a stale lease_epoch loses (guard: lease_epoch)', async () => {
         const { db, placements } = at();
-        const r = await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 4, state: 'LEASED' }, to: 'STARTING' });
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 4, state: 'LEASED' }, to: 'STARTING' });
         expect(r).toEqual({ ok: false, reason: 'cas_conflict' });
         expect(placements[0]!.state).toBe('LEASED');
     });
 
     it('a stale generation loses (guard: generation)', async () => {
         const { db, placements } = at();
-        const r = await transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
         expect(r).toEqual({ ok: false, reason: 'cas_conflict' });
         expect(placements[0]!.state).toBe('LEASED');
     });
 
     it('a wrong from-state loses even with matching counters (guard: state)', async () => {
         const { db, placements } = at({ state: 'RUNNING' });
-        const r = await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RETIRING' });
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RETIRING' });
         expect(r).toEqual({ ok: false, reason: 'cas_conflict' });
         expect(placements[0]!.state).toBe('RUNNING');
     });
@@ -235,7 +240,7 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, placements } = createFakePlacementDb({
             placements: [placementRow({ computer_id: A, state: 'LEASED' }), placementRow({ computer_id: B, state: 'LEASED' })],
         });
-        await transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 0, state: 'LEASED' }, to: 'STARTING' });
+        await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0, state: 'LEASED' }, to: 'STARTING' });
         expect(placements.map((p) => p.state)).toEqual(['STARTING', 'LEASED']);
     });
 
@@ -243,8 +248,8 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, placements } = at();
         const expected = { generation: 2, leaseEpoch: 5, state: 'LEASED' } as const;
         const results = await Promise.all([
-            transitionPlacement(db, { computerId: A, expected, to: 'STARTING' }),
-            transitionPlacement(db, { computerId: A, expected, to: 'UNCONFIRMED' }),
+            transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected, to: 'STARTING' }),
+            transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected, to: 'UNCONFIRMED' }),
         ]);
         expect(results.filter((r) => r.ok)).toHaveLength(1);
         expect(results.filter((r) => !r.ok)).toEqual([{ ok: false, reason: 'cas_conflict' }]);
@@ -255,7 +260,7 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, placements } = createFakePlacementDb({
             placements: [placementRow({ computer_id: A, state: 'LEASED' }), placementRow({ computer_id: A, state: 'LEASED' })],
         });
-        const e = await integrity(transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 0, state: 'LEASED' }, to: 'STARTING' }));
+        const e = await integrity(transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0, state: 'LEASED' }, to: 'STARTING' }));
         expect(e.reason).toBe('duplicate_placement');
         expect(placements.map((p) => p.state)).toEqual(['LEASED', 'LEASED']);
     });
@@ -264,33 +269,90 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, placements } = createFakePlacementDb({
             placements: [placementRow({ computer_id: A, state: 'LEASED', lease_epoch: 1 }), placementRow({ computer_id: A, state: 'STOPPED' })],
         });
-        const e = await integrity(transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 1, state: 'LEASED' }, to: 'STARTING' }));
+        const e = await integrity(transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 1, state: 'LEASED' }, to: 'STARTING' }));
         expect(e.reason).toBe('duplicate_placement');
         expect(placements.map((p) => p.state)).toEqual(['LEASED', 'STOPPED']);
     });
 
     it('illegal edges are refused without a statement; LEASED is reachable only by leasing', async () => {
         const { db, statements } = at({ state: 'STOPPED' });
-        expect(await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'LEASED' })).toEqual({ ok: false, reason: 'illegal_transition' });
-        expect(await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RUNNING' })).toEqual({ ok: false, reason: 'illegal_transition' });
+        expect(await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'LEASED' })).toEqual({ ok: false, reason: 'illegal_transition' });
+        expect(await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RUNNING' })).toEqual({ ok: false, reason: 'illegal_transition' });
         expect(statements).toEqual([]);
         for (const from of PLACEMENT_STATES) expect(PLACEMENT_TRANSITIONS[from]).not.toContain('LEASED');
     });
 
     it('a provision receipt may land RUNNING (the infra provision boots the instance); the epoch does not move', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, state: 'PROVISIONING', lease_epoch: 1 })] });
-        const r = await transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 1, state: 'PROVISIONING' }, to: 'RUNNING', fields: { instanceId: 'i-1' } });
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 1, state: 'PROVISIONING' }, to: 'RUNNING', fields: { instanceId: 'i-1' } });
         expect(r.ok && r.placement).toMatchObject({ state: 'RUNNING', generation: 1, leaseEpoch: 1, instanceId: 'i-1' });
         expect(PLACEMENT_TRANSITIONS.PROVISIONING).toEqual(['RUNNING', 'STOPPED', 'UNCONFIRMED']);
-        expect(await transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 1, state: 'RUNNING' }, to: 'PROVISIONING' })).toEqual({ ok: false, reason: 'illegal_transition' });
+        expect(await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 1, state: 'RUNNING' }, to: 'PROVISIONING' })).toEqual({ ok: false, reason: 'illegal_transition' });
     });
 
-    it('the CAS SQL carries all four guards and RETURNING', async () => {
+    it('the CAS SQL carries all five guards (owner included) and RETURNING', async () => {
         const { db, statements } = at();
-        await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
+        await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
         const cas = statements.find((s) => /placement:cas/.test(s.sql))!;
-        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+ AND state = \$\d+\s+RETURNING/);
+        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+ AND state = \$\d+ AND owner_user_id = \$\d+::uuid\s+RETURNING/);
         expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
+    });
+});
+
+describe('R-PL F2: user transitions are owner-guarded; the reconciler path is separate', () => {
+    const OTHER = '99999999-9999-4999-8999-999999999999';
+    const row = () => createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: 2, lease_epoch: 5, state: 'STOPPED' })] });
+
+    it("another user's STOPPED → RETIRING does not move (zero rows → cas_conflict)", async () => {
+        const { db, placements } = row();
+        expect(await transitionPlacement(db, { computerId: A, ownerUserId: OTHER, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RETIRING' })).toEqual({ ok: false, reason: 'cas_conflict' });
+        expect(placements[0]!.state).toBe('STOPPED');
+        // The recorded owner, in any case spelling, does move it.
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER.toUpperCase(), expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RETIRING' });
+        expect(r.ok && r.placement.state).toBe('RETIRING');
+    });
+
+    it.each([['missing', undefined], ['empty', ''], ['not a uuid', 'user-1']])('a %s owner throws before any statement', async (_n, owner) => {
+        const { db, statements, placements } = row();
+        await expect(transitionPlacement(db, { computerId: A, ownerUserId: owner as never, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RETIRING' })).rejects.toThrow(/ownerUserId/);
+        expect(statements).toEqual([]);
+        expect(placements[0]!.state).toBe('STOPPED');
+    });
+
+    it('the reconciler moves a placement whoever owns it, with the same edges and no owner predicate', async () => {
+        const { db, statements } = row();
+        const r = await transitionPlacementAsReconciler(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'RETIRING' });
+        expect(r.ok && r.placement.state).toBe('RETIRING');
+        expect(statements.find((s) => /placement:cas/.test(s.sql))!.sql.match(/WHERE([\s\S]*?)RETURNING/)![1]).not.toMatch(/owner_user_id/);
+        expect(await transitionPlacementAsReconciler(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'RETIRING' }, to: 'LEASED' })).toEqual({ ok: false, reason: 'illegal_transition' });
+    });
+
+    // Static, over the parsed source (comments may name it): no user-facing module may call the reconciler entry.
+    const SRC = path.resolve(__dirname, '../../..');
+    const identifiersIn = (rel: string) => {
+        const file = path.join(SRC, rel);
+        const found = new Set<string>();
+        const visit = (node: ts.Node) => {
+            if (ts.isIdentifier(node)) found.add(node.text);
+            ts.forEachChild(node, visit);
+        };
+        visit(ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true));
+        return found;
+    };
+    const USER_PATH = [
+        'server/lib/compute/aws-ec2.ts',
+        'server/lib/compute/admission.ts',
+        'server/lib/compute/select.ts',
+        'server/lib/compute/provider.ts',
+        'server/api/routers/cloudflare-guacamole.ts',
+        'server/api/routers/computer.ts',
+    ];
+    it.each(USER_PATH)('%s never names transitionPlacementAsReconciler', (rel) => {
+        expect(identifiersIn(rel).has('transitionPlacementAsReconciler')).toBe(false);
+    });
+    it('the scan is not vacuous', () => {
+        expect(identifiersIn('server/lib/compute/aws-ec2.ts').has('transitionPlacement')).toBe(true);
+        expect(identifiersIn('server/lib/compute/placement.ts').has('transitionPlacementAsReconciler')).toBe(true);
     });
 });
 
@@ -301,7 +363,7 @@ describe('leasing and AWS creation need the admission lock of the same transacti
         const r = await withAdmission(db, (tx, lock) => leasePlacement(tx, lock, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5 }, leaseUntil: until }));
         expect(r.ok && r.placement).toMatchObject({ state: 'LEASED', generation: 2, leaseEpoch: 6, leaseUntil: until });
         // LEASED → STOPPED (a lapsed lease), then a replace lease reserves generation + 1 as well.
-        await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 6, state: 'LEASED' }, to: 'STOPPED' });
+        await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 6, state: 'LEASED' }, to: 'STOPPED' });
         const r2 = await withAdmission(db, (tx, lock) =>
             leasePlacement(tx, lock, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 6 }, leaseUntil: until, replace: true }),
         );

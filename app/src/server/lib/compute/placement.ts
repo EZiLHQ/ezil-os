@@ -488,7 +488,7 @@ async function casInTx(
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
-    lease?: { provider: PlacementProvider; ownerUserId: string },
+    guard: { provider?: PlacementProvider; ownerUserId?: string } = {},
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
@@ -506,7 +506,7 @@ async function casInTx(
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
-            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${lease ? sql` AND provider = ${lease.provider} AND owner_user_id = ${canonicalId(lease.ownerUserId)}::uuid` : sql``}
+            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -515,8 +515,32 @@ async function casInTx(
     return { ok: true, placement: parsePlacementRow(rows[0]!, computerId) };
 }
 
-/** Any C-3 transition except leasing. Zero rows = someone else moved first. */
+/**
+ * A USER-TRIGGERED C-3 transition, except leasing: open, stop, or the undo of a
+ * failed start. `ownerUserId` is the AUTHENTICATED caller and is required: the
+ * CAS also matches `owner_user_id`, so another user's placement never moves
+ * (zero rows → `cas_conflict`). Zero rows otherwise means someone else moved first.
+ */
 export async function transitionPlacement(
+    db: PlacementDb,
+    input: { computerId: string; ownerUserId: string; expected: CasExpectation; to: PlacementState; fields?: PlacementFields },
+): Promise<TransitionResult> {
+    // Checked before anything else: a missing owner must never become an unguarded write.
+    if (typeof input.ownerUserId !== 'string' || !UUID.test(input.ownerUserId)) throw new Error('transitionPlacement requires the caller ownerUserId');
+    if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
+    return db.transaction((tx) =>
+        casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {}, { ownerUserId: input.ownerUserId }),
+    );
+}
+
+/**
+ * RECONCILER ONLY: a C-3 transition with NO owner predicate, for the lifecycle
+ * receipt path (execution results, EC2 observations), which moves a placement
+ * whoever owns it. The same legal-edge table and CAS guards apply. A user-facing
+ * path must never name it: `placement.test.ts` scans the user-path modules and
+ * routers and fails if any of them does.
+ */
+export async function transitionPlacementAsReconciler(
     db: PlacementDb,
     input: { computerId: string; expected: CasExpectation; to: PlacementState; fields?: PlacementFields },
 ): Promise<TransitionResult> {

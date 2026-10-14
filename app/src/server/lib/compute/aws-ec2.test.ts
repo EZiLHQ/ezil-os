@@ -12,7 +12,7 @@ import type { AwsTier } from './aws-config';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementState } from './placement';
+import { PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -145,9 +145,9 @@ describe('ensure: a new computer', () => {
 });
 
 /** The lifecycle receipt path is not built yet (lane A3): tests stand in for it with CAS transitions. */
-async function receipt(db: Parameters<typeof transitionPlacement>[0], to: PlacementState, fields: Parameters<typeof transitionPlacement>[1]['fields'] = {}): Promise<Placement> {
+async function receipt(db: Parameters<typeof transitionPlacementAsReconciler>[0], to: PlacementState, fields: Parameters<typeof transitionPlacementAsReconciler>[1]['fields'] = {}): Promise<Placement> {
     const { record } = await readPlacement(db, C1);
-    const r = await transitionPlacement(db, { computerId: C1, expected: record!, to, fields });
+    const r = await transitionPlacementAsReconciler(db, { computerId: C1, expected: record!, to, fields });
     if (!r.ok) throw new Error(`receipt ${record!.state} -> ${to}: ${r.reason}`);
     return r.placement;
 }
