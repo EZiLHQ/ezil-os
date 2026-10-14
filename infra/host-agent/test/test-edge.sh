@@ -9,8 +9,8 @@ cleanup() { ip netns delete "$NS" 2>/dev/null; }
 trap cleanup EXIT
 ip netns delete "$NS" 2>/dev/null; ip netns add "$NS"; ip -n "$NS" link set lo up
 pyns() { ip netns exec "$NS" env PYTHONPATH="$HA/lib" EZIL_EDGE_FIXED_PORTS=1 python3 "$@"; }
-check "edge E2E (real agent socket, fixed ports 8181/8443) inside a disposable netns" \
-    bash -c "cd '$HA/test' && $(declare -f pyns); NS='$NS' HA='$HA' pyns -m unittest -q test_edge.EdgeE2E"
+check "edge guards and E2E (real agent socket, fixed ports 8181/8443) inside a disposable netns" \
+    bash -c "cd '$HA/test' && $(declare -f pyns); NS='$NS' HA='$HA' pyns -m unittest -q test_edge"
 # The default config binds the edge to 127.0.0.1 only: a non-loopback address in the
 # namespace must not reach it.
 ip -n "$NS" link add ed0 type dummy; ip -n "$NS" addr add 192.0.2.10/24 dev ed0; ip -n "$NS" link set ed0 up

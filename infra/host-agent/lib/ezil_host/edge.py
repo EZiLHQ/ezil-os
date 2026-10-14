@@ -18,8 +18,8 @@ One request per connection (the upstream gets `Connection: close`), so a second 
 a kept-alive client connection can never ride through unverified. A WebSocket upgrade that
 the desktop accepts (101) becomes a raw two-way pipe, which is a WebSocket by then.
 
-Presence (GW-3): every verified request, and every 30 s while a verified WebSocket stays
-open, is reported to the agent as a `presence` command on its root-only control socket. The
+Presence (GW-3): every verified request, and one shared tick every 30 s while any verified
+WebSocket stays open, is reported to the agent as a `presence` command on its root-only control socket. The
 edge is that socket's only client, so it owns the per-epoch `seq` (the agent refuses any seq
 at or below its persisted high-water mark). Presence is throttled to one command per 15 s:
 the idle window is 600 s, and every command costs the agent an fsync.
@@ -59,7 +59,8 @@ CONTROL_RE = re.compile(r"^/__ezil/control/(stop|fence)(?:/(\d{1,3}))?$")
 ICE_RE = re.compile(r"^/__ezil/control/ice/([0-9a-f]{64})$")
 DESKTOP_STATUS_PATH = "/__ezil/control/desktop"
 MAX_ICE_BODY = 16384
-HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}(?::\d{1,5})?$")
+FORWARDING_HEADERS = {"forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
+                      "cf-connecting-ipv6", "cf-pseudo-ipv4", "cf-visitor"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
               "te", "trailer", "upgrade"}
 
@@ -108,8 +109,10 @@ def load_key(cfg):
 class Sequencer:
     """The agent control socket's single client: monotonic seq, signed commands, throttled presence."""
 
-    def __init__(self, cfg, lease, key, clock=time.time, log=lambda m: print(m, flush=True)):
+    def __init__(self, cfg, lease, key, clock=time.time, log=lambda m: print(m, flush=True),
+                 monotonic=time.monotonic):
         self.cfg, self.lease, self.key, self.clock, self.log = cfg, lease, key, clock, log
+        self.monotonic = monotonic
         self.lock = threading.Lock()
         self.seq = self._persisted_seq()
         self.last_presence = None
@@ -143,30 +146,33 @@ class Sequencer:
 
     def send(self, op, **fields):
         with self.lock:
+            if op == "presence":
+                now = self.monotonic()
+                if self.last_presence is not None and now - self.last_presence < PRESENCE_MIN_INTERVAL:
+                    return None
             for attempt in (1, 2):
                 self.seq = max(self.seq + 1, int(self.clock() * 1000))
                 msg = {"op": op, "leaseEpoch": self.lease["leaseEpoch"], "ts": self.clock(), "seq": self.seq, **fields}
-                resp = self._send_once(msg)
+                try:
+                    resp = self._send_once(msg)
+                finally:
+                    if op == "presence":
+                        # Include delivery time and failures in the shared throttle.
+                        self.last_presence = self.monotonic()
                 if resp.get("error") == "replayed" and attempt == 1:
                     self.seq = max(self.seq, self._persisted_seq())
-                    continue
+                    if op != "presence":
+                        continue   # presence retries must wait for the shared throttle
                 return resp
         return {"ok": False, "error": "replayed"}
 
-    def presence(self, force=False):
-        now = self.clock()
-        with self.lock:
-            if not force and self.last_presence is not None and now - self.last_presence < PRESENCE_MIN_INTERVAL:
-                return None
-            self.last_presence = now
+    def presence(self):
         try:
             resp = self.send("presence")
         except (OSError, ValueError) as e:
             self.log(f"edge: presence not delivered: {type(e).__name__}")
-            with self.lock:
-                self.last_presence = None   # retry on the next verified request
             return None
-        if not resp.get("ok"):
+        if resp is not None and not resp.get("ok"):
             self.log(f"edge: presence refused: {resp.get('error')}")
         return resp
 
@@ -200,13 +206,17 @@ def read_head(sock):
     parts = lines[0].split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
         raise ValueError("bad_request_line")
-    headers = []
+    headers, seen = [], set()
     for line in lines[1:]:
-        if ":" not in line or line[0] in " \t":
+        if "\r" in line or "\n" in line or ":" not in line or line[0] in " \t":
             raise ValueError("bad_header")
         k, v = line.split(":", 1)
         if not k or k.strip() != k:
             raise ValueError("bad_header")
+        lk = k.lower()
+        if lk in {"host", "content-length", "transfer-encoding"} and lk in seen:
+            raise ValueError("duplicate_header")
+        seen.add(lk)
         headers.append((k, v.strip()))
     return _Head(parts[0], parts[1], parts[2], headers, rest)
 
@@ -265,19 +275,14 @@ def _forward_body(client, upstream, head):
             if not re.fullmatch(rb"[0-9a-fA-F]{1,8}", size_txt):
                 raise ValueError("bad_chunk")
             size = int(size_txt, 16)
-            upstream.sendall(line + b"\r\n")
             if size == 0:
-                # trailers (if any) end with an empty line
-                while True:
-                    while b"\r\n" not in pending:
-                        more = client.recv(8192)
-                        if not more:
-                            raise ValueError("eof")
-                        pending += more
-                    tline, pending = pending.split(b"\r\n", 1)
-                    upstream.sendall(tline + b"\r\n")
-                    if tline == b"":
-                        return pending
+                # Withhold the final chunk until the empty trailer section is verified.
+                terminator, pending = _recv_exact(client, 2, pending)
+                if terminator != b"\r\n":
+                    raise ValueError("trailers_not_allowed")
+                upstream.sendall(line + b"\r\n\r\n")
+                return pending
+            upstream.sendall(line + b"\r\n")
             data, pending = _recv_exact(client, size + 2, pending)
             if not data.endswith(b"\r\n"):
                 raise ValueError("bad_chunk")
@@ -311,6 +316,15 @@ class Edge:
         self.ports = tuple(int(p) for p in (cfg.get("edgePorts") or PORTS))
         self.binding = {"computerId": lease["computerId"], "generation": lease["generation"],
                         "leaseEpoch": lease["leaseEpoch"]}
+        sandbox_id = cfg.get("sandboxId") or lease.get("sandboxId")
+        zone = cfg.get("zone") or lease.get("zone")
+        # These fields are trusted configuration, never inferred from a request.
+        self.browser_host_re = None
+        if isinstance(sandbox_id, str) and sandbox_id and isinstance(zone, str) and zone:
+            self.browser_host_re = re.compile(
+                r"aws-(8181|8080|3002|8443)-" + re.escape(sandbox_id) + r"\." + re.escape(zone))
+        self._ws_lock = threading.Lock()
+        self._websockets = 0
 
     # ------------------------------------------------------------------ one request
     def handle(self, client):
@@ -419,12 +433,14 @@ class Edge:
         upgrade = any(v.lower() == "websocket" for v in head.get("upgrade"))
         fwd = [f"{head.method} {upath} HTTP/1.1"]
         xfh = head.one("x-forwarded-host")
+        browser_host = (xfh if xfh and self.browser_host_re
+                        and self.browser_host_re.fullmatch(xfh) else None)
         for k, v in head.headers:
             lk = k.lower()
-            if lk == GW_HEADER or lk in HOP_BY_HOP or lk == "x-forwarded-host":
+            if lk in HOP_BY_HOP or lk in FORWARDING_HEADERS or lk.startswith(("x-forwarded-", "x-ezil-")):
                 continue
-            if lk == "host" and xfh and HOST_RE.match(xfh):
-                v = xfh       # the browser's host, so apps that check Origin against Host agree
+            if lk == "host" and browser_host:
+                v = browser_host   # otherwise retain the gateway's tunnel Host
             fwd.append(f"{k}: {v}")
         fwd += ["Upgrade: websocket", "Connection: Upgrade"] if upgrade else ["Connection: close"]
         try:
@@ -478,16 +494,23 @@ class Edge:
         stop = threading.Event()
         upstream.settimeout(None)
         client.settimeout(None)
-        ticker = threading.Thread(target=self._ws_presence, args=(stop,), daemon=True)
-        ticker.start()
-        t = threading.Thread(target=_pipe, args=(upstream, client, stop), daemon=True)
-        t.start()
-        _pipe(client, upstream, stop)
-        t.join(5)
+        with self._ws_lock:
+            self._websockets += 1
+        try:
+            t = threading.Thread(target=_pipe, args=(upstream, client, stop), daemon=True)
+            t.start()
+            _pipe(client, upstream, stop)
+            t.join(5)
+        finally:
+            with self._ws_lock:
+                self._websockets -= 1
 
     def _ws_presence(self, stop):
         while not stop.wait(WS_PRESENCE_INTERVAL):
-            self.seq.presence(force=True)
+            with self._ws_lock:
+                active = self._websockets > 0
+            if active:
+                self.seq.presence()
 
     # ------------------------------------------------------------------ server
     def serve(self, stop_event, ready=None):
@@ -498,9 +521,12 @@ class Edge:
         s.bind((bind, port))
         s.listen(64)
         s.settimeout(0.5)
-        if ready is not None:
-            ready(s.getsockname())
+        ticker_stop = threading.Event()
+        ticker = threading.Thread(target=self._ws_presence, args=(ticker_stop,), daemon=True)
+        ticker.start()
         try:
+            if ready is not None:
+                ready(s.getsockname())
             while not stop_event.is_set():
                 try:
                     c, _ = s.accept()
@@ -508,7 +534,9 @@ class Edge:
                     continue
                 threading.Thread(target=self._serve_one, args=(c,), daemon=True).start()
         finally:
+            ticker_stop.set()
             s.close()
+            ticker.join(1)
 
     def _serve_one(self, c):
         try:
