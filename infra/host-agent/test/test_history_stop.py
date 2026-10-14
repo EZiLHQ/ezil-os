@@ -273,6 +273,19 @@ class HangupScope(unittest.TestCase):
         finally:
             sh.kill()
 
+    def test_no_scope_and_unreadable_namespace_never_match(self):
+        # None == None must not count as membership: with the container gone and a pid whose
+        # /proc/<pid>/ns/pid cannot be read, nothing is signalled.
+        sh = Shell(self.home)
+        try:
+            time.sleep(0.3)
+            with mock.patch.object(desktop, "container_scope", return_value=None), \
+                 mock.patch.object(desktop, "_pid_ns", return_value=None):
+                self.assertEqual(desktop.hangup_shells(self.cfg, settle=0.5, pids=[sh.pid]), 0)
+            self.assertTrue(sh.alive())
+        finally:
+            sh.kill()
+
     def test_container_scope_is_the_init_pid_namespace(self):
         class R:
             def __init__(self, rc, out):
