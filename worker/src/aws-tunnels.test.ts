@@ -150,8 +150,26 @@ describe('remove', () => {
     calls.length = 0;
     expect((await svc.remove(claims({ leaseEpoch: 4 }), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 4 }))).body).toEqual({ deleted: true });
     expect(calls).toEqual(['deleteDns dns-1', 'deleteTunnel tun-1']);
-    expect(s.map.size).toBe(0);
+    expect(s.map.has('tunnel')).toBe(false);
+    expect(s.map.get('fenced_epoch')).toBe(4);
     expect((await svc.remove(claims({ leaseEpoch: 4 }), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 4 }))).body).toEqual({ deleted: false });
+  });
+  it('retains fences across restart and delete-before-create', async () => {
+    for (const created of [false, true]) {
+      const s = memStorage(); const { api, calls } = fakeApi();
+      let svc = createAwsTunnelService({ api, storage: s, zone: ZONE });
+      if (created) await svc.create(claims(), body());
+      const deletion = JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 4 });
+      expect((await svc.remove(claims({ leaseEpoch: 4 }), deletion)).body).toEqual({ deleted: created });
+      svc = createAwsTunnelService({ api, storage: s, zone: ZONE });
+      calls.length = 0;
+      for (const leaseEpoch of [2, 3, 4]) {
+        const result = await svc.create(claims({ leaseEpoch }), body({ leaseEpoch }));
+        expect(result).toEqual({ status: 409, body: { ok: false, error: 'stale_epoch' } });
+      }
+      expect(calls).toEqual([]);
+      expect((await svc.create(claims({ leaseEpoch: 5 }), body({ leaseEpoch: 5 }))).status).toBe(200);
+    }
   });
   it('mismatched claims are refused', async () => {
     const svc = createAwsTunnelService({ api: fakeApi().api, storage: memStorage(), zone: ZONE });
@@ -178,7 +196,8 @@ describe('verifyOrigin (C-6 step 5)', () => {
     calls.length = 0;
     expect(await svc.verifyOrigin()).toBe('mismatch');
     expect(calls).toEqual(['deleteDns dns-1', 'deleteTunnel tun-1']);
-    expect(s.map.size).toBe(0);
+    expect(s.map.has('tunnel')).toBe(false);
+    expect(s.map.get('fenced_epoch')).toBe(2);
   });
 });
 

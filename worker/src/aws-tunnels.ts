@@ -111,6 +111,7 @@ export interface TunnelStorage {
 }
 
 const RECORD_KEY = 'tunnel';
+const FENCE_KEY = 'fenced_epoch';
 const INSTANCE_ID = /^i-[0-9a-f]{8,17}$/;
 const REGION = /^[a-z]{2}(?:-[a-z]+)+-\d$/;
 const CREATE_KEYS = 'computerId,controlKey,generation,instanceId,leaseEpoch,publicIp,region,sandboxId';
@@ -203,20 +204,36 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
   const edgePort = deps.edgePort ?? AWS_EDGE_PORT_DEFAULT;
   const now = deps.nowMs ?? Date.now;
 
-  /** Tunnel (with its connections) and DNS record, then the record; throws if Cloudflare refuses. */
+  async function fencedEpoch(): Promise<number> {
+    return (await deps.storage.get<number>(FENCE_KEY)) ?? 0;
+  }
+
+  async function fenceThrough(epoch: number): Promise<void> {
+    const previous = await fencedEpoch();
+    if (epoch > previous) await deps.storage.put(FENCE_KEY, epoch);
+  }
+
+  async function liveRecord(): Promise<AwsTunnelRecord | null> {
+    const rec = (await deps.storage.get<AwsTunnelRecord>(RECORD_KEY)) ?? null;
+    return rec && rec.leaseEpoch > await fencedEpoch() ? rec : null;
+  }
+
+  /** Persist the fence before teardown; retain it after removing the tunnel record. */
   async function destroy(api: CloudflareTunnelApi, rec: AwsTunnelRecord): Promise<void> {
+    await fenceThrough(rec.leaseEpoch);
     await api.deleteDnsRecord(rec.dnsRecordId);
     await api.deleteTunnel(rec.tunnelId);
     await deps.storage.delete(RECORD_KEY);
   }
 
   return {
-    get: (): Promise<AwsTunnelRecord | null> => serial(async () => (await deps.storage.get<AwsTunnelRecord>(RECORD_KEY)) ?? null),
+    get: (): Promise<AwsTunnelRecord | null> => serial(liveRecord),
 
     create: (claims: PreviewTokenV2Claims | undefined, text: string): Promise<TunnelResult> => serial(async () => {
       const body = parseCreateBody(text);
       if (!body) return fail(400, 'tunnel_request_invalid');
       if (!claims || !claimsMatch(claims, body)) return fail(401, 'tunnel_claims_mismatch');
+      if (body.leaseEpoch <= await fencedEpoch()) return fail(409, 'stale_epoch');
       if (!deps.api || !deps.zone) return fail(503, 'tunnel_api_not_configured');
       const api = deps.api;
       const existing = (await deps.storage.get<AwsTunnelRecord>(RECORD_KEY)) ?? null;
@@ -259,11 +276,13 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       if (!body) return fail(400, 'tunnel_request_invalid');
       if (!claims || !claimsMatch(claims, body)) return fail(401, 'tunnel_claims_mismatch');
       const existing = (await deps.storage.get<AwsTunnelRecord>(RECORD_KEY)) ?? null;
-      if (!existing || existing.computerId !== body.computerId || existing.leaseEpoch > body.leaseEpoch) {
+      if (existing && (existing.computerId !== body.computerId || existing.leaseEpoch > body.leaseEpoch)) {
         return { status: 200, body: { deleted: false } };
       }
-      if (!deps.api) return fail(503, 'tunnel_api_not_configured');
       try {
+        await fenceThrough(body.leaseEpoch);
+        if (!existing) return { status: 200, body: { deleted: false } };
+        if (!deps.api) return fail(503, 'tunnel_api_not_configured');
         await destroy(deps.api, existing);
       } catch {
         return fail(502, 'tunnel_fence_failed');
@@ -273,7 +292,7 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
 
     /** C-6 step 5: the connector must come from the instance's public address. */
     verifyOrigin: (): Promise<'verified' | 'mismatch' | 'not_connected'> => serial(async () => {
-      const rec = (await deps.storage.get<AwsTunnelRecord>(RECORD_KEY)) ?? null;
+      const rec = await liveRecord();
       if (!rec || !deps.api) return 'not_connected';
       if (rec.originVerified) return 'verified';
       const origins = await deps.api.listConnectorOrigins(rec.tunnelId).catch(() => null);
