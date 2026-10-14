@@ -7,7 +7,8 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { AWS_RETIREMENT_UNDERWAY, AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
+import { AWS_RETIREMENT_UNDERWAY, AWS_RETIRING, AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
+import { START_ATTEMPTS } from './aws-receipts';
 import type { AwsTier } from './aws-config';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
@@ -46,13 +47,21 @@ const NONCE = NONCE_BYTES.toString('base64url');
 /** The host lease JSON a launch's user data carries (lease.py). */
 const leaseOf = (userData: string | null) => JSON.parse(Buffer.from(userData!, 'base64').toString('utf8')) as Record<string, unknown>;
 
-function recordingStarter(fail = false) {
+/** An ANSWERED refusal (Step Functions 400): AWS did nothing. */
+const refusedStart = () => Object.assign(new Error('refused'), { name: 'ExecutionLimitExceeded', $metadata: { httpStatusCode: 400 } });
+/** A LOST answer (connection reset, no HTTP status): the execution may have started. */
+const lostStart = () => Object.assign(new Error('socket hang up'), { name: 'Error', code: 'ECONNRESET' });
+
+/** `fail`: true = refused; 'lost' = every answer lost; a number = the first n answers lost, then accepted. */
+function recordingStarter(fail: boolean | 'lost' | number = false) {
     const calls: { region: string; stateMachineArn: string; name: string; intent: LifecycleIntent; digest: string }[] = [];
     const starter: LifecycleStarter = {
         async start(region, work) {
             const envelope = JSON.parse(work.input) as { document: string; digest: string };
             calls.push({ region, stateMachineArn: work.stateMachineArn, name: work.name, intent: JSON.parse(envelope.document), digest: envelope.digest });
-            if (fail) throw new Error('ExecutionLimitExceeded');
+            if (fail === true) throw refusedStart();
+            if (fail === 'lost') throw lostStart();
+            if (typeof fail === 'number' && calls.length <= fail) throw lostStart();
         },
     };
     return { starter, calls };
@@ -60,7 +69,7 @@ function recordingStarter(fail = false) {
 
 function setup(
     seed: Parameters<typeof createFakePlacementDb>[0] = {},
-    over: Partial<AwsProviderDeps> & { e?: Record<string, string>; tier?: AwsTier; failStart?: boolean; dbClock?: () => Date } = {},
+    over: Partial<AwsProviderDeps> & { e?: Record<string, string>; tier?: AwsTier; failStart?: boolean | 'lost' | number; dbClock?: () => Date } = {},
 ) {
     const fake = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }], ...seed }, over.dbClock ? { clock: over.dbClock } : {});
     const rec = recordingStarter(over.failStart);
@@ -72,6 +81,7 @@ function setup(
         starter: 'starter' in over ? over.starter : rec.starter,
         tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
         randomBytes: over.randomBytes ?? (() => Buffer.from(NONCE_BYTES)),
+        sleep: over.sleep ?? (async () => {}),
         ...(over.executions ? { executions: over.executions } : {}),
         ...(over.describer ? { describer: over.describer } : {}),
         ...(over.tunnels ? { tunnels: over.tunnels } : {}),
@@ -745,3 +755,73 @@ describe('Codex 4275911832: the lease deadline and hour caps bind during a sessi
         expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
     });
 });
+
+describe('Codex 4277262199: a StartExecution whose answer is lost is not a refusal', () => {
+    const me = { userId: U1, computerId: C1 };
+    /** Every attempt went to the SAME idempotent execution: one name, one input digest. */
+    const sameExecution = (calls: { name: string; digest: string }[]) => {
+        expect(new Set(calls.map((c) => c.name)).size).toBe(1);
+        expect(new Set(calls.map((c) => c.digest)).size).toBe(1);
+    };
+
+    it('provision: every answer lost → still starting; PROVISIONING keeps its job (the authority still authorizes it), marked for settling', async () => {
+        const { provider, placements, calls } = setup({}, { failStart: 'lost' });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(calls).toHaveLength(START_ATTEMPTS);
+        sameExecution(calls);
+        expect(placements[0]).toMatchObject({
+            state: 'PROVISIONING', lifecycle_job_id: calls[0]!.intent.jobId, lifecycle_digest: calls[0]!.digest, last_error: 'lifecycle_start_unknown:UNCONFIRMED',
+        });
+    });
+
+    it('provision: a lost answer, then an accepted retry of the same execution → started, nothing marked', async () => {
+        const { provider, placements, calls } = setup({}, { failStart: 1 });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(calls).toHaveLength(2);
+        sameExecution(calls);
+        expect(placements[0]).toMatchObject({ state: 'PROVISIONING', last_error: null });
+    });
+
+    it('wake by replace: lost → stays LEASED with its job (never UNCONFIRMED on a guess); settles to UNCONFIRMED only if it never ran', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped()] }, { failStart: 'lost' });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        sameExecution(calls);
+        expect(placements[0]).toMatchObject({ state: 'LEASED', generation: 2, lifecycle_job_id: calls[0]!.intent.jobId, last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+    });
+
+    it('wake in start mode: lost → stays LEASED; its settle state is STOPPED, as a refusal would leave it', async () => {
+        const { provider, placements } = setup({ placements: [stopped()] }, { e: startMode(), failStart: 'lost' });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(placements[0]).toMatchObject({ state: 'LEASED', generation: 1, last_error: 'lifecycle_start_unknown:STOPPED' });
+    });
+
+    it('stop: lost → stays DRAINING with its job and reports stopping', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] }, { failStart: 'lost' });
+        expect(await provider.stop(ctx, me, 'user')).toEqual({ ok: false, terminated: false, outcome: 'stopping' });
+        sameExecution(calls);
+        expect(placements[0]).toMatchObject({ state: 'DRAINING', lifecycle_job_id: calls[0]!.intent.jobId, last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+    });
+
+    it('retire: lost → stays RETIRING with its job, reported underway (the delete may proceed); settles back to where it came from', async () => {
+        const { provider, placements } = setup({ placements: [stopped({ lease_epoch: 2 })] }, { failStart: 'lost' });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: AWS_RETIRING });
+        expect(AWS_RETIREMENT_UNDERWAY).toContain(AWS_RETIRING);
+        expect(placements[0]).toMatchObject({ state: 'RETIRING', last_error: 'lifecycle_start_unknown:STOPPED' });
+    });
+
+    it('an answered refusal on a retry (after a lost answer) is still a refusal: undone as before', async () => {
+        let n = 0;
+        const starter: LifecycleStarter = {
+            async start() {
+                n += 1;
+                if (n === 1) throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
+                throw Object.assign(new Error('refused'), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 400 } });
+            },
+        };
+        const { provider, placements } = setup({ placements: [stopped()] }, { e: startMode(), starter });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'aws_lifecycle_start_failed' });
+        expect(n).toBe(2);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', generation: 1 });
+    });
+});
+

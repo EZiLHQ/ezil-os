@@ -10,11 +10,11 @@ import { describe, expect, it } from 'vitest';
 import { createAwsEc2Provider, type LifecycleStarter } from './aws-ec2';
 import { handleAwsEnrollment, nonceHashOf, type Ec2EnrollmentView, type TunnelClient } from './aws-enroll';
 import { AWS_IDENTITY_CERTS_ENV } from './aws-identity';
-import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
+import { buildLifecycleWork, currentGenerationIntent, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
-    applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
+    applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, reconcileGuestStop, startRetireAsReconciler, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
     runAwsBackgroundReconcile, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
@@ -532,7 +532,7 @@ describe('Codex 4275269627: a deleted AWS computer is retired in the background 
         const starts: { region: string; intent: LifecycleIntent }[] = [];
         const starter: LifecycleStarter = {
             async start(region, work) {
-                if (failStart) throw new Error('StartExecution refused');
+                if (failStart) throw Object.assign(new Error('StartExecution refused'), { name: 'ExecutionLimitExceeded', $metadata: { httpStatusCode: 400 } });
                 starts.push({ region, intent: JSON.parse((JSON.parse(work.input) as { document: string }).document) });
             },
         };
@@ -613,7 +613,7 @@ describe('Codex 4276508568: a deleted computer whose stop/retire failed is recov
         const control = { view: opts.view === undefined ? ({ state: 'stopped' } as View) : opts.view, failStart: opts.failStart ?? false };
         const starter: LifecycleStarter = {
             async start(region, work) {
-                if (control.failStart) throw new Error('StartExecution refused');
+                if (control.failStart) throw Object.assign(new Error('StartExecution refused'), { name: 'ExecutionLimitExceeded', $metadata: { httpStatusCode: 400 } });
                 starts.push({ region, intent: JSON.parse((JSON.parse(work.input) as { document: string }).document) });
             },
         };
@@ -783,3 +783,140 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         expect(f.placements.every((r) => r.reconciled_at !== null)).toBe(true);
     });
 });
+
+describe('Codex 4277262199: settling a recorded job whose start got no answer', () => {
+    const absent = () => Object.assign(new Error('missing'), { name: 'ExecutionDoesNotExist', $metadata: { httpStatusCode: 400 } });
+    const SETTLED = new Date(NOW.getTime() - 6 * 60_000);
+    const FRESH = new Date(NOW.getTime() - 60_000);
+    const base = {
+        computer_id: C1, owner_user_id: U1, region: 'ap-south-1', instance_type: 't3a.medium', instance_id: I_OLD, volume_id: VOL, fence_token: FENCE,
+        generation: 2, lease_epoch: 3, lifecycle_job_id: JOB, lifecycle_digest: DIGEST, updated_at: SETTLED,
+    };
+    /** The digest of THIS placement's stop job, exactly as the provider built it. */
+    const STOP_DIGEST = buildLifecycleWork(currentGenerationIntent(
+        { computerId: C1, generation: 2, fenceToken: FENCE, instanceId: I_OLD, volumeId: VOL, instanceType: 't3a.medium' }, 'stop', D, { jobId: JOB, userData: null, leaseEpoch: 3 },
+    )).digest;
+    function recorder(fail?: 'refused' | 'lost') {
+        const calls: { name: string; digest: string }[] = [];
+        const starter: LifecycleStarter = {
+            async start(_region, work) {
+                calls.push({ name: work.name, digest: (JSON.parse(work.input) as { digest: string }).digest });
+                if (fail === 'refused') throw Object.assign(new Error('refused'), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 400 } });
+                if (fail === 'lost') throw Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+            },
+        };
+        return { starter, calls };
+    }
+    async function settle(row: Record<string, unknown>, o: { describe?: () => Promise<Exec>; starter?: LifecycleStarter } = {}) {
+        const fake = createFakePlacementDb({ placements: [placementRow({ ...base, ...row } as never)] }, { clock: () => NOW });
+        const executions: LifecycleExecutionReader = { describe: o.describe ?? (async () => { throw absent(); }) };
+        const { record } = await readPlacement(fake.db, C1);
+        await applyLifecycleReceipt({ db: fake.db, executions, clock: () => NOW, sleep: async () => {}, ...(o.starter ? { starter: o.starter } : {}) }, record!, D);
+        return fake.placements[0]!;
+    }
+
+    it('inside the settle window nothing changes: a start may still appear', async () => {
+        expect(await settle({ state: 'PROVISIONING', last_error: 'lifecycle_start_unknown:UNCONFIRMED', updated_at: FRESH }))
+            .toMatchObject({ state: 'PROVISIONING', lifecycle_job_id: JOB, last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+    });
+
+    it('a provision that never reached Step Functions → UNCONFIRMED, job cleared, lifecycle_start_failed', async () => {
+        expect(await settle({ state: 'PROVISIONING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' }))
+            .toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: null, lifecycle_digest: null, last_error: 'lifecycle_start_failed' });
+    });
+
+    it('a start-mode wake that never ran → back to STOPPED, where a refusal would have left it', async () => {
+        expect(await settle({ state: 'LEASED', last_error: 'lifecycle_start_unknown:STOPPED' }))
+            .toMatchObject({ state: 'STOPPED', lifecycle_job_id: null, last_error: 'lifecycle_start_failed' });
+    });
+
+    it('without the mark an absent execution stays unknown (the ordinary in-flight case)', async () => {
+        expect(await settle({ state: 'PROVISIONING', last_error: null })).toMatchObject({ state: 'PROVISIONING', lifecycle_job_id: JOB });
+    });
+
+    it('any other describe failure is unknown, never settled', async () => {
+        const describe = async (): Promise<Exec> => { throw Object.assign(new Error('boom'), { name: 'InternalFailure', $metadata: { httpStatusCode: 500 } }); };
+        expect(await settle({ state: 'PROVISIONING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' }, { describe }))
+            .toMatchObject({ state: 'PROVISIONING', lifecycle_job_id: JOB });
+    });
+
+    it('a stop carries no secret: its exact job is rebuilt (digest-checked) and started again under the same name', async () => {
+        const rec = recorder();
+        expect(await settle({ state: 'DRAINING', lifecycle_digest: STOP_DIGEST, last_error: 'lifecycle_start_unknown:UNCONFIRMED' }, { starter: rec.starter }))
+            .toMatchObject({ state: 'DRAINING', lifecycle_job_id: JOB });
+        expect(rec.calls).toEqual([{ name: `computer-${JOB}`, digest: STOP_DIGEST }]);
+    });
+
+    it('a refused re-start resolves to the recorded undo', async () => {
+        const rec = recorder('refused');
+        expect(await settle({ state: 'DRAINING', lifecycle_digest: STOP_DIGEST, last_error: 'lifecycle_start_unknown:UNCONFIRMED' }, { starter: rec.starter }))
+            .toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: null, last_error: 'lifecycle_start_failed' });
+    });
+
+    it('a re-start that again gets no answer is re-marked: a new settle window, nothing undone', async () => {
+        const rec = recorder('lost');
+        const row = await settle({ state: 'DRAINING', lifecycle_digest: STOP_DIGEST, last_error: 'lifecycle_start_unknown:UNCONFIRMED' }, { starter: rec.starter });
+        expect(row).toMatchObject({ state: 'DRAINING', lifecycle_job_id: JOB, last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+        expect(row.updated_at).toEqual(NOW);
+    });
+
+    it('a recorded digest that is not exactly this job is never re-started: undo instead', async () => {
+        const rec = recorder();
+        expect(await settle({ state: 'DRAINING', lifecycle_digest: DIGEST, last_error: 'lifecycle_start_unknown:UNCONFIRMED' }, { starter: rec.starter }))
+            .toMatchObject({ state: 'UNCONFIRMED', last_error: 'lifecycle_start_failed' });
+        expect(rec.calls).toEqual([]);
+    });
+
+    it('an execution that does exist is simply followed (the lost answer was only an answer)', async () => {
+        const describe = async (): Promise<Exec> => ({ status: 'SUCCEEDED', output: receiptOf({ state: 'retired', instanceId: I_OLD }) });
+        expect(await settle({ state: 'RETIRING', last_error: 'lifecycle_start_unknown:STOPPED' }, { describe }))
+            .toMatchObject({ state: 'RETIRED', lifecycle_job_id: null });
+    });
+});
+
+describe('Codex 4277262205: the background pass stops at its budget', () => {
+    it('an aborted signal ends the fleet pass before its next placement', async () => {
+        const row = placementRow({ computer_id: C1, owner_user_id: U1, region: 'ap-south-1', state: 'RUNNING', instance_id: I_OLD, volume_id: VOL, fence_token: FENCE, instance_type: 't3a.medium' });
+        const aborted = new AbortController();
+        aborted.abort();
+        const off = createFakePlacementDb({ placements: [{ ...row }] }, { clock: () => NOW });
+        expect(await reconcileAwsFleet({ db: off.db, signal: aborted.signal }, { 'ap-south-1': D })).toMatchObject({ checked: 0 });
+        const on = createFakePlacementDb({ placements: [{ ...row }] }, { clock: () => NOW });
+        expect(await reconcileAwsFleet({ db: on.db }, { 'ap-south-1': D })).toMatchObject({ checked: 1 });
+    });
+});
+
+describe('Codex 4277262199: the reconciler\'s own starts keep a lost answer reconcilable', () => {
+    const lost: LifecycleStarter = { async start() { throw Object.assign(new Error('reset'), { code: 'ECONNRESET' }); } };
+    const row = (over: Record<string, unknown>) => placementRow({
+        computer_id: C1, owner_user_id: U1, region: 'ap-south-1', instance_id: I_OLD, volume_id: VOL, fence_token: FENCE, instance_type: 't3a.medium',
+        generation: 2, lease_epoch: 3, ...over,
+    } as never);
+    async function rec(over: Record<string, unknown>, computers: { id: string; user_id: string; deleted_at?: Date | null }[] = []) {
+        const fake = createFakePlacementDb({ placements: [row(over)], computers }, { clock: () => NOW });
+        const { record } = await readPlacement(fake.db, C1);
+        return { fake, p: record! };
+    }
+
+    it('a guest-stop whose answer is lost stays DRAINING with its job (never UNCONFIRMED on a guess)', async () => {
+        const { fake, p } = await rec({ state: 'RUNNING' });
+        const describer = { describeForEnrollment: async () => ({ state: 'stopped' }) as Ec2EnrollmentView };
+        expect(await reconcileGuestStop({ db: fake.db, starter: lost, describer, sleep: async () => {} }, p, D)).toBe(true);
+        expect(fake.placements[0]).toMatchObject({ state: 'DRAINING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+        expect(fake.placements[0]!.lifecycle_job_id).not.toBeNull();
+    });
+
+    it('a background retire whose answer is lost stays RETIRING with its job, settling back to where it came from', async () => {
+        const { fake, p } = await rec({ state: 'STOPPED' });
+        expect(await startRetireAsReconciler({ db: fake.db, starter: lost, sleep: async () => {} }, p, D)).toBe(true);
+        expect(fake.placements[0]).toMatchObject({ state: 'RETIRING', last_error: 'lifecycle_start_unknown:STOPPED' });
+    });
+
+    it('a deleted computer\'s recovery whose answer is lost stays RETIRING with its job', async () => {
+        const { fake, p } = await rec({ state: 'UNCONFIRMED', last_error: 'failed:States.Timeout' }, [{ id: C1, user_id: U1, deleted_at: NOW }]);
+        const describer = { describeForEnrollment: async () => ({ state: 'stopped' }) as Ec2EnrollmentView };
+        expect(await recoverDeletedAwsPlacement({ db: fake.db, starter: lost, describer, sleep: async () => {} }, p, D)).toBe('retire_started');
+        expect(fake.placements[0]).toMatchObject({ state: 'RETIRING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+    });
+});
+

@@ -657,6 +657,46 @@ export async function renewPlacementLease(
     );
 }
 
+// ── Lifecycle starts whose outcome is unknown ────────────────────────────
+
+/**
+ * `last_error` of an in-flight placement whose recorded job's StartExecution got no
+ * answer (5xx, timeout, connection lost): `lifecycle_start_unknown:<undo state>`. The
+ * execution may be running, so the placement keeps its state and its job (the authority
+ * endpoint still authorizes it); the receipt path follows the execution if it exists, and
+ * once it is still absent after a settle window, knows the start never happened and moves
+ * the placement to `<undo state>`, the state a definite refusal would have left.
+ */
+export const LIFECYCLE_START_UNKNOWN = 'lifecycle_start_unknown';
+/** `last_error` after a start known not to have happened (absent once settled, or refused on retry). */
+export const LIFECYCLE_START_FAILED = 'lifecycle_start_failed';
+
+/** The undo state recorded by `markLifecycleStartUnknown`, or null when `lastError` is not such a mark. */
+export function lifecycleStartUnknownUndo(p: Pick<Placement, 'state' | 'lastError'>): PlacementState | null {
+    const prefix = `${LIFECYCLE_START_UNKNOWN}:`;
+    if (!p.lastError?.startsWith(prefix)) return null;
+    const undo = p.lastError.slice(prefix.length) as PlacementState;
+    return PLACEMENT_TRANSITIONS[p.state]?.includes(undo) ? undo : 'UNCONFIRMED';
+}
+
+/**
+ * Mark the in-flight placement `expected` (its job already recorded) as started-unknown,
+ * without moving its state. CAS on the same keys and on `last_error` being what the caller
+ * saw, so it never overwrites enrollment or receipt progress made meanwhile. `ownerUserId`
+ * when a user's request launched it; omitted for the reconciler's own starts.
+ */
+export async function markLifecycleStartUnknown(
+    db: PlacementDb,
+    input: { computerId: string; ownerUserId?: string; expected: CasExpectation & Pick<Placement, 'lastError'>; undo: PlacementState },
+): Promise<TransitionResult> {
+    if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.undo)) return { ok: false, reason: 'illegal_transition' };
+    return db.transaction((tx) =>
+        casInTx(tx, input.computerId, input.expected, input.expected.state, { generation: 0, leaseEpoch: 0 },
+            { lastError: `${LIFECYCLE_START_UNKNOWN}:${input.undo}` },
+            { provider: 'aws-ec2', preserveState: true, lastError: input.expected.lastError, ...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}) }),
+    );
+}
+
 /**
  * RECONCILER ONLY: a C-3 transition with NO owner predicate, for the lifecycle
  * receipt path (execution results, EC2 observations), which moves a placement

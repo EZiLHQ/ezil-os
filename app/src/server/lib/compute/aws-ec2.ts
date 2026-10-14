@@ -49,8 +49,8 @@ import {
     type LifecycleOperation,
     type LifecycleWork,
 } from './aws-intent';
-import { ENROLLMENT_FAILED, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
-import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
+import { ENROLLMENT_FAILED, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 
 export const AWS_DISABLED = 'aws_disabled';
@@ -133,6 +133,8 @@ export interface AwsProviderDeps {
     describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'>;
     /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
+    /** Backoff between StartExecution attempts whose answer was lost; tests inject an instant one. */
+    sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -235,8 +237,17 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         userData: next.userData,
     });
 
-    /** Build and start; on any failure undo the placement step that preceded it. A prebuilt `work` is started as is. */
-    const launch = async (owner: string, p: Placement, intent: LifecycleIntent | LifecycleWork, undo: PlacementState): Promise<'started' | 'invalid' | 'failed'> => {
+    /**
+     * Build and start the job recorded on `p` (`startLifecycleJob`: idempotent retries).
+     * - `started`: accepted.
+     * - `failed`: AWS REFUSED it (nothing runs): undo the placement step that preceded it.
+     * - `pending`: no attempt got an answer, so the execution may be running. The placement
+     *   keeps its in-flight state and its job (the authority endpoint still authorizes it),
+     *   marked `lifecycle_start_unknown:<undo>`: the receipt path follows the execution, or,
+     *   once it is settled that none exists, moves it to `undo` (aws-receipts.ts).
+     * A prebuilt `work` is started as is.
+     */
+    const launch = async (owner: string, p: Placement, intent: LifecycleIntent | LifecycleWork, undo: PlacementState): Promise<'started' | 'pending' | 'invalid' | 'failed'> => {
         const region = p.region!;
         let work: LifecycleWork;
         try {
@@ -246,19 +257,20 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
             return 'invalid';
         }
-        try {
-            await deps.starter!.start(region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
-        } catch {
+        const outcome = await startLifecycleJob(deps.starter!, region, work, deps.sleep);
+        if (outcome === 'started') return 'started';
+        if (outcome === 'refused') {
             await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
             return 'failed';
         }
-        return 'started';
+        await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, undo });
+        return 'pending';
     };
 
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
-    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId });
+    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, sleep: deps.sleep });
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
@@ -330,6 +342,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         if (!draining.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
         const d = draining.placement;
         const r = await launch(c.userId, d, work, 'UNCONFIRMED');
+        // Pending: the stop may be running; it stays DRAINING with its job for the receipt path.
+        if (r === 'pending') return { ok: false, terminated: false, outcome: 'stopping' };
         if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
         await transitionPlacement(deps.db, { computerId: d.computerId, ownerUserId: c.userId, expected: d, to: 'STOPPING' });
         return { ok: false, terminated: false, outcome: 'stopping' };
@@ -358,7 +372,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         });
         if (!retiring.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
         const r = await launch(c.userId, retiring.placement, work, p.state);
-        if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
+        // Pending counts as underway: the retire job is recorded and may be running.
+        if (r !== 'started' && r !== 'pending') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
         return { ok: false, terminated: false, outcome: AWS_RETIRING };
     };
 
@@ -447,7 +462,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     return notReady('aws_intent_invalid');
                 }
                 const r = await launch(c.userId, p, work, 'UNCONFIRMED');
-                return r === 'started' ? notReady('computer_starting', true) : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
+                return r === 'started' || r === 'pending'
+                    ? notReady('computer_starting', true)
+                    : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
             }
 
             if (placement.provider !== 'aws-ec2') return notReady('provider_mismatch');
@@ -523,6 +540,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         return notReady('aws_intent_invalid');
                     }
                     const r = await launch(c.userId, p, work, undo);
+                    // Pending: the boot may be running; it stays LEASED with its job for the receipt path.
+                    if (r === 'pending') return notReady('computer_starting', true);
                     if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
                     await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STARTING' });
                     return notReady('computer_starting', true);

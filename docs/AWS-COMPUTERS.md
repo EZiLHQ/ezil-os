@@ -144,7 +144,9 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - Retirement: `RUNNING | STOPPED → RETIRING → RETIRED → PURGE_ELIGIBLE`. ONE `computer.delete` is enough: a
   RUNNING or STOPPED computer gets the lifecycle `retire` job (a running instance is stopped gracefully first, then
   terminated; the data volume is kept), and once that job — or an already-recorded stop — is on the placement the
-  row is soft-deleted. The sandbox-reap cron's AWS job (`runAwsBackgroundReconcile`) then applies receipts for
+  row is soft-deleted. The sandbox-reap cron's AWS job (`runAwsBackgroundReconcile`; it runs concurrently with the
+  Cloudflare reap under its own 60-second budget, so an AWS outage never delays or disables the Cloudflare billing
+  backstop; past the budget the pass stops before its next placement and reports `aws_reconcile_timeout`) then applies receipts for
   every placement whose computer is soft-deleted or gone, starts the retire of one that reached STOPPED, and fences
   the tunnel before RETIRED. Booting, recovering and unconfirmed states refuse the delete. A computer with no
   placement deletes at once. A refused retire `StartExecution` returns to the state it came from and the delete is
@@ -224,6 +226,16 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   recorded fence token: the instance and volume are tagged with it, and the helper refuses any other.
 - A refused `StartExecution` after a start-in-place lease returns the row to STOPPED (only the epoch moved). After a
   replace lease it goes to UNCONFIRMED: the generation already moved, so recovery decides.
+- Only an ANSWERED refusal is a refusal (a 4xx, a named service refusal, or a failure before sending). A
+  `StartExecution` that gets no answer (5xx, timeout, connection lost) may have started the execution, so it is
+  retried a bounded number of times (the execution name `computer-<jobId>` and its digest-fixed input make the retry
+  idempotent). If no attempt is answered the placement KEEPS its in-flight state and recorded job (the authority
+  endpoint still authorizes it), marked `lifecycle_start_unknown:<undo state>`. The receipt path follows the
+  execution if Step Functions knows it; once it is still unknown after a 5-minute settle window the start is known
+  never to have happened: a stop or retire (no secret in its input) is rebuilt, digest-checked and started again under
+  the same name, and a provision or wake (whose input carries the never-stored enrollment nonce) moves to the undo
+  state a refusal would have left (`lifecycle_start_failed`). This covers provision, wake, stop and retire, from the
+  provider and from the reconciler.
 
 **Errors**
 - Capacity and quota errors fail fast.
