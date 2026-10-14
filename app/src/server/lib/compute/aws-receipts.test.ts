@@ -148,6 +148,13 @@ describe('boot receipts (provider says running)', () => {
         expect(s.read).toHaveLength(reads);
     });
 
+    it('receipt applied (job cleared) but the host has NOT enrolled: stays MOUNTING, no read, never RUNNING', async () => {
+        const { status, read, placements } = setup([row({ state: 'MOUNTING', lifecycle_job_id: null, lifecycle_digest: null, instance_id: I_NEW })]);
+        expect(await status()).toMatchObject({ state: 'starting', placementState: 'MOUNTING' });
+        expect(placements[0]).toMatchObject({ state: 'MOUNTING' });
+        expect(read).toEqual([]);
+    });
+
     it('host enrolled first (instance recorded by enrollment): the receipt takes it straight to RUNNING', async () => {
         const { status, placements } = setup([row({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: I_NEW })], { status: 'SUCCEEDED', output: receiptOf() });
         expect(await status()).toMatchObject({ state: 'running', placementState: 'RUNNING' });
