@@ -5,9 +5,12 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "synth": "AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true CDK_DISABLE_CLI_TELEMETRY=true EZIL_FOUNDATION_CONFIG=config/foundation.example.json cdk synth --strict --no-lookups --no-notices --no-version-reporting -q -o cdk.out/foundation",
-    "synth:lifecycle": "AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true CDK_DISABLE_CLI_TELEMETRY=true EZIL_LIFECYCLE_CONFIG=config/lifecycle.example.json cdk synth --strict --no-lookups --no-notices --no-version-reporting -q -o cdk.out/lifecycle --app \"npx tsx bin/lifecycle.ts\"",
-    "gate": "npm run typecheck && npm test && npm run synth && npm run synth:lifecycle"
+    "synth": "env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true CDK_DISABLE_CLI_TELEMETRY=true EZIL_FOUNDATION_CONFIG=${EZIL_FOUNDATION_CONFIG:-config/foundation.example.json} cdk synth --strict --no-lookups --no-notices --no-version-reporting -q -o cdk.out/foundation",
+    "synth:lifecycle": "env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true CDK_DISABLE_CLI_TELEMETRY=true EZIL_LIFECYCLE_CONFIG=${EZIL_LIFECYCLE_CONFIG:-config/lifecycle.example.json} cdk synth --strict --no-lookups --no-notices --no-version-reporting -q -o cdk.out/lifecycle --app \"npx tsx bin/lifecycle.ts\"",
+    "gate": "npm run typecheck && npm test && npm run synth:all",
+    "synth:identity": "env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true CDK_DISABLE_CLI_TELEMETRY=true EZIL_IDENTITY_CONFIG=${EZIL_IDENTITY_CONFIG:-config/identity.example.json} cdk synth --strict --no-lookups --no-notices --no-version-reporting -q -o cdk.out/identity --app \"npx tsx bin/identity.ts\"",
+    "synth:ops": "env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true CDK_DISABLE_CLI_TELEMETRY=true EZIL_OPS_CONFIG=${EZIL_OPS_CONFIG:-config/ops.example.json} cdk synth --strict --no-lookups --no-notices --no-version-reporting -q -o cdk.out/ops --app \"npx tsx bin/ops.ts\"",
+    "synth:all": "npm run synth && npm run synth:lifecycle && npm run synth:identity && npm run synth:ops"
   },
   "dependencies": {
     "@aws-sdk/client-ec2": "3.1140.0",

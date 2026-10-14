@@ -1,2 +1,5 @@
 node_modules/
 cdk.out/
+# Real deployment configs stay local; only the public placeholders are committed.
+config/*.json
+!config/*.example.json

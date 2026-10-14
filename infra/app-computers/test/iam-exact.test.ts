@@ -45,7 +45,7 @@ function expectedController(userDataOpen: boolean) {
         { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: ec2('volume/*'), Condition: { StringEquals: { ...REGION_EQ, ...MANAGED },
             'ForAllValues:StringEquals': { 'aws:TagKeys': ['ezil:generation', 'ezil:fence-token'] }, Null: { 'aws:TagKeys': 'false' } } },
         { Effect: 'Deny', Action: 'ec2:CreateTags', Resource: '*', Condition: {
-            'ForAnyValue:StringEquals': { 'aws:TagKeys': ['ezil:computer-id', 'ezil:managed-by', 'ezil:stage'] }, Null: { 'ec2:CreateAction': 'true' } } },
+            'ForAnyValue:StringEquals': { 'aws:TagKeys': ['ezil:computer-id', 'ezil:managed-by', 'ezil:stage', 'ezil:backup'] }, Null: { 'ec2:CreateAction': 'true' } } },
         { Effect: 'Deny', Action: DENIED.filter(a => !(userDataOpen && a === 'ec2:ModifyInstanceAttribute')), Resource: '*' },
         ...(userDataOpen ? [
             { Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: ec2('instance/*'),
@@ -78,7 +78,7 @@ test('controller policy with userData delivery verified: allow userData only, de
 
 const GITHUB = { name: 'github' as const, providerArn: `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`,
     issuerHost: 'token.actions.githubusercontent.com', audience: 'sts.amazonaws.com', subject: 'repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>' };
-const VERSION = `arn:aws:states:${R}:${A}:stateMachine:ezil-lifecycle:1`;
+const VERSION = `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle:1`;
 test('item 9: app caller can only start the exact lifecycle version and describe EC2 in region', () => {
     assert.deepEqual(json(appCallerStatements(R, [VERSION])), [
         { Effect: 'Allow', Action: 'states:StartExecution', Resource: VERSION },
@@ -119,7 +119,7 @@ test('every role, key, queue and invoke policy in the synthesized stacks equals 
     const f = lifecycleFixture(), app = new App(), stack = new Stack(app, 'Snapshot', { env: { account: A, region: R } });
     const lifecycle = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: `arn:aws:kms:${R}:${A}:key/22222222-2222-4222-8222-222222222222` });
     new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: f.settings,
-        recoveryVersionArn: `arn:aws:states:${R}:${A}:stateMachine:ezil-lifecycle-recovery:1` }, sourceHistoryKey: lifecycle.historyKey });
+        recoveryVersionArn: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-recovery:1` }, sourceHistoryKey: lifecycle.historyKey });
     new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R, versionArns: [f.settings.deployment.stateMachineVersionArn] });
     // Lambda version logical IDs embed the code hash; normalize them so the
     // snapshot changes only when a policy changes, not when handler code does.

@@ -6,7 +6,7 @@
         {
           "Action": "states:StartExecution",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle:1"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
         },
         {
           "Action": "ec2:Describe*",
@@ -59,7 +59,7 @@
               "aws:SourceAccount": "123456789012"
             },
             "ArnEquals": {
-              "aws:SourceArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle"
+              "aws:SourceArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle"
             }
           },
           "Effect": "Allow",
@@ -269,7 +269,8 @@
               "aws:TagKeys": [
                 "ezil:computer-id",
                 "ezil:managed-by",
-                "ezil:stage"
+                "ezil:stage",
+                "ezil:backup"
               ]
             },
             "Null": {
@@ -494,19 +495,19 @@
         {
           "Action": "states:DescribeExecution",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
         },
         {
           "Action": "secretsmanager:GetSecretValue",
           "Effect": "Allow",
-          "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-key-abcdef"
+          "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/lifecycle-key-abcdef"
         },
         {
           "Action": "kms:Decrypt",
           "Condition": {
             "StringEquals": {
               "kms:ViaService": "secretsmanager.ap-south-1.amazonaws.com",
-              "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-key-abcdef"
+              "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/lifecycle-key-abcdef"
             }
           },
           "Effect": "Allow",
@@ -705,14 +706,14 @@
           "Action": "states:DescribeExecution",
           "Effect": "Allow",
           "Resource": [
-            "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*",
-            "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle-recovery:cleanup-computer-*"
+            "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*",
+            "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-recovery:cleanup-computer-*"
           ]
         },
         {
           "Action": "states:GetExecutionHistory",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
         },
         {
           "Action": [
@@ -828,20 +829,20 @@
         {
           "Action": "states:DescribeExecution",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
         },
         {
           "Action": "states:ListExecutions",
           "Effect": "Allow",
           "Resource": [
-            "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle",
-            "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle:1"
+            "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle",
+            "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
           ]
         },
         {
           "Action": "states:StartExecution",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1"
         },
         {
           "Action": "kms:Decrypt",
@@ -888,7 +889,7 @@
               "aws:SourceAccount": "123456789012"
             },
             "ArnEquals": {
-              "aws:SourceArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery"
+              "aws:SourceArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery"
             }
           },
           "Effect": "Allow",

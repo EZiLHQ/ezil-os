@@ -16,7 +16,8 @@ export const SettingsSchema = z.object({ deployment: LifecycleDeploymentSchema,
     authorityOrigin: z.string(), authoritySecretArn: z.string(), features: FeaturesSchema.default({}) }).strict().superRefine((s,ctx)=>{
     const d=s.deployment;
     if(!/^https:\/\/(?:[a-z0-9][a-z0-9-]*\.)+[a-z]{2,}$/.test(s.authorityOrigin)
-        ||!new RegExp(`^arn:aws:secretsmanager:${d.region}:${d.accountId}:secret:[A-Za-z0-9/_+=.@-]{1,512}-[A-Za-z0-9]{6}$`).test(s.authoritySecretArn)){
+        // The boundary lets bounded roles read only secrets named ezil/<ns>/*.
+        ||!new RegExp(`^arn:aws:secretsmanager:${d.region}:${d.accountId}:secret:ezil/${d.namespace}/[A-Za-z0-9/_+=.@-]{1,480}-[A-Za-z0-9]{6}$`).test(s.authoritySecretArn)){
         ctx.addIssue({code:'custom',message:'invalid_lifecycle_settings'});
     }
 });
@@ -35,11 +36,22 @@ export const tagsFor = (i:LifecycleIntent,generation=i.targetGeneration,fence=i.
 export const RETAG_KEYS = ['ezil:generation','ezil:fence-token'] as const;
 export const retagsFor = (i:LifecycleIntent) => ({'ezil:generation':String(i.targetGeneration),'ezil:fence-token':i.fenceToken});
 export const tagList = (tags:Record<string,string>) => Object.entries(tags).map(([Key,Value])=>({Key,Value}));
-export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume')});
+/** DLM (I6) snapshots data volumes carrying this tag, valued with the
+ * namespace. Set only at creation; root disks never carry it. */
+export const BACKUP_TAG='ezil:backup';
+export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume'),[BACKUP_TAG]:i.deployment.namespace});
 export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
 export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest});
 export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started'] as const;
 export type Phase=typeof phases[number];
-export type Action='createVolume'|'runInstances'|'attachVolume'|'createTags'|'modifyInstanceAttribute'|'startInstances'|'stopInstances'|'terminateInstances';
-export const afterAction:Record<Action,Phase>={createVolume:'volume',runInstances:'instance',attachVolume:'attached',modifyInstanceAttribute:'userdata',
-    createTags:'tagged',startInstances:'started',stopInstances:'stopped',terminateInstances:'terminated'};
+/** `runBurstableInstances` is RunInstances for a T-family type: the same EC2
+ * API, but its graph state also forwards CreditSpecification (standard). A
+ * separate state keeps every forwarded key mandatory in the fixed graph. */
+export type Action='createVolume'|'runInstances'|'runBurstableInstances'|'attachVolume'|'createTags'|'modifyInstanceAttribute'|'startInstances'|'stopInstances'|'terminateInstances';
+export const afterAction:Record<Action,Phase>={createVolume:'volume',runInstances:'instance',runBurstableInstances:'instance',attachVolume:'attached',
+    modifyInstanceAttribute:'userdata',createTags:'tagged',startInstances:'started',stopInstances:'stopped',terminateInstances:'terminated'};
+/** Graph states that call RunInstances. Recovery treats entering ANY of them
+ * as evidence that a launch may have happened. */
+export const LAUNCH_ACTIONS:readonly Action[]=['runInstances','runBurstableInstances'];
+/** The EC2 API each graph action calls (aws-sdk:ec2:<api>). */
+export const ec2Api=(action:Action)=>action==='runBurstableInstances'?'runInstances':action;

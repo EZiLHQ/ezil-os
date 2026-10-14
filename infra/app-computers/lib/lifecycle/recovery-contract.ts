@@ -7,7 +7,8 @@ export const RecoverySettingsSchema = z.object({
 }).strict().superRefine((s, ctx) => {
     const d = s.lifecycle.deployment;
     if (!new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$`).test(s.recoveryVersionArn)
-        || machineArn(s.recoveryVersionArn) === machineArn(d.stateMachineVersionArn)) {
+        || machineArn(s.recoveryVersionArn) === machineArn(d.stateMachineVersionArn)
+        || !machineArn(s.recoveryVersionArn).split(':').at(-1)!.startsWith(`ezil-${d.namespace}-`)) {
         ctx.addIssue({ code: 'custom', message: 'invalid_recovery_settings' });
     }
 });

@@ -36,7 +36,7 @@ test('actual history requests follow pagination without execution data and rejec
 });
 test('actual reconciler requests bind the original numeric version and reuse a single cleanup name', async () => {
     const f = lifecycleFixture(), settings = { lifecycle: f.settings,
-        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1' };
     let starts = 0, lists = 0, sourceStatus = 'FAILED'; const seen: string[] = [];
     const client = wire((action, body) => {
         seen.push(action);
@@ -64,7 +64,7 @@ test('actual reconciler requests bind the original numeric version and reuse a s
 });
 test('reconciliation refuses a redriven source before starting recovery', async () => {
     const f = lifecycleFixture(), settings = { lifecycle: f.settings,
-        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1' };
     const client = wire(action => {
         assert.equal(action, 'DescribeExecution');
         return { value: { ...f.state.execution, startDate: f.state.now / 1000, redriveCount: 1, status: 'FAILED' } };
@@ -76,7 +76,7 @@ test('reconciliation refuses a redriven source before starting recovery', async 
 
 test('one bad scan entry cannot abort the scan; the failure is surfaced after every entry is tried', async () => {
     const good = lifecycleFixture(), settings = { lifecycle: good.settings,
-        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1' };
     const machine = good.state.execution.stateMachineArn.replace(':stateMachine:', ':execution:');
     const bad = machine + ':computer-00000000-0000-4000-8000-000000000000', forged = machine + ':forged-entry';
     const started: string[] = [];

@@ -5,7 +5,7 @@ import { ComputerLifecycle } from '../lib/computer-lifecycle.js';
 import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
 
-const RECOVERY_ARN = `arn:aws:states:${REGION}:123456789012:stateMachine:ezil-lifecycle-recovery:1`;
+const RECOVERY_ARN = `arn:aws:states:${REGION}:123456789012:stateMachine:ezil-pilot-recovery:1`;
 function synth(recovery = false) {
     const f = lifecycleFixture(), app = new App(), stack = new Stack(app, 'LifecycleTest', { env: { account: f.settings.deployment.accountId, region: REGION } });
     const lifecycle = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: f.settings.deployment.dataKeyArn });
@@ -99,7 +99,7 @@ test('item 6: identity tags only at creation; retag limited to generation and fe
         else assert.deepEqual(createAction, ['RunInstances', 'CreateVolume']);
     }
     const deny = all.find(s => s.Effect === 'Deny' && actions(s).includes('ec2:CreateTags'))!;
-    assert.deepEqual(deny.Condition!['ForAnyValue:StringEquals']!['aws:TagKeys'], ['ezil:computer-id', 'ezil:managed-by', 'ezil:stage']);
+    assert.deepEqual(deny.Condition!['ForAnyValue:StringEquals']!['aws:TagKeys'], ['ezil:computer-id', 'ezil:managed-by', 'ezil:stage', 'ezil:backup']);
     assert.equal(deny.Condition!.Null!['ec2:CreateAction'], 'true');
 });
 

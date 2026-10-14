@@ -20,14 +20,14 @@
         "dataMaxGiB": 100
       },
       "dataKeyArn": "arn:aws:kms:ap-south-1:123456789012:key/00000000-0000-4000-8000-000000000000",
-      "stateMachineVersionArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-pilot:1"
+      "stateMachineVersionArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
     },
     "authorityOrigin": "https://control.example.com",
-    "authoritySecretArn": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-authority-AbCdEf"
+    "authoritySecretArn": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/lifecycle-authority-AbCdEf"
   },
   "authorityKeyArn": "arn:aws:kms:ap-south-1:123456789012:key/00000000-0000-4000-8000-000000000001",
   "notificationsEnabled": false,
-  "recoveryVersionArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery-pilot:1",
+  "recoveryVersionArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1",
   "recoveryEnabled": false,
   "appCaller": {
     "enabled": false,
@@ -40,5 +40,8 @@
         "subject": "repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>"
       }
     ]
+  },
+  "deploy": {
+    "assetBucketName": "ezil-pilot-deploy-assets-123456789012"
   }
 }

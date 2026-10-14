@@ -135,4 +135,4 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
  * force-detaches), never edits instances in place and never passes a role. */
 export const DENIED_ACTIONS=['ec2:DeleteVolume','ec2:DeleteSnapshot','ec2:DetachVolume','ec2:ModifyInstanceAttribute',
     'ec2:ModifyInstanceMetadataOptions','ec2:DeleteTags','iam:PassRole'] as const;
-export const IDENTITY_TAG_KEYS=['ezil:computer-id','ezil:managed-by','ezil:stage'] as const;
+export const IDENTITY_TAG_KEYS=['ezil:computer-id','ezil:managed-by','ezil:stage','ezil:backup'] as const;

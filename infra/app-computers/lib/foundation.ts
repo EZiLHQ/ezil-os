@@ -4,6 +4,7 @@ import {
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import { z } from 'zod';
+import { NAMESPACE_TAG } from './identity.js';
 import { DEFAULT_STORAGE, InstanceTypeSchema, REGION_PATTERN, ZONE_ID_PATTERN, zoneIdMatchesRegion } from './lifecycle/deployment.js';
 
 /** Foundation configuration. Region and ZoneIds are configuration, never
@@ -97,6 +98,8 @@ export class AppComputerFoundationStack extends Stack {
         });
         const launchTemplate = new ec2.CfnLaunchTemplate(this, 'ComputerLaunchTemplate', {
             launchTemplateName: `ezil-app-computer-${config.stage}`,
+            // The template's own tag: the I5 execution role may change it only by this tag.
+            tagSpecifications: [{ resourceType: 'launch-template', tags: [{ key: NAMESPACE_TAG, value: config.stage }] }],
             launchTemplateData: {
                 imageId: hostAmi.valueAsString,
                 instanceType: config.instanceType,
