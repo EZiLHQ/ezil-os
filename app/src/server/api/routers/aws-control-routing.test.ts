@@ -102,6 +102,20 @@ describe('control calls: AWS computers are signed as AWS', () => {
         }
     });
 
+    it('a CLOUDFLARE placement owned by someone else also looks absent: the owner check precedes the provider branch', async () => {
+        vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'test-only-secret');
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        // ezil_computers is user-writable: a re-keyed row passes assertOwnedComputer, but the
+        // placement's owner_user_id is authoritative (C-2), same NOT_FOUND as routeComputer.
+        const { api } = caller([placementRow({ computer_id: computerId, owner_user_id: other, provider: 'cloudflare', workspace_store: 'r2' })]);
+        await expect(api.focusApp({ computerId, app: 'chromium' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        await expect(api.getScreen({ computerId })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        await expect(api.relayState({ computerId })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(spies.focus).not.toHaveBeenCalled();
+        expect(spies.read).not.toHaveBeenCalled();
+        expect(spies.relay).not.toHaveBeenCalled();
+    });
+
     it('an AWS placement owned by someone else looks absent (NOT_FOUND) and nothing is forwarded', async () => {
         vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'test-only-secret');
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');

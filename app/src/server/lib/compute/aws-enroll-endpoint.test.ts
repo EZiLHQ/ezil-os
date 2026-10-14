@@ -131,13 +131,17 @@ function workerBackedTunnels(clockMs: () => number = () => NOW.getTime()) {
     };
     let n = 0;
     const created: string[] = [];
+    const named = new Map<string, string>(); // tunnel name -> id, as Cloudflare would keep it
+    const cnames = new Map<string, { id: string; content: string }>();
     const api: CloudflareTunnelApi = {
-        async createTunnel(name) { created.push(name); return { id: `tun-${++n}` }; },
+        async createTunnel(name) { created.push(name); const id = `tun-${++n}`; named.set(name, id); return { id }; },
+        async findTunnelByName(name) { const id = named.get(name); return id ? { id } : null; },
         async getTunnelToken(id) { return `token-for-${id}-${'x'.repeat(24)}`; },
         async putTunnelIngress() {},
-        async createDnsCname() { return { id: `dns-${n}` }; },
-        async deleteDnsRecord() {},
-        async deleteTunnel() {},
+        async createDnsCname(host, target) { const r = { id: `dns-${n}`, content: target }; cnames.set(host, r); return { id: r.id }; },
+        async findDnsCname(host) { return cnames.get(host) ?? null; },
+        async deleteDnsRecord(id) { for (const [h, r] of cnames) if (r.id === id) cnames.delete(h); },
+        async deleteTunnel(id) { for (const [k, v] of named) if (v === id) named.delete(k); },
         async listConnectorOrigins() { return []; },
     };
     const service = createAwsTunnelService({ api, storage, zone: 'origin.example.net', nowMs: clockMs });
@@ -429,6 +433,71 @@ describe('after the nonce is consumed', () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
         expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
         expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
+    });
+
+    /** Make the Nth database transaction fail (1 = the consume, 2 = the completion); `commitFirst` loses only the answer. */
+    function failTransaction(db: unknown, nth: number, commitFirst = false) {
+        const d = db as { transaction: (fn: (tx: unknown) => Promise<unknown>) => Promise<unknown> };
+        const real = d.transaction.bind(d);
+        let n = 0;
+        d.transaction = async (fn) => {
+            n++;
+            if (n !== nth) return real(fn);
+            if (commitFirst) await real(fn);
+            throw new Error('connection terminated unexpectedly');
+        };
+    }
+
+    it('Codex PR #200: the completion write fails after the tunnel exists → retryable 503; the retry finishes on the SAME tunnel', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        failTransaction(s.deps.db, 2);
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
+        // The host kept its nonce (retryable) and re-sends it.
+        const again = await s.enroll();
+        expect(again.status).toBe(200);
+        expect(again.body).toMatchObject({ controlKey: KEY.toString('base64'), tunnelToken: expect.stringContaining('token-for-tun-1') });
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
+    });
+
+    it('Codex PR #200: tunnel create AND completion write both fail → retryable; the retry creates the tunnel once and finishes', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        const real = w.client.createTunnel.bind(w.client);
+        let first = true;
+        w.client.createTunnel = async (owner, req) => { if (first) { first = false; throw new Error('socket'); } return real(owner, req); };
+        failTransaction(s.deps.db, 2);
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(w.created).toHaveLength(0);
+        const again = await s.enroll();
+        expect(again.status).toBe(200);
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
+    });
+
+    it('Codex PR #200: the consume committed but its answer was lost → the retry completes (pending path, one tunnel)', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        failTransaction(s.deps.db, 1, true);
+        await expect(s.enroll()).rejects.toThrow('connection terminated'); // the route answers this retryable (route.test.ts)
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
+        const again = await s.enroll();
+        expect(again.status).toBe(200);
+        expect(w.created).toHaveLength(1);
+    });
+
+    it('a pending enrollment with ANOTHER nonce while the tunnel exists: final 409, no second tunnel, nothing written', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        failTransaction(s.deps.db, 2);
+        expect((await s.enroll()).status).toBe(503);
+        const before = { ...s.placements[0] };
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toEqual(before);
     });
 
     it.each(['generation', 'lease_epoch'] as const)('GW-1 completion cannot mark a newer %s successful', async (counter) => {

@@ -29,8 +29,12 @@ export async function controlTargetFor(db: PlacementExecutor, computer: Computer
     const legacy: ControlTarget = { sandboxName: deriveGuacamoleSandboxId(computer.userId, computer.computerId), auth: { kind: 'v1' } };
     if (!isPlacementReadEnabled(env)) return legacy;
     const { record } = await readPlacement(db, computer.computerId);
-    if (!record || record.provider !== 'aws-ec2') return legacy;
+    if (!record) return legacy;
+    // The placement's owner is authoritative for EVERY provider (C-2): ezil_computers is
+    // user-writable, so a re-keyed row must not reach a foreign placement's sandbox, Cloudflare
+    // or AWS. Same NOT_FOUND as routeComputer.
     if (record.ownerUserId !== computer.userId.toLowerCase()) throw new PlacementOwnerError(record.computerId);
+    if (record.provider !== 'aws-ec2') return legacy;
     // Same derivation and claims as the AWS preview (aws-preview.ts) and the tunnel (aws-enroll.ts).
     const sandboxName = deriveGuacamoleSandboxId(record.ownerUserId, record.computerId);
     return {
