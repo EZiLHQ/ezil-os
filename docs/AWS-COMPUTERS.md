@@ -176,6 +176,19 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - Throttling errors retry.
 - Every error is recorded on `UNCONFIRMED`.
 
+**Receipts (app, `aws-receipts.ts`; the reconciler path)**
+- Only the placement's CURRENT job is read (`DescribeExecution` on `computer-<jobId>` under the region's machine). Its
+  success output must match that job, digest, generation, lease epoch, fence, data volume and the expected state
+  (`running` for a boot, `stopped` for a stop); anything else goes UNCONFIRMED (`receipt_conflict` / `receipt_invalid`)
+  and keeps the job for recovery.
+- A boot is RUNNING only when BOTH the provider receipt arrived AND its host enrolled (nonce consumed): STARTING →
+  MOUNTING on the receipt, MOUNTING → RUNNING once enrolled; a provision goes PROVISIONING → RUNNING once both hold.
+- A stop receipt lands STOPPED and fences that generation's tunnel (GW-1 DELETE).
+- A failed execution goes UNCONFIRMED with `last_error`: `capacity:<code>:<type>` for `LifecycleRefused` + a capacity code,
+  else `failed:<error>`. A capacity-refused computer answers `capacity_unavailable` and never moves region. Retrying the
+  tier's next type (t3a.medium → t3.medium) needs infra recovery to prove nothing launched and to keep the volume's
+  previous-generation tags (LIFECYCLE.md); `nextInstanceTypeAfterCapacity` exists but is not wired.
+
 ### C-4 Disk marker (bug fence only)
 
 `/srv/ezil-data/.ezil-marker.json` holds:

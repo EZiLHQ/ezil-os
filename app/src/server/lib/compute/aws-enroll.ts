@@ -330,7 +330,8 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     const consumed = await consumeEnrollmentNonce(deps.db, {
         computerId: p.computerId,
         expected: p,
-        nonceHash: p.enrollNonceHash,
+        // The PRESENTED nonce's hash: the swap itself binds what the host sent, not only the pre-check.
+        nonceHash: nonceHashOf(body.nonce),
         now,
         fields: { instanceId: doc.instanceId, volumeId },
     });

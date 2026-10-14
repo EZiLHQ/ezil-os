@@ -38,7 +38,7 @@ import {
     type AwsWakeMode,
     type Env,
 } from './aws-config';
-import { buildEnrollmentUserData, EnrollmentUserDataError, issueEnrollmentNonce } from './aws-enroll';
+import { buildEnrollmentUserData, EnrollmentUserDataError, issueEnrollmentNonce, type TunnelClient } from './aws-enroll';
 import {
     buildLifecycleWork,
     LifecycleIntentInvalidError,
@@ -49,6 +49,7 @@ import {
     type LifecycleWork,
 } from './aws-intent';
 import { PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { applyLifecycleReceipt, type LifecycleExecutionReader } from './aws-receipts';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from './provider';
 
 export const AWS_DISABLED = 'aws_disabled';
@@ -113,6 +114,10 @@ export interface AwsProviderDeps {
     tierFor?: (userId: string) => Promise<AwsTier>;
     /** Source of the enrollment nonce's 32 bytes (tests make it deterministic). */
     randomBytes?: (n: number) => Buffer;
+    /** Reads lifecycle executions so `status` can apply their receipts. Without it nothing is reconciled. */
+    executions?: LifecycleExecutionReader;
+    /** GW-1, to fence (delete) a stopped generation's tunnel. */
+    tunnels?: TunnelClient;
     /** Lease length on a wake. */
     leaseSeconds?: number;
 }
@@ -407,6 +412,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     const state = AWS_STATE_FOR[placement.state];
                     if (state === 'starting') return notReady('computer_starting', true);
                     if (state === 'stopping') return notReady('computer_stopping', true);
+                    if (placement.state === 'UNCONFIRMED' && placement.lastError?.startsWith('capacity:')) return notReady('capacity_unavailable', false, placement.lastError);
                     return notReady(placement.state === 'UNCONFIRMED' || placement.state === 'RECOVERING' ? 'computer_recovering' : 'computer_unavailable');
                 }
             }
@@ -415,8 +421,13 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         async status(_ctx, c) {
             const cfg = configured();
             if (!cfg.ok) return { ok: false, error: cfg.code };
-            const p = await ownPlacement(c);
+            let p = await ownPlacement(c);
             if (!p || p.provider !== 'aws-ec2') return { ok: false, error: 'aws_placement_missing' };
+            const deployment = cfg.deployments[p.region ?? ''];
+            if (deployment) {
+                await applyLifecycleReceipt({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels }, p, deployment);
+                p = (await ownPlacement(c)) ?? p;
+            }
             const state = AWS_STATE_FOR[p.state];
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region };
         },
