@@ -20,9 +20,10 @@ import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    claimAwsPlacementsPendingRetire,
     claimAwsPlacementsToReconcile,
-    listAwsPlacementsPendingRetire,
     PlacementIntegrityError,
+    readCanaryComputer,
     readMonthUsage,
     readPlacement,
     transitionPlacementAsReconciler,
@@ -414,20 +415,85 @@ export async function startRetireAsReconciler(deps: GuestStopDeps, p: Placement,
 export const RETIRE_RECONCILE_LIMIT = 20;
 
 /**
+ * Recover a DELETED computer's stuck placement (UNCONFIRMED after a failed, timed-out or
+ * aborted stop/retire, or RECOVERING left by an interrupted recovery) by retiring it:
+ * UNCONFIRMED → RECOVERING → RETIRING with a recorded retire job, then StartExecution.
+ * The lifecycle retire resolves any instance state itself (stops a running one, waits
+ * on stopping/shutting-down, terminates a stopped one, finishes on a terminated one once
+ * the volume is detached), so this does not choose between stop and retire.
+ *
+ * 🔴 Only a deleted (or vanished) computer: the computer row is re-read here, and a live
+ * computer's UNCONFIRMED placement is left alone (it is the owner's to recover). The
+ * instance must still be visible to EC2 describe: an unknown answer (describe failed)
+ * waits for the next pass; an instance EC2 no longer knows cannot be verified by the
+ * retire and is reported `stuck` (operator purge) instead of failing a job every pass.
+ * A refused StartExecution returns the placement to UNCONFIRMED (`retire_start_failed`),
+ * so the next pass tries again.
+ */
+export async function recoverDeletedAwsPlacement(
+    deps: GuestStopDeps,
+    p: Placement,
+    deployment: LifecycleDeployment,
+): Promise<'retire_started' | 'skipped' | 'stuck'> {
+    if ((p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING') || p.provider !== 'aws-ec2' || !deps.starter || !deps.describer) return 'skipped';
+    const computer = await readCanaryComputer(deps.db, p.computerId);
+    if (computer && !computer.deleted) return 'skipped';
+    if (!p.region || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return 'stuck';
+    let view;
+    try {
+        view = await deps.describer.describeForEnrollment(p.region, p.instanceId);
+    } catch {
+        return 'skipped'; // Unknown: try again on the next pass.
+    }
+    if (!view) return 'stuck';
+    let work: LifecycleWork;
+    try {
+        work = buildLifecycleWork(currentGenerationIntent(p, 'retire', deployment, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
+    } catch (error) {
+        if (error instanceof LifecycleIntentInvalidError) return 'stuck';
+        throw error;
+    }
+    let current = p;
+    if (current.state === 'UNCONFIRMED') {
+        const recovering = await transitionPlacementAsReconciler(deps.db, {
+            computerId: p.computerId, expected: current, to: 'RECOVERING', fields: { lastError: 'deleted_recovery' },
+        });
+        if (!recovering.ok) return 'skipped';
+        current = recovering.placement;
+    }
+    const retiring = await transitionPlacementAsReconciler(deps.db, {
+        computerId: p.computerId, expected: current, to: 'RETIRING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+    });
+    if (!retiring.ok) return 'skipped';
+    try {
+        await deps.starter.start(p.region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
+    } catch {
+        await transitionPlacementAsReconciler(deps.db, {
+            computerId: p.computerId, expected: retiring.placement, to: 'UNCONFIRMED', fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: 'retire_start_failed' },
+        });
+        return 'skipped';
+    }
+    return 'retire_started';
+}
+
+/**
  * Drive every deleted computer's placement to RETIRED: apply its current receipt (a
- * recorded stop or retire), then start the retire of one that is RUNNING or STOPPED.
+ * recorded stop or retire), then start the retire of one that is RUNNING or STOPPED, or
+ * recover one left UNCONFIRMED/RECOVERING by a failed job (`recoverDeletedAwsPlacement`).
  * `computer.delete` soft-deletes as soon as such a job is recorded, so one user delete
- * completes without the user returning. One bad row never blocks the rest.
+ * completes without the user returning. The pass rotates (`claimAwsPlacementsPendingRetire`)
+ * and one bad row never blocks the rest; `stuck` counts rows only an operator can settle.
  */
 export async function reconcileDeletedAwsComputers(
     deps: GuestStopDeps,
     deployments: Readonly<Record<string, LifecycleDeployment>>,
     limit = RETIRE_RECONCILE_LIMIT,
-): Promise<{ checked: number; retiresStarted: number; retired: number }> {
+): Promise<{ checked: number; retiresStarted: number; retired: number; stuck: number }> {
     let checked = 0;
     let retiresStarted = 0;
     let retired = 0;
-    for (const { computerId } of await listAwsPlacementsPendingRetire(deps.db, limit)) {
+    let stuck = 0;
+    for (const { computerId } of await claimAwsPlacementsPendingRetire(deps.db, limit)) {
         try {
             const { record } = await readPlacement(deps.db, computerId);
             const deployment = record && record.provider === 'aws-ec2' ? deployments[record.region ?? ''] : undefined;
@@ -437,12 +503,16 @@ export async function reconcileDeletedAwsComputers(
             const { record: now } = await readPlacement(deps.db, computerId);
             if (!now) continue;
             if (now.state === 'RETIRED') retired += 1;
-            else if (await startRetireAsReconciler(deps, now, deployment)) retiresStarted += 1;
+            else if (now.state === 'UNCONFIRMED' || now.state === 'RECOVERING') {
+                const outcome = await recoverDeletedAwsPlacement(deps, now, deployment);
+                if (outcome === 'retire_started') retiresStarted += 1;
+                else if (outcome === 'stuck') stuck += 1;
+            } else if (await startRetireAsReconciler(deps, now, deployment)) retiresStarted += 1;
         } catch (error) {
             if (!(error instanceof PlacementIntegrityError)) throw error;
         }
     }
-    return { checked, retiresStarted, retired };
+    return { checked, retiresStarted, retired, stuck };
 }
 
 /**

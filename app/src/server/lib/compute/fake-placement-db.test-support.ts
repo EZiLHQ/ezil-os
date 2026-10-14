@@ -259,21 +259,32 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 }
                 return { rows: hit.map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })) };
             }
-            case 'retire-pending': {
-                // LEFT JOIN ezil_computers: the computer row is gone or soft-deleted.
+            case 'retire-pending-claim': {
+                // Deleted-computer rotation (LEFT JOIN ezil_computers: row gone or soft-deleted).
+                // The SQL text is pinned; the model claims least-recently-checked rows and stamps them.
+                if (!/SET reconciled_at = now\(\)\s+WHERE computer_id IN \(SELECT p\.computer_id FROM [\w.]+ p\s+LEFT JOIN [\w.]+ c ON c\.id = p\.computer_id\s+WHERE p\.provider = 'aws-ec2' AND p\.state IN \([^)]*\)\s+AND \(c\.id IS NULL OR c\.deleted_at IS NOT NULL\)\s+ORDER BY p\.reconciled_at ASC NULLS FIRST, p\.updated_at ASC, p\.computer_id ASC\s+LIMIT \$\d+\s+FOR UPDATE OF p SKIP LOCKED\)/.test(text)) {
+                    throw new Error('fake db: unexpected retire-pending-claim SQL');
+                }
                 const limit = Number(params.at(-1));
                 const states = new Set(params.slice(0, -1) as string[]);
                 const gone = (id: unknown) => {
                     const c = computers.find((x) => uuidEq(x.id, id));
                     return !c || c.deleted_at != null;
                 };
-                return {
-                    rows: placements
-                        .filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)) && gone(r.computer_id))
-                        .sort((a, b) => new Date(a.updated_at as Date).getTime() - new Date(b.updated_at as Date).getTime())
-                        .slice(0, limit)
-                        .map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })),
-                };
+                const at = (v: unknown) => (v === null || v === undefined ? -Infinity : new Date(v as Date).getTime());
+                const picked = placements
+                    .filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)) && gone(r.computer_id))
+                    .sort((a, b) => at(a.reconciled_at) - at(b.reconciled_at) || at(a.updated_at) - at(b.updated_at)
+                        || String(a.computer_id).localeCompare(String(b.computer_id)))
+                    .slice(0, limit);
+                const ids = new Set(picked.map((r) => String(r.computer_id).toLowerCase()));
+                const hit = placements.filter((r) => ids.has(String(r.computer_id).toLowerCase()));
+                for (const r of hit) {
+                    const before = r.reconciled_at;
+                    r.reconciled_at = clock();
+                    tx?.undo.push(() => { r.reconciled_at = before; });
+                }
+                return { rows: hit.map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })) };
             }
             case 'retention':
                 return { rows: placements.filter((r) => r.state === 'STOPPED' || r.state === 'RETIRED').map((r) => ({ computer_id: r.computer_id, state: r.state, updated_at: r.updated_at })) };

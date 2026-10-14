@@ -108,7 +108,9 @@ export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly Pla
     DRAINING: ['STOPPING', 'UNCONFIRMED'],
     STOPPING: ['STOPPED', 'UNCONFIRMED'],
     UNCONFIRMED: ['RECOVERING'],
-    RECOVERING: ['STOPPED', 'UNCONFIRMED'],
+    // RECOVERING → RETIRING: a DELETED computer's stuck placement is recovered by retiring it
+    // (aws-receipts.ts `recoverDeletedAwsPlacement`); the retire job resolves any instance state.
+    RECOVERING: ['STOPPED', 'RETIRING', 'UNCONFIRMED'],
     // RETIRING → STOPPED / RUNNING is the undo of a retire whose StartExecution was refused:
     // nothing ran, so the placement returns to the state the retire started from.
     RETIRING: ['RETIRED', 'STOPPED', 'RUNNING', 'UNCONFIRMED'],
@@ -759,32 +761,50 @@ export async function claimAwsPlacementsToReconcile(db: PlacementExecutor, limit
     return claimed;
 }
 
-/** States a deleted computer's placement is driven out of, toward RETIRED (`listAwsPlacementsPendingRetire`). */
-export const RETIRE_PENDING_STATES: readonly PlacementState[] = ['RUNNING', 'DRAINING', 'STOPPING', 'STOPPED', 'RETIRING'];
+/**
+ * States a deleted computer's placement is driven out of, toward RETIRED
+ * (`claimAwsPlacementsPendingRetire`). UNCONFIRMED and RECOVERING are here because a
+ * failed, timed-out or aborted stop/retire lands UNCONFIRMED, and with the computer
+ * already deleted nothing else would ever retry it (Codex 4276508568).
+ */
+export const RETIRE_PENDING_STATES: readonly PlacementState[] = ['RUNNING', 'DRAINING', 'STOPPING', 'STOPPED', 'RETIRING', 'UNCONFIRMED', 'RECOVERING'];
 
 /**
  * Background retirement input (aws-receipts.ts `reconcileDeletedAwsComputers`): aws-ec2
- * placements that can still hold an instance while their computer row is soft-deleted
- * (`computer.delete` succeeds once the retire, or the stop before it, is durably
- * recorded) or gone (an account deletion cascades the row away). Oldest change first,
- * bounded. The placement's owner is unchanged; the computer row only says "retire".
+ * placements that can still hold an instance or a job while their computer row is
+ * soft-deleted (`computer.delete` succeeds once the retire, or the stop before it, is
+ * durably recorded) or gone (an account deletion cascades the row away). The placement's
+ * owner is unchanged; the computer row only says "retire".
+ *
+ * It ROTATES like `claimAwsPlacementsToReconcile`: least recently checked first (never
+ * checked first of all), stamping `reconciled_at`, skipping writer-held rows. A row that
+ * cannot progress (its instance gone, its region unconfigured) therefore never pins the
+ * head of the list and starves the rest. A duplicate's rows are returned once.
  */
-export async function listAwsPlacementsPendingRetire(db: PlacementExecutor, limit: number): Promise<{ computerId: string; ownerUserId: string }[]> {
+export async function claimAwsPlacementsPendingRetire(db: PlacementExecutor, limit: number): Promise<{ computerId: string; ownerUserId: string }[]> {
     const states = sql.join(RETIRE_PENDING_STATES.map((s) => sql`${s}`), sql`, `);
     const rows = rowsOf(
-        await db.execute(sql`/* placement:retire-pending */ SELECT p.computer_id::text AS computer_id, p.owner_user_id::text AS owner_user_id
-            FROM public.ezil_computer_placements p
-            LEFT JOIN public.ezil_computers c ON c.id = p.computer_id
-            WHERE p.provider = 'aws-ec2' AND p.state IN (${states})
-              AND (c.id IS NULL OR c.deleted_at IS NOT NULL)
-            ORDER BY p.updated_at ASC
-            LIMIT ${Math.max(1, Math.min(Math.trunc(limit), 100))}`),
+        await db.execute(sql`/* placement:retire-pending-claim */ UPDATE public.ezil_computer_placements
+            SET reconciled_at = now()
+            WHERE computer_id IN (SELECT p.computer_id FROM public.ezil_computer_placements p
+                LEFT JOIN public.ezil_computers c ON c.id = p.computer_id
+                WHERE p.provider = 'aws-ec2' AND p.state IN (${states})
+                  AND (c.id IS NULL OR c.deleted_at IS NOT NULL)
+                ORDER BY p.reconciled_at ASC NULLS FIRST, p.updated_at ASC, p.computer_id ASC
+                LIMIT ${Math.max(1, Math.min(Math.trunc(limit), 100))}
+                FOR UPDATE OF p SKIP LOCKED)
+            RETURNING computer_id::text AS computer_id, owner_user_id::text AS owner_user_id`),
     );
-    return rows.map((r) => {
+    const seen = new Set<string>();
+    const claimed: { computerId: string; ownerUserId: string }[] = [];
+    for (const r of rows) {
         const computerId = String(r.computer_id);
         if (!UUID.test(computerId) || typeof r.owner_user_id !== 'string' || !UUID.test(r.owner_user_id)) throw new PlacementIntegrityError('invalid_row', computerId);
-        return { computerId, ownerUserId: r.owner_user_id };
-    });
+        if (seen.has(computerId.toLowerCase())) continue;
+        seen.add(computerId.toLowerCase());
+        claimed.push({ computerId, ownerUserId: r.owner_user_id });
+    }
+    return claimed;
 }
 
 /**

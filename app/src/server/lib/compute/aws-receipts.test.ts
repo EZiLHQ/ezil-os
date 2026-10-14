@@ -14,12 +14,12 @@ import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
-    applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers,
+    applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
     runAwsBackgroundReconcile, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
-    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, listAwsPlacementsPendingRetire, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
+    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
 } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
@@ -552,7 +552,7 @@ describe('Codex 4275269627: a deleted AWS computer is retired in the background 
 
     it.each(['STOPPED', 'RUNNING'] as const)('a deleted computer that is %s gets its retire started (RETIRING, job recorded)', async (state) => {
         const b = bg([ready({ state })], DELETED);
-        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 1, retired: 0 });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 1, retired: 0, stuck: 0 });
         expect(b.starts.map((x) => x.intent.operation)).toEqual(['retire']);
         expect(b.starts[0]!.intent).toMatchObject({ providerInstanceId: I_NEW, dataVolumeId: VOL, targetGeneration: 2, leaseEpoch: 3, fenceToken: FENCE });
         expect(b.placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: b.starts[0]!.intent.jobId });
@@ -567,14 +567,14 @@ describe('Codex 4275269627: a deleted AWS computer is retired in the background 
 
     it('RETIRING + retired receipt → RETIRED (counted), nothing new started', async () => {
         const b = bg([ready({ state: 'RETIRING', lifecycle_job_id: JOB, lifecycle_digest: DIGEST })], DELETED, { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) });
-        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 1 });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 1, stuck: 0 });
         expect(b.starts).toEqual([]);
         expect(b.placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null });
     });
 
     it('a LIVE computer is never retired by the background pass', async () => {
         const b = bg([ready()], [{ id: C1, user_id: U1, deleted_at: null }]);
-        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 0, retiresStarted: 0, retired: 0 });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 0, retiresStarted: 0, retired: 0, stuck: 0 });
         expect(b.starts).toEqual([]);
         expect(b.placements[0]).toMatchObject({ state: 'STOPPED' });
     });
@@ -600,16 +600,123 @@ describe('Codex 4275269627: a deleted AWS computer is retired in the background 
     });
 });
 
-describe('retire-pending SQL (the fake answers by tag; the text is pinned here, run on real Postgres 16 in review)', () => {
-    it('LEFT JOINs the computer row and keeps only deleted or missing ones, oldest change first, bounded', async () => {
+describe('Codex 4276508568: a deleted computer whose stop/retire failed is recovered by retiring it', () => {
+    const DELETED = [{ id: C1, user_id: U1, deleted_at: NOW }];
+    const stuck = (over: Record<string, unknown> = {}) =>
+        row({ state: 'UNCONFIRMED', instance_id: I_NEW, lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null, enroll_expires_at: null,
+            last_error: 'failed:States.Timeout', ...over });
+    type View = Pick<Ec2EnrollmentView, 'state'> | null | 'throw';
+    function bg(rows: Record<string, unknown>[], computers: { id: string; user_id: string; deleted_at?: Date | null }[],
+        opts: { view?: View; exec?: Exec; failStart?: boolean } = {}) {
+        const fake = createFakePlacementDb({ placements: rows, computers }, { clock: () => NOW });
+        const starts: { region: string; intent: LifecycleIntent }[] = [];
+        const control = { view: opts.view === undefined ? ({ state: 'stopped' } as View) : opts.view, failStart: opts.failStart ?? false };
+        const starter: LifecycleStarter = {
+            async start(region, work) {
+                if (control.failStart) throw new Error('StartExecution refused');
+                starts.push({ region, intent: JSON.parse((JSON.parse(work.input) as { document: string }).document) });
+            },
+        };
+        const describes: string[] = [];
+        const describer = {
+            async describeForEnrollment(_region: string, instanceId: string) {
+                describes.push(instanceId);
+                if (control.view === 'throw') throw new Error('RequestLimitExceeded');
+                return control.view === null ? null : ({ ...control.view, instanceId } as Ec2EnrollmentView);
+            },
+        };
+        const tunnels: TunnelClient = { createTunnel: async () => ({ ok: true, tunnelToken: 'tok-' + 'x'.repeat(30) }), deleteTunnel: async () => ({ ok: true }) };
+        let n = 0;
+        const deps = {
+            db: fake.db, tunnels, starter, describer, newId: () => `bbbbbbbb-bbbb-4bbb-8bbb-${String(++n).padStart(12, '0')}`,
+            executions: { describe: async () => opts.exec ?? { status: 'RUNNING' } } as LifecycleExecutionReader,
+        };
+        return { ...fake, deps, starts, describes, control };
+    }
+    const deployments = { 'ap-south-1': D };
+
+    it('the reported case: a deleted computer\'s retire FAILED → UNCONFIRMED, and the same pass starts a new retire', async () => {
+        const b = bg([stuck({ state: 'RETIRING', lifecycle_job_id: JOB, lifecycle_digest: DIGEST, last_error: null })], DELETED,
+            { exec: { status: 'FAILED', error: 'States.Timeout' } });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 1, retired: 0, stuck: 0 });
+        expect(b.starts.map((x) => x.intent.operation)).toEqual(['retire']);
+        expect(b.starts[0]!.intent).toMatchObject({ providerInstanceId: I_NEW, dataVolumeId: VOL, fenceToken: FENCE });
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: b.starts[0]!.intent.jobId, last_error: null });
+        expect(b.placements[0]!.lifecycle_job_id).not.toBe(JOB);
+    });
+
+    it.each(['stopped', 'running', 'stopping', 'terminated'])('UNCONFIRMED with the instance %s → RECOVERING → RETIRING, retire started (the job resolves the state)', async (state) => {
+        const b = bg([stuck()], DELETED, { view: { state } });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 1, retired: 0, stuck: 0 });
+        expect(b.describes).toEqual([I_NEW]);
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: b.starts[0]!.intent.jobId });
+    });
+
+    it('a RECOVERING placement left by an interrupted recovery goes straight to RETIRING', async () => {
+        const b = bg([stuck({ state: 'RECOVERING', last_error: 'deleted_recovery' })], DELETED);
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 1 });
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+
+    it('a LIVE computer\'s UNCONFIRMED placement is never touched: not claimed, and the recovery itself refuses it', async () => {
+        const live = [{ id: C1, user_id: U1, deleted_at: null }];
+        const b = bg([stuck()], live);
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 0, retiresStarted: 0, retired: 0, stuck: 0 });
+        const { record } = await readPlacement(b.db, C1);
+        expect(await recoverDeletedAwsPlacement(b.deps, record!, D)).toBe('skipped');
+        expect(b.starts).toEqual([]);
+        expect(b.describes).toEqual([]);
+        expect(b.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'failed:States.Timeout' });
+    });
+
+    it('describe failing is unknown: nothing changes, and the next pass recovers it', async () => {
+        const b = bg([stuck()], DELETED, { view: 'throw' });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 0, stuck: 0 });
+        expect(b.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+        b.control.view = { state: 'stopped' };
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 1 });
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+
+    it('an instance EC2 no longer knows is reported stuck (operator purge), with no job started', async () => {
+        const b = bg([stuck()], DELETED, { view: null });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 0, stuck: 1 });
+        expect(b.starts).toEqual([]);
+        expect(b.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('a refused StartExecution returns it to UNCONFIRMED (retire_start_failed, job cleared); the next pass retries', async () => {
+        const b = bg([stuck()], DELETED, { failStart: true });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 0 });
+        expect(b.placements[0]).toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: null, lifecycle_digest: null, last_error: 'retire_start_failed' });
+        b.control.failStart = false;
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 1 });
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+
+    it('rows that cannot progress never starve the rest: the pass rotates past them', async () => {
+        const Cn = (i: number) => `c4c4c4c4-c4c4-4c4c-8c4c-${String(i).padStart(12, '0')}`;
+        const rows = [1, 2, 3].map((i) => stuck({ computer_id: Cn(i), updated_at: new Date(NOW.getTime() - (10 - i) * 60_000) }));
+        const b = bg(rows, [1, 2, 3].map((i) => ({ id: Cn(i), user_id: U1, deleted_at: NOW })), { view: null });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments, 2)).toMatchObject({ checked: 2, stuck: 2 });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments, 2)).toMatchObject({ checked: 2, stuck: 2 });
+        expect(new Set(b.describes)).toEqual(new Set([I_NEW]));
+        expect(b.placements.every((r) => r.reconciled_at != null)).toBe(true);
+    });
+});
+
+describe('retire-pending claim SQL (the fake models it; the text is pinned here, run on real Postgres 16 in review)', () => {
+    it('claims deleted or missing computers least-recently-checked first, stamps reconciled_at, skips locked rows, bounded', async () => {
         const fake = createFakePlacementDb({ placements: [], computers: [] });
-        await listAwsPlacementsPendingRetire(fake.db, 500);
+        await claimAwsPlacementsPendingRetire(fake.db, 500);
         const text = fake.statements[0]!.sql.replace(/\s+/g, ' ');
-        expect(text).toMatch(/\/\* placement:retire-pending \*\//);
+        expect(text).toMatch(/\/\* placement:retire-pending-claim \*\//);
+        expect(text).toMatch(/UPDATE public\.ezil_computer_placements SET reconciled_at = now\(\)/);
         expect(text).toMatch(/LEFT JOIN public\.ezil_computers c ON c\.id = p\.computer_id/);
-        expect(text).toMatch(/WHERE p\.provider = 'aws-ec2' AND p\.state IN \(\$1, \$2, \$3, \$4, \$5\) AND \(c\.id IS NULL OR c\.deleted_at IS NOT NULL\)/);
-        expect(text).toMatch(/ORDER BY p\.updated_at ASC LIMIT \$6/);
+        expect(text).toMatch(/WHERE p\.provider = 'aws-ec2' AND p\.state IN \((\$\d+, ){6}\$\d+\) AND \(c\.id IS NULL OR c\.deleted_at IS NOT NULL\)/);
+        expect(text).toMatch(/ORDER BY p\.reconciled_at ASC NULLS FIRST, p\.updated_at ASC, p\.computer_id ASC LIMIT \$8 FOR UPDATE OF p SKIP LOCKED/);
         expect(fake.statements[0]!.params).toEqual([...RETIRE_PENDING_STATES, 100]);
+        expect(RETIRE_PENDING_STATES).toEqual(expect.arrayContaining(['UNCONFIRMED', 'RECOVERING']));
     });
 });
 

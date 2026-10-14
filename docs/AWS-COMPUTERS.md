@@ -149,6 +149,12 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   the tunnel before RETIRED. Booting, recovering and unconfirmed states refuse the delete. A computer with no
   placement deletes at once. A refused retire `StartExecution` returns to the state it came from and the delete is
   refused. The purge itself is a separate operator action (§6).
+  - A deleted computer whose stop or retire then FAILS (UNCONFIRMED), or whose recovery was interrupted
+    (RECOVERING), is recovered by the same background pass: it re-checks that the computer is deleted or gone,
+    confirms EC2 still knows the instance, then `UNCONFIRMED → RECOVERING → RETIRING` with a new retire job (the
+    retire resolves any instance state). A refused start returns it to UNCONFIRMED (`retire_start_failed`) for the
+    next pass; an instance EC2 no longer knows is counted `stuck` for an operator. A LIVE computer's UNCONFIRMED
+    placement is never touched by this path. The pass rotates (`reconciled_at`), so stuck rows never starve others.
 - Guest-initiated idle stop (R9): the host stops its own instance with no lifecycle job. `status`, `ensure` and
   `terminate` read the instance's EC2 state (the app caller's region-scoped `DescribeInstances`); a RUNNING row
   whose instance is stopping or stopped gets the ORDINARY lifecycle `stop`, which the helper confirms at once, so
