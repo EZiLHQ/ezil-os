@@ -444,20 +444,56 @@ def container_pids(cfg):
     return [p for p in pids if isinstance(p, int) and not isinstance(p, bool) and p > 1]
 
 
-def hangup_shells(cfg, settle=HANGUP_SETTLE, pids=None):
+def _pid_ns(pid):
+    """The pid namespace a host pid lives in (`pid:[<inode>]`), or None."""
+    try:
+        return os.readlink(f"/proc/{pid}/ns/pid")
+    except OSError:
+        return None
+
+
+def container_scope(cfg):
+    """The desktop container's pid namespace, read from its init (runc state .pid)."""
+    r = runc(cfg, "state", cfg.containerId, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        init = json.loads(r.stdout).get("pid")
+    except ValueError:
+        return None
+    if not isinstance(init, int) or isinstance(init, bool) or init <= 1:
+        return None
+    return _pid_ns(init)
+
+
+def hangup_shells(cfg, settle=HANGUP_SETTLE, pids=None, scope=None):
     """Before the stop, SIGHUP every terminal shell (bash/zsh on a tty) in the desktop:
     an interactive shell saves its history on SIGHUP — including a command that is still
-    running — then exits, as when a terminal window closes. Signals go through a pidfd,
-    so a recycled pid is never signalled. Returns how many shells were hung up."""
+    running — then exits, as when a terminal window closes. Returns how many were hung up.
+
+    Identity: `runc ps` lists pids, then each is pinned with a pidfd. A pid could be
+    recycled between the listing and pidfd_open, so membership is re-checked AFTER the pin:
+    the process must be in the container's pid namespace (`scope`, from the container init),
+    and the pidfd must still be alive after those /proc reads — a live pidfd target cannot
+    have had its pid reused, so the reads described the pinned process. No scope (the
+    container is gone) means nothing is signalled."""
+    if pids is None:
+        pids = container_pids(cfg)
+    if scope is None:
+        scope = container_scope(cfg)
+    if scope is None:
+        return 0
     sent = []
-    for pid in (container_pids(cfg) if pids is None else pids):
+    for pid in pids:
         try:
             pfd = os.pidfd_open(pid)
         except OSError:
             continue
         try:
             info = _proc_shell_on_tty(pid)
-            if info and info[0] in HISTORY_SHELLS and info[1] != 0:
+            member = _pid_ns(pid) == scope
+            if member and info and info[0] in HISTORY_SHELLS and info[1] != 0:
+                signal.pidfd_send_signal(pfd, 0)      # still the pinned process (raises if gone)
                 signal.pidfd_send_signal(pfd, signal.SIGHUP)
                 sent.append(pfd)
                 continue
