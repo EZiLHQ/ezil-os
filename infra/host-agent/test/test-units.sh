@@ -5,7 +5,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "$HERE/lib.sh"
 S="$HA/systemd"
 dep() { grep -E "^$2=" "$S/$1" | sed "s/^$2=//" | tr ' ' '\n'; }
 export S; export -f dep
-chain="ezil-lease ezil-guard ezil-host-clean ezil-overlay ezil-desktop ezil-enroll"
+chain="ezil-lease ezil-guard ezil-host-clean ezil-overlay ezil-enroll"
 prev=""
 for u in $chain; do
     if [ -n "$prev" ]; then
@@ -17,7 +17,12 @@ done
 for u in ezil-cloudflared ezil-agent; do
     check "$u: requires and is ordered after ezil-enroll" bash -c "grep -qx ezil-enroll.service <(dep $u.service Requires) && grep -qx ezil-enroll.service <(dep $u.service After)"
 done
-check "edge: requires and is ordered after enroll, desktop and agent (gateway contract GW-2/GW-3)" bash -c "for d in ezil-enroll ezil-desktop ezil-agent; do grep -qx \$d.service <(dep ezil-edge.service Requires) && grep -qx \$d.service <(dep ezil-edge.service After) || exit 1; done"
+check "edge: requires and is ordered after enroll and agent (gateway contract GW-2/GW-3)" bash -c "for d in ezil-enroll ezil-agent; do grep -qx \$d.service <(dep ezil-edge.service Requires) && grep -qx \$d.service <(dep ezil-edge.service After) || exit 1; done"
+check "desktop: requires the overlay; ordered LAST, after agent, edge and cloudflared (the relay config arrives through them)" bash -c "grep -qx ezil-overlay.service <(dep ezil-desktop.service Requires) && for d in ezil-overlay ezil-agent ezil-edge ezil-cloudflared; do grep -qx \$d.service <(dep ezil-desktop.service After) || exit 1; done"
+check "nothing Requires= the desktop: an agent-driven desktop restart never cascades into enrollment or the tunnel" bash -c "! grep -l '^Requires=.*ezil-desktop' '$S'/*.service"
+check "the desktop is not bound to the agent: an agent restart never restarts the desktop" bash -c "! grep -qx ezil-agent.service <(dep ezil-desktop.service Requires)"
+check "the target pulls the desktop in" grep -q "^Wants=.*ezil-desktop.service" "$S/ezil-host.target"
+check "the AMI runs the desktop in relay mode (no inbound rule: TURN only)" grep -q 'iceMode: "relay"' "$HA/ami/build-host-ami.sh"
 check "cloudflared requires the edge: no verifier, no tunnel (fail closed)" bash -c "grep -qx ezil-edge.service <(dep ezil-cloudflared.service Requires) && grep -qx ezil-edge.service <(dep ezil-cloudflared.service After)"
 check "the AMI enables the edge unit" grep -q "ezil-edge.service" "$HA/ami/build-host-ami.sh"
 check "no unit uses Wants= for the boot chain (Wants would not fail closed)" bash -c "! grep -l '^Wants=ezil-' '$S'/*.service"
@@ -75,5 +80,10 @@ check "stop outcome: absent/clean/killed from desktop.stop" pyunit test_history_
 check "stop outcome: a killed desktop is never flush=ok; durable record written and reported at boot" pyunit test_history_stop.AgentStopRecord
 check "drift: same rules in another order is drift; netns delete failure is reported" pyunit test_history_stop.DriftOrder
 check "edge: gw1 verifier matches the Worker's shared vectors (valid, invalid, skew, framing)" pyunit test_edge.GwVectors
+check "relay config: TURN-only backend, authenticated TURN, neko /api/relay lifetime, derived neko values only" pyunit test_ice.RelayConfig
+check "relay env: Cloudflare's neko ICE env + derived credentials replace local mode's direct-connect settings" pyunit test_ice.RelayEnv
+check "relay store: runDir tmpfs 0600 only (refused on the data volume), expiry-aware, bounded wait" pyunit test_ice.RelayStore
+check "agent ice/desktop_status: accepted, refused before seq, kept while running, ice_missing desktop restarted once; no credential echoed or logged" pyunit test_ice.AgentIce
+check "desktop step (relay mode): applied or ice_missing, desktop last in the relay boot order, no credential printed" pyunit test_ice.DesktopStep
 check "edge: real edge + real agent socket (ephemeral ports): 401 forwards nothing, strip, no smuggling, framing, WS, presence, control" pyunit test_edge.EdgeE2E
 summary "units + pure functions"

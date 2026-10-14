@@ -102,6 +102,7 @@ class Agent:
         self.cfg, self.lease, self.clock, self.log = cfg, lease, clock, log
         self.last_presence = clock()          # boot counts as activity
         self.stop_request = None
+        self.restart_request = False          # a relay config for a desktop started without one
         self.stop_outcome = None              # worst desktop.stop() outcome seen this boot
         self.lock = threading.Lock()
         with open(os.path.join(cfg.stateDir, "control.key"), "rb") as f:
@@ -136,11 +137,17 @@ class Agent:
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
             return {"ok": False, "error": "bad_seq"}
         op = msg.get("op")
+        relay_config = None
         if op == "stop":
             warn = msg.get("warnSeconds", self.cfg.stopWarnSeconds)
             if not isinstance(warn, int) or isinstance(warn, bool) or not 0 <= warn <= MAX_WARN:
                 return {"ok": False, "error": "bad_warn"}
-        elif op not in ("presence", "fence"):
+        elif op == "ice":
+            try:
+                relay_config = desktop.validate_desktop_config(msg.get("config"), int(now * 1000))
+            except ValueError:
+                return {"ok": False, "error": "ice_config_invalid"}   # never echo the config
+        elif op not in ("presence", "fence", "desktop_status"):
             return {"ok": False, "error": "unknown_op"}
         with self.lock:
             if seq <= self.last_seq:
@@ -149,12 +156,56 @@ class Agent:
             if op == "presence":
                 self.last_presence = max(self.last_presence, min(float(ts), now))
                 return {"ok": True}
+            if op == "ice":
+                return self._accept_relay(relay_config)
+            if op == "desktop_status":
+                return self._desktop_status(now)
             if op == "stop":
                 self.stop_request = {"kind": "stop", "warn": warn, "reason": str(msg.get("reason", "control_plane"))[:64]}
                 return {"ok": True}
             tunnel.fence(self.cfg, f"fence:{str(msg.get('newEpoch'))[:32]}")
             self.stop_request = {"kind": "fence", "warn": 0, "reason": "fence"}
             return {"ok": True}
+
+    def _desktop_state(self):
+        try:
+            return desktop.state(self.cfg)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return "unknown"
+
+    def _accept_relay(self, relay_config):
+        """GW-5 `ice` (lock held): store the per-epoch relay config in runDir (tmpfs) for the
+        desktop step. A desktop that is already running WITH a relay keeps it (renewal goes
+        through neko's /api/relay in place); one that started WITHOUT a relay (the bounded
+        wait timed out) is restarted so it picks the config up."""
+        try:
+            desktop.write_desktop_config(self.cfg, relay_config)
+        except (OSError, Refused):
+            return {"ok": False, "error": "ice_store_failed"}
+        if self._desktop_state() != "running":
+            return {"ok": True, "state": "accepted"}
+        if desktop.read_ice_state(self.cfg) == "applied":
+            return {"ok": True, "state": "already_running"}
+        self.restart_request = True
+        return {"ok": True, "state": "restart_scheduled"}
+
+    def _desktop_status(self, now):
+        """GW-5 `desktop` (lock held): whether an unexpired config is held for this epoch and
+        how the desktop runs. Never the config itself."""
+        c = desktop.read_desktop_config(self.cfg, int(now * 1000))
+        return {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
+                "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg)}
+
+    def restart_desktop(self):
+        """A relay config arrived after the desktop started without one: restart it through
+        its unit (ExecStop stops it the normal way, hanging up terminal shells first; the
+        desktop step then starts it with the stored config). Non-blocking."""
+        self.log("desktop restart: relay config arrived after the desktop started without one")
+        try:
+            subprocess.run(list(self.cfg.desktopRestartCmd), timeout=30, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.log(f"desktop restart failed: {type(e).__name__}")
 
     def _seq_path(self):
         return os.path.join(self.cfg.stateDir, "control-seq.json")
@@ -277,6 +328,10 @@ class Agent:
     def tick(self):
         with self.lock:
             req = self.stop_request
+            restart, self.restart_request = self.restart_request and not req, False
+        if restart:
+            self.restart_desktop()
+            return "restarting"
         if req:
             if req["warn"] > 0:
                 self.warn(req["warn"], req["reason"])

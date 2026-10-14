@@ -39,6 +39,13 @@ DEFAULTS = {
     "edgePort": 18080,
     "edgeUpstreamHost": "10.200.0.2",
     "edgePorts": [8181, 8080, 3002, 8443],
+    # Streamed-desktop WebRTC (worker/src/aws-ice.ts). "relay" (the AWS AMI): the desktop
+    # waits up to iceWaitSeconds for the Worker's per-epoch relay config (GW-5 `ice`), then
+    # starts with it, or without it (ice_missing; the next push restarts it with
+    # desktopRestartCmd). "local": the direct-connect settings of local mode, no waiting.
+    "iceMode": "local",
+    "iceWaitSeconds": 90,
+    "desktopRestartCmd": ["/usr/bin/systemctl", "restart", "--no-block", "ezil-desktop.service"],
     # cloud-init's cached copies of user data (they hold the nonce); globs; wiped after use.
     # obj.pkl is cloud-init's pickled datasource cache (it embeds the raw user data); it is
     # a cache that cloud-init rebuilds when missing. instance-data-sensitive.json is the

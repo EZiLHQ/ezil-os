@@ -9,6 +9,7 @@ hosts/hostname/resolv.conf, tmpfs /tmp and /run, data-volume binds nosuid,nodev
 import base64
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -56,6 +57,158 @@ HISTORY_SHELLS = ("bash", "zsh")
 HANGUP_SETTLE = 3.0
 # The last stop's outcome, on the data root (not reachable by the guest), reported at boot.
 STOP_RECORD = ".ezil-last-stop.json"
+
+
+# ------------------------------------------------------------------ WebRTC relay
+# An AWS host has no inbound rule: the streamed desktop (neko) works only through a TURN
+# relay over outbound TCP/TLS. The Worker pushes one config per epoch through the edge
+# (GW-5 `ice`, body digest in the signed path): the relay-only ICE sets, their expiry and
+# the sandbox's DERIVED neko credentials (the values the app and the Worker's relay renewal
+# use). It lives ONLY in runDir (tmpfs, 0600), never on the data volume, and reaches the
+# container as the same env Cloudflare gives neko (worker/src/desktop-mode.ts
+# buildNekoIceEnv). Renewal later goes through neko's own admin /api/relay, in place.
+DESKTOP_CONFIG = "desktop-config.json"     # runDir: the pushed relay config
+ICE_STATE = "desktop-ice.json"             # runDir: how the running desktop was started
+RELAY_MIN_AHEAD_MS, RELAY_MAX_AHEAD_MS, CLOCK_SKEW_MS = 60_000, 1_800_000, 5_000
+MAX_ICE_SERVERS = MAX_ICE_URLS = 8
+NEKO_VALUE_RE = re.compile(r"^[0-9a-f]{32}$")
+ICE_URL_RE = re.compile(r"^(turns?|stun):[\x21-\x7e]{1,255}$")
+ICE_CRED_RE = re.compile(r"^[\x20-\x7e]{1,512}$")
+# Local mode's direct-connect settings can never use a relay (ICE-lite never relays, and a
+# NAT1TO1 of 127.0.0.1 advertises loopback); relay mode replaces them.
+NEKO_PASSWORD_KEYS = ("NEKO_MEMBER_MULTIUSER_USER_PASSWORD", "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD")
+
+
+def _is_turn(url):
+    return url.startswith("turn:") or url.startswith("turns:")
+
+
+def _ice_set(servers, relay_only):
+    if not isinstance(servers, list) or not 1 <= len(servers) <= MAX_ICE_SERVERS:
+        raise ValueError("ice_config_invalid")
+    out, has_turn = [], False
+    for s in servers:
+        if not isinstance(s, dict) or not set(s) <= {"urls", "username", "credential"}:
+            raise ValueError("ice_config_invalid")
+        urls = s.get("urls")
+        if (not isinstance(urls, list) or not 1 <= len(urls) <= MAX_ICE_URLS
+                or not all(isinstance(u, str) and ICE_URL_RE.match(u) for u in urls)):
+            raise ValueError("ice_config_invalid")
+        if relay_only and not all(_is_turn(u) for u in urls):
+            raise ValueError("ice_config_invalid")      # backend: no STUN, so no srflx gathering
+        entry = {"urls": list(urls)}
+        if any(_is_turn(u) for u in urls):
+            user, cred = s.get("username"), s.get("credential")
+            if not (isinstance(user, str) and ICE_CRED_RE.match(user) and isinstance(cred, str) and ICE_CRED_RE.match(cred)):
+                raise ValueError("ice_config_invalid")
+            entry.update(username=user, credential=cred)
+            has_turn = True
+        elif set(s) - {"urls"}:
+            raise ValueError("ice_config_invalid")
+        out.append(entry)
+    if not has_turn:
+        raise ValueError("ice_config_invalid")
+    return out
+
+
+def validate_desktop_config(c, now_ms):
+    """The pushed config, normalized, or ValueError('ice_config_invalid'). Mirrors the
+    Worker's buildAwsDesktopConfig and neko's /api/relay rules: authenticated TURN in both
+    sets, a TURN-only backend, an expiry more than 60 s and at most 30 min ahead, and two
+    distinct 32-hex derived neko values (never the image's built-in neko/admin)."""
+    if not isinstance(c, dict) or set(c) != {"v", "expiresAt", "frontend", "backend", "neko"} or c.get("v") != 1:
+        raise ValueError("ice_config_invalid")
+    exp = c["expiresAt"]
+    if (not isinstance(exp, int) or isinstance(exp, bool) or exp <= now_ms + RELAY_MIN_AHEAD_MS
+            or exp > now_ms + RELAY_MAX_AHEAD_MS + CLOCK_SKEW_MS):
+        raise ValueError("ice_config_invalid")
+    neko = c["neko"]
+    if (not isinstance(neko, dict) or set(neko) != {"user", "admin"}
+            or not all(isinstance(neko[k], str) and NEKO_VALUE_RE.match(neko[k]) for k in ("user", "admin"))
+            or neko["user"] == neko["admin"]):
+        raise ValueError("ice_config_invalid")
+    return {"v": 1, "expiresAt": exp, "frontend": _ice_set(c["frontend"], False),
+            "backend": _ice_set(c["backend"], True), "neko": {"user": neko["user"], "admin": neko["admin"]}}
+
+
+def _run_file(cfg, name):
+    run = os.path.realpath(cfg.runDir)
+    data = os.path.realpath(cfg.dataMount)
+    if run == data or run.startswith(data.rstrip("/") + "/"):
+        raise Refused("relay_config_not_on_tmpfs", run)    # credentials never on the data volume
+    return os.path.join(run, name)
+
+
+def _write_private_atomic(path, data):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def write_desktop_config(cfg, c):
+    _write_private_atomic(_run_file(cfg, DESKTOP_CONFIG), json.dumps(c, separators=(",", ":")).encode())
+
+
+def read_desktop_config(cfg, now_ms):
+    """The stored config if still valid at now_ms (unexpired by the 60 s margin), else None."""
+    try:
+        with open(_run_file(cfg, DESKTOP_CONFIG), encoding="utf-8") as f:
+            return validate_desktop_config(json.load(f), now_ms)
+    except (OSError, ValueError, Refused):
+        return None
+
+
+def wait_desktop_config(cfg, timeout, poll=1.0, clock=time.time, sleep=time.sleep):
+    """Bounded: the config, or None after `timeout` seconds (the desktop then starts without
+    a relay, reports ice_missing, and the Worker's next push schedules a restart)."""
+    deadline = clock() + max(0.0, float(timeout))
+    while True:
+        c = read_desktop_config(cfg, int(clock() * 1000))
+        if c is not None or clock() >= deadline:
+            return c
+        sleep(min(poll, max(0.0, deadline - clock())))
+
+
+def write_ice_state(cfg, state, expires_at=None):
+    _write_private_atomic(_run_file(cfg, ICE_STATE), json.dumps({"ice": state, "expiresAt": expires_at}).encode())
+
+
+def read_ice_state(cfg):
+    """applied | missing (how the current desktop was started) | none."""
+    try:
+        with open(_run_file(cfg, ICE_STATE), encoding="utf-8") as f:
+            s = json.load(f).get("ice")
+        return s if s in ("applied", "missing") else "none"
+    except (OSError, ValueError, AttributeError, Refused):
+        return "none"
+
+
+def relay_env(c):
+    """The container env for a relay config: exactly Cloudflare's neko ICE env (frontend and
+    backend JSON, ICE-lite off, trickle on, initial relay expiry), NAT1TO1 pinned to the
+    container's own address (no public-IP lookup, nothing public advertised as a host
+    candidate), and the derived neko credentials."""
+    return {
+        "NEKO_WEBRTC_ICESERVERS_FRONTEND": json.dumps(c["frontend"], separators=(",", ":")),
+        "NEKO_WEBRTC_ICESERVERS_BACKEND": json.dumps(c["backend"], separators=(",", ":")),
+        "NEKO_WEBRTC_ICELITE": "false",
+        "NEKO_WEBRTC_ICETRICKLE": "true",
+        "NEKO_WEBRTC_NAT1TO1": CT_IP,
+        "EZIL_RELAY_EXPIRES_AT": str(c["expiresAt"]),
+        "NEKO_MEMBER_MULTIUSER_USER_PASSWORD": c["neko"]["user"],
+        "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD": c["neko"]["admin"],
+    }
+
+
+def set_env(env, values):
+    """env (list of K=V) with every key in `values` set exactly once."""
+    out = [e for e in env if e.split("=", 1)[0] not in values]
+    return out + [f"{k}={v}" for k, v in values.items()]
 
 
 def with_history(env):
@@ -318,7 +471,10 @@ def netns_down(cfg):
 
 
 # ------------------------------------------------------------------------ spec
-def build_spec(cfg, lease, mode="desktop", extra_binds=()):
+def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
+    """desktop_config: a validated relay config (relay mode) puts Cloudflare's neko ICE env
+    and the derived neko credentials in place of local mode's direct-connect settings and
+    per-boot random passwords."""
     with open(cfg.imageConfigFile, encoding="utf-8") as f:
         image = json.load(f)
     host = f"ezil-gen-{lease['generation']}-e{lease['leaseEpoch']}"
@@ -338,6 +494,8 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=()):
         "NEKO_SESSION_IMPLICIT_HOSTING=true", "NEKO_WEBRTC_UDPMUX=52100", "NEKO_WEBRTC_TCPMUX=52100",
         "NEKO_WEBRTC_NAT1TO1=127.0.0.1", "NEKO_WEBRTC_ICELITE=true", "EZIL_WORKSPACE_ROOT=/workspace",
     ] + [f"{k}={v}" for k, v in PROFILE_ENV.items()])
+    if desktop_config is not None:
+        env = set_env(env, relay_env(desktop_config))
     args = (["/bin/bash", "-c", "DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh"] if mode == "desktop"
             else ["/bin/sleep", "infinity"])
     dm = cfg.dataMount

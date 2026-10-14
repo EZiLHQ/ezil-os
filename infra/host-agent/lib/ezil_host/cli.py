@@ -14,6 +14,22 @@ def _lease(cfg):
     return enrollmod.load_lease(cfg)
 
 
+def desktop_relay(cfg, lease, wait=None):
+    """Relay mode (the AWS AMI): wait, bounded, for the Worker's per-epoch relay config, then
+    rebuild the spec with it, or without it (ice_missing; the Worker's next push makes the
+    agent restart the desktop). Records which, for the agent's status. Local mode: None, the
+    overlay step's spec stands. Prints no credential."""
+    mode = cfg.get("iceMode", "local")
+    if mode == "local":
+        return None
+    if mode != "relay":
+        raise Refused("ice_mode_unknown", str(mode)[:32])
+    c = (wait or desktop.wait_desktop_config)(cfg, float(cfg.get("iceWaitSeconds", 90)))
+    desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"), desktop_config=c)
+    desktop.write_ice_state(cfg, "applied" if c else "missing", c["expiresAt"] if c else None)
+    return "applied" if c else "missing (ice_missing): started without a relay; the next push restarts it"
+
+
 def step(cfg, name, detach=False):
     if name == "lease":
         l = enrollmod.fetch_lease(cfg)
@@ -30,6 +46,9 @@ def step(cfg, name, detach=False):
         desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"))
         return "overlay mounted, netns up, spec written"
     if name == "desktop":
+        relay = desktop_relay(cfg, lease)
+        if relay is not None:
+            print(f"[desktop] relay {relay}", flush=True)
         if detach:
             rc = desktop.run(cfg, detach=True, log=os.path.join(cfg.runDir, "desktop.log"))
             if rc != 0:
@@ -55,6 +74,14 @@ def step(cfg, name, detach=False):
 
 
 BOOT_ORDER = ["lease", "guard", "clean", "overlay", "desktop", "enroll"]
+# Relay mode: the relay config arrives over the tunnel, so the desktop comes LAST (the
+# systemd units order it after the agent, edge and cloudflared; nothing Requires it, so a
+# desktop restart never cascades into enrollment or the tunnel).
+BOOT_ORDER_RELAY = ["lease", "guard", "clean", "overlay", "enroll", "desktop"]
+
+
+def boot_order(cfg):
+    return BOOT_ORDER_RELAY if cfg.get("iceMode", "local") == "relay" else BOOT_ORDER
 
 
 def main(argv=None):
@@ -66,8 +93,9 @@ def main(argv=None):
     cmd = argv[0]
     try:
         if cmd == "boot-chain":
-            until = argv[1] if len(argv) > 1 else BOOT_ORDER[-1]
-            for s in BOOT_ORDER[: BOOT_ORDER.index(until) + 1]:
+            order = boot_order(cfg)
+            until = argv[1] if len(argv) > 1 else order[-1]
+            for s in order[: order.index(until) + 1]:
                 print(f"[{s}] " + step(cfg, s, detach=True), flush=True)
             return 0
         if cmd == "desktop-stop":

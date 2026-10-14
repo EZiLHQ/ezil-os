@@ -1,7 +1,7 @@
 [Unit]
 Description=EZiL: C-6 enrollment (identity document + signature + one-time nonce)
-Requires=ezil-desktop.service
-After=ezil-desktop.service
+Requires=ezil-overlay.service
+After=ezil-overlay.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes

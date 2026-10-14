@@ -1,7 +1,11 @@
 [Unit]
 Description=EZiL: desktop container (runc, hardened spec)
+# Last in the chain: in relay mode its step waits (bounded) for the Worker's relay config,
+# which arrives through the agent, edge and tunnel. Nothing Requires= this unit, so the
+# agent's restart of it (a config that arrived after an ice_missing start) never cascades;
+# it is ordered after, not bound to, the agent, so an agent restart never restarts it.
 Requires=ezil-overlay.service
-After=ezil-overlay.service
+After=ezil-overlay.service ezil-agent.service ezil-edge.service ezil-cloudflared.service
 [Service]
 Type=simple
 Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
