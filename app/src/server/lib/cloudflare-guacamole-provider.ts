@@ -32,6 +32,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
+import { cookieHeaderFor, getFollowingSameOriginCookies, storeSetCookies, type ProbeCookieJar } from './compute/aws-preview-cookies';
 
 // ─── Correlation ──────────────────────────────────────────────────────────────
 
@@ -1659,12 +1660,13 @@ export async function probeDesktopFrame(
     }
 
     try {
-        const res = await fetch(target, {
-            method: 'GET',
+        // A redirect that lands somewhere healthy is healthy; follow it rather
+        // than treating a 302 as a status to judge. Followed by hand so a
+        // cookie the bootstrap sets reaches the SAME origin's next hop, as it
+        // does in the browser: an AWS bootstrap's follow-up is 401 without it
+        // (compute/aws-preview-cookies.ts). Never sent to another origin.
+        const { response: res } = await getFollowingSameOriginCookies(target, {
             headers: { Accept: 'text/html,*/*' },
-            // A redirect that lands somewhere healthy is healthy; follow it
-            // (the default) rather than treating a 302 as a status to judge.
-            redirect: 'follow',
             cache: 'no-store',
             signal: AbortSignal.timeout(timeoutMs),
         });
@@ -1961,15 +1963,17 @@ interface CachedAdminToken {
     /** The credential it was minted with. A rotated password must not reuse it. */
     password: string;
     expiresAt: number;
+    /** The origin's own preview cookie, when it requires one (AWS); the logout needs it too. */
+    cookie?: string;
 }
 
 const nekoAdminTokens = new Map<string, CachedAdminToken>();
 
 /** Best-effort `POST /api/logout`. Never awaited, never throws. */
-function releaseNekoAdminToken(origin: string, token: string): void {
+function releaseNekoAdminToken(origin: string, token: string, cookie?: string): void {
     void fetch(`${origin}/api/logout`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${token}`, ...(cookie ? { Cookie: cookie } : {}) },
         signal: AbortSignal.timeout(3_000),
     }).catch(() => undefined);
 }
@@ -1978,10 +1982,10 @@ function releaseNekoAdminToken(origin: string, token: string): void {
  * Hand a freshly minted admin token to the cache. Any token it replaces is
  * logged out, so the room never accumulates sessions.
  */
-export function cacheNekoAdminToken(origin: string, password: string, token: string): void {
+export function cacheNekoAdminToken(origin: string, password: string, token: string, cookie?: string): void {
     const previous = nekoAdminTokens.get(origin);
-    if (previous && previous.token !== token) releaseNekoAdminToken(origin, previous.token);
-    nekoAdminTokens.set(origin, { token, password, expiresAt: Date.now() + NEKO_ADMIN_TOKEN_TTL_MS });
+    if (previous && previous.token !== token) releaseNekoAdminToken(origin, previous.token, cookie ?? previous.cookie);
+    nekoAdminTokens.set(origin, { token, password, expiresAt: Date.now() + NEKO_ADMIN_TOKEN_TTL_MS, ...(cookie ? { cookie } : {}) });
 }
 
 /** The cached token for this origin, if one was minted with this password and is not stale. */
@@ -1990,7 +1994,7 @@ export function cachedNekoAdminToken(origin: string, password: string): string |
     if (!hit) return null;
     if (hit.password !== password || hit.expiresAt <= Date.now()) {
         nekoAdminTokens.delete(origin);
-        releaseNekoAdminToken(origin, hit.token);
+        releaseNekoAdminToken(origin, hit.token, hit.cookie);
         return null;
     }
     return hit.token;
@@ -2064,23 +2068,45 @@ export async function probeDesktopDisplay(
     timeoutMs: number = DESKTOP_DISPLAY_PROBE_TIMEOUT_MS,
 ): Promise<DesktopDisplayProbe> {
     let origin: string;
+    let bootstrap: URL | null = null;
     try {
         const u = new URL(desktopUrl);
         if (u.protocol !== 'https:' && u.protocol !== 'http:') {
             return { display: 'unknown', reason: 'bad_url' };
         }
         origin = u.origin;
+        if (u.pathname === PREVIEW_BOOTSTRAP_PATH && u.searchParams.get('token')) bootstrap = u;
     } catch {
         return { display: 'unknown', reason: 'bad_url' };
     }
 
     const deadline = AbortSignal.timeout(timeoutMs);
 
+    // A bootstrap URL (AWS) gates its whole origin behind the cookie the
+    // bootstrap sets: take it first, exactly as the browser's iframe did, and
+    // send it to that origin only (compute/aws-preview-cookies.ts).
+    let cookie: string | undefined;
+    if (bootstrap) {
+        try {
+            const jar: ProbeCookieJar = new Map();
+            const res = await fetch(`${bootstrap.origin}${bootstrap.pathname}${bootstrap.search}`, {
+                method: 'GET', headers: { Accept: 'text/html,*/*' }, redirect: 'manual', cache: 'no-store', signal: deadline,
+            });
+            storeSetCookies(jar, bootstrap, res.headers);
+            await res.body?.cancel().catch(() => undefined);
+            cookie = cookieHeaderFor(jar, bootstrap);
+            if (!cookie) return { display: 'unknown', reason: 'login_failed', status: res.status };
+        } catch {
+            return { display: 'unknown', reason: 'unreachable' };
+        }
+    }
+    const withCookie = (headers: Record<string, string>) => (cookie ? { ...headers, Cookie: cookie } : headers);
+
     /** Mint a fresh admin session and remember it. `null` = the login failed. */
     const login = async (): Promise<{ token: string } | { status?: number }> => {
         const loginRes = await fetch(`${origin}/api/login`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: withCookie({ 'Content-Type': 'application/json' }),
             // A distinct username from `enableImplicitHosting`'s so the two
             // server-side sessions are told apart in Neko's own logs. Both
             // authenticate by password; Neko does not key on the name. (A probe
@@ -2093,7 +2119,7 @@ export async function probeDesktopDisplay(
         if (!loginRes.ok) return { status: loginRes.status };
         const body = (await loginRes.json()) as { token?: unknown };
         if (typeof body.token !== 'string' || body.token.length === 0) return {};
-        cacheNekoAdminToken(origin, adminPassword, body.token);
+        cacheNekoAdminToken(origin, adminPassword, body.token, cookie);
         return { token: body.token };
     };
 
@@ -2114,7 +2140,7 @@ export async function probeDesktopDisplay(
         }
 
         let listRes = await fetch(`${origin}/api/sessions`, {
-            headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+            headers: withCookie({ Authorization: `Bearer ${token}`, Accept: 'application/json' }),
             cache: 'no-store',
             signal: deadline,
         });
@@ -2131,7 +2157,7 @@ export async function probeDesktopDisplay(
             }
             token = fresh.token;
             listRes = await fetch(`${origin}/api/sessions`, {
-                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                headers: withCookie({ Authorization: `Bearer ${token}`, Accept: 'application/json' }),
                 cache: 'no-store',
                 signal: deadline,
             });

@@ -1,8 +1,10 @@
 import { createHash, createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
-import { requestAwsPreview } from './aws-preview';
+import { AWS_BROWSER_ROUTE_TOKEN, requestAwsPreview } from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { EnsureOptions } from './provider';
 
@@ -10,14 +12,14 @@ const NOW = Date.parse('2026-10-14T12:00:00Z');
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = 'abcdefab-abcd-4abc-8abc-abcdefabcdef';
 const sandboxId = deriveGuacamoleSandboxId(userId, computerId);
-const config = { workerUrl: 'https://worker.example/', isConfigured: true, hasHmacSecret: true };
+const config = { workerUrl: 'https://worker.preview.example/', isConfigured: true, hasHmacSecret: true };
 const options = { sessionId: 'session', desktopMode: 'neko' as const };
 const failure = { ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable' };
 const row = (over: Record<string, unknown> = {}) => placementRow({
     computer_id: computerId, owner_user_id: userId, state: 'RUNNING', generation: 7, lease_epoch: 11, ...over,
 });
 const url = (port: number) =>
-    `https://aws-${port}-${sandboxId}.preview.example/preview-bootstrap?token=opaque%2Etoken&path=%2F`;
+    `https://aws-${port}-${sandboxId}-aws.preview.example/preview-bootstrap?token=opaque%2Etoken&path=%2F`;
 const ready = () => ({
     ok: true, provider: 'aws-ec2', mode: 'neko', sandboxId, generation: 7, leaseEpoch: 11,
     guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443),
@@ -57,7 +59,7 @@ describe('AWS preview handoff', () => {
         });
         expect(fetchMock).toHaveBeenCalledTimes(1);
         const [endpoint, init] = fetchMock.mock.calls[0]!;
-        expect(endpoint).toBe('https://worker.example/sandbox/preview');
+        expect(endpoint).toBe('https://worker.preview.example/sandbox/preview');
         const body = JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko', screen });
         expect(init).toMatchObject({ method: 'POST', body, redirect: 'error' });
         expect(init!.signal).toBeInstanceOf(AbortSignal);
@@ -186,5 +188,36 @@ describe('AWS preview handoff', () => {
         else if (kind === 'timeout') fetchMock.mockRejectedValue(new DOMException('LEAK', 'TimeoutError'));
         else fetchMock.mockResolvedValue(kind === 'json' ? new Response('LEAK') : Response.json(kind === 'null' ? null : []));
         await expect(open()).resolves.toEqual(failure);
+    });
+});
+
+describe('AWS browser host (Codex P1: the Worker appends the -aws route token)', () => {
+    const host = (h: string) => `https://${h}/preview-bootstrap?token=opaque%2Etoken&path=%2F`;
+    const answer = (guacamoleUrl: string) => Response.json({ ...ready(), guacamoleUrl });
+
+    it.each([
+        ['the worker zone root', `aws-8181-${sandboxId}-aws.preview.example`],
+        ['the worker host itself', `aws-8181-${sandboxId}-aws.worker.preview.example`],
+    ])('accepts the Worker host on %s', async (_name, h) => {
+        fetchMock.mockResolvedValue(answer(host(h)));
+        await expect(setup().open()).resolves.toMatchObject({ ok: true, guacamoleUrl: host(h) });
+    });
+
+    it.each([
+        ['suffixless (the zone catch-all owns it)', `aws-8181-${sandboxId}.preview.example`],
+        ['a foreign zone', `aws-8181-${sandboxId}-aws.other.example`],
+        ['a zone suffix lookalike', `aws-8181-${sandboxId}-aws.preview.example.evil.example`],
+        ['another port in the desktop field', `aws-3002-${sandboxId}-aws.preview.example`],
+        ['another sandbox', `aws-8181-guac-0000000000000000-0000000000000000-aws.preview.example`],
+        ['a different route token', `aws-8181-${sandboxId}-awsx.preview.example`],
+    ])('refuses %s', async (_name, h) => {
+        fetchMock.mockResolvedValue(answer(host(h)));
+        await expect(setup().open()).resolves.toEqual(failure);
+    });
+
+    it('pins the route token to the Worker source', () => {
+        const worker = readFileSync(path.resolve(__dirname, '../../../../../worker/src/aws-origin.ts'), 'utf8');
+        expect(worker).toContain(`export const AWS_BROWSER_ROUTE_TOKEN = '${AWS_BROWSER_ROUTE_TOKEN}';`);
+        expect(worker).toContain('https://aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}.${zoneRoot}/preview-bootstrap');
     });
 });
