@@ -104,6 +104,8 @@ test('item 9: a Vercel caller trusts one exact team/project/environment, never d
         ['wildcard project', { ...VERCEL, subject: 'owner:ezil-team:project:*:environment:production' }],
         ['development tokens', { ...VERCEL, subject: 'owner:ezil-team:project:ezil-os:environment:development' }],
         ['another team in the subject', { ...VERCEL, subject: 'owner:other:project:ezil-os:environment:production' }],
+        // With a custom audience only the issuer/subject team check can catch it.
+        ['another team in the subject, custom audience', { ...VERCEL, audience: 'sts.amazonaws.com', subject: 'owner:other:project:ezil-os:environment:production' }],
         ['another team in the audience', { ...VERCEL, audience: 'https://vercel.com/other' }],
         ['a foreign issuer', { ...VERCEL, providerArn: `arn:aws:iam::${A}:oidc-provider/oidc.example.com/ezil-team`, issuerHost: 'oidc.example.com/ezil-team' }],
         ['a malformed subject', { ...VERCEL, subject: 'repo:ezil/ezil-os:environment:production' }],
