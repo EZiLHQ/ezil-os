@@ -83,6 +83,7 @@ pyunit() { (cd "$HA/test" && python3 -m unittest -q "$@"); }
 check "canary: default off, public console schema, persistence and lifecycle ordering" pyunit test_canary
 check "enroll: the app's browser-host binding (sandboxId, zone) lands in the lease; a malformed one stores nothing" pyunit test_enroll_routing
 check "enroll: the nonce is re-sent only after an answer that consumed nothing; bounded; kept when retrying ends" pyunit test_boot_retries.EnrollRetry
+check "enroll: a 200 retires the nonce only after its credentials are durable; malformed/write error/crash keep it and the replay converges" pyunit test_enroll_durability
 check "guard: waits, bounded, for the late-attached data volume (wake link, provision disk)" pyunit test_boot_retries.VolumeWait
 check "lease: IMDS transport errors retried, bounded; HTTP refusals final" pyunit test_boot_retries.ImdsRetry
 check "history: env + read-only profile.d make an open terminal append each command (real pty bash)" pyunit test_history_stop.HistoryInjection

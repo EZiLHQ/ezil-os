@@ -3,7 +3,8 @@
 The edge trusts `x-forwarded-host` only for `aws-<port>-<sandboxId>-aws.<zone>`, and it reads
 sandboxId + zone from the lease. Enrollment is the only place the host learns them, so a
 successful answer records both in the lease (0600), and an answer without a well-formed
-binding is malformed: no token, no key, no binding stored, and the nonce is still wiped.
+binding is malformed: no token, no key, no binding stored, and the nonce is KEPT so a
+re-send takes the app's replay path (test_enroll_durability.py).
 No network: http.request is stubbed.
 """
 import base64
@@ -33,7 +34,7 @@ class EnrollRouting(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
         self.cfg.update(runDir=os.path.join(self.tmp, "run"), stateDir=os.path.join(self.tmp, "state"),
-                        enrollUrl="https://app.example.test/api/compute/aws/enroll")
+                        enrollUrl="https://app.example.test/api/compute/aws/enroll", enrollRetrySeconds=0)
         enroll._write_private(os.path.join(self.cfg.runDir, "lease.json"), json.dumps(LEASE).encode())
         enroll._write_private(os.path.join(self.cfg.runDir, "identity.json"),
                               json.dumps({"document": "{}", "signature": "s" * 20}).encode())
@@ -71,7 +72,7 @@ class EnrollRouting(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(self.cfg.stateDir, "control.key")))
                 lease = self.lease()
                 self.assertNotIn("sandboxId", lease)
-                self.assertNotIn("nonce", lease)
+                self.assertEqual(lease.get("nonce"), LEASE["nonce"], "kept: the replay can still complete")
 
 
 if __name__ == "__main__":
