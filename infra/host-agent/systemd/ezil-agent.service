@@ -1,7 +1,7 @@
 [Unit]
 Description=EZiL: control channel, idle predicate and quiesce/shutdown (R9)
-Requires=ezil-enroll.service ezil-desktop.service
-After=ezil-enroll.service ezil-desktop.service
+Requires=ezil-enroll.service
+After=ezil-enroll.service
 [Service]
 Type=simple
 Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json

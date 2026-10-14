@@ -1,7 +1,7 @@
 [Unit]
 Description=EZiL: host edge (gateway contract GW-2/GW-3) - cloudflared's only ingress target; verifies gw1, relays presence and control
-Requires=ezil-enroll.service ezil-desktop.service ezil-agent.service
-After=ezil-enroll.service ezil-desktop.service ezil-agent.service
+Requires=ezil-enroll.service ezil-agent.service
+After=ezil-enroll.service ezil-agent.service
 [Service]
 Type=simple
 Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json

@@ -54,6 +54,11 @@ METHOD_RE = re.compile(r"^[A-Z]{1,16}$")
 PATH_RE = re.compile(r"^/[\x21-\x7e]{0,2047}$")
 PROXY_RE = re.compile(r"^/__p/(\d{4,5})(/[\x21-\x7e]*)?$")
 CONTROL_RE = re.compile(r"^/__ezil/control/(stop|fence)(?:/(\d{1,3}))?$")
+# GW-5 `ice` (worker/src/aws-ice.ts): the body is not covered by the path-only gw1 signature,
+# so its sha256 is IN the signed path and the body must hash to it. `desktop`: status, no body.
+ICE_RE = re.compile(r"^/__ezil/control/ice/([0-9a-f]{64})$")
+DESKTOP_STATUS_PATH = "/__ezil/control/desktop"
+MAX_ICE_BODY = 16384
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}(?::\d{1,5})?$")
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
               "te", "trailer", "upgrade"}
@@ -328,6 +333,13 @@ class Edge:
         if m:
             self._control(client, head, m)
             return
+        m = ICE_RE.match(path)
+        if m:
+            self._ice(client, head, m.group(1), query)
+            return
+        if path == DESKTOP_STATUS_PATH:
+            self._desktop_status(client, head, query)
+            return
         m = PROXY_RE.match(path)
         if not m or int(m.group(1)) not in self.ports:
             _reply(client, 404, {"ok": False, "error": "not_found"})
@@ -353,6 +365,50 @@ class Edge:
             _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
             return
         _reply(client, 200 if resp.get("ok") else 409, resp)
+
+    def _agent(self, client, op, **fields):
+        try:
+            resp = self.seq.send(op, **fields)
+        except (OSError, ValueError):
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        # The agent never answers with the config; pass only its own keys through.
+        _reply(client, 200 if resp.get("ok") else 409,
+               {k: resp[k] for k in ("ok", "state", "error", "configured", "expiresAt", "desktop", "ice") if k in resp})
+
+    def _ice(self, client, head, digest, query):
+        """POST /__ezil/control/ice/<sha256>: a Content-Length body (no chunking, at most
+        MAX_ICE_BODY) whose sha256 equals the signed digest, relayed to the agent as `ice`.
+        The body holds TURN credentials and the neko values: never logged, never echoed."""
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if head.method != "POST" or query:
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        if te or len(cl) != 1 or not cl[0].isdigit() or not 0 < int(cl[0]) <= MAX_ICE_BODY:
+            _reply(client, 400, {"ok": False, "error": "ice_body_invalid"})
+            return
+        try:
+            body, _ = _recv_exact(client, int(cl[0]), head.rest)
+        except (ValueError, OSError):
+            _reply(client, 400, {"ok": False, "error": "ice_body_invalid"})
+            return
+        if not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+            _reply(client, 400, {"ok": False, "error": "ice_digest_mismatch"})
+            return
+        try:
+            config = json.loads(body)
+        except ValueError:
+            config = None
+        if not isinstance(config, dict):
+            _reply(client, 400, {"ok": False, "error": "ice_config_invalid"})
+            return
+        self._agent(client, "ice", config=config)
+
+    def _desktop_status(self, client, head, query):
+        if head.method != "GET" or query or head.get("content-length") or head.get("transfer-encoding"):
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        self._agent(client, "desktop_status")
 
     def _proxy(self, client, head, port, upath):
         te, cl = head.get("transfer-encoding"), head.get("content-length")

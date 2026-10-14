@@ -66,6 +66,21 @@ CID = "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b"
 LEASE = {"computerId": CID, "generation": 1, "leaseEpoch": 2}
 
 
+ICE_SECRETS = ("turn-user-SECRET-1", "turn-pass-SECRET-2", "a" * 32, "b" * 32)
+
+
+def ice_config(**over):
+    """A Worker-shaped relay config (worker/src/aws-ice.ts desktopConfigBody)."""
+    c = {"v": 1, "expiresAt": int(time.time() * 1000) + 1_200_000,
+         "frontend": [{"urls": ["turns:turn.cloudflare.com:443?transport=tcp"],
+                       "username": ICE_SECRETS[0], "credential": ICE_SECRETS[1]}],
+         "backend": [{"urls": ["turns:turn.cloudflare.com:443?transport=tcp"],
+                      "username": ICE_SECRETS[0], "credential": ICE_SECRETS[1]}],
+         "neko": {"user": ICE_SECRETS[2], "admin": ICE_SECRETS[3]}}
+    c.update(over)
+    return c
+
+
 def gw_header(method, path, ts=None, binding=LEASE, key=KEY):
     ts = int(time.time()) if ts is None else ts
     payload = edge.gateway_payload(binding, ts, method, path)
@@ -313,6 +328,60 @@ class EdgeE2E(unittest.TestCase):
         out = raw(self.port, self.req("POST", "/__ezil/control/stop", gw=False))
         self.assertTrue(out.startswith(b"HTTP/1.1 401"))
         self.assertIsNone(self.agent.stop_request)
+
+    # ------------------------------------------------- GW-5 ice + desktop status (aws-ice.ts)
+    def ice_req(self, body, digest=None, extra=(), gw=True, method="POST"):
+        digest = hashlib.sha256(body).hexdigest() if digest is None else digest
+        return self.req(method, f"/__ezil/control/ice/{digest}", headers=[f"Content-Length: {len(body)}", *extra], body=body, gw=gw)
+
+    def stored(self):
+        return os.path.exists(os.path.join(self.cfg.runDir, "desktop-config.json"))
+
+    def test_ice_push_with_the_signed_digest_reaches_the_agent_and_echoes_nothing(self):
+        body = json.dumps(ice_config()).encode()
+        out = raw(self.port, self.ice_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 200"), out)
+        self.assertIn(b'"state": "accepted"', out)
+        self.assertTrue(self.stored())
+        st = raw(self.port, self.req("GET", "/__ezil/control/desktop"))
+        self.assertTrue(st.startswith(b"HTTP/1.1 200"), st)
+        self.assertIn(b'"configured": true', st)
+        for s in ICE_SECRETS:
+            self.assertNotIn(s.encode(), out + st)
+            self.assertNotIn(s, "\n".join(self.logs))
+
+    def test_ice_body_must_hash_to_the_signed_digest(self):
+        body = json.dumps(ice_config()).encode()
+        other = hashlib.sha256(body + b" ").hexdigest()
+        out = raw(self.port, self.ice_req(body, digest=other))
+        self.assertTrue(out.startswith(b"HTTP/1.1 400") and b"ice_digest_mismatch" in out, out)
+        self.assertFalse(self.stored())
+
+    def test_ice_unsigned_chunked_oversize_wrong_method_or_query_never_reaches_the_agent(self):
+        body = json.dumps(ice_config()).encode()
+        d = hashlib.sha256(body).hexdigest()
+        cases = [
+            (self.ice_req(body, gw=False), b"401"),
+            (self.req("POST", f"/__ezil/control/ice/{d}", headers=["Transfer-Encoding: chunked"],
+                      body=b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n"), b"400"),
+            (self.req("POST", f"/__ezil/control/ice/{d}", headers=["Content-Length: 99999"], body=body), b"400"),
+            (self.req("POST", f"/__ezil/control/ice/{d}", headers=[f"Content-Length: {len(body)}"] * 2, body=body), b"400"),
+            (self.ice_req(body, method="GET"), b"404"),
+            (self.req("POST", f"/__ezil/control/ice/{d}?x=1", headers=[f"Content-Length: {len(body)}"], body=body), b"404"),
+            (self.req("POST", "/__ezil/control/desktop"), b"404"),
+        ]
+        for data, code in cases:
+            out = raw(self.port, data)
+            self.assertTrue(out.startswith(b"HTTP/1.1 " + code), (code, out[:80]))
+        self.assertFalse(self.stored())
+
+    def test_ice_config_the_agent_refuses_answers_409_with_its_code_only(self):
+        body = json.dumps(ice_config(backend=[{"urls": ["stun:stun.cloudflare.com:3478"]}])).encode()
+        out = raw(self.port, self.ice_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 409") and b"ice_config_invalid" in out, out)
+        self.assertFalse(self.stored())
+        for s in ICE_SECRETS:
+            self.assertNotIn(s.encode(), out)
 
     def test_seq_recovers_from_a_higher_persisted_mark(self):
         # Another writer (an older edge process) left a far higher seq: the first send is

@@ -62,7 +62,8 @@ install -m 0644 "$AGENT_SRC/security/seccomp.json" /etc/ezil-host/seccomp.json
 install -m 0644 "$AGENT_SRC/security/apparmor-ezil-desktop" /etc/apparmor.d/ezil-desktop
 apparmor_parser -r -W /etc/apparmor.d/ezil-desktop
 install -m 0644 "$AGENT_SRC"/systemd/* /etc/systemd/system/
-jq -n --arg u "$ENROLL_URL" '{enrollUrl: $u, networkMode: "veth-nat"}' > /etc/ezil-host/agent.json
+# iceMode relay: no inbound rule, so the streamed desktop needs the Worker's TURN relay config
+jq -n --arg u "$ENROLL_URL" '{enrollUrl: $u, networkMode: "veth-nat", iceMode: "relay"}' > /etc/ezil-host/agent.json
 install -d -m 0700 /var/lib/ezil-host
 
 # 4. desktop image rootfs by digest -> lower; record lowerImageDigest
