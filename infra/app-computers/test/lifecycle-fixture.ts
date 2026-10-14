@@ -3,14 +3,14 @@ import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import type { Dependencies } from '../lib/lifecycle/aws.js';
 import { SettingsSchema, tagsFor, tagList, token, initialVolumeTags } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
-import type { InstanceType } from '../lib/lifecycle/deployment.js';
+import { DEFAULT_STORAGE, type InstanceType, type Storage } from '../lib/lifecycle/deployment.js';
 export const REGION='ap-south-1',ZONE_ID='aps1-az1';
-export function lifecycleFixture(operation:LifecycleIntent['operation']='provision',options:{instanceType?:InstanceType;instanceTypes?:InstanceType[];dataVolumeGiB?:number;userData?:string|null;userDataNonce?:boolean}={}){
+export function lifecycleFixture(operation:LifecycleIntent['operation']='provision',options:{instanceType?:InstanceType;instanceTypes?:InstanceType[];dataVolumeGiB?:number;rootDeviceName?:Storage['rootDeviceName'];userData?:string|null;userDataNonce?:boolean}={}){
     const computerId=randomUUID(),generation=operation==='replace'?2:1;
     const deployment={accountId:'123456789012',region:REGION,zoneId:ZONE_ID,
         subnetId:'subnet-11111111111111111',securityGroupId:'sg-11111111111111111',launchTemplateId:'lt-11111111111111111',launchTemplateVersion:'1',
         amiId:'ami-11111111111111111',namespace:'pilot',instanceTypes:options.instanceTypes??['m6i.large','c6i.xlarge'] as InstanceType[],
-        storage:{rootGiB:20,dataMinGiB:20,dataMaxGiB:100},
+        storage:{...DEFAULT_STORAGE,rootDeviceName:options.rootDeviceName??DEFAULT_STORAGE.rootDeviceName},
         dataKeyArn:`arn:aws:kms:${REGION}:123456789012:key/11111111-1111-4111-8111-111111111111`,
         stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-pilot-lifecycle:1`};
     const settings=SettingsSchema.parse({deployment,features:{userDataNonce:options.userDataNonce??false},authorityOrigin:'https://control.example',
@@ -31,10 +31,10 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         instances:[] as Instance[],volumes:[] as Volume[],imageBad:false,templateBad:false};
     function instance(id:string,g=i.targetGeneration,fence=i.fenceToken):Instance{return {
         InstanceId:id,ClientToken:token(digest,'instance'),Tags:tagList(tagsFor(i,g,fence)),Placement:{AvailabilityZoneId:deployment.zoneId},
-        ImageId:deployment.amiId,InstanceType:instanceType,Architecture:'x86_64',RootDeviceType:'ebs',RootDeviceName:'/dev/xvda',SubnetId:deployment.subnetId,
+        ImageId:deployment.amiId,InstanceType:instanceType,Architecture:'x86_64',RootDeviceType:'ebs',RootDeviceName:deployment.storage.rootDeviceName,SubnetId:deployment.subnetId,
         SecurityGroups:[{GroupId:deployment.securityGroupId}],State:{Name:'running'},HibernationOptions:{Configured:false},
         MetadataOptions:{HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled',State:'applied'},
-        BlockDeviceMappings:[{DeviceName:'/dev/xvda',Ebs:{VolumeId:'vol-00000000000000000',Status:'attached',DeleteOnTermination:true}}]};}
+        BlockDeviceMappings:[{DeviceName:deployment.storage.rootDeviceName,Ebs:{VolumeId:'vol-00000000000000000',Status:'attached',DeleteOnTermination:true}}]};}
     function volume():Volume{return {VolumeId:'vol-11111111111111111',State:'available',AvailabilityZoneId:deployment.zoneId,VolumeType:'gp3',Size:dataVolumeGiB??50,
         Encrypted:true,KmsKeyId:deployment.dataKeyArn,MultiAttachEnabled:false,Attachments:[],Tags:tagList(initialVolumeTags(i,digest))};}
     function attach(v:Volume,target:Instance){v.State='in-use';v.Attachments=[{InstanceId:target.InstanceId,VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
@@ -48,8 +48,8 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         instances:async selector=>structuredClone(state.instances.filter(v=>Array.isArray(selector)?selector.includes(v.InstanceId!):v.ClientToken===selector.token)
             .map(instance=>({instance,owner:deployment.accountId}))),
         volumes:async selector=>structuredClone(state.volumes.filter(v=>Array.isArray(selector)?selector.includes(v.VolumeId!):v.Tags?.some(t=>t.Key==='ezil:allocation'&&t.Value===selector.token))),
-        image:async()=>({ImageId:deployment.amiId,Architecture:'x86_64',RootDeviceType:'ebs',RootDeviceName:state.imageBad?'/other':'/dev/xvda',State:'available',VirtualizationType:'hvm',BlockDeviceMappings:[{DeviceName:'/dev/xvda',Ebs:{VolumeSize:8}}]}),
+        image:async()=>({ImageId:deployment.amiId,Architecture:'x86_64',RootDeviceType:'ebs',RootDeviceName:state.imageBad?'/other':deployment.storage.rootDeviceName,State:'available',VirtualizationType:'hvm',BlockDeviceMappings:[{DeviceName:deployment.storage.rootDeviceName,Ebs:{VolumeSize:30}}]}),
         template:async()=>({LaunchTemplateId:deployment.launchTemplateId,VersionNumber:1,LaunchTemplateData:{ImageId:deployment.amiId,InstanceType:'m6i.large',
-            SecurityGroupIds:[deployment.securityGroupId],BlockDeviceMappings:[{DeviceName:'/dev/xvda'}],...(state.templateBad?{UserData:'unapproved'}:{})}})};
+            SecurityGroupIds:[deployment.securityGroupId],BlockDeviceMappings:[{DeviceName:deployment.storage.rootDeviceName}],...(state.templateBad?{UserData:'unapproved'}:{})}})};
     return {i,settings,envelope,digest,executionArn,state,deps,instance,volume,attach};
 }

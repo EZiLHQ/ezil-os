@@ -51,14 +51,16 @@ export function zoneIdMatchesRegion(zoneId: string, region: string): boolean {
 
 /** R11: sizes come from configuration, never literals. Data volumes may grow
  * online, so an observed data volume is valid anywhere in [min, max]. */
+export const RootDeviceNameSchema = z.enum(['/dev/sda1', '/dev/xvda']).default('/dev/sda1');
 export const StorageSchema = z.object({
-    rootGiB: z.number().int().min(8).max(64),
+    rootDeviceName: RootDeviceNameSchema,
+    rootGiB: z.number().int().min(8).max(64).default(30),
     dataMinGiB: z.number().int().min(1).max(16384),
     dataMaxGiB: z.number().int().min(1).max(16384),
 }).strict().refine(s => s.dataMinGiB <= s.dataMaxGiB, { message: 'invalid_storage_range' });
 export type Storage = z.infer<typeof StorageSchema>;
-/** Public defaults: root 20 GiB; data 20 GiB (free) or 50 GiB (premium); max 100 GiB. */
-export const DEFAULT_STORAGE: Storage = { rootGiB: 20, dataMinGiB: 20, dataMaxGiB: 100 };
+/** Public defaults: Ubuntu root 30 GiB; data 20 GiB (free) or 50 GiB (premium); max 100 GiB. */
+export const DEFAULT_STORAGE: Storage = StorageSchema.parse({ dataMinGiB: 20, dataMaxGiB: 100 });
 export const DEFAULT_DATA_TIERS_GIB = { free: 20, premium: 50 } as const;
 
 /** Names reserved for identity and operator resources. A namespace equal to

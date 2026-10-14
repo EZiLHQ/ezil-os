@@ -37,5 +37,5 @@ phases:
           commands:
             - test -x /usr/local/bin/cloudflared && test -x /usr/sbin/runc
             - test -s /etc/ezil-host/lower-image-digest && test -d "/var/lib/ezil/lowers/$(cut -d: -f2 /etc/ezil-host/lower-image-digest)/usr"
-            - systemctl is-enabled ezil-host.target
+            - test "$(systemctl is-enabled ezil-host.target)" = enabled
             - apparmor_parser -Q -K /etc/apparmor.d/ezil-desktop

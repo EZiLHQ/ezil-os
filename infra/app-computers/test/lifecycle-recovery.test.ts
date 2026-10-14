@@ -10,8 +10,9 @@ import { lifecycleFixture } from './lifecycle-fixture.js';
 import { runAsl, taskError } from './asl.js';
 import { toLambdaError } from '../lib/lifecycle/errors.js';
 
-function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision', allocated = true, launchState = 'runInstances') {
-    const f = lifecycleFixture(operation);
+function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision', allocated = true, launchState = 'runInstances',
+    rootDeviceName: '/dev/sda1' | '/dev/xvda' = '/dev/sda1') {
+    const f = lifecycleFixture(operation, { rootDeviceName });
     const settings: RecoverySettings = { lifecycle: f.settings,
         recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1' };
     const name = `cleanup-computer-${f.i.jobId}`;
@@ -66,7 +67,7 @@ async function run(f = fixture(), options: { lose?: string; noEffect?: string; s
                 if (action === 'stopInstances') target.State = { Name: 'stopped' };
                 else if (action === 'terminateInstances') {
                     assert.equal(target.State?.Name, 'stopped');
-                    assert.ok(target.BlockDeviceMappings!.every(m => m.DeviceName === '/dev/xvda' || m.Ebs?.DeleteOnTermination === false));
+                    assert.ok(target.BlockDeviceMappings!.every(m => m.DeviceName === f.settings.lifecycle.deployment.storage.rootDeviceName || m.Ebs?.DeleteOnTermination === false));
                     target.State = { Name: 'terminated' }; target.BlockDeviceMappings = [];
                     const v = f.state.volumes[0]!;
                     v.Attachments = v.Attachments!.filter(a => a.InstanceId !== target.InstanceId);
@@ -90,6 +91,19 @@ for (const operation of ['provision', 'start', 'stop', 'replace', 'retire'] as c
 test('a failure before any allocation can prove no resource effects', async () => {
     const result = await run(fixture('provision', false)); assert.equal(result.error, undefined);
     assert.equal(result.receipt.volumeId, null); assert.deepEqual(result.receipt.instances, []); assert.deepEqual(result.calls, []);
+});
+for (const rootDeviceName of ['/dev/sda1', '/dev/xvda'] as const) test(`recovery honors configured ${rootDeviceName} root`, async () => {
+    const result = await run(fixture('provision', true, 'runInstances', rootDeviceName));
+    assert.equal(result.error, undefined);
+    assert.deepEqual(result.calls.map(c => c.action), ['stopInstances', 'terminateInstances']);
+});
+for (const mismatch of ['root name', 'root mapping', 'duplicate root mapping']) test(`recovery refuses ${mismatch} inconsistent with Ubuntu storage`, async () => {
+    const f = fixture(), instance = f.state.instances[0]!;
+    if (mismatch === 'root name') instance.RootDeviceName = '/dev/xvda';
+    if (mismatch === 'root mapping') instance.BlockDeviceMappings![0]!.DeviceName = '/dev/xvda';
+    if (mismatch === 'duplicate root mapping') instance.BlockDeviceMappings!.push({ ...instance.BlockDeviceMappings![0]! });
+    const result = await run(f);
+    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
 });
 test('a data-only allocation is retained without launching a computer', async () => {
     const f = fixture('provision', false); f.state.volumes.push(f.volume()); f.entered('createVolume');

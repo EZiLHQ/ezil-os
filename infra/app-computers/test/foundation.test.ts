@@ -8,7 +8,7 @@ import { App, assertions } from 'aws-cdk-lib';
 import { AppComputerFoundationStack, FoundationConfigSchema, type FoundationConfig } from '../lib/foundation.js';
 import { zoneIdMatchesRegion, zoneIdPrefix } from '../lib/lifecycle/deployment.js';
 
-const base: FoundationConfig = { stage: 'pilot', region: 'ap-south-1', zoneIds: ['aps1-az1'], instanceType: 'm6i.large', rootVolumeGiB: 20 };
+const base: FoundationConfig = { stage: 'pilot', region: 'ap-south-1', zoneIds: ['aps1-az1'], instanceType: 'm6i.large', rootDeviceName: '/dev/sda1', rootVolumeGiB: 30 };
 function template(config: Partial<FoundationConfig> = {}) {
     const app = new App(), merged = { ...base, ...config };
     const stack = new AppComputerFoundationStack(app, 'TestAppComputers', { config: merged, env: { region: merged.region } });
@@ -69,8 +69,8 @@ test('items 2/4/5: launch template is IMDSv2-only, hop 1, tags off, no hibernati
         assert.deepEqual(data.HibernationOptions, { Configured: false });
         assert.equal(data.InstanceInitiatedShutdownBehavior, 'stop');
         assert.equal(data.IamInstanceProfile, undefined, 'item 3: hosts launch without an instance role');
-        assert.deepEqual(data.BlockDeviceMappings, [{ DeviceName: '/dev/xvda',
-            Ebs: { VolumeType: 'gp3', VolumeSize: 20, Encrypted: true, DeleteOnTermination: true } }]);
+        assert.deepEqual(data.BlockDeviceMappings, [{ DeviceName: '/dev/sda1',
+            Ebs: { VolumeType: 'gp3', VolumeSize: 30, Encrypted: true, DeleteOnTermination: true } }]);
         assert.deepEqual(data.ImageId, { Ref: 'HostAmiId' });
     }
     for (const instanceType of ['m7i.large', 't3.large']) {
@@ -94,6 +94,20 @@ test('item 3: no host role, profile or policy; registry retained and encrypted',
     assert.equal(repos[0]?.DeletionPolicy, 'Retain');
     output.resourceCountIs('AWS::EC2::Instance', 0);
     output.resourceCountIs('AWS::EC2::Volume', 0);
+});
+
+test('launch template uses the validated configured root device name', () => {
+    assert.equal(FoundationConfigSchema.parse({ ...base, rootDeviceName: undefined }).rootDeviceName, '/dev/sda1');
+    assert.equal(FoundationConfigSchema.parse({ ...base, rootVolumeGiB: undefined }).rootVolumeGiB, 30);
+    for (const rootDeviceName of ['/dev/sda1', '/dev/xvda'] as const) {
+        template({ rootDeviceName }).hasResourceProperties('AWS::EC2::LaunchTemplate', {
+            LaunchTemplateData: { BlockDeviceMappings: [{ DeviceName: rootDeviceName,
+                Ebs: { VolumeType: 'gp3', VolumeSize: 30, Encrypted: true, DeleteOnTermination: true } }] },
+        });
+    }
+    for (const rootDeviceName of ['/dev/sdf', '/dev/nvme0n1', '', null]) {
+        assert.equal(FoundationConfigSchema.safeParse({ ...base, rootDeviceName }).success, false);
+    }
 });
 
 test('item 1/2: no region or legacy instance-type literal anywhere in shipped source', () => {

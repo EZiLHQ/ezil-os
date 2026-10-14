@@ -2,3 +2,5 @@
 Description=EZiL AWS computer host (I4)
 Wants=ezil-agent.service ezil-edge.service ezil-cloudflared.service ezil-desktop.service
 After=ezil-agent.service ezil-edge.service ezil-cloudflared.service ezil-desktop.service
+[Install]
+WantedBy=multi-user.target

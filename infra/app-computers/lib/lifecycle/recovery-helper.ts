@@ -109,7 +109,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             if (!['running', 'pending', 'stopping', 'stopped'].includes(state ?? '')) return fail();
             // Recovery has no ModifyInstanceAttribute right: a data disk that
             // would be deleted with its writer is never repaired here, only refused.
-            const preserved = preservation(instance, v!);
+            const preserved = preservation(instance, v!, d.storage.rootDeviceName);
             if (preserved === 'wait') return wait();
             if (!preserved) return fail();
             if (state === 'pending' || state === 'stopping') return wait();
@@ -126,12 +126,13 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
     };
 }
 
-function preservation(instance: Instance, volume: Volume): boolean | 'wait' {
-    if (!Array.isArray(instance.BlockDeviceMappings)) return fail();
+function preservation(instance: Instance, volume: Volume, rootDeviceName: RecoverySettings['lifecycle']['deployment']['storage']['rootDeviceName']): boolean | 'wait' {
+    if (!Array.isArray(instance.BlockDeviceMappings) || instance.RootDeviceName !== rootDeviceName
+        || instance.BlockDeviceMappings.filter(m => m.DeviceName === rootDeviceName).length > 1) return fail();
     const data = instance.BlockDeviceMappings.filter(m => m.Ebs?.VolumeId === volume.VolumeId);
     const attachments = volume.Attachments!.filter(a => a.InstanceId === instance.InstanceId);
     // An unexpected attached volume must not be destroyed with the root disk.
-    if (instance.BlockDeviceMappings.some(m => m.DeviceName !== '/dev/xvda' && !(m.DeviceName === '/dev/sdf' && m.Ebs?.VolumeId === volume.VolumeId))) return fail();
+    if (instance.BlockDeviceMappings.some(m => m.DeviceName !== rootDeviceName && !(m.DeviceName === '/dev/sdf' && m.Ebs?.VolumeId === volume.VolumeId))) return fail();
     if (!data.length && !attachments.length) return true;
     if (data.length !== 1 || attachments.length !== 1) return 'wait';
     if (data[0]!.DeviceName !== '/dev/sdf' || attachments[0]!.Device !== '/dev/sdf') return fail();

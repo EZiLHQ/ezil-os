@@ -5,7 +5,7 @@ import { lifecycleDefinition } from '../lib/lifecycle/definition.js';
 import { token } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
-import { BURSTABLE_CREDITS, COMPUTER_TIERS, INSTANCE_TYPES, TIER_INSTANCE_TYPES, TierMapSchema, isBurstable } from '../lib/lifecycle/deployment.js';
+import { BURSTABLE_CREDITS, COMPUTER_TIERS, DEFAULT_STORAGE, INSTANCE_TYPES, StorageSchema, TIER_INSTANCE_TYPES, TierMapSchema, isBurstable } from '../lib/lifecycle/deployment.js';
 import { runAsl, taskError } from './asl.js';
 import { toLambdaError, MAX_THROTTLE_RETRIES } from '../lib/lifecycle/errors.js';
 import { LifecycleIntentSchema, validateLifecycleReceipt } from '../lib/lifecycle/intent.js';
@@ -63,7 +63,7 @@ for(const operation of ['provision','start','stop','replace','retire'] as const)
         assert.equal(launch.InstanceType,'m6i.large');assert.equal(launch.IamInstanceProfile,undefined);assert.equal(launch.Placement,undefined);
         assert.deepEqual(launch.MetadataOptions,{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'});
         assert.deepEqual(launch.HibernationOptions,{Configured:false});
-        assert.equal(launch.BlockDeviceMappings[0].Ebs.VolumeSize,20);assert.equal(launch.BlockDeviceMappings[0].Ebs.Encrypted,true);
+        assert.equal(launch.BlockDeviceMappings[0].Ebs.VolumeSize,30);assert.equal(launch.BlockDeviceMappings[0].Ebs.Encrypted,true);
         assert.equal(launch.UserData,r.f.i.userData);assert.ok(launch.UserData);assert.equal(launch.ClientToken,token(r.f.digest,'instance'));
     }
 });
@@ -116,8 +116,51 @@ test('allocation retry preserves the exact token and approved parameters',async(
 });
 test('unexpected AMI data devices cannot silently allocate extra volumes',async()=>{
     const f=lifecycleFixture();f.state.volumes.push(f.volume());const original=f.deps.image;
-    f.deps.image=async id=>({...await original(id),BlockDeviceMappings:[{DeviceName:'/dev/xvda',Ebs:{VolumeSize:8}},{DeviceName:'/dev/sdg',Ebs:{VolumeSize:500}}]});
+    f.deps.image=async id=>({...await original(id),BlockDeviceMappings:[{DeviceName:'/dev/sda1',Ebs:{VolumeSize:30}},{DeviceName:'/dev/sdg',Ebs:{VolumeSize:500}}]});
     await assert.rejects(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'volume'}),/launch_invalid/);
+});
+
+test('storage defaults to a 30 GiB Ubuntu root and validates the root device allowlist',()=>{
+    assert.deepEqual(StorageSchema.parse({dataMinGiB:20,dataMaxGiB:100}),DEFAULT_STORAGE);
+    assert.equal(DEFAULT_STORAGE.rootDeviceName,'/dev/sda1');assert.equal(DEFAULT_STORAGE.rootGiB,30);
+    for(const rootDeviceName of ['/dev/sda1','/dev/xvda'])assert.ok(StorageSchema.safeParse({...DEFAULT_STORAGE,rootDeviceName}).success);
+    for(const rootDeviceName of ['/dev/sdf','/dev/nvme0n1','',null])assert.equal(StorageSchema.safeParse({...DEFAULT_STORAGE,rootDeviceName}).success,false);
+});
+for(const rootDeviceName of ['/dev/sda1','/dev/xvda'] as const)
+test(`configured ${rootDeviceName} image is accepted and its root mapping reaches RunInstances`,async()=>{
+    const r=await run('provision',{fixture:lifecycleFixture('provision',{rootDeviceName})});
+    assert.equal(r.error,undefined);
+    assert.deepEqual(r.calls.find(c=>c.action==='runInstances')!.parameters.BlockDeviceMappings,[{
+        DeviceName:rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:30,Encrypted:true,KmsKeyId:r.f.i.deployment.dataKeyArn,DeleteOnTermination:true},
+    }]);
+});
+for(const mismatch of ['image root','image mapping','whole xvda image','missing mapping','duplicate mapping','oversized snapshot','template mapping'] as const)
+test(`Ubuntu launch refuses ${mismatch}`,async()=>{
+    const f=lifecycleFixture();f.state.volumes.push(f.volume());
+    const originalImage=f.deps.image,originalTemplate=f.deps.template;
+    f.deps.image=async id=>{
+        const image=(await originalImage(id))!;
+        if(mismatch==='image root'||mismatch==='whole xvda image')image.RootDeviceName='/dev/xvda';
+        if(mismatch==='image mapping'||mismatch==='whole xvda image')image.BlockDeviceMappings![0]!.DeviceName='/dev/xvda';
+        if(mismatch==='missing mapping')image.BlockDeviceMappings=[];
+        if(mismatch==='duplicate mapping')image.BlockDeviceMappings!.push({...image.BlockDeviceMappings![0]!});
+        if(mismatch==='oversized snapshot')image.BlockDeviceMappings![0]!.Ebs!.VolumeSize=31;
+        return image;
+    };
+    if(mismatch==='template mapping')f.deps.template=async(id,version)=>{
+        const template=(await originalTemplate(id,version))!;
+        template.LaunchTemplateData!.BlockDeviceMappings![0]!.DeviceName='/dev/xvda';return template;
+    };
+    await assert.rejects(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'volume'}),/lifecycle_launch_invalid/);
+});
+test('an observed instance with a different root device cannot start',async()=>{
+    const f=lifecycleFixture('start');f.state.instances[0]!.RootDeviceName='/dev/xvda';
+    const r=await run('start',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.deepEqual(r.calls,[]);
+});
+for(const operation of ['replace','retire'] as const)test(`${operation}: a different root device blocks termination`,async()=>{
+    const f=lifecycleFixture(operation);f.state.instances[0]!.RootDeviceName='/dev/xvda';
+    const r=await run(operation,{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');
+    assert.match(r.cause!,/lifecycle_unexpected_disk/);assert.ok(!r.calls.some(c=>c.action==='terminateInstances'));
 });
 
 test('a stale old-writer observation after launching replacement never repeats stop or termination',async()=>{

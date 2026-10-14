@@ -5,7 +5,7 @@ import {
 import type { Construct } from 'constructs';
 import { z } from 'zod';
 import { NAMESPACE_TAG } from './identity.js';
-import { DEFAULT_STORAGE, InstanceTypeSchema, REGION_PATTERN, ZONE_ID_PATTERN, zoneIdMatchesRegion } from './lifecycle/deployment.js';
+import { DEFAULT_STORAGE, InstanceTypeSchema, RootDeviceNameSchema, REGION_PATTERN, ZONE_ID_PATTERN, zoneIdMatchesRegion } from './lifecycle/deployment.js';
 
 /** Foundation configuration. Region and ZoneIds are configuration, never
  * literals (R1); zone names are never stored because they are account-mapped. */
@@ -16,6 +16,7 @@ export const FoundationConfigSchema = z.object({
     zoneIds: z.array(z.string().regex(ZONE_ID_PATTERN)).min(1).max(3),
     /** Launch-template default; the lifecycle supplies the per-computer type. */
     instanceType: InstanceTypeSchema,
+    rootDeviceName: RootDeviceNameSchema,
     rootVolumeGiB: z.number().int().min(8).max(64).default(DEFAULT_STORAGE.rootGiB),
 }).strict().superRefine((c, ctx) => {
     if (new Set(c.zoneIds).size !== c.zoneIds.length) ctx.addIssue({ code: 'custom', path: ['zoneIds'], message: 'duplicate_zone_id' });
@@ -118,7 +119,7 @@ export class AppComputerFoundationStack extends Stack {
                     // R3: the root disk is disposable (OS + pre-pulled image) and
                     // encrypted. The retained data disk is created per computer
                     // by the lifecycle workflow, never by this template.
-                    deviceName: '/dev/xvda',
+                    deviceName: config.rootDeviceName,
                     ebs: { volumeType: 'gp3', volumeSize: config.rootVolumeGiB, encrypted: true, deleteOnTermination: true },
                 }],
                 tagSpecifications: [{

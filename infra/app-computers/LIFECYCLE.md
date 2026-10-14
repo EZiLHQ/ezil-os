@@ -26,8 +26,9 @@ the configured range) in the configured ZoneId. It starts one instance of the
 intent's allowlisted type (`t3a.medium`, `t3.medium`, `m6i.large` or `c6i.xlarge`; T types with
 standard CPU credits) using a numeric
 launch-template version, the approved Linux/amd64 AMI and an encrypted
-disposable root disk of the configured size (default 20 GiB). The AMI must have a
-single `/dev/xvda` root device; additional implicit disks, user-data scripts,
+disposable root disk of the configured size (default 30 GiB). The AMI must have a
+single root device matching `storage.rootDeviceName` (default `/dev/sda1`;
+`/dev/xvda` is also supported); additional implicit disks, user-data scripts,
 network-interface overrides and unsupported launch-template fields fail.
 Detailed monitoring is explicitly disabled and hibernation is off. IMDSv2 is
 required with hop limit one and instance metadata tags are disabled. Hosts
