@@ -3,6 +3,8 @@ same steps in unit order for operators and tests. Exit codes: 0 ok, 2 refused, 1
 import json
 import os
 import sys
+import threading
+import signal
 
 from . import agent as agentmod, config, desktop, enroll as enrollmod, guard, rebase, tunnel
 from .fsops import Refused
@@ -43,6 +45,12 @@ def step(cfg, name, detach=False):
     if name == "agent":
         agentmod.Agent(cfg, lease).run()
         return "agent stopped"
+    if name == "edge":
+        from . import edge as edgemod      # gateway contract GW-2/GW-3: cloudflared's only target
+        stop = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        edgemod.Edge(cfg, lease, edgemod.load_key(cfg)).serve(stop)
+        return "edge stopped"
     raise SystemExit(f"unknown step {name}")
 
 

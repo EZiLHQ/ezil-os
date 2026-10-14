@@ -100,5 +100,5 @@ printf '[Resolve]\nDNSStubListenerExtra=10.200.0.1\n' > /etc/systemd/resolved.co
 # 7. enable the host chain
 systemctl daemon-reload
 systemctl enable ezil-host.target ezil-lease.service ezil-guard.service ezil-host-clean.service \
-  ezil-overlay.service ezil-desktop.service ezil-enroll.service ezil-cloudflared.service ezil-agent.service
+  ezil-overlay.service ezil-desktop.service ezil-enroll.service ezil-edge.service ezil-cloudflared.service ezil-agent.service
 echo "ezil host AMI build complete: lower ${DESKTOP_IMAGE_ID}"

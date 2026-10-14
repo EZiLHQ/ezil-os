@@ -17,6 +17,9 @@ done
 for u in ezil-cloudflared ezil-agent; do
     check "$u: requires and is ordered after ezil-enroll" bash -c "grep -qx ezil-enroll.service <(dep $u.service Requires) && grep -qx ezil-enroll.service <(dep $u.service After)"
 done
+check "edge: requires and is ordered after enroll, desktop and agent (gateway contract GW-2/GW-3)" bash -c "for d in ezil-enroll ezil-desktop ezil-agent; do grep -qx \$d.service <(dep ezil-edge.service Requires) && grep -qx \$d.service <(dep ezil-edge.service After) || exit 1; done"
+check "cloudflared requires the edge: no verifier, no tunnel (fail closed)" bash -c "grep -qx ezil-edge.service <(dep ezil-cloudflared.service Requires) && grep -qx ezil-edge.service <(dep ezil-cloudflared.service After)"
+check "the AMI enables the edge unit" grep -q "ezil-edge.service" "$HA/ami/build-host-ami.sh"
 check "no unit uses Wants= for the boot chain (Wants would not fail closed)" bash -c "! grep -l '^Wants=ezil-' '$S'/*.service"
 check "every service runs the agent with the baked config" bash -c "for f in '$S'/*.service; do grep -q '^Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json' \$f || exit 1; done"
 mkdir -p "$T/units/opt/ezil-host/bin"; cp "$S"/* "$T/units/"
@@ -70,4 +73,6 @@ check "history: a still-running command is saved when the terminal shell is hung
 check "stop outcome: absent/clean/killed from desktop.stop" pyunit test_history_stop.StopOutcome
 check "stop outcome: a killed desktop is never flush=ok; durable record written and reported at boot" pyunit test_history_stop.AgentStopRecord
 check "drift: same rules in another order is drift; netns delete failure is reported" pyunit test_history_stop.DriftOrder
+check "edge: gw1 verifier matches the Worker's shared vectors (valid, invalid, skew, framing)" pyunit test_edge.GwVectors
+check "edge: real edge + real agent socket (ephemeral ports): 401 forwards nothing, strip, no smuggling, framing, WS, presence, control" pyunit test_edge.EdgeE2E
 summary "units + pure functions"

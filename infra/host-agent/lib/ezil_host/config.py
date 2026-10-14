@@ -33,6 +33,12 @@ DEFAULTS = {
              "flushTimeoutSeconds": 120},
     "shutdownCmd": ["/usr/sbin/shutdown", "-h", "now"],
     "stopWarnSeconds": 60,
+    # Host edge (gateway contract GW-2/GW-3): cloudflared's only ingress target. It forwards
+    # verified requests to the desktop at edgeUpstreamHost on the edgePorts the CF route exposes.
+    "edgeBind": "127.0.0.1",
+    "edgePort": 18080,
+    "edgeUpstreamHost": "10.200.0.2",
+    "edgePorts": [8181, 8080, 3002, 8443],
     # cloud-init's cached copies of user data (they hold the nonce); globs; wiped after use.
     # obj.pkl is cloud-init's pickled datasource cache (it embeds the raw user data); it is
     # a cache that cloud-init rebuilds when missing. instance-data-sensitive.json is the
