@@ -14,8 +14,8 @@ import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
-    applyLifecycleReceipt, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileDeletedAwsComputers, runAwsBackgroundReconcile,
-    type LifecycleExecutionReader,
+    applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers,
+    runAwsBackgroundReconcile, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
@@ -69,7 +69,9 @@ const row = (over: Record<string, unknown> = {}) =>
     placementRow({
         computer_id: C1, owner_user_id: U1, state: 'STARTING', generation: 2, lease_epoch: 3, region: 'ap-south-1', zone_id: 'aps1-az1', instance_type: 't3a.medium',
         instance_id: null, volume_id: VOL, fs_uuid: 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5', fence_token: FENCE, lifecycle_job_id: JOB, lifecycle_digest: DIGEST,
-        enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 300_000), ...over,
+        enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 300_000),
+        // A wake always leases (aws-ec2.ts): an hour from the scenario clock.
+        lease_until: new Date(NOW.getTime() + 3_600_000), ...over,
     });
 
 function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[] } = {}) {
@@ -376,15 +378,17 @@ describe('Codex #5: the usage ledger is written by confirmed receipts (hour caps
         expect(usage).toEqual([]);
     });
 
-    it('end to end: hours written by the receipts make the monthly hour cap refuse the next wake', async () => {
+    it('end to end: hours written by the receipts stop the session at the cap (Codex 4275911832) and refuse the next wake', async () => {
         let answer: Exec = { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 101 * 3_600_000) };
         const s = setup([row()], () => answer);
         const me = { userId: U1, computerId: C1 };
         await s.status(); // STARTING → MOUNTING: row opened 101 h ago
         expect((await s.enroll()).status).toBe(200);
-        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
-        await s.provider.stop(ctx, me, 'user');
+        // The receipt makes it RUNNING; the same poll finds 101 h ≥ the 100 h cap and stops it through the lifecycle.
+        expect(await s.status()).toMatchObject({ state: 'stopping', placementState: 'STOPPING' });
         const stop = s.starts.at(-1)!;
+        expect(stop.intent.operation).toBe('stop');
+        expect(s.placements[0]).toMatchObject({ last_error: 'user_hours_cap', lifecycle_job_id: stop.intent.jobId });
         answer = { status: 'SUCCEEDED', output: receiptOf({ jobId: stop.intent.jobId, digest: stop.digest, state: 'stopped' }) };
         expect(await s.status()).toMatchObject({ placementState: 'STOPPED' });
         expect(s.usage).toEqual([expect.objectContaining({ instance_id: I_NEW, stopped_at: NOW })]);
@@ -606,5 +610,69 @@ describe('retire-pending SQL (the fake answers by tag; the text is pinned here, 
         expect(text).toMatch(/WHERE p\.provider = 'aws-ec2' AND p\.state IN \(\$1, \$2, \$3, \$4, \$5\) AND \(c\.id IS NULL OR c\.deleted_at IS NOT NULL\)/);
         expect(text).toMatch(/ORDER BY p\.updated_at ASC LIMIT \$6/);
         expect(fake.statements[0]!.params).toEqual([...RETIRE_PENDING_STATES, 100]);
+    });
+});
+
+describe('the background pass: lapsed sessions stop (Codex 4275911832) and the fleet rotates (Codex 4275911808)', () => {
+    const HOUR = 3_600_000;
+    const Cn = (i: number) => `c0c0c0c0-c0c0-4c0c-8c0c-${String(i).padStart(12, '0')}`;
+    const In = (i: number) => `i-${String(i).padStart(17, '0')}`;
+    /** RUNNING, lease live, no job: row i changed i minutes after the oldest. */
+    const live = (i: number, over: Record<string, unknown> = {}) =>
+        row({
+            computer_id: Cn(i), state: 'RUNNING', instance_id: In(i), lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null, enroll_expires_at: null,
+            lease_until: new Date(NOW.getTime() + HOUR), updated_at: new Date(NOW.getTime() - (1000 - i) * 60_000), ...over,
+        });
+    function fleet(rows: Record<string, unknown>[], ec2Stopped: Set<string> = new Set()) {
+        // Live computers: the deleted-computer pass must leave every one of them alone.
+        const computers = rows.map((r) => ({ id: String(r.computer_id), user_id: U1, deleted_at: null }));
+        const fake = createFakePlacementDb({ placements: rows, computers }, { clock: () => NOW });
+        const starts: LifecycleIntent[] = [];
+        let n = 0;
+        const deps: GuestStopDeps = {
+            db: fake.db,
+            executions: { describe: async () => ({ status: 'RUNNING' }) },
+            starter: { async start(_r, work) { starts.push(JSON.parse((JSON.parse(work.input) as { document: string }).document)); } },
+            describer: { async describeForEnrollment(_region, instanceId) { return { instanceId, state: ec2Stopped.has(instanceId) ? 'stopped' : 'running' } as never; } },
+            newId: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++n).padStart(12, '0')}`,
+            clock: () => NOW,
+        };
+        return { ...fake, deps, starts };
+    }
+
+    it('the cron pass stops a RUNNING computer whose lease lapsed while EC2 still says running', async () => {
+        const f = fleet([live(1, { lease_until: new Date(NOW.getTime() - 1) }), live(2)]);
+        expect(await runAwsBackgroundReconcile(env(), f.deps)).toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 1 } });
+        expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired' });
+        expect(f.placements.find((r) => r.computer_id === Cn(2))).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it('the cron pass stops a computer at the user hour cap, reading the month usage once', async () => {
+        const usage = [{
+            computer_id: Cn(1), user_id: U1, instance_id: In(1), instance_type: 't3a.medium', started_at: new Date(NOW.getTime() - 100 * HOUR), stopped_at: null,
+            egress_bytes: null, observed_by: 'x', updated_at: NOW,
+        }];
+        const fake = fleet([live(1), live(2)]);
+        fake.usage.push(...usage);
+        await runAwsBackgroundReconcile(env(), fake.deps);
+        // Both rows belong to U1: both are over the cap.
+        expect(fake.starts.map((i) => i.operation)).toEqual(['stop', 'stop']);
+        expect(fake.statements.filter((s) => s.sql.includes('placement:usage-month'))).toHaveLength(1);
+    });
+
+    it('rotation: with more rows than one pass looks at, a guest-stopped row behind them is reached on the next pass', async () => {
+        const total = FLEET_RECONCILE_LIMIT + 5;
+        const hidden = total; // the most recently changed row: last in updated_at order
+        const f = fleet(Array.from({ length: total }, (_, k) => live(k + 1)), new Set([In(hidden)]));
+        const first = await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null });
+        expect(first).toEqual({ checked: FLEET_RECONCILE_LIMIT, stopsStarted: 0, limitStops: 0 });
+        expect(f.starts).toEqual([]);
+        const second = await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null });
+        // The second pass claims the 5 never-reconciled rows first (then 15 more): the hidden one is among them.
+        expect(second).toMatchObject({ checked: FLEET_RECONCILE_LIMIT, stopsStarted: 1 });
+        expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(hidden)]]);
+        // Every row has now been looked at once.
+        expect(f.placements.every((r) => r.reconciled_at !== null)).toBe(true);
     });
 });

@@ -88,7 +88,8 @@ CREATE TABLE public.ezil_computer_placements (
   generation bigint NOT NULL, lease_epoch bigint NOT NULL, state text NOT NULL, region text NULL, zone_id text NULL,
   instance_id text NULL, instance_type text NULL, volume_id text NULL, fs_uuid uuid NULL,
   tunnel_id text NULL, enroll_nonce_hash text NULL, enroll_expires_at timestamptz NULL,
-  lease_until timestamptz NULL, presence_at timestamptz NULL, updated_at timestamptz NOT NULL);
+  lease_until timestamptz NULL, presence_at timestamptz NULL, updated_at timestamptz NOT NULL,
+  reconciled_at timestamptz NULL);
 CREATE INDEX ezil_computer_placements_computer_idx ON public.ezil_computer_placements (computer_id);
 REVOKE ALL ON TABLE public.ezil_computer_placements FROM public, anon, authenticated;
 ALTER TABLE public.ezil_computer_placements ENABLE ROW LEVEL SECURITY;
@@ -153,7 +154,27 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   whose instance is stopping or stopped gets the ORDINARY lifecycle `stop`, which the helper confirms at once, so
   the receipt path fences the tunnel, closes the usage row and lands STOPPED. A capacity refusal runs the same
   check across the fleet (`reconcileAwsFleet`, bounded), so idle-stopped rows cannot exhaust running capacity.
-  The EC2 observation never writes STOPPED itself.
+  The EC2 observation never writes STOPPED itself. The fleet pass ROTATES: it claims the least recently
+  reconciled rows (never-reconciled first) and stamps `reconciled_at` (bookkeeping only; no CAS reads it,
+  `updated_at` is untouched; `FOR UPDATE SKIP LOCKED`), so successive passes cover every row instead of the
+  oldest `FLEET_RECONCILE_LIMIT` forever.
+- Session limits (R9, `aws-receipts.ts` `enforceSessionLimits`): a RUNNING computer whose `lease_until` has passed
+  (`lease_expired`; no lease at all counts as lapsed), or whose owner (`user_hours_cap`) or the whole fleet
+  (`global_hours_cap`) reached the month's hour cap, gets the ORDINARY lifecycle `stop` (OS shutdown, so the host
+  flushes like any stop) with the reason in `last_error`. Checked on every `status` and `ensure`, on every activity
+  heartbeat, and by the fleet pass (sandbox-reap cron, capacity refusals). Admission refuses the next wake with the
+  same cap codes.
+- Lease: set at provision and at every wake (`leaseSeconds`, 1 h). Renewed ONLY from the authenticated owner's
+  presence: the shell's activity heartbeat (`reportActivity`, sent each minute while the desktop tab is visible and
+  focused, never on stale presence) and an explicit open (`ensure`). Renewal is an owner-guarded same-state CAS
+  (`renewPlacementLease`) that moves `presence_at` and `lease_until`, never shortens a lease, and writes only once
+  half of it is used. A status poll is not presence and renews nothing.
+- **Open (not enforced in real time yet):** a tab left open but unattended stops heartbeating, so its lease lapses,
+  but nothing reaches the app until the next status/ensure or the daily cron; the host's own idle stop does not
+  fire either, because the open WebSocket keeps gateway presence (GW-3) alive. Closing that needs the deadline on
+  the host: the app pushes `lease_until` through the GW-5 control relay on each renewal (a `lease` command signed
+  with `controlKey`, like `stop`/`fence`), and the agent stops itself, flushing, once it passes. No warning is shown
+  before a stop yet.
 - Stage B slots: `WARMING → READY → CLAIMED → terminated`.
 
 **Lifecycle authority (app)**

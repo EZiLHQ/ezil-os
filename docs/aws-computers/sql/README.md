@@ -77,3 +77,6 @@ insert policy accepts a caller-chosen `id`, including a soft-deleted row that ta
 slot. **Founder finding, not fixed here:** consider revoking `UPDATE (id)` and
 caller-chosen ids on insert from `authenticated`; R2 prefixes and other tables keyed by
 the computer id have the same exposure.
+
+`ezil_computer_placements.reconciled_at` (nullable) is reconciler bookkeeping: the fleet pass stamps the
+rows it claims so successive bounded passes rotate through every placement. No CAS reads it.

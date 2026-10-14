@@ -35,7 +35,8 @@ CREATE TABLE public.ezil_computer_placements (
   lifecycle_job_id uuid NULL,
   lifecycle_digest text NULL,
   last_error text NULL,
-  updated_at timestamptz NOT NULL
+  updated_at timestamptz NOT NULL,
+  reconciled_at timestamptz NULL
 );
 CREATE INDEX ezil_computer_placements_computer_idx ON public.ezil_computer_placements (computer_id);
 REVOKE ALL ON TABLE public.ezil_computer_placements FROM public, anon, authenticated;

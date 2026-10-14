@@ -262,7 +262,8 @@ describe('routers: AWS previews use their own Worker route', () => {
         for (const region of ['ap-south-1', 'us-east-1']) {
             vi.stubEnv(appCallerRoleEnv(region), 'arn:aws:iam::123456789012:role/ezil/pilot/app-caller');
         }
-        const { db, fake } = routerDb([awsRow({ state: 'RUNNING', generation: 7, lease_epoch: 11 })]);
+        // A wake leases for an hour (aws-ec2.ts); most of it is left, so opening renews nothing.
+        const { db, fake } = routerDb([awsRow({ state: 'RUNNING', generation: 7, lease_epoch: 11, lease_until: new Date(Date.now() + 3_600_000) })]);
         const sandboxId = deriveGuacamoleSandboxId(U1, C1);
         const url = (port: number) =>
             `https://aws-${port}-${sandboxId}-aws.example/preview-bootstrap?token=opaque&path=%2F`;
@@ -292,7 +293,8 @@ describe('routers: AWS previews use their own Worker route', () => {
                 sandboxId, computerId: C1, userId: U1, provider: 'aws-ec2', generation: 7, leaseEpoch: 11,
             });
         }
-        expect(fake.statements.every((s) => s.sql.includes('placement:read'))).toBe(true);
+        // Reads only: the placement, and the month's usage for the hour caps (Codex 4275911832). No write.
+        expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month'))).toBe(true);
     });
 
     it('status reports the AWS lifecycle state, no Worker call', async () => {
@@ -310,9 +312,11 @@ describe('routers: AWS previews use their own Worker route', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('reportActivity and restartDesktop answer the AWS refusal, no Worker call', async () => {
-        const { db } = routerDb([awsRow({ state: 'RUNNING' })]);
-        await expect(caller(db).reportActivity({ computerId: C1, lastInputAgoMs: 5 })).resolves.toMatchObject({ ok: false, error: 'aws_not_supported' });
+    it('reportActivity renews the AWS lease from the owner\'s presence; restartDesktop refuses; no Worker call', async () => {
+        const { db, fake } = routerDb([awsRow({ state: 'RUNNING', lease_until: new Date(Date.now() + 60_000) })]);
+        await expect(caller(db).reportActivity({ computerId: C1, lastInputAgoMs: 5 })).resolves.toMatchObject({ ok: true });
+        // Presence 5 ms ago: the lease now runs an hour from it (Codex 4275911832).
+        expect(new Date(fake.placements[0]!.lease_until as string).getTime()).toBeGreaterThan(Date.now() + 3_500_000);
         await expect(caller(db).restartDesktop({ computerId: C1 })).resolves.toMatchObject({ ok: false, errorCode: 'aws_not_supported' });
         expect(fetchMock).not.toHaveBeenCalled();
     });
