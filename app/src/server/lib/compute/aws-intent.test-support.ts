@@ -23,11 +23,34 @@ export function fixtureDeployment(region: 'ap-south-1' | 'us-east-1', instanceTy
 
 const COMPUTER = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
 export function fixtureIntent(
-    operation: 'provision' | 'start' | 'stop',
+    operation: 'provision' | 'start' | 'stop' | 'replace',
     region: 'ap-south-1' | 'us-east-1' = 'ap-south-1',
     instanceType = 'm6i.large',
     deploymentTypes?: string[],
 ): LifecycleIntent {
+    if (operation === 'replace') {
+        // Wake by replace: a new instance (generation 2) on the retained volume; the
+        // stopped generation-1 instance and its fence are handed on as previous*.
+        return {
+            schemaVersion: 1,
+            jobId: '0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c',
+            computerId: COMPUTER,
+            revision: 1,
+            operation,
+            targetGeneration: 2,
+            fenceToken: 'fdfdfdfd-fdfd-4dfd-8dfd-fdfdfdfdfdfd',
+            providerInstanceId: null,
+            dataVolumeId: 'vol-11111111111111111',
+            previousGeneration: 1,
+            previousInstanceId: 'i-11111111111111111',
+            previousFenceToken: 'fefefefe-fefe-4efe-8efe-fefefefefefe',
+            deployment: fixtureDeployment(region, deploymentTypes),
+            instanceType,
+            dataVolumeGiB: null,
+            leaseEpoch: 4,
+            userData: 'ZXppbC1ub25jZQ==',
+        };
+    }
     return {
         schemaVersion: 1,
         jobId: '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b',

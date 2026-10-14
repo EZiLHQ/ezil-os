@@ -27,7 +27,17 @@
 import { randomBytes as nodeRandomBytes, randomUUID } from 'node:crypto';
 
 import { runAdmission, type AdmissionRefusal } from './admission';
-import { AWS_TIER_DATA_GIB, instanceTypeForTier, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsEnrollUrl, type AwsTier, type Env } from './aws-config';
+import {
+    AWS_TIER_DATA_GIB,
+    instanceTypeForTier,
+    isAwsComputersEnabled,
+    readAwsAdmissionConfig,
+    readAwsEnrollUrl,
+    readAwsWakeMode,
+    type AwsTier,
+    type AwsWakeMode,
+    type Env,
+} from './aws-config';
 import { buildEnrollmentUserData, EnrollmentUserDataError, issueEnrollmentNonce } from './aws-enroll';
 import {
     buildLifecycleWork,
@@ -139,7 +149,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
 
     /** Flag, admission config and every configured region's deployment, or the refusal code. */
     const configured = ():
-        | { ok: true; e: Env; deployments: Record<string, LifecycleDeployment>; enrollUrl: string | null }
+        | { ok: true; e: Env; deployments: Record<string, LifecycleDeployment>; enrollUrl: string | null; wakeMode: AwsWakeMode }
         | { ok: false; code: string } => {
         const e = env();
         if (!isAwsComputersEnabled(e)) return { ok: false, code: AWS_DISABLED };
@@ -147,7 +157,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         if (!config.enabled) return { ok: false, code: config.reason };
         const d = readLifecycleDeployments(e, config.regions.map((r) => r.name));
         if (!d.ok) return { ok: false, code: 'aws_config_invalid' };
-        return { ok: true, e, deployments: d.deployments, enrollUrl: readAwsEnrollUrl(e) };
+        // `start` without the deployment's userData-nonce feature could never enroll: fail closed.
+        const wake = readAwsWakeMode(e);
+        if (!wake.ok) return { ok: false, code: 'aws_config_invalid' };
+        return { ok: true, e, deployments: d.deployments, enrollUrl: readAwsEnrollUrl(e), wakeMode: wake.mode };
     };
 
     /** The caller's own aws-ec2 placement, or null when there is none. Another owner is NOT_FOUND upstream. */
@@ -157,11 +170,17 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         return record;
     };
 
-    const intentFor = (
+    /**
+     * A start or stop of the placement's CURRENT generation. Its fence token is the
+     * one that generation's instance and volume are tagged with (`fenceToken`):
+     * the helper refuses any other (`lifecycle_volume_invalid`), so it is never
+     * re-minted here.
+     */
+    const sameGenerationIntent = (
         p: Placement,
-        operation: LifecycleOperation,
+        operation: Extract<LifecycleOperation, 'start' | 'stop'>,
         deployment: LifecycleDeployment,
-        extra: { userData: string | null; dataVolumeGiB: number | null; leaseEpoch: number },
+        extra: { userData: string | null; leaseEpoch: number },
     ): LifecycleIntent => ({
         schemaVersion: 1,
         jobId: newId(),
@@ -169,17 +188,48 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         revision: 1,
         operation,
         targetGeneration: p.generation,
-        fenceToken: newId(),
-        providerInstanceId: operation === 'provision' ? null : p.instanceId,
-        dataVolumeId: operation === 'provision' ? null : p.volumeId,
+        fenceToken: p.fenceToken!,
+        providerInstanceId: p.instanceId,
+        dataVolumeId: p.volumeId,
         previousGeneration: null,
         previousInstanceId: null,
         previousFenceToken: null,
         deployment,
         instanceType: p.instanceType ?? '',
-        dataVolumeGiB: extra.dataVolumeGiB,
+        dataVolumeGiB: null,
         leaseEpoch: extra.leaseEpoch,
         userData: extra.userData,
+    });
+
+    /**
+     * Wake by REPLACE (C-3): a new instance of the placement's type boots on the
+     * retained data volume as generation + 1, with a fresh fence token. The old
+     * generation's instance, generation and fence are handed on as `previous*`;
+     * the helper stops and terminates it, never the volume. Its launch user data
+     * carries this boot's enrollment nonce, so no attribute write is needed.
+     */
+    const replaceIntent = (
+        p: Placement,
+        deployment: LifecycleDeployment,
+        next: { fenceToken: string; leaseEpoch: number; userData: string },
+    ): LifecycleIntent => ({
+        schemaVersion: 1,
+        jobId: newId(),
+        computerId: p.computerId.toLowerCase(),
+        revision: 1,
+        operation: 'replace',
+        targetGeneration: p.generation + 1,
+        fenceToken: next.fenceToken,
+        providerInstanceId: null,
+        dataVolumeId: p.volumeId,
+        previousGeneration: p.generation,
+        previousInstanceId: p.instanceId,
+        previousFenceToken: p.fenceToken,
+        deployment,
+        instanceType: p.instanceType ?? '',
+        dataVolumeGiB: null,
+        leaseEpoch: next.leaseEpoch,
+        userData: next.userData,
     });
 
     /** Build and start; on any failure undo the placement step that preceded it. A prebuilt `work` is started as is. */
@@ -286,7 +336,38 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 case 'RUNNING':
                     return { ok: true };
                 case 'STOPPED': {
-                    if (!placement.instanceId || !placement.volumeId || !placement.instanceType || !placement.region) return notReady('aws_placement_incomplete');
+                    if (!placement.instanceId || !placement.volumeId || !placement.instanceType || !placement.region || !placement.fsUuid || !placement.fenceToken) {
+                        return notReady('aws_placement_incomplete');
+                    }
+                    const enrollUrl = cfg.enrollUrl;
+                    if (!enrollUrl) return notReady('aws_enrollment_unavailable');
+                    // Region is sticky: the deployment is the placement's own region, never another.
+                    const deployment = cfg.deployments[placement.region];
+                    if (!deployment) return notReady('region_not_configured');
+                    const replace = cfg.wakeMode === 'replace';
+                    // The lease's compare-and-swap moves the epoch (and, for a replace, the
+                    // generation) by exactly one, so this boot's intent is fully known BEFORE
+                    // the lease and its job, digest, fence and nonce hash are written by that
+                    // same statement. A lost race fails the CAS and nothing is started.
+                    const leaseEpoch = placement.leaseEpoch + 1;
+                    const generation = placement.generation + (replace ? 1 : 0);
+                    const nonce = issueEnrollmentNonce(now(), randomBytes);
+                    const fenceToken = replace ? newId() : placement.fenceToken;
+                    let work: LifecycleWork;
+                    try {
+                        const userData = buildEnrollmentUserData({
+                            computerId: placement.computerId, volumeId: placement.volumeId, fsUuid: placement.fsUuid, generation, leaseEpoch,
+                            nonce: nonce.nonce, provision: false, enrollUrl,
+                        });
+                        work = buildLifecycleWork(
+                            replace
+                                ? replaceIntent(placement, deployment, { fenceToken, leaseEpoch, userData })
+                                : sameGenerationIntent(placement, 'start', deployment, { userData, leaseEpoch }),
+                        );
+                    } catch (error) {
+                        if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
+                        throw error;
+                    }
                     const leased = await runAdmission(
                         deps.db,
                         {
@@ -295,18 +376,29 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                             computerId: c.computerId,
                             expected: { generation: placement.generation, leaseEpoch: placement.leaseEpoch },
                             leaseUntil: new Date(now().getTime() + leaseSeconds * 1000),
+                            replace,
+                            fields: {
+                                fenceToken,
+                                enrollNonceHash: nonce.nonceHash,
+                                enrollExpiresAt: nonce.expiresAt,
+                                lifecycleJobId: work.intent.jobId,
+                                lifecycleDigest: work.digest,
+                                lastError: null,
+                            },
                         },
                         { env: cfg.e, now },
                     );
                     if (!leased.admitted) return leased.reason === 'cas_conflict' ? notReady('computer_starting', true) : refusal(leased.reason);
                     const p = leased.placement;
-                    // Region is sticky: the deployment is the placement's own region, never another.
-                    const deployment = cfg.deployments[p.region!];
-                    if (!deployment) {
-                        await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STOPPED' });
-                        return notReady('region_not_configured');
+                    // A replace cannot be undone by compare-and-swap (the generation already moved):
+                    // a refused StartExecution leaves it for recovery (UNCONFIRMED). A start-in-place
+                    // only moved the epoch, which a later wake simply raises again: back to STOPPED.
+                    const undo: PlacementState = replace ? 'UNCONFIRMED' : 'STOPPED';
+                    if (p.generation !== generation || p.leaseEpoch !== leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
+                        await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
+                        return notReady('aws_intent_invalid');
                     }
-                    const r = await launch(c.userId, p, intentFor(p, 'start', deployment, { userData: null, dataVolumeGiB: null, leaseEpoch: p.leaseEpoch }), 'STOPPED');
+                    const r = await launch(c.userId, p, work, undo);
                     if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
                     await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STARTING' });
                     return notReady('computer_starting', true);
@@ -337,12 +429,24 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!p || p.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'aws_placement_missing', error: 'aws_placement_missing' };
             if (p.state === 'STOPPED') return { ok: true, terminated: false, outcome: 'already_stopped' };
             if (p.state !== 'RUNNING') return { ok: false, terminated: false, outcome: `placement_${p.state.toLowerCase()}` };
+            if (!p.instanceId || !p.volumeId || !p.fenceToken) return { ok: false, terminated: false, outcome: 'aws_placement_incomplete', error: 'aws_placement_incomplete' };
             const deployment = cfg.deployments[p.region ?? ''];
             if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
-            const draining = await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'DRAINING' });
+            let work: LifecycleWork;
+            try {
+                work = buildLifecycleWork(sameGenerationIntent(p, 'stop', deployment, { userData: null, leaseEpoch: p.leaseEpoch }));
+            } catch (error) {
+                if (!(error instanceof LifecycleIntentInvalidError)) throw error;
+                return { ok: false, terminated: false, outcome: 'aws_intent_invalid', error: 'aws_intent_invalid' };
+            }
+            // The stop's job and digest are recorded by the same compare-and-swap that starts draining.
+            const draining = await transitionPlacement(deps.db, {
+                computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'DRAINING',
+                fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+            });
             if (!draining.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
             const d = draining.placement;
-            const r = await launch(c.userId, d, intentFor(d, 'stop', deployment, { userData: null, dataVolumeGiB: null, leaseEpoch: d.leaseEpoch }), 'UNCONFIRMED');
+            const r = await launch(c.userId, d, work, 'UNCONFIRMED');
             if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
             await transitionPlacement(deps.db, { computerId: d.computerId, ownerUserId: c.userId, expected: d, to: 'STOPPING' });
             // Not confirmed until the execution's receipt marks the placement STOPPED.

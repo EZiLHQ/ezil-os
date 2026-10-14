@@ -73,8 +73,15 @@ function setup(seed: Parameters<typeof createFakePlacementDb>[0] = {}, over: Par
     return { ...fake, ...rec, provider };
 }
 
+const FS = 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5';
+const FENCE = 'fe0fe0fe-fe0f-4e0f-8e0f-e0fe0fe0fe0f';
+/** A stopped computer as a completed provision leaves it: instance, volume, fs uuid and generation fence recorded. */
 const stopped = (over: Record<string, unknown> = {}) =>
-    placementRow({ computer_id: C1, region: 'ap-south-1', instance_type: 't3a.medium', instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111', ...over });
+    placementRow({
+        computer_id: C1, region: 'ap-south-1', instance_type: 't3a.medium', instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111',
+        fs_uuid: FS, fence_token: FENCE, ...over,
+    });
+const startMode = (over: Record<string, string> = {}) => env({ EZIL_AWS_WAKE_MODE: 'start', EZIL_AWS_LIFECYCLE_USERDATA_NONCE: '1', ...over });
 
 describe('configuration refusals happen before any statement', () => {
     it.each([
@@ -201,6 +208,7 @@ async function receipt(db: Parameters<typeof transitionPlacementAsReconciler>[0]
     if (!r.ok) throw new Error(`receipt ${record!.state} -> ${to}: ${r.reason}`);
     return r.placement;
 }
+const INSTANCE_2 = 'i-22222222222222222';
 
 describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fence)', () => {
     // The host guard (infra/host-agent guard.py) mounts only when the disk marker's
@@ -216,7 +224,7 @@ describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fen
         expect(placements[0]).toMatchObject({ state: 'PROVISIONING', lease_epoch: provisionEpoch });
         await receipt(db, 'STOPPED', { instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111' });
         await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
-        expect(calls[1]!.intent).toMatchObject({ operation: 'start', providerInstanceId: 'i-11111111111111111' });
+        expect(calls[1]!.intent).toMatchObject({ operation: 'replace', previousInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111' });
         expect(calls[1]!.intent.leaseEpoch).toBeGreaterThan(provisionEpoch);
         expect(placements[0]).toMatchObject({ state: 'STARTING', lease_epoch: calls[1]!.intent.leaseEpoch });
     });
@@ -227,41 +235,65 @@ describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fen
         await receipt(db, 'RUNNING', { instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111' });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: true });
         expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ outcome: 'stopping' });
-        expect(calls[1]!.intent).toMatchObject({ operation: 'stop', leaseEpoch: calls[0]!.intent.leaseEpoch });
+        // The stop carries the provision's fence: the instance and volume are tagged with it.
+        expect(calls[1]!.intent).toMatchObject({ operation: 'stop', leaseEpoch: calls[0]!.intent.leaseEpoch, fenceToken: calls[0]!.intent.fenceToken });
         await receipt(db, 'STOPPED');
         await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
-        expect(calls[2]!.intent.operation).toBe('start');
+        expect(calls[2]!.intent.operation).toBe('replace');
+        expect(calls[2]!.intent.previousFenceToken).toBe(calls[0]!.intent.fenceToken);
         expect(calls[2]!.intent.leaseEpoch).toBeGreaterThan(calls[0]!.intent.leaseEpoch);
         expect(placements[0]).toMatchObject({ state: 'STARTING' });
     });
 
-    it('every later wake leases above the previous boot (stop → wake → stop → wake)', async () => {
+    it('every later wake leases above the previous boot and hands its generation fence on (replace → stop → replace)', async () => {
         const { provider, calls, db } = setup();
         await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
         await receipt(db, 'STOPPED', { instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111' });
         let marker = calls[0]!.intent.leaseEpoch;
+        let fence = calls[0]!.intent.fenceToken;
+        let generation = calls[0]!.intent.targetGeneration;
         for (let wake = 0; wake < 2; wake++) {
             await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
             const boot = calls.at(-1)!.intent;
-            expect(boot.operation).toBe('start');
+            expect(boot.operation).toBe('replace');
             expect(boot.leaseEpoch).toBeGreaterThan(marker);
+            expect(boot).toMatchObject({ previousGeneration: generation, previousFenceToken: fence, targetGeneration: generation + 1 });
+            expect(boot.fenceToken).not.toBe(fence);
             marker = boot.leaseEpoch;
-            for (const to of ['MOUNTING', 'RUNNING', 'DRAINING', 'STOPPING', 'STOPPED'] as const) await receipt(db, to);
+            fence = boot.fenceToken;
+            generation = boot.targetGeneration;
+            await receipt(db, 'MOUNTING');
+            await receipt(db, 'RUNNING', { instanceId: wake === 0 ? INSTANCE_2 : 'i-33333333333333333' });
+            await receipt(db, 'DRAINING');
+            await receipt(db, 'STOPPING');
+            await receipt(db, 'STOPPED');
         }
     });
 });
 
-describe('ensure: wake (cold boot of the same instance, same volume, same region)', () => {
-    it('STOPPED → leased (epoch + 1) → start intent for the same instance and volume → STARTING', async () => {
-        const { provider, placements, calls } = setup({ placements: [stopped()] });
+describe('ensure: wake by replace (default): a NEW instance on the SAME volume, same region', () => {
+    it('STOPPED → leased (generation + 1, epoch + 1, new fence, nonce hash) → replace intent → STARTING', async () => {
+        const { provider, placements, calls, statements } = setup({ placements: [stopped({ generation: 3, lease_epoch: 7 })] });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
         expect(calls).toHaveLength(1);
         expect(calls[0]).toMatchObject({ region: 'ap-south-1', stateMachineArn: DEPLOYMENTS['ap-south-1'].stateMachineVersionArn });
-        expect(calls[0]!.intent).toMatchObject({
-            operation: 'start', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', leaseEpoch: 1,
-            dataVolumeGiB: null, userData: null, instanceType: 't3a.medium', targetGeneration: 1,
+        const i = calls[0]!.intent;
+        expect(i).toMatchObject({
+            operation: 'replace', targetGeneration: 4, leaseEpoch: 8, providerInstanceId: null, dataVolumeId: 'vol-11111111111111111',
+            previousGeneration: 3, previousInstanceId: 'i-11111111111111111', previousFenceToken: FENCE, instanceType: 't3a.medium', dataVolumeGiB: null,
         });
-        expect(placements[0]).toMatchObject({ state: 'STARTING', lease_epoch: 1, region: 'ap-south-1' });
+        expect(i.fenceToken).not.toBe(FENCE);
+        expect(leaseOf(i.userData)).toEqual({
+            v: 1, computerId: C1, volumeId: 'vol-11111111111111111', fsUuid: FS, generation: 4, leaseEpoch: 8, nonce: NONCE, provision: false, enrollUrl: ENROLL_URL,
+        });
+        expect(placements[0]).toMatchObject({
+            state: 'STARTING', generation: 4, lease_epoch: 8, region: 'ap-south-1', fence_token: i.fenceToken,
+            enroll_nonce_hash: nonceHashOf(NONCE), lifecycle_job_id: i.jobId, lifecycle_digest: calls[0]!.digest,
+        });
+        expect(JSON.stringify(statements.map((st) => st.params))).not.toContain(NONCE);
+        // The nonce hash, fence and job are written by the LEASE compare-and-swap itself.
+        const lease = statements.find((st) => st.sql.includes('placement:cas') && st.sql.includes("'LEASED'") === false && st.params.includes('LEASED'))!;
+        for (const col of ['fence_token', 'enroll_nonce_hash', 'lifecycle_job_id', 'lifecycle_digest']) expect(lease.sql).toContain(col);
     });
 
     it('a US computer wakes in the US even though Mumbai comes first', async () => {
@@ -275,19 +307,38 @@ describe('ensure: wake (cold boot of the same instance, same volume, same region
         const { provider, placements, calls } = setup({ placements: [stopped()] }, { e: env({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '9' }) });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false });
         expect(calls).toEqual([]);
-        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0, region: 'ap-south-1' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0, generation: 1, region: 'ap-south-1', enroll_nonce_hash: null });
     });
 
-    it('StartExecution refused on wake → back to STOPPED, not left LEASED', async () => {
+    it('StartExecution refused on a replace → UNCONFIRMED (the generation already moved; recovery decides), never STOPPED on a half-moved row', async () => {
         const { provider, placements } = setup({ placements: [stopped()] }, { failStart: true });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_lifecycle_start_failed' });
-        expect(placements[0]).toMatchObject({ state: 'STOPPED' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', generation: 2 });
     });
 
-    it('a STOPPED row missing its instance or volume is not started', async () => {
-        const { provider, calls } = setup({ placements: [stopped({ instance_id: null })] });
+    it.each([
+        ['instance', { instance_id: null }],
+        ['volume', { volume_id: null }],
+        ['fs uuid', { fs_uuid: null }],
+        ['generation fence', { fence_token: null }],
+    ] as const)('a STOPPED row missing its %s is not woken', async (_n, over) => {
+        const { provider, calls, placements } = setup({ placements: [stopped(over)] });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_placement_incomplete' });
         expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
+    });
+
+    it('no enrollment URL → nothing leased, nothing started', async () => {
+        const { provider, calls, placements } = setup({ placements: [stopped()] }, { e: env({ EZIL_AWS_ENROLL_URL: '' }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_enrollment_unavailable' });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
+    });
+
+    it('the replace intent parses with the shared schema and its user data stays under 4096 characters', async () => {
+        const { provider, calls } = setup({ placements: [stopped()] });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(calls[0]!.intent.userData!.length).toBeLessThan(4096);
     });
 
     it.each([
@@ -311,12 +362,57 @@ describe('ensure: wake (cold boot of the same instance, same volume, same region
     });
 });
 
+describe('wake mode configuration', () => {
+    it('start mode WITH the userData-nonce feature: start in place, same generation and fence, nonce in user data', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 2 })] }, { e: startMode() });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        const i = calls[0]!.intent;
+        expect(i).toMatchObject({
+            operation: 'start', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', targetGeneration: 1, leaseEpoch: 3,
+            fenceToken: FENCE, previousGeneration: null, dataVolumeGiB: null,
+        });
+        expect(leaseOf(i.userData)).toMatchObject({ generation: 1, leaseEpoch: 3, volumeId: 'vol-11111111111111111', nonce: NONCE, provision: false });
+        expect(placements[0]).toMatchObject({ state: 'STARTING', generation: 1, lease_epoch: 3, fence_token: FENCE, enroll_nonce_hash: nonceHashOf(NONCE) });
+    });
+
+    it('start mode: StartExecution refused → back to STOPPED (only the epoch moved; a later wake raises it again)', async () => {
+        const { provider, placements } = setup({ placements: [stopped()] }, { e: startMode(), failStart: true });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_lifecycle_start_failed' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', generation: 1 });
+    });
+
+    it.each([
+        ['start without the userData-nonce feature (a started host could never enroll)', { EZIL_AWS_WAKE_MODE: 'start' }],
+        ['start with the feature set to anything but 1', { EZIL_AWS_WAKE_MODE: 'start', EZIL_AWS_LIFECYCLE_USERDATA_NONCE: 'true' }],
+        ['an unknown wake mode', { EZIL_AWS_WAKE_MODE: 'hibernate' }],
+    ] as const)('%s → aws_config_invalid before any statement', async (_n, over) => {
+        const { provider, calls, statements } = setup({ placements: [stopped()] }, { e: env(over) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_config_invalid' });
+        expect(statements).toEqual([]);
+        expect(calls).toEqual([]);
+    });
+
+    it("explicit 'replace' equals the default", async () => {
+        const { provider, calls } = setup({ placements: [stopped()] }, { e: env({ EZIL_AWS_WAKE_MODE: 'replace' }) });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(calls[0]!.intent.operation).toBe('replace');
+    });
+});
+
 describe('stop and status', () => {
-    it('RUNNING → DRAINING → stop intent → STOPPING; not confirmed until the receipt', async () => {
+    it('RUNNING → DRAINING (job recorded) → stop intent with the generation fence → STOPPING; not confirmed until the receipt', async () => {
         const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] });
         expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toEqual({ ok: false, terminated: false, outcome: 'stopping' });
-        expect(calls[0]!.intent).toMatchObject({ operation: 'stop', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', leaseEpoch: 4 });
-        expect(placements[0]).toMatchObject({ state: 'STOPPING' });
+        expect(calls[0]!.intent).toMatchObject({
+            operation: 'stop', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', leaseEpoch: 4, fenceToken: FENCE, userData: null,
+        });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: calls[0]!.intent.jobId, lifecycle_digest: calls[0]!.digest });
+    });
+
+    it('a RUNNING row without its generation fence is not stopped through the lifecycle', async () => {
+        const { provider, calls } = setup({ placements: [stopped({ state: 'RUNNING', fence_token: null })] });
+        expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ ok: false, outcome: 'aws_placement_incomplete' });
+        expect(calls).toEqual([]);
     });
 
     it('stop start failure → UNCONFIRMED (the reconciler decides), never back to RUNNING', async () => {

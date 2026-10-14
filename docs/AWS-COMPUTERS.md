@@ -154,6 +154,23 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   transaction, computer, user and kind (create or lease), and only after that computer's counters were read under the
   lock. AWS creation and leasing refuse without it. Only the admission module mints tickets (a repository scan test).
 
+**Wake mode (`EZIL_AWS_WAKE_MODE`, app)**
+- `replace` (default): a STOPPED computer wakes as a NEW instance of its recorded type on the retained data volume. The
+  lease reserves `generation + 1` and `lease_epoch + 1`, and a new fence token. The intent hands the stopped writer's
+  instance, generation and fence on as `previous*`; the helper stops and terminates it, never the volume. The launch
+  user data carries this boot's enrollment nonce (C-6), so no attribute write is needed. The disposable root boots fresh
+  from the AMI; user state lives on the data volume (overlay upper, HOME).
+- `start`: the same instance starts in place (epoch + 1 only). Its nonce must be written into user data while stopped,
+  which the lifecycle deployment allows only with `features.userDataNonce` after the staging proof. The app refuses
+  `start` (`aws_config_invalid`) unless the operator also sets `EZIL_AWS_LIFECYCLE_USERDATA_NONCE=1`, because a started
+  host without a fresh nonce could never enroll.
+- Every boot's job id, intent digest, fence token and enrollment nonce hash are written by the SAME compare-and-swap that
+  admits the boot (the creation insert or the lease). The intent is built first: the CAS moves generation and epoch by
+  exactly one, so nothing about it depends on the write. Starts and stops of a generation carry that generation's
+  recorded fence token: the instance and volume are tagged with it, and the helper refuses any other.
+- A refused `StartExecution` after a start-in-place lease returns the row to STOPPED (only the epoch moved). After a
+  replace lease it goes to UNCONFIRMED: the generation already moved, so recovery decides.
+
 **Errors**
 - Capacity and quota errors fail fast.
 - Throttling errors retry.
