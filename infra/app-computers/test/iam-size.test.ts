@@ -6,6 +6,7 @@ import { App, BootstraplessSynthesizer, Stack, assertions } from 'aws-cdk-lib';
 import { DeployIdentityStack, IdentityConfigSchema } from '../lib/identity.js';
 import { AppComputerFoundationStack, FoundationConfigSchema } from '../lib/foundation.js';
 import { OpsConfigSchema, OpsStack } from '../lib/ops.js';
+import { PilotKeysConfigSchema, PilotKeysStack } from '../lib/pilot-keys.js';
 import { ComputerLifecycle } from '../lib/computer-lifecycle.js';
 import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
@@ -18,6 +19,7 @@ const example = (name: string) => JSON.parse(readFileSync(join(__dirname, '../co
 const identity = IdentityConfigSchema.parse(example('identity'));
 const foundation = FoundationConfigSchema.parse(example('foundation'));
 const ops = OpsConfigSchema.parse(example('ops'));
+const keys = PilotKeysConfigSchema.parse(example('keys'));
 const lifecycle = example('lifecycle');
 const env = { account: identity.accountId, region: identity.region };
 
@@ -25,7 +27,7 @@ const env = { account: identity.accountId, region: identity.region };
  * allocated at deployment, use the service's maximum name length. Unknown
  * references fail closed: extend this resolver when new policy targets appear.
  * This is an upper bound for generated names, exact for the literal boundary. */
-function documentSize(document: unknown, resources: Record<string, Resource>): number {
+function documentSize(document: unknown, resources: Record<string, Resource>, bytes = false): number {
     const arn = (service: string, suffix: string) =>
         'arn:aws:' + service + ':' + env.region + ':' + env.account + ':' + suffix;
     function target(id: string, attribute = 'Ref'): string {
@@ -85,7 +87,8 @@ function documentSize(document: unknown, resources: Record<string, Resource>): n
         assert.ok(!Object.keys(value).some(key => key.startsWith('Fn::')), 'unhandled policy intrinsic');
         return Object.fromEntries(Object.entries(value).map(([key, part]) => [key, resolve(part)]));
     }
-    return JSON.stringify(resolve(document)).replace(/\s/g, '').length;
+    const json = JSON.stringify(resolve(document));
+    return bytes ? Buffer.byteLength(json, 'utf8') : json.replace(/\s/g, '').length;
 }
 
 /** Both embedded Policies and separate IAM Policy/RolePolicy resources count
@@ -112,6 +115,9 @@ function checkStack(stack: Stack): string[] {
     for (const [id, resource] of Object.entries(resources)) {
         const p = resource.Properties ?? {};
         switch (resource.Type) {
+            case 'AWS::KMS::Key':
+                limit(id + '/key policy bytes', documentSize(p.KeyPolicy, resources, true), 32768);
+                break;
             case 'AWS::IAM::ManagedPolicy':
                 limit(id + '/managed', documentSize(p.PolicyDocument, resources), 6144);
                 if (p.ManagedPolicyName?.endsWith('-boundary'))
@@ -158,6 +164,10 @@ for (const killSwitch of [false, true]) for (const userDataNonce of [false, true
             const opsStack = new OpsStack(app, 'ezil-pilot-ops', {
                 config: ops, env, synthesizer: new BootstraplessSynthesizer(),
             });
+            const keysStack = new PilotKeysStack(app, 'ezil-pilot-keys', {
+                config: keys, env: { account: keys.accountId, region: keys.region },
+                synthesizer: new BootstraplessSynthesizer(),
+            });
             const settings = SettingsSchema.parse({
                 ...lifecycle.settings, features: { userDataNonce, userDataAttributeKeyVerified },
             });
@@ -178,7 +188,7 @@ for (const killSwitch of [false, true]) for (const userDataNonce of [false, true
                 config: AppCallerConfigSchema.parse({ ...lifecycle.appCaller, enabled: true }),
                 region: settings.deployment.region, versionArns: [settings.deployment.stateMachineVersionArn],
             });
-            const failures = [identityStack, foundationStack, opsStack, lifecycleStack].flatMap(checkStack);
+            const failures = [identityStack, foundationStack, opsStack, keysStack, lifecycleStack].flatMap(checkStack);
             assert.deepEqual(failures, [], 'IAM documents exceed their non-whitespace character quotas');
             for (const role of Object.values(assertions.Template.fromStack(lifecycleStack).findResources('AWS::IAM::Role'))) {
                 assert.equal(role.Properties.Path, `/ezil/${settings.deployment.namespace}/`);
