@@ -6,7 +6,7 @@
  * - Reads ON: no row / cloudflare row → that same adapter; aws-ec2 row → the
  *   AWS provider, never Cloudflare; a foreign placement → NOT_FOUND before any
  *   provider call (two users).
- * - Routers: an AWS computer never reaches the Cloudflare Worker (no fetch),
+ * - Routers: AWS previews use the Worker's AWS route; lifecycle refusals never fetch,
  *   not-ready answers are VALUES, a user stop is `stop` (keeps disks), delete
  *   retires or refuses — never deletes data, never falls back to Cloudflare.
  */
@@ -42,6 +42,7 @@ import { computerRouter } from '@/server/api/routers/computer';
 import { LIFECYCLE_DEPLOYMENTS_ENV } from '@/server/lib/compute/aws-intent';
 import { fixtureDeployment } from '@/server/lib/compute/aws-intent.test-support';
 import type { LifecycleStarter } from '@/server/lib/compute/aws-ec2';
+import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
 import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 
@@ -200,14 +201,24 @@ describe('shell-facing AWS answers', () => {
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_stopping', retryable: true })).toBe('sandbox_starting');
     });
 
-    it('a deterministic refusal keeps its own code (capacity is never dressed up as waking)', () => {
+    it('a deterministic refusal keeps its own code (capacity is never dressed up as waking)', async () => {
         expect(shellCodeForAwsEnsure({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false })).toBe('capacity_unavailable');
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_starting', retryable: false })).toBe('computer_starting');
-        expect(awsPreviewAnswer({ ok: false, error: 'x', errorCode: 'aws_disabled', retryable: false })).toMatchObject({ ok: false, errorCode: 'aws_disabled', computeProvider: 'aws-ec2' });
+        const preview = vi.fn(async () => { throw new Error('preview after failed ensure'); });
+        await expect(awsPreviewAnswer({ ok: false, error: 'x', errorCode: 'aws_disabled', retryable: false }, preview))
+            .resolves.toMatchObject({ ok: false, errorCode: 'aws_disabled', computeProvider: 'aws-ec2' });
+        expect(preview).not.toHaveBeenCalled();
     });
 
-    it('ready but no AWS desktop URL route yet → a refusal value, not a Cloudflare URL', () => {
-        expect(awsPreviewAnswer({ ok: true })).toMatchObject({ ok: false, errorCode: 'aws_desktop_url_unavailable', computeProvider: 'aws-ec2' });
+    it('ready ensure invokes the preview callback and preserves its fixed error as a value', async () => {
+        const preview = vi.fn(async () => ({
+            ok: false as const, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable',
+        }));
+        await expect(awsPreviewAnswer({ ok: true }, preview)).resolves.toEqual({
+            ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable',
+            provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2',
+        });
+        expect(preview).toHaveBeenCalledTimes(1);
     });
 
     it('status: guacamoleRunning is true only for a running AWS computer', () => {
@@ -218,7 +229,7 @@ describe('shell-facing AWS answers', () => {
     });
 });
 
-describe('routers: an AWS computer never reaches the Cloudflare Worker', () => {
+describe('routers: AWS previews use their own Worker route', () => {
     const awsRow = (over: Record<string, unknown> = {}) =>
         placementRow({ computer_id: C1, owner_user_id: U1, state: 'STOPPED', region: 'ap-south-1', instance_type: 't3a.medium', instance_id: 'i-0123456789abcdef0', volume_id: 'vol-0123456789abcdef0', ...over });
     const caller = (db: unknown, user = U1) => cloudflareGuacamoleRouter.createCaller({ user: { id: user }, db } as never);
@@ -239,6 +250,47 @@ describe('routers: an AWS computer never reaches the Cloudflare Worker', () => {
             expect(out).toMatchObject({ ok: false, errorCode: 'aws_lifecycle_unconfigured', computeProvider: 'aws-ec2' });
         }
         expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['previewUrl', 'aws_desktop_starting'], ['previewUrl', 'aws_origin_starting'],
+        ['appPreviewUrl', 'aws_desktop_starting'], ['appPreviewUrl', 'aws_origin_starting'],
+        ['codePreviewUrl', 'aws_desktop_starting'], ['codePreviewUrl', 'aws_origin_starting'],
+    ] as const)('%s re-asks after %s and hands off an AWS bootstrap URL', async (surface, error) => {
+        for (const region of ['ap-south-1', 'us-east-1']) {
+            vi.stubEnv(appCallerRoleEnv(region), 'arn:aws:iam::123456789012:role/ezil/pilot/app-caller');
+        }
+        const { db, fake } = routerDb([awsRow({ state: 'RUNNING', generation: 7, lease_epoch: 11 })]);
+        const sandboxId = deriveGuacamoleSandboxId(U1, C1);
+        const url = (port: number) =>
+            `https://aws-${port}-${sandboxId}.preview.example/preview-bootstrap?token=opaque&path=%2F`;
+        const ready = {
+            ok: true, provider: 'aws-ec2', mode: 'neko', sandboxId, generation: 7, leaseEpoch: 11,
+            guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443),
+            expiresAt: Date.now() + 3_600_000,
+            relay: { runtimeId: 'a'.repeat(32), expiresAt: Date.now() + 600_000 }, turnRelay: true,
+        };
+        fetchMock.mockResolvedValueOnce(Response.json({ ok: false, error, reason: 'LEAK' }, { status: 503 }));
+        fetchMock.mockResolvedValueOnce(Response.json(ready));
+        const open = () => surface === 'previewUrl'
+            ? caller(db).previewUrl({ sessionId: '33333333-3333-4333-8333-333333333333', computerId: C1 })
+            : caller(db)[surface]({ computerId: C1 });
+        await expect(open()).resolves.toEqual({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
+            provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2',
+        });
+        const out = await open();
+        expect(out).toMatchObject({ ...ready, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' });
+        expect(out).not.toHaveProperty('frame.confirmed');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        for (const [endpoint, init] of fetchMock.mock.calls) {
+            expect(endpoint).toBe('https://worker.example/sandbox/preview');
+            const token = new Headers(init.headers).get('x-ezil-auth')!;
+            expect(JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString())).toMatchObject({
+                sandboxId, computerId: C1, userId: U1, provider: 'aws-ec2', generation: 7, leaseEpoch: 11,
+            });
+        }
+        expect(fake.statements.every((s) => s.sql.includes('placement:read'))).toBe(true);
     });
 
     it('status reports the AWS lifecycle state, no Worker call', async () => {

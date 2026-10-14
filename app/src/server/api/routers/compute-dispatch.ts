@@ -24,6 +24,7 @@ import { TRPCError } from '@trpc/server';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
+import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
@@ -107,10 +108,10 @@ export function shellCodeForAwsEnsure(result: Extract<EnsureResult, { ok: false 
 /**
  * The preview answer for an AWS computer. Not-ready → a VALUE (never a throw:
  * a thrown error is what TanStack retries, and the wake loop already re-asks).
- * Ready → still a refusal: the AWS desktop URL is minted through the Worker's
- * AWS routing (GATEWAY-CONTRACT-v1 GW-4), which this lane does not build.
+ * Ready → ask the Worker's AWS route for the current placement's URLs.
+ * The callback is lazy: an ensure refusal must never issue a preview request.
  */
-export function awsPreviewAnswer(result: EnsureResult) {
+export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>) {
     if (!result.ok) {
         return {
             ok: false as const,
@@ -121,9 +122,7 @@ export function awsPreviewAnswer(result: EnsureResult) {
         };
     }
     return {
-        ok: false as const,
-        error: 'aws_desktop_url_unavailable',
-        errorCode: 'aws_desktop_url_unavailable',
+        ...await preview(),
         provider: 'cloudflare-guacamole' as const,
         computeProvider: 'aws-ec2' as const,
     };

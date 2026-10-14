@@ -66,6 +66,7 @@ import {
     fitScreenRequest,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
 import { awsPreviewAnswer, awsStatusAnswer, routeComputer } from './compute-dispatch';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -182,7 +183,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer);
             if (routed.kind === 'aws-ec2') {
-                return awsPreviewAnswer(await routed.provider.ensure({ correlationId }, computer, ensureOptions));
+                return awsPreviewAnswer(
+                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
@@ -428,7 +432,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer);
             if (routed.kind === 'aws-ec2') {
-                return awsPreviewAnswer(await routed.provider.ensure({ correlationId }, computer, ensureOptions));
+                return awsPreviewAnswer(
+                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
@@ -598,7 +605,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer);
             if (routed.kind === 'aws-ec2') {
-                return awsPreviewAnswer(await routed.provider.ensure({ correlationId }, computer, ensureOptions));
+                return awsPreviewAnswer(
+                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
