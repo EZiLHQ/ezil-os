@@ -3,7 +3,7 @@
 This package holds the AWS side of [docs/AWS-COMPUTERS.md](../../docs/AWS-COMPUTERS.md).
 It is **off by default**: nothing here creates a computer, and nothing here is deployed by CI.
 
-It contains four CDK stacks. Every stack is named `ezil-<namespace>-<kind>`, except the
+Every CDK stack is named `ezil-<namespace>-<kind>`, except the
 identity stack, which is `ezil-identity-<namespace>`.
 
 - **Foundation** (`lib/foundation.ts`, `bin/main.ts`):
@@ -20,6 +20,8 @@ identity stack, which is `ezil-identity-<namespace>`.
   founder creates it once (see "Founder bootstrap"). CI never deploys it.
 - **Ops guardrails (I6)** (`lib/ops.ts`, `bin/ops.ts`): DLM snapshots, the egress alarm,
   budget alerts, the alert topic and the kill-switch policy.
+- **Pilot keys** (`lib/pilot-keys.ts`, `bin/keys.ts`): the retained data and authority KMS
+  keys and the generated lifecycle authority secret. Founder-deployed; see [Pilot keys](#pilot-keys).
 
 [LIFECYCLE.md](LIFECYCLE.md) describes the workflow's behaviour.
 
@@ -262,7 +264,8 @@ npm run synth:lifecycle  # lifecycle + recovery, config/lifecycle.example.json
 npm run synth:identity   # I5 deploy identity, config/identity.example.json
 npm run synth:ops        # I6 ops guardrails, config/ops.example.json
 npm run synth:ami        # founder host AMI pipeline, config/ami.example.json
-npm run synth:all        # all five
+npm run synth:keys       # founder lifecycle keys + secret, config/keys.example.json
+npm run synth:all        # all six
 # or, from the repository root:
 bash tools/test.sh infra
 ```
@@ -301,8 +304,9 @@ These cannot be proven offline:
 - **CMK-encrypted state machine.** `CreateStateMachine` with a CMK needs `kms:GenerateDataKey`
   and `Decrypt` on the namespace-tagged history key, both for the execution role and for the
   state machine role.
-- **External keys.** The data and authority keys must carry `ezil:namespace=<ns>`; check that
-  `CreateGrant`, `Decrypt` through Secrets Manager, and EBS encryption then succeed.
+- **Pilot keys.** The [founder keys stack](#pilot-keys) tags the data and authority keys
+  `ezil:namespace=<ns>`; check that `CreateGrant`, `Decrypt` through Secrets Manager,
+  and EBS encryption then succeed.
 - **Alarm-action key.** Confirm that `cloudwatch:AlarmActions` also covers the OK and
   INSUFFICIENT_DATA action lists. Otherwise, add explicit denies for those lists once the
   matching keys are confirmed.
@@ -373,7 +377,7 @@ Workload stacks are deployed with `aws cloudformation deploy --role-arn <exec ro
   `CliCredentialsStackSynthesizer`, which writes to `s3://<asset bucket>/assets/` with the
   caller's own credentials. There are no publishing roles and no bootstrap version rule; a
   test asserts no `BootstrapVersion`.
-- **Other stacks have no assets.** Foundation, ops and identity use `BootstraplessSynthesizer`.
+- **Other stacks have no assets.** Foundation, ops, identity and keys use `BootstraplessSynthesizer`.
 
 **Namespaces.** A namespace is lowercase letters and digits only, with no `-`, so
 `ezil-<ns>-*` can never match another namespace's names. Reserved names are refused:
@@ -399,8 +403,8 @@ The workload boundary allows only:
   log group/stream creation and log writes, and SQS dead-letter sends.
 - `GetSecretValue` on `secret:ezil/<ns>/*`.
 - Symmetric KMS encryption/decryption, data-key generation, description and grants, only on
-  keys already tagged `ezil:namespace=<ns>`. **The externally created data and authority
-  keys must carry that tag.** Workloads cannot create keys, edit key policies or retag keys.
+  keys already tagged `ezil:namespace=<ns>`. The [pilot keys stack](#pilot-keys) supplies
+  tagged data and authority keys. Workloads cannot create keys, edit key policies or retag keys.
 - EC2 instance/volume/image/launch-template/AZ description and the eight account-level Logs
   discovery/delivery/resource-policy actions required by Step Functions logging.
 - Compute creates with `ezil:managed-by=app-computer-platform` and `ezil:stage=<ns>` request
@@ -532,9 +536,10 @@ unchanged inline grants and the same identity guardrails as exec.
 
 **Identity.** The founder runs this once, with **their own administrator session**: an IAM
 Identity Center `AdministratorAccess` permission-set session with MFA, in the target account.
-Never the root user, and never a CI role. The same applies to the **ops and AMI stacks**:
-DLM, budgets, the kill switch and Image Builder are founder change sets only, because
-they sit outside the workload boundary. See [Host AMI](#host-ami) for the AMI runbook.
+Never the root user, and never a CI role. The same applies to the **ops, AMI and keys stacks**:
+DLM, budgets, the kill switch, Image Builder and lifecycle key provisioning are founder change
+sets only, because they sit outside the workload boundary. See [Host AMI](#host-ami) and
+[Pilot keys](#pilot-keys) for their runbooks.
 
 **No prior deployment.** The foundation stack is now `ezil-<ns>-foundation` (it was
 `EzilAppComputers-<stage>`). The lead verified on 2026-10-13 that ap-south-1 is empty and that
@@ -603,6 +608,74 @@ aws cloudformation execute-change-set --region ap-south-1 \
 - The lifecycle template is over 51 kB, so it goes through S3.
 - The foundation stack has no assets: it follows the same steps without `publish-assets`, with
   `cdk.out/foundation/ezil-pilot-foundation.template.json`.
+
+## Pilot keys
+
+The founder deploys `ezil-pilot-keys` before the lifecycle stack, using the `ezil-admin`
+administrator profile in `us-east-1`. It needs no CDK bootstrap, assets or execution role.
+Both symmetric KMS keys rotate automatically; both keys and the secret retain on stack
+deletion or resource replacement. All three carry `ezil:namespace=pilot`.
+
+`EZIL_KEYS_CONFIG` names a strict JSON config with only `namespace`, `accountId` and
+`region`. From the repository root, copy the public example and set `accountId` to the
+target account and `region` to `us-east-1`; keep `namespace` as `pilot` for these commands.
+The other pilot configs must use that same account, region and namespace (the existing
+lifecycle example uses `ap-south-1`, so its ZoneId and regional ARNs also need updating).
+
+```sh
+cd infra/app-computers
+cp config/keys.example.json config/keys.pilot.json
+# Edit config/keys.pilot.json: set accountId to the target account and region to us-east-1.
+EZIL_KEYS_CONFIG=config/keys.pilot.json npm run synth:keys
+
+aws cloudformation create-change-set --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys --change-set-name keys-1 --change-set-type CREATE \
+  --template-body file://cdk.out/keys/ezil-pilot-keys.template.json
+aws cloudformation wait change-set-create-complete --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys --change-set-name keys-1
+aws cloudformation describe-change-set --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys --change-set-name keys-1
+```
+
+Review the two keys, their policies, retention and tags, and the generated secret before
+executing the change set. The data key delegates to account IAM policies, with explicit
+EC2 `kms:ViaService` usage and AWS-resource grant statements. The authority key delegates
+only to account IAM policies; the lifecycle helper's IAM policy scopes decryption to Secrets
+Manager and this secret's ARN.
+
+```sh
+aws cloudformation execute-change-set --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys --change-set-name keys-1
+aws cloudformation wait stack-create-complete --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys
+aws cloudformation update-termination-protection --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys --enable-termination-protection
+aws cloudformation describe-stacks --profile ezil-admin --region us-east-1 \
+  --stack-name ezil-pilot-keys --query 'Stacks[0].Outputs' --output table
+```
+
+The CDK app enables termination protection in its assembly; the explicit command above
+also enables it when deploying the template directly through CloudFormation. For later
+changes, use a fresh change-set name, `--change-set-type UPDATE` and `stack-update-complete`.
+
+Copy the three ARN outputs into the config selected by `EZIL_LIFECYCLE_CONFIG`:
+
+| Keys output | Lifecycle config field |
+|---|---|
+| `DataKeyArn` | `settings.deployment.dataKeyArn` |
+| `AuthorityKeyArn` | top-level `authorityKeyArn` |
+| `AuthoritySecretArn` | `settings.authoritySecretArn` |
+
+Use the full `AuthoritySecretArn` output, including Secrets Manager's six-character
+suffix. The secret is named `ezil/pilot/lifecycle-authority`; AWS generates its 64-character
+alphanumeric value during deployment and encrypts it with `AuthorityKey`. The template,
+outputs and local config contain no secret value.
+
+In the AWS Secrets Manager console in `us-east-1`, the founder opens
+`ezil/pilot/lifecycle-authority`, retrieves its value, and copies that exact plain-text value
+into the Vercel app environment variable `EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET`, then
+redeploys the app to apply it. This variable must equal the secret's **value**, not its ARN.
+Never print the value in a command, terminal output or logs, or put it in a config file.
 
 ## Host AMI
 
