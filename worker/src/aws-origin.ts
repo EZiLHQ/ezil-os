@@ -19,7 +19,9 @@
  * forwards only to a port the Worker chose from `AWS_EDGE_PORTS`, and the contract's
  * path-only signature still covers it.
  */
+import type { AwsDesktopReadiness } from './aws-ice';
 import { APP_PREVIEW_PORT, CODE_PREVIEW_PORT, portFor } from './desktop-mode';
+import { relayFailureResult, type RelayState } from './relay-refresh';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
@@ -312,6 +314,12 @@ export interface AwsPreviewDeps {
   lookup: (sandboxId: string) => Promise<AwsTunnelRecord | null>;
   /** GW-1's connector check; called only while the record is not yet origin-verified. */
   verifyOrigin: (sandboxId: string) => Promise<'verified' | 'mismatch' | 'not_connected'>;
+  /**
+   * The desktop's WebRTC relay (`./aws-ice` `ensureAwsDesktop`), once the origin is verified:
+   * pushes the per-epoch relay config while the host needs one, renews it in place on a warm
+   * open. `starting` answers 503 `aws_desktop_starting` (the client's wake loop retries).
+   */
+  ensureDesktop?: (record: AwsTunnelRecord) => Promise<AwsDesktopReadiness>;
   nowMs: () => number;
 }
 
@@ -339,6 +347,19 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     if (verdict === 'mismatch') return json({ ok: false, error: 'tunnel_origin_mismatch' }, 502);
     if (verdict !== 'verified') return json({ ok: false, error: 'aws_origin_starting' }, 503);
   }
+  let relay: RelayState | undefined;
+  if (deps.ensureDesktop) {
+    let readiness: AwsDesktopReadiness;
+    try {
+      readiness = await deps.ensureDesktop(record);
+    } catch (error) {
+      // Codes only: a relay failure never carries a credential (relay-refresh.ts).
+      const failure = relayFailureResult(error);
+      return json({ ok: false, error: failure.error }, failure.status);
+    }
+    if (readiness.state === 'starting') return json({ ok: false, error: 'aws_desktop_starting', reason: readiness.reason }, 503);
+    relay = readiness.relay;
+  }
   const now = deps.nowMs();
   const token = await mintPreviewBootstrapToken(secrets[0]!, claims.sandboxId, now);
   const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token);
@@ -353,6 +374,8 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     appPreviewUrl: url(APP_PREVIEW_PORT),
     codePreviewUrl: url(CODE_PREVIEW_PORT),
     expiresAt: now + AWS_PREVIEW_TTL_MS,
+    // Like Cloudflare: the relay state the client renews from, and only WHETHER a relay is wired.
+    ...(relay ? { relay, turnRelay: true } : {}),
   });
 }
 
