@@ -44,7 +44,10 @@ def parse(raw):
     for k in ("computerId", "fsUuid"):
         if not isinstance(d.get(k), str) or not UUID_RE.match(d[k]):
             raise LeaseError(f"lease_field_invalid: {k}")
-    if not isinstance(d.get("volumeId"), str) or not VOL_RE.match(d["volumeId"]):
+    # A provision intent precedes CreateVolume; all other leases still need an ID.
+    discover = (d.get("provision") is True and d.get("volumeId") is None
+                and d.get("rebase") is None)
+    if not discover and (not isinstance(d.get("volumeId"), str) or not VOL_RE.fullmatch(d["volumeId"])):
         raise LeaseError("lease_field_invalid: volumeId")
     _int(d.get("generation"), "generation")
     if _int(d.get("leaseEpoch"), "leaseEpoch") < 1:

@@ -77,6 +77,7 @@ check "history: env + read-only profile.d make an open terminal append each comm
 check "history: a still-running command is saved when the terminal shell is hung up before the stop" pyunit test_history_stop.HangupBeforeStop
 check "hangup: a shell outside the container pid namespace is never signalled; membership read after the pidfd pin" pyunit test_history_stop.HangupScope
 check "stop outcome: absent/clean/killed from desktop.stop" pyunit test_history_stop.StopOutcome
+check "provision: exactly one non-root EBS data volume by NVMe identity; host-sized container limits" pyunit test_provision_resources
 check "stop outcome: a killed desktop is never flush=ok; durable record written and reported at boot" pyunit test_history_stop.AgentStopRecord
 check "drift: same rules in another order is drift; netns delete failure is reported" pyunit test_history_stop.DriftOrder
 check "edge: gw1 verifier matches the Worker's shared vectors (valid, invalid, skew, framing)" pyunit test_edge.GwVectors

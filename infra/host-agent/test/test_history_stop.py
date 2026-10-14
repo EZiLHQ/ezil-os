@@ -132,7 +132,8 @@ class HistoryInjection(unittest.TestCase):
         cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
         cfg.update({"runDir": run, "imageConfigFile": img, "dataMount": os.path.join(self.home, "data"),
                     "seccompProfile": os.path.join(HERE, "..", "security", "seccomp.json")})
-        bundle = desktop.build_spec(cfg, {"generation": 1, "leaseEpoch": 1})
+        with mock.patch.object(desktop, "host_limits", return_value=(200000, 3584 * 1024**2)):
+            bundle = desktop.build_spec(cfg, {"generation": 1, "leaseEpoch": 1})
         spec = json.load(open(os.path.join(bundle, "config.json")))
         env = env_list_to_dict(spec["process"]["env"])
         self.assertEqual(env["PROMPT_COMMAND"], desktop.HISTORY_PROMPT)

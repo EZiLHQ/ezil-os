@@ -15,8 +15,10 @@ Order (each step refuses before anything is written):
 
 The marker is a bug fence, not a security fence (C-4): guest root can rewrite it.
 """
+import glob
 import json
 import os
+import re
 import stat
 import subprocess
 import time
@@ -29,14 +31,78 @@ REBASE_STATE = ".ezil-rebase-state.json"
 MOUNT_OPTS = "nosuid,nodev"
 
 
+def _device_number(number):
+    return f"{os.major(number)}:{os.minor(number)}"
+
+
+def _root_devices():
+    """Include the root partition and every backing disk (also through dm/LVM)."""
+    root = _device_number(os.stat("/").st_dev)
+    try:
+        r = subprocess.run(["lsblk", "--inverse", "--noheadings", "--raw", "--output",
+                            "MAJ:MIN", f"/dev/block/{root}"],
+                           capture_output=True, text=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Refused("root_device_unknown", "cannot inspect root backing devices") from e
+    devices = set(r.stdout.split())
+    if root not in devices or any(not re.fullmatch(r"[0-9]+:[0-9]+", d) for d in devices):
+        raise Refused("root_device_unknown", "incomplete root backing devices")
+    return devices
+
+
+def provision_volume(cfg):
+    """Resolve exactly one non-root EBS disk, then verify its EC2 attachment name."""
+    name = cfg.dataDeviceName
+    if not isinstance(name, str) or not re.fullmatch(r"/dev/[A-Za-z0-9]+", name):
+        raise Refused("data_device_name_invalid")
+    roots = _root_devices()
+    candidates = set()
+    for link in glob.glob(os.path.join(cfg.deviceByIdDir, "nvme-Amazon_Elastic_Block_Store_vol*")):
+        serial = re.fullmatch(r"nvme-Amazon_Elastic_Block_Store_vol([0-9a-f]{8,17})",
+                              os.path.basename(link))
+        if serial is None:  # partition aliases (-partN) are never candidates
+            continue
+        try:
+            dev = os.path.realpath(link, strict=True)
+            st = os.stat(dev)
+        except OSError:
+            continue  # stale udev link: not an attached candidate
+        if not stat.S_ISBLK(st.st_mode):
+            raise Refused("volume_device_not_block", dev)
+        if _device_number(st.st_rdev) not in roots:
+            candidates.add(("vol-" + serial[1], dev))
+    if len(candidates) != 1:
+        raise Refused("provision_volume_candidates",
+                      f"expected one attached non-root EBS data volume; found {len(candidates)}")
+    volume_id, dev = next(iter(candidates))
+    try:
+        r = subprocess.run(["nvme", "id-ctrl", dev, "--raw-binary"],
+                           capture_output=True, check=True, timeout=5)
+        if len(r.stdout) != 4096:
+            raise ValueError("identify controller must contain 4096 bytes")
+        # NVMe Identify Controller: serial at 4; EBS attachment name in vendor data.
+        actual_id = r.stdout[4:24].decode("ascii").strip(" \0").replace("-", "")
+        actual_name = r.stdout[3072:3104].decode("ascii").strip(" \0").removeprefix("/dev/")
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        raise Refused("volume_identity_unreadable", dev) from e
+    if actual_id != volume_id.replace("-", ""):
+        raise Refused("volume_id_mismatch", dev)
+    if actual_name != name.removeprefix("/dev/"):
+        raise Refused("data_device_name_mismatch", f"expected {name} on {dev}")
+    return volume_id
+
+
 def device_for_volume(cfg, volume_id):
     link = os.path.join(cfg.deviceByIdDir, "nvme-Amazon_Elastic_Block_Store_" + volume_id.replace("-", ""))
     try:
         dev = os.path.realpath(link, strict=True)
     except (OSError, TypeError):
         raise Refused("volume_device_missing", volume_id)
-    if not stat.S_ISBLK(os.stat(dev).st_mode):
+    st = os.stat(dev)
+    if not stat.S_ISBLK(st.st_mode):
         raise Refused("volume_device_not_block", dev)
+    if _device_number(st.st_rdev) in _root_devices():
+        raise Refused("volume_is_root_device", dev)
     return dev
 
 

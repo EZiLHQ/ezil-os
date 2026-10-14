@@ -15,7 +15,7 @@ import glob
 import json
 import os
 
-from . import http, lease as leasemod
+from . import guard, http, lease as leasemod
 from .fsops import Refused
 
 TOKEN_FILE = "tunnel.json"
@@ -66,6 +66,8 @@ def wipe(path):
 def fetch_lease(cfg):
     raw, doc, sig = leasemod.Imds(cfg).lease_and_identity()
     lease = leasemod.parse(raw)
+    if lease.get("volumeId") is None:  # parse permits this only for PROVISION
+        lease["volumeId"] = guard.provision_volume(cfg)
     _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
     _write_private(os.path.join(cfg.runDir, "identity.json"), json.dumps({"document": doc, "signature": sig}).encode())
     return lease

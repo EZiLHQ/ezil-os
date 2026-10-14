@@ -49,6 +49,9 @@ def relay_config(now_ms=None, **over):
 
 
 def scratch(test):
+    limits = mock.patch.object(desktop, "host_limits", return_value=(200000, 3584 * 1024**2))
+    limits.start()
+    test.addCleanup(limits.stop)
     d = tempfile.mkdtemp(prefix="ezil-ice-unit-")
     test.addCleanup(shutil.rmtree, d, True)
     for sub in ("state", "run", "data", "etc"):

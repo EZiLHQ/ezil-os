@@ -16,6 +16,7 @@ DEFAULTS = {
     "seccompProfile": "/etc/ezil-host/seccomp.json",
     "apparmorProfile": "ezil-desktop",
     "deviceByIdDir": "/dev/disk/by-id",
+    "dataDeviceName": "/dev/sdf",              # EC2 attachment name, not the Nitro guest path
     "imdsUrl": "http://169.254.169.254",
     "enrollUrl": None,                         # https://<app>/api/internal/computers/enroll
     "caFile": None,                            # None = system trust store
@@ -27,8 +28,8 @@ DEFAULTS = {
     "networkMode": "none",                     # none | veth-nat (see netns.py)
     "cgroupsPath": "system.slice:ezil:desktop",
     "pidsLimit": 4096,
-    "cpuQuota": 200000,
-    "memoryLimit": 8589934592,
+    "hostMemoryReserveMiB": 512,
+    "meminfoFile": "/proc/meminfo",
     "idle": {"inactivitySeconds": 600, "load1Busy": 0.5, "intervalSeconds": 30,
              "flushTimeoutSeconds": 120},
     "shutdownCmd": ["/usr/sbin/shutdown", "-h", "now"],

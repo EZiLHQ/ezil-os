@@ -474,10 +474,36 @@ def netns_down(cfg):
 
 
 # ------------------------------------------------------------------------ spec
+def host_limits(cfg):
+    """OCI quota and memory bytes, sized from the host at spec creation."""
+    reserve = cfg.hostMemoryReserveMiB
+    if not isinstance(reserve, int) or isinstance(reserve, bool) or reserve < 0:
+        raise Refused("host_memory_reserve_invalid", "hostMemoryReserveMiB must be a nonnegative integer")
+    try:
+        with open(cfg.meminfoFile, encoding="ascii") as f:
+            total = re.search(r"^MemTotal:\s+([0-9]+)[ \t]+kB[ \t]*$", f.read(), re.MULTILINE)
+    except (OSError, UnicodeError) as e:
+        raise Refused("host_memory_unreadable", cfg.meminfoFile) from e
+    if total is None or int(total[1]) <= 0:
+        raise Refused("host_memory_unreadable", "MemTotal must be positive, in kB")
+    memory = int(total[1]) * 1024 - reserve * 1024**2
+    if memory < 1024**3:
+        raise Refused("host_memory_insufficient",
+                      f"MemTotal minus reserve is {memory} bytes; at least 1 GiB required")
+    try:
+        cpus = os.sysconf("SC_NPROCESSORS_ONLN")
+    except (OSError, ValueError) as e:
+        raise Refused("host_cpu_unreadable") from e
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
+        raise Refused("host_cpu_unreadable")
+    return cpus * 100000, memory
+
+
 def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     """desktop_config: a validated relay config (relay mode) puts Cloudflare's neko ICE env
     and the derived neko credentials in place of local mode's direct-connect settings and
     per-boot random passwords."""
+    cpu_quota, memory_limit = host_limits(cfg)
     with open(cfg.imageConfigFile, encoding="utf-8") as f:
         image = json.load(f)
     host = f"ezil-gen-{lease['generation']}-e{lease['leaseEpoch']}"
@@ -543,7 +569,7 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
             "namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}, {"type": "cgroup"},
                            {"type": "network", "path": f"/var/run/netns/{cfg.netnsName}"}],
             "cgroupsPath": cfg.cgroupsPath,
-            "resources": {"cpu": {"quota": cfg.cpuQuota, "period": 100000}, "memory": {"limit": cfg.memoryLimit},
+            "resources": {"cpu": {"quota": cpu_quota, "period": 100000}, "memory": {"limit": memory_limit},
                           "pids": {"limit": cfg.pidsLimit}, "devices": [{"allow": False, "access": "rwm"}]},
             "seccomp": seccomp,
             "maskedPaths": ["/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",

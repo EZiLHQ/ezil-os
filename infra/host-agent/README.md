@@ -190,7 +190,9 @@ The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
 - `noNewPrivileges`.
 - seccomp `security/seccomp.json`.
 - AppArmor `ezil-desktop` (`security/apparmor-ezil-desktop`).
-- pids limit 4096, 2 CPU / 8 GiB.
+- pids limit 4096; CPU quota equals the online CPU count. Memory is host `MemTotal`
+  minus `hostMemoryReserveMiB` (default 512 MiB); less than 1 GiB remaining refuses
+  spec creation. `cpuQuota` and `memoryLimit` are no longer used.
 - Read-only binds for `hosts`, `hostname` (`ezil-gen-<g>-e<e>`) and `resolv.conf`.
 - tmpfs `/tmp` and `/run`.
 - `/workspace` bound `nosuid,nodev`; `/var/lib/ezil-profiles` bound `nosuid,nodev,noexec`.
@@ -265,6 +267,20 @@ It bakes in no secrets: `agent.json` holds only the enrollment URL. It was **not
 (no cloud calls); `test-units.sh` checks it statically.
 
 ## Tests
+
+A PROVISION lease may omit `volumeId` (or supply null). Before saving it, the lease
+step resolves exactly one attached non-root EBS disk from Nitro by-id serials.
+Root backing devices and partition aliases are excluded; zero or multiple disks
+refuse. NVMe controller identity must agree with the serial, and its EC2 attachment
+name must equal `dataDeviceName` (default `/dev/sdf`, not the guest NVMe path).
+Other operations, including rebase, still require a volume ID. Explicit IDs also
+refuse root backing devices before any filesystem operation.
+
+Unprivileged provisioning and resource-limit tests (mocked devices, no AWS calls):
+
+```
+python3 -m unittest discover -s infra/host-agent/test -p test_provision_resources.py -v
+```
 
 Run as root on a Linux host with Docker, runc, AppArmor and the `ezil-final` image:
 
