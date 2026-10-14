@@ -97,6 +97,17 @@ check "(drift really opened the hole) metadata reachable while the rule is missi
 check "net-ensure repairs the drift" bash -c "EZIL_HOST_CONFIG='$H/etc/agent.json' '$AGENT' net-ensure | grep -q 'EZIL-CT-FWD' && EZIL_HOST_CONFIG='$H/etc/agent.json' '$AGENT' net-check >/dev/null"
 check "metadata unreachable again after the repair" ct_cannot 169.254.169.254 8080
 check "repaired ruleset identical to the original" test "$(ip netns exec "$FH" sh -c 'iptables-save; ip6tables-save' | grep -vE '^#|^:')" = "$S1"
+# same rules, other ORDER: the ACCEPT moved ahead of the drops (count and membership unchanged)
+N0="$(ip netns exec "$FH" iptables -S EZIL-CT-FWD | grep -c '^-A')"
+ip netns exec "$FH" iptables -D EZIL-CT-FWD -i ezh0 -j ACCEPT
+ip netns exec "$FH" iptables -I EZIL-CT-FWD 1 -i ezh0 -j ACCEPT
+check "(reorder) same rule count, every desired rule still present" bash -c "[ \"\$(ip netns exec '$FH' iptables -S EZIL-CT-FWD | grep -c '^-A')\" = $N0 ] && ip netns exec '$FH' iptables -C EZIL-CT-FWD -i ezh0 -d 169.254.0.0/16 -j DROP"
+check "a reordered chain (ACCEPT ahead of the drops) is detected as drift" bash -c "! EZIL_HOST_CONFIG='$H/etc/agent.json' '$AGENT' net-check >/dev/null"
+check "(reorder really opened the hole) metadata reachable while reordered" ct_can 169.254.169.254 8080
+check "net-ensure repairs the reorder" bash -c "EZIL_HOST_CONFIG='$H/etc/agent.json' '$AGENT' net-ensure | grep -q 'EZIL-CT-FWD' && EZIL_HOST_CONFIG='$H/etc/agent.json' '$AGENT' net-check >/dev/null"
+check "metadata unreachable again after the reorder repair" ct_cannot 169.254.169.254 8080
+check "no scratch chain left behind by the drift check" bash -c "! ip netns exec '$FH' sh -c 'iptables-save; iptables-save -t nat; ip6tables-save' | grep -qE 'EZIL-CT-[A-Z0-9]+-C'"
+check "ruleset identical to the original after the reorder repair" test "$(ip netns exec "$FH" sh -c 'iptables-save; ip6tables-save' | grep -vE '^#|^:')" = "$S1"
 ip netns exec "$FH" iptables-save > "$T/fh-iptables.txt"
 check "the real host's networking was never touched (before == after)" test "$(real_host_state)" = "$BEFORE"
 log "real host: $BEFORE"

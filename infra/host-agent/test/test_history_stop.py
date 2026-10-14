@@ -274,9 +274,11 @@ class AgentStopRecord(unittest.TestCase):
         self.cfg["idle"]["flushTimeoutSeconds"] = 5
         self.a = agentmod.Agent(self.cfg, self.lease, log=lambda m: None)
 
-    def flush_with(self, outcome):
+    def flush_with(self, outcome, sync_rc=0):
+        sync = lambda argv, **kw: subprocess.CompletedProcess(argv, sync_rc, "", "")  # noqa: E731 (host IO-independent)
         with mock.patch.object(agentmod.desktop, "stop", return_value=outcome), \
-                mock.patch.object(agentmod, "dpkg_lock_held", return_value=False):
+                mock.patch.object(agentmod, "dpkg_lock_held", return_value=False), \
+                mock.patch.object(agentmod.subprocess, "run", sync):
             return self.a.flush(blockable=True)
 
     def test_killed_stop_is_never_ok(self):
@@ -285,6 +287,7 @@ class AgentStopRecord(unittest.TestCase):
         self.assertEqual(self.flush_with("killed"), "unclean")
         self.assertEqual(self.flush_with("absent"), "ok")
         self.assertEqual(self.a.stop_outcome, "killed", "worst outcome of the boot is kept")
+        self.assertEqual(self.flush_with("clean", sync_rc=1), "failed")
 
     def test_idle_tick_stops_on_unclean_and_blocks_on_busy(self):
         calls = []
@@ -309,6 +312,23 @@ class AgentStopRecord(unittest.TestCase):
         with mock.patch.object(desktop, "remove_singletons", return_value=[]), \
                 mock.patch.object(desktop, "clear_dir", return_value=0):
             self.assertEqual(desktop.host_clean(self.cfg)["lastStop"]["outcome"], "killed")
+
+    def test_shutdown_records_the_outcome_before_the_volume_unmounts(self):
+        p = os.path.join(self.cfg.dataMount, desktop.STOP_RECORD)
+        seen = []
+
+        def run(argv, **kw):
+            if argv[0] == "umount":
+                seen.append(os.path.exists(p))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(agentmod.tunnel, "fence"), mock.patch.object(agentmod.time, "sleep"), \
+                mock.patch.object(agentmod.desktop, "stop", return_value="killed"), \
+                mock.patch.object(agentmod.desktop, "overlay_umount"), mock.patch.object(agentmod.desktop, "netns_down"), \
+                mock.patch.object(agentmod.guard, "clear_stamp"), mock.patch.object(agentmod.guard, "is_mounted", return_value=True), \
+                mock.patch.object(agentmod.subprocess, "run", run):
+            self.a.shutdown("stop:cap flush=unclean")
+        self.assertEqual(seen, [True], "the record must exist when the data volume is unmounted")
+        self.assertEqual(desktop.read_stop_record(self.cfg)["outcome"], "killed")
 
     def test_record_refused_without_the_data_volume(self):
         with mock.patch.object(agentmod.guard, "is_mounted", return_value=False):

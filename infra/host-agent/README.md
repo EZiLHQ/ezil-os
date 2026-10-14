@@ -66,6 +66,59 @@ and **wipes** the token.
 Then the agent stops the desktop, unmounts the overlay, syncs, unmounts the data volume
 and runs `shutdown -h now`.
 
+**Stop outcome is recorded, never assumed.** `desktop.stop()` first hangs up the terminal
+shells (below), then sends TERM, waits the grace, and only then KILLs. It returns:
+- `absent` if nothing was running;
+- `clean` if the desktop exited after TERM within the grace;
+- `killed` if KILL was needed.
+
+How the outcome is used:
+- A killed desktop makes the flush `unclean`, never `ok`.
+- The idle stop still proceeds on `unclean`: the desktop is already gone, and a running
+  computer without a desktop only bills. It is logged as `shutdown: idle flush=unclean`.
+- Before the data volume unmounts, the agent writes the boot's worst outcome durably to
+  the data root (`.ezil-last-stop.json`, 0600, next to the marker, not reachable by the
+  guest) with its reason, epoch and time.
+- The next boot reports it in the `clean` step (`lastStop`), so an unclean stop is in
+  the boot log. Reporting it to the control plane (for example at enrollment) is an open
+  item.
+
+## Terminal history across stop and cold boot
+
+Bash writes `~/.bash_history` only when a shell exits, and a stop never lets an open
+terminal exit, so without this the commands typed in an open terminal were lost. HOME
+(`/root`) is on the overlay upper, on the data volume, so a written history file already
+survives. The fix is injected **from the host**, so the image and the user's rc files are
+untouched.
+
+**How terminals are spawned.** The only user terminal is code-server's integrated one:
+1. The OCI env is passed to `start-desktop.sh`.
+2. `start-desktop.sh` execs `start-neko.sh`.
+3. `start-neko.sh` runs `supervise_app` → `setsid code-server` (start-neko.sh:1975).
+4. code-server starts `bash --init-file shellIntegration-bash.sh`. That script sources
+   `~/.bashrc` and keeps an inherited `PROMPT_COMMAND`, which it evals from its own prompt
+   function.
+
+The image's openbox menu has no terminal entry, and `xterm` is not launched.
+
+**Two mechanisms:**
+1. **Per prompt.** The container env carries `PROMPT_COMMAND="history -a; shopt -s
+   histappend"`. Any image `PROMPT_COMMAND` is kept after it. Every completed command is
+   appended as the next prompt is drawn, so it survives even a KILL or power loss.
+   - A read-only bind `/etc/profile.d/ezil-history.sh` does the same for login shells
+     that reset the env.
+   - The user's own `~/.bashrc` still runs later and wins.
+2. **Before the stop.** Every bash/zsh **attached to a terminal** in the desktop gets
+   SIGHUP, signalled through a pidfd so a recycled pid is never hit. This is what happens
+   when a terminal window closes: the shell saves its history, including a command that
+   is **still running**, and exits.
+   - Scripts (no tty) and other programs are not hung up.
+   - A forced KILL (`teardown --kill`) skips this.
+
+**What is not preserved:** running processes, RAM, shell state (cwd, variables) and
+terminal scrollback. zsh/fish need their own per-command options (zsh
+`INC_APPEND_HISTORY`), and only the pre-stop hangup covers zsh.
+
 **Control-plane stop.** warn → flush (cannot be blocked) → the same ordered stop. The agent
 **never renews its lease** and makes no outbound call after enrollment.
 
@@ -97,6 +150,15 @@ points at 10.200.0.1. Three dedicated chains carry the rules:
 - the drift check also requires IPv6 to be off on `ezh0`, and `net-ensure` turns it back off;
 - `net-check` reports drift and `net-ensure` repairs it.
 
+"Exactly as desired" includes **rule order**. If an ACCEPT moves ahead of the drops, every
+rule is still present, but the metadata, private and spoof holes are open again.
+- iptables rewrites rules when it prints them: it reorders options and adds implicit
+  matches (`-p udp` gains `-m udp`). So the comparison form comes from iptables itself.
+- The desired rules are built in an **unreferenced** scratch chain `<chain>-C`, which no
+  packet can reach. That chain is listed and removed again, and its listing must equal
+  the live chain line for line.
+- A failed `ip netns delete` is reported (`netns_delete_failed`), not ignored.
+
 The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
 
 `test/test-network.sh` exercises all of this **without touching the machine's networking**.
@@ -115,7 +177,8 @@ The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
   deliberately re-enabled on both ends (test only), the container still cannot reach the
   host over v6; the drift check reports it, and `net-ensure` restores it.
 - Re-applying the rules leaves `iptables-save` identical. A deleted rule is detected as
-  drift, actually reopens the hole, and is repaired.
+  drift, actually reopens the hole, and is repaired. The same holds for a **reordered**
+  chain (ACCEPT moved first, same count and members). No scratch chain is left behind.
 - The real host's `ezh0`, `EZIL-CT` rules, `ip_forward` and test links are compared before
   and after.
 
@@ -269,6 +332,31 @@ directory, and it counts as killed only if the named check fails.
 | M39 | drift check ignores IPv6 on `ezh0` | `test-network`: drift reported |
 | M40 | `CAP_NET_RAW` back in the spec | `test-network` (probe container) |
 | M41 | IPv6 never disabled on `ezh0` (both places) | `test-network`: no IPv6 address. Removing only the early, pre-link-up setting survives: `ensure_rules` sets it as well, and the early one only closes the window before the rules run |
+| M42 | drift check compares rules as a set (order ignored) | `test-units`: reordered chain is drift |
+| M43 | same as M42 | `test-network`: real reordered chain (ACCEPT first) detected |
+| M44 | history `PROMPT_COMMAND` not injected | `test-units`: env + profile.d (real pty bash) |
+| M45 | profile.d bind removed | `test-units`: env + profile.d |
+| M46 | hangup ignores the tty test (hits scripts) | `test-units`: scripts and non-shells not hung up |
+| M47 | bash not hung up | `test-units`: running command saved on hangup |
+| M48 | no hangup before the stop | `test-boot`: [host B] command still running at stop survived |
+| M49 | killed desktop reported `flush=ok` | `test-units`: never ok after KILL |
+| M50 | `stop()` always says clean | `test-units`: absent/clean/killed |
+| M51 | stop record not written on shutdown | `test-units`: record exists before the volume unmounts |
+| M52 | netns delete failure ignored | `test-units`: failure reported |
+| M53 | stop record written without the data volume mounted | `test-units`: refused, nothing written |
+| M54 | boot does not report `lastStop` | `test-units`: reported at boot |
+| M55 | `PROMPT_COMMAND` without `history -a` | `test-units`: open terminal appends each command |
+
+`test/test_history_stop.py` (run by `test-units`) is unprivileged. Its history tests drive
+**real interactive bash shells on ptys**. There is a control showing that a plain shell
+loses the line on KILL, and a VS Code-style prompt wrapper. `test-boot` then does it on the
+real desktop:
+1. On host A, a terminal is spawned exactly as code-server spawns one (its environment,
+   its bash integration script), with one finished and one still-running command, and it
+   is left open.
+2. Host A goes through the idle stop.
+3. Host B (same volume, cold boot) has both commands in `~/.bash_history` and reports
+   `lastStop`.
 
 `worker/src/neko-persistent-profiles.test.ts` (bun) executes the real `start-neko.sh`
 profile block. It fails against the pre-change script.
@@ -311,6 +399,12 @@ These are interim or prototype:
   the gateway lane and does not exist yet.
 - **Enrollment response shape** `{tunnelToken, controlKey}` and the HMAC control
   protocol are defined here and need the app and gateway lanes to adopt them.
+- **Stop outcome to the control plane.** `lastStop` is only in the boot log for now. The
+  app should receive it, for example in the enrollment request, so the UI can say "your
+  last session did not stop cleanly".
+- **Teardown leaves rules.** `netns_down` removes the namespace and veth, but leaves the
+  `EZIL-CT-*` chains and their jumps. They are DROPs that only match `ezh0`, and the next
+  boot's `ensure_rules` rebuilds them.
 - **Not tested:**
   - code-server extensions with native binaries under `noexec` (§3a.9);
   - an NVMe device resolved on real Nitro hardware;
