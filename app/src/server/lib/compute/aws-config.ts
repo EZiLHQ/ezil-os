@@ -37,9 +37,86 @@ export interface AwsAdmissionCaps {
     globalMonthlyEgressGb: number;
 }
 
+/**
+ * One region a computer may be created in, with its own running cap.
+ *
+ * 🔴 A computer is pinned to its data volume's region and zone. The region is
+ * chosen ONCE, at creation (first region in `AWS_REGIONS` order with room),
+ * and every later wake uses the placement's region; a full region refuses
+ * (`region_capacity`), it never moves a computer.
+ *
+ * `maxRunning` is the computers this deployment may run there. It must come
+ * from the region's VERIFIED On-Demand Standard vCPU quota minus every other
+ * workload in the same quota (e.g. ezil-db-aws holds 4 of Mumbai's 5), divided
+ * by the vCPU of the largest tier type. There is no default: an unset or
+ * malformed cap disables AWS admission.
+ */
+export interface AwsRegionConfig {
+    name: string;
+    maxRunning: number;
+}
+
 export type AwsAdmissionConfig =
     | { enabled: false; reason: 'aws_disabled' | 'aws_config_invalid'; invalid?: string[] }
-    | { enabled: true; killSwitch: boolean; caps: AwsAdmissionCaps };
+    | { enabled: true; killSwitch: boolean; caps: AwsAdmissionCaps; regions: AwsRegionConfig[] };
+
+/** Ordered creation preference, e.g. `ap-south-1,us-east-1`. */
+export const AWS_REGIONS_ENV = 'AWS_REGIONS';
+/** At most this many regions: each is a separate lifecycle deployment and quota. */
+export const MAX_AWS_REGIONS = 4;
+/** Same grammar as infra/app-computers/lib/lifecycle/deployment.ts REGION_PATTERN. */
+export const AWS_REGION_PATTERN = /^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$/;
+
+/** `ap-south-1` → `EZIL_AWS_MAX_RUNNING_AP_SOUTH_1`. */
+export function regionCapEnv(region: string): string {
+    return `EZIL_AWS_MAX_RUNNING_${region.toUpperCase().replace(/-/g, '_')}`;
+}
+
+/**
+ * Computer size tiers (founder decision 2026-10-14). Types are in preference
+ * order; the first is what a new computer records. Every type must be in the
+ * lifecycle deployment's instance-type allowlist, or the intent is refused.
+ * - free: 2 vCPU / 4 GiB. Burstable, launched with standard CPU credits
+ *   (T3 defaults to unlimited, which bills surplus CPU).
+ * - plus: 2 vCPU / 8 GiB.
+ */
+export const AWS_TIERS = {
+    free: ['t3a.medium', 't3.medium'],
+    plus: ['m6i.large'],
+} as const satisfies Record<string, readonly string[]>;
+export type AwsTier = keyof typeof AWS_TIERS;
+
+export function isAwsTier(value: unknown): value is AwsTier {
+    return typeof value === 'string' && Object.prototype.hasOwnProperty.call(AWS_TIERS, value);
+}
+
+/** The instance type a new computer of `tier` records. Throws on an unknown tier: never a default size. */
+export function instanceTypeForTier(tier: AwsTier): string {
+    if (!isAwsTier(tier)) throw new Error('aws_tier_invalid');
+    return AWS_TIERS[tier][0];
+}
+
+/** Regions in order, or the names of the invalid settings. Never a partial list. */
+export function readAwsRegions(env: Env): { ok: true; regions: AwsRegionConfig[] } | { ok: false; invalid: string[] } {
+    const raw = env[AWS_REGIONS_ENV];
+    const names = raw === undefined ? [] : raw.split(',');
+    if (
+        names.length === 0 ||
+        names.length > MAX_AWS_REGIONS ||
+        names.some((n) => !AWS_REGION_PATTERN.test(n)) ||
+        new Set(names).size !== names.length
+    ) {
+        return { ok: false, invalid: [AWS_REGIONS_ENV] };
+    }
+    const regions: AwsRegionConfig[] = [];
+    const invalid: string[] = [];
+    for (const name of names) {
+        const n = strictCount(env[regionCapEnv(name)]);
+        if (n === null) invalid.push(regionCapEnv(name));
+        else regions.push({ name, maxRunning: n });
+    }
+    return invalid.length > 0 ? { ok: false, invalid } : { ok: true, regions };
+}
 
 export const AWS_CAP_ENV: Record<keyof AwsAdmissionCaps, string> = {
     maxRunning: 'AWS_MAX_RUNNING',
@@ -67,8 +144,10 @@ export function readAwsAdmissionConfig(env: Env = process.env): AwsAdmissionConf
         if (n === null) invalid.push(name);
         else caps[key] = n;
     }
-    if (invalid.length > 0) return { enabled: false, reason: 'aws_config_invalid', invalid };
+    const regions = readAwsRegions(env);
+    if (!regions.ok) invalid.push(...regions.invalid);
+    if (invalid.length > 0 || !regions.ok) return { enabled: false, reason: 'aws_config_invalid', invalid };
     // Kill switch: anything but absent or exactly '0' is ON.
     const kill = env.EZIL_AWS_KILL_SWITCH;
-    return { enabled: true, killSwitch: kill !== undefined && kill !== '0', caps: caps as AwsAdmissionCaps };
+    return { enabled: true, killSwitch: kill !== undefined && kill !== '0', caps: caps as AwsAdmissionCaps, regions: regions.regions };
 }

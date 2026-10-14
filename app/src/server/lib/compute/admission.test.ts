@@ -6,8 +6,8 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { decideAdmission, runAdmission } from './admission';
-import { AWS_CAP_ENV, readAwsAdmissionConfig, type AwsAdmissionConfig } from './aws-config';
+import { decideAdmission, runAdmission, type RegionalCounters, type RegionPlan } from './admission';
+import { AWS_CAP_ENV, AWS_TIERS, instanceTypeForTier, isAwsTier, readAwsAdmissionConfig, regionCapEnv, type AwsAdmissionConfig } from './aws-config';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { leasePlacement, withAdmission, type AdmissionCounters } from './placement';
 
@@ -18,6 +18,8 @@ const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
 const C2 = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
 const C3 = 'c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3';
 const NOW = new Date('2026-10-13T12:00:00Z');
+/** Every AWS row lives in a region; seeded rows default to the configured one. */
+const awsRow = (over: Parameters<typeof placementRow>[0]) => placementRow({ region: 'ap-south-1', ...over });
 const GB = 1_000_000_000;
 
 const ENV = {
@@ -27,6 +29,8 @@ const ENV = {
     EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
     EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50',
     EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
+    AWS_REGIONS: 'ap-south-1',
+    EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
 };
 const config = readAwsAdmissionConfig(ENV);
 const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'targetPlacementOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { targetOwnerId: U1, targetPlacementOwnerId: null, targetDeleted: false, targetForeignUsage: 0, runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: [] };
@@ -49,6 +53,7 @@ describe('config: absent or invalid means disabled', () => {
             enabled: true,
             killSwitch: false,
             caps: { maxRunning: 2, userMonthlyHours: 100, globalMonthlyHours: 600, userMonthlyEgressGb: 50, globalMonthlyEgressGb: 200 },
+            regions: [{ name: 'ap-south-1', maxRunning: 2 }],
         });
     });
 
@@ -119,7 +124,7 @@ describe('runAdmission (transactional)', () => {
     });
 
     it('takes the global lock FIRST, reads after it, issues no isolation change', async () => {
-        const { db, statements } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
+        const { db, statements } = createFakePlacementDb({ placements: [awsRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: true, placement: { state: 'LEASED', leaseEpoch: 1 } });
         const sqls = statements.map((s) => s.sql);
         expect(sqls[0]).toBe('BEGIN');
@@ -127,14 +132,15 @@ describe('runAdmission (transactional)', () => {
         expect(sqls.slice(2, 9).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual([
             'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-user', 'duplicates', 'usage-month',
         ]);
-        expect(sqls[9]).toMatch(/placement:read/); // the CAS duplicate pre-check
-        expect(sqls[10]).toMatch(/placement:cas/);
-        expect(sqls[11]).toBe('COMMIT');
+        expect(sqls[9]).toMatch(/placement:read/); // the lease's home region, read under the lock
+        expect(sqls[10]).toMatch(/placement:read/); // the CAS duplicate pre-check
+        expect(sqls[11]).toMatch(/placement:cas/);
+        expect(sqls[12]).toBe('COMMIT');
         expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 
     it('the counter SQL counts running-class aws-ec2 rows and the user\'s other aws-ec2 rows by owner_user_id', async () => {
-        const { db, statements } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
+        const { db, statements } = createFakePlacementDb({ placements: [awsRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
         await runAdmission(db, lease(U1, C1), deps);
         const running = statements.find((s) => /count-running/.test(s.sql))!;
         expect(running.sql).toMatch(/provider = 'aws-ec2' AND state IN \(/);
@@ -152,9 +158,9 @@ describe('runAdmission (transactional)', () => {
         // AWS_MAX_RUNNING=2, one computer already RUNNING: one slot left, two contenders.
         const { db, placements } = createFakePlacementDb({
             placements: [
-                placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING' }),
-                placementRow({ computer_id: C1, owner_user_id: U1 }),
-                placementRow({ computer_id: C2, owner_user_id: U2 }),
+                awsRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING' }),
+                awsRow({ computer_id: C1, owner_user_id: U1 }),
+                awsRow({ computer_id: C2, owner_user_id: U2 }),
             ],
             computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }, { id: C3, user_id: U3 }],
         });
@@ -165,7 +171,7 @@ describe('runAdmission (transactional)', () => {
     });
 
     it('two concurrent leases of the same computer: exactly one winner, the loser sees cas_conflict', async () => {
-        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
+        const { db, placements } = createFakePlacementDb({ placements: [awsRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
         const results = await Promise.all([runAdmission(db, lease(U1, C1), deps), runAdmission(db, lease(U1, C1), deps)]);
         expect(results.filter((r) => r.admitted)).toHaveLength(1);
         expect(results.find((r) => !r.admitted)).toMatchObject({ reason: 'cas_conflict' });
@@ -174,7 +180,7 @@ describe('runAdmission (transactional)', () => {
 
     it('one AWS computer per user, even when the other computer is soft-deleted', async () => {
         const { db } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C1 }), placementRow({ computer_id: C2, state: 'RETIRED' })],
+            placements: [awsRow({ computer_id: C1 }), awsRow({ computer_id: C2, state: 'RETIRED' })],
             computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U1 }],
         });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'user_has_aws_computer' });
@@ -183,8 +189,8 @@ describe('runAdmission (transactional)', () => {
     it('two concurrent creates for one user: exactly one AWS placement', async () => {
         const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U1 }] });
         const results = await Promise.all([
-            runAdmission(db, { kind: 'create', userId: U1, computerId: C1 }, deps),
-            runAdmission(db, { kind: 'create', userId: U1, computerId: C2 }, deps),
+            runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps),
+            runAdmission(db, { kind: 'create', userId: U1, computerId: C2, tier: 'free' }, deps),
         ]);
         expect(results.filter((r) => r.admitted)).toHaveLength(1);
         expect(results.find((r) => !r.admitted)).toMatchObject({ reason: 'user_has_aws_computer' });
@@ -194,7 +200,7 @@ describe('runAdmission (transactional)', () => {
 
     it('usage from the ledger closes admission at the hours cap (open row counted to now)', async () => {
         const { db } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C1 })],
+            placements: [awsRow({ computer_id: C1 })],
             computers: [{ id: C1, user_id: U1 }],
             usage: [{ computer_id: C1, user_id: U1, started_at: new Date(NOW.getTime() - 100 * 3_600_000), stopped_at: null, egress_bytes: null }],
         });
@@ -203,14 +209,14 @@ describe('runAdmission (transactional)', () => {
 
     it("a create for another user's computer is refused before any write", async () => {
         const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: U2 }] });
-        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1 }, deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
-        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C2 }, deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
+        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
+        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C2, tier: 'free' }, deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
         expect(placements).toEqual([]);
     });
 
     it('a STOPPED Cloudflare row is never leased under AWS admission', async () => {
         const { db, placements } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C1, provider: 'cloudflare', workspace_store: 'r2' })],
+            placements: [awsRow({ computer_id: C1, provider: 'cloudflare', workspace_store: 'r2' })],
             computers: [{ id: C1, user_id: U1 }],
         });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'cas_conflict' });
@@ -220,16 +226,16 @@ describe('runAdmission (transactional)', () => {
     it('a re-keyed computer row cannot hide an AWS computer that has run (usage ledger counts)', async () => {
         // C3's ezil_computers row is gone (re-keyed by its owner), but the ledger metered it to U1.
         const { db } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C3 })],
+            placements: [awsRow({ computer_id: C3 })],
             computers: [{ id: C1, user_id: U1 }],
             usage: [{ computer_id: C3, user_id: U1, started_at: new Date('2026-09-01T00:00:00Z'), stopped_at: new Date('2026-09-01T01:00:00Z'), egress_bytes: 0 }],
         });
-        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1 }, deps)).toMatchObject({ admitted: false, reason: 'user_has_aws_computer' });
+        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps)).toMatchObject({ admitted: false, reason: 'user_has_aws_computer' });
     });
 
     it('a placement whose usage was metered to another user is not leasable by the current row owner', async () => {
         const { db, placements } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C1 })],
+            placements: [awsRow({ computer_id: C1 })],
             computers: [{ id: C1, user_id: U1 }],
             usage: [{ computer_id: C1, user_id: U2, started_at: new Date('2026-09-01T00:00:00Z'), stopped_at: new Date('2026-09-01T01:00:00Z'), egress_bytes: 0 }],
         });
@@ -238,13 +244,13 @@ describe('runAdmission (transactional)', () => {
     });
 
     it('a soft-deleted computer is not admitted', async () => {
-        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1, deleted_at: NOW }] });
+        const { db } = createFakePlacementDb({ placements: [awsRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1, deleted_at: NOW }] });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'computer_deleted' });
     });
 
     it('a malformed egress_bytes refuses admission instead of counting as 0', async () => {
         const { db, placements } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C1 })],
+            placements: [awsRow({ computer_id: C1 })],
             computers: [{ id: C1, user_id: U1 }],
             usage: [{ computer_id: C1, user_id: U1, started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: 'lots' }],
         });
@@ -254,7 +260,7 @@ describe('runAdmission (transactional)', () => {
 
     it('refuses outside READ COMMITTED before reading any counter', async () => {
         const { db, statements, placements } = createFakePlacementDb(
-            { placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] },
+            { placements: [awsRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] },
             { isolation: 'repeatable read' },
         );
         await expect(runAdmission(db, lease(U1, C1), deps)).rejects.toThrow(/READ COMMITTED/);
@@ -269,27 +275,27 @@ describe('runAdmission (transactional)', () => {
         it('(a) the owner re-keys a NEVER-RUN computer to dodge the per-user check: still counted', async () => {
             // C9's ezil_computers row was re-keyed away by U1; no usage was ever metered.
             const { db, placements } = createFakePlacementDb({
-                placements: [placementRow({ computer_id: C9, owner_user_id: U1, state: 'STOPPED' })],
+                placements: [awsRow({ computer_id: C9, owner_user_id: U1, state: 'STOPPED' })],
                 computers: [{ id: C1, user_id: U1 }],
             });
-            expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1 }, deps)).toMatchObject({ admitted: false, reason: 'user_has_aws_computer' });
+            expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps)).toMatchObject({ admitted: false, reason: 'user_has_aws_computer' });
             expect(placements).toHaveLength(1);
         });
 
         it('(b) after account deletion, another user re-inserts a computer row with the same id: refused', async () => {
             const { db, placements } = createFakePlacementDb({
-                placements: [placementRow({ computer_id: C9, owner_user_id: GONE, state: 'STOPPED' })],
+                placements: [awsRow({ computer_id: C9, owner_user_id: GONE, state: 'STOPPED' })],
                 computers: [{ id: C9, user_id: U2 }], // U2 inserted a row with the orphaned id
             });
             const leased = await runAdmission(db, lease(U2, C9), deps);
             expect(leased).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
-            const created = await runAdmission(db, { kind: 'create', userId: U2, computerId: C9 }, deps);
+            const created = await runAdmission(db, { kind: 'create', userId: U2, computerId: C9, tier: 'free' }, deps);
             expect(created).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
             expect(placements).toEqual([expect.objectContaining({ owner_user_id: GONE, state: 'STOPPED', lease_epoch: 0 })]);
         });
 
         it('the lease CAS itself only matches the owner, even if the decision were bypassed', async () => {
-            const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: C9, owner_user_id: GONE })] });
+            const { db, placements } = createFakePlacementDb({ placements: [awsRow({ computer_id: C9, owner_user_id: GONE })] });
             const r = await withAdmission(db, (tx, lock) =>
                 leasePlacement(tx, lock, { computerId: C9, ownerUserId: U2, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: NOW }),
             );
@@ -300,7 +306,7 @@ describe('runAdmission (transactional)', () => {
         it('create records the session user as owner, lower-cased, whatever ezil_computers says later', async () => {
             const UA = 'abcdefab-cdef-4abc-8def-abcdefabcdef'; // letters, so case actually matters
             const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: UA }] });
-            const r = await runAdmission(db, { kind: 'create', userId: UA.toUpperCase(), computerId: C1 }, deps);
+            const r = await runAdmission(db, { kind: 'create', userId: UA.toUpperCase(), computerId: C1, tier: 'free' }, deps);
             expect(r).toMatchObject({ admitted: true, placement: { ownerUserId: UA } });
             expect(placements[0]!.owner_user_id).toBe(UA);
         });
@@ -308,9 +314,141 @@ describe('runAdmission (transactional)', () => {
 
     it('duplicate placements anywhere close admission', async () => {
         const { db } = createFakePlacementDb({
-            placements: [placementRow({ computer_id: C1 }), placementRow({ computer_id: C2 }), placementRow({ computer_id: C2 })],
+            placements: [awsRow({ computer_id: C1 }), awsRow({ computer_id: C2 }), awsRow({ computer_id: C2 })],
             computers: [{ id: C1, user_id: U1 }],
         });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'duplicate_placement' });
+    });
+});
+
+describe('regions and tiers (founder decisions 2026-10-14)', () => {
+    const TWO = { ...ENV, AWS_REGIONS: 'ap-south-1,us-east-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2' };
+    const deps2 = (env: Record<string, string>) => ({ env, now: () => NOW });
+
+    describe('config', () => {
+        it('reads regions in order with their own caps', () => {
+            const cfg = readAwsAdmissionConfig(TWO);
+            expect(cfg.enabled && cfg.regions).toEqual([{ name: 'ap-south-1', maxRunning: 2 }, { name: 'us-east-1', maxRunning: 2 }]);
+            expect(regionCapEnv('us-east-1')).toBe('EZIL_AWS_MAX_RUNNING_US_EAST_1');
+        });
+
+        it.each([undefined, '', 'ap-south-1,', 'AP-SOUTH-1', 'ap-south-1,ap-south-1', 'mars-east-1', 'ap-south-1 ,us-east-1', 'ap-south-1,us-east-1,us-east-2,us-west-2,eu-west-1'])(
+            'AWS_REGIONS=%j disables admission',
+            (v) => {
+                expect(readAwsAdmissionConfig({ ...TWO, AWS_REGIONS: v })).toEqual({ enabled: false, reason: 'aws_config_invalid', invalid: ['AWS_REGIONS'] });
+            },
+        );
+
+        it.each([undefined, '', '-1', '1.5', 'x'])('a region cap of %j disables admission (no default, never 64)', (v) => {
+            expect(readAwsAdmissionConfig({ ...TWO, EZIL_AWS_MAX_RUNNING_US_EAST_1: v })).toEqual({
+                enabled: false,
+                reason: 'aws_config_invalid',
+                invalid: ['EZIL_AWS_MAX_RUNNING_US_EAST_1'],
+            });
+        });
+
+        it('tiers: free is 2 vCPU / 4 GiB burstable first, plus is 2 vCPU / 8 GiB; unknown tiers never get a default', () => {
+            expect(AWS_TIERS).toEqual({ free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'] });
+            expect(instanceTypeForTier('free')).toBe('t3a.medium');
+            expect(instanceTypeForTier('plus')).toBe('m6i.large');
+            for (const t of ['premium', '', 'toString', '__proto__', 'constructor', null, undefined]) {
+                expect(isAwsTier(t)).toBe(false);
+                expect(() => instanceTypeForTier(t as never)).toThrow('aws_tier_invalid');
+            }
+        });
+    });
+
+    describe('decideAdmission with a region plan (pure)', () => {
+        const cfg = (ap: number, us: number) => readAwsAdmissionConfig({ ...TWO, AWS_MAX_RUNNING: '50', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: String(ap), EZIL_AWS_MAX_RUNNING_US_EAST_1: String(us) });
+        const decide = (c: AwsAdmissionConfig, region: RegionPlan, counters: Partial<typeof empty> & RegionalCounters = {}) =>
+            decideAdmission({ config: c, counters: { ...empty, ...counters }, userId: U1, now: NOW, region });
+
+        it('create picks the first region in order with room', () => {
+            expect(decide(cfg(2, 2), { kind: 'create' })).toEqual({ admit: true, region: 'ap-south-1' });
+            expect(decide(cfg(0, 2), { kind: 'create' })).toEqual({ admit: true, region: 'us-east-1' });
+            expect(decide(cfg(2, 2), { kind: 'create' }, { runningCount: 2 })).toMatchObject({ admit: false, reason: 'region_capacity' });
+            expect(decide(cfg(0, 0), { kind: 'create' })).toMatchObject({ admit: false, reason: 'region_capacity' });
+        });
+
+        it('without exact per-region counts the global count bounds every region (never over-admits)', () => {
+            // One computer runs somewhere: with AP cap 1 the global count fills AP even if that computer is in the US.
+            expect(decide(cfg(1, 5), { kind: 'create' }, { runningCount: 1 })).toEqual({ admit: true, region: 'us-east-1' });
+            // Exact counts, when supplied, are used instead.
+            expect(decide(cfg(1, 5), { kind: 'create' }, { runningCount: 1, runningByRegion: { 'ap-south-1': 0, 'us-east-1': 1 } })).toEqual({ admit: true, region: 'ap-south-1' });
+            expect(decide(cfg(1, 1), { kind: 'create' }, { runningCount: 1, runningByRegion: { 'ap-south-1': 1, 'us-east-1': 1 } })).toMatchObject({ reason: 'region_capacity' });
+        });
+
+        it('lease stays in its home region: full home refuses even when another region has room', () => {
+            expect(decide(cfg(2, 2), { kind: 'lease', region: 'us-east-1' })).toEqual({ admit: true, region: 'us-east-1' });
+            expect(decide(cfg(0, 5), { kind: 'lease', region: 'ap-south-1' })).toMatchObject({ admit: false, reason: 'region_capacity' });
+            expect(decide(cfg(2, 2), { kind: 'lease', region: 'eu-west-1' })).toMatchObject({ admit: false, reason: 'region_not_configured' });
+            expect(decide(cfg(2, 2), { kind: 'lease', region: null })).toMatchObject({ admit: false, reason: 'region_not_configured' });
+        });
+
+        it('region refusals rank after the global caps and are listed with them', () => {
+            expect(decide(cfg(0, 0), { kind: 'create' }, { runningCount: 50 })).toMatchObject({ reason: 'max_running', reasons: ['max_running', 'region_capacity'] });
+        });
+    });
+
+    describe('runAdmission across regions (transactional)', () => {
+        it('Mumbai full → a new computer is created in the US with the tier type; both full → refused, nothing written', async () => {
+            const env = { ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0' };
+            const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }] });
+            const r = await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free', fields: { region: 'ap-south-1', instanceType: 'c6i.xlarge' } }, deps2(env));
+            expect(r).toMatchObject({ admitted: true, placement: { region: 'us-east-1', instanceType: 't3a.medium', state: 'PROVISIONING' } });
+            const full = await runAdmission(db, { kind: 'create', userId: U2, computerId: C2, tier: 'plus' }, deps2({ ...env, EZIL_AWS_MAX_RUNNING_US_EAST_1: '1' }));
+            expect(full).toMatchObject({ admitted: false, reason: 'region_capacity' });
+            expect(placements).toHaveLength(1);
+        });
+
+        it('plus tier records the 8 GiB type', async () => {
+            const { db } = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }] });
+            expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'plus' }, deps2(TWO))).toMatchObject({
+                admitted: true,
+                placement: { region: 'ap-south-1', instanceType: 'm6i.large' },
+            });
+        });
+
+        it('a wake never hops regions: home region full or unconfigured refuses and the placement is unchanged', async () => {
+            const seed = () =>
+                createFakePlacementDb({
+                    placements: [placementRow({ computer_id: C1, region: 'ap-south-1' }), placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'us-east-1' })],
+                    computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
+                });
+            const lease = { kind: 'lease', userId: U1, computerId: C1, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date(NOW.getTime() + 3_600_000) } as const;
+            const a = seed();
+            expect(await runAdmission(a.db, lease, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '9' }))).toMatchObject({
+                admitted: false,
+                reason: 'region_capacity',
+            });
+            expect(a.placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0, region: 'ap-south-1' });
+            const b = seed();
+            expect(await runAdmission(b.db, lease, deps2({ ...ENV, AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '9' }))).toMatchObject({
+                admitted: false,
+                reason: 'region_not_configured',
+            });
+            expect(b.placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
+            const c = seed();
+            expect(await runAdmission(c.db, lease, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2' }))).toMatchObject({
+                admitted: true,
+                placement: { state: 'LEASED', region: 'ap-south-1' },
+            });
+        });
+
+        it('a legacy aws-ec2 row without a region is not leased', async () => {
+            const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
+            const lease = { kind: 'lease', userId: U1, computerId: C1, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date(NOW.getTime() + 3_600_000) } as const;
+            expect(await runAdmission(db, lease, deps2(TWO))).toMatchObject({ admitted: false, reason: 'region_not_configured' });
+            expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
+        });
+
+        it('an unknown tier refuses before a single statement', async () => {
+            const { db, statements } = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }] });
+            expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'premium' as never }, deps2(TWO))).toMatchObject({
+                admitted: false,
+                reason: 'aws_tier_invalid',
+            });
+            expect(statements).toEqual([]);
+        });
     });
 });
