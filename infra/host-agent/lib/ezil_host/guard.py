@@ -23,7 +23,7 @@ import stat
 import subprocess
 import time
 
-from . import config as cfgmod
+from . import canary, config as cfgmod
 from .fsops import DIR_FLAGS, Refused, read_regular_at, write_file_durable_at
 
 MARKER = ".ezil-marker.json"
@@ -194,7 +194,21 @@ def new_marker(lease, digest):
 
 
 def run_guard(cfg, lease, rebase_runner=None):
-    """Steps 1-6. Leaves the data volume mounted rw on success; unmounted on refusal."""
+    """Steps 1-6, with optional public console diagnostics."""
+    try:
+        verdict = _run_guard(cfg, lease, rebase_runner)
+    except Refused:
+        canary.guard_result(cfg, "refused")
+        raise
+    except (Exception, SystemExit):
+        canary.guard_result(cfg, "error")
+        raise
+    canary.guard_result(cfg, verdict)
+    return verdict
+
+
+def _run_guard(cfg, lease, rebase_runner=None):
+    """Leaves the data volume mounted rw on success; unmounted on refusal."""
     digest = cfgmod.host_digest(cfg)
     stamp = os.path.join(cfg.runDir, "guard-ok")
     try:

@@ -34,6 +34,7 @@ DEFAULTS = {
              "flushTimeoutSeconds": 120},
     "shutdownCmd": ["/usr/sbin/shutdown", "-h", "now"],
     "stopWarnSeconds": 60,
+    "canaryConsole": False,                   # opt-in, bounded public diagnostics on ttyS0
     # Host edge (gateway contract GW-2/GW-3): cloudflared's only ingress target. It forwards
     # verified requests to the desktop at edgeUpstreamHost on the edgePorts the CF route exposes.
     "edgeBind": "127.0.0.1",

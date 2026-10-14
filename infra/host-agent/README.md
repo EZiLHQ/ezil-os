@@ -9,6 +9,48 @@ C-4, C-6, and §3a. The S1 spike (`feat/aws-s1-runtime-spike`) holds the runtime
 
 Python 3 standard library only. Nothing here calls an AWS API.
 
+## Canary serial diagnostics (default off)
+
+Set `canaryConsole: true` in the baked `/etc/ezil-host/agent.json` for a canary.
+Only JSON boolean true enables it. Every record is a single `EZIL-CANARY `-prefixed
+JSON line, at most 512 bytes. The destination is `/dev/ttyS0`, EC2 Linux's first
+serial port; `/dev/console` can instead follow a VGA kernel-console selection.
+The writer uses a nonblocking open/write, creates no device/file, and drops console
+errors without redirecting general logs. Delivery is best effort, not an acknowledgement.
+
+Read with `aws ec2 get-console-output --instance-id <id> --query Output --output text`.
+On supported Nitro instances, add `--latest` for the latest available buffer.
+See https://docs.aws.amazon.com/cli/latest/reference/ec2/get-console-output.html.
+Actual serial capture and buffer timing on the target AMI are UNCONFIRMED.
+
+Records:
+
+- `guard`: verdict, committed marker generation/leaseEpoch and `lastStop` from
+  `.ezil-last-stop.json`, projected to outcome/time/generation/epoch only. Refusal
+  or error reports null metadata after unmount; no exception detail or stop reason.
+- `persistence`: after the overlay mount and after every desktop stop attempt, before
+  teardown. Reads only `/root/.ezil-canary-sentinel` and `/root/.bash_history` through
+  the merged overlay (the spec fixes HOME to `/root`). Reports sentinel SHA-256,
+  physical history-line count (including an unterminated final line), and exact
+  presence of the line `: EZIL-CANARY-HISTORY-v1`; never history or sentinel contents.
+- `desktop`: `started` only after observing runc's `running` state, otherwise
+  `unconfirmed` after a bounded wait. This confirms the container, not app readiness.
+- `stop`: each desktop stop outcome, including systemd/teardown without enrollment;
+  an agent shutdown additionally reports its worst outcome and whether quiesce
+  steps succeeded. Repeated stop calls (including restarts) can report `absent`.
+
+Prepare the sentinel with public test data and the history marker in an offline or
+boot fixture before comparing stops/cold boots. Probes never create or repair them.
+Missing/unreadable files produce explicit statuses and null measurements; symlinks,
+special files and oversized files are unreadable (64 KiB sentinel, 4 MiB history).
+Compare the shutdown hash/count/marker with the next boot probe. This observes persisted
+bytes; it does not establish that a live interactive shell flushed its history.
+
+These hooks need no enrollment or control key and preserve guard/enrollment requirements.
+Without an existing stop record, `lastStop` is null; its durable writer remains the agent.
+Run the unprivileged tests with
+`python3 -m unittest discover -s infra/host-agent/test -p test_canary.py`.
+
 ## Threat model
 
 **Guest root controls every byte of the data volume** (R5, §3a). The marker, the upper

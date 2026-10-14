@@ -15,7 +15,7 @@ import signal
 import subprocess
 import time
 
-from . import config as cfgmod
+from . import canary, config as cfgmod
 from .fsops import DIR_FLAGS, Refused, clear_dir, read_regular_at, remove_singletons
 
 # Docker's default set MINUS CAP_NET_RAW: no raw/packet sockets, so no forged packets
@@ -293,6 +293,7 @@ def overlay_mount(cfg, lower=None):
     up = os.path.join(cfg.dataMount, "root")
     subprocess.run(["mount", "-t", "overlay", "ezil-rootfs", "-o",
                     f"nodev,lowerdir={lower},upperdir={up}/upper,workdir={up}/work,{OVL_OPTS}", m], check=True)
+    canary.probe(cfg, "boot")
     return m
 
 
@@ -602,8 +603,11 @@ def run(cfg, detach=False, log=None):
     bundle = os.path.join(cfg.runDir, "bundle")
     if detach:
         with open(log or os.devnull, "ab") as lf:
-            return runc(cfg, "run", "--detach", "--bundle", bundle, cfg.containerId,
-                        stdin=subprocess.DEVNULL, stdout=lf, stderr=lf).returncode
+            rc = runc(cfg, "run", "--detach", "--bundle", bundle, cfg.containerId,
+                      stdin=subprocess.DEVNULL, stdout=lf, stderr=lf).returncode
+        if rc == 0:
+            canary.desktop_started(cfg)
+        return rc
     os.execv(cfg.runcBin, [cfg.runcBin, "--root", os.path.join(cfg.runDir, "runc"), "--systemd-cgroup",
                            "run", "--bundle", bundle, cfg.containerId])
 
@@ -701,6 +705,19 @@ def hangup_shells(cfg, settle=HANGUP_SETTLE, pids=None, scope=None):
 
 
 def stop(cfg, grace=10.0, kill=False):
+    """Observe every stop path, after shells save history and before overlay teardown."""
+    try:
+        outcome = _stop(cfg, grace, kill)
+    except Exception:
+        canary.probe(cfg, "shutdown")
+        canary.stopped(cfg, "error")
+        raise
+    canary.probe(cfg, "shutdown")
+    canary.stopped(cfg, outcome)
+    return outcome
+
+
+def _stop(cfg, grace=10.0, kill=False):
     """Stop the desktop. Returns how it ended: 'absent' (nothing was running), 'clean'
     (exited after TERM within grace) or 'killed' (KILL was needed, or asked for). Only
     'clean' and 'absent' mean the guest had its chance to finish writing."""

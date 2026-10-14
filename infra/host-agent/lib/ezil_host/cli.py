@@ -6,7 +6,7 @@ import sys
 import threading
 import signal
 
-from . import agent as agentmod, config, desktop, enroll as enrollmod, guard, rebase, tunnel
+from . import agent as agentmod, canary, config, desktop, enroll as enrollmod, guard, rebase, tunnel
 from .fsops import Refused
 
 
@@ -92,6 +92,9 @@ def main(argv=None):
     cfg = config.load()
     cmd = argv[0]
     try:
+        if cmd == "canary-desktop-started":
+            canary.desktop_started(cfg)       # ExecStartPost; no lease or enrollment read
+            return 0
         if cmd == "boot-chain":
             order = boot_order(cfg)
             until = argv[1] if len(argv) > 1 else order[-1]

@@ -36,7 +36,7 @@ import subprocess
 import threading
 import time
 
-from . import desktop, guard, tunnel
+from . import canary, desktop, guard, tunnel
 from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -311,6 +311,7 @@ class Agent:
         time.sleep(1.0)
         # Ordered quiesce. Each step is attempted even if an earlier one failed: the OS
         # shutdown that follows must happen regardless (it also unmounts).
+        quiesce_ok = True
         for name, fn in (("desktop", lambda: self._note_stop(desktop.stop(self.cfg))),
                          ("record", lambda: self.record_stop(why)),
                          ("overlay", lambda: desktop.overlay_umount(self.cfg)),
@@ -321,7 +322,9 @@ class Agent:
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
+                quiesce_ok = False
                 self.log(f"quiesce step {name} failed: {e}")
+        canary.stopped(self.cfg, self.stop_outcome, source="agent", quiesce_ok=quiesce_ok)
         subprocess.run(list(self.cfg.shutdownCmd))
 
     # ------------------------------------------------------------------- loop
