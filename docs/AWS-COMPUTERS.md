@@ -135,6 +135,10 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 
 **Leasing and admission**
 - `LEASED` reserves `lease_epoch + 1`. A replace or recovery also reserves `generation + 1`.
+- An AWS placement is created at `lease_epoch` 1, because the provision is the computer's first lease. Its intent carries
+  epoch 1 and the host writes disk-marker epoch 1, so the first wake leases 2. A row created at 0 would lease 1 on its
+  first wake, the C-4 guard would refuse it (the marker epoch is not below it), and the computer could never wake.
+  Cloudflare rows never lease and start at 0.
 - Admission runs in the same transaction, under one global advisory lock. All of these must hold:
   - running-class count < `AWS_MAX_RUNNING`
   - one AWS computer per user

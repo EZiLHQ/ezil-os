@@ -187,6 +187,12 @@ describe('create: per-computer advisory lock, then refuse an existing row', () =
         expect(r.ok && r.placement).toMatchObject({ provider: 'cloudflare', store: 'r2', generation: 1, leaseEpoch: 0 });
     });
 
+    it('an aws-ec2 row starts at lease_epoch 1: the provision is its first lease (C-4 marker fence)', async () => {
+        const { db } = createFakePlacementDb();
+        const r = await withAdmission(db, (tx, lock) => createAwsPlacement(tx, lock, { computerId: A, ownerUserId: OWNER }));
+        expect(r.ok && r.placement).toMatchObject({ provider: 'aws-ec2', store: 'ebs', state: 'PROVISIONING', generation: 1, leaseEpoch: 1 });
+    });
+
     it('aws-ec2 rows cannot be created outside admission', async () => {
         const { db, statements } = createFakePlacementDb();
         await expect(createPlacement(db, { computerId: A, ownerUserId: OWNER, provider: 'aws-ec2', state: 'PROVISIONING' })).rejects.toThrow(/admission/);

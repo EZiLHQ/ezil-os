@@ -195,7 +195,7 @@ describe('runAdmission (transactional)', () => {
         expect(results.filter((r) => r.admitted)).toHaveLength(1);
         expect(results.find((r) => !r.admitted)).toMatchObject({ reason: 'user_has_aws_computer' });
         expect(placements).toHaveLength(1);
-        expect(placements[0]).toMatchObject({ provider: 'aws-ec2', workspace_store: 'ebs', state: 'PROVISIONING', generation: 1, lease_epoch: 0 });
+        expect(placements[0]).toMatchObject({ provider: 'aws-ec2', workspace_store: 'ebs', state: 'PROVISIONING', generation: 1, lease_epoch: 1 });
     });
 
     it('usage from the ledger closes admission at the hours cap (open row counted to now)', async () => {

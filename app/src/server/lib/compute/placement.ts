@@ -57,6 +57,15 @@ export type WorkspaceStore = (typeof WORKSPACE_STORES)[number];
 const STORES_FOR_PROVIDER: Record<PlacementProvider, readonly WorkspaceStore[]> = { cloudflare: ['r2', 's3'], 'aws-ec2': ['ebs'] };
 /** The store a newly created row records. */
 const DEFAULT_STORE: Record<PlacementProvider, WorkspaceStore> = { cloudflare: 'r2', 'aws-ec2': 'ebs' };
+/**
+ * The lease_epoch a newly created row records. An AWS provision IS the
+ * computer's first lease: its intent carries leaseEpoch 1 and the host writes
+ * disk-marker epoch 1 (C-4). The row must say 1 too, so the first wake leases
+ * 2. A row left at 0 would lease 1 on the first wake, and the host guard
+ * refuses a lease epoch that is not above the marker's: the computer could
+ * never wake. Cloudflare rows never lease and stay at 0.
+ */
+const INITIAL_LEASE_EPOCH: Record<PlacementProvider, 0 | 1> = { cloudflare: 0, 'aws-ec2': 1 };
 
 /** C-3. Stage B's "terminated" is the end of a slot, not a stored state. */
 export const PLACEMENT_STATES = [
@@ -418,7 +427,7 @@ async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput)
         sql`${input.provider}`,
         sql`${DEFAULT_STORE[input.provider]}`,
         sql`1`,
-        sql`0`,
+        sql.raw(String(INITIAL_LEASE_EPOCH[input.provider])),
         sql`${input.state}`,
         sql`now()`,
         ...keys.map((k) => valueSql(k, fields[k] ?? null)),
@@ -447,7 +456,7 @@ export async function createPlacement(db: PlacementDb, input: CreatePlacementInp
     return db.transaction((tx) => createInTx(tx, input));
 }
 
-/** AWS creation, inside the admission transaction. Starts at PROVISIONING, generation 1, lease_epoch 0. */
+/** AWS creation, inside the admission transaction. Starts at PROVISIONING, generation 1, lease_epoch 1 (the provision is the first lease). */
 export async function createAwsPlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,

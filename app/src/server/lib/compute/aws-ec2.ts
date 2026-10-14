@@ -220,8 +220,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     await transitionPlacement(deps.db, { computerId: p.computerId, expected: p, to: 'UNCONFIRMED' });
                     return notReady('aws_enrollment_unavailable');
                 }
-                // A provision is the computer's first lease: epoch 1 (infra fixture; contract gap, see docs).
-                const intent = intentFor(p, 'provision', cfg.deployments[p.region!]!, { userData, dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: Math.max(1, p.leaseEpoch) });
+                // A provision is the computer's first lease: the row was created at epoch 1 and the
+                // intent carries exactly the row's epoch, so the first wake leases 2 (C-3/C-4).
+                const intent = intentFor(p, 'provision', cfg.deployments[p.region!]!, { userData, dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: p.leaseEpoch });
                 const r = await launch(p, intent, 'UNCONFIRMED');
                 return r === 'started' ? notReady('computer_starting', true) : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
             }

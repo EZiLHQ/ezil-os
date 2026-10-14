@@ -12,7 +12,7 @@ import type { AwsTier } from './aws-config';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { PLACEMENT_STATES, PlacementOwnerError } from './placement';
+import { PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementState } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -141,6 +141,49 @@ describe('ensure: a new computer', () => {
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_enrollment_unavailable' });
         expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
         expect(calls).toEqual([]);
+    });
+});
+
+/** The lifecycle receipt path is not built yet (lane A3): tests stand in for it with CAS transitions. */
+async function receipt(db: Parameters<typeof transitionPlacement>[0], to: PlacementState, fields: Parameters<typeof transitionPlacement>[1]['fields'] = {}): Promise<Placement> {
+    const { record } = await readPlacement(db, C1);
+    const r = await transitionPlacement(db, { computerId: C1, expected: record!, to, fields });
+    if (!r.ok) throw new Error(`receipt ${record!.state} -> ${to}: ${r.reason}`);
+    return r.placement;
+}
+
+describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fence)', () => {
+    // The host guard (infra/host-agent guard.py) mounts only when the disk marker's
+    // epoch is BELOW the lease epoch, and the marker carries the epoch of the last
+    // boot. So every wake must lease strictly above the provision's epoch.
+    it('provision → receipt (STOPPED) → wake: the wake intent leases strictly above the provision epoch', async () => {
+        const { provider, placements, calls, db } = setup();
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        const provisionEpoch = calls[0]!.intent.leaseEpoch;
+        expect(calls[0]!.intent.operation).toBe('provision');
+        expect(provisionEpoch).toBe(1);
+        // The row records the same epoch the provision intent carries (and the host wrote).
+        expect(placements[0]).toMatchObject({ state: 'PROVISIONING', lease_epoch: provisionEpoch });
+        await receipt(db, 'STOPPED', { instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111' });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(calls[1]!.intent).toMatchObject({ operation: 'start', providerInstanceId: 'i-11111111111111111' });
+        expect(calls[1]!.intent.leaseEpoch).toBeGreaterThan(provisionEpoch);
+        expect(placements[0]).toMatchObject({ state: 'STARTING', lease_epoch: calls[1]!.intent.leaseEpoch });
+    });
+
+    it('every later wake leases above the previous boot (stop → wake → stop → wake)', async () => {
+        const { provider, calls, db } = setup();
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        await receipt(db, 'STOPPED', { instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111' });
+        let marker = calls[0]!.intent.leaseEpoch;
+        for (let wake = 0; wake < 2; wake++) {
+            await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+            const boot = calls.at(-1)!.intent;
+            expect(boot.operation).toBe('start');
+            expect(boot.leaseEpoch).toBeGreaterThan(marker);
+            marker = boot.leaseEpoch;
+            for (const to of ['MOUNTING', 'RUNNING', 'DRAINING', 'STOPPING', 'STOPPED'] as const) await receipt(db, to);
+        }
     });
 });
 
