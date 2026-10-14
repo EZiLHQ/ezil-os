@@ -35,13 +35,13 @@ export type RoutedComputer =
 
 /**
  * The AWS provider's runtime collaborators that are not built yet: the Step
- * Functions starter and the C-6 enrollment issuer (lanes L-ENR / A3). Until they
+ * Functions starter, the execution reader and the GW-1 tunnel client (L-ENR). Until they
  * land, an AWS computer's `ensure`/`stop` refuse BEFORE any write
  * (`aws_lifecycle_unconfigured`, `aws_enrollment_unavailable`) — never Cloudflare.
  * This is the ONE place the routers get them from, so wiring them in touches no
  * router.
  */
-export function defaultAwsCollaborators(): Pick<AwsProviderDeps, 'starter' | 'enrollment'> {
+export function defaultAwsCollaborators(): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels'> {
     return {};
 }
 
@@ -50,7 +50,7 @@ export interface RouteOptions {
     /** Where a user's paid entitlement is read from. None in this app today → every AWS computer is `free`. */
     entitlements?: EntitlementReader;
     /** Overrides `defaultAwsCollaborators()` (tests; the later wiring). */
-    aws?: Pick<AwsProviderDeps, 'starter' | 'enrollment' | 'now' | 'newId' | 'leaseSeconds'>;
+    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */

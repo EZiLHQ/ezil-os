@@ -164,9 +164,8 @@ describe('routeComputer', () => {
     it('a RUNNING AWS computer is ready through the routed provider (nothing started)', async () => {
         const calls: string[] = [];
         const starter: LifecycleStarter = { start: async () => { calls.push('start'); } };
-        const enrollment = { issue: async () => ({ userData: Buffer.from('{}').toString('base64') }) };
         const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, state: 'RUNNING', region: 'ap-south-1', instance_type: 't3a.medium', instance_id: 'i-0123456789abcdef0', volume_id: 'vol-0123456789abcdef0' })]);
-        const routed = await routeComputer(db, computer, { env: AWS_ENV, aws: { starter, enrollment } });
+        const routed = await routeComputer(db, computer, { env: AWS_ENV, aws: { starter } });
         expect(routed.kind).toBe('aws-ec2');
         await expect(routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).resolves.toEqual({ ok: true });
         expect(calls).toEqual([]);
