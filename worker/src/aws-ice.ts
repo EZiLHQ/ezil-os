@@ -244,6 +244,32 @@ export function awsRelayContainer(record: AwsTunnelRecord, zone: string, fetchFn
   };
 }
 
+/** What the screen routes need from a desktop: reachability and neko's admin API on its port. */
+export interface ScreenDesktop {
+  desktopReachable(): Promise<boolean>;
+  runningContainerFetch(url: string, init: RequestInit, port: number): Promise<Response>;
+}
+
+/**
+ * The screen routes' desktop for an AWS computer: neko's admin API on the desktop port
+ * through the gateway (`awsRelayContainer`), and reachable only while the host reports its
+ * desktop `running` (GW-5 `desktop`). Any other port is refused before a fetch.
+ */
+export function awsScreenDesktop(record: AwsTunnelRecord, zone: string, fetchFn: FetchLike, nowMs: () => number): ScreenDesktop {
+  const nowSeconds = () => Math.floor(nowMs() / 1000);
+  const container = awsRelayContainer(record, zone, fetchFn, nowSeconds);
+  return {
+    async desktopReachable() {
+      try {
+        return (await readAwsDesktopStatus(record, zone, fetchFn, nowSeconds())).desktop === 'running';
+      } catch {
+        return false;
+      }
+    },
+    runningContainerFetch: (url, init, port) => container.containerFetch(url, init, port),
+  };
+}
+
 export type RelayMint = (signal: AbortSignal) => Promise<{ servers: IceServerEntry[]; expiresAt: number } | null>;
 
 /** Cloudflare's `relayRefresh`, for an AWS computer: read the relay state, or renew it in place. */

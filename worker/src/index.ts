@@ -60,10 +60,10 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
 // AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
-import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, resolveAwsOriginZone } from './aws-origin';
+import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
 import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
-import { awsRelayRefresh, ensureAwsDesktop, type RelayMint } from './aws-ice';
+import { awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
 // Separate value import of the SAME class (under a local alias) so the
@@ -530,6 +530,7 @@ import {
   readHead,
   readMigratedHead,
   writeMigratedHead,
+  isOwnMigratedHead,
   WorkspaceMigratedError,
   MIGRATING_FLAG,
   MIGRATION_TARGETS,
@@ -3301,6 +3302,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * Make the export terminal: CAS the `migrated` marker over the exported
    * workspace head (refused if any checkpoint landed since), then over the
    * system head the export read. Every later Cloudflare flush is refused.
+   *
+   * Recoverable by retry with the same parameters: a moved system head is
+   * refused BEFORE anything is written (`system_head_moved`, export again);
+   * a system fence that fails after the workspace marker committed is
+   * `system_fence_failed` (never `ok: true`), and the retry recognises its
+   * own workspace marker (`isOwnMigratedHead`) and fences the system head.
+   * Once the workspace head is migrated, no Cloudflare flush writes the
+   * system layer (`runWorkspaceFlush` runs it only after an ok workspace flush).
    */
   async commitMigration(params: { targetProvider: MigrationTarget; expectedEtag: string; expectedSystemEtag: string | null }): Promise<
     { ok: true; systemFenced: boolean } | { ok: false; reason: string }
@@ -3312,15 +3321,37 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const store = await this.selectWorkspaceStore();
       if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
       const bucket = store.store as unknown as FlushR2BucketLike;
-      const ws = await writeMigratedHead({ bucket, realPrefix: wctx.prefix, targetProvider: params.targetProvider, expectedEtag: params.expectedEtag });
-      if (!ws.ok) return { ok: false as const, reason: ws.reason };
       const sp = systemPrefixOf(wctx.prefix);
-      let systemFenced = params.expectedSystemEtag === null;
-      if (sp && params.expectedSystemEtag !== null) {
-        const sys = await writeMigratedHead({ bucket, realPrefix: sp, targetProvider: params.targetProvider, expectedEtag: params.expectedSystemEtag });
-        systemFenced = sys.ok;
+      const systemEtag = params.expectedSystemEtag;
+      if (systemEtag !== null) {
+        if (!sp) return { ok: false as const, reason: 'invalid' };
+        // Nothing is written unless the system head is still the one the export read
+        // (or this commit's own marker, on a retry).
+        try {
+          const sys = await readHead(bucket, sp);
+          if (!sys || sys.etag !== systemEtag) return { ok: false as const, reason: 'system_head_moved' };
+        } catch (err) {
+          if (!(err instanceof WorkspaceMigratedError) || !await isOwnMigratedHead(bucket, sp, params.targetProvider, systemEtag)) {
+            return { ok: false as const, reason: err instanceof WorkspaceMigratedError ? 'already_migrated' : 'head_unreadable' };
+          }
+        }
       }
-      return { ok: true as const, systemFenced };
+      const ws = await writeMigratedHead({ bucket, realPrefix: wctx.prefix, targetProvider: params.targetProvider, expectedEtag: params.expectedEtag });
+      if (!ws.ok && !(ws.reason === 'already_migrated'
+        && await isOwnMigratedHead(bucket, wctx.prefix, params.targetProvider, params.expectedEtag))) {
+        return { ok: false as const, reason: ws.reason };
+      }
+      if (sp && systemEtag !== null) {
+        let fenced = false;
+        try {
+          const sys = await writeMigratedHead({ bucket, realPrefix: sp, targetProvider: params.targetProvider, expectedEtag: systemEtag });
+          fenced = sys.ok || (sys.reason === 'already_migrated' && await isOwnMigratedHead(bucket, sp, params.targetProvider, systemEtag));
+        } catch {
+          fenced = false;
+        }
+        if (!fenced) return { ok: false as const, reason: 'system_fence_failed' };
+      }
+      return { ok: true as const, systemFenced: true };
     });
   }
 
@@ -3859,6 +3890,25 @@ export { AwsTunnelRegistry };
 function awsRegistryFor(env: Env): RegistryFor | null {
   const ns = env.AWS_TUNNELS;
   return ns ? (sandboxId) => ns.get(ns.idFromName(sandboxId)) : null;
+}
+
+/**
+ * Per-computer dispatch for the `/sandbox/:name/*` control routes (relay refresh, focus,
+ * screen): the registered AWS tunnel for `name` when AWS routing is on, a refusal, or null
+ * for the Cloudflare path. An AWS computer is never served by opening (and waking) a
+ * Cloudflare Sandbox of the same name. v2 claims bind the computer: a token for another
+ * sandbox, or for a non-AWS provider, is refused before any host call.
+ */
+async function awsControlTarget(env: Env, request: Request, name: string, prefix: string):
+  Promise<{ record: AwsTunnelRecord; zone: string } | Response | null> {
+  const registry = awsRoutingEnabled(env.AWS_ROUTING_ENABLED) ? awsRegistryFor(env) : null;
+  const zone = registry ? resolveAwsOriginZone(env) : null;
+  const record = registry && zone ? await lookupAwsTunnel(registry, name) : null;
+  if (!record || !zone) return null;
+  const v2c = verifiedV2Claims.get(request);
+  if (v2c && (v2c.sandboxId !== name || v2c.provider !== 'aws-ec2')) return json({ ok: false, error: `${prefix}_claims_mismatch` }, 401);
+  if (!record.originVerified) return json({ ok: false, error: 'aws_origin_starting' }, 503);
+  return { record, zone };
 }
 
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
@@ -5660,14 +5710,28 @@ async function withDeadline<T>(work: Promise<T>, ms: number, label: string): Pro
  * definition of "what the screen is" and it cannot drift from the setter's.
  * Same HMAC gate as every other sandbox control route.
  */
-async function handleScreenRead(env: Env, sandboxName: string): Promise<Response> {
+/**
+ * The screen routes' desktop for `name`: an AWS computer's neko through its gateway
+ * (./aws-ice `awsScreenDesktop`), a refusal, or null for the Cloudflare Sandbox.
+ */
+async function screenDesktopFor(env: Env, request: Request, name: string): Promise<ScreenDesktop | Response | null> {
+  try {
+    const aws = await awsControlTarget(env, request, name, 'screen');
+    if (aws instanceof Response || aws === null) return aws;
+    return awsScreenDesktop(aws.record, aws.zone, (input, init) => fetch(input, init), Date.now);
+  } catch {
+    return json({ ok: false, sandboxId: name, error: 'screen_upstream_exception' }, 502);
+  }
+}
+
+async function handleScreenRead(env: Env, sandboxName: string, desktop?: ScreenDesktop): Promise<Response> {
   const started = Date.now();
   const remaining = () => Math.max(1, SCREEN_SET_BUDGET_MS - (Date.now() - started));
   const nekoPort = portFor('neko').port;
   const origin = `http://127.0.0.1:${nekoPort}`;
 
   try {
-    const sandbox = openSandbox(env, sandboxName);
+    const sandbox: ScreenDesktop = desktop ?? openSandbox(env, sandboxName);
     if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
@@ -5710,7 +5774,7 @@ async function handleScreenRead(env: Env, sandboxName: string): Promise<Response
   }
 }
 
-async function handleScreen(request: Request, env: Env, sandboxName: string): Promise<Response> {
+async function handleScreen(request: Request, env: Env, sandboxName: string, desktop?: ScreenDesktop): Promise<Response> {
   let body: unknown = {};
   try {
     const raw = await request.text();
@@ -5746,7 +5810,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
   const origin = `http://127.0.0.1:${nekoPort}`;
 
   try {
-    const sandbox = openSandbox(env, sandboxName);
+    const sandbox: ScreenDesktop = desktop ?? openSandbox(env, sandboxName);
     if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
@@ -7029,15 +7093,10 @@ export default {
           runtimeId = body.runtimeId;
         }
         // An AWS computer (GW-4): the same read/renew, through its gateway (./aws-ice).
-        const awsRegistry = awsRoutingEnabled(env.AWS_ROUTING_ENABLED) ? awsRegistryFor(env) : null;
-        const awsZone = awsRegistry ? resolveAwsOriginZone(env) : null;
-        const awsRecord = awsRegistry && awsZone ? await lookupAwsTunnel(awsRegistry, name) : null;
-        if (awsRecord && awsZone) {
-          // v2 claims bind the computer: never renew another sandbox's relay with them.
-          const v2c = verifiedV2Claims.get(request);
-          if (v2c && (v2c.sandboxId !== name || v2c.provider !== 'aws-ec2')) return json({ ok:false, error:'relay_claims_mismatch' }, 401);
-          if (!awsRecord.originVerified) return json({ ok:false, error:'aws_origin_starting' }, 503);
-          const state = await awsRelayRefresh({ record: awsRecord, zone: awsZone, fetch: (input, init) => fetch(input, init),
+        const aws = await awsControlTarget(env, request, name, 'relay');
+        if (aws instanceof Response) return aws;
+        if (aws) {
+          const state = await awsRelayRefresh({ record: aws.record, zone: aws.zone, fetch: (input, init) => fetch(input, init),
             nowMs: Date.now, admin: (await deriveNekoCredentials(env, name)).admin, runtimeId, mint: awsRelayMint(env) });
           return json({ ok: true, ...state });
         }
@@ -7059,7 +7118,17 @@ export default {
       }
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
-      return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
+      const name = decodeURIComponent(focusMatch[1]);
+      // An AWS computer has no host-side focus operation (GW-5 carries stop/fence only), so it
+      // is refused as unsupported, like `focus_disabled`: never via a Cloudflare Sandbox.
+      try {
+        const aws = await awsControlTarget(env, request, name, 'focus');
+        if (aws instanceof Response) return aws;
+        if (aws) return json({ ok: false, error: 'focus_unsupported' }, 404);
+      } catch {
+        return json({ ok: false, error: 'focus_upstream_exception' }, 502);
+      }
+      return handleFocus(request, env, name);
     }
 
     const screenMatch = path.match(/^\/sandbox\/([^/]+)\/screen$/);
@@ -7073,7 +7142,10 @@ export default {
       // the stream does not have.
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
-      return handleScreenRead(env, decodeURIComponent(screenMatch[1]));
+      const name = decodeURIComponent(screenMatch[1]);
+      const desktop = await screenDesktopFor(env, request, name);
+      if (desktop instanceof Response) return desktop;
+      return handleScreenRead(env, name, desktop ?? undefined);
     }
     if (method === 'POST' && screenMatch) {
       // Live X screen resize. HMAC-gated (SAME envelope as `/focus`), and its
@@ -7089,7 +7161,10 @@ export default {
       // wanted later, `SANDBOX_SCREEN` alongside `SANDBOX_FOCUS` is the shape.
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
-      return handleScreen(request, env, decodeURIComponent(screenMatch[1]));
+      const name = decodeURIComponent(screenMatch[1]);
+      const desktop = await screenDesktopFor(env, request, name);
+      if (desktop instanceof Response) return desktop;
+      return handleScreen(request, env, name, desktop ?? undefined);
     }
 
     const activityMatch = path.match(/^\/sandbox\/([^/]+)\/activity$/);

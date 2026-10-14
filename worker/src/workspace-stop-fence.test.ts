@@ -285,6 +285,55 @@ describe('C-7 on the Durable Object', () => {
   });
 });
 
+describe('C-7: commitMigration is recoverable (never a split migration)', () => {
+  const SYS = `${COMPUTER}/system/.ezil-snapshots/latest.json`;
+  const text = (objects: Map<string, { bytes: Uint8Array }>, k: string) => new TextDecoder().decode(objects.get(k)!.bytes);
+  async function withSystemHead() {
+    const f = await makeFake();
+    await (await proto()).runWorkspaceFlush.call(f.fake, 'alarm' as never);
+    f.objects.set(SYS, { ...f.objects.get(HEAD)!, etag: 'sys1' });
+    return { ...f, wsEtag: f.objects.get(HEAD)!.etag };
+  }
+  const commit = async (fake: unknown, p: Record<string, unknown>) => (await proto()).commitMigration.call(fake, p as never);
+
+  it('a system fence that fails after the workspace marker committed is not ok, and the retry completes it', async () => {
+    const { fake, objects, bucket, wsEtag } = await withSystemHead();
+    const realPut = bucket.put;
+    let failOnce = true;
+    bucket.put = (async (k: string, v: Uint8Array | string, o?: never) => {
+      if (k === SYS && failOnce) { failOnce = false; throw new Error('r2 transient'); }
+      return realPut(k, v, o);
+    }) as typeof bucket.put;
+    const params = { targetProvider: 'aws-ec2', expectedEtag: wsEtag, expectedSystemEtag: 'sys1' };
+    expect(await commit(fake, params)).toEqual({ ok: false, reason: 'system_fence_failed' });
+    expect(text(objects, HEAD)).toContain('"kind":"migrated"');
+    expect(text(objects, SYS)).not.toContain('"kind":"migrated"');
+    // Same parameters again: its own workspace marker is recognised, the system head is fenced.
+    expect(await commit(fake, params)).toEqual({ ok: true, systemFenced: true });
+    expect(text(objects, SYS)).toContain('"kind":"migrated"');
+    // ...and once more is still ok (idempotent), while a different target is refused.
+    expect(await commit(fake, params)).toEqual({ ok: true, systemFenced: true });
+    expect(await commit(fake, { ...params, targetProvider: 'cloudflare' })).toMatchObject({ ok: false, reason: 'already_migrated' });
+  });
+
+  it('a system head that moved since the export is refused before anything is written', async () => {
+    const { fake, objects, wsEtag } = await withSystemHead();
+    objects.set(SYS, { ...objects.get(SYS)!, etag: 'sys2' });
+    const before = text(objects, HEAD);
+    expect(await commit(fake, { targetProvider: 'aws-ec2', expectedEtag: wsEtag, expectedSystemEtag: 'sys1' }))
+      .toEqual({ ok: false, reason: 'system_head_moved' });
+    expect(text(objects, HEAD)).toBe(before);
+    expect(objects.get(HEAD)!.etag).toBe(wsEtag);
+  });
+
+  it('a workspace head migrated by ANOTHER export is still already_migrated', async () => {
+    const { fake, objects, bucket } = await withSystemHead();
+    await migrate(objects, bucket);
+    expect(await commit(fake, { targetProvider: 'aws-ec2', expectedEtag: 'some-other-etag', expectedSystemEtag: 'sys1' }))
+      .toEqual({ ok: false, reason: 'already_migrated' });
+  });
+});
+
 describe('C-7: the Durable Object fences the SYSTEM prefix GC with the workspace prefix\'s migrating flag', () => {
   for (const flagged of [false, true]) {
     it(flagged ? 'flag raised: system garbage is kept' : 'positive control: no flag, system garbage is deleted', async () => {
