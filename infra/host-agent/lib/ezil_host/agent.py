@@ -18,6 +18,11 @@ plane regardless of what this agent reports; this agent only:
   * honours a `fence`: cloudflared stops and the token is wiped, then stop.
 Stop = desktop stopped, overlay and data volume unmounted in order (sync), then
 cfg.shutdownCmd (`shutdown -h now`).
+
+A desktop that needed KILL is never reported as a clean stop: the flush says `unclean`
+(the idle stop still proceeds — the desktop is already gone, staying up only bills), and
+the worst outcome of this boot is written durably to the data root before it unmounts
+(desktop.STOP_RECORD); the next boot reports it (host_clean -> lastStop).
 """
 import hashlib
 import hmac
@@ -32,12 +37,13 @@ import threading
 import time
 
 from . import desktop, guard, tunnel
-from .fsops import Refused, open_dir_below
+from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
 MAX_PAST = 120        # seconds a request may be old
 MAX_FUTURE = 5        # seconds of clock skew tolerated ahead of this host
 MAX_WARN = 900        # a control-plane stop warns for at most 15 minutes
+STOP_RANK = {"absent": 0, "clean": 1, "killed": 2}
 
 
 def _is_number(v):
@@ -96,6 +102,7 @@ class Agent:
         self.cfg, self.lease, self.clock, self.log = cfg, lease, clock, log
         self.last_presence = clock()          # boot counts as activity
         self.stop_request = None
+        self.stop_outcome = None              # worst desktop.stop() outcome seen this boot
         self.lock = threading.Lock()
         with open(os.path.join(cfg.stateDir, "control.key"), "rb") as f:
             self.key = f.read()
@@ -204,8 +211,14 @@ class Agent:
         s.close()
 
     # ------------------------------------------------------------------ flush
+    def _note_stop(self, outcome):
+        if outcome in STOP_RANK and (self.stop_outcome is None or STOP_RANK[outcome] > STOP_RANK[self.stop_outcome]):
+            self.stop_outcome = outcome
+        return outcome
+
     def flush(self, blockable=True):
-        """ok | busy | stale | failed. Only ok permits an idle stop."""
+        """ok | unclean | busy | stale | failed. ok and unclean both mean the desktop is
+        stopped and the data volume synced; unclean = it needed KILL (never reported ok)."""
         if os.path.exists(tunnel.fence_path(self.cfg)) and blockable:
             return "stale"
         try:
@@ -218,11 +231,28 @@ class Agent:
         if blockable and dpkg_lock_held(self.cfg):
             return "busy"
         try:
-            desktop.stop(self.cfg, grace=float(self.cfg.idle["flushTimeoutSeconds"]))
+            outcome = self._note_stop(desktop.stop(self.cfg, grace=float(self.cfg.idle["flushTimeoutSeconds"])))
             r = subprocess.run(["sync", "-f", self.cfg.dataMount], timeout=self.cfg.idle["flushTimeoutSeconds"])
-            return "ok" if r.returncode == 0 else "failed"
+            if r.returncode != 0:
+                return "failed"
+            return "unclean" if outcome == "killed" else "ok"
         except (OSError, subprocess.SubprocessError):
             return "failed"
+
+    def record_stop(self, why):
+        """Durably write this boot's stop outcome to the data root (host-only, next to the
+        marker) BEFORE the volume unmounts; the next boot reports it. Never on the host
+        disk: refused unless the data volume is the mount at dataMount."""
+        if not guard.is_mounted(self.cfg.dataMount):
+            raise Refused("stop_record_no_volume", self.cfg.dataMount)
+        rec = {"v": 1, "outcome": self.stop_outcome or "absent", "reason": str(why)[:128], "at": int(time.time()),
+               "generation": self.lease["generation"], "leaseEpoch": self.lease["leaseEpoch"]}
+        root = os.open(self.cfg.dataMount, DIR_FLAGS)
+        try:
+            write_file_durable_at(root, desktop.STOP_RECORD, (json.dumps(rec) + "\n").encode(), 0o600)
+        finally:
+            os.close(root)
+        self.log(f"stop recorded: outcome={rec['outcome']} reason={rec['reason']}")
 
     def shutdown(self, why):
         self.log(f"shutdown: {why}")
@@ -230,7 +260,8 @@ class Agent:
         time.sleep(1.0)
         # Ordered quiesce. Each step is attempted even if an earlier one failed: the OS
         # shutdown that follows must happen regardless (it also unmounts).
-        for name, fn in (("desktop", lambda: desktop.stop(self.cfg)),
+        for name, fn in (("desktop", lambda: self._note_stop(desktop.stop(self.cfg))),
+                         ("record", lambda: self.record_stop(why)),
                          ("overlay", lambda: desktop.overlay_umount(self.cfg)),
                          ("sync", lambda: subprocess.run(["sync"], check=True)),
                          ("stamp", lambda: guard.clear_stamp(self.cfg)),
@@ -264,10 +295,12 @@ class Agent:
         if load1 is None or load1 >= self.cfg.idle["load1Busy"]:
             return "busy_load"
         res = self.flush(blockable=True)
-        if res != "ok":
+        if res not in ("ok", "unclean"):
             self.log(f"idle stop blocked: flush={res}")
             return f"flush_{res}"
-        self.shutdown("idle")
+        # unclean: the desktop needed KILL and is already gone; stopping is still right
+        # (a running computer without a desktop only bills), but it is recorded as unclean
+        self.shutdown("idle" if res == "ok" else f"idle flush={res}")
         return "stopped"
 
     def warn(self, seconds, reason):

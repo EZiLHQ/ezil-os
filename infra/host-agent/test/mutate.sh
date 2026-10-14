@@ -73,7 +73,28 @@ mutate M40 lib/ezil_host/desktop.py 'CAPS = ["CAP_CHOWN",' 'CAPS = ["CAP_NET_RAW
 # M41: BOTH places that disable IPv6 on ezh0 removed (each alone is redundant with the
 # other for the end state; the early one only closes the window before ensure_rules runs)
 mutate M41 lib/ezil_host/desktop.py 'f"net.ipv6.conf.{HOST_IF}.disable_ipv6=1"' 'f"net.ipv6.conf.{HOST_IF}.forwarding=0"' test-network.sh "ezh0: IPv6 disabled and no IPv6 address" all
+# ---- terminal history, honest stop outcome, ordered drift (lane H-a)
+mutate M42 lib/ezil_host/desktop.py '    if _rule_lines(listing.stdout, chain, chain) != _canonical(cfg, tool, table, chain, rules):' '    if sorted(_rule_lines(listing.stdout, chain, chain)) != sorted(_canonical(cfg, tool, table, chain, rules)):' test-units.sh "drift: same rules in another order is drift"
+mutate M43 lib/ezil_host/desktop.py '    if _rule_lines(listing.stdout, chain, chain) != _canonical(cfg, tool, table, chain, rules):' '    if sorted(_rule_lines(listing.stdout, chain, chain)) != sorted(_canonical(cfg, tool, table, chain, rules)):' test-network.sh "a reordered chain (ACCEPT ahead of the drops) is detected as drift"
+mutate M44 lib/ezil_host/desktop.py '    env = with_history(list(image["Env"]) + [' '    env = (list(image["Env"]) + [' test-units.sh "history: env + read-only profile.d"
+mutate M45 lib/ezil_host/desktop.py '        bind(f"{gen_dir}/ezil-history.sh", "/etc/profile.d/ezil-history.sh", ["ro"]),
+' '' test-units.sh "history: env + read-only profile.d"
+mutate M46 lib/ezil_host/desktop.py '            if info and info[0] in HISTORY_SHELLS and info[1] != 0:' '            if info and info[0] in HISTORY_SHELLS:' test-units.sh "history: a still-running command is saved"
+mutate M47 lib/ezil_host/desktop.py 'HISTORY_SHELLS = ("bash", "zsh")' 'HISTORY_SHELLS = ("zsh",)' test-units.sh "history: a still-running command is saved"
+mutate M49 lib/ezil_host/agent.py '            return "unclean" if outcome == "killed" else "ok"' '            return "ok"' test-units.sh "stop outcome: a killed desktop is never flush=ok"
+mutate M50 lib/ezil_host/desktop.py '    outcome = "killed" if kill or state(cfg) == "running" else "clean"' '    outcome = "clean"' test-units.sh "stop outcome: absent/clean/killed from desktop.stop"
+mutate M51 lib/ezil_host/agent.py '                         ("record", lambda: self.record_stop(why)),
+' '' test-units.sh "stop outcome: a killed desktop is never flush=ok; durable record"
+mutate M52 lib/ezil_host/desktop.py '        if r.returncode != 0:
+            raise Refused("netns_delete_failed"' '        if False:
+            raise Refused("netns_delete_failed"' test-units.sh "netns delete failure is reported"
+mutate M53 lib/ezil_host/agent.py '        if not guard.is_mounted(self.cfg.dataMount):' '        if False:' test-units.sh "stop outcome: a killed desktop is never flush=ok; durable record"
+mutate M54 lib/ezil_host/desktop.py '    out = {"lastStop": read_stop_record(cfg), "singletons":' '    out = {"singletons":' test-units.sh "stop outcome: a killed desktop is never flush=ok; durable record"
+mutate M55 lib/ezil_host/desktop.py 'HISTORY_PROMPT = "history -a; shopt -s histappend"' 'HISTORY_PROMPT = "shopt -s histappend"' test-units.sh "history: env + read-only profile.d"
 if [ "${1:-}" != --quick ]; then
+mutate M48 lib/ezil_host/desktop.py '    if not kill:
+        hangup_shells(cfg)
+' '' test-boot.sh "[host B] open-terminal history: the command still running at the stop survived too"
 mutate M17 lib/ezil_host/agent.py '        if blockable and dpkg_lock_held(self.cfg):
             return "busy"' '' test-boot.sh "a held dpkg lock (install in progress) blocks the idle stop"
 mutate M18 lib/ezil_host/desktop.py '"noNewPrivileges": True,' '"noNewPrivileges": False,' test-boot.sh "no_new_privs set"

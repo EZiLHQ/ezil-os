@@ -64,4 +64,10 @@ check "agent default scrubs every cloud-init user-data copy (incl. obj.pkl)" py 
 from ezil_host import config
 c=config.DEFAULTS['userDataCopies']
 assert '/var/lib/cloud/instances/*/obj.pkl' in c and '/run/cloud-init/instance-data-sensitive.json' in c and '/var/lib/cloud/instances/*/user-data.txt.i' in c"
+pyunit() { (cd "$HA/test" && python3 -m unittest -q "$@"); }
+check "history: env + read-only profile.d make an open terminal append each command (real pty bash)" pyunit test_history_stop.HistoryInjection
+check "history: a still-running command is saved when the terminal shell is hung up before the stop" pyunit test_history_stop.HangupBeforeStop
+check "stop outcome: absent/clean/killed from desktop.stop" pyunit test_history_stop.StopOutcome
+check "stop outcome: a killed desktop is never flush=ok; durable record written and reported at boot" pyunit test_history_stop.AgentStopRecord
+check "drift: same rules in another order is drift; netns delete failure is reported" pyunit test_history_stop.DriftOrder
 summary "units + pure functions"

@@ -79,6 +79,45 @@ manifest a > "$T/ref.manifest"
 check "reference manifest complete" bash -c "! grep -q MISSING '$T/ref.manifest'"
 check "profile sentinel survives a persistent-profile boot (start-neko change in effect)" test -e "$D/profiles/chrome/EZIL_SENTINEL"
 
+# An OPEN terminal, spawned the way code-server spawns one: bash --init-file <VS Code's
+# shell integration> with code-server's own process environment, on a pty held by a
+# "terminal emulator" process. One command finished, one still running; never exited.
+HU="ezil-hist-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+CS_PID='$(pgrep -o -f "code-server.*--bind-addr")'
+ctr_sh a "cat > /tmp/ezil-term.py" <<'PY'
+import os, pty, select, subprocess, sys, time
+hu = sys.argv[1]
+integ = "/usr/lib/code-server/lib/vscode/out/vs/workbench/contrib/terminal/common/scripts/shellIntegration-bash.sh"
+cs = int(subprocess.check_output(["pgrep", "-o", "-f", "code-server.*--bind-addr"]).split()[0])
+env = dict(kv.split("=", 1) for kv in open(f"/proc/{cs}/environ").read().split("\0") if "=" in kv)
+env.update({"VSCODE_INJECTION": "1", "TERM": "xterm-256color", "TERM_PROGRAM": "vscode"})
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir("/workspace")
+    os.execve("/bin/bash", ["/bin/bash", "--init-file", integ], env)
+def drain(t):
+    end = time.time() + t
+    while time.time() < end:
+        if select.select([fd], [], [], 0.2)[0]:
+            try:
+                os.read(fd, 65536)
+            except OSError:
+                return
+drain(3)
+os.write(fd, f"echo {hu}-done\n".encode()); drain(2)
+os.write(fd, f"sleep 600 # {hu}-running\n".encode())
+while True:
+    drain(60)
+PY
+check "code-server's own environment carries the history PROMPT_COMMAND (host-injected)" ctr_sh a "tr '\0' '\n' < /proc/$CS_PID/environ | grep -qx 'PROMPT_COMMAND=history -a; shopt -s histappend'"
+check "/etc/profile.d/ezil-history.sh is the host's read-only file" ctr_sh a 'grep -q "Managed by ezil-host-agent" /etc/profile.d/ezil-history.sh && ! sh -c "echo x >> /etc/profile.d/ezil-history.sh" 2>/dev/null'
+runc_h a exec -d "${TAG}-a" python3 /tmp/ezil-term.py "$HU"
+for i in $(seq 1 30); do ctr_sh a "grep -qx 'echo $HU-done' /root/.bash_history" 2>/dev/null && break; sleep 0.5; done
+check "open terminal: the finished command is in ~/.bash_history while the shell is still open" ctr_sh a "grep -qx 'echo $HU-done' /root/.bash_history"
+for i in $(seq 1 30); do ctr_sh a "pgrep -f '^sleep 600\$' >/dev/null" 2>/dev/null && break; sleep 0.5; done
+check "open terminal: the shell is still open and the second command still running" ctr_sh a "pgrep -f -- '--init-file .*shellIntegration-bash.sh' >/dev/null && pgrep -f '^sleep 600\$' >/dev/null"
+check "(control) the still-running command is NOT yet in history (only the pre-stop hangup can save it)" ctr_sh a "! grep -q '$HU-running' /root/.bash_history"
+
 # enroll, tunnel, agent
 check "enroll" agent a enroll
 env "$(host_env a)" "$AGENT" cloudflared > "$H/run/cf.out" 2>&1 & echo $! > "$H/run/cf.pid"
@@ -102,6 +141,7 @@ check "everything unmounted BEFORE shutdown (overlay, data volume)" test "$(sed 
 for i in $(seq 1 40); do kill -0 "$(cat "$H/run/cf.pid")" 2>/dev/null || break; sleep 0.25; done
 check "shutdown fenced cloudflared and wiped the token" bash -c "! kill -0 $(cat "$H/run/cf.pid") 2>/dev/null && [ ! -e '$H/state/tunnel.json' ]"
 check "agent log: idle stop" grep -q 'shutdown: idle' "$H/run/agent.out"
+check "agent log: the stop outcome was recorded on the data volume before unmount" grep -q '^stop recorded: outcome=' "$H/run/agent.out"
 check "the agent never renewed the lease (no outbound request after enrollment)" test "$(wc -l < "$H/stub/enroll-requests.jsonl")" = 1
 
 # ================================================================ host B
@@ -125,5 +165,11 @@ check "[host B] deleted image file stays deleted" ctr_sh b '[ ! -e /usr/share/do
 check "[host B] profile sentinel + extension entry persisted" bash -c "[ -e '$D/profiles/chrome/EZIL_SENTINEL' ] && [ -e '$D/profiles/code-server-extensions/ezil.i4-ext-1.0.0/package.json' ]"
 check "[host B] Chrome running on the persisted profile" has_proc b 'chrome.*--user-data-dir=/var/lib/ezil-profiles/chrome'
 check "[host B] marker generation 1, epoch 2" jq -e '.generation==1 and .leaseEpoch==2' "$D/.ezil-marker.json"
+LAST="$(sed -n 's/^\[clean\] clean //p' <<<"$out" | jq -c .lastStop 2>/dev/null)"; log "host B lastStop: $LAST"
+check "[host B] boot log reports how host A stopped (lastStop: idle, epoch 1)" jq -e '.reason=="idle" and .leaseEpoch==1 and (.outcome|IN("clean","killed","absent"))' <<<"$LAST"
+check "[host B] host A's desktop stopped cleanly within the grace (lastStop.outcome == clean)" jq -e '.outcome=="clean"' <<<"$LAST"
+check "[host B] stop record is host-only on the data root (0600)" bash -c "[ \"\$(stat -c %a '$D/.ezil-last-stop.json')\" = 600 ]"
+check "[host B] open-terminal history: the finished command survived stop + cold boot" ctr_sh b "grep -qx 'echo $HU-done' /root/.bash_history"
+check "[host B] open-terminal history: the command still running at the stop survived too" ctr_sh b "grep -qx 'sleep 600 # $HU-running' /root/.bash_history"
 check "[host B] hostname ezil-gen-1-e2" ctr_sh b '[ "$(hostname)" = ezil-gen-1-e2 ]'
 summary "full chain (real desktop, host swap)"

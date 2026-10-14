@@ -10,11 +10,12 @@ import base64
 import json
 import os
 import secrets
+import signal
 import subprocess
 import time
 
 from . import config as cfgmod
-from .fsops import Refused, clear_dir, remove_singletons
+from .fsops import DIR_FLAGS, Refused, clear_dir, read_regular_at, remove_singletons
 
 # Docker's default set MINUS CAP_NET_RAW: no raw/packet sockets, so no forged packets
 # (the anti-spoof rule is the network-side fence). The desktop boots without it (test-boot).
@@ -29,16 +30,90 @@ PROFILE_ENV = {
     "EZIL_PERSISTENT_PROFILES": "1",
 }
 
+# Terminal history that survives a stop with terminals still open. Bash writes
+# ~/.bash_history only when a shell exits, and a stop that ends in KILL never lets it.
+# Injected from the host, never by editing the image: the container env reaches the
+# only user terminal (code-server's: start-desktop.sh -> start-neko.sh -> setsid
+# code-server -> `bash --init-file shellIntegration-bash.sh`, which keeps an inherited
+# PROMPT_COMMAND), and a read-only /etc/profile.d file covers login shells that reset
+# the env. The user's own ~/.bashrc still wins: it runs after both.
+HISTORY_PROMPT = "history -a; shopt -s histappend"
+HISTORY_PROFILE = """# Managed by ezil-host-agent (read-only). Interactive bash appends each command to
+# $HISTFILE at every prompt, so history survives a stop with terminals still open.
+if [ -n "${BASH_VERSION:-}" ]; then
+  case $- in
+    *i*)
+      case "${PROMPT_COMMAND:-}" in
+        *"history -a"*) ;;
+        *) PROMPT_COMMAND="history -a; shopt -s histappend${PROMPT_COMMAND:+; $PROMPT_COMMAND}" ;;
+      esac ;;
+  esac
+fi
+"""
+# Shells that save their history when they get SIGHUP (and then exit). Only those
+# attached to a terminal are hung up: that is a user's open terminal, not a script.
+HISTORY_SHELLS = ("bash", "zsh")
+HANGUP_SETTLE = 3.0
+# The last stop's outcome, on the data root (not reachable by the guest), reported at boot.
+STOP_RECORD = ".ezil-last-stop.json"
+
+
+def with_history(env):
+    """env (list of K=V) with PROMPT_COMMAND running `history -a` first; an existing
+    PROMPT_COMMAND (e.g. from the image) is kept after it."""
+    out, existing = [], None
+    for e in env:
+        if e.startswith("PROMPT_COMMAND="):
+            existing = e.split("=", 1)[1]
+        else:
+            out.append(e)
+    if existing and "history -a" in existing:
+        pc = existing
+    else:
+        pc = HISTORY_PROMPT + (f"; {existing}" if existing else "")
+    return out + [f"PROMPT_COMMAND={pc}"]
+
 
 def merged(cfg):
     return os.path.join(cfg.runDir, "rootfs")
 
 
 # ------------------------------------------------------------------ host-clean
+def read_stop_record(cfg):
+    """The previous stop's record from the data root, or None. Host-written, but read
+    no-follow, size-bounded and reduced to known fields like any volume content."""
+    try:
+        root = os.open(cfg.dataMount, DIR_FLAGS)
+    except OSError:
+        return None
+    try:
+        try:
+            st = os.stat(STOP_RECORD, dir_fd=root, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        raw = read_regular_at(root, STOP_RECORD, st, limit=4096)
+    finally:
+        os.close(root)
+    try:
+        d = json.loads(raw) if raw is not None else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return {"outcome": "unreadable"}
+    out = {k: d[k] for k in ("outcome", "reason", "at", "generation", "leaseEpoch")
+           if isinstance(d.get(k), (str, int)) and not isinstance(d.get(k), bool)}
+    if out.get("outcome") not in ("clean", "killed", "absent"):
+        out["outcome"] = "unreadable"
+    if "reason" in out:
+        out["reason"] = str(out["reason"])[:128]
+    return out
+
+
 def host_clean(cfg):
     """R15 + §3a.1: no-follow clearing of legacy upper/tmp and upper/run (tmpfs now, so
-    normally empty) and the Chrome Singleton* entries. Runs only after the guard."""
-    out = {"singletons": remove_singletons(cfg.dataMount)}
+    normally empty) and the Chrome Singleton* entries. Runs only after the guard. Also
+    reports how the previous stop ended (lastStop), so an unclean stop is in the boot log."""
+    out = {"lastStop": read_stop_record(cfg), "singletons": remove_singletons(cfg.dataMount)}
     for d in ("tmp", "run"):
         try:
             out[d] = clear_dir(cfg.dataMount, "root/upper/" + d)
@@ -119,15 +194,43 @@ def desired_rules(cfg):
             ("ip6tables", "filter", "EZIL-CT-FWD6"): fwd6, ("ip6tables", "filter", "EZIL-CT-IN6"): in6}
 
 
+def _rule_lines(listing, src, dst):
+    """The `-A <src> ...` lines of an `-S` listing, renamed to chain dst, in order."""
+    out = []
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "-A" and parts[1] == src:
+            out.append(" ".join(["-A", dst] + parts[2:]))
+    return out
+
+
+def _canonical(cfg, tool, table, chain, rules):
+    """The exact `-S` lines iptables prints for `rules`, in order. iptables reorders
+    options and adds implicit matches (`-p udp` gains `-m udp`), so the comparison form
+    comes from iptables itself: the rules are built in an UNREFERENCED scratch chain (no
+    packet can reach it), listed, and the scratch chain is removed again."""
+    scratch = chain + "-C"
+    _run(cfg, [tool, "-w", "-t", table, "-F", scratch], check=False)
+    _run(cfg, [tool, "-w", "-t", table, "-X", scratch], check=False)
+    _run(cfg, [tool, "-w", "-t", table, "-N", scratch])
+    try:
+        for r in rules:
+            _run(cfg, [tool, "-w", "-t", table, "-A", scratch] + r)
+        listing = _run(cfg, [tool, "-w", "-t", table, "-S", scratch]).stdout
+    finally:
+        _run(cfg, [tool, "-w", "-t", table, "-F", scratch], check=False)
+        _run(cfg, [tool, "-w", "-t", table, "-X", scratch], check=False)
+    return _rule_lines(listing, scratch, chain)
+
+
 def _chain_ok(cfg, tool, table, chain, rules):
     listing = _run(cfg, [tool, "-w", "-t", table, "-S", chain], check=False)
     if listing.returncode != 0:
         return False
-    if len([l for l in listing.stdout.splitlines() if l.startswith("-A ")]) != len(rules):
+    # ORDER matters: an ACCEPT moved ahead of the drops keeps every rule present but
+    # opens the metadata/private/spoof holes. Compare the ordered listing exactly.
+    if _rule_lines(listing.stdout, chain, chain) != _canonical(cfg, tool, table, chain, rules):
         return False
-    for r in rules:
-        if _run(cfg, [tool, "-w", "-t", table, "-C", chain] + r, check=False).returncode != 0:
-            return False
     parent, how = CHAINS[(tool, table, chain)]
     lines = _run(cfg, [tool, "-w", "-t", table, "-S", parent], check=False).stdout.splitlines()
     jumps = [i for i, l in enumerate(lines) if l.split()[-2:] == ["-j", chain]]
@@ -208,7 +311,10 @@ def netns_up(cfg):
 def netns_down(cfg):
     names = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True).stdout.split()
     if cfg.netnsName in names:
-        subprocess.run(["ip", "netns", "delete", cfg.netnsName])     # removes the veth pair too
+        # removes the veth pair too (once nothing else holds the namespace)
+        r = subprocess.run(["ip", "netns", "delete", cfg.netnsName], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Refused("netns_delete_failed", f"{cfg.netnsName}: {r.stderr.strip()[:200]}")
 
 
 # ------------------------------------------------------------------------ spec
@@ -220,17 +326,18 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=()):
     os.makedirs(gen_dir, mode=0o755, exist_ok=True)
     files = {"hostname": host + "\n",
              "hosts": f"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n",
-             "resolv.conf": "# managed by ezil-host-agent\n" + (f"nameserver {HOST_IP}\n" if cfg.networkMode == "veth-nat" else "")}
+             "resolv.conf": "# managed by ezil-host-agent\n" + (f"nameserver {HOST_IP}\n" if cfg.networkMode == "veth-nat" else ""),
+             "ezil-history.sh": HISTORY_PROFILE}
     for n, body in files.items():
         with open(os.path.join(gen_dir, n), "w") as f:
             f.write(body)
     pw = lambda: base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("=")  # noqa: E731
-    env = list(image["Env"]) + [
+    env = with_history(list(image["Env"]) + [
         "HOME=/root", f"HOSTNAME={host}", "DESKTOP_MODE=neko", "NEKO_SCREEN=1920x1080x24",
         f"NEKO_MEMBER_MULTIUSER_USER_PASSWORD={pw()}", f"NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD={pw()}",
         "NEKO_SESSION_IMPLICIT_HOSTING=true", "NEKO_WEBRTC_UDPMUX=52100", "NEKO_WEBRTC_TCPMUX=52100",
         "NEKO_WEBRTC_NAT1TO1=127.0.0.1", "NEKO_WEBRTC_ICELITE=true", "EZIL_WORKSPACE_ROOT=/workspace",
-    ] + [f"{k}={v}" for k, v in PROFILE_ENV.items()]
+    ] + [f"{k}={v}" for k, v in PROFILE_ENV.items()])
     args = (["/bin/bash", "-c", "DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh"] if mode == "desktop"
             else ["/bin/sleep", "infinity"])
     dm = cfg.dataMount
@@ -256,6 +363,7 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=()):
         bind(f"{gen_dir}/hosts", "/etc/hosts", ["ro"]),
         bind(f"{gen_dir}/hostname", "/etc/hostname", ["ro"]),
         bind(f"{gen_dir}/resolv.conf", "/etc/resolv.conf", ["ro"]),
+        bind(f"{gen_dir}/ezil-history.sh", "/etc/profile.d/ezil-history.sh", ["ro"]),
     ] + [bind(s, d, o) for s, d, o in extra_binds]
     spec = {
         "ociVersion": "1.2.0",
@@ -313,19 +421,82 @@ def run(cfg, detach=False, log=None):
                            "run", "--bundle", bundle, cfg.containerId])
 
 
+def _proc_shell_on_tty(pid):
+    """(comm, tty_nr) of a host pid, or None."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return comm, int(fields[4])          # after "pid (comm)": state ppid pgrp session tty_nr
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def container_pids(cfg):
+    r = runc(cfg, "ps", "--format", "json", cfg.containerId, capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    try:
+        pids = json.loads(r.stdout or "[]")
+    except ValueError:
+        return []
+    return [p for p in pids if isinstance(p, int) and not isinstance(p, bool) and p > 1]
+
+
+def hangup_shells(cfg, settle=HANGUP_SETTLE, pids=None):
+    """Before the stop, SIGHUP every terminal shell (bash/zsh on a tty) in the desktop:
+    an interactive shell saves its history on SIGHUP — including a command that is still
+    running — then exits, as when a terminal window closes. Signals go through a pidfd,
+    so a recycled pid is never signalled. Returns how many shells were hung up."""
+    sent = []
+    for pid in (container_pids(cfg) if pids is None else pids):
+        try:
+            pfd = os.pidfd_open(pid)
+        except OSError:
+            continue
+        try:
+            info = _proc_shell_on_tty(pid)
+            if info and info[0] in HISTORY_SHELLS and info[1] != 0:
+                signal.pidfd_send_signal(pfd, signal.SIGHUP)
+                sent.append(pfd)
+                continue
+        except OSError:
+            pass
+        os.close(pfd)
+    deadline = time.time() + settle
+    for pfd in sent:
+        try:
+            while time.time() < deadline:
+                signal.pidfd_send_signal(pfd, 0)      # raises once the shell has exited
+                time.sleep(0.1)
+        except OSError:
+            pass
+        finally:
+            os.close(pfd)
+    return len(sent)
+
+
 def stop(cfg, grace=10.0, kill=False):
+    """Stop the desktop. Returns how it ended: 'absent' (nothing was running), 'clean'
+    (exited after TERM within grace) or 'killed' (KILL was needed, or asked for). Only
+    'clean' and 'absent' mean the guest had its chance to finish writing."""
     if state(cfg) == "absent":
-        return
+        return "absent"
+    if not kill:
+        hangup_shells(cfg)
     runc(cfg, "kill", "--all", cfg.containerId, "KILL" if kill else "TERM", capture_output=True)
     deadline = time.time() + (0 if kill else grace)
     while time.time() < deadline and state(cfg) == "running":
         time.sleep(0.5)
+    outcome = "killed" if kill or state(cfg) == "running" else "clean"
     runc(cfg, "kill", "--all", cfg.containerId, "KILL", capture_output=True)
     for _ in range(40):
         if state(cfg) != "running":
             break
         time.sleep(0.25)
     runc(cfg, "delete", "--force", cfg.containerId, capture_output=True)
+    return outcome
 
 
 def exec_(cfg, argv, **kw):
