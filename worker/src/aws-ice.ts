@@ -185,7 +185,19 @@ export interface AwsDesktopStatus {
   desktop: string;
   /** How the running desktop was started: applied (with relay) | missing (timed out) | none. */
   ice: string;
+  /**
+   * The host's desktop unit (systemd): active | activating | deactivating | reloading | pending
+   * (its start still waits) | inactive (it ran and exited) | failed | unknown. Null from a host
+   * that does not report it (older AMI): the caller then keeps the old behaviour.
+   */
+  unit: string | null;
+  /** The host restarted its desktop as often as it may within its window. */
+  restartsExhausted: boolean;
 }
+
+/** A desktop unit nothing will start again on its own: it exited (a crash) or failed. */
+export const STALLED_DESKTOP_UNITS: readonly string[] = ['inactive', 'failed'];
+const UNIT_STATE = /^[a-z]{1,16}$/;
 
 /** GW-5 `desktop`: the host's config and desktop state for this epoch. */
 export async function readAwsDesktopStatus(
@@ -218,6 +230,8 @@ export async function readAwsDesktopStatus(
     expiresAt: typeof exp === 'number' && Number.isSafeInteger(exp) ? exp : null,
     desktop: d.desktop,
     ice: d.ice,
+    unit: typeof d.unit === 'string' && UNIT_STATE.test(d.unit) ? d.unit : null,
+    restartsExhausted: d.restartsExhausted === true,
   };
 }
 
@@ -307,8 +321,11 @@ export type AwsDesktopReadiness =
 /**
  * What an open does for an AWS computer's desktop (mirrors Cloudflare's preview path):
  *   - the host has no usable config for this epoch, or its desktop runs WITHOUT a relay
- *     (it timed out waiting) -> mint once, push, report `starting`;
- *   - the desktop is not running yet -> `starting` (no mint);
+ *     (it timed out waiting), or it is not running and its unit exited or failed (a crash:
+ *     nothing would start it) -> mint once, push, report `starting` (the host restarts it);
+ *   - the host's desktop restarts are exhausted -> `aws_desktop_failed` (a clear failure,
+ *     never an endless `starting`); a push the host refuses for that reason fails the same way;
+ *   - the desktop is not running yet and its unit is starting -> `starting` (no mint);
  *   - it runs with a relay -> read neko's relay state; renew in place when it expires within
  *     60 s (warm open); report `ready` with the relay state the client renews from.
  * neko still booting (its admin API not answering yet) is `starting`, never an error.
@@ -325,8 +342,10 @@ export async function ensureAwsDesktop(p: {
   const nowS = () => Math.floor(p.nowMs() / 1000);
   const status = await readAwsDesktopStatus(p.record, p.zone, p.fetch, nowS());
   const running = status.desktop === 'running';
+  if (!running && status.restartsExhausted) throw new RelayFailure('aws_desktop_failed', 502);
   const fresh = status.configured && status.expiresAt !== null && status.expiresAt > p.nowMs() + RELAY_MIN_AHEAD_MS;
-  if ((!running && !fresh) || (running && status.ice !== 'applied')) {
+  const stalled = !running && status.unit !== null && STALLED_DESKTOP_UNITS.includes(status.unit);
+  if ((!running && (!fresh || stalled)) || (running && status.ice !== 'applied')) {
     const minted = await p.mint(AbortSignal.timeout(20_000));
     if (!minted) throw new RelayFailure('turn_unavailable');
     const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
@@ -338,6 +357,7 @@ export async function ensureAwsDesktop(p: {
       /* an unreadable answer is a failed push */
     }
     if (!res.ok || body.ok !== true) {
+      if (body.error === 'desktop_restart_exhausted') throw new RelayFailure('aws_desktop_failed', 502);
       throw new RelayFailure(typeof body.error === 'string' && /^[a-z_]{1,64}$/.test(body.error) ? body.error : 'aws_desktop_config_refused', 502);
     }
     return { state: 'starting', reason: body.state === 'restart_scheduled' ? 'restart_scheduled' : 'config_pushed' };

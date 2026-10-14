@@ -27,6 +27,7 @@ from . import canary, config as cfgmod
 from .fsops import DIR_FLAGS, Refused, read_regular_at, write_file_durable_at
 
 MARKER = ".ezil-marker.json"
+INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{3,17}")
 REBASE_STATE = ".ezil-rebase-state.json"
 MOUNT_OPTS = "nosuid,nodev"
 
@@ -195,6 +196,7 @@ def read_marker(root_fd):
         raise Refused("marker_malformed", "not json")
     ok = (isinstance(m, dict)
           and all(isinstance(m.get(k), str) for k in ("computerId", "volumeId", "fsUuid", "lowerImageDigest"))
+          and (m.get("instanceId") is None or (isinstance(m["instanceId"], str) and INSTANCE_ID_RE.fullmatch(m["instanceId"])))
           and all(isinstance(m.get(k), int) and not isinstance(m.get(k), bool) and m[k] >= 0
                   for k in ("generation", "leaseEpoch")))
     if not ok:
@@ -214,24 +216,43 @@ def read_rebase_state(root_fd):
         return {"state": "unreadable"}
 
 
-def check_marker(m, lease, host_digest):
-    """Pure C-4 comparison. Returns 'ok' or 'rebase_needed'; raises Refused otherwise."""
+def current_instance_id(cfg):
+    """This instance's id from the identity document the lease step stored (runDir), or None.
+    IMDS answers only the instance itself, so it names the boot's machine."""
+    try:
+        with open(os.path.join(cfg.runDir, "identity.json"), encoding="utf-8") as f:
+            iid = json.loads(json.load(f)["document"]).get("instanceId")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return iid if isinstance(iid, str) and INSTANCE_ID_RE.fullmatch(iid) else None
+
+
+def check_marker(m, lease, host_digest, instance_id=None):
+    """Pure C-4 comparison. Returns 'ok', 'reboot' or 'rebase_needed'; raises Refused
+    otherwise. The epoch must increase, except for the SAME instance rebooting in place in the
+    same (generation, epoch): the marker records which instance took the epoch, so a different
+    instance replaying old user data is still refused."""
     for k, code in (("computerId", "computer_id_mismatch"), ("volumeId", "volume_id_mismatch"),
                     ("fsUuid", "fs_uuid_mismatch")):
         if m[k] != lease[k]:
             raise Refused(code, f"marker={m[k]}")
     if m["generation"] > lease["generation"]:
         raise Refused("generation_ahead", f"marker={m['generation']} lease={lease['generation']}")
-    if m["leaseEpoch"] >= lease["leaseEpoch"]:
+    reboot = (instance_id is not None and m.get("instanceId") == instance_id
+              and m["leaseEpoch"] == lease["leaseEpoch"] and m["generation"] == lease["generation"])
+    if m["leaseEpoch"] >= lease["leaseEpoch"] and not reboot:
         raise Refused("epoch_not_increasing", f"marker={m['leaseEpoch']} lease={lease['leaseEpoch']}")
     if m["lowerImageDigest"] != host_digest:
         return "rebase_needed"
-    return "ok"
+    return "reboot" if reboot else "ok"
 
 
-def new_marker(lease, digest):
-    return {"computerId": lease["computerId"], "volumeId": lease["volumeId"], "fsUuid": lease["fsUuid"],
-            "generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"], "lowerImageDigest": digest}
+def new_marker(lease, digest, instance_id=None):
+    m = {"computerId": lease["computerId"], "volumeId": lease["volumeId"], "fsUuid": lease["fsUuid"],
+         "generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"], "lowerImageDigest": digest}
+    if instance_id is not None:
+        m["instanceId"] = instance_id      # which instance took this epoch (same-instance reboot)
+    return m
 
 
 def run_guard(cfg, lease, rebase_runner=None):
@@ -251,6 +272,7 @@ def run_guard(cfg, lease, rebase_runner=None):
 def _run_guard(cfg, lease, rebase_runner=None):
     """Leaves the data volume mounted rw on success; unmounted on refusal."""
     digest = cfgmod.host_digest(cfg)
+    instance_id = current_instance_id(cfg)
     stamp = os.path.join(cfg.runDir, "guard-ok")
     try:
         os.unlink(stamp)
@@ -272,7 +294,7 @@ def _run_guard(cfg, lease, rebase_runner=None):
                     raise Refused("marker_missing", "init only on a provisioning lease and an empty volume")
                 verdict = "init"
             else:
-                verdict = check_marker(m, lease, digest)
+                verdict = check_marker(m, lease, digest, instance_id)
             if verdict == "rebase_needed":
                 if rebase_runner is None or not lease.get("rebase"):
                     raise Refused("lower_digest_mismatch", f"marker={m['lowerImageDigest']} host={digest}")
@@ -297,7 +319,7 @@ def _run_guard(cfg, lease, rebase_runner=None):
             if quarantined:
                 verdict += " quarantined=" + ",".join(quarantined)
             # the marker is bumped only after every check, rebase and layout step passed
-            write_file_durable_at(root, MARKER, (json.dumps(new_marker(lease, digest)) + "\n").encode(), 0o600)
+            write_file_durable_at(root, MARKER, (json.dumps(new_marker(lease, digest, instance_id)) + "\n").encode(), 0o600)
         finally:
             if root is not None:
                 os.close(root)

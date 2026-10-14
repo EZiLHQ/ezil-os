@@ -80,10 +80,10 @@ def guard_result(cfg, verdict):
     if not enabled(cfg):
         return
     base = verdict.partition(" ")[0] if type(verdict) is str else ""
-    result = _choice(base, ("init", "ok", "rebase_needed", "refused", "error"))
+    result = _choice(base, ("init", "ok", "reboot", "rebase_needed", "refused", "error"))
     marker, previous = {}, None
     # On refusal the guard has unmounted: do not mistake host-root files for volume data.
-    if result in ("init", "ok", "rebase_needed"):
+    if result in ("init", "ok", "reboot", "rebase_needed"):
         try:
             root = os.open(cfg.dataMount, DIR_FLAGS)
             try:

@@ -33,6 +33,12 @@ DEFAULTS = {
     "idle": {"inactivitySeconds": 600, "load1Busy": 0.5, "intervalSeconds": 30,
              "flushTimeoutSeconds": 120},
     "shutdownCmd": ["/usr/sbin/shutdown", "-h", "now"],
+    # A failed poweroff never ends the agent: it retries with backoff (initial, doubling, capped),
+    # alternating with the forced fallback after shutdownFallbackAfter failures, until one succeeds.
+    "shutdownFallbackCmd": ["/usr/bin/systemctl", "poweroff", "--force"],
+    "shutdownFallbackAfter": 3,
+    "shutdownRetryInitialSeconds": 1,
+    "shutdownRetryMaxSeconds": 60,
     "stopWarnSeconds": 60,
     "canaryConsole": False,                   # opt-in, bounded public diagnostics on ttyS0
     # Host edge (gateway contract GW-2/GW-3): cloudflared's only ingress target. It forwards
@@ -48,6 +54,14 @@ DEFAULTS = {
     "iceMode": "local",
     "iceWaitSeconds": 90,
     "desktopRestartCmd": ["/usr/bin/systemctl", "restart", "--no-block", "ezil-desktop.service"],
+    # A desktop that exited (crashed) is restarted: systemd does it (Restart=always, bounded by
+    # its start limit); an open that finds it exited or failed makes the agent reset and restart
+    # it, at most desktopRestartMax times per desktopRestartWindowSeconds, then reports exhaustion.
+    "desktopUnitStateCmd": ["/usr/bin/systemctl", "show", "--property=ActiveState,ExecMainStartTimestampMonotonic",
+                            "ezil-desktop.service"],
+    "desktopResetCmd": ["/usr/bin/systemctl", "reset-failed", "ezil-desktop.service"],
+    "desktopRestartMax": 3,
+    "desktopRestartWindowSeconds": 600,
     # cloud-init's cached copies of user data (they hold the nonce); globs; wiped after use.
     # obj.pkl is cloud-init's pickled datasource cache (it embeds the raw user data); it is
     # a cache that cloud-init rebuilds when missing. instance-data-sensitive.json is the

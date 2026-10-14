@@ -69,6 +69,7 @@ STOP_RECORD = ".ezil-last-stop.json"
 # buildNekoIceEnv). Renewal later goes through neko's own admin /api/relay, in place.
 DESKTOP_CONFIG = "desktop-config.json"     # runDir: the pushed relay config
 ICE_STATE = "desktop-ice.json"             # runDir: how the running desktop was started
+STOPPING = "stopping"                      # runDir: the agent committed to stopping; no desktop may start
 RELAY_MIN_AHEAD_MS, RELAY_MAX_AHEAD_MS, CLOCK_SKEW_MS = 60_000, 1_800_000, 5_000
 MAX_ICE_SERVERS = MAX_ICE_URLS = 8
 NEKO_VALUE_RE = re.compile(r"^[0-9a-f]{32}$")

@@ -21,9 +21,15 @@ check "guard stamp bound to (generation 1, epoch 1)" jq -e '.generation==1 and .
 agent g data-down >/dev/null
 
 # --- C-4 refusals (each on a fresh lease; marker is gen 1 / epoch 1)
-lease 1 1 false; expect_refuse "same epoch replayed" epoch_not_increasing agent g guard
+check "marker records the instance that took the epoch" jq -e '.instanceId=="i-0abc"' <(mount -o ro "$DEV" "$H/srv/ezil-data" && cat "$M"; umount "$H/srv/ezil-data")
+# userdata (inside lease) rewrites the identity stub, so swap the instance AFTER it, then re-read
+userdata g 1 1 false; jq -c '.instanceId="i-0def"' "$H/stub/identity.json" > "$T/id" && cp "$T/id" "$H/stub/identity.json"
+agent g lease >/dev/null; expect_refuse "same epoch replayed by ANOTHER instance" epoch_not_increasing agent g guard
 check "a refusal leaves the volume unmounted" bash -c "! mountpoint -q '$H/srv/ezil-data'"
 check "a refusal leaves no guard stamp" test ! -e "$H/run/guard-ok"
+lease 1 1 false; out="$(agent g guard 2>&1)"
+check "same instance, same epoch (in-place EC2 reboot): accepted as a reboot" bash -c "grep -q '^guard reboot' <<<'$out'"
+agent g data-down >/dev/null
 lease 1 2 false; check "same writer generation, next epoch: accepted (start-in-place)" agent g guard; agent g data-down >/dev/null
 check "marker follows the lease: generation 1, epoch 2" jq -e '.generation==1 and .leaseEpoch==2' <(mount -o ro "$DEV" "$H/srv/ezil-data" && cat "$M"; umount "$H/srv/ezil-data")
 lease 2 3 false; check "next writer generation + epoch: accepted (replacement)" agent g guard; agent g data-down >/dev/null
