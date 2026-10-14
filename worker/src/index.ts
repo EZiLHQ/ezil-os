@@ -58,6 +58,10 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  */
 
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
+// AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
+// dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
+import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, resolveAwsOriginZone } from './aws-origin';
+import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, type RegistryFor } from './aws-tunnels';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
 // Separate value import of the SAME class (under a local alias) so the
@@ -102,6 +106,18 @@ export { ContainerProxy } from '@cloudflare/sandbox';
 interface Env extends SandboxEnv {
   /** Approved bare preview zone; unset preserves production's ezil.org routing. */
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
+  /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
+  AWS_ROUTING_ENABLED?: string;
+  /** Origin zone for `c-<sandboxId>-g<gen>-e<epoch>.<zone>`; used only if also allowlisted. */
+  AWS_ORIGIN_ZONE?: string;
+  AWS_ORIGIN_ZONE_ALLOWLIST?: string;
+  AWS_EDGE_PORT?: string;
+  /** Worker-only Cloudflare credentials for per-epoch tunnels (GW-1). Secrets, never vars. */
+  AWS_TUNNEL_CF_ACCOUNT_ID?: string;
+  AWS_TUNNEL_CF_ZONE_ID?: string;
+  AWS_TUNNEL_CF_API_TOKEN?: string;
+  /** One AwsTunnelRegistry per sandbox. */
+  AWS_TUNNELS?: DurableObjectNamespace;
   /** Shared HMAC secret (set via `wrangler secret put SANDBOX_HMAC_SECRET`). */
   SANDBOX_HMAC_SECRET?: string;
   /** Alternate secret name matching the EBuilder env var. Either is accepted. */
@@ -3835,6 +3851,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 }
 
 export { EzilSandboxDO as Sandbox };
+export { AwsTunnelRegistry };
+
+/** The per-sandbox tunnel registry, or null when the binding is absent (everything AWS fails closed). */
+function awsRegistryFor(env: Env): RegistryFor | null {
+  const ns = env.AWS_TUNNELS;
+  return ns ? (sandboxId) => ns.get(ns.idFromName(sandboxId)) : null;
+}
 
 /**
  * Turn the raw exposed-port base URL into the embeddable Apache Guacamole client
@@ -4195,6 +4218,18 @@ async function handlePreview(
     }
     // This Worker serves Cloudflare computers only; AWS routing is P5 (C-5).
     if (v2.provider !== 'cloudflare') {
+      const registry = awsRegistryFor(env);
+      if (v2.provider === 'aws-ec2' && awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && registry) {
+        tl.event('project_authorization', 'sandbox.preview.v2_binding', 'ok', { detail: 'provider=aws-ec2' });
+        return handleAwsPreview(v2, {
+          zone: resolveAwsOriginZone(env),
+          secrets: resolvePreviewSecrets(env).slice(0, 1),
+          zoneRoot: resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT),
+          lookup: (sid) => lookupAwsTunnel(registry, sid),
+          verifyOrigin: (sid) => verifyAwsTunnelOrigin(registry, sid),
+          nowMs: Date.now,
+        });
+      }
       tl.event('project_authorization', 'sandbox.preview.v2_binding', 'error', { error: 'provider_not_routable' });
       return json({ ok: false, error: 'provider_not_routable' }, 401);
     }
@@ -6759,6 +6794,23 @@ export default {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
+    // 0a) AWS computer browser hostnames (`aws-<port>-<sandboxId>.<zone>`, GW-4): fail-closed
+    //     cookie gate, then a gw1-signed forward through the computer's tunnel. Returns null
+    //     for every other hostname, so the Cloudflare dispatch below is unchanged.
+    {
+      const registry = awsRegistryFor(env);
+      const awsBrowser = await handleAwsBrowserHost(request, url, {
+        routingEnabled: awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && registry !== null,
+        zone: resolveAwsOriginZone(env),
+        secrets: resolvePreviewSecrets(env).slice(0, 1),
+        zoneRoot: (() => { try { return resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT); } catch { return ''; } })(),
+        lookup: (sid) => (registry ? lookupAwsTunnel(registry, sid) : Promise.resolve(null)),
+        fetch: (input, init) => fetch(input, init),
+        nowMs: Date.now,
+      });
+      if (awsBrowser) return awsBrowser;
+    }
+
     const bridgeResponse = await handleBridgeHost(request, env, url);
     if (bridgeResponse) return bridgeResponse;
 
@@ -6796,6 +6848,16 @@ export default {
         // Lets the app refuse to enable v2 against a Worker that predates it.
         previewTokenVersions: previewTokenV1Accepted(env.EZIL_PREVIEW_TOKEN_V1_UNTIL) ? ['v1', 'v2'] : ['v2'],
       });
+    }
+
+    if ((method === 'POST' || method === 'DELETE') && path === '/internal/aws/tunnels') {
+      // GW-1: the app asks for (or fences) a per-epoch tunnel. v2-only: the claims verified
+      // above against this exact body must name the body's computer and epoch.
+      const registry = awsRegistryFor(env);
+      if (!awsRoutingEnabled(env.AWS_ROUTING_ENABLED) || !registry) {
+        return json({ ok: false, error: 'aws_routing_disabled' }, 404);
+      }
+      return routeAwsTunnels(method, verifiedV2Claims.get(request), await request.text(), registry);
     }
 
     if (method === 'POST' && path === '/sandbox/preview') {

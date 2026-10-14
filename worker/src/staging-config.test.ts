@@ -20,8 +20,14 @@ describe('staging Worker resources and routes', () => {
   it('uses its own Worker, container application and local Sandbox namespace', () => {
     expect(staging.name).toBe('ezil-os-worker-staging');
     expect(staging.name).not.toBe(config.name);
-    expect(staging.durable_objects.bindings).toEqual([{ name: 'Sandbox', class_name: 'Sandbox' }]);
-    expect(staging.migrations).toEqual([{ tag: 'v1', new_sqlite_classes: ['Sandbox'] }]);
+    expect(staging.durable_objects.bindings).toEqual([
+      { name: 'Sandbox', class_name: 'Sandbox' },
+      { name: 'AWS_TUNNELS', class_name: 'AwsTunnelRegistry' },
+    ]);
+    expect(staging.migrations).toEqual([
+      { tag: 'v1', new_sqlite_classes: ['Sandbox'] },
+      { tag: 'v2', new_sqlite_classes: ['AwsTunnelRegistry'] },
+    ]);
     expect(staging.containers).toHaveLength(1);
     expect(staging.containers[0].name).toBe('ezil-os-worker-staging-sandbox');
     expect(staging.containers[0].class_name).toBe('Sandbox');

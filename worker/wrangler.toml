@@ -76,10 +76,20 @@ rollout_active_grace_period = 300
 class_name = "Sandbox"
 name = "Sandbox"
 
+# AWS computers (GATEWAY-CONTRACT-v1 GW-1): one tunnel registry per sandbox. Inert while
+# AWS_ROUTING_ENABLED is unset (the default): every AWS route then answers 404.
+[[durable_objects.bindings]]
+class_name = "AwsTunnelRegistry"
+name = "AWS_TUNNELS"
+
 # ── Migration registering the Sandbox DO (SQLite storage) ─────────────────────
 [[migrations]]
 new_sqlite_classes = ["Sandbox"]
 tag = "v1"
+
+[[migrations]]
+new_sqlite_classes = ["AwsTunnelRegistry"]
+tag = "v2"
 
 # ── R2 bucket binding (credential-less workspace mount path) ─────────────────
 # Backs the persistent sandbox workspace. When this binding is present,
@@ -331,9 +341,17 @@ SANDBOX_NEKO_ICE_POLICY = "relay"
 class_name = "Sandbox"
 name = "Sandbox"
 
+[[env.staging.durable_objects.bindings]]
+class_name = "AwsTunnelRegistry"
+name = "AWS_TUNNELS"
+
 [[env.staging.migrations]]
 new_sqlite_classes = ["Sandbox"]
 tag = "v1"
+
+[[env.staging.migrations]]
+new_sqlite_classes = ["AwsTunnelRegistry"]
+tag = "v2"
 
 [[env.staging.containers]]
 name = "ezil-os-worker-staging-sandbox"
