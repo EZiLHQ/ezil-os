@@ -168,6 +168,17 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 const n = placements.filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state))).length;
                 return { rows: [{ n }] };
             }
+            case 'count-running-region': {
+                if (!/provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/.test(text)) throw new Error('fake db: unexpected per-region count SQL');
+                const states = new Set(params as string[]);
+                const byRegion = new Map<string | null, number>();
+                for (const r of placements) {
+                    if (r.provider !== 'aws-ec2' || !states.has(String(r.state))) continue;
+                    const key = (r.region as string | null) ?? null;
+                    byRegion.set(key, (byRegion.get(key) ?? 0) + 1);
+                }
+                return { rows: [...byRegion].map(([region, n]) => ({ region, n })) };
+            }
             case 'count-user': {
                 const [computerId, userId] = params as string[];
                 const mine = (r: Row) =>

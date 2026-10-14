@@ -55,16 +55,19 @@ export type RegionPlan = { kind: 'create' } | { kind: 'lease'; region: string | 
 export type AdmissionDecision = { admit: true; region?: string } | { admit: false; reason: AdmissionRefusal; reasons: AdmissionRefusal[] };
 
 /**
- * Exact per-region running counts, when the counter read supplies them.
- * Until then each region is checked against the GLOBAL running count: an
- * upper bound on any one region's count, so a region can be refused while it
- * still has room, but is never over-admitted.
+ * Exact per-region running counts, as `readAdmissionCounters` supplies them.
+ * A region absent from `runningByRegion` has NO running computers (0), and
+ * running rows without a region (`runningUnplaced`) count against every
+ * region. Only a caller that supplies no per-region counts at all (pure cap
+ * checks) falls back to the GLOBAL count, an upper bound that never
+ * over-admits.
  */
-export type RegionalCounters = { runningByRegion?: Readonly<Record<string, number>> };
+export type RegionalCounters = { runningByRegion?: Readonly<Record<string, number>>; runningUnplaced?: number };
 
 function regionRunning(counters: { runningCount: number } & RegionalCounters, region: string): number {
-    const exact = counters.runningByRegion?.[region];
-    return exact === undefined ? counters.runningCount : exact;
+    if (counters.runningByRegion === undefined) return counters.runningCount;
+    const exact = Object.prototype.hasOwnProperty.call(counters.runningByRegion, region) ? counters.runningByRegion[region]! : 0;
+    return exact + (counters.runningUnplaced ?? 0);
 }
 
 /**

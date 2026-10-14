@@ -129,13 +129,13 @@ describe('runAdmission (transactional)', () => {
         const sqls = statements.map((s) => s.sql);
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\), current_setting\('transaction_isolation'\) AS isolation/);
-        expect(sqls.slice(2, 9).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual([
-            'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-user', 'duplicates', 'usage-month',
+        expect(sqls.slice(2, 10).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual([
+            'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-running-region', 'count-user', 'duplicates', 'usage-month',
         ]);
-        expect(sqls[9]).toMatch(/placement:read/); // the lease's home region, read under the lock
-        expect(sqls[10]).toMatch(/placement:read/); // the CAS duplicate pre-check
-        expect(sqls[11]).toMatch(/placement:cas/);
-        expect(sqls[12]).toBe('COMMIT');
+        expect(sqls[10]).toMatch(/placement:read/); // the lease's home region, read under the lock
+        expect(sqls[11]).toMatch(/placement:read/); // the CAS duplicate pre-check
+        expect(sqls[12]).toMatch(/placement:cas/);
+        expect(sqls[13]).toBe('COMMIT');
         expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 
@@ -146,6 +146,9 @@ describe('runAdmission (transactional)', () => {
         expect(running.sql).toMatch(/provider = 'aws-ec2' AND state IN \(/);
         expect(running.params).toContain('UNCONFIRMED');
         expect(running.params).not.toContain('STOPPED');
+        const perRegion = statements.find((s) => /count-running-region/.test(s.sql))!;
+        expect(perRegion.sql).toMatch(/SELECT region, count\(\*\)::int AS n\s+FROM public\.ezil_computer_placements\s+WHERE provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/);
+        expect(perRegion.params).toEqual(running.params);
         const user = statements.find((s) => /count-user/.test(s.sql))!;
         expect(user.sql).toMatch(/p\.computer_id <> \$1::uuid AND p\.state <> 'PURGE_ELIGIBLE'/);
         expect(user.sql).toMatch(/AND \(p\.owner_user_id = \$2::uuid/);
@@ -412,7 +415,8 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
         it('a wake never hops regions: home region full or unconfigured refuses and the placement is unchanged', async () => {
             const seed = () =>
                 createFakePlacementDb({
-                    placements: [placementRow({ computer_id: C1, region: 'ap-south-1' }), placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'us-east-1' })],
+                    // Mumbai (home) holds one running computer; the US has room. A full home must refuse, not hop.
+                    placements: [placementRow({ computer_id: C1, region: 'ap-south-1' }), placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'ap-south-1' })],
                     computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
                 });
             const lease = { kind: 'lease', userId: U1, computerId: C1, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date(NOW.getTime() + 3_600_000) } as const;
@@ -433,6 +437,38 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
                 admitted: true,
                 placement: { state: 'LEASED', region: 'ap-south-1' },
             });
+        });
+
+        it('exact per-region counts: Mumbai full while the US is empty admits into the US although the GLOBAL count is at Mumbai\'s cap', async () => {
+            const { db, placements } = createFakePlacementDb({
+                placements: [placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'ap-south-1' })],
+                computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
+            });
+            const r = await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '1' }));
+            expect(r).toMatchObject({ admitted: true, placement: { region: 'us-east-1' } });
+            expect(placements).toHaveLength(2);
+        });
+
+        it('a running row in another region does not fill this one, and a STOPPED row fills none', async () => {
+            const { db } = createFakePlacementDb({
+                placements: [
+                    placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'us-east-1' }),
+                    placementRow({ computer_id: C2, owner_user_id: U2, state: 'STOPPED', region: 'ap-south-1' }),
+                ],
+                computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }, { id: C3, user_id: U3 }],
+            });
+            const r = await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '1' }));
+            expect(r).toMatchObject({ admitted: true, placement: { region: 'ap-south-1' } });
+        });
+
+        it('a running row WITHOUT a region counts against every region (safe direction)', async () => {
+            const { db, placements } = createFakePlacementDb({
+                placements: [placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: null })],
+                computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
+            });
+            const r = await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '1' }));
+            expect(r).toMatchObject({ admitted: false, reason: 'region_capacity' });
+            expect(placements).toHaveLength(1);
         });
 
         it('a legacy aws-ec2 row without a region is not leased', async () => {

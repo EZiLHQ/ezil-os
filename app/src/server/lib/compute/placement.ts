@@ -571,6 +571,13 @@ export interface AdmissionCounters {
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
     /**
+     * The same running-class rows, per region (only regions that have any). A
+     * region absent here has none. Rows without a region are `runningUnplaced`
+     * and count against EVERY region (the safe direction).
+     */
+    runningByRegion: Readonly<Record<string, number>>;
+    runningUnplaced: number;
+    /**
      * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE: counted by
      * `owner_user_id` (or usage metered to the user), never through
      * `ezil_computers`, so re-keying a computer row hides nothing.
@@ -608,6 +615,12 @@ export async function readAdmissionCounters(
             FROM public.ezil_computer_placements
             WHERE provider = 'aws-ec2' AND state IN (${running})`),
     );
+    const regionRows = rowsOf(
+        await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n
+            FROM public.ezil_computer_placements
+            WHERE provider = 'aws-ec2' AND state IN (${running})
+            GROUP BY region`),
+    );
     // No `deleted_at IS NULL`: soft-deleting a computer must not free the per-user slot
     // while its volume still exists.
     const userRows = rowsOf(
@@ -630,6 +643,15 @@ export async function readAdmissionCounters(
         if (n === null) throw new Error('admission counter query returned no count');
         return n;
     };
+    const runningByRegion: Record<string, number> = {};
+    let runningUnplaced = 0;
+    for (const r of regionRows) {
+        const n = counter(r.n);
+        if (n === null) throw new Error('admission region counter returned no count');
+        if (r.region === null || r.region === undefined) runningUnplaced += n;
+        else if (typeof r.region === 'string' && !Object.prototype.hasOwnProperty.call(runningByRegion, r.region)) runningByRegion[r.region] = n;
+        else throw new Error('admission region counter returned a duplicate or invalid region');
+    }
     const owner = ownerRows[0];
     return {
         targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
@@ -637,6 +659,8 @@ export async function readAdmissionCounters(
         targetDeleted: owner?.deleted === true,
         targetForeignUsage: count(foreignRows),
         runningCount: count(runningRows),
+        runningByRegion,
+        runningUnplaced,
         userOtherAwsComputers: count(userRows),
         duplicates,
         usage: usageRows.map((r) => {
