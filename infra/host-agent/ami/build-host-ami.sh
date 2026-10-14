@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # EZiL AWS computer host AMI build (I4). Runs ON THE BUILD INSTANCE as root (an EC2
-# Image Builder component calls it; see imagebuilder-component.yaml). It makes no AWS API
-# calls and bakes in no secrets: the tunnel token and control key arrive per epoch at
+# Image Builder component calls it; see imagebuilder-component.yaml). ECR pulls use
+# the build instance role. It bakes in no secrets: the tunnel token and control key arrive per epoch at
 # enrollment (C-6), the nonce through user data.
 #
 # Required inputs (environment):
@@ -12,7 +12,7 @@
 #   CLOUDFLARED_SHA256        sha256 of cloudflared-linux-amd64 for that release, copied
 #                             from the reviewed release notes. NO DEFAULT: the build fails
 #                             without it, and fails if the download does not match.
-#   ENROLL_URL                https://<app>/api/internal/computers/enroll (not secret)
+#   ENROLL_URL                https://os.ezil.work/api/compute/aws/enroll (not secret)
 # Optional:
 #   PREVIOUS_DESKTOP_IMAGE_REF / PREVIOUS_DESKTOP_IMAGE_ID   keep the N-1 lower for R4 rebase
 set -euo pipefail
@@ -67,7 +67,15 @@ jq -n --arg u "$ENROLL_URL" '{enrollUrl: $u, networkMode: "veth-nat", iceMode: "
 install -d -m 0700 /var/lib/ezil-host
 
 # 4. desktop image rootfs by digest -> lower; record lowerImageDigest
-apt-get install -y -q --no-install-recommends "${SNAP[@]}" "docker.io=${PIN_DOCKER_IO:-29.1.3-0ubuntu3~24.04.2}"
+# The pinned Ubuntu helper uses the instance role through IMDSv2; no CLI or
+# static credentials are needed. Apt verifies the package SHA-256 against its
+# signed archive metadata, just as for the other pinned packages above.
+apt-get install -y -q --no-install-recommends "${SNAP[@]}" "docker.io=${PIN_DOCKER_IO:-29.1.3-0ubuntu3~24.04.2}" "amazon-ecr-credential-helper=${PIN_ECR_HELPER:-0.7.1-1ubuntu0.24.04.3}"
+DOCKER_CONFIG="$(mktemp -d)"
+export DOCKER_CONFIG AWS_ECR_DISABLE_CACHE=true
+export AWS_ECR_CACHE_DIR="$DOCKER_CONFIG/ecr"
+trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+printf '{"credsStore":"ecr-login"}\n' > "$DOCKER_CONFIG/config.json"
 extract() { # extract <ref@digest> <expected image id>
   docker pull "$1"
   local id; id="$(docker image inspect --format '{{.Id}}' "$1")"
@@ -82,7 +90,10 @@ extract "$DESKTOP_IMAGE_REF" "$DESKTOP_IMAGE_ID"
 echo "$DESKTOP_IMAGE_ID" > /etc/ezil-host/lower-image-digest
 cp "/var/lib/ezil/lowers/${DESKTOP_IMAGE_ID#sha256:}.image-config.json" /etc/ezil-host/image-config.json
 if [ -n "${PREVIOUS_DESKTOP_IMAGE_REF:-}" ]; then extract "$PREVIOUS_DESKTOP_IMAGE_REF" "${PREVIOUS_DESKTOP_IMAGE_ID:?}"; fi
-apt-get purge -y -q docker.io && rm -rf /var/lib/docker /var/lib/containerd
+apt-get purge -y -q docker.io amazon-ecr-credential-helper
+rm -rf /var/lib/docker /var/lib/containerd "$DOCKER_CONFIG"
+trap - EXIT
+unset DOCKER_CONFIG AWS_ECR_DISABLE_CACHE AWS_ECR_CACHE_DIR
 
 # 5. user data is data, not a script: cloud-init must not act on it. cloud-init still
 #    CACHES it (instances/<id>/user-data.txt*, obj.pkl, /run/cloud-init/
@@ -100,6 +111,6 @@ printf '[Resolve]\nDNSStubListenerExtra=10.200.0.1\n' > /etc/systemd/resolved.co
 
 # 7. enable the host chain
 systemctl daemon-reload
-systemctl enable ezil-host.target ezil-lease.service ezil-guard.service ezil-host-clean.service \
-  ezil-overlay.service ezil-desktop.service ezil-enroll.service ezil-edge.service ezil-cloudflared.service ezil-agent.service
+# The target pulls in the services through Wants/Requires; services remain static.
+systemctl enable ezil-host.target
 echo "ezil host AMI build complete: lower ${DESKTOP_IMAGE_ID}"

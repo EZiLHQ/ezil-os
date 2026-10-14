@@ -16,7 +16,7 @@ function synth(bin: string, env: Record<string, string>) {
         execFileSync(process.execPath, ['--import', 'tsx', bin], { cwd: root, stdio: 'pipe', env: { ...clean, ...offline, ...env, CDK_OUTDIR: out } });
         const manifest = JSON.parse(readFileSync(join(out, 'manifest.json'), 'utf8'));
         const stacks = Object.entries(manifest.artifacts as Record<string, any>).filter(([, a]) => a.type === 'aws:cloudformation:stack');
-        return Object.fromEntries(stacks.map(([name, a]) => [name, { template: JSON.parse(readFileSync(join(out, a.properties.templateFile), 'utf8')),
+        return Object.fromEntries(stacks.map(([name, a]) => [name, { terminationProtection: a.properties.terminationProtection, template: JSON.parse(readFileSync(join(out, a.properties.templateFile), 'utf8')),
             assets: (a.dependencies ?? []).filter((d: string) => d.endsWith('.assets')).map((d: string) =>
                 JSON.parse(readFileSync(join(out, manifest.artifacts[d].properties.file), 'utf8'))) }]));
     } finally { rmSync(out, { recursive: true, force: true }); }
@@ -49,6 +49,17 @@ test('bin/main (foundation), bin/identity and bin/ops synthesize without bootstr
     assert.equal(roles(ops).length, 0);
     for (const t of [identity, ops]) assert.ok(!JSON.stringify(t).includes('BootstrapVersion'));
 });
+test('bin/ami is a protected founder stack with no assets, bootstrap or workload boundary', () => {
+    const stacks = synth('bin/ami.ts', { EZIL_AMI_CONFIG: 'config/ami.example.json' });
+    assert.deepEqual(Object.keys(stacks), ['ezil-pilot-ami']);
+    const { template, assets, terminationProtection } = stacks['ezil-pilot-ami']!;
+    assert.equal(terminationProtection, true);
+    assert.deepEqual(assets, []);
+    assert.equal(roles(template).length, 1);
+    assert.equal(roles(template)[0].Properties.Path, '/ezil/pilot/');
+    assert.equal(roles(template)[0].Properties.PermissionsBoundary, undefined);
+    assert.ok(!JSON.stringify(template).includes('BootstrapVersion'));
+});
 test('bin entrypoints refuse to run without a config', () => {
-    for (const bin of ['bin/main.ts', 'bin/lifecycle.ts', 'bin/identity.ts', 'bin/ops.ts']) assert.throws(() => synth(bin, {}), bin);
+    for (const bin of ['bin/main.ts', 'bin/lifecycle.ts', 'bin/identity.ts', 'bin/ops.ts', 'bin/ami.ts']) assert.throws(() => synth(bin, {}), bin);
 });

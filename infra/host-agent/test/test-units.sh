@@ -24,7 +24,14 @@ check "the desktop is not bound to the agent: an agent restart never restarts th
 check "the target pulls the desktop in" grep -q "^Wants=.*ezil-desktop.service" "$S/ezil-host.target"
 check "the AMI runs the desktop in relay mode (no inbound rule: TURN only)" grep -q 'iceMode: "relay"' "$HA/ami/build-host-ami.sh"
 check "cloudflared requires the edge: no verifier, no tunnel (fail closed)" bash -c "grep -qx ezil-edge.service <(dep ezil-cloudflared.service Requires) && grep -qx ezil-edge.service <(dep ezil-cloudflared.service After)"
-check "the AMI enables the edge unit" grep -q "ezil-edge.service" "$HA/ami/build-host-ami.sh"
+check "AMI: enabling the host target really connects it to boot (static is refused)" bash -c "
+root='$T/ami-enable'
+rm -rf \"\$root\"
+mkdir -p \"\$root/etc/systemd/system\"
+cp '$S'/* \"\$root/etc/systemd/system/\"
+systemctl --root=\"\$root\" enable ezil-host.target &&
+[ \"\$(systemctl --root=\"\$root\" is-enabled ezil-host.target)\" = enabled ]
+"
 check "no unit uses Wants= for the boot chain (Wants would not fail closed)" bash -c "! grep -l '^Wants=ezil-' '$S'/*.service"
 check "every service runs the agent with the baked config" bash -c "for f in '$S'/*.service; do grep -q '^Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json' \$f || exit 1; done"
 mkdir -p "$T/units/opt/ezil-host/bin"; cp "$S"/* "$T/units/"

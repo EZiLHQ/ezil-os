@@ -7,7 +7,8 @@ tunnel, and idle-stops or honours a control-plane stop (R9). The contracts live 
 `docs/AWS-COMPUTERS.md`; this directory implements the host side of R3, R4, R5, R9 and R15,
 C-4, C-6, and §3a. The S1 spike (`feat/aws-s1-runtime-spike`) holds the runtime evidence.
 
-Python 3 standard library only. Nothing here calls an AWS API.
+The runtime agent uses Python 3 standard library only and makes no AWS API calls.
+The AMI build uses its temporary instance role to pull the desktop image from ECR.
 
 ## Canary serial diagnostics (default off)
 
@@ -277,6 +278,9 @@ An image upgrade is a per-computer job.
 
 ## AMI (`ami/`)
 
+The founder deploys and runs the pipeline using the explicit
+[Host AMI operator commands](../app-computers/README.md#host-ami).
+
 **Packages are pinned.** The base must be Ubuntu 24.04. Every apt package is installed at
 an exact version: the set the I4 tests ran with, overridable only by an explicit `PIN_*`
 variable. They are then held. A pin that has left the archive fails the build, so either
@@ -302,8 +306,12 @@ It installs:
 
 It then extracts the desktop image **by digest** into `/var/lib/ezil/lowers/<image id>`,
 verifies the image ID, and records it as `lowerImageDigest`. It can keep the N−1 lower
-for rebases, removes the build-time Docker, sets cloud-init `allow_userdata: false`, and
-enables the units.
+for rebases, removes the build-time Docker and ECR credential helper, sets cloud-init
+`allow_userdata: false`, and enables the units. The helper is pinned to Ubuntu package
+`0.7.1-1ubuntu0.24.04.3` (apt verifies the signed archive SHA-256), obtains ECR credentials
+from the build instance role through IMDSv2, and disables its token cache. Its temporary
+Docker configuration/cache directory is removed on success and failure. No registry login
+or build role is attached to runtime hosts.
 
 It bakes in no secrets: `agent.json` holds only the enrollment URL. It was **not run** here
 (no cloud calls); `test-units.sh` checks it statically.

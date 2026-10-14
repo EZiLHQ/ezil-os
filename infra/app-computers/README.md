@@ -259,7 +259,8 @@ npm run synth            # foundation, config/foundation.example.json
 npm run synth:lifecycle  # lifecycle + recovery, config/lifecycle.example.json
 npm run synth:identity   # I5 deploy identity, config/identity.example.json
 npm run synth:ops        # I6 ops guardrails, config/ops.example.json
-npm run synth:all        # all four
+npm run synth:ami        # founder host AMI pipeline, config/ami.example.json
+npm run synth:all        # all five
 # or, from the repository root:
 bash tools/test.sh infra
 ```
@@ -530,8 +531,9 @@ Both are capped by the boundary. Today the account is empty in the pilot region,
 
 **Identity.** The founder runs this once, with **their own administrator session**: an IAM
 Identity Center `AdministratorAccess` permission-set session with MFA, in the target account.
-Never the root user, and never a CI role. The same applies to the **ops stack**: DLM, budgets
-and the kill switch are founder change sets only, because they sit outside the boundary.
+Never the root user, and never a CI role. The same applies to the **ops and AMI stacks**:
+DLM, budgets, the kill switch and Image Builder are founder change sets only, because
+they sit outside the workload boundary. See [Host AMI](#host-ami) for the AMI runbook.
 
 **No prior deployment.** The foundation stack is now `ezil-<ns>-foundation` (it was
 `EzilAppComputers-<stage>`). The lead verified on 2026-10-13 that ap-south-1 is empty and that
@@ -600,6 +602,228 @@ aws cloudformation execute-change-set --region ap-south-1 \
 - The lifecycle template is over 51 kB, so it goes through S3.
 - The foundation stack has no assets: it follows the same steps without `publish-assets`, with
   `cdk.out/foundation/ezil-pilot-foundation.template.json`.
+
+## Host AMI
+
+Run this section in Bash from the repository root as the founder's SSO
+`AdministratorAccess` session, in `us-east-1`. The identity and foundation stacks
+must already exist there. Required local tools: AWS CLI v2, Docker, git, jq, curl,
+sha256sum, and installed `infra/app-computers` npm dependencies. Commit and review
+the agent/pipeline changes before packaging; the archive below contains exactly HEAD.
+
+This is founder infrastructure: no workload execution role, CDK bootstrap, assets,
+or schedule. Only an explicit Image Builder start creates build instances. The build
+role has the two required AWS-managed policies plus inline read access to
+`ami/host-agent-*.tgz` and the foundation ECR repository. Runtime hosts have no role.
+AMI distribution stays private in the configured region.
+
+**Known launch blocker:** Canonical Ubuntu uses `/dev/sda1` and this recipe makes
+a 30 GiB root. The current lifecycle requires `/dev/xvda` and defaults to 20 GiB
+(`lib/lifecycle/helper.ts` and `deployment.ts`); the foundation also maps `/dev/xvda`.
+Step (f) updates the AMI parameter only. Align those launch contracts in a separate
+reviewed change before attempting lifecycle launches.
+
+**(a) Select the founder session, read the existing outputs, archive and upload.**
+
+```sh
+export AWS_PROFILE='<founder-sso-admin-profile>'
+export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=''
+aws sso login --profile "$AWS_PROFILE"
+set -euo pipefail
+CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+[[ "$CALLER_ARN" == *:assumed-role/AWSReservedSSO_AdministratorAccess_*/* ]]
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+NS=pilot
+FOUNDATION_STACK="ezil-$NS-foundation"
+AMI_STACK="ezil-$NS-ami"
+stack_output() {
+  aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$1" \
+    --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue | [0]" --output text
+}
+ASSET_BUCKET="$(stack_output "ezil-identity-$NS" AssetBucketName)"
+SUBNET_ID="$(stack_output "$FOUNDATION_STACK" SubnetId0)"
+SECURITY_GROUP_ID="$(stack_output "$FOUNDATION_STACK" SecurityGroupId)"
+REPOSITORY_URI="$(stack_output "$FOUNDATION_STACK" ApplicationImageRepositoryUri)"
+for value in "$ASSET_BUCKET" "$SUBNET_ID" "$SECURITY_GROUP_ID" "$REPOSITORY_URI"; do
+  [[ -n "$value" && "$value" != None ]]
+done
+REPOSITORY_NAME="${REPOSITORY_URI#*/}"
+REPOSITORY_ARN="$(aws ecr describe-repositories --region "$AWS_REGION" \
+  --repository-names "$REPOSITORY_NAME" --query 'repositories[0].repositoryArn' --output text)"
+AGENT_SHA="$(git rev-parse HEAD)"
+RELEASE_DIR="$(mktemp -d "/tmp/ezil-ami-${AGENT_SHA:0:12}.XXXXXX")"
+git archive --format=tar.gz --output "$RELEASE_DIR/host-agent-$AGENT_SHA.tgz" \
+  "$AGENT_SHA:infra/host-agent"
+AGENT_SRC_S3_URI="s3://$ASSET_BUCKET/ami/host-agent-$AGENT_SHA.tgz"
+aws s3 cp --region "$AWS_REGION" "$RELEASE_DIR/host-agent-$AGENT_SHA.tgz" "$AGENT_SRC_S3_URI"
+```
+
+**(b) Push the local amd64 desktop image and record both digests.** The ECR manifest
+digest pins the pull; the image configuration digest is the expected image ID.
+Use a fresh tag because the foundation repository has immutable tags.
+
+```sh
+LOCAL_IMAGE=ezil-final:82b0f33-local
+[[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$LOCAL_IMAGE")" == linux/amd64 ]]
+DESKTOP_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")"
+DESKTOP_TAG="host-$AGENT_SHA-$(date -u +%Y%m%d%H%M%S)"
+aws ecr get-login-password --region "$AWS_REGION" |
+  docker login --username AWS --password-stdin "${REPOSITORY_URI%%/*}"
+docker tag "$LOCAL_IMAGE" "$REPOSITORY_URI:$DESKTOP_TAG"
+docker push "$REPOSITORY_URI:$DESKTOP_TAG"
+DESKTOP_DIGEST="$(aws ecr describe-images --region "$AWS_REGION" \
+  --repository-name "$REPOSITORY_NAME" --image-ids "imageTag=$DESKTOP_TAG" \
+  --query 'imageDetails[0].imageDigest' --output text)"
+[[ "$DESKTOP_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+DESKTOP_IMAGE_REF="$REPOSITORY_URI@$DESKTOP_DIGEST"
+docker pull "$DESKTOP_IMAGE_REF"
+[[ "$(docker image inspect --format '{{.Id}}' "$DESKTOP_IMAGE_REF")" == "$DESKTOP_IMAGE_ID" ]]
+printf 'DesktopImageRef=%s\nDesktopImageId=%s\n' "$DESKTOP_IMAGE_REF" "$DESKTOP_IMAGE_ID" |
+  tee "$RELEASE_DIR/desktop.txt"
+```
+
+**(c) Select and verify cloudflared.** Read the reviewed release's
+`cloudflared-linux-amd64` SHA-256 at
+https://github.com/cloudflare/cloudflared/releases. Neither value has a default.
+
+```sh
+read -r -p 'Reviewed cloudflared version (YYYY.M.N): ' CLOUDFLARED_VERSION
+read -r -p 'Reviewed cloudflared-linux-amd64 SHA-256: ' CLOUDFLARED_SHA256
+[[ "$CLOUDFLARED_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]
+[[ "$CLOUDFLARED_SHA256" =~ ^[a-f0-9]{64}$ ]]
+curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64" \
+  -o "$RELEASE_DIR/cloudflared-linux-amd64"
+printf '%s  %s\n' "$CLOUDFLARED_SHA256" "$RELEASE_DIR/cloudflared-linux-amd64" | sha256sum -c -
+```
+
+**(d) Synthesize, create and review the founder change set.** Set
+`AMI_CHANGE_TYPE=UPDATE` for an existing AMI stack. Increment `AMI_VERSION` for
+every component/recipe update, including changed parameters or a refreshed parent
+AMI: Image Builder versions are immutable. Re-running an unchanged pipeline needs
+only step (e). The public Ubuntu SSM parameter resolves during the change set,
+without a synth-time lookup.
+
+```sh
+AMI_VERSION=1.0.0
+AMI_CHANGE_TYPE=CREATE
+jq -n --arg namespace "$NS" --arg accountId "$ACCOUNT_ID" --arg region "$AWS_REGION" \
+  --arg version "$AMI_VERSION" \
+  '{namespace:$namespace, accountId:$accountId, region:$region, version:$version}' \
+  > "infra/app-computers/config/ami.$NS.json"
+(
+  cd infra/app-computers
+  EZIL_AMI_CONFIG="config/ami.$NS.json" npm run synth:ami
+)
+jq -n --arg bucket "$ASSET_BUCKET" --arg repo "$REPOSITORY_ARN" \
+  --arg subnet "$SUBNET_ID" --arg sg "$SECURITY_GROUP_ID" \
+  --arg src "$AGENT_SRC_S3_URI" --arg image "$DESKTOP_IMAGE_REF" --arg id "$DESKTOP_IMAGE_ID" \
+  --arg version "$CLOUDFLARED_VERSION" --arg sha "$CLOUDFLARED_SHA256" \
+  '{AssetBucketName:$bucket, ApplicationImageRepositoryArn:$repo, SubnetId:$subnet, SecurityGroupId:$sg,
+    UbuntuAmiId:"/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
+    AgentSrcS3Uri:$src, DesktopImageRef:$image, DesktopImageId:$id,
+    CloudflaredVersion:$version, CloudflaredSha256:$sha,
+    EnrollUrl:"https://os.ezil.work/api/compute/aws/enroll"}
+   | to_entries | map({ParameterKey:.key, ParameterValue:.value})' \
+  > "$RELEASE_DIR/ami-parameters.json"
+AMI_CHANGE_SET="ami-${AGENT_SHA:0:12}-$(date -u +%Y%m%d%H%M%S)"
+aws cloudformation create-change-set --region "$AWS_REGION" --stack-name "$AMI_STACK" \
+  --change-set-name "$AMI_CHANGE_SET" --change-set-type "$AMI_CHANGE_TYPE" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --template-body "file://infra/app-computers/cdk.out/ami/$AMI_STACK.template.json" \
+  --parameters "file://$RELEASE_DIR/ami-parameters.json"
+aws cloudformation wait change-set-create-complete --region "$AWS_REGION" \
+  --stack-name "$AMI_STACK" --change-set-name "$AMI_CHANGE_SET"
+aws cloudformation describe-change-set --region "$AWS_REGION" \
+  --stack-name "$AMI_STACK" --change-set-name "$AMI_CHANGE_SET" --output json
+```
+
+Review the local template, all parameter values and resource changes above. Then execute.
+Direct CloudFormation commands require the explicit termination-protection call below;
+the CDK assembly's protection setting is not part of the template.
+
+```sh
+aws cloudformation execute-change-set --region "$AWS_REGION" \
+  --stack-name "$AMI_STACK" --change-set-name "$AMI_CHANGE_SET"
+if [[ "$AMI_CHANGE_TYPE" == CREATE ]]; then
+  aws cloudformation wait stack-create-complete --region "$AWS_REGION" --stack-name "$AMI_STACK"
+else
+  aws cloudformation wait stack-update-complete --region "$AWS_REGION" --stack-name "$AMI_STACK"
+fi
+aws cloudformation update-termination-protection --region "$AWS_REGION" \
+  --stack-name "$AMI_STACK" --enable-termination-protection
+PIPELINE_ARN="$(stack_output "$AMI_STACK" PipelineArn)"
+```
+
+**(e) Start one bake, poll its execution, and read its AMI ID.** The poll is bounded
+to four hours. Failure prints Image Builder's reason and stops before promotion.
+If the local poll times out, the remote execution continues; resume polling the
+same `BUILD_ARN` rather than starting a duplicate bake.
+
+```sh
+BUILD_ARN="$(aws imagebuilder start-image-pipeline-execution --region "$AWS_REGION" \
+  --image-pipeline-arn "$PIPELINE_ARN" --query imageBuildVersionArn --output text)"
+printf '%s\n' "$BUILD_ARN" | tee "$RELEASE_DIR/build-arn.txt"
+deadline=$((SECONDS + 14400))
+while true; do
+  aws imagebuilder get-image --region "$AWS_REGION" --image-build-version-arn "$BUILD_ARN" \
+    --output json > "$RELEASE_DIR/build.json"
+  STATUS="$(jq -er '.image.state.status' "$RELEASE_DIR/build.json")"
+  printf '%s: %s\n' "$BUILD_ARN" "$STATUS"
+  case "$STATUS" in
+    AVAILABLE) break ;;
+    FAILED|CANCELLED|DELETED|DEPRECATED|DISABLED)
+      jq '.image.state' "$RELEASE_DIR/build.json"
+      exit 1 ;;
+  esac
+  if (( SECONDS >= deadline )); then
+    printf 'Timed out waiting for %s; inspect/resume this execution.\n' "$BUILD_ARN" >&2
+    exit 1
+  fi
+  sleep 30
+done
+HOST_AMI_ID="$(jq -er --arg region "$AWS_REGION" \
+  '.image.outputResources.amis | map(select(.region == $region))
+   | if length == 1 then .[0].image else error("expected one regional AMI") end' \
+  "$RELEASE_DIR/build.json")"
+[[ "$HOST_AMI_ID" =~ ^ami-[a-f0-9]{17}$ ]]
+printf '%s\n' "$HOST_AMI_ID" | tee "$RELEASE_DIR/ami-id.txt"
+aws ec2 wait image-available --region "$AWS_REGION" --image-ids "$HOST_AMI_ID"
+aws ec2 describe-images --region "$AWS_REGION" --image-ids "$HOST_AMI_ID" \
+  --query 'Images[0].{Id:ImageId,State:State,Architecture:Architecture,Root:RootDeviceName,Disks:BlockDeviceMappings}' \
+  --output json
+```
+
+**(f) Promote through a foundation UPDATE change set.** Reuse the deployed
+template and preserve every other parameter. Review the AMI evidence and launch
+blocker above before executing; this does not update lifecycle deployment settings.
+
+```sh
+aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$FOUNDATION_STACK" \
+  --query 'Stacks[0].Parameters' --output json |
+  jq --arg ami "$HOST_AMI_ID" \
+    'map(if .ParameterKey == "HostAmiId"
+         then {ParameterKey:.ParameterKey, ParameterValue:$ami}
+         else {ParameterKey:.ParameterKey, UsePreviousValue:true} end)' \
+  > "$RELEASE_DIR/foundation-parameters.json"
+FOUNDATION_CHANGE_SET="host-ami-$(date -u +%Y%m%d%H%M%S)"
+aws cloudformation create-change-set --region "$AWS_REGION" --stack-name "$FOUNDATION_STACK" \
+  --change-set-name "$FOUNDATION_CHANGE_SET" --change-set-type UPDATE --use-previous-template \
+  --parameters "file://$RELEASE_DIR/foundation-parameters.json"
+aws cloudformation wait change-set-create-complete --region "$AWS_REGION" \
+  --stack-name "$FOUNDATION_STACK" --change-set-name "$FOUNDATION_CHANGE_SET"
+aws cloudformation describe-change-set --region "$AWS_REGION" \
+  --stack-name "$FOUNDATION_STACK" --change-set-name "$FOUNDATION_CHANGE_SET" --output json
+```
+
+After reviewing the foundation change set:
+
+```sh
+aws cloudformation execute-change-set --region "$AWS_REGION" \
+  --stack-name "$FOUNDATION_STACK" --change-set-name "$FOUNDATION_CHANGE_SET"
+aws cloudformation wait stack-update-complete --region "$AWS_REGION" --stack-name "$FOUNDATION_STACK"
+aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$FOUNDATION_STACK" \
+  --query "Stacks[0].Parameters[?ParameterKey=='HostAmiId'].ParameterValue | [0]" --output text
+```
 
 ## Ops guardrails (I6)
 
