@@ -207,6 +207,45 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                         .map((u) => ({ ...u, egress_bytes: u.egress_bytes === null ? null : String(u.egress_bytes) })),
                 };
             }
+            case 'usage-close':
+            case 'usage-close-other': {
+                if (!tx) throw new Error('fake db: a usage write outside its transition transaction');
+                const [observedBy, computerId, keepInstance] = params as string[];
+                const hit = usage.filter((u) => uuidEq(u.computer_id, computerId) && u.stopped_at == null
+                    && (tag === 'usage-close' || u.instance_id !== keepInstance));
+                for (const u of hit) {
+                    const before = { ...u };
+                    Object.assign(u, { stopped_at: clock(), observed_by: observedBy, updated_at: clock() });
+                    tx.undo.push(() => Object.assign(u, before));
+                }
+                return { rows: [] };
+            }
+            case 'usage-open': {
+                if (!tx) throw new Error('fake db: a usage write outside its transition transaction');
+                if (!/WHERE NOT EXISTS \(SELECT 1 FROM [\w.]+\s+WHERE computer_id = \$7::uuid AND instance_id = \$8 AND stopped_at IS NULL\)/.test(text)) {
+                    throw new Error('fake db: unexpected usage-open SQL');
+                }
+                const [computerId, userId, instanceId, instanceType, startedAt, observedBy] = params as (string | null)[];
+                if (usage.some((u) => uuidEq(u.computer_id, computerId) && u.instance_id === instanceId && u.stopped_at == null)) return { rows: [] };
+                const row: Row = {
+                    computer_id: computerId, user_id: userId, instance_id: instanceId, instance_type: instanceType,
+                    started_at: startedAt ? new Date(startedAt) : clock(), stopped_at: null, egress_bytes: null, observed_by: observedBy, updated_at: clock(),
+                };
+                usage.push(row);
+                tx.undo.push(() => usage.splice(usage.indexOf(row), 1));
+                return { rows: [] };
+            }
+            case 'reconcile-list': {
+                const limit = Number(params.at(-1));
+                const states = new Set(params.slice(0, -1) as string[]);
+                return {
+                    rows: placements
+                        .filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)))
+                        .sort((a, b) => new Date(a.updated_at as Date).getTime() - new Date(b.updated_at as Date).getTime())
+                        .slice(0, limit)
+                        .map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })),
+                };
+            }
             case 'retention':
                 return { rows: placements.filter((r) => r.state === 'STOPPED' || r.state === 'RETIRED').map((r) => ({ computer_id: r.computer_id, state: r.state, updated_at: r.updated_at })) };
             case 'insert': {

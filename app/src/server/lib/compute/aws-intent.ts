@@ -212,6 +212,39 @@ export interface LifecycleWork {
     stateMachineArn: string;
 }
 
+/**
+ * A lifecycle job on a placement's CURRENT generation: start, stop or retire. Its fence
+ * token is the one that generation's instance and volume are tagged with: the helper
+ * refuses any other (`lifecycle_volume_invalid`), so it is never re-minted. A retire
+ * keeps the data volume (R11): the helper stops and terminates the instance only.
+ */
+export function currentGenerationIntent(
+    p: { computerId: string; generation: number; fenceToken: string | null; instanceId: string | null; volumeId: string | null; instanceType: string | null },
+    operation: Extract<LifecycleOperation, 'start' | 'stop' | 'retire'>,
+    deployment: LifecycleDeployment,
+    extra: { jobId: string; userData: string | null; leaseEpoch: number },
+): LifecycleIntent {
+    return {
+        schemaVersion: 1,
+        jobId: extra.jobId,
+        computerId: p.computerId.toLowerCase(),
+        revision: 1,
+        operation,
+        targetGeneration: p.generation,
+        fenceToken: p.fenceToken!,
+        providerInstanceId: p.instanceId,
+        dataVolumeId: p.volumeId,
+        previousGeneration: null,
+        previousInstanceId: null,
+        previousFenceToken: null,
+        deployment,
+        instanceType: p.instanceType ?? '',
+        dataVolumeGiB: null,
+        leaseEpoch: extra.leaseEpoch,
+        userData: extra.userData,
+    };
+}
+
 /** Validate, serialize and digest one intent. Throws `LifecycleIntentInvalidError` rather than send a document the helper would refuse. */
 export function buildLifecycleWork(candidate: LifecycleIntent): LifecycleWork {
     const parsed = LifecycleIntentSchema.safeParse(candidate);

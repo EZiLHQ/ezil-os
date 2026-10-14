@@ -51,7 +51,7 @@ const env = (over: Record<string, string> = {}) => ({
     ...over,
 });
 
-type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null };
+type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null };
 
 function receiptOf(o: { jobId?: string; digest?: string; generation?: number; leaseEpoch?: number; fenceToken?: string; instanceId?: string; volumeId?: string; state?: string } = {}) {
     return JSON.stringify({
@@ -67,8 +67,9 @@ const row = (over: Record<string, unknown> = {}) =>
         enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 300_000), ...over,
     });
 
-function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean } = {}) {
-    const fake = createFakePlacementDb({ placements: rows, computers: [{ id: C1, user_id: U1 }] });
+function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[] } = {}) {
+    // The database clock is the scenario clock: usage rows are dated by it.
+    const fake = createFakePlacementDb({ placements: rows, computers: [{ id: C1, user_id: U1 }], usage: opts.usage }, { clock: () => NOW });
     const read: string[] = [];
     const executions: LifecycleExecutionReader = {
         async describe(region, arn) {
@@ -319,6 +320,88 @@ describe('stop receipts', () => {
         const { status, deleted } = setup([stopping()], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped', instanceId: 'i-33333333333333333' }) });
         expect(await status()).toMatchObject({ placementState: 'UNCONFIRMED' });
         expect(deleted).toEqual([]);
+    });
+});
+
+describe('Codex #5: the usage ledger is written by confirmed receipts (hour caps are real; egress is not measured)', () => {
+    const STARTED = new Date(NOW.getTime() - 2 * 3_600_000);
+    const usageRow = (over: Record<string, unknown> = {}) => ({
+        computer_id: C1, user_id: U1, instance_id: I_OLD, instance_type: 't3a.medium', started_at: new Date(NOW.getTime() - 9 * 3_600_000),
+        stopped_at: null, egress_bytes: null, observed_by: 'lifecycle-receipt', updated_at: NOW, ...over,
+    });
+
+    it('a running receipt opens one row for the instance, dated from the job start, egress NULL; re-applying adds nothing', async () => {
+        const { status, usage } = setup([row()], { status: 'SUCCEEDED', output: receiptOf(), startDate: STARTED });
+        await status();
+        expect(usage).toEqual([{
+            computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium', started_at: STARTED, stopped_at: null, egress_bytes: null,
+            observed_by: 'lifecycle-receipt', updated_at: NOW,
+        }]);
+        await status();
+        await status();
+        expect(usage).toHaveLength(1);
+    });
+
+    it('without an execution start the row is dated by the database clock', async () => {
+        const { status, usage } = setup([row()], { status: 'SUCCEEDED', output: receiptOf() });
+        await status();
+        expect(usage[0]).toMatchObject({ instance_id: I_NEW, started_at: NOW });
+    });
+
+    it('a replace closes the old instance\'s open row and opens the new one', async () => {
+        const { status, usage } = setup([row()], { status: 'SUCCEEDED', output: receiptOf(), startDate: STARTED }, { usage: [usageRow()] });
+        await status();
+        expect(usage.map((u) => [u.instance_id, u.stopped_at])).toEqual([[I_OLD, NOW], [I_NEW, null]]);
+    });
+
+    it('a stopped receipt closes the open row (at the database clock), only once the transition wins', async () => {
+        const stopping = row({ state: 'STOPPING', instance_id: I_NEW, enroll_nonce_hash: null, enroll_expires_at: null });
+        const s = setup([stopping], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) }, { usage: [usageRow({ instance_id: I_NEW })] });
+        s.tunnels.deleteTunnel = async () => ({ ok: false, status: 502 });
+        await s.status();
+        expect(s.usage[0]).toMatchObject({ stopped_at: null }); // fence pending: still STOPPING, still billed
+        s.tunnels.deleteTunnel = async () => ({ ok: true });
+        await s.status();
+        expect(s.usage[0]).toMatchObject({ stopped_at: NOW });
+    });
+
+    it('a conflicting receipt writes no usage', async () => {
+        const { status, usage } = setup([row()], { status: 'SUCCEEDED', output: receiptOf({ jobId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }) });
+        expect(await status()).toMatchObject({ placementState: 'UNCONFIRMED' });
+        expect(usage).toEqual([]);
+    });
+
+    it('end to end: hours written by the receipts make the monthly hour cap refuse the next wake', async () => {
+        let answer: Exec = { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 101 * 3_600_000) };
+        const s = setup([row()], () => answer);
+        const me = { userId: U1, computerId: C1 };
+        await s.status(); // STARTING → MOUNTING: row opened 101 h ago
+        expect((await s.enroll()).status).toBe(200);
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        await s.provider.stop(ctx, me, 'user');
+        const stop = s.starts.at(-1)!;
+        answer = { status: 'SUCCEEDED', output: receiptOf({ jobId: stop.intent.jobId, digest: stop.digest, state: 'stopped' }) };
+        expect(await s.status()).toMatchObject({ placementState: 'STOPPED' });
+        expect(s.usage).toEqual([expect.objectContaining({ instance_id: I_NEW, stopped_at: NOW })]);
+        expect(await s.provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, error: 'user_hours_cap' });
+    });
+});
+
+describe('retire receipts (computer.delete)', () => {
+    const retiring = (over: Record<string, unknown> = {}) => row({ state: 'RETIRING', instance_id: I_NEW, enroll_nonce_hash: null, enroll_expires_at: null, ...over });
+
+    it('RETIRING + retired receipt → RETIRED, job cleared, volume kept, any open usage row closed; no tunnel call (fenced at stop)', async () => {
+        const open = { computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium', started_at: NOW, stopped_at: null, egress_bytes: null, observed_by: 'x', updated_at: NOW };
+        const { status, placements, usage, deleted } = setup([retiring()], { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) }, { usage: [open] });
+        expect(await status()).toMatchObject({ placementState: 'RETIRED' });
+        expect(placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null, volume_id: VOL, instance_id: I_NEW });
+        expect(usage[0]).toMatchObject({ stopped_at: NOW });
+        expect(deleted).toEqual([]);
+    });
+
+    it.each([['stopped'], ['running']])('a %s receipt for a retire job is a conflict (UNCONFIRMED)', async (state) => {
+        const { status } = setup([retiring()], { status: 'SUCCEEDED', output: receiptOf({ state }) });
+        expect(await status()).toMatchObject({ placementState: 'UNCONFIRMED' });
     });
 });
 

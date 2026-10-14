@@ -192,6 +192,8 @@ describe('defaultAwsCollaborators: the real AWS clients, gated', () => {
         const all = defaultAwsCollaborators({ ...AWS_ENV, ...ROLES });
         expect(typeof all.starter?.start).toBe('function');
         expect(typeof all.executions?.describe).toBe('function');
+        // Codex #6: the EC2 describe that catches a guest-initiated idle stop reaches the provider.
+        expect(typeof all.describer?.describeForEnrollment).toBe('function');
     });
 });
 

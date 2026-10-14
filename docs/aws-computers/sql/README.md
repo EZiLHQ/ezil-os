@@ -53,6 +53,14 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
    ones may hold an R2 workspace). Deleting an AWS computer is refused until retire is
    implemented (`terminate` answers `aws_not_supported`).
 
+## Usage ledger (`ezil_compute_usage`)
+
+Rows are written only by `placement.ts`, in the same transaction as the placement
+transition that applied a lifecycle receipt: a confirmed `running` receipt opens one
+row per instance run, a confirmed `stopped`/`retired` receipt closes it. Hours caps
+therefore bind. `egress_bytes` is always NULL (egress is not measured yet), so the
+egress caps do not bind.
+
 ## Ownership (`owner_user_id`)
 
 `ezil_computer_placements.owner_user_id` is set once, at creation, from the
