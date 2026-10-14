@@ -1,6 +1,7 @@
 """Unprivileged canary tests; synthetic data only, no EC2 or real console access."""
 import hashlib
 import json
+import subprocess
 import os
 from pathlib import Path
 import stat
@@ -232,6 +233,7 @@ class Canary(unittest.TestCase):
     def test_agent_shutdown_probes_before_unmount_and_keeps_worst_outcome(self):
         worker = agent.Agent.__new__(agent.Agent)  # no control key or enrollment needed by these hooks
         worker.cfg, worker.stop_outcome, worker.log = self.cfg, "killed", lambda _: None
+        worker.sleep = lambda _: None              # power_off retries a failed poweroff
         order = []
         with mock.patch.object(agent.tunnel, "fence"), mock.patch.object(agent.time, "sleep"), \
              mock.patch.object(worker, "record_stop"), mock.patch.object(guard, "clear_stamp"), \
@@ -239,7 +241,7 @@ class Canary(unittest.TestCase):
              mock.patch.object(canary, "probe", side_effect=lambda *_: order.append("probe")), \
              mock.patch.object(desktop, "overlay_umount", side_effect=lambda *_: order.append("unmount")), \
              mock.patch.object(desktop, "netns_down", side_effect=OSError("private")), \
-             mock.patch.object(agent.subprocess, "run"):
+             mock.patch.object(agent.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
             worker.shutdown("private")
         self.assertEqual(order, ["probe", "unmount"])
         final = self.records()[-1]

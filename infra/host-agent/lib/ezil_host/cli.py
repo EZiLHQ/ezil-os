@@ -30,6 +30,50 @@ def desktop_relay(cfg, lease, wait=None):
     return "applied" if c else "missing (ice_missing): started without a relay; the next push restarts it"
 
 
+ENROLLED_FILE = "enrolled.json"   # stateDir: which instance enrolled which epoch, and its routing
+
+
+def _current_instance_id(cfg):
+    return guard.current_instance_id(cfg)
+
+
+def enroll_or_reuse(cfg, lease):
+    """The enroll step. An in-place reboot of the SAME instance in the same epoch (EC2 host
+    maintenance) re-reads the same user data, whose nonce the app already consumed: posting it
+    again is refused. So when this instance already enrolled this exact (generation, epoch),
+    and its tunnel token and control key are still on the host root volume (a fence wipes
+    them), reuse them: wipe the local nonce copies and restore the edge's routing. Any other
+    case enrolls normally."""
+    iid = _current_instance_id(cfg)
+    rec = None
+    try:
+        with open(os.path.join(cfg.stateDir, ENROLLED_FILE), encoding="utf-8") as f:
+            rec = json.load(f)
+        with open(os.path.join(cfg.stateDir, enrollmod.TOKEN_FILE), encoding="utf-8") as f:
+            tok = json.load(f)
+        have_key = os.path.getsize(os.path.join(cfg.stateDir, "control.key")) >= 32
+    except (OSError, ValueError):
+        rec, tok, have_key = None, None, False
+    same = (isinstance(rec, dict) and isinstance(tok, dict) and have_key and iid is not None
+            and rec.get("instanceId") == iid
+            and rec.get("generation") == lease["generation"] == tok.get("generation")
+            and rec.get("leaseEpoch") == lease["leaseEpoch"] == tok.get("leaseEpoch")
+            and isinstance(rec.get("sandboxId"), str) and enrollmod.SANDBOX_ID_RE.fullmatch(rec["sandboxId"])
+            and enrollmod.valid_zone(rec.get("zone")))
+    if same:
+        lease = enrollmod.wipe_nonce(cfg, lease)
+        routed = dict(lease, sandboxId=rec["sandboxId"], zone=rec["zone"])
+        enrollmod._write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(routed).encode())
+        return "re-enrolled from this instance's own credentials (same-instance reboot, same epoch); nonce wiped"
+    enrollmod.enroll(cfg, lease)
+    routed = enrollmod.load_lease(cfg)
+    if iid is not None:
+        enrollmod._write_private(os.path.join(cfg.stateDir, ENROLLED_FILE), json.dumps({
+            "instanceId": iid, "generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"],
+            "sandboxId": routed.get("sandboxId"), "zone": routed.get("zone")}).encode())
+    return "enrolled; tunnel token stored host-only; nonce wiped"
+
+
 def step(cfg, name, detach=False):
     if name == "lease":
         l = enrollmod.fetch_lease(cfg)
@@ -46,6 +90,10 @@ def step(cfg, name, detach=False):
         desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"))
         return "overlay mounted, netns up, spec written"
     if name == "desktop":
+        if os.path.exists(os.path.join(cfg.runDir, desktop.STOPPING)):
+            # The agent committed to stopping: the unit's Restart= must not bring a desktop
+            # back onto a volume being unmounted (exit 2 = RestartPreventExitStatus).
+            raise Refused("desktop_stopping", "the agent is stopping this host")
         relay = desktop_relay(cfg, lease)
         if relay is not None:
             print(f"[desktop] relay {relay}", flush=True)
@@ -56,8 +104,7 @@ def step(cfg, name, detach=False):
             return "desktop started"
         desktop.run(cfg)                      # execs runc (systemd Type=simple)
     if name == "enroll":
-        enrollmod.enroll(cfg, lease)
-        return "enrolled; tunnel token stored host-only; nonce wiped"
+        return enroll_or_reuse(cfg, lease)
     if name == "cloudflared":
         reason, restarts = tunnel.supervise(cfg, lease)
         return f"cloudflared supervisor exit: {reason} restarts={restarts}"

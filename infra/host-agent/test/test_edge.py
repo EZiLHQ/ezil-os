@@ -567,6 +567,8 @@ class EdgeE2E(unittest.TestCase):
         st = raw(self.port, self.req("GET", "/__ezil/control/desktop"))
         self.assertTrue(st.startswith(b"HTTP/1.1 200"), st)
         self.assertIn(b'"configured": true', st)
+        self.assertIn(b'"unit": ', st, "the desktop unit state passes the edge (aws-ice.ts reads it)")
+        self.assertIn(b'"restartsExhausted": false', st)
         for s in ICE_SECRETS:
             self.assertNotIn(s.encode(), out + st)
             self.assertNotIn(s, "\n".join(self.logs))

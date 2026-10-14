@@ -98,6 +98,11 @@ check "relay config: TURN-only backend, authenticated TURN, neko /api/relay life
 check "relay env: Cloudflare's neko ICE env + derived credentials replace local mode's direct-connect settings" pyunit test_ice.RelayEnv
 check "relay store: runDir tmpfs 0600 only (refused on the data volume), expiry-aware, bounded wait" pyunit test_ice.RelayStore
 check "agent ice/desktop_status: accepted, refused before seq, kept while running, ice_missing desktop restarted once; no credential echoed or logged" pyunit test_ice.AgentIce
+check "poweroff: a failed shutdown is retried (backoff, capped, forced fallback) until accepted; a restarted agent resumes it" pyunit test_host_resilience.PowerOff
+check "desktop crash: unit exited/failed -> reset + restart on the next push, bounded per window, then reported; refused while stopping" pyunit test_host_resilience.DesktopRestart
+check "guard: same instance + same epoch = reboot; another instance replaying the epoch is refused" pyunit test_host_resilience.GuardReboot
+check "enroll: a same-instance reboot reuses its own epoch's credentials; any other case enrolls" pyunit test_host_resilience.EnrollReuse
+check "units: the desktop restarts on exit except on a refusal (exit 2); the agent restarts on failure" bash -c "grep -qx 'Restart=always' '$S/ezil-desktop.service' && grep -qx 'RestartPreventExitStatus=2' '$S/ezil-desktop.service' && grep -qx 'StartLimitBurst=5' '$S/ezil-desktop.service' && grep -qx 'Restart=on-failure' '$S/ezil-agent.service'"
 check "desktop step (relay mode): applied or ice_missing, desktop last in the relay boot order, no credential printed" pyunit test_ice.DesktopStep
 check "edge: real edge + real agent socket (ephemeral ports): 401 forwards nothing, strip, no smuggling, framing, WS, presence, control" pyunit test_edge.EdgeE2E
 summary "units + pure functions"

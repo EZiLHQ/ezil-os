@@ -69,6 +69,9 @@ interface HostState {
   pushError?: string;
   nekoUp: boolean;
   relay: { runtimeId: string; expiresAt: number };
+  /** The desktop unit's state the host reports; undefined = an older host that does not. */
+  unit?: string;
+  restartsExhausted?: boolean;
 }
 
 function fakeHost(over: Partial<HostState> = {}) {
@@ -89,7 +92,8 @@ function fakeHost(over: Partial<HostState> = {}) {
     if (!v.ok) return new Response(JSON.stringify({ ok: false, error: v.error }), { status: 401 });
     const j = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s });
     if (method === 'GET' && u.pathname === '/__ezil/control/desktop') {
-      return j({ ok: true, configured: st.configured, expiresAt: st.expiresAt, desktop: st.desktop, ice: st.ice });
+      return j({ ok: true, configured: st.configured, expiresAt: st.expiresAt, desktop: st.desktop, ice: st.ice,
+        ...(st.unit === undefined ? {} : { unit: st.unit, restartsExhausted: st.restartsExhausted === true }) });
     }
     if (method === 'POST' && u.pathname.startsWith('/__ezil/control/ice/')) {
       if (u.pathname.slice('/__ezil/control/ice/'.length) !== (await sha256Hex(body ?? ''))) return j({ ok: false, error: 'ice_digest_mismatch' }, 400);
@@ -180,7 +184,10 @@ describe('push and status (GW-5): signed, digest in the signed path', () => {
   });
   it('status: parsed from a signed GET; an unreadable answer is aws_desktop_unreachable (503)', async () => {
     const h = fakeHost({ configured: true, expiresAt: NOW + 5, desktop: 'running', ice: 'applied' });
-    expect(await readAwsDesktopStatus(record(), ZONE, h.fetch, NOW / 1000)).toEqual({ configured: true, expiresAt: NOW + 5, desktop: 'running', ice: 'applied' });
+    expect(await readAwsDesktopStatus(record(), ZONE, h.fetch, NOW / 1000)).toEqual({ configured: true, expiresAt: NOW + 5, desktop: 'running', ice: 'applied',
+      unit: null, restartsExhausted: false });
+    const newer = fakeHost({ desktop: 'absent', unit: 'failed', restartsExhausted: true });
+    expect(await readAwsDesktopStatus(record(), ZONE, newer.fetch, NOW / 1000)).toMatchObject({ unit: 'failed', restartsExhausted: true });
     const broken: FetchLike = async () => new Response('{"ok":true}', { status: 200 });
     const err = await readAwsDesktopStatus(record(), ZONE, broken, NOW / 1000).catch((e) => e);
     expect(err).toBeInstanceOf(RelayFailure);
@@ -249,6 +256,34 @@ describe('ensureAwsDesktop: the open flow', () => {
     const m = mintOk();
     expect(await run(h, m.mint)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
     expect(m.count()).toBe(1);
+  });
+  it('a crashed desktop (unit exited or failed) with a fresh config: push, so the host restarts it', async () => {
+    for (const unit of ['inactive', 'failed']) {
+      const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit, pushState: 'restart_scheduled' });
+      const m = mintOk();
+      expect(await run(h, m.mint)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+      expect(m.count()).toBe(1);
+    }
+  });
+  it('a desktop whose unit is still starting (or an older host that does not say): starting, no push', async () => {
+    for (const unit of ['pending', 'activating', 'active', undefined]) {
+      const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit });
+      const m = mintOk();
+      expect(await run(h, m.mint)).toEqual({ state: 'starting', reason: 'desktop_starting' });
+      expect(m.count()).toBe(0);
+    }
+  });
+  it('restarts exhausted: aws_desktop_failed, a clear failure, never another starting and no mint', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit: 'failed', restartsExhausted: true });
+    const m = mintOk();
+    await expect(run(h, m.mint)).rejects.toMatchObject({ code: 'aws_desktop_failed', status: 502 });
+    expect(m.count()).toBe(0);
+    const refused = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit: 'failed', pushError: 'desktop_restart_exhausted' });
+    await expect(run(refused, mintOk().mint)).rejects.toMatchObject({ code: 'aws_desktop_failed' });
+  });
+  it('a malformed unit value is ignored (null), never trusted', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit: 'Inactive; x' });
+    expect(await run(h, mintOk().mint)).toEqual({ state: 'starting', reason: 'desktop_starting' });
   });
   it('running with a relay far from expiry: ready with the relay state, no mint', async () => {
     const h = fakeHost({ configured: true, expiresAt: NOW + 1_200_000, desktop: 'running', ice: 'applied' });

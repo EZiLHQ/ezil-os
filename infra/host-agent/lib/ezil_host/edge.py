@@ -391,7 +391,8 @@ class Edge:
             return
         # The agent never answers with the config; pass only its own keys through.
         _reply(client, 200 if resp.get("ok") else 409,
-               {k: resp[k] for k in ("ok", "state", "error", "configured", "expiresAt", "desktop", "ice") if k in resp})
+               {k: resp[k] for k in ("ok", "state", "error", "configured", "expiresAt", "desktop", "ice",
+                                     "unit", "restartsExhausted") if k in resp})
 
     def _ice(self, client, head, digest, query):
         """POST /__ezil/control/ice/<sha256>: a Content-Length body (no chunking, at most

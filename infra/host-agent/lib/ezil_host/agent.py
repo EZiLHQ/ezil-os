@@ -17,7 +17,16 @@ plane regardless of what this agent reports; this agent only:
   * honours a control-plane `stop`: warn -> flush (not blockable) -> stop;
   * honours a `fence`: cloudflared stops and the token is wiped, then stop.
 Stop = desktop stopped, overlay and data volume unmounted in order (sync), then
-cfg.shutdownCmd (`shutdown -h now`).
+cfg.shutdownCmd (`shutdown -h now`). A poweroff that fails is retried with backoff, alternating
+with cfg.shutdownFallbackCmd, until one succeeds: the agent never ends while the instance runs
+with its tunnel fenced and its volume unmounted. A shutdown that began is resumed by a
+restarted agent (runDir/shutdown-pending).
+
+Once the agent commits to stopping, runDir/stopping makes the desktop step refuse, so the
+desktop unit's Restart=always cannot bring a desktop back onto a volume being unmounted.
+A desktop that exited is restarted by systemd (bounded by its start limit); an `ice` push that
+finds it exited or failed makes the agent reset and restart it, at most desktopRestartMax
+times per desktopRestartWindowSeconds, after which `desktop_status` says restartsExhausted.
 
 A desktop that needed KILL is never reported as a clean stop: the flush says `unclean`
 (the idle stop still proceeds — the desktop is already gone, staying up only bills), and
@@ -44,6 +53,9 @@ MAX_PAST = 120        # seconds a request may be old
 MAX_FUTURE = 5        # seconds of clock skew tolerated ahead of this host
 MAX_WARN = 900        # a control-plane stop warns for at most 15 minutes
 STOP_RANK = {"absent": 0, "clean": 1, "killed": 2}
+SHUTDOWN_PENDING = "shutdown-pending"      # runDir: a shutdown began; a restarted agent resumes it
+UNIT_STATES = ("active", "activating", "deactivating", "reloading", "inactive", "failed")
+STALLED_UNIT_STATES = ("inactive", "failed")   # exited after running, or failed: nothing will start it
 
 
 def _is_number(v):
@@ -98,8 +110,9 @@ def sign(key, msg):
 
 
 class Agent:
-    def __init__(self, cfg, lease, clock=time.time, log=lambda m: print(m, flush=True)):
-        self.cfg, self.lease, self.clock, self.log = cfg, lease, clock, log
+    def __init__(self, cfg, lease, clock=time.time, log=lambda m: print(m, flush=True), sleep=time.sleep):
+        self.cfg, self.lease, self.clock, self.log, self.sleep = cfg, lease, clock, log, sleep
+        self.desktop_restarts = []            # when this agent restarted the desktop (bounded)
         self.last_presence = clock()          # boot counts as activity
         self.stop_request = None
         self.restart_request = False          # a relay config for a desktop started without one
@@ -173,39 +186,90 @@ class Agent:
         except (OSError, ValueError, subprocess.SubprocessError):
             return "unknown"
 
+    def _desktop_unit(self):
+        """The desktop unit's systemd state: active | activating | deactivating | reloading |
+        pending (inactive, never started this boot: its start job still waits) | inactive (it
+        ran and exited) | failed | unknown."""
+        try:
+            r = subprocess.run(list(self.cfg.desktopUnitStateCmd), capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        if r.returncode != 0:
+            return "unknown"
+        props = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        state = props.get("ActiveState", "").strip()
+        if state not in UNIT_STATES:
+            return "unknown"
+        if state == "inactive" and props.get("ExecMainStartTimestampMonotonic", "").strip() in ("", "0"):
+            return "pending"
+        return state
+
+    def _restarts_exhausted(self, now):
+        window = float(self.cfg.get("desktopRestartWindowSeconds", 600))
+        self.desktop_restarts = [t for t in self.desktop_restarts if now - t < window]
+        return len(self.desktop_restarts) >= int(self.cfg.get("desktopRestartMax", 3))
+
     def _accept_relay(self, relay_config):
         """GW-5 `ice` (lock held): store the per-epoch relay config in runDir (tmpfs) for the
         desktop step. A desktop that is already running WITH a relay keeps it (renewal goes
         through neko's /api/relay in place); one that started WITHOUT a relay (the bounded
-        wait timed out) is restarted so it picks the config up."""
+        wait timed out) is restarted so it picks the config up. A desktop that is not running
+        and that nothing will start (its unit exited or failed: a crash) is reset and
+        restarted, bounded; once the bound is reached the push is refused, never `accepted`."""
         try:
             desktop.write_desktop_config(self.cfg, relay_config)
         except (OSError, Refused):
             return {"ok": False, "error": "ice_store_failed"}
         if self._desktop_state() != "running":
-            return {"ok": True, "state": "accepted"}
+            if self._desktop_unit() not in STALLED_UNIT_STATES:
+                return {"ok": True, "state": "accepted"}
+            if self._restarts_exhausted(self.clock()):
+                return {"ok": False, "error": "desktop_restart_exhausted"}
+            self.restart_request = True
+            return {"ok": True, "state": "restart_scheduled"}
         if desktop.read_ice_state(self.cfg) == "applied":
             return {"ok": True, "state": "already_running"}
         self.restart_request = True
         return {"ok": True, "state": "restart_scheduled"}
 
     def _desktop_status(self, now):
-        """GW-5 `desktop` (lock held): whether an unexpired config is held for this epoch and
-        how the desktop runs. Never the config itself."""
+        """GW-5 `desktop` (lock held): whether an unexpired config is held for this epoch, how
+        the desktop runs, its unit's state and whether the agent's restarts are exhausted.
+        Never the config itself."""
         c = desktop.read_desktop_config(self.cfg, int(now * 1000))
         return {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
-                "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg)}
+                "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg),
+                "unit": self._desktop_unit(), "restartsExhausted": self._restarts_exhausted(now)}
 
     def restart_desktop(self):
-        """A relay config arrived after the desktop started without one: restart it through
-        its unit (ExecStop stops it the normal way, hanging up terminal shells first; the
-        desktop step then starts it with the stored config). Non-blocking."""
-        self.log("desktop restart: relay config arrived after the desktop started without one")
+        """Restart the desktop through its unit: a relay config arrived after it started
+        without one, or it exited and nothing would start it. reset-failed first, so a unit
+        stopped by its start limit can start again. ExecStop stops a running desktop the
+        normal way (terminal shells hung up first); the desktop step then starts it with the
+        stored config. Non-blocking; counted against desktopRestartMax."""
+        self.log("desktop restart: through its unit (relay config, or the desktop exited)")
+        with self.lock:
+            self.desktop_restarts.append(self.clock())
+        for cmd in (self.cfg.get("desktopResetCmd"), self.cfg.desktopRestartCmd):
+            if not cmd:
+                continue
+            try:
+                subprocess.run(list(cmd), timeout=30, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as e:
+                self.log(f"desktop restart step failed: {type(e).__name__}")
+
+    def _marker(self, name):
+        return os.path.join(self.cfg.runDir, name)
+
+    def _set_marker(self, name):
+        from .enroll import _write_private
+        _write_private(self._marker(name), b"1\n")
+
+    def _clear_marker(self, name):
         try:
-            subprocess.run(list(self.cfg.desktopRestartCmd), timeout=30, check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError) as e:
-            self.log(f"desktop restart failed: {type(e).__name__}")
+            os.unlink(self._marker(name))
+        except FileNotFoundError:
+            pass
 
     def _seq_path(self):
         return os.path.join(self.cfg.stateDir, "control-seq.json")
@@ -307,6 +371,11 @@ class Agent:
 
     def shutdown(self, why):
         self.log(f"shutdown: {why}")
+        for name in (desktop.STOPPING, SHUTDOWN_PENDING):
+            try:
+                self._set_marker(name)       # no desktop may start; a restarted agent resumes
+            except OSError as e:
+                self.log(f"shutdown marker {name} failed: {type(e).__name__}")
         tunnel.fence(self.cfg, why)          # cloudflared stops and wipes its token
         time.sleep(1.0)
         # Ordered quiesce. Each step is attempted even if an earlier one failed: the OS
@@ -325,7 +394,35 @@ class Agent:
                 quiesce_ok = False
                 self.log(f"quiesce step {name} failed: {e}")
         canary.stopped(self.cfg, self.stop_outcome, source="agent", quiesce_ok=quiesce_ok)
-        subprocess.run(list(self.cfg.shutdownCmd))
+        self.power_off()
+
+    def power_off(self):
+        """Run cfg.shutdownCmd until the OS accepts it. A nonzero exit or a failure to run is
+        retried with backoff (initial, doubling, capped at shutdownRetryMaxSeconds),
+        alternating with cfg.shutdownFallbackCmd after shutdownFallbackAfter failures. Never
+        gives up: the volume is already unmounted and the tunnel fenced, so a running
+        instance only bills."""
+        delay = float(self.cfg.get("shutdownRetryInitialSeconds", 1))
+        cap = float(self.cfg.get("shutdownRetryMaxSeconds", 60))
+        after = int(self.cfg.get("shutdownFallbackAfter", 3))
+        fallback = self.cfg.get("shutdownFallbackCmd")
+        attempt = 0
+        while True:
+            cmd = self.cfg.shutdownCmd
+            if fallback and attempt >= after and (attempt - after) % 2 == 0:
+                cmd = fallback
+            attempt += 1
+            try:
+                rc = subprocess.run(list(cmd), timeout=60).returncode
+            except (OSError, subprocess.SubprocessError) as e:
+                rc = type(e).__name__
+            if rc == 0:
+                if attempt > 1:
+                    self.log(f"poweroff accepted after {attempt} attempts")
+                return attempt
+            self.log(f"poweroff failed (attempt {attempt}: {rc}); retrying in {delay:g}s")
+            self.sleep(delay)
+            delay = min(delay * 2, cap)
 
     # ------------------------------------------------------------------- loop
     def tick(self):
@@ -336,6 +433,7 @@ class Agent:
             self.restart_desktop()
             return "restarting"
         if req:
+            self._set_marker(desktop.STOPPING)     # committed: no desktop may start again
             if req["warn"] > 0:
                 self.warn(req["warn"], req["reason"])
                 time.sleep(req["warn"])
@@ -352,8 +450,10 @@ class Agent:
             load1 = None
         if load1 is None or load1 >= self.cfg.idle["load1Busy"]:
             return "busy_load"
+        self._set_marker(desktop.STOPPING)         # the desktop's Restart= must not undo the flush
         res = self.flush(blockable=True)
         if res not in ("ok", "unclean"):
+            self._clear_marker(desktop.STOPPING)   # not stopping after all: the desktop may start
             self.log(f"idle stop blocked: flush={res}")
             return f"flush_{res}"
         # unclean: the desktop needed KILL and is already gone; stopping is still right
@@ -368,6 +468,11 @@ class Agent:
             desktop.exec_(self.cfg, [hook, str(seconds), reason], capture_output=True, timeout=10)
 
     def run(self):
+        if os.path.exists(self._marker(SHUTDOWN_PENDING)):
+            # A previous agent began a shutdown and ended before the OS accepted the poweroff
+            # (it crashed, or was restarted): finish it. Every quiesce step tolerates having run.
+            self.shutdown("resume: a shutdown was in progress")
+            return
         ev = threading.Event()
         t = threading.Thread(target=self.serve, args=(ev,), daemon=True)
         t.start()
