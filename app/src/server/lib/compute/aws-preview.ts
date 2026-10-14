@@ -16,12 +16,32 @@ const unavailable = () => ({
     errorCode: 'aws_preview_unavailable',
 });
 
+/**
+ * The route token the Worker appends to every AWS browser host:
+ * `aws-<port>-<sandboxId>-aws.<zoneRoot>` (worker/src/aws-origin.ts `AWS_BROWSER_ROUTE_TOKEN`,
+ * claimed by the narrow `*-aws.<zone>/*` route). Pinned against the Worker source by
+ * aws-preview.test.ts.
+ */
+export const AWS_BROWSER_ROUTE_TOKEN = 'aws';
+
+/**
+ * The zones an AWS browser host may sit in: the Worker's own host, or its zone root
+ * after removing exactly one label — the same rule as `isOwnDesktopOrigin`, so the
+ * handoff and the later frame confirmation accept the same hosts.
+ */
+function browserZones(workerHost: string): string[] {
+    const host = workerHost.toLowerCase();
+    const dot = host.indexOf('.');
+    return dot > 0 ? [host, host.slice(dot + 1)] : [host];
+}
+
 /** Preserve the bootstrap URL verbatim; never compose a Cloudflare bridge URL. */
-function bootstrapUrl(port: number, sandboxId: string) {
+function bootstrapUrl(port: number, sandboxId: string, zones: readonly string[]) {
+    const label = `aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}`.toLowerCase();
     return z.string().url().refine((value) => {
         const url = new URL(value);
         return url.protocol === 'https:' && !url.username && !url.password && !url.port
-            && url.hostname.startsWith(`aws-${port}-${sandboxId}.`)
+            && zones.some((zone) => url.hostname === `${label}.${zone}`)
             && url.pathname === '/preview-bootstrap' && !!url.searchParams.get('token');
     });
 }
@@ -51,6 +71,7 @@ export async function requestAwsPreview(
         const sandboxId = deriveGuacamoleSandboxId(placement.ownerUserId, placement.computerId);
         const endpoint = new URL(`${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`);
         if (endpoint.search || endpoint.hash) return unavailable();
+        const zones = browserZones(endpoint.hostname);
         const body = JSON.stringify({
             sessionId: options.sessionId,
             userId: placement.ownerUserId,
@@ -95,9 +116,9 @@ export async function requestAwsPreview(
             sandboxId: z.literal(sandboxId),
             generation: z.literal(placement.generation),
             leaseEpoch: z.literal(placement.leaseEpoch),
-            guacamoleUrl: bootstrapUrl(8181, sandboxId),
-            appPreviewUrl: bootstrapUrl(3002, sandboxId),
-            codePreviewUrl: bootstrapUrl(8443, sandboxId),
+            guacamoleUrl: bootstrapUrl(8181, sandboxId, zones),
+            appPreviewUrl: bootstrapUrl(3002, sandboxId, zones),
+            codePreviewUrl: bootstrapUrl(8443, sandboxId, zones),
             expiresAt: z.number().int().gt(Date.now()),
             relay: z.object({
                 runtimeId: z.string().regex(/^[a-f0-9]{32}$/),

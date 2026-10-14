@@ -263,7 +263,7 @@ describe('routers: AWS previews use their own Worker route', () => {
         const { db, fake } = routerDb([awsRow({ state: 'RUNNING', generation: 7, lease_epoch: 11 })]);
         const sandboxId = deriveGuacamoleSandboxId(U1, C1);
         const url = (port: number) =>
-            `https://aws-${port}-${sandboxId}.preview.example/preview-bootstrap?token=opaque&path=%2F`;
+            `https://aws-${port}-${sandboxId}-aws.example/preview-bootstrap?token=opaque&path=%2F`;
         const ready = {
             ok: true, provider: 'aws-ec2', mode: 'neko', sandboxId, generation: 7, leaseEpoch: 11,
             guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443),
