@@ -44,6 +44,14 @@ export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
 export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest});
 export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started'] as const;
 export type Phase=typeof phases[number];
-export type Action='createVolume'|'runInstances'|'attachVolume'|'createTags'|'modifyInstanceAttribute'|'startInstances'|'stopInstances'|'terminateInstances';
-export const afterAction:Record<Action,Phase>={createVolume:'volume',runInstances:'instance',attachVolume:'attached',modifyInstanceAttribute:'userdata',
-    createTags:'tagged',startInstances:'started',stopInstances:'stopped',terminateInstances:'terminated'};
+/** `runBurstableInstances` is RunInstances for a T-family type: the same EC2
+ * API, but its graph state also forwards CreditSpecification (standard). A
+ * separate state keeps every forwarded key mandatory in the fixed graph. */
+export type Action='createVolume'|'runInstances'|'runBurstableInstances'|'attachVolume'|'createTags'|'modifyInstanceAttribute'|'startInstances'|'stopInstances'|'terminateInstances';
+export const afterAction:Record<Action,Phase>={createVolume:'volume',runInstances:'instance',runBurstableInstances:'instance',attachVolume:'attached',
+    modifyInstanceAttribute:'userdata',createTags:'tagged',startInstances:'started',stopInstances:'stopped',terminateInstances:'terminated'};
+/** Graph states that call RunInstances. Recovery treats entering ANY of them
+ * as evidence that a launch may have happened. */
+export const LAUNCH_ACTIONS:readonly Action[]=['runInstances','runBurstableInstances'];
+/** The EC2 API each graph action calls (aws-sdk:ec2:<api>). */
+export const ec2Api=(action:Action)=>action==='runBurstableInstances'?'runInstances':action;

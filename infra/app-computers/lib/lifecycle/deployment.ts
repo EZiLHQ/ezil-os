@@ -1,11 +1,35 @@
 import { z } from 'zod';
 
-/** R10: closed allowlist. m6i.large is the 2 vCPU / 8 GiB pilot baseline;
- * c6i.xlarge (4 vCPU / 8 GiB) is for benchmarks only. No burstable types.
- * A deployment may narrow this list but never extend it. */
-export const INSTANCE_TYPES = ['m6i.large', 'c6i.xlarge'] as const;
+/** R10: closed allowlist. A deployment may narrow this list but never extend it.
+ * - t3a.medium / t3.medium (2 vCPU / 4 GiB): the free tier. The founder decided
+ *   on 2026-10-14 that free computers must be cheap, which reverses the earlier
+ *   "no burstable types" rule. Every burstable launch is pinned to standard CPU
+ *   credits (`BURSTABLE_CREDITS`), so a free computer is throttled to its
+ *   baseline instead of billing surplus credits.
+ * - m6i.large (2 vCPU / 8 GiB): the upgraded tier.
+ * - c6i.xlarge (4 vCPU / 8 GiB): benchmarks only. */
+export const INSTANCE_TYPES = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'] as const;
 export const InstanceTypeSchema = z.enum(INSTANCE_TYPES);
 export type InstanceType = z.infer<typeof InstanceTypeSchema>;
+/** Burstable (T-family) types. T3/T3a launch with UNLIMITED credits by
+ * default, so every launch of one of these must carry `BURSTABLE_CREDITS`. */
+export const isBurstable = (type: string): boolean => /^t\d[a-z]*\./.test(type);
+export const BURSTABLE_CREDITS = { CpuCredits: 'standard' } as const;
+/** Tier -> instance types in preference order (the first type with capacity
+ * wins). Every type must be in INSTANCE_TYPES. */
+export const COMPUTER_TIERS = ['free', 'plus'] as const;
+export const TierSchema = z.enum(COMPUTER_TIERS);
+export type ComputerTier = z.infer<typeof TierSchema>;
+export const TierMapSchema = z.object({
+    free: z.array(InstanceTypeSchema).min(1),
+    plus: z.array(InstanceTypeSchema).min(1),
+}).strict().superRefine((m, ctx) => {
+    for (const tier of COMPUTER_TIERS) if (new Set(m[tier]).size !== m[tier].length)
+        ctx.addIssue({ code: 'custom', path: [tier], message: 'duplicate_instance_type' });
+});
+export type TierMap = z.infer<typeof TierMapSchema>;
+/** free = 2 vCPU / 4 GiB (burstable, standard credits); plus = 2 vCPU / 8 GiB. */
+export const TIER_INSTANCE_TYPES: TierMap = TierMapSchema.parse({ free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'] });
 
 /** R1: one commercial region per deployment, configured. */
 export const REGION_PATTERN = /^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$/;

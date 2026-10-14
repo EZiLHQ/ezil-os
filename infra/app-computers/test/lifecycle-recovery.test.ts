@@ -10,7 +10,7 @@ import { lifecycleFixture } from './lifecycle-fixture.js';
 import { runAsl, taskError } from './asl.js';
 import { toLambdaError } from '../lib/lifecycle/errors.js';
 
-function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision', allocated = true) {
+function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision', allocated = true, launchState = 'runInstances') {
     const f = lifecycleFixture(operation);
     const settings: RecoverySettings = { lifecycle: f.settings,
         recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1' };
@@ -26,7 +26,7 @@ function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision'
     history.push({ id: 2, type: 'ExecutionFailed', timestamp: source.stopDate });
     if (operation === 'provision' && allocated) { f.state.volumes.push(f.volume()); entered('createVolume'); }
     if ((operation === 'provision' || operation === 'replace') && allocated) {
-        entered('runInstances');
+        entered(launchState);
         if (operation === 'replace') {
             const old = f.state.instances[0]!; old.State = { Name: 'terminated' }; old.BlockDeviceMappings = [];
             f.state.volumes[0]!.Tags = tagList(tagsFor(f.i));
@@ -96,10 +96,15 @@ test('a data-only allocation is retained without launching a computer', async ()
     const result = await run(f); assert.equal(result.error, undefined); assert.equal(result.receipt.volumeId, f.state.volumes[0]!.VolumeId);
     assert.deepEqual(result.calls, []);
 });
-for (const action of ['createVolume', 'runInstances']) test(`uncertain ${action} cannot be called absent after a lost response`, async () => {
+for (const action of ['createVolume', 'runInstances', 'runBurstableInstances']) test(`uncertain ${action} cannot be called absent after a lost response`, async () => {
     const f = fixture('provision', false); f.entered('createVolume');
-    if (action === 'runInstances') { f.state.volumes.push(f.volume()); f.entered('runInstances'); }
+    if (action !== 'createVolume') { f.state.volumes.push(f.volume()); f.entered(action); }
     const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined); assert.deepEqual(result.calls, []);
+});
+for (const operation of ['provision', 'replace'] as const) test(`free tier: a burstable ${operation} launch (runBurstableInstances) is launch evidence and is fenced`, async () => {
+    const f = fixture(operation, true, 'runBurstableInstances');
+    const result = await run(f); assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced');
+    assert.ok(f.state.instances.every(i => i.State?.Name === 'terminated')); assert.equal(f.state.volumes[0]!.State, 'available');
 });
 test('a data disk marked DeleteOnTermination is refused, never repaired or terminated', async () => {
     const f = fixture(); f.state.instances.at(-1)!.BlockDeviceMappings!.find(m => m.DeviceName === '/dev/sdf')!.Ebs!.DeleteOnTermination = true;

@@ -41,7 +41,7 @@ The example files in `config/` hold public placeholders only.
 | `stage` | `pilot` \| `production` | |
 | `region` | string | commercial region, e.g. `ap-south-1` |
 | `zoneIds` | string[1..3] | each matches `^[a-z]{2,4}\d-az\d+$` and belongs to `region` (e.g. `aps1-az1`). One subnet per ZoneId. |
-| `instanceType` | `m6i.large` \| `c6i.xlarge` | launch-template default; the workflow sets the per-computer type |
+| `instanceType` | `t3a.medium` \| `t3.medium` \| `m6i.large` \| `c6i.xlarge` | launch-template default; the workflow sets the per-computer type (and, for T types, the credit option) |
 | `rootVolumeGiB` | int 8..64 | default 20 |
 
 ```json
@@ -59,7 +59,7 @@ full shape, see `config/lifecycle.example.json`.
 |---|---|
 | `region`, `zoneId` | same rules as the foundation; one ZoneId per lifecycle deployment |
 | `subnetId` | the foundation subnet for that ZoneId |
-| `instanceTypes` | a non-empty subset of the closed allowlist `{m6i.large, c6i.xlarge}`. A deployment can narrow it, never extend it. |
+| `instanceTypes` | a non-empty subset of the closed allowlist `{t3a.medium, t3.medium, m6i.large, c6i.xlarge}`. A deployment can narrow it, never extend it. To serve the free tier it must list `t3a.medium` (and `t3.medium` as the fallback). |
 | `storage.rootGiB` | root disk size (default 20) |
 | `storage.dataMinGiB`, `storage.dataMaxGiB` | allowed data-volume range (defaults 20 and 100) |
 | ARNs | must name the configured region and account |
@@ -67,6 +67,18 @@ full shape, see `config/lifecycle.example.json`.
 The data-volume size is chosen **per computer** in the intent (`dataVolumeGiB`, provision only):
 - 20 GiB on the free tier
 - 50 GiB on the premium tier
+
+**Computer tiers (founder decision 2026-10-14).** `TIER_INSTANCE_TYPES` in `lib/lifecycle/deployment.ts`:
+
+| Tier | Size | Types, in preference order | Credits |
+|---|---|---|---|
+| `free` | 2 vCPU / 4 GiB | `t3a.medium`, then `t3.medium` | standard: throttled to the T3 baseline (20% per vCPU) once earned credits run out; never billed for surplus |
+| `plus` (upgraded) | 2 vCPU / 8 GiB | `m6i.large` | not burstable |
+
+`c6i.xlarge` stays allowlisted for benchmarks only. This reverses the earlier R10 note "no burstable
+types": free computers must be cheap. The cost of that choice is the T3 baseline: a long Chrome or
+build session on a free computer slows down when its credits are spent, and it stays slow rather
+than adding to the bill.
 
 Existing volumes are accepted anywhere in `[dataMinGiB, dataMaxGiB]`, so a volume grown online
 still validates. The intent also carries `instanceType`, which must be in the deployment
@@ -129,6 +141,7 @@ The role's policy allows only:
 |---|---|---|
 | R1: ZoneId only; no zone names, no `Fn::GetAZs` | L1 `CfnSubnet({availabilityZoneId})`; `CreateVolume.AvailabilityZoneId`; IAM `ec2:AvailabilityZoneId` on CreateVolume, RunInstances and AttachVolume | `foundation.test.ts`; exact IAM spec |
 | R10: closed type allowlist | IAM `StringEquals ec2:InstanceType` (no `IfExists`); the helper rejects other types | exact IAM spec; `lifecycle.test.ts` |
+| Burstable launches never bill surplus credits | T3/T3a default to `unlimited`. Every T-type launch takes the `runBurstableInstances` graph state, which forwards `CreditSpecification {CpuCredits: standard}`; non-T launches take `runInstances`, which cannot forward it. The launch template may not carry a credit option (validator allow-list). | `lifecycle.test.ts` (free-tier tests, graph test), `lifecycle-aws.test.ts` (SDK wire form) |
 | No type, disk-flag or metadata change after launch | `ModifyInstanceAttribute` and `ModifyInstanceMetadataOptions` under an unconditional Deny (see the userData flags above) | exact IAM spec, both flag states |
 | R5: no host credentials | no instance role or profile and no `iam:PassRole`; `RunInstances` requires `Null ec2:InstanceProfile` | exact IAM spec; the snapshot has no `InstanceProfile` |
 | R5: IMDS | `HttpTokens=required`, hop limit ≤ 1 and `InstanceMetadataTags=disabled`, in the template, the launch call and IAM | `foundation.test.ts`; exact IAM spec; `lifecycle.test.ts` |

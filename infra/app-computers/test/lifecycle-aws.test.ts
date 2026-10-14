@@ -63,3 +63,18 @@ test('the actual EC2 SDK accepts allocation parameters and omits any invented St
         assert.equal(requests[2]!.get('ClientToken'),null);assert.equal(requests[3]!.get('SkipOsShutdown'),'false');
     }finally{client.destroy()}
 });
+test('free tier: the actual EC2 SDK serializes the burstable launch with CreditSpecification.CpuCredits=standard',async()=>{
+    const f=lifecycleFixture('provision',{instanceType:'t3a.medium',instanceTypes:['t3a.medium','t3.medium','m6i.large']});
+    const helper=createLifecycleHelper(f.settings,f.deps),requests:URLSearchParams[]=[];
+    const client=new EC2Client({region:'ap-south-1',credentials,maxAttempts:1,requestHandler:{async handle(r:any){
+        const p=new URLSearchParams(typeof r.body==='string'?r.body:Buffer.from(r.body).toString());requests.push(p);return xml(p.get('Action')!);
+    }}});
+    try{
+        await helper({executionArn:f.executionArn,phase:'initial'});f.state.volumes.push(f.volume());
+        const launch=await helper({executionArn:f.executionArn,phase:'volume'});
+        assert.equal(launch.decision,'runBurstableInstances');
+        await client.send(new RunInstancesCommand(launch.parameters as any));
+        assert.equal(requests[0]!.get('Action'),'RunInstances');assert.equal(requests[0]!.get('InstanceType'),'t3a.medium');
+        assert.equal(requests[0]!.get('CreditSpecification.CpuCredits'),'standard');
+    }finally{client.destroy()}
+});

@@ -1,6 +1,6 @@
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
-import { EnvelopeSchema, equal, tagsFor, token } from './contract.js';
+import { EnvelopeSchema, LAUNCH_ACTIONS, equal, tagsFor, token } from './contract.js';
 import { toLambdaError } from './errors.js';
 import { parseLifecycleWork } from './intent.js';
 import { tagged } from './helper.js';
@@ -51,6 +51,8 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || history.some((h, index) => h.id !== index + 1 || !h.timestamp || !Number.isFinite(h.timestamp.getTime())
                 || (h.type === 'TaskStateEntered' && !h.stateEnteredEventDetails?.name))) return fail();
         const entered = (name: string) => history.some(h => h.type === 'TaskStateEntered' && h.stateEnteredEventDetails?.name === name);
+        // A launch may have gone through either RunInstances state (burstable or not).
+        const launchEntered = () => LAUNCH_ACTIONS.some(entered);
         const volumes = await deps.volumes(i.dataVolumeId ? [i.dataVolumeId] : { token: token(envelope.digest, 'volume') });
         if (volumes.length > 1) return fail();
         const v = volumes[0], currentTags = tagsFor(i), oldTags = tagsFor(i, i.previousGeneration ?? i.targetGeneration, i.previousFenceToken ?? i.fenceToken);
@@ -62,7 +64,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
                 || (!tagged(v.Tags, currentTags) && !tagged(v.Tags, oldTags))
                 || (i.operation === 'provision' && (!entered('createVolume')
                     || !tagged(v.Tags, { 'ezil:allocation': token(envelope.digest, 'volume') })))) return fail();
-        } else if (i.dataVolumeId || entered('createVolume') || entered('runInstances')) return wait();
+        } else if (i.dataVolumeId || entered('createVolume') || launchEntered()) return wait();
         const targets: { role: 'old' | 'target'; instance: Instance; generation: number; fenceToken: string }[] = [];
         const originalId = i.previousInstanceId ?? i.providerInstanceId;
         if (originalId) {
@@ -75,10 +77,10 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         if (i.operation === 'provision' || i.operation === 'replace') {
             const rows = await deps.instances({ token: token(envelope.digest, 'instance') });
             if (rows.length > 1) return fail();
-            if (!rows.length && entered('runInstances')) return wait();
+            if (!rows.length && launchEntered()) return wait();
             if (rows[0]) {
                 const row = rows[0];
-                if (!entered('runInstances') || row.owner !== d.accountId || row.instance.ClientToken !== token(envelope.digest, 'instance')
+                if (!launchEntered() || row.owner !== d.accountId || row.instance.ClientToken !== token(envelope.digest, 'instance')
                     || row.instance.InstanceId === originalId || !tagged(row.instance.Tags, currentTags)) return fail();
                 targets.push({ role: 'target', instance: row.instance, generation: i.targetGeneration, fenceToken: i.fenceToken });
             }

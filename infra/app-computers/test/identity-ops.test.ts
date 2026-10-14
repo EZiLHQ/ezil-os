@@ -67,7 +67,7 @@ function expectedBoundary(killSwitch: boolean) {
                 'ec2:ModifySubnetAttribute', 'ec2:DeleteSubnet', 'ec2:AuthorizeSecurityGroupEgress', 'ec2:RevokeSecurityGroupEgress',
                 'ec2:DeleteSecurityGroup', 'ec2:CreateLaunchTemplateVersion', 'ec2:ModifyLaunchTemplate', 'ec2:DeleteLaunchTemplate'] },
         { Sid: 'AllowLaunchAllowlistedTypes', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('instance'),
-            Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:InstanceType': ['m6i.large', 'c6i.xlarge'] } } },
+            Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:InstanceType': ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'] } } },
         { Sid: 'AllowCappedEncryptedGp3Volumes', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: EC2('volume'),
             Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
                 NumericLessThanEquals: { 'ec2:VolumeSize': '100' } } },

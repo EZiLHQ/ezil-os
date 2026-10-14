@@ -1,9 +1,12 @@
-import { afterAction, phases, type Action } from './contract.js';
+import { afterAction, ec2Api, phases, type Action } from './contract.js';
 import { NO_ERROR, RETRYABLE_ERROR } from './errors.js';
+const RUN_FIELDS=['LaunchTemplate','ImageId','InstanceType','MinCount','MaxCount','ClientToken','SubnetId','SecurityGroupIds',
+    'MetadataOptions','HibernationOptions','EbsOptimized','Monitoring','BlockDeviceMappings','TagSpecifications','UserData'];
 const fields:Record<Exclude<Action,'modifyInstanceAttribute'>,string[]>={
     createVolume:['AvailabilityZoneId','Size','VolumeType','Iops','Throughput','Encrypted','KmsKeyId','ClientToken','TagSpecifications'],
-    runInstances:['LaunchTemplate','ImageId','InstanceType','MinCount','MaxCount','ClientToken','SubnetId','SecurityGroupIds',
-        'MetadataOptions','HibernationOptions','EbsOptimized','Monitoring','BlockDeviceMappings','TagSpecifications','UserData'],
+    runInstances:RUN_FIELDS,
+    // T-family launches: the same API plus the (standard) credit option.
+    runBurstableInstances:[...RUN_FIELDS,'CreditSpecification'],
     attachVolume:['Device','InstanceId','VolumeId'],createTags:['Resources','Tags'],
     startInstances:['InstanceIds'],stopInstances:['InstanceIds','Force','Hibernate','SkipOsShutdown'],terminateInstances:['InstanceIds'],
 };
@@ -45,7 +48,7 @@ export function lifecycleDefinition(helperArn:string,features:{userDataNonce?:bo
         Catch:[{ErrorEquals:['States.ALL'],ResultPath:'$.ctl.observeError',Next:'Unconfirmed'}]};
     for(const [name,keys]of Object.entries(all)) {
         const next='After-'+name;
-        States[name]={Type:'Task',Resource:`arn:aws:states:::aws-sdk:ec2:${name}`,TimeoutSeconds:30,
+        States[name]={Type:'Task',Resource:`arn:aws:states:::aws-sdk:ec2:${ec2Api(name as Action)}`,TimeoutSeconds:30,
             Parameters:Object.fromEntries(keys.map(key=>[key+'.$','$.step.parameters.'+key])),
             ResultSelector:NO_ERROR,ResultPath:'$.ctl.lastError',Next:next,
             Catch:[{ErrorEquals:['States.ALL'],ResultPath:'$.ctl.lastError',Next:next}]};

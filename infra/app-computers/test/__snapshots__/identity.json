@@ -222,6 +222,8 @@
                 "aws:RequestTag/ezil:managed-by": "app-computer-platform",
                 "aws:RequestTag/ezil:stage": "pilot",
                 "ec2:InstanceType": [
+                  "t3a.medium",
+                  "t3.medium",
                   "m6i.large",
                   "c6i.xlarge"
                 ]

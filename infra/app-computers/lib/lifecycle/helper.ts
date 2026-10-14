@@ -5,6 +5,7 @@ import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFo
 import { MAX_THROTTLE_RETRIES, NO_ERROR, RecordedErrorSchema, classifyProviderError, throttleDelaySeconds, toLambdaError } from './errors.js';
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
 import { awsDependencies, type Dependencies } from './aws.js';
+import { BURSTABLE_CREDITS, isBurstable } from './deployment.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases),
     lastError:RecordedErrorSchema.default(NO_ERROR),throttles:z.number().int().min(0).max(100).default(0)}).strict();
 export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
@@ -109,7 +110,12 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(target){if(found[0]?.owner!==d.accountId||target.ClientToken!==token(envelope.digest,'instance'))return fail();assertIdentity(target,tags,i);}
             if(!target){
                 if(v.State!=='available'||v.Attachments.length)return fail();
-                return action('runInstances',await launchParameters(i,envelope.digest,deps));
+                // T3/T3a default to unlimited credits (surplus is billed): every
+                // burstable launch goes through the state that forwards
+                // CreditSpecification, and nothing else carries it.
+                const launch=await launchParameters(i,envelope.digest,deps);
+                return isBurstable(launch.InstanceType!)?action('runBurstableInstances',{...launch,CreditSpecification:{...BURSTABLE_CREDITS}})
+                    :action('runInstances',launch);
             }
         }
         if(!target||!instanceId(target.InstanceId))return fail();

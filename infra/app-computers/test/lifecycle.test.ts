@@ -5,6 +5,7 @@ import { lifecycleDefinition } from '../lib/lifecycle/definition.js';
 import { token } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
+import { BURSTABLE_CREDITS, COMPUTER_TIERS, INSTANCE_TYPES, TIER_INSTANCE_TYPES, TierMapSchema, isBurstable } from '../lib/lifecycle/deployment.js';
 import { runAsl, taskError } from './asl.js';
 import { toLambdaError, MAX_THROTTLE_RETRIES } from '../lib/lifecycle/errors.js';
 import { LifecycleIntentSchema, validateLifecycleReceipt } from '../lib/lifecycle/intent.js';
@@ -172,6 +173,47 @@ test('premium type and size from the allowlist provision end to end',async()=>{
     const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType:'c6i.xlarge',dataVolumeGiB:50})});
     assert.equal(r.error,undefined);assert.equal(r.calls.find(c=>c.action==='runInstances')!.parameters.InstanceType,'c6i.xlarge');
     assert.equal(r.calls.find(c=>c.action==='createVolume')!.parameters.Size,50);
+});
+// ── Tiers (founder 2026-10-14): free = t3a/t3.medium with standard credits; plus = m6i.large ──
+const TIERED=['t3a.medium','t3.medium','m6i.large'] as const;
+for(const [instanceType,operation] of [['t3a.medium','provision'],['t3.medium','provision'],['t3a.medium','replace']] as const)
+    test(`free tier ${instanceType} ${operation}: RunInstances carries exactly CpuCredits=standard through the burstable state`,async()=>{
+        const r=await run(operation,{fixture:lifecycleFixture(operation,{instanceType,instanceTypes:[...TIERED]})});
+        assert.equal(r.error,undefined);const launches=r.calls.filter(c=>c.action==='runInstances');assert.equal(launches.length,1);
+        assert.equal(launches[0]!.parameters.InstanceType,instanceType);
+        assert.deepEqual(launches[0]!.parameters.CreditSpecification,{CpuCredits:'standard'});
+        assert.ok(r.visited.includes('runBurstableInstances'));assert.ok(!r.visited.includes('runInstances'));
+    });
+test('upgraded tier m6i.large: RunInstances carries no CreditSpecification',async()=>{
+    const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType:'m6i.large',instanceTypes:[...TIERED]})});
+    assert.equal(r.error,undefined);const launch=r.calls.find(c=>c.action==='runInstances')!;
+    assert.equal(launch.parameters.InstanceType,'m6i.large');assert.ok(!('CreditSpecification' in launch.parameters));
+    assert.ok(r.visited.includes('runInstances'));assert.ok(!r.visited.includes('runBurstableInstances'));
+});
+test('graph: only the burstable state forwards CreditSpecification, and both states call EC2 RunInstances',()=>{
+    const g=lifecycleDefinition('helper') as any,plain=g.States.runInstances,burst=g.States.runBurstableInstances;
+    assert.equal(plain.Resource,'arn:aws:states:::aws-sdk:ec2:runInstances');assert.equal(burst.Resource,'arn:aws:states:::aws-sdk:ec2:runInstances');
+    assert.deepEqual(Object.keys(burst.Parameters),[...Object.keys(plain.Parameters),'CreditSpecification.$']);
+    assert.equal(burst.Parameters['CreditSpecification.$'],'$.step.parameters.CreditSpecification');
+    assert.ok(!Object.keys(plain.Parameters).includes('CreditSpecification.$'));
+    assert.equal(burst.Next,'After-runBurstableInstances');assert.equal(g.States['After-runBurstableInstances'].Next,'Observe-instance');
+});
+test('tier map: free = t3a.medium then t3.medium (burstable), plus = m6i.large; all allowlisted; schema refuses bad maps',()=>{
+    assert.deepEqual(TIER_INSTANCE_TYPES,{free:['t3a.medium','t3.medium'],plus:['m6i.large']});
+    for(const tier of COMPUTER_TIERS)for(const t of TIER_INSTANCE_TYPES[tier])assert.ok((INSTANCE_TYPES as readonly string[]).includes(t),t);
+    assert.deepEqual(INSTANCE_TYPES.filter(isBurstable),['t3a.medium','t3.medium']);
+    assert.ok(TIER_INSTANCE_TYPES.free.every(isBurstable));assert.ok(!TIER_INSTANCE_TYPES.plus.some(isBurstable));
+    for(const bad of [{free:['t3a.large'],plus:['m6i.large']},{free:['t3a.medium','t3a.medium'],plus:['m6i.large']},{free:[],plus:['m6i.large']},
+        {free:['t3a.medium']},{free:['t3a.medium'],plus:['m6i.large'],pro:['c6i.xlarge']}])
+        assert.equal(TierMapSchema.safeParse(bad).success,false,JSON.stringify(bad));
+    assert.deepEqual(BURSTABLE_CREDITS,{CpuCredits:'standard'});
+});
+test('a free-tier type outside the deployment allowlist is refused by the intent',()=>{
+    const f=lifecycleFixture();
+    assert.equal(LifecycleIntentSchema.safeParse({...f.i,instanceType:'t3a.medium'}).success,false,'default deployment lists no burstable type');
+    const tiered=lifecycleFixture('provision',{instanceType:'t3a.medium',instanceTypes:[...TIERED]});
+    assert.ok(LifecycleIntentSchema.safeParse(tiered.i).success);
+    assert.equal(LifecycleIntentSchema.safeParse({...tiered.i,instanceType:'t3a.large'}).success,false);
 });
 test('intent refuses types outside the deployment allowlist and sizes outside the range',()=>{
     const f=lifecycleFixture();

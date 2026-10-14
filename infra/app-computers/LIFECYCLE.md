@@ -23,7 +23,8 @@ Neither are stop, termination or attachment. Status reads cannot wake compute.
 
 Provisioning creates an encrypted gp3 data disk of the intent's size (inside
 the configured range) in the configured ZoneId. It starts one instance of the
-intent's allowlisted type (`m6i.large` or `c6i.xlarge`) using a numeric
+intent's allowlisted type (`t3a.medium`, `t3.medium`, `m6i.large` or `c6i.xlarge`; T types with
+standard CPU credits) using a numeric
 launch-template version, the approved Linux/amd64 AMI and an encrypted
 disposable root disk of the configured size (default 20 GiB). The AMI must have a
 single `/dev/xvda` root device; additional implicit disks, user-data scripts,
