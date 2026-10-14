@@ -30,7 +30,7 @@ def desktop_relay(cfg, lease, wait=None):
     return "applied" if c else "missing (ice_missing): started without a relay; the next push restarts it"
 
 
-ENROLLED_FILE = "enrolled.json"   # stateDir: which instance enrolled which epoch, and its routing
+ENROLLED_FILE = enrollmod.ENROLLED_FILE   # written by enroll.persist, before the nonce is retired
 
 
 def _current_instance_id(cfg):
@@ -51,7 +51,7 @@ def enroll_or_reuse(cfg, lease):
             rec = json.load(f)
         with open(os.path.join(cfg.stateDir, enrollmod.TOKEN_FILE), encoding="utf-8") as f:
             tok = json.load(f)
-        have_key = os.path.getsize(os.path.join(cfg.stateDir, "control.key")) >= 32
+        have_key = os.path.getsize(os.path.join(cfg.stateDir, enrollmod.KEY_FILE)) >= 32
     except (OSError, ValueError):
         rec, tok, have_key = None, None, False
     same = (isinstance(rec, dict) and isinstance(tok, dict) and have_key and iid is not None
@@ -61,16 +61,11 @@ def enroll_or_reuse(cfg, lease):
             and isinstance(rec.get("sandboxId"), str) and enrollmod.SANDBOX_ID_RE.fullmatch(rec["sandboxId"])
             and enrollmod.valid_zone(rec.get("zone")))
     if same:
-        lease = enrollmod.wipe_nonce(cfg, lease)
-        routed = dict(lease, sandboxId=rec["sandboxId"], zone=rec["zone"])
-        enrollmod._write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(routed).encode())
+        # One lease rewrite: the routing comes back in the same write that drops the nonce.
+        enrollmod.wipe_nonce(cfg, dict(lease, sandboxId=rec["sandboxId"], zone=rec["zone"]))
         return "re-enrolled from this instance's own credentials (same-instance reboot, same epoch); nonce wiped"
-    enrollmod.enroll(cfg, lease)
-    routed = enrollmod.load_lease(cfg)
-    if iid is not None:
-        enrollmod._write_private(os.path.join(cfg.stateDir, ENROLLED_FILE), json.dumps({
-            "instanceId": iid, "generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"],
-            "sandboxId": routed.get("sandboxId"), "zone": routed.get("zone")}).encode())
+    # enroll.persist records this instance's enrollment BEFORE it retires the nonce.
+    enrollmod.enroll(cfg, lease, instance_id=iid)
     return "enrolled; tunnel token stored host-only; nonce wiped"
 
 

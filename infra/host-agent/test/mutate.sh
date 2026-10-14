@@ -39,8 +39,8 @@ mutate M9 lib/ezil_host/rebase.py 'body = read_regular_at(dfd, name, st) if stat
 mutate M10 lib/ezil_host/rebase.py 'raise RuntimeError("injected rebase fault (EZIL_REBASE_FAULT_AFTER)")' 'pass' test-rebase.sh "rebase fault after 5 entries"
 mutate M11 lib/ezil_host/desktop.py '"nodev,lowerdir=' '"lowerdir=' test-hostile.sh "production overlay_mount passes nodev"
 mutate M12 lib/ezil_host/tunnel.py 'wiped = wipe(tok_path)' 'wiped = False' test-enroll-tunnel.sh "fence: local token wiped"
-mutate M13 lib/ezil_host/enroll.py '    wipe_nonce(cfg, lease)
-    if status != 200:' '    if status != 200:' test-enroll-tunnel.sh "nonce is wiped from local state"
+mutate M13 lib/ezil_host/enroll.py '                wipe_nonce(cfg, lease)
+                raise Refused("enroll_refused"' '                raise Refused("enroll_refused"' test-enroll-tunnel.sh "nonce is wiped from local state"
 mutate M14 lib/ezil_host/agent.py 'if not isinstance(mac, str) or not hmac.compare_digest(mac, sign(self.key, msg)):' 'if False:' test-enroll-tunnel.sh "bad MAC refused"
 mutate M15 lib/ezil_host/agent.py 'if msg.get("leaseEpoch") != self.lease["leaseEpoch"] or isinstance(msg.get("leaseEpoch"), bool):' 'if False:' test-enroll-tunnel.sh "wrong epoch refused"
 mutate M16 systemd/ezil-host-clean.service 'Requires=ezil-guard.service' 'Wants=ezil-guard.service' test-units.sh "ezil-host-clean: Requires=ezil-guard.service"

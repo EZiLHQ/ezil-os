@@ -7,6 +7,9 @@
                tunnel token (and the control-channel key); store both under stateDir
                (0700 dir, 0600 files) on the HOST root volume — never in the container's
                view and never on the data volume; then WIPE the nonce from local state.
+               A 200 retires the nonce only AFTER its credentials are durable (`persist`):
+               until then a crash, a malformed body or a write error keeps the nonce, and a
+               re-send takes the app's replay path (same key, same token) and converges.
 The nonce is single-use (the app clears it by compare-and-swap). The client re-sends it
 only after an answer that proves nothing was consumed and the failure may clear: a
 transport error, the app's `retryable: true` (aws-enroll.ts `retryLater`), or a 5xx the
@@ -25,6 +28,8 @@ from . import guard, http, lease as leasemod
 from .fsops import Refused
 
 TOKEN_FILE = "tunnel.json"
+KEY_FILE = "control.key"
+ENROLLED_FILE = "enrolled.json"   # stateDir: which instance enrolled which epoch, and its routing
 # The Worker's routable sandbox id and its browser-host zone (worker/src/aws-origin.ts): the
 # app returns both at enrollment so the edge can recognise `aws-<port>-<sandboxId>-aws.<zone>`.
 SANDBOX_ID_RE = re.compile(r"guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}")
@@ -45,6 +50,10 @@ def _write_private(path, data):
     dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
     try:
         tmp = os.path.basename(path) + f".tmp.{os.getpid()}"
+        try:   # a crash can leave this pid's temp behind; a reused pid must not wedge every write
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
         try:
             os.write(fd, data)
@@ -108,14 +117,25 @@ def load_lease(cfg):
         return json.load(f)
 
 
-def wipe_nonce(cfg, lease):
+def mark_nonce_consumed(cfg, lease):
+    """ONE atomic rewrite of the lease without the nonce (and with whatever else `lease`
+    carries, e.g. the edge's routing). The point after which the nonce is never sent again."""
     lease = dict(lease)
     lease.pop("nonce", None)
     lease["nonceConsumed"] = True
     _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
+    return lease
+
+
+def wipe_nonce_copies(cfg):
     for pattern in cfg.get("userDataCopies") or []:
         for copy in sorted(glob.glob(pattern)):
             wipe(copy)
+
+
+def wipe_nonce(cfg, lease):
+    lease = mark_nonce_consumed(cfg, lease)
+    wipe_nonce_copies(cfg)
     return lease
 
 
@@ -134,7 +154,48 @@ def retryable(status, resp):
     return status >= 500
 
 
-def enroll(cfg, lease):
+class Malformed(ValueError):
+    """A 200 whose body is not a usable enrollment (e.g. truncated in flight)."""
+
+
+def parse_answer(resp):
+    """A 200's body -> (token, key, sandboxId, zone); Malformed otherwise. Validates
+    everything before anything is written."""
+    try:
+        r = json.loads(resp)
+        token, key = r["tunnelToken"], base64.b64decode(r["controlKey"], validate=True)
+        sandbox_id, zone = r["sandboxId"], r["zone"]
+        if not isinstance(token, str) or len(token) < 16 or len(key) < 32:
+            raise ValueError
+        if not isinstance(sandbox_id, str) or not SANDBOX_ID_RE.fullmatch(sandbox_id) or not valid_zone(zone):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        raise Malformed
+    return token, key, sandbox_id, zone
+
+
+def persist(cfg, lease, answer, instance_id=None):
+    """Make a 200 durable, THEN retire the nonce. Each write is atomic (temp, fsync, rename,
+    dir fsync) and writes the same bytes when repeated, in this order:
+      1. tunnel.json, control.key, enrolled.json (host root volume)
+      2. ONE lease rewrite that records the edge's routing AND drops the nonce
+    A crash or an OSError before step 2 leaves the nonce in local state, so a re-sent request
+    takes the app's replay path (the same derived key, the Worker's same token for this epoch)
+    and this sequence converges. The caller wipes the cloud-init copies afterwards."""
+    token, key, sandbox_id, zone = answer
+    _write_private(os.path.join(cfg.stateDir, TOKEN_FILE),
+                   json.dumps({"token": token, "generation": lease["generation"],
+                               "leaseEpoch": lease["leaseEpoch"]}).encode())
+    _write_private(os.path.join(cfg.stateDir, KEY_FILE), key)
+    if instance_id is not None:   # a same-instance reboot reuses these (cli.enroll_or_reuse)
+        _write_private(os.path.join(cfg.stateDir, ENROLLED_FILE), json.dumps({
+            "instanceId": instance_id, "generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"],
+            "sandboxId": sandbox_id, "zone": zone}).encode())
+    # The edge (started after this unit) reads its browser-host binding from the lease.
+    return mark_nonce_consumed(cfg, dict(load_lease(cfg), sandboxId=sandbox_id, zone=zone))
+
+
+def enroll(cfg, lease, instance_id=None):
     if lease.get("nonceConsumed") or not lease.get("nonce"):
         raise Refused("enroll_nonce_absent", "nonce already used for this epoch")
     if not cfg.enrollUrl:
@@ -154,35 +215,28 @@ def enroll(cfg, lease):
                                         headers={"Content-Type": "application/json"}, timeout=20,
                                         ca_file=cfg.caFile, server_name=cfg.tlsServerName)
         except OSError as e:   # no answer: nothing can have been decided
-            why = f"transport: {type(e).__name__}"
+            code, why = "enroll_retry_exhausted", f"transport: {type(e).__name__}"
         else:
-            if not retryable(status, resp):
-                break
-            why = f"HTTP {status}"
+            if status == 200:
+                # The app consumed the nonce. Keep it locally until the credentials are durable:
+                # an unusable body or a failed write is retried, and the re-send replays.
+                try:
+                    persist(cfg, lease, parse_answer(resp), instance_id)
+                except Malformed:
+                    code, why = "enroll_response_malformed", "HTTP 200 with an unusable body"
+                except OSError as e:
+                    code, why = "enroll_persist_failed", f"persist: {type(e).__name__}"
+                else:
+                    wipe_nonce_copies(cfg)
+                    return True
+            elif retryable(status, resp):
+                code, why = "enroll_retry_exhausted", f"HTTP {status}"
+            else:
+                # A settled refusal: the app refused the nonce for good. Never send it again.
+                wipe_nonce(cfg, lease)
+                raise Refused("enroll_refused", f"HTTP {status}: {resp[:200]!r}")
         if time.monotonic() + delay > deadline:   # the nonce stays: a later run may retry
-            raise Refused("enroll_retry_exhausted", why)
+            raise Refused(code, why)
         print(f"[enroll] not enrolled yet ({why}); retrying in {delay:g}s", flush=True)
         time.sleep(delay)
         delay = min(delay * 2, 30.0)
-    # A settled answer: the app consumed the nonce or refused it for good. Never send it again.
-    wipe_nonce(cfg, lease)
-    if status != 200:
-        raise Refused("enroll_refused", f"HTTP {status}: {resp[:200]!r}")
-    try:
-        r = json.loads(resp)
-        token, key = r["tunnelToken"], base64.b64decode(r["controlKey"], validate=True)
-        sandbox_id, zone = r["sandboxId"], r["zone"]
-        if not isinstance(token, str) or len(token) < 16 or len(key) < 32:
-            raise ValueError
-        if not isinstance(sandbox_id, str) or not SANDBOX_ID_RE.fullmatch(sandbox_id) or not valid_zone(zone):
-            raise ValueError
-    except (ValueError, KeyError, TypeError):
-        raise Refused("enroll_response_malformed")
-    _write_private(os.path.join(cfg.stateDir, TOKEN_FILE),
-                   json.dumps({"token": token, "generation": lease["generation"],
-                               "leaseEpoch": lease["leaseEpoch"]}).encode())
-    _write_private(os.path.join(cfg.stateDir, "control.key"), key)
-    # The edge (started after this unit) reads its browser-host binding from the lease.
-    routed = dict(load_lease(cfg), sandboxId=sandbox_id, zone=zone)
-    _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(routed).encode())
-    return True

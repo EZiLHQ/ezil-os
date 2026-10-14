@@ -310,22 +310,19 @@ class EnrollReuse(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.d, "cloud", "user-data.txt")), "local nonce copies wiped")
 
     def test_any_other_case_enrolls_and_records_the_instance(self):
-        cases = [("identity.json", "runDir", {"document": '{"instanceId": "i-0def"}', "signature": "s"}),
-                 ("tunnel.json", "stateDir", {"token": "t" * 32, "generation": 1, "leaseEpoch": 1})]
-        for name, where, obj in cases:
+        cases = [("identity.json", "runDir", {"document": '{"instanceId": "i-0def"}', "signature": "s"}, "i-0def"),
+                 ("tunnel.json", "stateDir", {"token": "t" * 32, "generation": 1, "leaseEpoch": 1}, "i-0abc")]
+        for name, where, obj, iid in cases:
             self.setUp()
             self.write(self.cfg[where], name, obj)
             calls = []
 
-            def fake_enroll(cfg, lease):
-                calls.append(lease["leaseEpoch"])
-                self.write(cfg.runDir, "lease.json", dict(lease, sandboxId=SID, zone=ZONE))
+            def fake_enroll(cfg, lease, instance_id=None):
+                calls.append((lease["leaseEpoch"], instance_id))
             with mock.patch.object(enrollmod, "enroll", side_effect=fake_enroll):
                 cli.enroll_or_reuse(self.cfg, self.lease)
-            self.assertEqual(calls, [2], name)
-            with open(os.path.join(self.cfg.stateDir, cli.ENROLLED_FILE)) as f:
-                rec = json.load(f)
-            self.assertEqual((rec["leaseEpoch"], rec["sandboxId"]), (2, SID))
+            # enroll.persist records the instance (test_enroll_durability.py), so cli passes it on.
+            self.assertEqual(calls, [(2, iid)], name)
 
     def test_a_fenced_host_without_its_control_key_enrolls(self):
         os.unlink(os.path.join(self.cfg.stateDir, "control.key"))
