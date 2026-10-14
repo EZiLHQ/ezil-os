@@ -13,9 +13,9 @@ import { AWS_IDENTITY_CERTS_ENV } from './aws-identity';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
-import { lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, type LifecycleExecutionReader } from './aws-receipts';
+import { applyLifecycleReceipt, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, type LifecycleExecutionReader } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { PlacementOwnerError } from './placement';
+import { ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, PlacementOwnerError, readPlacement } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -62,7 +62,7 @@ function receiptOf(o: { jobId?: string; digest?: string; generation?: number; le
 const row = (over: Record<string, unknown> = {}) =>
     placementRow({
         computer_id: C1, owner_user_id: U1, state: 'STARTING', generation: 2, lease_epoch: 3, region: 'ap-south-1', zone_id: 'aps1-az1', instance_type: 't3a.medium',
-        instance_id: I_OLD, volume_id: VOL, fs_uuid: 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5', fence_token: FENCE, lifecycle_job_id: JOB, lifecycle_digest: DIGEST,
+        instance_id: null, volume_id: VOL, fs_uuid: 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5', fence_token: FENCE, lifecycle_job_id: JOB, lifecycle_digest: DIGEST,
         enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 300_000), ...over,
     });
 
@@ -94,7 +94,27 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
         randomBytes: () => Buffer.from(NONCE_BYTES), executions, ...(opts.noTunnels ? {} : { tunnels }),
     });
     const status = () => provider.status(ctx, { userId: U1, computerId: C1 });
-    return { ...fake, provider, status, read, deleted, created, starts, tunnels };
+    const enroll = () => {
+        const p = fake.placements[0]!;
+        const tags = {
+            'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot', 'ezil:computer-id': C1,
+            'ezil:generation': String(p.generation), 'ezil:fence-token': String(p.fence_token),
+        };
+        return handleAwsEnrollment(
+            {
+                db: fake.db, env: env(), now: () => NOW, tunnels,
+                describer: { describeForEnrollment: async () => ({
+                    instanceId: I_NEW, state: 'running', availabilityZone: 'ap-south-1a', availabilityZoneId: 'aps1-az1',
+                    publicIp: '13.0.0.5', tags, volumes: [{ volumeId: VOL, deleteOnTermination: false, tags }],
+                }) },
+            },
+            {
+                computerId: C1, generation: Number(p.generation), leaseEpoch: Number(p.lease_epoch), nonce: NONCE,
+                identityDocument: fx.document, signature: fx.pkcs7_rsa_detached,
+            },
+        );
+    };
+    return { ...fake, provider, status, enroll, read, deleted, created, starts, tunnels, executions };
 }
 
 describe('the execution read', () => {
@@ -143,6 +163,7 @@ describe('boot receipts (provider says running)', () => {
         await s.status();
         s.placements[0]!.enroll_nonce_hash = null;
         s.placements[0]!.enroll_expires_at = null;
+        s.placements[0]!.last_error = ENROLLMENT_SUCCEEDED;
         const reads = s.read.length;
         expect(await s.status()).toMatchObject({ ok: true, state: 'running', placementState: 'RUNNING' });
         expect(s.read).toHaveLength(reads);
@@ -156,7 +177,7 @@ describe('boot receipts (provider says running)', () => {
     });
 
     it('host enrolled first (instance recorded by enrollment): the receipt takes it straight to RUNNING', async () => {
-        const { status, placements } = setup([row({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: I_NEW })], { status: 'SUCCEEDED', output: receiptOf() });
+        const { status, placements } = setup([row({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: I_NEW, last_error: ENROLLMENT_SUCCEEDED })], { status: 'SUCCEEDED', output: receiptOf() });
         expect(await status()).toMatchObject({ state: 'running', placementState: 'RUNNING' });
         expect(placements[0]).toMatchObject({ lifecycle_job_id: null });
     });
@@ -171,11 +192,69 @@ describe('boot receipts (provider says running)', () => {
             status: 'SUCCEEDED', output: receiptOf({ generation: 1, leaseEpoch: 1 }),
         });
         expect(await pending.status()).toMatchObject({ placementState: 'PROVISIONING' });
-        const done = setup([row({ state: 'PROVISIONING', generation: 1, lease_epoch: 1, instance_id: I_NEW, volume_id: VOL, enroll_nonce_hash: null, enroll_expires_at: null })], {
+        const done = setup([row({ state: 'PROVISIONING', generation: 1, lease_epoch: 1, instance_id: I_NEW, volume_id: VOL, enroll_nonce_hash: null, enroll_expires_at: null, last_error: ENROLLMENT_SUCCEEDED })], {
             status: 'SUCCEEDED', output: receiptOf({ generation: 1, leaseEpoch: 1 }),
         });
         expect(await done.status()).toMatchObject({ placementState: 'RUNNING', state: 'running' });
         expect(done.placements[0]).toMatchObject({ instance_id: I_NEW, volume_id: VOL, lifecycle_job_id: null });
+    });
+});
+
+describe('enrollment outcomes fence receipt promotion', () => {
+    it.each(['PROVISIONING', 'STARTING', 'MOUNTING'])('%s requires explicit success, including after the job is cleared', async (state) => {
+        for (const last_error of [null, ENROLLMENT_PENDING]) {
+            const s = setup([row({
+                state, instance_id: I_NEW, enroll_nonce_hash: null, enroll_expires_at: null, last_error,
+                ...(state === 'MOUNTING' ? { lifecycle_job_id: null, lifecycle_digest: null } : {}),
+            })], { status: 'SUCCEEDED', output: receiptOf() });
+            await s.status();
+            expect(s.placements[0]!.state).not.toBe('RUNNING');
+        }
+    });
+
+    it.each(['PROVISIONING', 'STARTING', 'MOUNTING'])('%s cannot run while GW-1 is pending; failure allows a fresh replace', async (state) => {
+        const s = setup([row({ state })], { status: 'SUCCEEDED', output: receiptOf() });
+        s.tunnels.createTunnel = async () => {
+            expect(s.placements[0]!.last_error).toBe(ENROLLMENT_PENDING);
+            await s.status(); // receipt poll between nonce consumption and the tunnel answer
+            expect(s.placements[0]!.state).not.toBe('RUNNING');
+            return { ok: false, status: 502, code: 'tunnel_transport' };
+        };
+        expect((await s.enroll()).status).toBe(502);
+        await s.status();
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.starts[0]!.intent).toMatchObject({ operation: 'replace', targetGeneration: 3, leaseEpoch: 4, previousInstanceId: I_NEW });
+        expect(s.placements[0]).toMatchObject({ state: 'STARTING', instance_id: null, last_error: null });
+    });
+
+    it('a receipt during GW-1 success preserves its progress and the success marker', async () => {
+        const s = setup([row()], { status: 'SUCCEEDED', output: receiptOf() });
+        s.tunnels.createTunnel = async () => {
+            await s.status();
+            expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', last_error: ENROLLMENT_PENDING });
+            return { ok: true, tunnelToken: 'tok-' + 'x'.repeat(30) };
+        };
+        expect((await s.enroll()).status).toBe(200);
+        expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', last_error: ENROLLMENT_SUCCEEDED });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+    });
+
+    it('a stale receipt snapshot cannot erase a completed enrollment outcome', async () => {
+        const s = setup([row({ instance_id: I_NEW, enroll_nonce_hash: null, last_error: ENROLLMENT_PENDING })], { status: 'SUCCEEDED', output: receiptOf() });
+        const { record } = await readPlacement(s.db, C1);
+        s.placements[0]!.last_error = ENROLLMENT_SUCCEEDED;
+        await applyLifecycleReceipt(s, record!, D);
+        expect(s.placements[0]).toMatchObject({ state: 'STARTING', last_error: ENROLLMENT_SUCCEEDED });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+    });
+
+    it('a stale receipt snapshot cannot overwrite an instance bound since its read', async () => {
+        const s = setup([row()], { status: 'SUCCEEDED', output: receiptOf() });
+        const { record } = await readPlacement(s.db, C1);
+        s.placements[0]!.instance_id = I_OLD;
+        await applyLifecycleReceipt(s, record!, D);
+        expect(s.placements[0]).toMatchObject({ state: 'STARTING', instance_id: I_OLD });
     });
 });
 

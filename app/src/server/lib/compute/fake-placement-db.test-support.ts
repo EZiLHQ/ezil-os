@@ -218,29 +218,39 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             case 'cas': {
                 const m = text.match(/SET\s+([\s\S]*?)\s+WHERE\s+([\s\S]*?)\s+RETURNING/);
                 if (!m) throw new Error('fake db: unparsed update');
-                // `col = $n` (equality) and `col > $n::timestamptz` (a deadline, compared as instants).
-                const where = m[2]!.split(/\s+AND\s+/).map((pred) => {
-                    const w = pred.trim().match(/^(\w+) (=|>) (\$\d+(?:::\w+)?)$/);
-                    if (!w) throw new Error(`fake db: unsupported predicate ${pred}`);
-                    if (w[2] === '>' && !w[3]!.endsWith('::timestamptz')) throw new Error(`fake db: unsupported comparison ${pred}`);
-                    return [w[1]!, value(w[3]!, params), w[2] as '=' | '>'] as const;
-                });
                 const instant = (v: unknown) => (v === null || v === undefined ? NaN : new Date(v as string | Date).getTime());
-                const matches = (r: Row, [col, v, op]: (typeof where)[number]) =>
-                    op === '>'
+                const where = m[2]!.split(/\s+AND\s+/).map((pred): ((r: Row) => boolean) => {
+                    const text = pred.trim();
+                    const isNull = text.match(/^(\w+) IS NULL$/);
+                    if (isNull) return (r) => r[isNull[1]!] == null;
+                    const nullable = text.match(/^(\w+) IS NOT DISTINCT FROM (\$\d+(?:::\w+)?)$/);
+                    if (nullable) return (r) => (r[nullable[1]!] ?? null) === value(nullable[2]!, params);
+                    const available = text.match(/^\((\w+) IS NULL OR \1 = (\$\d+)\)$/);
+                    if (available) return (r) => r[available[1]!] == null || r[available[1]!] === value(available[2]!, params);
+                    const list = text.match(/^(\w+) IN \(([^)]+)\)$/);
+                    if (list) {
+                        const values = list[2]!.split(',').map((v) => value(v.trim(), params));
+                        return (r) => values.includes(r[list[1]!]);
+                    }
+                    const w = text.match(/^(\w+) (=|>) (\$\d+(?:::\w+)?|now\(\))$/);
+                    if (!w) throw new Error(`fake db: unsupported predicate ${pred}`);
+                    if (w[2] === '>' && w[3] !== 'now()' && !w[3]!.endsWith('::timestamptz')) throw new Error(`fake db: unsupported comparison ${pred}`);
+                    const col = w[1]!, v = value(w[3]!, params);
+                    return (r) => w[2] === '>'
                         ? instant(r[col]) > instant(v)
                         : col === 'computer_id' || col === 'owner_user_id'
                           ? uuidEq(r[col], v)
                           : r[col] !== null && r[col] !== undefined && String(r[col]) === String(v);
+                });
                 const sets = m[1]!.split(/,\s*/).map((assign) => {
                     const inc = assign.match(/^(\w+) = (\w+) \+ (\$\d+)$/);
                     if (inc) return (r: Row) => (r[inc[1]!] = Number(r[inc[2]!]) + Number(value(inc[3]!, params)));
                     const set = assign.match(/^(\w+) = (.+)$/);
                     if (!set) throw new Error(`fake db: unsupported assignment ${assign}`);
-                    return (r: Row) => (r[set[1]!] = value(set[2]!.trim(), params));
+                    return (r: Row) => (r[set[1]!] = set[2]!.trim() === set[1] ? r[set[1]!] : value(set[2]!.trim(), params));
                 });
                 // Atomic match-and-apply, like row-locked UPDATE re-evaluation.
-                const hit = placements.filter((r) => where.every((w) => matches(r, w)));
+                const hit = placements.filter((r) => where.every((matches) => matches(r)));
                 for (const r of hit) {
                     const before = { ...r };
                     sets.forEach((apply) => apply(r));

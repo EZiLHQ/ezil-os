@@ -48,7 +48,7 @@ import {
     type LifecycleOperation,
     type LifecycleWork,
 } from './aws-intent';
-import { PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { ENROLLMENT_FAILED, PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import { applyLifecycleReceipt, type LifecycleExecutionReader } from './aws-receipts';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from './provider';
 
@@ -340,7 +340,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             switch (placement.state) {
                 case 'RUNNING':
                     return { ok: true };
+                case 'UNCONFIRMED':
                 case 'STOPPED': {
+                    if (placement.state === 'UNCONFIRMED' && placement.lastError !== ENROLLMENT_FAILED) {
+                        if (placement.lastError?.startsWith('capacity:')) return notReady('capacity_unavailable', false, placement.lastError);
+                        return notReady('computer_recovering');
+                    }
                     if (!placement.instanceId || !placement.volumeId || !placement.instanceType || !placement.region || !placement.fsUuid || !placement.fenceToken) {
                         return notReady('aws_placement_incomplete');
                     }
@@ -349,7 +354,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // Region is sticky: the deployment is the placement's own region, never another.
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
-                    const replace = cfg.wakeMode === 'replace';
+                    const replace = placement.lastError === ENROLLMENT_FAILED || cfg.wakeMode === 'replace';
                     // The lease's compare-and-swap moves the epoch (and, for a replace, the
                     // generation) by exactly one, so this boot's intent is fully known BEFORE
                     // the lease and its job, digest, fence and nonce hash are written by that
@@ -412,8 +417,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     const state = AWS_STATE_FOR[placement.state];
                     if (state === 'starting') return notReady('computer_starting', true);
                     if (state === 'stopping') return notReady('computer_stopping', true);
-                    if (placement.state === 'UNCONFIRMED' && placement.lastError?.startsWith('capacity:')) return notReady('capacity_unavailable', false, placement.lastError);
-                    return notReady(placement.state === 'UNCONFIRMED' || placement.state === 'RECOVERING' ? 'computer_recovering' : 'computer_unavailable');
+                    return notReady(placement.state === 'RECOVERING' ? 'computer_recovering' : 'computer_unavailable');
                 }
             }
         },

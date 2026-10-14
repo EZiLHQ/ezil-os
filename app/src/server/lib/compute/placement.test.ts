@@ -305,7 +305,7 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, statements } = at();
         await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
         const cas = statements.find((s) => /placement:cas/.test(s.sql))!;
-        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+ AND state = \$\d+ AND owner_user_id = \$\d+::uuid\s+RETURNING/);
+        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+\s+AND state = \$\d+\s+AND owner_user_id = \$\d+::uuid\s+RETURNING/);
         expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 });

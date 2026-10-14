@@ -17,6 +17,7 @@
 
 import {
     withAdmission,
+    ENROLLMENT_FAILED,
     createAwsPlacement,
     leasePlacement,
     mintAdmissionTicket,
@@ -186,8 +187,20 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
         });
         // The lease's region is the placement's own, read inside this transaction
         // after the lock: never caller-supplied.
+        const placement = request.kind === 'lease' ? (await readPlacement(tx, request.computerId)).record : null;
         const region: RegionPlan =
-            request.kind === 'create' ? { kind: 'create' } : { kind: 'lease', region: (await readPlacement(tx, request.computerId)).record?.region ?? null };
+            request.kind === 'create' ? { kind: 'create' } : { kind: 'lease', region: placement?.region ?? null };
+        // Replacing this failed boot reuses its running slot. Keep every other cap
+        // and ownership check; the lease CAS rechecks the failure and exact boot.
+        if (request.kind === 'lease' && request.replace && placement?.provider === 'aws-ec2' &&
+            placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED && placement.region &&
+            placement.generation === request.expected.generation && placement.leaseEpoch === request.expected.leaseEpoch) {
+            counters.runningCount = Math.max(0, counters.runningCount - 1);
+            counters.runningByRegion = {
+                ...counters.runningByRegion,
+                [placement.region]: Math.max(0, (counters.runningByRegion[placement.region] ?? 0) - 1),
+            };
+        }
         const decision = decideAdmission({ config, counters, userId: request.userId, now, region });
         if (!decision.admit) return { admitted: false, reason: decision.reason, reasons: decision.reasons };
 

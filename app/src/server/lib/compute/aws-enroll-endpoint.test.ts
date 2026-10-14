@@ -24,6 +24,7 @@ import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { readPlacement } from './placement';
+import * as placement from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
@@ -48,7 +49,7 @@ const env = (over: Record<string, string> = {}) => ({
 const booting = (over: Record<string, unknown> = {}) =>
     placementRow({
         computer_id: C1, owner_user_id: U1, state: 'STARTING', generation: 2, lease_epoch: 3, region: 'ap-south-1', zone_id: 'aps1-az1',
-        instance_type: 't3a.medium', instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111', fs_uuid: 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5',
+        instance_type: 't3a.medium', instance_id: null, volume_id: 'vol-11111111111111111', fs_uuid: 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5',
         fence_token: FENCE, enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 300_000), ...over,
     });
 
@@ -74,15 +75,15 @@ const hostBody = (over: Record<string, unknown> = {}) => ({
     computerId: C1, generation: 2, leaseEpoch: 3, nonce: NONCE, identityDocument: fx.document, signature: fx.pkcs7_rsa_detached, ...over,
 });
 
-function setup(rows = [booting()], over: Partial<EnrollDeps> & { e?: Record<string, string>; view?: Ec2EnrollmentView | null; tunnel?: TunnelClient['createTunnel'] } = {}) {
-    const fake = createFakePlacementDb({ placements: rows });
+function setup(rows = [booting()], over: Partial<EnrollDeps> & { e?: Record<string, string>; view?: Ec2EnrollmentView | null; tunnel?: TunnelClient['createTunnel']; clock?: () => Date } = {}) {
+    const fake = createFakePlacementDb({ placements: rows }, { clock: over.clock ?? (() => NOW) });
     const described: { region: string; instanceId: string }[] = [];
     const tunnels: { owner: { userId: string }; request: TunnelRequest }[] = [];
     const deps: EnrollDeps = {
         db: fake.db,
         env: over.e ?? env(),
         now: () => NOW,
-        randomBytes: () => Buffer.from(KEY),
+        randomBytes: over.randomBytes ?? (() => Buffer.from(KEY)),
         describer:
             'describer' in over
                 ? over.describer
@@ -110,7 +111,7 @@ describe('a valid enrollment', () => {
         const { enroll, placements, tunnels, described } = setup();
         const r = await enroll();
         expect(r).toEqual({ status: 200, body: { tunnelToken: TOKEN, controlKey: KEY.toString('base64') } });
-        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING' });
+        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING', last_error: placement.ENROLLMENT_SUCCEEDED });
         expect(described).toEqual([{ region: 'ap-south-1', instanceId: DOC.instanceId }]);
         expect(tunnels).toEqual([
             {
@@ -149,6 +150,48 @@ describe('a valid enrollment', () => {
         expect((await enroll()).status).toBe(200);
     });
 
+    it('a receipt moving STARTING to MOUNTING during describe still enrolls without rewinding state', async () => {
+        const s = setup();
+        const consume = vi.spyOn(placement, 'consumeEnrollmentNonce');
+        s.deps.describer = { describeForEnrollment: async () => {
+            Object.assign(s.placements[0]!, { state: 'MOUNTING', instance_id: DOC.instanceId });
+            return liveView();
+        } };
+        expect((await s.enroll()).status).toBe(200);
+        expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', last_error: placement.ENROLLMENT_SUCCEEDED });
+        expect(consume).toHaveBeenCalledTimes(1);
+        expect(s.tunnels).toHaveLength(1);
+    });
+
+    it('re-reads an unconsumed boot after a CAS miss and retries once', async () => {
+        const s = setup();
+        const consume = vi.spyOn(placement, 'consumeEnrollmentNonce').mockResolvedValueOnce({ ok: false, reason: 'cas_conflict' });
+        expect((await s.enroll()).status).toBe(200);
+        expect(consume).toHaveBeenCalledTimes(2);
+        expect(s.tunnels).toHaveLength(1);
+    });
+
+    it('a second unexplained miss is bounded and is not reported as a consumed nonce', async () => {
+        const s = setup();
+        const consume = vi.spyOn(placement, 'consumeEnrollmentNonce').mockResolvedValue({ ok: false, reason: 'cas_conflict' });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_conflict' } });
+        expect(consume).toHaveBeenCalledTimes(2);
+        expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
+        expect(s.tunnels).toEqual([]);
+    });
+
+    it.each(['generation', 'lease_epoch'] as const)('a moved %s is terminal without retrying the CAS', async (counter) => {
+        const s = setup();
+        s.deps.describer = { describeForEnrollment: async () => {
+            s.placements[0]![counter] = Number(s.placements[0]![counter]) + 1;
+            return liveView();
+        } };
+        const consume = vi.spyOn(placement, 'consumeEnrollmentNonce');
+        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_stale_epoch' } });
+        expect(consume).toHaveBeenCalledTimes(1);
+        expect(s.tunnels).toEqual([]);
+    });
+
     it('never logs the nonce, the control key or the tunnel token', async () => {
         const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
         const { enroll } = setup();
@@ -176,6 +219,7 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
         ['no region certificate', [[booting()], { e: env({ [AWS_IDENTITY_CERTS_ENV]: JSON.stringify({ 'us-east-1': fx.cert_rsa }) }) }], hostBody(), 503, 'enroll_unavailable'],
         ['a signature by another key', [[booting()], { e: env({ [AWS_IDENTITY_CERTS_ENV]: JSON.stringify({ 'ap-south-1': fx.cert_other }) }) }], hostBody(), 403, 'identity_signature_mismatch'],
         ['a tampered document', [[booting()]], hostBody({ identityDocument: fx.document.replace('10.0.0.12', '10.0.0.13') }), 403, 'identity_signature_mismatch'],
+        ['a receipt already bound another instance', [[booting({ instance_id: 'i-33333333333333333' })]], hostBody(), 403, 'instance_mismatch'],
         ['instance type differs from the placement', [[booting({ instance_type: 'm6i.large' })]], hostBody(), 403, 'identity_document_mismatch'],
         [
             'another account',
@@ -200,11 +244,42 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
     ];
 
     it.each(cases)('%s → %i %s', async (_n, args, body, status, error) => {
-        const { enroll, placements, tunnels } = setup(...args);
+        const { enroll, placements, tunnels, described } = setup(...args);
         const before = placements.map((r) => ({ ...r }));
         expect(await enroll(body)).toEqual({ status, body: { error } });
+        if (error === 'instance_mismatch') expect(described).toEqual([]);
         expect(placements).toEqual(before);
         expect(tunnels).toEqual([]);
+    });
+
+    it('expiry reached during EC2 describe is refused by the database clock, even with a stale JS clock', async () => {
+        let clock = NOW;
+        const s = setup([booting()], { clock: () => clock });
+        s.deps.describer = { describeForEnrollment: async () => {
+            clock = new Date(NOW.getTime() + 300_000);
+            return liveView();
+        } };
+        expect((await s.enroll()).status).not.toBe(200);
+        expect(s.placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE), instance_id: null, last_error: null });
+        expect(s.tunnels).toEqual([]);
+    });
+
+    it('an instance bound by a receipt during describe cannot be overwritten by the CAS', async () => {
+        const s = setup();
+        s.deps.describer = { describeForEnrollment: async () => {
+            s.placements[0]!.instance_id = 'i-33333333333333333';
+            return liveView();
+        } };
+        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'instance_mismatch' } });
+        expect(s.placements[0]).toMatchObject({ instance_id: 'i-33333333333333333', enroll_nonce_hash: nonceHashOf(NONCE) });
+        expect(s.tunnels).toEqual([]);
+    });
+
+    it.each([() => Buffer.alloc(16), () => { throw new Error('random'); }])('a broken random source leaves the nonce intact', async (randomBytes) => {
+        const s = setup([booting()], { randomBytes });
+        expect(await s.enroll()).toEqual({ status: 500, body: { error: 'enroll_failed' } });
+        expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
+        expect(s.tunnels).toEqual([]);
     });
 
     it('a describe failure is 503 and changes nothing', async () => {
@@ -218,14 +293,28 @@ describe('after the nonce is consumed', () => {
     it('a tunnel failure is non-200, the nonce stays consumed, and no control key is returned', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status: 409, code: 'tunnel_exists' }) });
         expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
-        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null });
+        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
         // The host never re-sends it (enroll.py), and a replay is refused.
         expect((await enroll()).status).toBe(403);
     });
 
     it('a thrown tunnel call is the same 502', async () => {
-        const { enroll } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
+        const { enroll, placements } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
         expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
+    });
+
+    it.each(['generation', 'lease_epoch'] as const)('GW-1 completion cannot mark a newer %s successful', async (counter) => {
+        const s = setup();
+        s.deps.tunnels = {
+            createTunnel: async () => {
+                s.placements[0]![counter] = Number(s.placements[0]![counter]) + 1;
+                return { ok: true, tunnelToken: TOKEN };
+            },
+            deleteTunnel: async () => ({ ok: true }),
+        };
+        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_conflict' } });
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
     });
 });
 
@@ -276,8 +365,9 @@ describe('consumeEnrollmentNonce SQL', () => {
         const { enroll, statements } = setup();
         await enroll();
         const cas = statements.filter((st) => st.sql.includes('placement:cas'));
-        expect(cas).toHaveLength(1);
-        for (const frag of ['generation = $', 'lease_epoch = $', 'state = $', 'provider = $', 'enroll_nonce_hash = $', 'enroll_expires_at > $']) expect(cas[0]!.sql).toContain(frag);
+        expect(cas).toHaveLength(2); // consume, then record GW-1 success
+        for (const frag of ['generation = $', 'lease_epoch = $', 'state IN (', 'provider = $', 'enroll_nonce_hash = $', 'enroll_expires_at > now()', '(instance_id IS NULL OR instance_id = $']) expect(cas[0]!.sql).toContain(frag);
+        expect(cas[0]!.sql).toContain('state = state');
         const { record } = await readPlacement(setup().db, C1);
         expect(record?.enrollNonceHash).toBe(nonceHashOf(NONCE));
     });

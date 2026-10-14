@@ -13,7 +13,7 @@ import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { nonceHashOf } from './aws-enroll';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
+import { ENROLLMENT_FAILED, PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -287,13 +287,40 @@ describe('ensure: wake by replace (default): a NEW instance on the SAME volume, 
             v: 1, computerId: C1, volumeId: 'vol-11111111111111111', fsUuid: FS, generation: 4, leaseEpoch: 8, nonce: NONCE, provision: false, enrollUrl: ENROLL_URL,
         });
         expect(placements[0]).toMatchObject({
-            state: 'STARTING', generation: 4, lease_epoch: 8, region: 'ap-south-1', fence_token: i.fenceToken,
+            state: 'STARTING', generation: 4, lease_epoch: 8, region: 'ap-south-1', fence_token: i.fenceToken, instance_id: null,
             enroll_nonce_hash: nonceHashOf(NONCE), lifecycle_job_id: i.jobId, lifecycle_digest: calls[0]!.digest,
         });
         expect(JSON.stringify(statements.map((st) => st.params))).not.toContain(NONCE);
         // The nonce hash, fence and job are written by the LEASE compare-and-swap itself.
         const lease = statements.find((st) => st.sql.includes('placement:cas') && st.sql.includes("'LEASED'") === false && st.params.includes('LEASED'))!;
         for (const col of ['fence_token', 'enroll_nonce_hash', 'lifecycle_job_id', 'lifecycle_digest']) expect(lease.sql).toContain(col);
+    });
+
+    it('a failed enrollment forces replace even in start mode at the running caps', async () => {
+        const { provider, placements, calls } = setup({
+            placements: [stopped({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED, generation: 3, lease_epoch: 7 })],
+        }, { e: startMode({ AWS_MAX_RUNNING: '1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1' }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(calls[0]!.intent).toMatchObject({
+            operation: 'replace', targetGeneration: 4, leaseEpoch: 8, previousInstanceId: 'i-11111111111111111',
+        });
+        expect(placements[0]).toMatchObject({ state: 'STARTING', last_error: null, instance_id: null, enroll_nonce_hash: nonceHashOf(NONCE) });
+    });
+
+    it('enrollment recovery credits only its own running slot', async () => {
+        const { provider, calls } = setup({ placements: [
+            stopped({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED }),
+            stopped({ computer_id: 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2', owner_user_id: U2, state: 'RUNNING' }),
+        ] }, { e: env({ AWS_MAX_RUNNING: '1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1' }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false });
+        expect(calls).toEqual([]);
+    });
+
+    it('an unrelated UNCONFIRMED failure cannot enter the enrollment recovery path', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'UNCONFIRMED', last_error: 'receipt_conflict' })] });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_recovering' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'receipt_conflict' });
+        expect(calls).toEqual([]);
     });
 
     it('a US computer wakes in the US even though Mumbai comes first', async () => {

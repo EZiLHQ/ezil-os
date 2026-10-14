@@ -19,7 +19,7 @@ import { z } from 'zod';
 import { isAwsComputersEnabled, type Env as AwsEnv } from './aws-config';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
-import { consumeEnrollmentNonce, ENROLLABLE_STATES, readPlacement, type Placement, type PlacementDb } from './placement';
+import { consumeEnrollmentNonce, ENROLLABLE_STATES, finishEnrollment, readPlacement, type Placement, type PlacementDb } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
@@ -301,6 +301,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         return refuse(403, 'identity_document_invalid');
     }
     if (doc.region !== p.region || doc.accountId !== deployment.accountId || doc.instanceType !== p.instanceType) return refuse(403, 'identity_document_mismatch');
+    if (p.instanceId !== null && p.instanceId !== doc.instanceId) return refuse(403, 'instance_mismatch');
 
     // Live describe: this instance is running NOW, in the placement's ZoneId, tagged as this
     // generation (fence included) and holding the computer's data volume.
@@ -328,19 +329,37 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         volumeId = data[0]!.volumeId;
     }
 
-    // Consume: one compare-and-swap on the exact boot, nonce hash and unexpired deadline.
-    const consumed = await consumeEnrollmentNonce(deps.db, {
-        computerId: p.computerId,
-        expected: p,
-        // The PRESENTED nonce's hash: the swap itself binds what the host sent, not only the pre-check.
-        nonceHash: nonceHashOf(body.nonce),
-        now,
-        fields: { instanceId: doc.instanceId, volumeId },
-    });
-    if (!consumed.ok) return refuse(409, 'enroll_nonce_consumed');
+    // Generate the key before consuming: even a broken random source leaves the nonce intact.
+    let controlKey: Buffer;
+    try {
+        controlKey = (deps.randomBytes ?? nodeRandomBytes)(32);
+        if (!Buffer.isBuffer(controlKey) || controlKey.length !== 32) throw new Error('invalid control key');
+    } catch {
+        return refuse(500, 'enroll_failed');
+    }
 
-    const controlKey = (deps.randomBytes ?? nodeRandomBytes)(32);
-    if (!Buffer.isBuffer(controlKey) || controlKey.length !== 32) return refuse(500, 'enroll_failed');
+    let expected = p;
+    let consumed: Placement | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await consumeEnrollmentNonce(deps.db, {
+            computerId: p.computerId, expected, nonceHash: nonceHashOf(body.nonce),
+            fields: { instanceId: doc.instanceId, volumeId },
+        });
+        if (result.ok) {
+            consumed = result.placement;
+            break;
+        }
+        // The host discards its nonce on any HTTP answer. Resolve receipt races here.
+        const { record: current } = await readPlacement(deps.db, p.computerId);
+        if (!current || current.generation !== p.generation || current.leaseEpoch !== p.leaseEpoch) return refuse(409, 'enroll_stale_epoch');
+        if (!current.enrollNonceHash) return refuse(409, 'enroll_nonce_consumed');
+        if (!sameHash(current.enrollNonceHash, nonceHashOf(body.nonce))) return refuse(403, 'enroll_nonce_invalid');
+        if (current.instanceId !== null && current.instanceId !== doc.instanceId) return refuse(403, 'instance_mismatch');
+        if (!current.enrollExpiresAt || current.enrollExpiresAt.getTime() <= deps.now().getTime()) return refuse(403, 'enroll_nonce_expired');
+        if (!ENROLLABLE_STATES.includes(current.state)) return refuse(409, 'enroll_state');
+        expected = current;
+    }
+    if (!consumed) return refuse(503, 'enroll_conflict');
     const keyB64 = controlKey.toString('base64');
     let tunnel: TunnelResult;
     try {
@@ -360,6 +379,8 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     } catch {
         tunnel = { ok: false, status: 0, code: 'tunnel_transport' };
     }
+    const finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
     if (!tunnel.ok) return refuse(502, 'tunnel_unavailable');
+    if (!finished.ok) return refuse(409, 'enroll_conflict');
     return { status: 200, body: { tunnelToken: tunnel.tunnelToken, controlKey: keyB64 } };
 }

@@ -208,7 +208,7 @@ export interface Placement {
     lifecycleJobId: string | null;
     /** sha256 of that job's intent document (the execution input's `digest`). */
     lifecycleDigest: string | null;
-    /** Machine-readable cause of the last failed job (e.g. `capacity:InsufficientInstanceCapacity:t3a.medium`). */
+    /** Machine-readable lifecycle error or explicit enrollment outcome (ENROLLMENT_* below). */
     lastError: string | null;
     updatedAt: Date;
 }
@@ -573,14 +573,18 @@ async function casInTx(
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
-    guard: { provider?: PlacementProvider; ownerUserId?: string; enrollNonceHash?: string; enrollNotExpiredAt?: Date } = {},
+    guard: {
+        provider?: PlacementProvider; ownerUserId?: string; enrollNonceHash?: string; enrollUnexpired?: boolean;
+        states?: readonly PlacementState[]; preserveState?: boolean; availableInstanceId?: string;
+        instanceId?: string | null; lastError?: string | null; nonceConsumed?: boolean;
+    } = {},
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
     // while every reader fails closed. Refuse first, inside the transaction.
     if ((await selectRows(tx, computerId)).length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     const sets: SQL[] = [
-        sql`state = ${to}`,
+        guard.preserveState ? sql`state = state` : sql`state = ${to}`,
         sql`generation = generation + ${bump.generation}`,
         sql`lease_epoch = lease_epoch + ${bump.leaseEpoch}`,
         ...(Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[])
@@ -591,7 +595,16 @@ async function casInTx(
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
-            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}${guard.enrollNonceHash !== undefined ? sql` AND enroll_nonce_hash = ${guard.enrollNonceHash}` : sql``}${guard.enrollNotExpiredAt !== undefined ? sql` AND enroll_expires_at > ${guard.enrollNotExpiredAt.toISOString()}::timestamptz` : sql``}
+            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch}
+                AND ${guard.states ? sql`state IN (${sql.join(guard.states.map((s) => sql`${s}`), sql`, `)})` : sql`state = ${expected.state}`}
+                ${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}
+                ${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
+                ${guard.enrollNonceHash !== undefined ? sql` AND enroll_nonce_hash = ${guard.enrollNonceHash}` : sql``}
+                ${guard.enrollUnexpired ? sql` AND enroll_expires_at > now()` : sql``}
+                ${guard.availableInstanceId !== undefined ? sql` AND (instance_id IS NULL OR instance_id = ${guard.availableInstanceId})` : sql``}
+                ${guard.instanceId !== undefined ? sql` AND instance_id IS NOT DISTINCT FROM ${guard.instanceId}::text` : sql``}
+                ${guard.lastError !== undefined ? sql` AND last_error IS NOT DISTINCT FROM ${guard.lastError}::text` : sql``}
+                ${guard.nonceConsumed ? sql` AND enroll_nonce_hash IS NULL` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -627,11 +640,12 @@ export async function transitionPlacement(
  */
 export async function transitionPlacementAsReconciler(
     db: PlacementDb,
-    input: { computerId: string; expected: CasExpectation; to: PlacementState; fields?: PlacementFields },
+    input: { computerId: string; expected: CasExpectation & Partial<Pick<Placement, 'instanceId' | 'lastError'>>; to: PlacementState; fields?: PlacementFields },
 ): Promise<TransitionResult> {
     if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
     return db.transaction((tx) =>
-        casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {}),
+        casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {},
+            { instanceId: input.expected.instanceId, lastError: input.expected.lastError }),
     );
 }
 
@@ -656,16 +670,19 @@ export async function leasePlacement(
 ): Promise<TransitionResult> {
     assertAdmissionLock(tx, lock);
     consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'lease' });
+    const { record: current } = await readPlacement(tx, input.computerId);
+    // A failed enrollment still owns a live instance. Only a fresh replace may lease it.
+    const recover = input.replace && current?.state === 'UNCONFIRMED' && current.lastError === ENROLLMENT_FAILED;
     return casInTx(
         tx,
         input.computerId,
-        { ...input.expected, state: 'STOPPED' },
+        { ...input.expected, state: recover ? 'UNCONFIRMED' : 'STOPPED' },
         'LEASED',
         { generation: input.replace ? 1 : 0, leaseEpoch: 1 },
-        { ...input.fields, leaseUntil: input.leaseUntil },
+        { ...input.fields, ...(input.replace ? { instanceId: null } : {}), leaseUntil: input.leaseUntil, lastError: null },
         // Only the recorded owner's aws-ec2 row matches: a Cloudflare row is never leased under
         // AWS caps, and a re-keyed or re-inserted ezil_computers row cannot claim a placement.
-        { provider: 'aws-ec2', ownerUserId: input.ownerUserId },
+        { provider: 'aws-ec2', ownerUserId: input.ownerUserId, lastError: recover ? ENROLLMENT_FAILED : undefined },
     );
 }
 
@@ -674,11 +691,17 @@ export async function leasePlacement(
 /** States a host may enroll in: the provision's first boot, or a wake's boot (C-6 step 3). */
 export const ENROLLABLE_STATES: readonly PlacementState[] = ['PROVISIONING', 'STARTING', 'MOUNTING'];
 
+// Stored in last_error: a cleared nonce alone is never evidence of GW-1 success.
+export const ENROLLMENT_PENDING = 'enroll_tunnel_pending';
+export const ENROLLMENT_SUCCEEDED = 'enroll_succeeded';
+export const ENROLLMENT_FAILED = 'enroll_tunnel_failed';
+
 /**
  * C-6 step 4: consume the boot's one-time enrollment nonce. ONE compare-and-swap
- * matches the exact generation, lease epoch, state, provider, the nonce's sha256
- * AND an unexpired deadline, and clears both nonce columns; so a nonce works once
- * and a second enrollment for the same epoch finds zero rows (`cas_conflict`).
+ * matches the generation, lease epoch, an enrollable state, provider, nonce hash
+ * AND a deadline after the database clock. Receipt progress is preserved.
+ * It clears both nonce columns and records a pending outcome; only GW-1 success
+ * may complete enrollment. An existing instance binding must match the host.
  * The state does not change. `fields` records what the verified host proved
  * (its instance and data volume). No owner predicate: the caller is a host, not
  * a user; the nonce, the signed identity document and the live describe are the
@@ -686,7 +709,7 @@ export const ENROLLABLE_STATES: readonly PlacementState[] = ['PROVISIONING', 'ST
  */
 export async function consumeEnrollmentNonce(
     db: PlacementDb,
-    input: { computerId: string; expected: CasExpectation; nonceHash: string; now: Date; fields?: Pick<PlacementFields, 'instanceId' | 'volumeId'> },
+    input: { computerId: string; expected: CasExpectation; nonceHash: string; fields: { instanceId: string; volumeId: string } },
 ): Promise<TransitionResult> {
     if (!ENROLLABLE_STATES.includes(input.expected.state)) return { ok: false, reason: 'illegal_transition' };
     if (!/^[a-f0-9]{64}$/.test(input.nonceHash)) return { ok: false, reason: 'cas_conflict' };
@@ -697,10 +720,28 @@ export async function consumeEnrollmentNonce(
             input.expected,
             input.expected.state,
             { generation: 0, leaseEpoch: 0 },
-            { ...input.fields, enrollNonceHash: null, enrollExpiresAt: null },
-            { provider: 'aws-ec2', enrollNonceHash: input.nonceHash, enrollNotExpiredAt: input.now },
+            { ...input.fields, enrollNonceHash: null, enrollExpiresAt: null, lastError: ENROLLMENT_PENDING },
+            {
+                provider: 'aws-ec2', enrollNonceHash: input.nonceHash, enrollUnexpired: true,
+                states: ENROLLABLE_STATES, preserveState: true, availableInstanceId: input.fields.instanceId,
+            },
         ),
     );
+}
+
+/** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
+export async function finishEnrollment(
+    db: PlacementDb,
+    input: { computerId: string; expected: Placement; success: boolean },
+): Promise<TransitionResult> {
+    return db.transaction((tx) => casInTx(
+        tx, input.computerId, input.expected, input.success ? input.expected.state : 'UNCONFIRMED',
+        { generation: 0, leaseEpoch: 0 }, { lastError: input.success ? ENROLLMENT_SUCCEEDED : ENROLLMENT_FAILED },
+        {
+            provider: 'aws-ec2', states: ENROLLABLE_STATES, preserveState: input.success,
+            instanceId: input.expected.instanceId, lastError: ENROLLMENT_PENDING, nonceConsumed: true,
+        },
+    ));
 }
 
 // ── Admission reads ──────────────────────────────────────────────────────

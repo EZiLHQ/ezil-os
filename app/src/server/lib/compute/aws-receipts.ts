@@ -15,7 +15,7 @@ import { z } from 'zod';
 import { AWS_TIERS, type AwsTier } from './aws-config';
 import { awsSandboxId, type TunnelClient } from './aws-enroll';
 import type { LifecycleDeployment } from './aws-intent';
-import { transitionPlacementAsReconciler, type Placement, type PlacementDb, type PlacementFields, type PlacementState } from './placement';
+import { ENROLLMENT_SUCCEEDED, transitionPlacementAsReconciler, type Placement, type PlacementDb, type PlacementFields, type PlacementState } from './placement';
 
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
 export interface LifecycleExecutionReader {
@@ -85,7 +85,7 @@ export interface ReceiptDeps {
  * placement's own job id is read, and its receipt must match that job, its
  * digest, the generation, epoch and fence; anything else is a conflict and
  * the placement goes UNCONFIRMED. A boot is RUNNING only once BOTH the
- * provider receipt arrived AND its host enrolled (the nonce was consumed).
+ * provider receipt arrived AND GW-1 enrollment explicitly succeeded.
  */
 export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment): Promise<void> {
     const step = async (p: Placement, to: PlacementState, fields: PlacementFields = {}): Promise<Placement | null> => {
@@ -93,7 +93,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         return r.ok ? r.placement : null;
     };
     let p: Placement | null = p0;
-    const enrolled = (x: Placement) => x.enrollNonceHash === null && x.instanceId !== null;
+    const enrolled = (x: Placement) => x.lastError === ENROLLMENT_SUCCEEDED && x.enrollNonceHash === null && x.instanceId !== null;
     // A receipt already applied (job cleared): MOUNTING waits only for the host's enrollment.
     if (p.state === 'MOUNTING' && p.lifecycleJobId === null) {
         if (enrolled(p)) await step(p, 'RUNNING');
@@ -128,13 +128,13 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         r.generation !== p.generation || r.leaseEpoch !== p.leaseEpoch || r.fenceToken !== p.fenceToken ||
         r.state !== (stopping ? 'stopped' : 'running') ||
         (p.volumeId !== null && r.volumeId !== p.volumeId) ||
-        // A stop names the generation's own instance; a boot the host already enrolled names the instance it proved.
-        ((stopping || enrolled(p)) && r.instanceId !== p.instanceId);
+        // Any recorded instance belongs to this generation; a receipt cannot replace its identity.
+        ((stopping || p.instanceId !== null) && r.instanceId !== p.instanceId);
     if (conflict) {
         await step(p, 'UNCONFIRMED', { lastError: 'receipt_conflict' });
         return;
     }
-    const done: PlacementFields = { instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null, lastError: null };
+    const done: PlacementFields = { instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null, lastError: stopping ? null : p.lastError };
     if (stopping) {
         if (p.state === 'DRAINING') p = await step(p, 'STOPPING');
         if (!p) return;

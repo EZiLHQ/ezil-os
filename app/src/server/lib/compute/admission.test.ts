@@ -133,9 +133,10 @@ describe('runAdmission (transactional)', () => {
             'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-running-region', 'count-user', 'duplicates', 'usage-month',
         ]);
         expect(sqls[10]).toMatch(/placement:read/); // the lease's home region, read under the lock
-        expect(sqls[11]).toMatch(/placement:read/); // the CAS duplicate pre-check
-        expect(sqls[12]).toMatch(/placement:cas/);
-        expect(sqls[13]).toBe('COMMIT');
+        expect(sqls[11]).toMatch(/placement:read/); // the replacement/enrollment-outcome re-read (review C1)
+        expect(sqls[12]).toMatch(/placement:read/); // the CAS duplicate pre-check
+        expect(sqls[13]).toMatch(/placement:cas/);
+        expect(sqls[14]).toBe('COMMIT');
         expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 
