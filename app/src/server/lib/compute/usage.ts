@@ -62,3 +62,44 @@ export function totalsFor(rows: readonly UsageRow[], now: Date): UsageTotals {
 export function summarizeUsage(rows: readonly UsageRow[], userId: string, now: Date): { user: UsageTotals; global: UsageTotals } {
     return { user: totalsFor(rows.filter((r) => r.userId === userId), now), global: totalsFor(rows, now) };
 }
+
+/**
+ * This month's usage, already totalled: fleet-wide and per user. `placement.ts`
+ * `readMonthUsage` computes it IN THE DATABASE (one row per user with usage this
+ * month), so an admission under its lock never transfers the whole month's ledger.
+ * `monthUsageFromRows` is the same arithmetic over rows: the reference the SQL is
+ * checked against, and what the test fake answers with.
+ */
+export interface MonthUsage {
+    global: UsageTotals;
+    byUser: ReadonlyMap<string, UsageTotals>;
+}
+
+const ZERO: UsageTotals = Object.freeze({ hours: 0, egressBytes: 0 });
+
+export function monthUsageFromRows(rows: readonly UsageRow[], now: Date): MonthUsage {
+    const byUser = new Map<string, UsageTotals>();
+    for (const row of rows) {
+        if (!rowOverlapsMonth(row, now)) continue;
+        const key = row.userId.toLowerCase();
+        const prev = byUser.get(key) ?? ZERO;
+        byUser.set(key, { hours: prev.hours + rowHoursInMonth(row, now), egressBytes: prev.egressBytes + (row.egressBytes ?? 0) });
+    }
+    return { global: totalsOf(byUser.values()), byUser };
+}
+
+/** Fleet-wide totals from per-user totals. */
+export function totalsOf(perUser: Iterable<UsageTotals>): UsageTotals {
+    let hours = 0;
+    let egressBytes = 0;
+    for (const t of perUser) {
+        hours += t.hours;
+        egressBytes += t.egressBytes;
+    }
+    return { hours, egressBytes };
+}
+
+/** One user's and the fleet's totals: what the caps compare against. */
+export function usageFor(usage: MonthUsage, userId: string): { user: UsageTotals; global: UsageTotals } {
+    return { user: usage.byUser.get(userId.toLowerCase()) ?? ZERO, global: usage.global };
+}

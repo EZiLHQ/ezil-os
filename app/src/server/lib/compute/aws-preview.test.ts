@@ -40,6 +40,7 @@ beforeEach(() => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(NOW);
     vi.stubEnv('EZIL_PREVIEW_TOKEN_V2', '0');
+    vi.stubEnv('EZIL_AWS_BROWSER_ZONE', 'preview.example');
     fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json(ready()));
     vi.stubGlobal('fetch', fetchMock);
 });
@@ -195,10 +196,8 @@ describe('AWS browser host (Codex P1: the Worker appends the -aws route token)',
     const host = (h: string) => `https://${h}/preview-bootstrap?token=opaque%2Etoken&path=%2F`;
     const answer = (guacamoleUrl: string) => Response.json({ ...ready(), guacamoleUrl });
 
-    it.each([
-        ['the worker zone root', `aws-8181-${sandboxId}-aws.preview.example`],
-        ['the worker host itself', `aws-8181-${sandboxId}-aws.worker.preview.example`],
-    ])('accepts the Worker host on %s', async (_name, h) => {
+    it('accepts the Worker host on the configured browser zone', async () => {
+        const h = `aws-8181-${sandboxId}-aws.preview.example`;
         fetchMock.mockResolvedValue(answer(host(h)));
         await expect(setup().open()).resolves.toMatchObject({ ok: true, guacamoleUrl: host(h) });
     });
@@ -210,11 +209,45 @@ describe('AWS browser host (Codex P1: the Worker appends the -aws route token)',
         ['another port in the desktop field', `aws-3002-${sandboxId}-aws.preview.example`],
         ['another sandbox', `aws-8181-guac-0000000000000000-0000000000000000-aws.preview.example`],
         ['a different route token', `aws-8181-${sandboxId}-awsx.preview.example`],
+        // Never derived from the Worker's host: its own host is not the configured zone.
+        ['the Worker host itself (not the configured zone)', `aws-8181-${sandboxId}-aws.worker.preview.example`],
     ])('refuses %s', async (_name, h) => {
         fetchMock.mockResolvedValue(answer(host(h)));
         await expect(setup().open()).resolves.toEqual(failure);
     });
+});
 
+describe('AWS browser zone comes from EZIL_AWS_BROWSER_ZONE, never the Worker host (Codex 4278276844)', () => {
+    const answerOn = (zone: string) => Response.json({
+        ...ready(),
+        guacamoleUrl: `https://aws-8181-${sandboxId}-aws.${zone}/preview-bootstrap?token=t&path=%2F`,
+        appPreviewUrl: `https://aws-3002-${sandboxId}-aws.${zone}/preview-bootstrap?token=t&path=%2F`,
+        codePreviewUrl: `https://aws-8443-${sandboxId}-aws.${zone}/preview-bootstrap?token=t&path=%2F`,
+    });
+
+    it.each([
+        // Staging: the Worker host has the zone below a hyphenated label.
+        ['staging', 'https://api-desktop-staging.ezil.work/', 'ezil.work'],
+        // Production.
+        ['production', 'https://api-desktop.ezil.org/', 'ezil.org'],
+        // A Worker host two labels below its zone: "host minus one label" would be wrong here.
+        ['a deeper Worker host', 'https://api.desktop-staging.ezil.work/', 'ezil.work'],
+    ])('%s: %s serves AWS hosts on %s', async (_name, workerUrl, zone) => {
+        vi.stubEnv('EZIL_AWS_BROWSER_ZONE', zone);
+        fetchMock.mockResolvedValue(answerOn(zone));
+        await expect(setup().open({ ...config, workerUrl })).resolves.toMatchObject({ ok: true });
+    });
+
+    it.each([['unset', ''], ['malformed', 'not a zone'], ['a bare label', 'example']])(
+        'fails closed (no Worker call) when the zone is %s', async (_name, value) => {
+            vi.stubEnv('EZIL_AWS_BROWSER_ZONE', value);
+            await expect(setup().open()).resolves.toEqual(failure);
+            expect(fetchMock).not.toHaveBeenCalled();
+        },
+    );
+});
+
+describe('AWS browser route token', () => {
     it('pins the route token to the Worker source', () => {
         const worker = readFileSync(path.resolve(__dirname, '../../../../../worker/src/aws-origin.ts'), 'utf8');
         expect(worker).toContain(`export const AWS_BROWSER_ROUTE_TOKEN = '${AWS_BROWSER_ROUTE_TOKEN}';`);

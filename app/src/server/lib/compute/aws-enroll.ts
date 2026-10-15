@@ -16,7 +16,7 @@
 import { createHash, createHmac, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
-import { isAwsComputersEnabled, type Env as AwsEnv } from './aws-config';
+import { isAwsComputersEnabled, readAwsBrowserZone, type Env as AwsEnv } from './aws-config';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
@@ -156,22 +156,8 @@ export function awsSandboxId(ownerUserId: string, computerId: string): string {
     return deriveGuacamoleSandboxId(ownerUserId.toLowerCase(), computerId.toLowerCase());
 }
 
-/**
- * The zone the Worker serves AWS browser hosts on (`aws-<port>-<sandboxId>-aws.<zone>`,
- * worker/src/aws-origin.ts), e.g. `ezil.org`. The host's edge trusts `x-forwarded-host`
- * only when it is one of those hosts, so enrollment hands the host this value and its
- * sandbox id. Explicit configuration, never derived from a request: unset or malformed
- * means enrollment is unavailable.
- */
-export const AWS_BROWSER_ZONE_ENV = 'EZIL_AWS_BROWSER_ZONE';
-const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-
-export function readAwsBrowserZone(env: AwsEnv): string | null {
-    const zone = env[AWS_BROWSER_ZONE_ENV]?.trim();
-    if (!zone || zone.length > 253) return null;
-    const labels = zone.split('.');
-    return labels.length >= 2 && labels.every((l) => DNS_LABEL.test(l)) && !/^\d+$/.test(labels.at(-1)!) ? zone : null;
-}
+// The browser zone reader lives in aws-config.ts (aws-preview.ts and the frame check use it too).
+export { AWS_BROWSER_ZONE_ENV, readAwsBrowserZone } from './aws-config';
 
 /**
  * GW-1 over HTTPS with the app's v2 envelope (provider aws-ec2, no store claim).

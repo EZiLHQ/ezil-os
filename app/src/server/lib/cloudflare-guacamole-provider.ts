@@ -33,6 +33,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
 import { cookieHeaderFor, getFollowingSameOriginCookies, storeSetCookies, type ProbeCookieJar } from './compute/aws-preview-cookies';
+import { readAwsBrowserZone } from './compute/aws-config';
 
 // ─── Correlation ──────────────────────────────────────────────────────────────
 
@@ -2338,14 +2339,21 @@ export async function probeDesktopDisplayLongPoll(
  * Both must hold. `8181-guac-a-b-nekodesktop.evil.com` fails (2);
  * `8181-guac-SOMEONE-ELSE-nekodesktop.ezil.org` fails (1).
  *
- * @param workerHost   hostname of `CLOUDFLARE_GUACAMOLE_WORKER_URL` — server config, never client input
- * @param sandboxId    `deriveGuacamoleSandboxId(userId, computerId)` for the AUTHENTICATED owner
- * @param candidateUrl the URL the browser says its iframe is showing
+ * An AWS browser host (`aws-<port>-<sandboxId>-aws.<zone>`, worker/src/aws-origin.ts)
+ * is also accepted on the configured AWS browser zone (`EZIL_AWS_BROWSER_ZONE`), the
+ * ONLY zone the AWS preview handoff accepts (compute/aws-preview.ts), so the handoff and
+ * this confirmation agree whatever shape the Worker's own host has. Matched exactly.
+ *
+ * @param workerHost     hostname of `CLOUDFLARE_GUACAMOLE_WORKER_URL` — server config, never client input
+ * @param sandboxId      `deriveGuacamoleSandboxId(userId, computerId)` for the AUTHENTICATED owner
+ * @param candidateUrl   the URL the browser says its iframe is showing
+ * @param awsBrowserZone the configured AWS browser zone — server config, never client input
  */
 export function isOwnDesktopOrigin(
     workerHost: string,
     sandboxId: string,
     candidateUrl: string,
+    awsBrowserZone: string | null = readAwsBrowserZone(process.env),
 ): boolean {
     if (!workerHost || !sandboxId) return false;
 
@@ -2366,6 +2374,12 @@ export function isOwnDesktopOrigin(
     // (1) this caller's own sandbox, as a whole hyphen-delimited run.
     if (!firstLabel.includes(`-${sandboxId.toLowerCase()}-`)) return false;
 
+    // (2a) an AWS browser host on the configured AWS browser zone.
+    if (awsBrowserZone && rest === awsBrowserZone.toLowerCase()
+        && new RegExp(`^aws-\\d{4,5}-${escapeRegExp(sandboxId.toLowerCase())}-aws$`).test(firstLabel)) {
+        return true;
+    }
+
     // (2) our own Worker's host, or its zone root after the one-label collapse.
     const wh = workerHost.toLowerCase().replace(/:\d+$/, '');
     const whDot = wh.indexOf('.');
@@ -2374,6 +2388,11 @@ export function isOwnDesktopOrigin(
     // is not, and a bare TLD is never reachable here because `zoneRoot` is
     // produced by removing exactly one label, never by matching a suffix.
     return rest === wh || (zoneRoot !== '' && rest === zoneRoot);
+}
+
+/** Escape a value for use inside a RegExp source. */
+function escapeRegExp(v: string): string {
+    return v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // ─── Taking control of your own computer ──────────────────────────────────────

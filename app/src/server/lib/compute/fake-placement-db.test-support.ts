@@ -27,6 +27,8 @@
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
+import { monthUsageFromRows } from './usage';
+
 const dialect = new PgDialect();
 
 export type Row = Record<string, unknown>;
@@ -202,11 +204,20 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 return { rows: [{ n }] };
             }
             case 'usage-month': {
-                const [now, monthStart] = (params as string[]).map((s) => new Date(s).getTime());
+                // The SQL totals per user in the database; answer with the same arithmetic
+                // (usage.ts `monthUsageFromRows`, the reference placement-usage-sql pins on real
+                // Postgres). Params: [now, monthStart, nextMonth].
+                const now = new Date(String(params[0]));
+                const rows = usage.map((u) => ({
+                    computerId: String(u.computer_id), userId: String(u.user_id),
+                    startedAt: u.started_at as Date, stoppedAt: (u.stopped_at as Date | null) ?? null,
+                    egressBytes: u.egress_bytes === null || u.egress_bytes === undefined ? null : Number(u.egress_bytes),
+                }));
+                const totals = monthUsageFromRows(rows, now);
                 return {
-                    rows: usage
-                        .filter((u) => (u.started_at as Date).getTime() < now! && (u.stopped_at === null || (u.stopped_at as Date).getTime() >= monthStart!))
-                        .map((u) => ({ ...u, egress_bytes: u.egress_bytes === null ? null : String(u.egress_bytes) })),
+                    rows: [...totals.byUser].map(([user_id, t]) => ({
+                        user_id, seconds: (t.hours * 3_600).toFixed(6), egress_bytes: String(t.egressBytes),
+                    })),
                 };
             }
             case 'usage-close':
