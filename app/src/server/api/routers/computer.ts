@@ -33,7 +33,9 @@ import { computers } from '@/server/db/schema';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { AWS_RETIREMENT_UNDERWAY } from '@/server/lib/compute/aws-ec2';
+import type { PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
+import { readSystemInfo } from '@/server/lib/compute/system-info';
 import { routeComputer } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
 import {
@@ -199,6 +201,27 @@ export const computerRouter = createTRPCRouter({
             }
 
             return computer;
+        }),
+
+    /**
+     * What Settings → System may say about the machine behind a computer: its
+     * recorded provider, the configured size of that machine, and its lifecycle
+     * state. READ ONLY — reads the placement, never creates or pins one (see
+     * `server/lib/compute/system-info.ts`). Ownership-scoped twice: the live row
+     * must be the caller's, and so must any recorded placement. Both misses are
+     * NOT_FOUND, never FORBIDDEN.
+     */
+    systemInfo: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            const owned = await ctx.db.query.computers.findFirst({
+                where: liveOwnedComputer(ctx.user.id, input.computerId),
+                columns: { id: true },
+            });
+            if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            const info = await readSystemInfo(ctx.db as unknown as PlacementExecutor, { computerId: input.computerId, userId: ctx.user.id });
+            if (!info) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            return info;
         }),
 
     /** Rename a computer. Ownership-scoped. */

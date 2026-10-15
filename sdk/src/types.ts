@@ -24,6 +24,31 @@ export interface Computer {
     metadata: unknown;
 }
 
+/**
+ * Result of `computers.systemInfo` — where a computer is RECORDED to run and the
+ * CONFIGURED size of that machine. A read: it never assigns a provider. Nothing
+ * here is a live measurement, and `usage` is always `null` until the server
+ * reports CPU/memory use. Mirrors `SystemInfo` in
+ * `app/src/server/lib/compute/system-info.ts`.
+ */
+export interface SystemInfo {
+    /** `unassigned`: no placement recorded yet. `unknown`: not readable, or placement reads are off. */
+    provider: 'cloudflare' | 'aws-ec2' | 'unassigned' | 'unknown';
+    providerSource: 'placement' | 'reads_off' | 'no_placement' | 'unavailable';
+    /** Only with `reads_off`: where routing is CONFIGURED to start computers. A setting, not an observation. */
+    configuredRouting?: 'cloudflare';
+    machine: {
+        vcpu: number | null;
+        memoryMiB: number | null;
+        instanceType: string | null;
+        region: string | null;
+        /** `configured`: the size of the recorded instance type or container class. Never measured. */
+        source: 'configured' | 'unknown';
+    };
+    lifecycleState: string | null;
+    usage: null;
+}
+
 /** Result of `desktop.status` — a cheap poll that never boots anything. */
 export interface DesktopStatus {
     ok: boolean;

@@ -27,6 +27,14 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 //   * the desktop's screen comes from `session.getScreen()` — an OBSERVATION
 //     of the live X display, not the last thing this side asked for. That
 //     distinction is the whole reason that route exists.
+//   * the machine comes from `session.getSystemInfo()`: the RECORDED placement
+//     provider and the CONFIGURED size of that machine (instance type or
+//     container class) — labelled as configured, never as a measurement. CPU
+//     and memory USE are not reported by any computer yet, and the tab says so.
+//     Wording lives in `./system-describe.js` so it is unit-tested.
+//   * the connection route (relayed through TURN or direct) comes from the
+//     selected candidate pair the streamed client measured — never from a
+//     provider-wide assumption.
 //   * the stream vitals come from `getStats()` inside the streamed client and
 //     arrive by `postMessage`. The shell CANNOT read them itself: the desktop
 //     is a cross-origin iframe, so its `RTCPeerConnection` and its `<video>`
@@ -45,6 +53,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 // 2-vCPU container whose budget the encoder already dominates.
 
 import session from '../../../session.js';
+import { describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './system-describe.js';
 
 const PHASE = 'ezil-os:settings/system';
 
@@ -60,6 +69,8 @@ let vitals = null;          // the last payload the streamed client published
 let vitalsAt = 0;           // when it arrived, so staleness can be shown
 let screenObserved = null;  // { width, height } from the live read
 let screenError = null;
+let systemInfo = null;      // `computer.systemInfo`: recorded provider + configured size
+let systemInfoReason = null; // why it is null, when it is
 let refreshTimer = null;
 let nativeProvider = { configured: false, pending: false, error: '' };
 let nativeTools = null;
@@ -147,11 +158,35 @@ async function refreshScreen () {
             screenError = null;
         } else {
             screenObserved = null;
-            screenError = (res && res.code) ? String(res.code).toLowerCase().replace(/_/g, ' ') : 'unavailable';
+            screenError = describeScreenError(res && res.code, res && res.message);
         }
     } catch ( err ) {
         screenObserved = null;
         screenError = 'unreachable';
+    }
+    paint();
+}
+
+/**
+ * Read where this computer runs and the configured size of that machine. A
+ * READ: the server never assigns a provider for this call.
+ */
+async function refreshSystemInfo () {
+    const computer = linkedComputer();
+    if ( isNative(tabCtx) ) return;
+    if ( ! computer || typeof session.getSystemInfo !== 'function' ) {
+        systemInfo = null;
+        systemInfoReason = 'UNSUPPORTED';
+        paint();
+        return;
+    }
+    try {
+        const res = await session.getSystemInfo(computer.id);
+        systemInfo = res && res.ok === true ? res.info : null;
+        systemInfoReason = res && res.ok === true ? null : (res && res.code) || 'UPSTREAM';
+    } catch ( err ) {
+        systemInfo = null;
+        systemInfoReason = 'UPSTREAM';
     }
     paint();
 }
@@ -177,7 +212,8 @@ function paint () {
     const computer = linkedComputer();
     const desktopOpen = !! desktopFrame();
     // Older than three publish intervals: the client has stopped talking.
-    const stale = vitals && (Date.now() - vitalsAt) > 6500;
+    const vitalsAge = vitals ? Date.now() - vitalsAt : Infinity;
+    const stale = vitals && vitalsAge > VITALS_STALE_MS;
     const v = (! vitals || stale) ? null : vitals;
 
     const num = (x, unit) => (typeof x === 'number' && Number.isFinite(x) ? `${x}${unit ?? ''}` : UNKNOWN);
@@ -216,13 +252,18 @@ function paint () {
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to, and how that connection is doing.
-           Everything here is measured; anything not known right now shows as ${UNKNOWN}.</p>
+           Each value says whether it is recorded, configured or measured; anything not known right now shows as ${UNKNOWN}.</p>
 
         <h4>Linked computer</h4>
         ${row('Name', computer ? esc(computer.name) : UNKNOWN)}
         ${row('Slot', computer && computer.slot != null ? esc(computer.slot) : UNKNOWN)}
         ${row('Identifier', computer ? `<code>${esc(String(computer.id).slice(0, 8))}…</code>` : UNKNOWN,
               'The sandbox this session is bound to.')}
+
+        <h4>Machine</h4>
+        ${(() => { const p = describeProvider(systemInfo, systemInfoReason); return row('Provider', esc(p.value), esc(p.hint)); })()}
+        ${(() => { const m = describeMachine(systemInfo); return row('Size', esc(m.value), esc(m.hint)); })()}
+        ${(() => { const u = describeUsage(); return row('CPU and memory use', esc(u.value), esc(u.hint)); })()}
 
         <h4>Desktop screen</h4>
         ${row('Resolution',
@@ -242,8 +283,8 @@ function paint () {
         ${row('Picture', (v.width && v.height) ? `${v.width} × ${v.height}` : UNKNOWN)}
         ${row('Frame rate', num(v.fps, ' fps'))}
         ${row('Bitrate', num(v.kbps, ' kbit/s'), 'Measured between two samples, so it is blank on the first.')}
-        ${row('Round trip', num(v.rttMs, ' ms'),
-              'Every session is relayed through TURN — Cloudflare Containers have no UDP — so this has a floor that no quality setting can move.')}
+        ${(() => { const t = describeTransport(v, vitalsAge, systemInfo ? systemInfo.provider : null); return row('Route', esc(t.value), esc(t.hint)); })()}
+        ${row('Round trip', num(v.rttMs, ' ms'), 'Measured on the selected connection route.')}
         ${row('Jitter', num(v.jitterMs, ' ms'))}
         ${row('Packets lost', num(v.packetsLost))}`)}
     `;
@@ -297,6 +338,7 @@ export default {
         startListening();
         requestVitals(true);
         void refreshScreen();
+        void refreshSystemInfo();
         paint();
         // The screen is re-read on a slow cadence rather than once: a
         // troubleshoot restart or a window resize changes it while this tab is

@@ -241,6 +241,9 @@ describe('toShellDesktopState — never implies an observation it does not have'
             // `previewUrl` — see `cloudflareGuacamole.codePreviewUrl`.
             codePreviewUrl: '/api/shell/code-preview-url',
             focus: '/api/shell/focus',
+            // Settings → System's machine section (recorded provider, configured
+            // size). Read only; the tab shows the machine as unknown without it.
+            system: '/api/shell/system',
             telemetry: '/api/shell/telemetry',
             restart: '/api/shell/restart',
             // Container-billing fix: the activity heartbeat's feature flag —

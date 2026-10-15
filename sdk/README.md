@@ -61,6 +61,7 @@ const { url } = await ezil.desktop.open(computer.id);
 | `computers.create({ name })` | Creates in the lowest free slot. Throws if the user already holds two. |
 | `computers.getOrCreateDefault()` | The default computer, made on first call. Idempotent. |
 | `computers.rename(id, name)` | |
+| `computers.systemInfo(id)` | Where the computer is recorded to run (`cloudflare`, `aws-ec2`, `unassigned` or `unknown`) and the configured size of that machine. Read only; never assigns a provider. `usage` is `null`: nothing is measured yet. |
 | `computers.delete(id)` | Soft-deletes and terminates the container. The row survives. |
 | `desktop.status(id)` | Cheap poll. Boots nothing. |
 | `desktop.open(id)` | Starts or attaches the desktop and mints its URL. **Cold boot ~22s.** |
