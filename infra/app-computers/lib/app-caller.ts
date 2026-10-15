@@ -56,21 +56,30 @@ export type AppCallerConfig = z.infer<typeof AppCallerConfigSchema>;
 
 /** The policy of the app caller, exported for exact-equality tests:
  * - start only the exact lifecycle VERSION(s), all in `region`;
- * - describe only the `computer-*` executions of those state machines;
+ * - describe only the `computer-*` executions of those state machines, and decrypt
+ *   their execution data with the lifecycle history key, via Step Functions only;
  * - read-only EC2 describes for enrollment's live check, in `region` only
  *   (DescribeInstances/Volumes/AvailabilityZones support no resource scoping). */
-export function appCallerStatements(region: string, versionArns: string[]): iam.PolicyStatement[] {
-    const executions: string[] = [];
+export function appCallerStatements(region: string, versionArns: string[], historyKeyArn: string): iam.PolicyStatement[] {
+    const executions: string[] = [], machines: string[] = [];
     for (const v of versionArns) {
         const m = /^arn:aws:states:([a-z0-9-]+):(\d{12}):stateMachine:([A-Za-z0-9_-]{1,80}):[1-9][0-9]*$/.exec(v);
         if (!m) throw new Error('invalid_version_arn');
         if (m[1] !== region) throw new Error('version_arn_region');
         const execution = `arn:aws:states:${m[1]}:${m[2]}:execution:${m[3]}:computer-*`;
         if (!executions.includes(execution)) executions.push(execution);
+        // The encryption context names the state machine; list the version too so either form matches.
+        for (const machine of [`arn:aws:states:${m[1]}:${m[2]}:stateMachine:${m[3]}`, v]) if (!machines.includes(machine)) machines.push(machine);
     }
     return [
         new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [...versionArns] }),
         new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: executions }),
+        // The lifecycle machine encrypts execution data with its customer-managed history key, and
+        // DescribeExecution then needs kms:Decrypt by the CALLER (Step Functions encryption-at-rest
+        // docs). Only that key, only through Step Functions, only for these machines.
+        new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [historyKeyArn],
+            conditions: { StringEquals: { 'kms:ViaService': `states.${region}.amazonaws.com`,
+                'kms:EncryptionContext:aws:states:stateMachineArn': machines } } }),
         new iam.PolicyStatement({ actions: ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeAvailabilityZones'], resources: ['*'],
             conditions: { StringEquals: { 'aws:RequestedRegion': region } } }),
     ];
@@ -82,7 +91,7 @@ export function appCallerTrust(p: z.infer<typeof ProviderSchema>): iam.PolicySta
 
 export class AppCaller extends Construct {
     readonly role: iam.Role;
-    constructor(scope: Construct, id: string, props: { config: AppCallerConfig; region: string; versionArns: string[] }) {
+    constructor(scope: Construct, id: string, props: { config: AppCallerConfig; region: string; versionArns: string[]; historyKeyArn: string }) {
         super(scope, id);
         const config = AppCallerConfigSchema.parse(props.config);
         if (!config.enabled) throw new Error('app caller is disabled');
@@ -91,7 +100,7 @@ export class AppCaller extends Construct {
             description: 'EZiL app: start exact lifecycle versions, read their computer executions, describe EC2',
             assumedBy: new iam.FederatedPrincipal(first!.providerArn, appCallerTrust(first!).conditions, 'sts:AssumeRoleWithWebIdentity') });
         for (const p of rest) this.role.assumeRolePolicy!.addStatements(appCallerTrust(p));
-        for (const s of appCallerStatements(props.region, props.versionArns)) this.role.addToPolicy(s);
+        for (const s of appCallerStatements(props.region, props.versionArns, props.historyKeyArn)) this.role.addToPolicy(s);
         new CfnOutput(this, 'RoleArn', { value: this.role.roleArn });
     }
 }

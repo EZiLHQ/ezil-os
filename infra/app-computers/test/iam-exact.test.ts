@@ -80,17 +80,22 @@ test('controller policy with userData delivery verified: allow userData only, de
 const GITHUB = { name: 'github' as const, providerArn: `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`,
     issuerHost: 'token.actions.githubusercontent.com', audience: 'sts.amazonaws.com', subject: 'repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>' };
 const VERSION = `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle:1`;
+const HISTORY_KEY = `arn:aws:kms:${R}:${A}:key/33333333-3333-4333-8333-333333333333`;
 const VERCEL = { name: 'vercel' as const, providerArn: `arn:aws:iam::${A}:oidc-provider/oidc.vercel.com/ezil-team`,
     issuerHost: 'oidc.vercel.com/ezil-team', audience: 'https://vercel.com/ezil-team', subject: 'owner:ezil-team:project:ezil-os:environment:production' };
 test('item 9: app caller can only start the exact lifecycle version, read its computer executions, and describe EC2 in region', () => {
-    assert.deepEqual(json(appCallerStatements(R, [VERSION])), [
+    assert.deepEqual(json(appCallerStatements(R, [VERSION], HISTORY_KEY)), [
         { Effect: 'Allow', Action: 'states:StartExecution', Resource: VERSION },
         { Effect: 'Allow', Action: 'states:DescribeExecution', Resource: `arn:aws:states:${R}:${A}:execution:ezil-pilot-lifecycle:computer-*` },
+        // DescribeExecution on a CMK-encrypted machine needs the caller's kms:Decrypt (Step Functions docs).
+        { Effect: 'Allow', Action: 'kms:Decrypt', Resource: HISTORY_KEY, Condition: { StringEquals: {
+            'kms:ViaService': `states.${R}.amazonaws.com`,
+            'kms:EncryptionContext:aws:states:stateMachineArn': [`arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle`, VERSION] } } },
         { Effect: 'Allow', Action: ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeAvailabilityZones'], Resource: '*',
             Condition: { StringEquals: { 'aws:RequestedRegion': R } } },
     ]);
-    assert.throws(() => appCallerStatements(R, [VERSION.replace(/:1$/, '')]), /invalid_version_arn/);
-    assert.throws(() => appCallerStatements(R, [VERSION.replace(R, 'us-east-1')]), /version_arn_region/);
+    assert.throws(() => appCallerStatements(R, [VERSION.replace(/:1$/, '')], HISTORY_KEY), /invalid_version_arn/);
+    assert.throws(() => appCallerStatements(R, [VERSION.replace(R, 'us-east-1')], HISTORY_KEY), /version_arn_region/);
     assert.equal(AppCallerConfigSchema.parse({}).enabled, false, 'disabled by default');
     for (const bad of [{ ...GITHUB, subject: 'repo:<org>/*' }, { ...GITHUB, issuerHost: 'oidc.vercel.com/team' }, { ...GITHUB, audience: 'https://vercel.com/x' }])
         assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [bad] }).success, false);
@@ -113,15 +118,32 @@ test('item 9: a Vercel caller trusts one exact team/project/environment, never d
     ];
     for (const [why, bad] of refused) assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [bad] }).success, false, why);
     const app = new App(), stack = new Stack(app, 'VercelCaller', { env: { account: A, region: R } });
-    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [VERCEL] }, region: R, versionArns: [VERSION] });
+    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [VERCEL] }, region: R, versionArns: [VERSION], historyKeyArn: HISTORY_KEY });
     const role = Object.values(assertions.Template.fromStack(stack).findResources('AWS::IAM::Role'))[0] as any;
     assert.deepEqual(role.Properties.AssumeRolePolicyDocument.Statement, [{ Effect: 'Allow', Action: 'sts:AssumeRoleWithWebIdentity',
         Principal: { Federated: VERCEL.providerArn }, Condition: { StringEquals: {
             'oidc.vercel.com/ezil-team:aud': 'https://vercel.com/ezil-team', 'oidc.vercel.com/ezil-team:sub': VERCEL.subject } } }]);
 });
+test('item 9: the synthesized app caller can decrypt receipts with the lifecycle history key, via Step Functions only', () => {
+    const f = lifecycleFixture(), app = new App(), stack = new Stack(app, 'CallerKey', { env: { account: A, region: R } });
+    const lifecycle = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: `arn:aws:kms:${R}:${A}:key/22222222-2222-4222-8222-222222222222` });
+    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R,
+        versionArns: [f.settings.deployment.stateMachineVersionArn], historyKeyArn: lifecycle.historyKey.keyArn });
+    const t = assertions.Template.fromStack(stack).toJSON().Resources as Record<string, any>;
+    const [roleId] = Object.entries(t).find(([id, r]) => r.Type === 'AWS::IAM::Role' && id.startsWith('AppCaller'))!;
+    const statements = Object.values(t).filter((r: any) => r.Type === 'AWS::IAM::Policy' && r.Properties.Roles.some((x: any) => x.Ref === roleId))
+        .flatMap((r: any) => r.Properties.PolicyDocument.Statement);
+    const decrypt = statements.filter((s: any) => [s.Action].flat().includes('kms:Decrypt'));
+    assert.equal(decrypt.length, 1);
+    const [keyId] = Object.entries(t).find(([id, r]) => r.Type === 'AWS::KMS::Key' && id.startsWith('LifecycleHistoryKey'))!;
+    assert.deepEqual(decrypt[0].Resource, { 'Fn::GetAtt': [keyId, 'Arn'] });
+    assert.equal(decrypt[0].Condition.StringEquals['kms:ViaService'], `states.${R}.amazonaws.com`);
+    const machine = f.settings.deployment.stateMachineVersionArn.replace(/:\d+$/, '');
+    assert.deepEqual(decrypt[0].Condition.StringEquals['kms:EncryptionContext:aws:states:stateMachineArn'], [machine, f.settings.deployment.stateMachineVersionArn]);
+});
 test('item 9: app caller trust is web identity on the exact audience and subject', () => {
     const app = new App(), stack = new Stack(app, 'Caller', { env: { account: A, region: R } });
-    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R, versionArns: [VERSION] });
+    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R, versionArns: [VERSION], historyKeyArn: HISTORY_KEY });
     const role = Object.values(assertions.Template.fromStack(stack).findResources('AWS::IAM::Role'))[0] as any;
     assert.deepEqual(role.Properties.AssumeRolePolicyDocument.Statement, [{ Effect: 'Allow', Action: 'sts:AssumeRoleWithWebIdentity',
         Principal: { Federated: GITHUB.providerArn }, Condition: { StringEquals: {
@@ -149,7 +171,8 @@ test('every role, key, queue and invoke policy in the synthesized stacks equals 
     const lifecycle = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: `arn:aws:kms:${R}:${A}:key/22222222-2222-4222-8222-222222222222` });
     new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: f.settings,
         recoveryVersionArn: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-recovery:1` }, sourceHistoryKey: lifecycle.historyKey });
-    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R, versionArns: [f.settings.deployment.stateMachineVersionArn] });
+    new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R, versionArns: [f.settings.deployment.stateMachineVersionArn],
+        historyKeyArn: lifecycle.historyKey.keyArn });
     // Lambda version logical IDs embed the code hash; normalize them so the
     // snapshot changes only when a policy changes, not when handler code does.
     const actual = JSON.parse(JSON.stringify(policies(stack)).replace(/CurrentVersion([A-F0-9]{8})[a-f0-9]{32}/g, 'CurrentVersion$1<code-hash>')), file = join(__dirname, '__snapshots__', 'iam-policies.json');

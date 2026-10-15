@@ -187,6 +187,7 @@ for (const killSwitch of [false, true]) for (const userDataNonce of [false, true
             new AppCaller(lifecycleStack, 'AppCaller', {
                 config: AppCallerConfigSchema.parse({ ...lifecycle.appCaller, enabled: true }),
                 region: settings.deployment.region, versionArns: [settings.deployment.stateMachineVersionArn],
+                historyKeyArn: controller.historyKey.keyArn,
             });
             const failures = [identityStack, foundationStack, opsStack, keysStack, lifecycleStack].flatMap(checkStack);
             assert.deepEqual(failures, [], 'IAM documents exceed their non-whitespace character quotas');

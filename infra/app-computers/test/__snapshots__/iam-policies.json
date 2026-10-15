@@ -14,6 +14,25 @@
           "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
         },
         {
+          "Action": "kms:Decrypt",
+          "Condition": {
+            "StringEquals": {
+              "kms:ViaService": "states.ap-south-1.amazonaws.com",
+              "kms:EncryptionContext:aws:states:stateMachineArn": [
+                "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle",
+                "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
+              ]
+            }
+          },
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleHistoryKey897F7B53",
+              "Arn"
+            ]
+          }
+        },
+        {
           "Action": [
             "ec2:DescribeInstances",
             "ec2:DescribeVolumes",
