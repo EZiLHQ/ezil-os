@@ -104,6 +104,9 @@ describe('reads on: a no-row computer is pinned to Cloudflare before its sandbox
     it('a no-row computer the canary claims is NOT pinned to Cloudflare (the canary is checked first)', async () => {
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
         vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '1');
+        // A full admission config: the canary routes to AWS only when admission would admit.
+        for (const [k, v] of Object.entries({ AWS_MAX_RUNNING: '2', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
+            EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200', AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2' })) vi.stubEnv(k, v);
         vi.stubEnv('EZIL_AWS_CANARY_USER_IDS', userId);
         vi.stubEnv('EZIL_AWS_CANARY_SINCE', '2026-10-01T00:00:00Z');
         const h = harness();

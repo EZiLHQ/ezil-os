@@ -24,7 +24,8 @@
  * `ComputeProvider`'s result types.
  */
 
-import { awsCanaryConfig, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
+import { precheckAdmission } from './admission';
+import { awsCanaryConfig, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
 import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
@@ -132,7 +133,11 @@ async function isAwsCanary(db: PlacementExecutor, computer: ComputerRef, env: En
     if (!isAwsComputersEnabled(env)) return false;
     const canary = awsCanaryConfig(env);
     const userId = computer.userId.toLowerCase();
-    if (!canary || !canary.userIds.has(userId)) return false;
+    if (!canary || !inAwsCanary(canary, userId)) return false;
     const row = await readCanaryComputer(db, computer.computerId);
-    return row !== null && !row.deleted && row.userId === userId && row.createdAt.getTime() >= canary.since.getTime();
+    if (row === null || row.deleted || row.userId !== userId || row.createdAt.getTime() < canary.since.getTime()) return false;
+    // Graceful fallback: AWS only when admission would admit it now (capacity, one AWS
+    // computer per user, monthly caps, kill switch). Otherwise it stays Cloudflare and is
+    // pinned there on its first sandbox start, so no one gets a computer that cannot start.
+    return (await precheckAdmission(db, { userId, computerId: computer.computerId, env })).admit;
 }

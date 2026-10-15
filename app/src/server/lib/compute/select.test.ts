@@ -4,7 +4,7 @@
  */
 
 import { PgDialect } from 'drizzle-orm/pg-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AwsProviderNotImplementedError, createAwsEc2StubProvider } from './aws-ec2';
 import { cloudflareComputeProvider } from './cloudflare';
@@ -16,6 +16,11 @@ const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
 const computer = { userId, computerId };
 const ON = { EZIL_AWS_COMPUTERS_ENABLED: '1' };
+const ADMIT = {
+    AWS_MAX_RUNNING: '2', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
+    EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
+    AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
+};
 
 describe('resolveComputeProvider', () => {
     it.each([{}, { EZIL_AWS_COMPUTERS_ENABLED: '0' }, { EZIL_AWS_COMPUTERS_ENABLED: 'true' }])('flag off (%j): Cloudflare with ZERO statements', async (env) => {
@@ -145,7 +150,8 @@ describe('resolveComputeProvider: AWS canary cohort (no placement row)', () => {
     const after = new Date('2026-10-14T12:00:00Z');
     const before = new Date('2026-10-13T23:59:59Z');
     const other = '33333333-3333-4333-8333-333333333333';
-    const CANARY = { ...ON, EZIL_AWS_CANARY_USER_IDS: ` ${other}, ${userId.toUpperCase()} `, EZIL_AWS_CANARY_SINCE: SINCE };
+    // A full admission config: the canary routes to AWS only when admission would admit (precheckAdmission).
+    const CANARY = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: ` ${other}, ${userId.toUpperCase()} `, EZIL_AWS_CANARY_SINCE: SINCE };
     const seeded = (c: Partial<{ user_id: string; deleted_at: Date | null; created_at: Date }> = {}) =>
         createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: after, ...c }] });
     const canaryReads = (statements: { sql: string }[]) => statements.filter((s) => s.sql.includes('placement:canary-computer'));
@@ -217,5 +223,77 @@ describe('resolveComputeProvider: AWS canary cohort (no placement row)', () => {
             new PgDialect().sqlToQuery(q).sql.includes('placement:canary-computer')
                 ? { rows: [{ user_id: userId, deleted: false, created_at: 'not a date' }] } : db.execute(q) };
         await expect(resolveComputeProvider(garbled, computer, CANARY)).rejects.toBeInstanceOf(PlacementIntegrityError);
+    });
+});
+
+describe('resolveComputeProvider: canary `*` (every user) with the admission fallback', () => {
+    const SINCE = '2026-10-14T00:00:00Z';
+    const after = new Date('2026-10-14T12:00:00Z');
+    const EVERYONE = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: '*', EZIL_AWS_CANARY_SINCE: SINCE };
+    const otherUser = '44444444-4444-4444-8444-444444444444';
+    const mine = { id: computerId, user_id: userId, created_at: after };
+    const aws = (id: string, owner: string, state = 'RUNNING') =>
+        placementRow({ computer_id: id, owner_user_id: owner, provider: 'aws-ec2', state, region: 'us-east-1' });
+    const canaryReads = (statements: { sql: string }[]) => statements.filter((s) => s.sql.includes('placement:canary-computer'));
+
+    it('routes a new no-row computer of ANY signed-in user to AWS while admission would admit', async () => {
+        const { db } = createFakePlacementDb({ computers: [mine] });
+        expect((await resolveComputeProvider(db, computer, EVERYONE)).kind).toBe('aws-ec2');
+    });
+
+    it('falls back to Cloudflare when running AWS computers are at the cap', async () => {
+        const { db } = createFakePlacementDb({
+            computers: [mine],
+            placements: [aws('55555555-5555-4555-8555-555555555555', otherUser), aws('66666666-6666-4666-8666-666666666666', otherUser)],
+        });
+        expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
+    });
+
+    it('falls back to Cloudflare when the user already has an AWS computer', async () => {
+        const { db } = createFakePlacementDb({ computers: [mine], placements: [aws('77777777-7777-4777-8777-777777777777', userId, 'STOPPED')] });
+        expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
+    });
+
+    it('falls back to Cloudflare when the user monthly hour cap is reached', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date('2026-10-20T00:00:00Z'));
+        try {
+            const { db } = createFakePlacementDb({
+                computers: [mine],
+                usage: [{ computer_id: '88888888-8888-4888-8888-888888888888', user_id: userId, instance_id: 'i-1', instance_type: 't3a.medium',
+                    started_at: new Date('2026-10-01T00:00:00Z'), stopped_at: new Date('2026-10-06T00:00:00Z'), egress_bytes: null, observed_by: 't', updated_at: new Date('2026-10-06T00:00:00Z') }],
+            });
+            expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider); // 120 h >= 100 h
+            const { db: under } = createFakePlacementDb({ computers: [mine] });
+            expect((await resolveComputeProvider(under, computer, EVERYONE)).kind).toBe('aws-ec2');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('falls back to Cloudflare when the kill switch is on, or the admission config is incomplete', async () => {
+        const { db } = createFakePlacementDb({ computers: [mine] });
+        expect(await resolveComputeProvider(db, computer, { ...EVERYONE, EZIL_AWS_KILL_SWITCH: '1' })).toBe(cloudflareComputeProvider);
+        expect(await resolveComputeProvider(db, computer, { ...EVERYONE, AWS_MAX_RUNNING: undefined })).toBe(cloudflareComputeProvider);
+    });
+
+    it.each(['*,' + userId, userId + ',*', ' * , * '])('`*` beside anything else (%j) is malformed: no cohort, no canary read', async (list) => {
+        const { db, statements } = createFakePlacementDb({ computers: [mine] });
+        expect(await resolveComputeProvider(db, computer, { ...EVERYONE, EZIL_AWS_CANARY_USER_IDS: list })).toBe(cloudflareComputeProvider);
+        expect(canaryReads(statements)).toEqual([]);
+    });
+
+    it('an existing row always wins over `*`: cloudflare stays Cloudflare, aws stays AWS', async () => {
+        const cf = createFakePlacementDb({ computers: [mine], placements: [placementRow({ computer_id: computerId, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' })] });
+        expect(await resolveComputeProvider(cf.db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
+        expect(canaryReads(cf.statements)).toEqual([]);
+        const full = [aws('55555555-5555-4555-8555-555555555555', otherUser), aws('66666666-6666-4666-8666-666666666666', otherUser)];
+        const own = createFakePlacementDb({ computers: [mine], placements: [...full, aws(computerId, userId, 'STOPPED')] });
+        expect((await resolveComputeProvider(own.db, computer, EVERYONE)).kind).toBe('aws-ec2');
+    });
+
+    it('a computer created before SINCE stays Cloudflare under `*`', async () => {
+        const { db } = createFakePlacementDb({ computers: [{ ...mine, created_at: new Date('2026-10-13T00:00:00Z') }] });
+        expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
     });
 });

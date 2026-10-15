@@ -16,11 +16,13 @@
  */
 
 import {
+    type PlacementExecutor,
     withAdmission,
     ENROLLMENT_FAILED,
     createAwsPlacement,
     leasePlacement,
     mintAdmissionTicket,
+    peekAdmissionCounters,
     readAdmissionCounters,
     readPlacement,
     type AdmissionCounters,
@@ -166,6 +168,25 @@ export type AdmissionOutcome =
 export interface AdmissionDeps {
     env?: Env;
     now?: () => Date;
+}
+
+/**
+ * Would admission admit a NEW aws-ec2 computer for this user right now? Read-only and
+ * unlocked (`peekAdmissionCounters`), the same rules as `runAdmission` for a create
+ * (config enabled, kill switch, ownership, running caps per region, one AWS computer
+ * per user, monthly caps). Used to keep a canary computer on Cloudflare instead of
+ * routing it to AWS only to be refused. Not a reservation: admission re-decides
+ * under its lock, and a lost race refuses as before (no row written).
+ */
+export async function precheckAdmission(
+    db: PlacementExecutor,
+    input: { userId: string; computerId: string; env?: Env; now?: Date },
+): Promise<AdmissionDecision> {
+    const config = readAwsAdmissionConfig(input.env ?? process.env);
+    if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
+    const now = input.now ?? new Date();
+    const counters = await peekAdmissionCounters(db, { userId: input.userId, computerId: input.computerId, monthStart: utcMonthStart(now), now });
+    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'create' } });
 }
 
 export async function runAdmission(db: PlacementDb, request: AdmissionRequest, deps: AdmissionDeps = {}): Promise<AdmissionOutcome> {
