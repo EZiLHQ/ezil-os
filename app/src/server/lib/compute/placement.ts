@@ -1165,8 +1165,9 @@ export async function readAdmissionCounters(
 // ── Retention reads ──────────────────────────────────────────────────────
 
 /**
- * Read-only input to the purge dry run (§6): every STOPPED or RETIRED
- * placement and when it last changed. For RETIRED, `updated_at` is the
+ * Read-only input to the purge dry run (§6): every STOPPED or RETIRED AWS
+ * placement and when it last changed. Only aws-ec2 rows retain a volume: a
+ * `cloudflare` row (a pinned Cloudflare computer, select.ts) is never a candidate. For RETIRED, `updated_at` is the
  * retirement stamp (C-2 has no `retired_at`); a later write only delays
  * eligibility, which is the safe direction.
  */
@@ -1174,7 +1175,7 @@ export async function readRetentionCandidates(db: PlacementExecutor): Promise<{ 
     const rows = rowsOf(
         await db.execute(sql`/* placement:retention */ SELECT computer_id::text AS computer_id, state, updated_at
             FROM public.ezil_computer_placements
-            WHERE state IN ('STOPPED', 'RETIRED')`),
+            WHERE provider = 'aws-ec2' AND state IN ('STOPPED', 'RETIRED')`),
     );
     return rows.map((r) => {
         const computerId = String(r.computer_id);

@@ -53,6 +53,12 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
    ones may hold an R2 workspace). Deleting an AWS computer starts its retire and
    completes in one delete; the sandbox-reap cron finishes the retirement in the
    background (docs/AWS-COMPUTERS.md, Retirement).
+   **Pinning.** With placement reads on, the first sandbox start of a computer with no
+   placement row (open, app/code preview, desktop restart) records a `cloudflare` row before
+   the sandbox starts, so a computer that has run on Cloudflare (its workspace is in R2) can
+   never later be reassigned to AWS by the canary. Reads and stops never pin. With reads OFF
+   nothing is pinned, so set `EZIL_AWS_CANARY_SINCE` to the moment the canary is enabled
+   (with reads on): computers created before it stay on Cloudflare.
 
 ## Usage ledger (`ezil_compute_usage`)
 

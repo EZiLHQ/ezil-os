@@ -62,6 +62,8 @@ export interface RouteOptions {
     entitlements?: EntitlementReader;
     /** Overrides `defaultAwsCollaborators(env)` (tests). */
     aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
+    /** The caller starts a sandbox: pin a no-row Cloudflare computer first (select.ts `ResolveOptions`). */
+    pinCloudflare?: boolean;
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */
@@ -76,13 +78,13 @@ export function awsDepsFor(env: Env, entitlements: EntitlementReader | undefined
 export async function routeComputer(
     db: unknown,
     computer: ComputerRef,
-    { env = process.env, entitlements, aws = defaultAwsCollaborators(env) }: RouteOptions = {},
+    { env = process.env, entitlements, aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
 ): Promise<RoutedComputer> {
     // Flag off: no database read at all — the pre-P3 call, unchanged.
     if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
     let provider: ComputeProvider;
     try {
-        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlements, aws));
+        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlements, aws), { pinCloudflare });
     } catch (err) {
         if (err instanceof PlacementOwnerError) {
             // NOT_FOUND, never FORBIDDEN — a foreign computer must look absent.

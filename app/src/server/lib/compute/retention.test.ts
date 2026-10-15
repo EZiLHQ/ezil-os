@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
+import { readRetentionCandidates } from './placement';
 import { listPurgeEligible, PURGE_AFTER_DAYS, purgeEligibility, type RetentionCandidate } from './retention';
 
 const NOW = new Date('2026-10-30T00:00:00Z');
@@ -72,3 +73,18 @@ describe('purge eligibility (§6, dry run)', () => {
         expect(rows).toEqual(before);
     });
 });
+
+describe('readRetentionCandidates: only AWS rows retain a volume', () => {
+    it('a pinned cloudflare row (STOPPED) is never a purge candidate; AWS STOPPED/RETIRED rows are', async () => {
+        const cf = '22222222-2222-4222-8222-222222222222';
+        const aws = '33333333-3333-4333-8333-333333333333';
+        const { db, statements } = createFakePlacementDb({ placements: [
+            placementRow({ computer_id: cf, provider: 'cloudflare', workspace_store: 'r2', state: 'STOPPED', updated_at: new Date('2026-01-01T00:00:00Z') }),
+            placementRow({ computer_id: aws, state: 'STOPPED', updated_at: new Date('2026-01-01T00:00:00Z') }),
+        ] });
+        const rows = await readRetentionCandidates(db);
+        expect(rows.map((r) => r.computerId)).toEqual([aws]);
+        expect(statements[0]!.sql).toMatch(/WHERE provider = 'aws-ec2' AND state IN \('STOPPED', 'RETIRED'\)/);
+    });
+});
+

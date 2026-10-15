@@ -287,8 +287,13 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 }
                 return { rows: hit.map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })) };
             }
-            case 'retention':
-                return { rows: placements.filter((r) => r.state === 'STOPPED' || r.state === 'RETIRED').map((r) => ({ computer_id: r.computer_id, state: r.state, updated_at: r.updated_at })) };
+            case 'retention': {
+                // The provider predicate is read from the SQL text, so dropping it changes the answer.
+                const awsOnly = /provider = 'aws-ec2'/.test(text);
+                return { rows: placements
+                    .filter((r) => (r.state === 'STOPPED' || r.state === 'RETIRED') && (!awsOnly || r.provider === 'aws-ec2'))
+                    .map((r) => ({ computer_id: r.computer_id, state: r.state, updated_at: r.updated_at })) };
+            }
             case 'insert': {
                 const m = text.match(/\(([^)]*)\)\s*VALUES\s*\(([\s\S]*)\)\s*RETURNING/);
                 if (!m) throw new Error('fake db: unparsed insert');
