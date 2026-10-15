@@ -4,5 +4,10 @@
   "region": "ap-south-1",
   "monthlyBudgetUsd": 100,
   "budgetEmails": [],
-  "egressBytesPer5Min": 3000000000
+  "egressBytesPer5Min": 3000000000,
+  "alertEmails": [
+    "ops@example.com"
+  ],
+  "quotaAlarmPercent": 80,
+  "capacityAlarmVcpus": 16
 }
