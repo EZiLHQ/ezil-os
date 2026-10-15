@@ -1,0 +1,13 @@
+[Unit]
+Description=EZiL: C-6 enrollment (identity document + signature + one-time nonce)
+Requires=ezil-overlay.service
+After=ezil-overlay.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+# Transient failures are retried INSIDE this activation (enroll.py: bounded by
+# enrollRetrySeconds, inside the nonce TTL), not with Restart=: a failed oneshot start would
+# fail the start jobs of every unit that Requires= it, and nothing would start them again.
+ExecStart=/opt/ezil-host/bin/ezil-host-agent enroll

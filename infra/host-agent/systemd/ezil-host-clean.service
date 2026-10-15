@@ -1,0 +1,10 @@
+[Unit]
+Description=EZiL: no-follow host-clean of legacy upper tmp/run and Chrome Singleton* (after the guard)
+Requires=ezil-guard.service
+After=ezil-guard.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent clean

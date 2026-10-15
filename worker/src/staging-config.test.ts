@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { appPortFor, codePortFor, portFor } from './desktop-mode';
+import { AWS_BROWSER_ROUTE_TOKEN } from './aws-origin';
 
 interface WorkerConfig {
   name: string;
@@ -20,8 +21,14 @@ describe('staging Worker resources and routes', () => {
   it('uses its own Worker, container application and local Sandbox namespace', () => {
     expect(staging.name).toBe('ezil-os-worker-staging');
     expect(staging.name).not.toBe(config.name);
-    expect(staging.durable_objects.bindings).toEqual([{ name: 'Sandbox', class_name: 'Sandbox' }]);
-    expect(staging.migrations).toEqual([{ tag: 'v1', new_sqlite_classes: ['Sandbox'] }]);
+    expect(staging.durable_objects.bindings).toEqual([
+      { name: 'Sandbox', class_name: 'Sandbox' },
+      { name: 'AWS_TUNNELS', class_name: 'AwsTunnelRegistry' },
+    ]);
+    expect(staging.migrations).toEqual([
+      { tag: 'v1', new_sqlite_classes: ['Sandbox'] },
+      { tag: 'v2', new_sqlite_classes: ['AwsTunnelRegistry'] },
+    ]);
     expect(staging.containers).toHaveLength(1);
     expect(staging.containers[0].name).toBe('ezil-os-worker-staging-sandbox');
     expect(staging.containers[0].class_name).toBe('Sandbox');
@@ -53,7 +60,7 @@ describe('staging Worker resources and routes', () => {
   it('covers the API and every preview token without claiming a zone catch-all', () => {
     const root = staging.vars.SANDBOX_PREVIEW_ZONE_ROOT;
     const tokens = [portFor('guacamole').token, portFor('neko').token,
-      appPortFor('neko')!.token, codePortFor('neko')!.token];
+      appPortFor('neko')!.token, codePortFor('neko')!.token, AWS_BROWSER_ROUTE_TOKEN];
     const expected = ['api-desktop-staging.ezil.work/*', ...tokens.map((token) => `*-${token}.${root}/*`)];
     expect(staging.routes.map((route) => route.pattern).sort()).toEqual(expected.sort());
     const productionZones = config.routes.map((route) => route.zone_name);

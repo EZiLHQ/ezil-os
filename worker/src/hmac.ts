@@ -336,3 +336,186 @@ export async function verifyPreviewToken(
   }
   return { ok: true };
 }
+
+// ── Preview token v2: a signed envelope that binds the request (C-5, R13) ────
+//
+// v1 signs the constant `${ts}.POST./sandbox/preview.`, so a v1 token binds no
+// sandbox, user, route or body: any fresh v1 token authorizes every route for
+// every sandbox. v2 signs
+//
+//   v2|ts|METHOD|path|sandboxId|computerId|userId|provider|store|generation|leaseEpoch|sha256hex(body)
+//
+// where METHOD, path (the URL pathname exactly as sent, no query) and the body
+// digest are recomputed by the VERIFIER from the request it actually received,
+// never read from the token. The token therefore carries only the claims.
+//
+// Wire format (header `x-ezil-auth`, never the body: the body is digested):
+//   v2.<base64url(JSON claims)>.<hex hmac_sha256>
+//
+// Field rules (shared with the app minter through
+// `contracts/preview-token-v2.vectors.json`):
+//   - ids (sandboxId, computerId, userId): 1..256 chars of [A-Za-z0-9._:@-], so
+//     the `|` separator can never appear inside a field;
+//   - provider: 'cloudflare' | 'aws-ec2'; anything else fails closed (R13);
+//   - store: 'r2' | 's3' | '' (empty = no store claim; the Worker then applies
+//     its own per-computer choice);
+//   - generation, leaseEpoch: non-negative safe integers, written in decimal;
+//     a Cloudflare computer sends 0 and 0;
+//   - ts: unix ms, same 5-minute window as v1.
+//
+// Query strings are NOT signed: a request authenticated by v2 must carry no
+// query at all (the Worker refuses one with `hmac_v2_query_not_allowed`).
+// Replay: there is no nonce (C-5 does not require one), so a captured token
+// can be replayed for the SAME method, path and body within the 5-minute TTL.
+//
+// Unlike v1, v2 has NO local-dev bypass: no secret configured => refused
+// (`hmac_secret_not_configured`), matching #166's fail-closed rule.
+
+export const PREVIEW_TOKEN_V2_HEADER = 'x-ezil-auth';
+export const PREVIEW_TOKEN_V2_PREFIX = 'v2.';
+export const PREVIEW_TOKEN_V2_PROVIDERS = ['cloudflare', 'aws-ec2'] as const;
+export const PREVIEW_TOKEN_V2_STORES = ['r2', 's3'] as const;
+export type PreviewTokenV2Provider = (typeof PREVIEW_TOKEN_V2_PROVIDERS)[number];
+export type PreviewTokenV2Store = (typeof PREVIEW_TOKEN_V2_STORES)[number];
+
+export interface PreviewTokenV2Claims {
+  ts: number;
+  sandboxId: string;
+  computerId: string;
+  userId: string;
+  provider: PreviewTokenV2Provider;
+  /** '' = no store claim. */
+  store: PreviewTokenV2Store | '';
+  generation: number;
+  leaseEpoch: number;
+}
+
+export interface PreviewTokenV2Request {
+  method: string;
+  /** URL pathname as received (no query string). */
+  path: string;
+  /** The exact request body bytes ('' / empty for a body-less request). */
+  body: Uint8Array | string;
+}
+
+const V2_ID = /^[A-Za-z0-9._:@-]{1,256}$/;
+const V2_PATH = /^\/[\x21-\x7e]{0,2047}$/;
+const V2_METHOD = /^[A-Z]{1,16}$/;
+
+export function isPreviewTokenV2(token: unknown): boolean {
+  return typeof token === 'string' && token.startsWith(PREVIEW_TOKEN_V2_PREFIX);
+}
+
+function validV2Claims(c: unknown): c is PreviewTokenV2Claims {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+  const o = c as Record<string, unknown>;
+  const keys = Object.keys(o).sort().join(',');
+  if (keys !== 'computerId,generation,leaseEpoch,provider,sandboxId,store,ts,userId') return false;
+  return Number.isSafeInteger(o.ts) && (o.ts as number) > 0
+    && typeof o.sandboxId === 'string' && V2_ID.test(o.sandboxId)
+    && typeof o.computerId === 'string' && V2_ID.test(o.computerId)
+    && typeof o.userId === 'string' && V2_ID.test(o.userId)
+    && (PREVIEW_TOKEN_V2_PROVIDERS as readonly unknown[]).includes(o.provider)
+    && (o.store === '' || (PREVIEW_TOKEN_V2_STORES as readonly unknown[]).includes(o.store))
+    && Number.isSafeInteger(o.generation) && (o.generation as number) >= 0
+    && Number.isSafeInteger(o.leaseEpoch) && (o.leaseEpoch as number) >= 0;
+}
+
+export async function sha256Hex(data: Uint8Array | string): Promise<string> {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes)));
+  return [...digest].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** The canonical v2 signed string. Throws on a field that could break the framing. */
+export function previewTokenV2Payload(c: PreviewTokenV2Claims, method: string, path: string, bodySha256: string): string {
+  if (!validV2Claims(c)) throw new Error('invalid v2 claims');
+  if (!V2_METHOD.test(method) || !V2_PATH.test(path) || path.includes('|') || !/^[0-9a-f]{64}$/.test(bodySha256)) {
+    throw new Error('invalid v2 request binding');
+  }
+  return ['v2', c.ts, method, path, c.sandboxId, c.computerId, c.userId, c.provider, c.store,
+    c.generation, c.leaseEpoch, bodySha256].join('|');
+}
+
+function base64UrlEncode(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(text: string): string | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  try {
+    const bin = atob(text.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (text.length % 4)) % 4));
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(Uint8Array.from(bin, (ch) => ch.charCodeAt(0)));
+  } catch {
+    return null;
+  }
+}
+
+/** Claims are serialized in this fixed key order so both minters emit identical tokens. */
+function encodeV2Claims(c: PreviewTokenV2Claims): string {
+  return base64UrlEncode(JSON.stringify({
+    ts: c.ts, sandboxId: c.sandboxId, computerId: c.computerId, userId: c.userId,
+    provider: c.provider, store: c.store, generation: c.generation, leaseEpoch: c.leaseEpoch,
+  }));
+}
+
+export async function mintPreviewTokenV2(
+  secret: string,
+  claims: PreviewTokenV2Claims,
+  req: PreviewTokenV2Request,
+): Promise<string> {
+  if (!secret || !secret.trim()) throw new Error('hmac_secret_not_configured');
+  const payload = previewTokenV2Payload(claims, req.method.toUpperCase(), req.path, await sha256Hex(req.body));
+  return `${PREVIEW_TOKEN_V2_PREFIX}${encodeV2Claims(claims)}.${await hmacSha256Hex(secret, payload)}`;
+}
+
+export async function verifyPreviewTokenV2(
+  token: string | null | undefined,
+  secret: string | string[] | undefined,
+  req: PreviewTokenV2Request,
+  now: number = Date.now(),
+): Promise<{ ok: true; claims: PreviewTokenV2Claims } | { ok: false; error: string }> {
+  const secrets = (Array.isArray(secret) ? secret : secret ? [secret] : []).filter((s) => s && s.trim());
+  // Fail closed: v2 never has a local-dev bypass.
+  if (secrets.length === 0) return { ok: false, error: 'hmac_secret_not_configured' };
+  if (!token) return { ok: false, error: 'hmac_v2_token_missing' };
+  const m = /^v2\.([A-Za-z0-9_-]{1,4096})\.([0-9a-f]{64})$/.exec(token);
+  if (!m) return { ok: false, error: 'hmac_v2_malformed_token' };
+  const decoded = base64UrlDecode(m[1]!);
+  let claims: unknown;
+  try { claims = decoded === null ? null : JSON.parse(decoded); } catch { claims = null; }
+  if (!validV2Claims(claims)) return { ok: false, error: 'hmac_v2_invalid_claims' };
+  if (Math.abs(now - claims.ts) > TOKEN_MAX_AGE_MS) return { ok: false, error: 'hmac_token_expired' };
+  let payload: string;
+  try {
+    payload = previewTokenV2Payload(claims, req.method.toUpperCase(), req.path, await sha256Hex(req.body));
+  } catch {
+    return { ok: false, error: 'hmac_v2_invalid_request' };
+  }
+  let matched = false;
+  for (const candidate of secrets) {
+    if (timingSafeEqualHex(await hmacSha256Hex(candidate, payload), m[2]!)) matched = true;
+  }
+  if (!matched) return { ok: false, error: 'hmac_signature_mismatch' };
+  return { ok: true, claims };
+}
+
+/**
+ * Whether a v1 (`t=…,v1=…`) preview token may still be accepted.
+ * `EZIL_PREVIEW_TOKEN_V1_UNTIL` is an ISO timestamp: absent/blank => v1 is
+ * accepted (today's behaviour); a parseable instant in the future => accepted;
+ * at/after it => refused. An unparseable value fails closed (refused).
+ * Applies to the preview/control envelope only, never to the
+ * `/preview-bootstrap` token or the `ezil_preview` cookie.
+ */
+export function previewTokenV1Accepted(until: string | undefined, now: number = Date.now()): boolean {
+  const raw = until?.trim();
+  if (!raw) return true;
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(raw)) return false;
+  const cutoff = Date.parse(raw);
+  if (!Number.isFinite(cutoff)) return false;
+  return now < cutoff;
+}

@@ -8,6 +8,6 @@ export async function POST(req: Request) {
         const headers = new Headers(req.headers); headers.set('x-trpc-source', 'shell-http');
         const ctx = await createTRPCContext({ headers }); if (!ctx.user) return shellUnauthenticated();
         let body: { computerId?: string }; try { body = await req.json(); } catch { return shellJson({ ok:false,error:'invalid_json_body' },400); }
-        return shellJson(await appRouter.createCaller(ctx).cloudflareGuacamole.terminate({ computerId:body?.computerId ?? '' }));
+        return shellJson(await appRouter.createCaller(ctx).cloudflareGuacamole.terminate({ computerId:body?.computerId ?? '', confirm:true }));
     } catch (error) { return shellErrorResponse(error, 'POST /api/shell/stop'); }
 }

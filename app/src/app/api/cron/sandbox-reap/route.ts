@@ -2,11 +2,16 @@ import { db } from '@/server/db';
 import { env } from '@/env';
 import {
     deriveGuacamoleSandboxId,
-    getGuacamoleSandboxStatus,
     newCorrelationId,
-    requestGuacamoleSandboxTerminate,
     resolveCloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { defaultAwsCollaborators } from '@/server/api/routers/compute-dispatch';
+import { isAwsComputersEnabled, isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { runAwsBackgroundReconcile } from '@/server/lib/compute/aws-receipts';
+import { createCloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
+import { noNonCloudflarePlacement, readPlacement, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { sql } from 'drizzle-orm';
+import type { ComputerRef } from '@/server/lib/compute/provider';
 import { handleSandboxReap } from './handler';
 
 /**
@@ -49,6 +54,32 @@ function guacamoleConfig() {
 }
 
 /**
+ * The reaper is a CLOUDFLARE-ONLY sweep: it addresses Cloudflare sandbox
+ * names and the `lastOpenedAt` staleness rule only means anything for a
+ * container the Worker idles. So it holds the Cloudflare adapter directly
+ * rather than `selectComputeProvider` (placement-aware dispatch makes its
+ * candidate SQL skip non-Cloudflare rows instead — plan row P3).
+ *
+ * The HMAC secret is read from `env`, exactly as this route did before the
+ * seam, not from `process.env` like the router.
+ */
+const provider = createCloudflareComputeProvider({
+    readHmacSecret: () => env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+});
+
+/**
+ * `handleSandboxReap` speaks in sandbox names (its tests pin that); the
+ * provider speaks in computers. Every name the handler uses was derived by
+ * `deriveSandboxName` in the same request, so the per-request map below is
+ * total; an unknown name is a programming error, not a Worker answer.
+ */
+function refFor(refs: Map<string, ComputerRef>, sandboxName: string): ComputerRef {
+    const ref = refs.get(sandboxName);
+    if (!ref) throw new Error('sandbox_name_not_derived_this_run');
+    return ref;
+}
+
+/**
  * `GET /sandbox/:name/status` — never wakes or touches the container (see
  * `worker/src/index.ts`'s `handleStatus` doc comment: it reads only Durable
  * Object storage / `ctx.container.running` via `getExposedPorts()`). A
@@ -57,12 +88,12 @@ function guacamoleConfig() {
  * treating "couldn't tell" as "not running" (which would skip a genuine
  * orphan) or "running" (which would attempt a terminate on bad information).
  */
-async function checkRunning(sandboxName: string): Promise<boolean> {
+async function checkRunning(computer: ComputerRef): Promise<boolean> {
     const config = guacamoleConfig();
     if (!config.isConfigured) {
         throw new Error('provider_not_configured');
     }
-    const result = await getGuacamoleSandboxStatus(config, sandboxName, newCorrelationId());
+    const result = await provider.status({ correlationId: newCorrelationId() }, computer);
     if (!result.ok) {
         throw new Error(result.error ?? 'status_check_failed');
     }
@@ -75,14 +106,13 @@ async function checkRunning(sandboxName: string): Promise<boolean> {
  * the user-initiated delete path. No new teardown mechanism.
  */
 async function terminate(
-    sandboxName: string,
+    computer: ComputerRef,
 ): Promise<{ ok: boolean; terminated: boolean; outcome?: string; error?: string }> {
     const config = guacamoleConfig();
     if (!config.isConfigured) {
         return { ok: false, terminated: false, error: 'provider_not_configured' };
     }
-    const hmacSecret = env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-    return requestGuacamoleSandboxTerminate(config, hmacSecret, sandboxName, newCorrelationId());
+    return provider.stop({ correlationId: newCorrelationId() }, computer, 'idle_reap');
 }
 
 /**
@@ -90,12 +120,31 @@ async function terminate(
  * (`vercel.json`), same as `telemetry-maintenance` / `telemetry-drain`.
  */
 export async function GET(req: Request): Promise<Response> {
+    const refs = new Map<string, ComputerRef>();
     return handleSandboxReap(req, {
         cronSecret: env.CRON_SECRET,
         db,
         killSwitch: process.env.SANDBOX_REAP_CRON,
-        deriveSandboxName: deriveGuacamoleSandboxId,
-        checkRunning,
-        terminate,
+        // P3: with placement reads on, only Cloudflare computers are reap candidates
+        // (an AWS host idle-stops itself). Reads go through placement.ts, the one
+        // module that names the placement table (C-2). Off: no read, as before.
+        ...(isPlacementReadEnabled(process.env)
+            ? {
+                providerOf: async (computerId: string) => (await readPlacement(db as unknown as PlacementExecutor, computerId)).provider,
+                // In SQL, before the LIMIT: AWS rows never fill the candidate window.
+                candidateFilter: noNonCloudflarePlacement(sql`ezil_computers.id`),
+            }
+            : {}),
+        // AWS on: drive deleted AWS computers to RETIRED and settle the fleet (its own job).
+        ...(isAwsComputersEnabled(process.env)
+            ? { awsReconcile: (signal: AbortSignal) => runAwsBackgroundReconcile(process.env, { db: db as unknown as PlacementDb, ...defaultAwsCollaborators(process.env), signal }) }
+            : {}),
+        deriveSandboxName: (userId, computerId) => {
+            const sandboxName = deriveGuacamoleSandboxId(userId, computerId);
+            refs.set(sandboxName, { userId, computerId });
+            return sandboxName;
+        },
+        checkRunning: (sandboxName) => checkRunning(refFor(refs, sandboxName)),
+        terminate: (sandboxName) => terminate(refFor(refs, sandboxName)),
     });
 }

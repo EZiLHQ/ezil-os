@@ -677,22 +677,34 @@ export function resolveWorkspaceStore(
     return MISCONFIGURED;
   }
 
+  const s3 = buildS3Store(env, options);
+  if (!s3) return MISCONFIGURED;
+
+  const r2 = env.SANDBOX_WORKSPACE_R2_BUCKET;
+  if (r2) {
+    return { ok: true, kind: 's3', store: new MigratingWorkspaceStore(s3, r2AsWorkspaceStore(r2), options?.log) };
+  }
+  return { ok: true, kind: 's3', store: s3 };
+}
+
+/** The pure S3 store from env credentials, or null when any required value is missing/invalid. */
+function buildS3Store(env: WorkspaceStoreEnv, options?: { fetchImpl?: FetchLike }): S3WorkspaceStore | null {
   const bucket = trimmed(env.EZIL_WORKSPACE_S3_BUCKET);
   const region = trimmed(env.EZIL_WORKSPACE_S3_REGION);
   const accessKeyId = trimmed(env.EZIL_WORKSPACE_S3_ACCESS_KEY_ID);
   const secretAccessKey = trimmed(env.EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY);
   if (!bucket || !region || !accessKeyId || !secretAccessKey) {
-    return MISCONFIGURED;
+    return null;
   }
 
   const sseRaw = trimmed(env.EZIL_WORKSPACE_S3_SSE);
   let sse: 'AES256' | 'aws:kms' | undefined;
   if (sseRaw !== undefined) {
-    if (sseRaw !== 'AES256' && sseRaw !== 'aws:kms') return MISCONFIGURED;
+    if (sseRaw !== 'AES256' && sseRaw !== 'aws:kms') return null;
     sse = sseRaw;
   }
 
-  const s3 = new S3WorkspaceStore({
+  return new S3WorkspaceStore({
     bucket,
     region,
     accessKeyId,
@@ -703,10 +715,30 @@ export function resolveWorkspaceStore(
     kmsKeyId: trimmed(env.EZIL_WORKSPACE_S3_KMS_KEY_ID),
     fetchImpl: options?.fetchImpl,
   });
+}
 
-  const r2 = env.SANDBOX_WORKSPACE_R2_BUCKET;
-  if (r2) {
-    return { ok: true, kind: 's3', store: new MigratingWorkspaceStore(s3, r2AsWorkspaceStore(r2), options?.log) };
-  }
-  return { ok: true, kind: 's3', store: s3 };
+// ── Sticky per-computer store (R13) ─────────────────────────────────────────
+
+export type WorkspaceStoreKind = 'r2' | 's3';
+
+export function isWorkspaceStoreKind(v: unknown): v is WorkspaceStoreKind {
+  return v === 'r2' || v === 's3';
+}
+
+/**
+ * The store for a computer whose choice is already PINNED (Durable Object
+ * storage). Env only supplies bindings and credentials here, never the
+ * choice. A pinned 's3' computer gets the PURE S3 store — never
+ * `MigratingWorkspaceStore`, which reads R2 when the S3 head is missing — so a
+ * computer whose head is in S3 can never be restored from R2. Missing S3
+ * credentials fail closed.
+ */
+export function resolvePinnedWorkspaceStore(
+  env: WorkspaceStoreEnv,
+  kind: WorkspaceStoreKind,
+  options?: { fetchImpl?: FetchLike },
+): WorkspaceStoreResolution {
+  if (kind === 'r2') return { ok: true, kind: 'r2', store: env.SANDBOX_WORKSPACE_R2_BUCKET };
+  const s3 = buildS3Store(env, options);
+  return s3 ? { ok: true, kind: 's3', store: s3 } : MISCONFIGURED;
 }

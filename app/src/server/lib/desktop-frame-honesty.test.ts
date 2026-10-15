@@ -201,6 +201,32 @@ describe('a desktop host that returns 500 cannot be reported ready', () => {
  * server-side request forgery primitive pointed at anything the app server can
  * reach — which, on a serverless host, includes the metadata endpoint.
  */
+describe('isOwnDesktopOrigin — AWS browser hosts on the configured zone (Codex 4278276844)', () => {
+    const SANDBOX = 'guac-abc123def456-789xyz012345';
+    // A Worker host whose "minus one label" is NOT the AWS zone: the configured zone decides.
+    const WORKER_HOST = 'api.desktop-staging.ezil.work';
+    const aws = (zone: string, label = `aws-8181-${SANDBOX}-aws`) => `https://${label}.${zone}/preview-bootstrap?token=t`;
+
+    it('accepts an AWS host on the configured zone, whatever shape the Worker host has', () => {
+        expect(isOwnDesktopOrigin(WORKER_HOST, SANDBOX, aws('ezil.work'), 'ezil.work')).toBe(true);
+    });
+
+    it.each([
+        ['another zone', aws('evil.example'), 'ezil.work'],
+        ['a zone lookalike', aws('ezil.work.evil.example'), 'ezil.work'],
+        ['another sandbox', aws('ezil.work', 'aws-8181-guac-000000000000-000000000000-aws'), 'ezil.work'],
+        ['a non-AWS label on the AWS zone', aws('ezil.work', `8181-${SANDBOX}-nekodesktop`), 'ezil.work'],
+        ['the suffixless AWS form', aws('ezil.work', `aws-8181-${SANDBOX}`), 'ezil.work'],
+        ['no configured zone', aws('ezil.work'), null],
+    ])('refuses %s', (_name, url, zone) => {
+        expect(isOwnDesktopOrigin(WORKER_HOST, SANDBOX, url, zone)).toBe(false);
+    });
+
+    it('a regex metacharacter in the sandbox id never widens the match', () => {
+        expect(isOwnDesktopOrigin(WORKER_HOST, 'guac-a.b-c', aws('ezil.work', 'aws-8181-guac-aXb-c-aws'), 'ezil.work')).toBe(false);
+    });
+});
+
 describe('isOwnDesktopOrigin — the confirm route only ever probes our own desktop', () => {
     const SANDBOX = 'guac-abc123def456-789xyz012345';
     const WORKER_HOST = 'os.ezil.org';

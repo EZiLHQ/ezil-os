@@ -1,0 +1,59 @@
+-- AWS persistent computers: placement and usage records (docs/AWS-COMPUTERS.md, C-2).
+--
+-- NOT A REGISTERED MIGRATION. The `.sql.txt` suffix is deliberate: the
+-- production migration engine's `validate` inventories every tracked or
+-- unignored `*.sql` file in the repository, and an unregistered one turns CI
+-- red. Registration needs catalog digests observed against the real database,
+-- which is founder-gated. See README.md in this directory for the steps.
+--
+-- Written strictly inside the hosted additive grammar
+-- (.github/scripts/production-migrations.mjs `additiveSQL`): plain typed
+-- columns, NULL / NOT NULL, non-unique indexes, REVOKE ALL, ENABLE RLS.
+-- No UNIQUE (R8): duplicate rows are detected by the placement module's
+-- duplicate check and fail closed on read.
+
+CREATE TABLE public.ezil_computer_placements (
+  computer_id uuid NOT NULL,
+  owner_user_id uuid NOT NULL,
+  provider text NOT NULL,
+  workspace_store text NULL,
+  generation bigint NOT NULL,
+  lease_epoch bigint NOT NULL,
+  state text NOT NULL,
+  region text NULL,
+  zone_id text NULL,
+  instance_id text NULL,
+  instance_type text NULL,
+  volume_id text NULL,
+  fs_uuid uuid NULL,
+  tunnel_id text NULL,
+  enroll_nonce_hash text NULL,
+  enroll_expires_at timestamptz NULL,
+  enroll_consumed_hash text NULL,
+  lease_until timestamptz NULL,
+  presence_at timestamptz NULL,
+  fence_token uuid NULL,
+  lifecycle_job_id uuid NULL,
+  lifecycle_digest text NULL,
+  last_error text NULL,
+  updated_at timestamptz NOT NULL,
+  reconciled_at timestamptz NULL
+);
+CREATE INDEX ezil_computer_placements_computer_idx ON public.ezil_computer_placements (computer_id);
+REVOKE ALL ON TABLE public.ezil_computer_placements FROM public, anon, authenticated;
+ALTER TABLE public.ezil_computer_placements ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE public.ezil_compute_usage (
+  computer_id uuid NOT NULL,
+  user_id uuid NOT NULL,
+  instance_id text NOT NULL,
+  instance_type text NOT NULL,
+  started_at timestamptz NOT NULL,
+  stopped_at timestamptz NULL,
+  egress_bytes bigint NULL,
+  observed_by text NOT NULL,
+  updated_at timestamptz NOT NULL
+);
+CREATE INDEX ezil_compute_usage_computer_idx ON public.ezil_compute_usage (computer_id);
+REVOKE ALL ON TABLE public.ezil_compute_usage FROM public, anon, authenticated;
+ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;

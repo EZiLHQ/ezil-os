@@ -253,7 +253,13 @@ The automatic grammar intentionally supports only:
 - `CREATE TABLE owned_schema.name (...)` with named columns and allowlisted
   built-in types, optionally `NULL` or `NOT NULL`.
 - `ALTER TABLE owned_schema.name ADD COLUMN ...` using the same column grammar.
-- Plain, nonunique `CREATE INDEX name ON owned_schema.table (column, ...)`.
+- Plain, nonunique `CREATE INDEX name ON owned_schema.table (column, ...)`, with
+  no `WHERE` clause (a partial index must be UNIQUE).
+- `CREATE UNIQUE INDEX name ON owned_schema.table (column, ...)`, optionally
+  followed by `WHERE` and one or more terms joined by `AND`, each one of
+  `column IS NULL`, `column IS NOT NULL`, `column = 'string'`,
+  `column = <non-negative integer>`, `column = true` or `column = false`
+  (see "Unique and partial unique indexes" below).
 - `ALTER FUNCTION owned_schema.name (args) SET search_path = path`, also allowing
   `TO` instead of `=`. The path is a nonempty, comma-separated list of identifiers
   from the owned schemas plus `pg_catalog`, `pg_temp`, and `extensions`, without
@@ -288,6 +294,104 @@ Additional syntax requires a reviewed engine extension, not an override flag.
 Migration SQL runs inside a DO block with escaped string literals, preventing
 transaction escapes even if source text contains quotation delimiters. There
 are no updates to application feature flags.
+
+### Unique and partial unique indexes (F9)
+
+Added for single-writer guarantees (AWS persistent computers R8, Stage B pool
+slots). Anything outside the exact forms listed above is refused, including
+`CONCURRENTLY`, `IF NOT EXISTS`, `USING`, `INCLUDE`, `NULLS NOT DISTINCT`,
+`WITH (...)`, `TABLESPACE`, operator classes, `ASC`/`DESC`/`NULLS`, `COLLATE`,
+expressions and function calls in the column list or predicate, `OR`, `NOT`
+(other than `IS NOT NULL`), parentheses, subqueries, casts, parameters, other
+operators, negative or fractional numbers, `E'...'` strings, column-to-column
+comparisons, qualified columns, and a predicate name equal to the indexed
+table's own name. PostgreSQL reads `WHERE x IS NULL` on table `x` as a
+whole-row test, not a column test; the transaction test shows PostgreSQL
+accepts it as a row-valued predicate.
+
+- **Unquoted keywords.** An unquoted PostgreSQL reserved or type/function-name
+  keyword is refused as an index name, index column or predicate column, in
+  both index forms. Unquoted, `CONCURRENTLY` becomes an option, `NULL`/`TRUE`
+  a constant and `CURRENT_USER`/`LOCALTIMESTAMP` a function call. Quote the
+  identifier to use such a name.
+- **Line endings and whitespace.** The tokenizer lexes like PostgreSQL.
+  Whitespace is `[ \t\n\r\f\v]` only, and any other Unicode space (NBSP,
+  U+2028, BOM, ...) is refused, because PostgreSQL treats it as part of an
+  identifier. `--` comments end at CR or LF. A lone CR is refused everywhere,
+  because PostgreSQL ends a comment at it and could otherwise run hidden
+  `DROP`/`OR` text. CRLF is accepted. This tokenizer fix applies to the whole
+  grammar, not only to indexes, and also ships separately ahead of F9 on
+  `fix/migration-tokenizer-cr-nbsp`.
+- **Predicate columns.** The engine has no knowledge of table columns at
+  validate time. PostgreSQL resolves every predicate column against the indexed
+  table when the migration executes, so an unknown column fails the whole
+  apply transaction (tested). Existing duplicate rows also fail `CREATE UNIQUE
+  INDEX` at apply and roll everything back; check for them before proposing one.
+- **Catalog digest.** No fingerprint change is needed. The index row already
+  hashes `pg_get_indexdef`, which renders `UNIQUE` and the `WHERE` predicate,
+  and unique constraints have their own rows. The
+  transaction test shows that non-unique to unique, full to partial, a changed
+  predicate and a dropped index each change the digest.
+- **Test vectors.** `e2e/fixtures/migration-grammar-unique.json` holds every
+  accept/reject case with the refusal message each must produce. The OS test
+  iterates that file offline and executes every accepted case in PostgreSQL.
+
+#### Porting to the Gateway and Works copies
+
+The engine is not byte-identical across repositories (sha256 of
+`.github/scripts/production-migrations.mjs`):
+
+| Repository | Ref | Engine | Test | sha256 | Same as OS? |
+|---|---|---|---|---|---|
+| EZiL OS | `e652970` | `.github/scripts/production-migrations.mjs` | `e2e/production-migrations.test.mjs` | `798a69d3…debc7a` | — |
+| EZiL AI Gateway | `origin/main` `752fa4fe05` | `.github/scripts/production-migrations.mjs` (protocol v1.2) | `test/production-migrations.test.mjs` | `1c4f3cf6…7f9bad` | no |
+| EZiL Works | `origin/main` `ce74e03c22` | `.github/scripts/production-migrations.mjs` | `tools/production-migrations.test.mjs` | `107a744a…91f894` | no |
+
+All three share the same `CREATE INDEX` production and the same `index` catalog
+row. The port is re-anchored per repository:
+
+- `migration-grammar-f9/works-engine.patch` contains:
+  - the keyword set
+  - the index helpers
+  - the UNIQUE branch
+  - the table-name return from `qualified`
+  - the CR/Unicode-whitespace tokenizer guards, which Works lacks today
+- `migration-grammar-f9/gateway-engine.patch` contains the same grammar hunks
+  without the tokenizer part, because Gateway v1.2 already has `noLoneCR` and
+  the ASCII-whitespace check. In Gateway the helpers live in
+  `parseMigrationSQL` and use `p.i`, and `qualified()` returns
+  `[schema, name]`.
+
+Each patch applies with `git apply` to its repository's `origin/main` engine.
+Port steps in each repository:
+
+1. Apply the engine patch.
+2. In the grammar test, delete `'CREATE UNIQUE INDEX x ON app.x(id);'` from the
+   reject list.
+3. Copy the vector file and add the OS offline vector loop
+   (`F9 unique-index vectors …`).
+4. Re-run that repository's own suite.
+
+Measured on 2026-10-13 against scratch copies, offline. "PGlite" here is
+PostgreSQL 18.3 (PGlite 0.5.5). The Docker `postgres:16-alpine` mode was
+run by the independent reviewer on the first F9 commit (43/43), not on
+these copies.
+
+- **Works:** 41/41 before and after.
+- **Gateway:** 62 tests, 55 pass, 0 fail, 7 skipped, before and after.
+- **Vectors:** all 88 pass on both ported engines. The unported Works
+  engine fails 12 of the CR/Unicode-whitespace vectors. Unported Gateway
+  already passes them.
+- **Journaled migrations:** the ported grammar newly refuses none of them.
+  Gateway: 4 re-parsed. Works: the manifest's 6 entries are all
+  `hosted-rollout`, which `additiveSQL` never parses.
+
+Works has a second SQL gate. `packages/db/tools/hosted-rollout.ts` plans
+hosted rollouts and already recognises `CREATE [UNIQUE] INDEX` on its own
+terms. F9 does not change it.
+
+This is a founder-reviewed cross-repo change. Neither repository has been
+edited.
 
 ## Validation
 

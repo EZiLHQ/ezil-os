@@ -1,0 +1,11 @@
+[Unit]
+Description=EZiL: overlay rootfs (nodev), network namespace and OCI spec
+Requires=ezil-host-clean.service
+After=ezil-host-clean.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent overlay
+ExecStop=/opt/ezil-host/bin/ezil-host-agent overlay-down

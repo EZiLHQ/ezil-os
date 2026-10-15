@@ -28,7 +28,7 @@
  * separated from its route: keeping `@/env` (throws on a missing DB URL) and
  * a live Postgres connection out of the import graph a unit test exercises.
  */
-import { sql } from 'drizzle-orm';
+import { sql, type SQL } from 'drizzle-orm';
 
 export type SandboxReapKillSwitchFlag = string | undefined;
 
@@ -111,18 +111,31 @@ interface RawStaleComputerRow {
  * `terminateComputerSandbox()` (`@/server/api/routers/computer.ts`) as part
  * of the delete flow, so a deleted-and-still-running sandbox is a different
  * failure (that call not being confirmed) than the one this backstop targets.
+ *
+ * 🔴 `staleBefore` goes in as an ISO string cast to timestamptz, never a raw `Date`:
+ * drizzle's postgres-js driver installs pass-through timestamp serializers, so a
+ * `Date` in a raw `sql` template throws ("Received an instance of Date") on every
+ * run. Found on real Postgres 16; placement.ts binds timestamps the same way.
  */
 export async function findStaleComputers(
     db: SandboxReapDb,
     staleBefore: Date,
     limit: number,
+    /**
+     * P3, placement reads on: a predicate over `ezil_computers.id` that keeps only
+     * Cloudflare computers (placement.ts `noNonCloudflarePlacement`). Applied BEFORE
+     * the LIMIT, so AWS rows — skipped by this sweep — can never fill the window and
+     * starve the Cloudflare rows behind them.
+     */
+    candidateFilter?: SQL,
 ): Promise<StaleComputerRow[]> {
     const result = await db.execute(sql`
         SELECT id, user_id, last_opened_at
         FROM ezil_computers
         WHERE deleted_at IS NULL
           AND last_opened_at IS NOT NULL
-          AND last_opened_at < ${staleBefore}
+          AND last_opened_at < ${staleBefore.toISOString()}::timestamptz
+          ${candidateFilter ? sql`AND ${candidateFilter}` : sql``}
         ORDER BY last_opened_at ASC
         LIMIT ${limit}
     `);
@@ -138,7 +151,9 @@ export type SandboxReapOutcome =
     | 'not_running'
     | 'check_failed'
     | 'terminate_failed'
-    | 'skipped_cap';
+    | 'skipped_cap'
+    /** P3: the computer's placement is not Cloudflare (an AWS host idle-stops itself). Never checked, never terminated. */
+    | 'skipped_not_cloudflare';
 
 export interface SandboxReapResultRow {
     computerId: string;
@@ -155,6 +170,8 @@ export interface SandboxReapResponseBody {
     reaped?: number;
     results?: SandboxReapResultRow[];
     error?: string;
+    /** The AWS background reconcile's summary, when it ran. */
+    aws?: unknown;
 }
 
 export interface SandboxReapDeps {
@@ -166,6 +183,27 @@ export interface SandboxReapDeps {
     staleAfterMs?: number;
     maxCandidates?: number;
     maxReapPerRun?: number;
+    /**
+     * P3, set only when placement reads are on: the provider a computer lives on.
+     * Anything but `cloudflare` is skipped BEFORE the status check, so an AWS
+     * computer is never addressed by this Cloudflare-only sweep. A throw (missing
+     * table, duplicate or unknown placement) is `check_failed`: never terminated.
+     * Unset = every candidate is Cloudflare, exactly as before P3.
+     */
+    providerOf?(computerId: string): Promise<string>;
+    /** P3, set with `providerOf`: the SQL that keeps non-Cloudflare computers out of the candidate window. */
+    candidateFilter?: SQL;
+    /**
+     * The AWS background reconcile (aws-receipts.ts `runAwsBackgroundReconcile`): drives
+     * deleted AWS computers to RETIRED and settles the live fleet. Its own job: it runs
+     * after the bearer check whatever the reap kill switch says (that switch governs
+     * Cloudflare reaping only), and a failure is reported in `aws`, never blocking the reap.
+     * It runs CONCURRENTLY with the reap, under `awsBudgetMs`: past it the signal is aborted
+     * and the summary is `aws_reconcile_timeout`.
+     */
+    awsReconcile?(signal: AbortSignal): Promise<unknown>;
+    /** The AWS pass's hard budget; defaults to `AWS_RECONCILE_BUDGET_MS`. */
+    awsBudgetMs?: number;
     /** Derive the sandbox name for a (userId, computerId) pair — MUST match
      * `deriveGuacamoleSandboxId`/`deriveSandboxId`. Injected rather than
      * imported directly so tests never need a real HMAC/Worker config. */
@@ -200,9 +238,47 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
     const authHeader = req.headers.get('authorization');
     if (authHeader !== `Bearer ${deps.cronSecret}`) return NOT_FOUND();
 
+    // Two independent jobs, run CONCURRENTLY: the AWS pass under its own hard budget, so a
+    // slow or failing AWS can never delay or disable the Cloudflare billing backstop below.
+    const awsPass = deps.awsReconcile ? runAwsPassWithBudget(deps.awsReconcile, deps.awsBudgetMs ?? AWS_RECONCILE_BUDGET_MS) : Promise.resolve(undefined);
+    const [reap, aws] = await Promise.all([reapCloudflare(deps), awsPass]);
+    const body: SandboxReapResponseBody = { ...reap.body, ...(aws !== undefined ? { aws } : {}) };
+    return Response.json(body, { status: reap.status });
+}
+
+/** The AWS pass's share of the route's `maxDuration` (90 s); the Cloudflare reaper runs alongside it. */
+export const AWS_RECONCILE_BUDGET_MS = 60_000;
+
+/**
+ * Run the AWS background reconcile with a hard deadline: past `budgetMs` its signal is
+ * aborted (the pass stops before its next placement) and the summary is
+ * `aws_reconcile_timeout`, whatever it was doing. A throw is `aws_reconcile_failed`.
+ */
+async function runAwsPassWithBudget(run: (signal: AbortSignal) => Promise<unknown>, budgetMs: number): Promise<unknown> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<unknown>((resolve) => {
+        timer = setTimeout(() => {
+            controller.abort();
+            console.error('[sandbox-reap] aws reconcile out of budget', { budgetMs });
+            resolve({ ok: false, error: 'aws_reconcile_timeout' });
+        }, budgetMs);
+    });
+    const pass = run(controller.signal).catch((err: unknown) => {
+        console.error('[sandbox-reap] aws reconcile failed', { m: String((err as Error)?.message ?? err) });
+        return { ok: false, error: 'aws_reconcile_failed' };
+    });
+    try {
+        return await Promise.race([pass, deadline]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** The Cloudflare reap (everything below the bearer check except the AWS pass). */
+async function reapCloudflare(deps: SandboxReapDeps): Promise<{ status: number; body: SandboxReapResponseBody }> {
     if (reapCronDisabled(deps.killSwitch)) {
-        const body: SandboxReapResponseBody = { ok: true, skipped: true, reason: 'kill_switch_disabled' };
-        return Response.json(body);
+        return { status: 200, body: { ok: true, skipped: true, reason: 'kill_switch_disabled' } };
     }
 
     const now = (deps.now ?? (() => new Date()))();
@@ -212,7 +288,7 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
     const staleBefore = new Date(now.getTime() - staleAfterMs);
 
     try {
-        const candidates = await findStaleComputers(deps.db, staleBefore, maxCandidates);
+        const candidates = await findStaleComputers(deps.db, staleBefore, maxCandidates, deps.candidateFilter);
         const results: SandboxReapResultRow[] = [];
         let reaped = 0;
 
@@ -222,6 +298,25 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
             if (reaped >= maxReapPerRun) {
                 results.push({ computerId: candidate.id, sandboxName, outcome: 'skipped_cap' });
                 continue;
+            }
+
+            if (deps.providerOf) {
+                let provider: string;
+                try {
+                    provider = await deps.providerOf(candidate.id);
+                } catch (err) {
+                    results.push({
+                        computerId: candidate.id,
+                        sandboxName,
+                        outcome: 'check_failed',
+                        error: err instanceof Error ? err.message : String(err),
+                    });
+                    continue;
+                }
+                if (provider !== 'cloudflare') {
+                    results.push({ computerId: candidate.id, sandboxName, outcome: 'skipped_not_cloudflare' });
+                    continue;
+                }
             }
 
             let running: boolean;
@@ -260,16 +355,9 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
             }
         }
 
-        const body: SandboxReapResponseBody = {
-            ok: true,
-            candidates: candidates.length,
-            reaped,
-            results,
-        };
-        return Response.json(body);
+        return { status: 200, body: { ok: true, candidates: candidates.length, reaped, results } };
     } catch (err) {
         console.error('[sandbox-reap] cron run failed', { m: String((err as Error)?.message ?? err) });
-        const body: SandboxReapResponseBody = { ok: false, error: 'internal_error' };
-        return Response.json(body, { status: 500 });
+        return { status: 500, body: { ok: false, error: 'internal_error' } };
     }
 }

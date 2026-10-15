@@ -299,6 +299,14 @@ export interface TerminateReport {
   wasRunning: boolean;
   runningAfter: boolean;
   error?: string;
+  /**
+   * The computer stopped, but the user's changes outside /workspace made in
+   * this session were NOT saved (the last committed system layer stays
+   * authoritative). Persistence-health signal: busy | failed | stale | not_restored.
+   */
+  systemChangesNotSaved?: string;
+  /** On a bounded refusal (system checkpoint busy/failed): when to retry. */
+  retryAfterSeconds?: number;
 }
 
 /**

@@ -1,0 +1,26 @@
+[Unit]
+Description=EZiL: desktop container (runc, hardened spec)
+# Last in the chain: in relay mode its step waits (bounded) for the Worker's relay config,
+# which arrives through the agent, edge and tunnel. Nothing Requires= this unit, so the
+# agent's restart of it (a config that arrived after an ice_missing start) never cascades;
+# it is ordered after, not bound to, the agent, so an agent restart never restarts it.
+Requires=ezil-overlay.service
+After=ezil-overlay.service ezil-agent.service ezil-edge.service ezil-cloudflared.service
+# A desktop that exits (a crash) is restarted, at most 5 starts per 10 minutes; past that the
+# unit fails and the next open's `ice` push makes the agent reset and restart it (bounded too).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+[Service]
+Type=simple
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent desktop
+ExecStartPost=/opt/ezil-host/bin/ezil-host-agent canary-desktop-started
+ExecStop=/opt/ezil-host/bin/ezil-host-agent desktop-stop
+TimeoutStopSec=90
+KillMode=mixed
+Restart=always
+RestartSec=5
+# Exit 2 = a refusal (guard stamp gone, or runDir/stopping: the agent is stopping this host):
+# never loop on it, so a stop's flush is never undone by a restart.
+RestartPreventExitStatus=2

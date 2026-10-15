@@ -31,6 +31,10 @@
 
 import { createHmac, randomUUID } from 'node:crypto';
 
+import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
+import { cookieHeaderFor, getFollowingSameOriginCookies, storeSetCookies, type ProbeCookieJar } from './compute/aws-preview-cookies';
+import { readAwsBrowserZone } from './compute/aws-config';
+
 // ─── Correlation ──────────────────────────────────────────────────────────────
 
 /**
@@ -167,6 +171,41 @@ export function mintSandboxPreviewToken(hmacSecret: string): string {
     const payload = `${timestamp}.POST./sandbox/preview.`;
     const sig = createHmac('sha256', hmacSecret).update(payload).digest('hex');
     return `t=${timestamp},v1=${sig}`;
+}
+
+/**
+ * The `x-ezil-auth` header for a v2-signed Worker call (C-5): signs the exact
+ * `body` string sent, the method and the URL's pathname. Throws without a
+ * secret (v2 has no unsigned local-dev mode); callers check first.
+ */
+function v2AuthHeader(
+    hmacSecret: string,
+    auth: Extract<WorkerAuth, { kind: 'v2' }>,
+    method: string,
+    url: string,
+    body: string,
+): Record<string, string> {
+    const target = new URL(url);
+    // The Worker refuses any query under v2 (it is not signed): never send one.
+    if (target.search !== '') throw new Error('v2 requests carry no query string');
+    const token = mintPreviewTokenV2(hmacSecret, { ...auth.claims, ts: Date.now() }, {
+        method,
+        path: target.pathname,
+        body,
+    });
+    return { [PREVIEW_TOKEN_V2_HEADER]: token };
+}
+
+const V2_SECRET_MISSING = 'hmac_secret_not_configured';
+
+/**
+ * Auth headers for a sandbox control call: the v2 envelope for `auth.kind === 'v2'` (an AWS
+ * computer, compute/aws-control-auth.ts), else the legacy v1 bearer, unchanged.
+ */
+function controlAuthHeaders(hmacSecret: string, auth: WorkerAuth, method: string, endpoint: string, body: string): Record<string, string> {
+    return auth.kind === 'v2'
+        ? v2AuthHeader(hmacSecret, auth, method, endpoint, body)
+        : { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}` };
 }
 
 // ─── Worker call helpers ──────────────────────────────────────────────────────
@@ -507,6 +546,7 @@ export async function requestGuacamolePreview(
     hmacSecret: string,
     input: Omit<GuacamolePreviewRequest, 'token'>,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamolePreviewResult> {
     if (!config.isConfigured) {
         // Deterministic by definition: no amount of retrying supplies a
@@ -518,14 +558,22 @@ export async function requestGuacamolePreview(
         );
     }
 
-    const token = mintSandboxPreviewToken(hmacSecret);
-    const body: GuacamolePreviewRequest = { ...input, token };
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return previewError(V2_SECRET_MISSING, 'preconditions_unmet');
+    const previewUrl = `${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`;
+    // v1 carries its token in the body; v2 signs the body and travels in a header.
+    const bodyText = auth.kind === 'v2'
+        ? JSON.stringify(input)
+        : JSON.stringify({ ...input, token: mintSandboxPreviewToken(hmacSecret) } satisfies GuacamolePreviewRequest);
 
     try {
-        const workerCall = fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`, {
+        const workerCall = fetch(previewUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
-            body: JSON.stringify(body),
+            headers: {
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+                ...(auth.kind === 'v2' ? v2AuthHeader(hmacSecret, auth, 'POST', previewUrl, bodyText) : {}),
+            },
+            body: bodyText,
             // Generous timeout to allow the container's cold start.
             signal: AbortSignal.timeout(SANDBOX_COLD_START_TIMEOUT_MS),
         });
@@ -676,18 +724,22 @@ export async function requestGuacamoleSandboxTerminate(
     hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleTerminateResult> {
     if (!config.isConfigured) {
         // No provider configured -> no sandbox to tear down. Not a failure.
         return { ok: true, terminated: false };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, terminated: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
+    const terminateUrl = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`;
 
     try {
-        const res = await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`, {
+        const res = await fetch(terminateUrl, {
             method: 'DELETE',
-            headers: { Authorization: `Bearer ${token}`, [CORRELATION_HEADER]: correlationId },
+            headers: auth.kind === 'v2'
+                ? { ...v2AuthHeader(hmacSecret, auth, 'DELETE', terminateUrl, ''), [CORRELATION_HEADER]: correlationId }
+                : { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`, [CORRELATION_HEADER]: correlationId },
             signal: AbortSignal.timeout(SANDBOX_STOP_TIMEOUT_MS),
         });
 
@@ -816,23 +868,25 @@ export async function requestGuacamoleFocusApp(
     sandboxName: string,
     app: FocusableApp,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleFocusResult> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/focus`;
+    const focusBody = JSON.stringify({ app });
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${token}`,
+                ...controlAuthHeaders(hmacSecret, auth, 'POST', endpoint, focusBody),
                 'Content-Type': 'application/json',
                 [CORRELATION_HEADER]: correlationId,
             },
-            body: JSON.stringify({ app }),
+            body: focusBody,
             // Generous against the measured 150-400ms round trip, and well
             // under any route budget: this must not sit on a slow path.
             signal: AbortSignal.timeout(15_000),
@@ -925,23 +979,31 @@ export async function requestGuacamoleActivity(
     sandboxName: string,
     lastInputAgoMs: number,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleActivityResult> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/activity`;
+    const activityBody = JSON.stringify({ lastInputAgoMs });
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                [CORRELATION_HEADER]: correlationId,
-            },
-            body: JSON.stringify({ lastInputAgoMs }),
+            headers: auth.kind === 'v2'
+                ? {
+                    ...v2AuthHeader(hmacSecret, auth, 'POST', endpoint, activityBody),
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                }
+                : {
+                    Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`,
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                },
+            body: activityBody,
             // A Durable Object storage write, not a container call — generous
             // against any transient edge latency, well under any route budget.
             signal: AbortSignal.timeout(10_000),
@@ -1045,22 +1107,29 @@ export async function requestGuacamoleDesktopRestart(
     hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleRestartResult> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/restart`;
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                [CORRELATION_HEADER]: correlationId,
-            },
+            headers: auth.kind === 'v2'
+                ? {
+                    ...v2AuthHeader(hmacSecret, auth, 'POST', endpoint, '{}'),
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                }
+                : {
+                    Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`,
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                },
             // No `desktopMode`: an omitted mode is what makes the Worker
             // AUTO-DETECT whatever is actually running (`handleRestart`'s
             // `explicitMode` stays undefined), which is the honest thing to do
@@ -1604,12 +1673,13 @@ export async function probeDesktopFrame(
     }
 
     try {
-        const res = await fetch(target, {
-            method: 'GET',
+        // A redirect that lands somewhere healthy is healthy; follow it rather
+        // than treating a 302 as a status to judge. Followed by hand so a
+        // cookie the bootstrap sets reaches the SAME origin's next hop, as it
+        // does in the browser: an AWS bootstrap's follow-up is 401 without it
+        // (compute/aws-preview-cookies.ts). Never sent to another origin.
+        const { response: res } = await getFollowingSameOriginCookies(target, {
             headers: { Accept: 'text/html,*/*' },
-            // A redirect that lands somewhere healthy is healthy; follow it
-            // (the default) rather than treating a 302 as a status to judge.
-            redirect: 'follow',
             cache: 'no-store',
             signal: AbortSignal.timeout(timeoutMs),
         });
@@ -1906,15 +1976,17 @@ interface CachedAdminToken {
     /** The credential it was minted with. A rotated password must not reuse it. */
     password: string;
     expiresAt: number;
+    /** The origin's own preview cookie, when it requires one (AWS); the logout needs it too. */
+    cookie?: string;
 }
 
 const nekoAdminTokens = new Map<string, CachedAdminToken>();
 
 /** Best-effort `POST /api/logout`. Never awaited, never throws. */
-function releaseNekoAdminToken(origin: string, token: string): void {
+function releaseNekoAdminToken(origin: string, token: string, cookie?: string): void {
     void fetch(`${origin}/api/logout`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${token}`, ...(cookie ? { Cookie: cookie } : {}) },
         signal: AbortSignal.timeout(3_000),
     }).catch(() => undefined);
 }
@@ -1923,10 +1995,10 @@ function releaseNekoAdminToken(origin: string, token: string): void {
  * Hand a freshly minted admin token to the cache. Any token it replaces is
  * logged out, so the room never accumulates sessions.
  */
-export function cacheNekoAdminToken(origin: string, password: string, token: string): void {
+export function cacheNekoAdminToken(origin: string, password: string, token: string, cookie?: string): void {
     const previous = nekoAdminTokens.get(origin);
-    if (previous && previous.token !== token) releaseNekoAdminToken(origin, previous.token);
-    nekoAdminTokens.set(origin, { token, password, expiresAt: Date.now() + NEKO_ADMIN_TOKEN_TTL_MS });
+    if (previous && previous.token !== token) releaseNekoAdminToken(origin, previous.token, cookie ?? previous.cookie);
+    nekoAdminTokens.set(origin, { token, password, expiresAt: Date.now() + NEKO_ADMIN_TOKEN_TTL_MS, ...(cookie ? { cookie } : {}) });
 }
 
 /** The cached token for this origin, if one was minted with this password and is not stale. */
@@ -1935,7 +2007,7 @@ export function cachedNekoAdminToken(origin: string, password: string): string |
     if (!hit) return null;
     if (hit.password !== password || hit.expiresAt <= Date.now()) {
         nekoAdminTokens.delete(origin);
-        releaseNekoAdminToken(origin, hit.token);
+        releaseNekoAdminToken(origin, hit.token, hit.cookie);
         return null;
     }
     return hit.token;
@@ -2009,23 +2081,46 @@ export async function probeDesktopDisplay(
     timeoutMs: number = DESKTOP_DISPLAY_PROBE_TIMEOUT_MS,
 ): Promise<DesktopDisplayProbe> {
     let origin: string;
+    let bootstrap: URL | null = null;
     try {
         const u = new URL(desktopUrl);
         if (u.protocol !== 'https:' && u.protocol !== 'http:') {
             return { display: 'unknown', reason: 'bad_url' };
         }
         origin = u.origin;
+        if (u.pathname === PREVIEW_BOOTSTRAP_PATH && u.searchParams.get('token')) bootstrap = u;
     } catch {
         return { display: 'unknown', reason: 'bad_url' };
     }
 
     const deadline = AbortSignal.timeout(timeoutMs);
 
+    // A bootstrap URL (AWS) gates its whole origin behind the cookie the
+    // bootstrap sets: take it first, exactly as the browser's iframe did, and
+    // send it to that origin only (compute/aws-preview-cookies.ts).
+    let cookie: string | undefined;
+    if (bootstrap) {
+        try {
+            const jar: ProbeCookieJar = new Map();
+            const res = await fetch(`${bootstrap.origin}${bootstrap.pathname}${bootstrap.search}`, {
+                method: 'GET', headers: { Accept: 'text/html,*/*' }, redirect: 'manual', cache: 'no-store', signal: deadline,
+            });
+            storeSetCookies(jar, bootstrap, res.headers);
+            await res.body?.cancel().catch(() => undefined);
+            cookie = cookieHeaderFor(jar, bootstrap);
+            if (!cookie) return { display: 'unknown', reason: 'login_failed', status: res.status };
+        } catch {
+            return { display: 'unknown', reason: 'unreachable' };
+        }
+    }
+    const withCookie = (headers: Record<string, string>) => (cookie ? { ...headers, Cookie: cookie } : headers);
+
     /** Mint a fresh admin session and remember it. `null` = the login failed. */
     const login = async (): Promise<{ token: string } | { status?: number }> => {
         const loginRes = await fetch(`${origin}/api/login`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: withCookie({ 'Content-Type': 'application/json' }),
             // A distinct username from `enableImplicitHosting`'s so the two
             // server-side sessions are told apart in Neko's own logs. Both
             // authenticate by password; Neko does not key on the name. (A probe
@@ -2038,7 +2133,7 @@ export async function probeDesktopDisplay(
         if (!loginRes.ok) return { status: loginRes.status };
         const body = (await loginRes.json()) as { token?: unknown };
         if (typeof body.token !== 'string' || body.token.length === 0) return {};
-        cacheNekoAdminToken(origin, adminPassword, body.token);
+        cacheNekoAdminToken(origin, adminPassword, body.token, cookie);
         return { token: body.token };
     };
 
@@ -2059,7 +2154,8 @@ export async function probeDesktopDisplay(
         }
 
         let listRes = await fetch(`${origin}/api/sessions`, {
-            headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
+            headers: withCookie({ Authorization: `Bearer ${token}`, Accept: 'application/json' }),
             cache: 'no-store',
             signal: deadline,
         });
@@ -2076,7 +2172,8 @@ export async function probeDesktopDisplay(
             }
             token = fresh.token;
             listRes = await fetch(`${origin}/api/sessions`, {
-                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
+                headers: withCookie({ Authorization: `Bearer ${token}`, Accept: 'application/json' }),
                 cache: 'no-store',
                 signal: deadline,
             });
@@ -2242,14 +2339,21 @@ export async function probeDesktopDisplayLongPoll(
  * Both must hold. `8181-guac-a-b-nekodesktop.evil.com` fails (2);
  * `8181-guac-SOMEONE-ELSE-nekodesktop.ezil.org` fails (1).
  *
- * @param workerHost   hostname of `CLOUDFLARE_GUACAMOLE_WORKER_URL` — server config, never client input
- * @param sandboxId    `deriveGuacamoleSandboxId(userId, computerId)` for the AUTHENTICATED owner
- * @param candidateUrl the URL the browser says its iframe is showing
+ * An AWS browser host (`aws-<port>-<sandboxId>-aws.<zone>`, worker/src/aws-origin.ts)
+ * is also accepted on the configured AWS browser zone (`EZIL_AWS_BROWSER_ZONE`), the
+ * ONLY zone the AWS preview handoff accepts (compute/aws-preview.ts), so the handoff and
+ * this confirmation agree whatever shape the Worker's own host has. Matched exactly.
+ *
+ * @param workerHost     hostname of `CLOUDFLARE_GUACAMOLE_WORKER_URL` — server config, never client input
+ * @param sandboxId      `deriveGuacamoleSandboxId(userId, computerId)` for the AUTHENTICATED owner
+ * @param candidateUrl   the URL the browser says its iframe is showing
+ * @param awsBrowserZone the configured AWS browser zone — server config, never client input
  */
 export function isOwnDesktopOrigin(
     workerHost: string,
     sandboxId: string,
     candidateUrl: string,
+    awsBrowserZone: string | null = readAwsBrowserZone(process.env),
 ): boolean {
     if (!workerHost || !sandboxId) return false;
 
@@ -2270,6 +2374,12 @@ export function isOwnDesktopOrigin(
     // (1) this caller's own sandbox, as a whole hyphen-delimited run.
     if (!firstLabel.includes(`-${sandboxId.toLowerCase()}-`)) return false;
 
+    // (2a) an AWS browser host on the configured AWS browser zone.
+    if (awsBrowserZone && rest === awsBrowserZone.toLowerCase()
+        && new RegExp(`^aws-\\d{4,5}-${escapeRegExp(sandboxId.toLowerCase())}-aws$`).test(firstLabel)) {
+        return true;
+    }
+
     // (2) our own Worker's host, or its zone root after the one-label collapse.
     const wh = workerHost.toLowerCase().replace(/:\d+$/, '');
     const whDot = wh.indexOf('.');
@@ -2278,6 +2388,11 @@ export function isOwnDesktopOrigin(
     // is not, and a bare TLD is never reachable here because `zoneRoot` is
     // produced by removing exactly one label, never by matching a suffix.
     return rest === wh || (zoneRoot !== '' && rest === zoneRoot);
+}
+
+/** Escape a value for use inside a RegExp source. */
+function escapeRegExp(v: string): string {
+    return v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // ─── Taking control of your own computer ──────────────────────────────────────
@@ -2357,6 +2472,7 @@ export async function enableImplicitHosting(
 
     try {
         const loginRes = await fetch(`${origin}/api/login`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username: 'ezil-os-control', password: adminPassword }),
@@ -2746,19 +2862,20 @@ export async function readGuacamoleScreen(
     hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleScreenResult> {
     if (!config.isConfigured) {
         return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, code: 'UPSTREAM', message: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
 
     try {
         const res = await fetch(endpoint, {
             method: 'GET',
             headers: {
-                Authorization: `Bearer ${token}`,
+                ...controlAuthHeaders(hmacSecret, auth, 'GET', endpoint, ''),
                 Accept: 'application/json',
                 [CORRELATION_HEADER]: correlationId,
             },
@@ -2813,6 +2930,7 @@ export async function requestGuacamoleScreen(
     width: number,
     height: number,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleScreenResult> {
     if (!config.isConfigured) {
         return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
@@ -2829,19 +2947,20 @@ export async function requestGuacamoleScreen(
     if (!fitted || fitted.width !== width || fitted.height !== height) {
         return { ok: false, code: 'BAD_REQUEST', message: 'not_an_applicable_screen' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, code: 'UPSTREAM', message: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
+    const screenBody = JSON.stringify({ width, height });
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${token}`,
+                ...controlAuthHeaders(hmacSecret, auth, 'POST', endpoint, screenBody),
                 'Content-Type': 'application/json',
                 [CORRELATION_HEADER]: correlationId,
             },
-            body: JSON.stringify({ width, height }),
+            body: screenBody,
             // A mode set is a capture-pipeline restart inside the container.
             // Its real cost is UNMEASURED (no container run was available);
             // 20s is above the 15s the sibling control routes use and still
@@ -2962,6 +3081,7 @@ export async function readDesktopScreen(
 
     const login = async (): Promise<string | null> => {
         const res = await fetch(`${origin}/api/login`, {
+            redirect: 'manual', // never follow: a desktop server must not bounce this server-side call elsewhere (SSRF)
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username: 'ezil-os-screen', password: adminPassword }),
@@ -3055,13 +3175,16 @@ export function classifyScreenFailure(status: number, workerError: string): Scre
 export type RelayRefreshResult = { ok: true; runtimeId: string; expiresAt: number } | { ok: false; error: string };
 /** Uses the same signed Worker boundary as all computer controls. */
 export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hmacSecret: string,
-    sandboxName: string, correlationId: string, runtimeId?: string): Promise<RelayRefreshResult> {
+    sandboxName: string, correlationId: string, runtimeId?: string, auth: WorkerAuth = { kind: 'v1' }): Promise<RelayRefreshResult> {
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/relay-refresh`;
+    const method = runtimeId ? 'POST' : 'GET';
+    const relayBody = runtimeId ? JSON.stringify({ runtimeId }) : '';
     try {
         const response = await fetch(endpoint, {
-            method: runtimeId ? 'POST' : 'GET',
-            headers: { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`, 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
-            ...(runtimeId ? { body: JSON.stringify({ runtimeId }) } : {}),
+            method,
+            headers: { ...controlAuthHeaders(hmacSecret, auth, method, endpoint, relayBody), 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
+            ...(runtimeId ? { body: relayBody } : {}),
             signal: AbortSignal.timeout(30_000), cache: 'no-store',
         });
         const data = await response.json() as Partial<{ ok: boolean; runtimeId: string; expiresAt: number; error: string }>;

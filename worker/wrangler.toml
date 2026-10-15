@@ -76,10 +76,20 @@ rollout_active_grace_period = 300
 class_name = "Sandbox"
 name = "Sandbox"
 
+# AWS computers (GATEWAY-CONTRACT-v1 GW-1): one tunnel registry per sandbox. Inert while
+# AWS_ROUTING_ENABLED is unset (the default): every AWS route then answers 404.
+[[durable_objects.bindings]]
+class_name = "AwsTunnelRegistry"
+name = "AWS_TUNNELS"
+
 # ── Migration registering the Sandbox DO (SQLite storage) ─────────────────────
 [[migrations]]
 new_sqlite_classes = ["Sandbox"]
 tag = "v1"
+
+[[migrations]]
+new_sqlite_classes = ["AwsTunnelRegistry"]
+tag = "v2"
 
 # ── R2 bucket binding (credential-less workspace mount path) ─────────────────
 # Backs the persistent sandbox workspace. When this binding is present,
@@ -245,9 +255,26 @@ zone_name = "ezil.org"
 pattern = "*-code.ezil.org/*"
 zone_name = "ezil.org"
 
+# AWS computers' browser hosts: `aws-<port>-<sandboxId>-aws.ezil.org` (worker/src/aws-origin.ts).
+# Same narrow-suffix rule as above; the existing proxied `*.ezil.org` wildcard record covers
+# DNS. Inert until AWS_ROUTING_ENABLED: every AWS route answers 404 before then. The AWS
+# ORIGIN hosts (`c-<sandboxId>-g<n>-e<n>.ezil.org`) need no route: the Worker creates their
+# proxied CNAMEs to `<tunnel>.cfargotunnel.com`, and its own same-zone fetch() goes to that
+# origin, bypassing every Worker route (no `global_fetch_strictly_public` flag).
+[[routes]]
+pattern = "*-aws.ezil.org/*"
+zone_name = "ezil.org"
+
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
-# When unset (local dev), the Worker skips HMAC verification.
+# When unset (local dev), the Worker skips HMAC verification (v1 only; v2
+# always fails closed without a secret).
+#
+# EZIL_PREVIEW_TOKEN_V1_UNTIL (ISO timestamp) retires the v1 envelope. Leave it
+# UNSET until every v1 minter is migrated (list: docs/AWS-COMPUTERS.md, C-5):
+# app focus / screen / relay / telemetry-drain / telemetry-maintenance,
+# worker/scripts/*, e2e/hosted-continuity.mjs. Rollout order: deploy this
+# Worker first, then set the app's EZIL_PREVIEW_TOKEN_V2=1.
 # ── Neko WebRTC / Cloudflare Realtime TURN (secrets by NAME only) ────────────
 # `neko` desktop-mode media (VS Code pixels + input) travels over WebRTC, which
 # needs a TURN relay behind Cloudflare's HTTP/WS-only edge. The Worker mints
@@ -324,9 +351,17 @@ SANDBOX_NEKO_ICE_POLICY = "relay"
 class_name = "Sandbox"
 name = "Sandbox"
 
+[[env.staging.durable_objects.bindings]]
+class_name = "AwsTunnelRegistry"
+name = "AWS_TUNNELS"
+
 [[env.staging.migrations]]
 new_sqlite_classes = ["Sandbox"]
 tag = "v1"
+
+[[env.staging.migrations]]
+new_sqlite_classes = ["AwsTunnelRegistry"]
+tag = "v2"
 
 [[env.staging.containers]]
 name = "ezil-os-worker-staging-sandbox"
@@ -364,4 +399,8 @@ zone_name = "ezil.work"
 
 [[env.staging.routes]]
 pattern = "*-code.ezil.work/*"
+zone_name = "ezil.work"
+
+[[env.staging.routes]]
+pattern = "*-aws.ezil.work/*"
 zone_name = "ezil.work"

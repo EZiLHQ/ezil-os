@@ -1,0 +1,18 @@
+[Unit]
+Description=EZiL: cloudflared supervisor (per-epoch tunnel; fence stops it and wipes the token)
+Requires=ezil-enroll.service ezil-edge.service
+After=ezil-enroll.service ezil-edge.service
+# A crashed supervisor is restarted, at most 20 starts per 10 minutes. A fence exits 0, which
+# on-failure never restarts; exit 2 is a refusal (runDir/stopping, or the token a fence wiped)
+# and is never restarted either, so a restart never undoes a stop or revives a fenced tunnel.
+StartLimitIntervalSec=600
+StartLimitBurst=20
+[Service]
+Type=simple
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent cloudflared
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2

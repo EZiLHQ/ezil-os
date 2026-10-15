@@ -30,12 +30,11 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
-import {
-    deriveGuacamoleSandboxId,
-    newCorrelationId,
-    requestGuacamoleSandboxTerminate,
-    resolveCloudflareGuacamoleConfig,
-} from '@/server/lib/cloudflare-guacamole-provider';
+import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
+import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
+import { AWS_RETIREMENT_UNDERWAY } from '@/server/lib/compute/aws-ec2';
+import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
+import { routeComputer } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
 import {
     createComputerInLowestFreeSlot,
@@ -66,18 +65,44 @@ export { MAX_COMPUTERS_PER_USER, pickFreeSlot };
  * still proceeds. A provider that isn't configured at all is a no-op rather
  * than a failure, since there is no sandbox to tear down.
  */
-async function terminateComputerSandbox(userId: string, computerId: string): Promise<void> {
+async function terminateComputerSandbox(provider: CloudflareComputeProvider, computer: ComputerRef): Promise<void> {
     const config = resolveCloudflareGuacamoleConfig();
     if (!config.isConfigured) return;
-    const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-    const result = await requestGuacamoleSandboxTerminate(
-        config,
-        hmacSecret,
-        deriveGuacamoleSandboxId(userId, computerId),
-        newCorrelationId(),
-    );
+    const result = await provider.terminate({ correlationId: newCorrelationId() }, computer);
     if (!result.ok) {
         throw new Error(`sandbox_terminate_not_confirmed: ${result.error ?? result.outcome ?? 'unknown'}`);
+    }
+}
+
+/**
+ * An AWS computer's retirement is under way before its row is soft-deleted: the
+ * provider's `terminate` is retire (C-3: the data volume is kept for the 14-day
+ * retention window, §6 / F6 — nothing is deleted). One user delete is enough:
+ * once a lifecycle job that ends the instance is durably recorded on the placement
+ * (`AWS_RETIREMENT_UNDERWAY`), or the computer is already RETIRED, the row is
+ * soft-deleted and the sandbox-reap cron's background reconcile drives the
+ * placement to RETIRED. Any other answer REFUSES THE DELETE: soft-deleting while
+ * nothing will end the instance would leave AWS resources no flow can reach, and
+ * falling back to the Cloudflare teardown would address a sandbox that does not
+ * exist. Ownership of the live row is checked first, so a foreign id is NOT_FOUND
+ * before any provider call.
+ */
+async function retireAwsComputerBeforeDelete(
+    db: Parameters<typeof softDeleteComputer>[0],
+    provider: ComputeProvider,
+    computer: ComputerRef,
+): Promise<void> {
+    const owned = await db.query.computers.findFirst({
+        where: liveOwnedComputer(computer.userId, computer.computerId),
+        columns: { id: true },
+    });
+    if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+    const result = await provider.terminate({ correlationId: newCorrelationId() }, computer);
+    if (!result.ok && !AWS_RETIREMENT_UNDERWAY.includes(result.outcome ?? '')) {
+        throw new TRPCError({
+            code: 'PRECONDITION_FAILED',
+            message: `aws_retire_unavailable: ${result.outcome ?? result.error ?? 'unknown'}`,
+        });
     }
 }
 
@@ -237,10 +262,17 @@ export const computerRouter = createTRPCRouter({
     delete: protectedProcedure
         .input(z.object({ id: z.string().uuid() }))
         .mutation(async ({ ctx, input }) => {
+            const computer = { userId: ctx.user.id, computerId: input.id };
+            // P3: the provider this computer lives on. A foreign AWS placement is NOT_FOUND here.
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') await retireAwsComputerBeforeDelete(ctx.db, routed.provider, computer);
             const deleted = await softDeleteComputer(ctx.db, {
                 userId: ctx.user.id,
                 computerId: input.id,
-                terminateSandbox: () => terminateComputerSandbox(ctx.user.id, input.id),
+                terminateSandbox: routed.kind === 'cloudflare'
+                    ? () => terminateComputerSandbox(routed.provider, computer)
+                    // Retired (and confirmed) above; there is no Cloudflare sandbox to tear down.
+                    : async () => {},
             });
 
             if (!deleted) {
