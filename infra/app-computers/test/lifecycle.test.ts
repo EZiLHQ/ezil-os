@@ -427,7 +427,44 @@ test('a previous instance that EXISTS but is not this computer still refuses the
     const f=lifecycleFixture('replace');f.state.instances[0]!.Tags=[];
     const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
 });
-for(const operation of ['stop','retire','start'] as const)test(`${operation}: a vanished instance is still a failure (only replace may proceed without it)`,async()=>{
+for(const operation of ['stop','start'] as const)test(`${operation}: a vanished instance is still a failure (only replace and retire may proceed without it)`,async()=>{
     const f=lifecycleFixture(operation);f.state.instances=[];
     const r=await run(operation,{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
+
+// Codex 4278130057: a computer whose instance was lost (instance_lost → STOPPED) and was then
+// deleted retires with no instance to stop or terminate; the retained volume is kept (R11).
+function lostRetire(){
+    const f=lifecycleFixture('retire');
+    f.state.instances=[];
+    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];
+    return f;
+}
+test('retire with a vanished instance succeeds on the free, owned retained volume (nothing to stop or terminate, volume kept)',async()=>{
+    const f=lostRetire(),volumeId=f.state.volumes[0]!.VolumeId;
+    const r=await run('retire',{fixture:f});
+    assert.equal(r.error,undefined,r.cause);assert.equal(r.receipt?.state,'retired');
+    assert.deepEqual(r.calls.map(c=>c.action),[]);
+    assert.equal(r.receipt.volumeId,volumeId);assert.equal(r.receipt.instanceId,f.i.providerInstanceId);
+    assert.equal(r.f.state.volumes.length,1);
+});
+test('retire with a vanished instance refuses a volume attached elsewhere',async()=>{
+    const f=lostRetire(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:'i-99999999999999999',VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('retire',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);assert.equal(r.calls.length,0);
+});
+test('retire with a vanished instance refuses a volume still claiming it',async()=>{
+    const f=lostRetire(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:f.i.providerInstanceId!,VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('retire',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);assert.equal(r.calls.length,0);
+});
+test('retire with a vanished instance refuses a foreign or missing volume',async()=>{
+    const foreign=lostRetire();foreign.state.volumes[0]!.Tags=[];
+    const a=await run('retire',{fixture:foreign});assert.equal(a.error,'LifecycleUnconfirmed');assert.equal(a.calls.length,0);
+    const missing=lostRetire();missing.state.volumes=[];
+    const b=await run('retire',{fixture:missing});assert.equal(b.error,'LifecycleUnconfirmed');assert.equal(b.calls.length,0);
+});
+test('an instance that EXISTS but is not this computer still refuses the retire',async()=>{
+    const f=lifecycleFixture('retire');f.state.instances[0]!.Tags=[];
+    const r=await run('retire',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
 });

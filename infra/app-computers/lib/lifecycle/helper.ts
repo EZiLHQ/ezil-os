@@ -72,12 +72,19 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
         const sourceId=i.previousInstanceId??i.providerInstanceId;
-        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,i.operation==='replace'):undefined;
+        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,['replace','retire'].includes(i.operation)):undefined;
         // A replace whose previous instance EC2 no longer knows (the app's instance_lost recovery)
         // has nothing to stop or terminate. The volume must not claim an attachment to it; the
         // launch below still requires the volume `available` and unattached, and its tags were
         // checked above, so a foreign, attached or missing volume never gets a new instance.
         if(!source&&sourceId&&v.Attachments.some(a=>a.InstanceId===sourceId))return fail('lifecycle_volume_invalid');
+        // A retire whose instance EC2 no longer knows (instance_lost, then the computer deleted) has
+        // nothing to stop or terminate either. The retained volume (R11) is kept: it must be free,
+        // unattached and this computer's (tags checked above); anything else stays a failure.
+        if(!source&&sourceId&&i.operation==='retire'){
+            if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
+            return success(i,envelope.digest,sourceId,v.VolumeId,'retired');
+        }
         if(source&&['stop','retire','replace'].includes(i.operation)){
             const status=source.State?.Name;
             if(status==='terminated'){
@@ -184,8 +191,8 @@ export function assertOnlyExpectedDisks(instance:Instance,v:Volume,rootDeviceNam
         ||mappings.filter(m=>m.DeviceName===rootDeviceName).length>1
         ||mappings.some(m=>m.DeviceName!==rootDeviceName&&!(m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===v.VolumeId)))return fail('lifecycle_unexpected_disk');
 }
-/** `allowAbsent` (replace only): EC2 no longer knowing the instance at all is an answer, not a
- * failure. Nothing else is relaxed: an instance that exists must still be exactly this one. */
+/** `allowAbsent` (replace and retire only): EC2 no longer knowing the instance at all is an answer,
+ * not a failure. Nothing else is relaxed: an instance that exists must still be exactly this one. */
 async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies,allowAbsent=false){
     const rows=await deps.instances([id]);
     if(rows.length===0&&allowAbsent)return undefined;
