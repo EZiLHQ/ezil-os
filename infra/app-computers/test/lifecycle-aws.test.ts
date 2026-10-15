@@ -79,3 +79,15 @@ test('free tier: the actual EC2 SDK serializes the burstable launch with CreditS
         assert.equal(requests[0]!.get('CreditSpecification.CpuCredits'),'standard');
     }finally{client.destroy()}
 });
+
+test('instances by ID: EC2 NotFound is an empty answer; other errors and the token query still throw',async()=>{
+    const f=lifecycleFixture();
+    const errorXml=(code:string)=>({response:{statusCode:400,headers:{'content-type':'text/xml'},body:Readable.from([
+        `<Response><Errors><Error><Code>${code}</Code><Message>m</Message></Error></Errors><RequestID>r</RequestID></Response>`])}});
+    let code='InvalidInstanceID.NotFound';
+    const deps=awsDependencies(f.settings,{credentials,requestHandler:{async handle(){return errorXml(code);}},fetcher:fetch});
+    assert.deepEqual(await deps.instances(['i-22222222222222222']),[]);
+    await assert.rejects(deps.instances({token:token(f.digest,'instance')}));
+    code='InvalidInstanceID.Malformed';await assert.rejects(deps.instances(['i-22222222222222222']));
+    code='UnauthorizedOperation';await assert.rejects(deps.instances(['i-22222222222222222']));
+});

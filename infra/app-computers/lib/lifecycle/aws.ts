@@ -27,8 +27,16 @@ export function awsDependencies(settings:Settings,test?:{requestHandler:EC2Clien
     return {now:Date.now,
         execution:arn=>sfn.send(new DescribeExecutionCommand({executionArn:arn}),request()),
         instances:async selector=>{
-            const result=await ec2.send(new DescribeInstancesCommand(Array.isArray(selector)?{InstanceIds:selector}
-                :{Filters:[{Name:'client-token',Values:[selector.token]}]}),request());
+            let result;
+            try{result=await ec2.send(new DescribeInstancesCommand(Array.isArray(selector)?{InstanceIds:selector}
+                :{Filters:[{Name:'client-token',Values:[selector.token]}]}),request());}
+            catch(error){
+                // EC2 answers an instance ID it no longer knows (terminated and aged out) with an
+                // error, not an empty set. That is a definite "gone", which the helper decides on;
+                // every other error (throttling, access, malformed ID) stays an error.
+                if(Array.isArray(selector)&&(error as {name?:unknown}).name==='InvalidInstanceID.NotFound')return [];
+                throw error;
+            }
             const rows=result.Reservations?.flatMap(r=>(r.Instances??[]).map(instance=>({instance,owner:r.OwnerId})))??[];
             if(result.NextToken||rows.length>2)throw new Error('instance_ambiguous');return rows;
         },

@@ -72,7 +72,12 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
         const sourceId=i.previousInstanceId??i.providerInstanceId;
-        const source=sourceId?await getInstance(sourceId,previousTags,i,deps):undefined;
+        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,i.operation==='replace'):undefined;
+        // A replace whose previous instance EC2 no longer knows (the app's instance_lost recovery)
+        // has nothing to stop or terminate. The volume must not claim an attachment to it; the
+        // launch below still requires the volume `available` and unattached, and its tags were
+        // checked above, so a foreign, attached or missing volume never gets a new instance.
+        if(!source&&sourceId&&v.Attachments.some(a=>a.InstanceId===sourceId))return fail('lifecycle_volume_invalid');
         if(source&&['stop','retire','replace'].includes(i.operation)){
             const status=source.State?.Name;
             if(status==='terminated'){
@@ -173,8 +178,12 @@ export function assertOnlyExpectedDisks(instance:Instance,v:Volume,rootDeviceNam
         ||mappings.filter(m=>m.DeviceName===rootDeviceName).length>1
         ||mappings.some(m=>m.DeviceName!==rootDeviceName&&!(m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===v.VolumeId)))return fail('lifecycle_unexpected_disk');
 }
-async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies){
-    const rows=await deps.instances([id]);if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
+/** `allowAbsent` (replace only): EC2 no longer knowing the instance at all is an answer, not a
+ * failure. Nothing else is relaxed: an instance that exists must still be exactly this one. */
+async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies,allowAbsent=false){
+    const rows=await deps.instances([id]);
+    if(rows.length===0&&allowAbsent)return undefined;
+    if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
     assertIdentity(rows[0].instance,tags,i);return rows[0].instance;
 }
 function assertAttached(instance:Instance,v:Volume,id:string){
