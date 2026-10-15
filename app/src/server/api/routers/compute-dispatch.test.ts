@@ -11,6 +11,9 @@
  *   retires or refuses — never deletes data, never falls back to Cloudflare.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import { initTRPC, TRPCError } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -46,7 +49,7 @@ import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-prov
 import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 
-import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
+import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
 import { appCallerRoleEnv } from '@/server/lib/compute/aws-clients';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
@@ -372,5 +375,59 @@ describe('computer.delete: AWS retires or refuses — never deletes data, never 
         await expect(caller.delete({ id: C1 })).resolves.toMatchObject({ id: C1 });
         expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(fetchMock.mock.calls[0]![1]).toMatchObject({ method: 'DELETE' });
+    });
+});
+
+describe('Codex 4277613545: the shell stop of an AWS computer answers only a CONFIRMED stop', () => {
+    const computer = { userId: U1, computerId: C1 };
+    /** A provider whose stop answers `first` and whose status walks `states` (each status look applies the receipt). */
+    function scripted(first: { ok: boolean; terminated: boolean; outcome?: string }, states: (string | undefined)[]) {
+        const looks: string[] = [];
+        const provider = {
+            kind: 'aws-ec2',
+            stop: vi.fn(async () => first),
+            status: vi.fn(async () => { const s = states.shift(); looks.push(String(s)); return { ok: true, placementState: s }; }),
+        } as never;
+        let t = 0;
+        const clock = { now: () => t, sleep: async (ms: number) => { t += ms; } };
+        return { provider, looks, clock };
+    }
+
+    it('a running computer: the stop is started, polled through its receipt, and answered destroyed once STOPPED', async () => {
+        const { provider, looks, clock } = scripted({ ok: false, terminated: false, outcome: 'stopping' }, ['STOPPING', 'STOPPING', 'STOPPED']);
+        expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, { ...clock, budgetMs: 60_000, pollMs: 5_000 }))
+            .toEqual({ ok: true, terminated: true, outcome: 'destroyed' });
+        expect(looks).toEqual(['STOPPING', 'STOPPING', 'STOPPED']);
+    });
+
+    it('an already stopped computer: not_running, terminated false (the cold-start precondition)', async () => {
+        const { provider, looks, clock } = scripted({ ok: true, terminated: false, outcome: 'already_stopped' }, []);
+        expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, clock)).toEqual({ ok: true, terminated: false, outcome: 'not_running' });
+        expect(looks).toEqual([]);
+    });
+
+    it.each(['placement_draining', 'placement_stopping'])('a stop already in flight (%s) is waited for, not refused', async (outcome) => {
+        const { provider, clock } = scripted({ ok: false, terminated: false, outcome }, ['STOPPED']);
+        expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, clock)).toEqual({ ok: true, terminated: true, outcome: 'destroyed' });
+    });
+
+    it('not settled within the budget: the shell\'s "not yet" (still_running), never a false success', async () => {
+        const { provider, looks, clock } = scripted({ ok: false, terminated: false, outcome: 'stopping' }, Array(100).fill('STOPPING'));
+        expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, { ...clock, budgetMs: 20_000, pollMs: 5_000 }))
+            .toEqual({ ok: false, terminated: false, outcome: 'still_running' });
+        expect(looks).toHaveLength(4);
+    });
+
+    it('a refusal or a stop that moves elsewhere is a failure, unchanged', async () => {
+        const refused = scripted({ ok: false, terminated: false, outcome: 'placement_starting' }, []);
+        expect(await confirmAwsStop(refused.provider, { correlationId: 'c' }, computer, refused.clock)).toEqual({ ok: false, terminated: false, outcome: 'placement_starting' });
+        const moved = scripted({ ok: false, terminated: false, outcome: 'stopping' }, ['UNCONFIRMED']);
+        expect(await confirmAwsStop(moved.provider, { correlationId: 'c' }, computer, moved.clock))
+            .toEqual({ ok: false, terminated: false, outcome: 'placement_unconfirmed', error: 'placement_unconfirmed' });
+    });
+
+    it('the shell route asks for the confirmed stop', () => {
+        const src = readFileSync(path.join(__dirname, '../../../app/api/shell/stop/route.ts'), 'utf8');
+        expect(src).toMatch(/cloudflareGuacamole\.terminate\(\{[^}]*confirm:\s*true/);
     });
 });

@@ -828,3 +828,30 @@ describe('Codex 4277262199: a StartExecution whose answer is lost is not a refus
     });
 });
 
+
+describe('Codex 4277613510: an open of a computer whose instance EC2 lost replaces it onto the volume', () => {
+    const me = { userId: U1, computerId: C1 };
+    const lostDescriber = (instance: string | null, volume: string | null) => ({
+        describeForEnrollment: async (_r: string, instanceId: string) => (instance === null ? null : ({ instanceId, state: instance } as never)),
+        describeVolume: async (_r: string, volumeId: string) => (volume === null ? null : { volumeId, state: volume }),
+    });
+    const tunnels = { createTunnel: async () => ({ ok: true as const, tunnelToken: 'tok-' + 'x'.repeat(30) }), deleteTunnel: async () => ({ ok: true }) };
+
+    it.each([['terminated'], [null]] as const)('EC2 says %s: the same open records instance_lost and starts a REPLACE (even in start mode)', async (ec2) => {
+        const { provider, placements, calls } = setup(
+            { placements: [stopped({ state: 'RUNNING', generation: 3, lease_epoch: 7 })] },
+            { e: startMode(), describer: lostDescriber(ec2, 'available'), tunnels },
+        );
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['replace']);
+        expect(calls[0]!.intent).toMatchObject({ targetGeneration: 4, leaseEpoch: 8, previousInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111' });
+        expect(placements[0]).toMatchObject({ state: 'STARTING', generation: 4, lease_epoch: 8, instance_id: null });
+    });
+
+    it('status of such a computer reports it stopped, never running', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING' })] }, { describer: lostDescriber('terminated', 'in-use'), tunnels });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopped', placementState: 'STOPPED' });
+        expect(placements[0]).toMatchObject({ last_error: 'instance_lost' });
+        expect(calls).toEqual([]);
+    });
+});

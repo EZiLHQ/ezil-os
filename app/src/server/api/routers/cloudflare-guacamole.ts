@@ -69,7 +69,7 @@ import {
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
-import { awsPreviewAnswer, awsStatusAnswer, routeComputer } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, routeComputer } from './compute-dispatch';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -901,9 +901,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             return { ...status, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
         }),
 
-    /** Request teardown of a computer's sandbox. Fire-and-forget. */
+    /**
+     * Request teardown of a computer's sandbox. Fire-and-forget, except with `confirm`
+     * (the shell's `POST /api/shell/stop`): an AWS stop is then waited for and reported
+     * only once confirmed (`confirmAwsStop`).
+     */
     terminate: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({ computerId: z.string().uuid(), confirm: z.boolean().optional() }))
         .mutation(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
@@ -919,7 +923,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // A user stop of an AWS computer STOPS the instance (data and root disks kept;
             // reopen is a cold boot). It never retires: retire is the computer delete.
             const result = routed.kind === 'aws-ec2'
-                ? await routed.provider.stop({ correlationId }, computer, 'user')
+                ? input.confirm
+                    ? await confirmAwsStop(routed.provider, { correlationId }, computer)
+                    : await routed.provider.stop({ correlationId }, computer, 'user')
                 : await routed.provider.terminate({ correlationId }, computer);
             // Report what the Worker actually confirmed, not a hardcoded
             // success — `result.ok` is false for still_running/destroy_failed,

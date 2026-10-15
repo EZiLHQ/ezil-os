@@ -920,3 +920,88 @@ describe('Codex 4277262199: the reconciler\'s own starts keep a lost answer reco
     });
 });
 
+
+describe('Codex 4277613510: a RUNNING placement whose EC2 instance is gone is recovered onto its volume', () => {
+    type Vol = string | null | 'throw';
+    function lost(view: string | null, volume: Vol, opts: { fenceOk?: boolean; noVolumeDescribe?: boolean } = {}) {
+        const fake = createFakePlacementDb({
+            placements: [row({ state: 'RUNNING', instance_id: I_NEW, lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null, enroll_expires_at: null, last_error: null })],
+            computers: [{ id: C1, user_id: U1 }],
+            usage: [{ computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium', started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: null, observed_by: 'receipt', updated_at: NOW }],
+        }, { clock: () => NOW });
+        const fences: { generation: number; leaseEpoch: number }[] = [];
+        const control = { fenceOk: opts.fenceOk ?? true };
+        const tunnels: TunnelClient = {
+            createTunnel: async () => ({ ok: true, tunnelToken: 'tok-' + 'x'.repeat(30) }),
+            deleteTunnel: async (_owner, req) => { fences.push({ generation: req.generation, leaseEpoch: req.leaseEpoch }); return { ok: control.fenceOk }; },
+        };
+        const starts: string[] = [];
+        const starter: LifecycleStarter = { async start(_region, work) { starts.push(work.input); } };
+        const volumes: string[] = [];
+        const describer = {
+            describeForEnrollment: async (_r: string, instanceId: string) => (view === null ? null : ({ instanceId, state: view } as Ec2EnrollmentView)),
+            ...(opts.noVolumeDescribe ? {} : {
+                describeVolume: async (_r: string, volumeId: string) => {
+                    volumes.push(volumeId);
+                    if (volume === 'throw') throw new Error('RequestLimitExceeded');
+                    return volume === null ? null : { volumeId, state: volume };
+                },
+            }),
+        };
+        return { ...fake, deps: { db: fake.db, tunnels, starter, describer, sleep: async () => {} }, fences, starts, volumes, control };
+    }
+    const placement = async (db: Parameters<typeof readPlacement>[0]) => (await readPlacement(db, C1)).record!;
+
+    it.each([[null], ['terminated'], ['shutting-down']] as const)('EC2 says %s, volume kept → fenced, usage closed, STOPPED instance_lost (no job started)', async (state) => {
+        const l = lost(state, 'available');
+        expect(await reconcileGuestStop(l.deps, await placement(l.db), D)).toBe(true);
+        expect(l.volumes).toEqual([VOL]);
+        expect(l.fences).toEqual([{ generation: 2, leaseEpoch: 3 }]);
+        expect(l.starts).toEqual([]);
+        expect(l.placements[0]).toMatchObject({ state: 'STOPPED', last_error: 'instance_lost', instance_id: I_NEW, volume_id: VOL, lifecycle_job_id: null, lifecycle_digest: null });
+        expect(l.usage[0]).toMatchObject({ observed_by: 'reconcile:instance_lost' });
+        expect(l.usage[0]!.stopped_at).not.toBeNull();
+    });
+
+    it('the volume is gone too → UNCONFIRMED instance_lost_volume_missing, still fenced and closed', async () => {
+        const l = lost('terminated', null);
+        expect(await reconcileGuestStop(l.deps, await placement(l.db), D)).toBe(true);
+        expect(l.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'instance_lost_volume_missing' });
+        expect(l.fences).toHaveLength(1);
+        expect(l.usage[0]!.stopped_at).not.toBeNull();
+    });
+
+    it('an unknown volume answer or a failed fence changes nothing; the next look recovers it', async () => {
+        const l = lost('terminated', 'throw');
+        expect(await reconcileGuestStop(l.deps, await placement(l.db), D)).toBe(false);
+        expect(l.fences).toEqual([]);
+        expect(l.placements[0]).toMatchObject({ state: 'RUNNING' });
+        const f = lost('terminated', 'available', { fenceOk: false });
+        expect(await reconcileGuestStop(f.deps, await placement(f.db), D)).toBe(false);
+        expect(f.placements[0]).toMatchObject({ state: 'RUNNING' });
+        expect(f.usage[0]!.stopped_at).toBeNull();
+        f.control.fenceOk = true;
+        expect(await reconcileGuestStop(f.deps, await placement(f.db), D)).toBe(true);
+        expect(f.placements[0]).toMatchObject({ state: 'STOPPED', last_error: 'instance_lost' });
+    });
+
+    it('without a volume describe the lost instance is left for a look that can check it', async () => {
+        const l = lost('terminated', 'available', { noVolumeDescribe: true });
+        expect(await reconcileGuestStop(l.deps, await placement(l.db), D)).toBe(false);
+        expect(l.placements[0]).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it.each(['running', 'pending'])('a live instance (%s) is never treated as lost', async (state) => {
+        const l = lost(state, 'available');
+        expect(await reconcileGuestStop(l.deps, await placement(l.db), D)).toBe(false);
+        expect(l.volumes).toEqual([]);
+        expect(l.placements[0]).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it('the fleet pass recovers it too', async () => {
+        const l = lost('terminated', 'available');
+        const fleet = await reconcileAwsFleet({ ...l.deps, executions: { describe: async () => ({ status: 'RUNNING' }) } as LifecycleExecutionReader }, { 'ap-south-1': D });
+        expect(fleet).toMatchObject({ checked: 1 });
+        expect(l.placements[0]).toMatchObject({ state: 'STOPPED', last_error: 'instance_lost' });
+    });
+});

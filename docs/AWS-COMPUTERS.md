@@ -157,6 +157,18 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
     retire resolves any instance state). A refused start returns it to UNCONFIRMED (`retire_start_failed`) for the
     next pass; an instance EC2 no longer knows is counted `stuck` for an operator. A LIVE computer's UNCONFIRMED
     placement is never touched by this path. The pass rotates (`reconciled_at`), so stuck rows never starve others.
+- Lost instance: a RUNNING row whose instance EC2 no longer has, or shows `shutting-down`/`terminated` (an external
+  terminate, an EC2 failure), gets no receipt ever. The same looks (`status`, `ensure`, the fleet pass) describe its
+  data volume (`DescribeVolumes`), fence the epoch's tunnel, then in ONE reconciler-only compare-and-swap close the
+  usage row and move RUNNING → STOPPED with `last_error = instance_lost`, after which the next open is always a
+  REPLACE onto that volume (start mode included). A missing volume lands UNCONFIRMED
+  `instance_lost_volume_missing` instead. An unknown describe or a failed fence changes nothing until the next look.
+- Shell stop (`POST /api/shell/stop`, `terminate` with `confirm`): an AWS stop is asynchronous, so the route waits
+  (bounded, 200 s inside its 300 s) for the stop's receipt and answers `destroyed` only once the placement is
+  STOPPED, `not_running` when it already was, and the shell's "not yet" (`still_running`) at the deadline. The UI's
+  own `terminate` stays fire-and-forget.
+- Lease renewal is monotonic: `presence_at`/`lease_until` are written as `GREATEST(current, new)`, so racing renewals
+  (two tabs, an open and a heartbeat) can never shorten a lease.
 - Guest-initiated idle stop (R9): the host stops its own instance with no lifecycle job. `status`, `ensure` and
   `terminate` read the instance's EC2 state (the app caller's region-scoped `DescribeInstances`); a RUNNING row
   whose instance is stopping or stopped gets the ORDINARY lifecycle `stop`, which the helper confirms at once, so

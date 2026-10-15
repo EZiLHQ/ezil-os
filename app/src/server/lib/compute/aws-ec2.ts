@@ -49,7 +49,8 @@ import {
     type LifecycleOperation,
     type LifecycleWork,
 } from './aws-intent';
-import { ENROLLMENT_FAILED, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import type { Ec2VolumeDescriber } from './aws-clients';
 import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 
@@ -130,7 +131,7 @@ export interface AwsProviderDeps {
      * Read-only EC2 describe (the enrollment describer). Catches a guest-initiated idle
      * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber>;
     /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
     /** Backoff between StartExecution attempts whose answer was lost; tests inject an instant one. */
@@ -485,7 +486,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // Region is sticky: the deployment is the placement's own region, never another.
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
-                    const replace = placement.lastError === ENROLLMENT_FAILED || cfg.wakeMode === 'replace';
+                    // A lost instance (INSTANCE_LOST: EC2 terminated it) can only come back as a REPLACE onto its volume.
+                    const replace = placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace';
                     // The lease's compare-and-swap moves the epoch (and, for a replace, the
                     // generation) by exactly one, so this boot's intent is fully known BEFORE
                     // the lease and its job, digest, fence and nonce hash are written by that
