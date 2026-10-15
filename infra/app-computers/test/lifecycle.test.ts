@@ -311,6 +311,29 @@ test('start-in-place writes the epoch nonce as userData while stopped, then star
     assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','startInstances']);
     assert.deepEqual(r.calls[0]!.parameters,{InstanceId:f.state.instances[0]!.InstanceId,UserData:{Value:'bm9uY2UtZTM='}});
 });
+// C-6 (PR #200 review 4277908738): an uncertain ModifyInstanceAttribute may never have reached EC2;
+// starting then would boot the previous epoch's nonce. Start only after a DEFINITE write.
+for(const [why,noEffect] of [['did not land',true],['landed',false]] as const)
+    test(`start-in-place: a lost userData write reply (${why}) is re-issued before any start`,async()=>{
+        const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});
+        const r=await run('start',{fixture:f,lose:'modifyInstanceAttribute',...(noEffect?{noEffect:'modifyInstanceAttribute'}:{})});
+        assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
+        assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','modifyInstanceAttribute','startInstances']);
+        for(const c of r.calls.filter(c=>c.action==='modifyInstanceAttribute'))assert.deepEqual(c.parameters.UserData,{Value:'bm9uY2UtZTM='});
+    });
+test('start-in-place: a userData write that never gets a definite answer never starts the instance',async()=>{
+    const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});
+    const r=await run('start',{fixture:f,fail:{action:'modifyInstanceAttribute',times:100000,error:taskError('States.Timeout','Task timed out')}});
+    assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.receipt,undefined);
+    assert.ok(!r.calls.some(c=>c.action==='startInstances'),'never starts on an unconfirmed nonce');
+    assert.ok(r.calls.filter(c=>c.action==='modifyInstanceAttribute').length>1,'the idempotent write is re-issued');
+});
+test('start-in-place: a definitely rejected userData write ends the run without a start',async()=>{
+    const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});
+    const r=await run('start',{fixture:f,fail:{action:'modifyInstanceAttribute',times:1,
+        error:taskError('EC2.UnauthorizedOperation','You are not authorized (Service: Ec2, Status Code: 403, Request ID: x)')}});
+    assert.equal(r.error,'LifecycleUnconfirmed');assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute']);
+});
 test('nonce delivery to a stopped instance is refused while the flag is off, and the graph has no modify step',async()=>{
     const r=await run('start',{fixture:lifecycleFixture('start',{userData:'bm9uY2UtZTM='})});
     assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_userdata_disabled/);assert.deepEqual(r.calls,[]);

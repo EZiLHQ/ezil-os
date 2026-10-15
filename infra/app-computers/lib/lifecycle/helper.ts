@@ -156,7 +156,13 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(i.userData!==null){
             // C-6: write this epoch's nonce while stopped, then start.
             if(!settings.features.userDataNonce)return fail('lifecycle_userdata_disabled');
-            if(phase!=='userdata')return action('modifyInstanceAttribute',{InstanceId:targetId,UserData:{Value:i.userData}});
+            // Start only after a DEFINITE write. An uncertain ModifyInstanceAttribute (lost reply,
+            // timeout, 5xx) may never have reached EC2, and a host booted on the previous epoch's
+            // nonce looks like a same-instance reboot and reuses old credentials. The write is
+            // idempotent, so an uncertain one is re-issued until EC2 answers it; each round costs a
+            // 5 s Wait and the execution's 870 s window bounds them. A definite rejection already
+            // ended the run above (Rejected).
+            if(phase!=='userdata'||previous.kind!=='none')return action('modifyInstanceAttribute',{InstanceId:targetId,UserData:{Value:i.userData}});
         }
         return action('startInstances',{InstanceIds:[targetId]});
     };
