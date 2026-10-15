@@ -27,7 +27,7 @@
 import { awsCanaryConfig, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
-import { PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
@@ -63,22 +63,63 @@ function isPlacementDb(db: PlacementExecutor): db is PlacementDb {
     return typeof (db as Partial<PlacementDb>).transaction === 'function';
 }
 
+export interface ResolveOptions {
+    /**
+     * The caller is about to START a sandbox (open, app/code preview, desktop restart).
+     * A no-row computer the canary does not claim is then PINNED to Cloudflare first
+     * (`pinCloudflare`), so it can never later be reassigned to AWS. Reads and stops
+     * never pin: a computer that never ran stays eligible.
+     */
+    pinCloudflare?: boolean;
+}
+
 export async function resolveComputeProvider(
     db: PlacementExecutor,
     computer: ComputerRef,
     env: Env = process.env,
     aws: Omit<AwsProviderDeps, 'db' | 'env'> = {},
+    options: ResolveOptions = {},
 ): Promise<ComputeProvider> {
     if (!isPlacementReadEnabled(env)) return cloudflareComputeProvider;
-    const placement = await readPlacement(db, computer.computerId);
+    let placement = await readPlacement(db, computer.computerId);
     // Every provider operation is the recorded owner's only (C-2): `computer.userId` is the
     // authenticated session user; a re-keyed or re-inserted ezil_computers row changes nothing.
+    assertPlacementOwner(placement, computer);
+    const deps = isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined;
+    if (!placement.record) {
+        // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
+        if (await isAwsCanary(db, computer, env)) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+        if (options.pinCloudflare && isPlacementDb(db)) {
+            placement = await pinCloudflare(db, computer);
+            assertPlacementOwner(placement, computer);
+        }
+    }
+    return providerForPlacement(placement, env, deps);
+}
+
+function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRef): void {
     if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) {
         throw new PlacementOwnerError(placement.record.computerId);
     }
-    // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
-    const effective = !placement.record && (await isAwsCanary(db, computer, env)) ? { provider: 'aws-ec2' as const } : placement;
-    return providerForPlacement(effective, env, isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined);
+}
+
+/**
+ * 🔴 A computer that runs on Cloudflare keeps its workspace in R2. Without a row it has
+ * no recorded provider, so enabling the canary (or adding its user) later would send it
+ * to AWS and an EMPTY EBS volume — the R2 workspace would look lost. The first sandbox
+ * start therefore records a `cloudflare` row, through the single writer under the
+ * per-computer lock, BEFORE the sandbox starts. Its state is not tracked (Cloudflare's
+ * lifecycle lives in the Worker); STOPPED keeps it out of every running-class count.
+ * A concurrent writer's row wins (`placement_exists` → re-read), whatever its provider.
+ */
+async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<ResolvedPlacement> {
+    const created = await createPlacement(db, {
+        computerId: computer.computerId, ownerUserId: computer.userId, provider: 'cloudflare', state: 'STOPPED',
+    });
+    if (created.ok) return { provider: 'cloudflare', store: created.placement.store, record: created.placement };
+    const existing = await readPlacement(db, computer.computerId);
+    if (!existing.record) throw new PlacementIntegrityError('invalid_row', computer.computerId.toLowerCase());
+    return existing;
 }
 
 /**

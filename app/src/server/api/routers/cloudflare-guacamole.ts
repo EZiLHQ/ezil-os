@@ -200,7 +200,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     : { screen: { width: screen.width, height: screen.height } }),
             };
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
-            const routed = await routeComputer(ctx.db, computer);
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -449,7 +449,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // POST handler: defaulting sessionId to the computer id
             // when the shell has no separate session concept for it.
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
-            const routed = await routeComputer(ctx.db, computer);
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -622,7 +622,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
-            const routed = await routeComputer(ctx.db, computer);
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -1244,7 +1244,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const routed = await routeComputer(ctx.db, computer);
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             if (routed.kind === 'aws-ec2') {
                 // No in-place desktop restart on AWS yet; a refusal the UI renders, never Cloudflare.
                 const aws = await routed.provider.restart({ correlationId }, computer);
