@@ -369,3 +369,42 @@ test('I6: only the data volume carries the namespace backup tag DLM targets; the
     const launch=r.calls.find(c=>c.action==='runInstances')!.parameters;
     for(const spec of launch.TagSpecifications)assert.ok(!spec.Tags.some((t:any)=>t.Key==='ezil:backup'),spec.ResourceType);
 });
+
+// Codex 4277801516: replace after the app's instance_lost recovery, when EC2 no longer knows the
+// previous instance (terminated and aged out: DescribeInstances by ID answers NotFound).
+function lostPrevious(){
+    const f=lifecycleFixture('replace');
+    f.state.instances=[];
+    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];
+    return f;
+}
+test('replace with a vanished previous instance relaunches onto the free retained volume (nothing to stop or terminate)',async()=>{
+    const r=await run('replace',{fixture:lostPrevious()});
+    assert.equal(r.error,undefined,r.cause);assert.equal(r.receipt?.state,'running');
+    assert.deepEqual(r.calls.map(c=>c.action),['runInstances','createTags','attachVolume']);
+    assert.equal(r.receipt.volumeId,r.f.state.volumes[0]!.VolumeId);
+});
+test('replace with a vanished previous instance refuses a volume attached elsewhere',async()=>{
+    const f=lostPrevious(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:'i-99999999999999999',VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
+test('replace with a vanished previous instance refuses a volume still claiming it',async()=>{
+    const f=lostPrevious(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:f.i.previousInstanceId!,VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);assert.equal(r.calls.length,0);
+});
+test('replace with a vanished previous instance refuses a foreign or missing volume',async()=>{
+    const foreign=lostPrevious();foreign.state.volumes[0]!.Tags=[];
+    const a=await run('replace',{fixture:foreign});assert.equal(a.error,'LifecycleUnconfirmed');assert.equal(a.calls.length,0);
+    const missing=lostPrevious();missing.state.volumes=[];
+    const b=await run('replace',{fixture:missing});assert.equal(b.error,'LifecycleUnconfirmed');assert.equal(b.calls.length,0);
+});
+test('a previous instance that EXISTS but is not this computer still refuses the replace',async()=>{
+    const f=lifecycleFixture('replace');f.state.instances[0]!.Tags=[];
+    const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
+for(const operation of ['stop','retire','start'] as const)test(`${operation}: a vanished instance is still a failure (only replace may proceed without it)`,async()=>{
+    const f=lifecycleFixture(operation);f.state.instances=[];
+    const r=await run(operation,{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
