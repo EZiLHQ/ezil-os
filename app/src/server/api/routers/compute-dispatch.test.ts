@@ -58,6 +58,8 @@ const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
 const TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
 const AWS_ENV: Record<string, string> = {
     EZIL_AWS_COMPUTERS_ENABLED: '1',
+    // The configured AWS browser zone: the ONLY zone the AWS preview handoff accepts.
+    EZIL_AWS_BROWSER_ZONE: 'preview.example',
     AWS_MAX_RUNNING: '10',
     EZIL_AWS_USER_MONTHLY_HOURS: '100',
     EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
@@ -269,7 +271,7 @@ describe('routers: AWS previews use their own Worker route', () => {
         const { db, fake } = routerDb([awsRow({ state: 'RUNNING', generation: 7, lease_epoch: 11, lease_until: new Date(Date.now() + 3_600_000) })]);
         const sandboxId = deriveGuacamoleSandboxId(U1, C1);
         const url = (port: number) =>
-            `https://aws-${port}-${sandboxId}-aws.example/preview-bootstrap?token=opaque&path=%2F`;
+            `https://aws-${port}-${sandboxId}-aws.preview.example/preview-bootstrap?token=opaque&path=%2F`;
         const ready = {
             ok: true, provider: 'aws-ec2', mode: 'neko', sandboxId, generation: 7, leaseEpoch: 11,
             guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443),

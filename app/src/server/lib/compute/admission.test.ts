@@ -10,6 +10,7 @@ import { decideAdmission, runAdmission, type RegionalCounters, type RegionPlan }
 import { AWS_CAP_ENV, AWS_TIERS, instanceTypeForTier, isAwsTier, readAwsAdmissionConfig, regionCapEnv, type AwsAdmissionConfig } from './aws-config';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { leasePlacement, mintAdmissionTicket, readAdmissionCounters, withAdmission, type AdmissionCounters } from './placement';
+import { monthUsageFromRows } from './usage';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -33,7 +34,7 @@ const ENV = {
     EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
 };
 const config = readAwsAdmissionConfig(ENV);
-const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'targetPlacementOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { targetOwnerId: U1, targetPlacementOwnerId: null, targetDeleted: false, targetForeignUsage: 0, runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: [] };
+const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'targetPlacementOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { targetOwnerId: U1, targetPlacementOwnerId: null, targetDeleted: false, targetForeignUsage: 0, runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: monthUsageFromRows([], NOW) };
 const hoursRow = (userId: string, hours: number, egressBytes: number | null = 0) => ({
     computerId: C3,
     userId,
@@ -72,8 +73,11 @@ describe('config: absent or invalid means disabled', () => {
 });
 
 describe('decideAdmission (pure)', () => {
-    const decide = (counters: Partial<typeof empty> = {}, cfg: AwsAdmissionConfig = config) =>
-        decideAdmission({ config: cfg, counters: { ...empty, ...counters }, userId: U1, now: NOW });
+    // Fixtures are usage ROWS; admission takes the database's totals (`readMonthUsage`), which
+    // `monthUsageFromRows` reproduces exactly (pinned against real Postgres in placement-usage-sql).
+    type DecideCounters = Partial<Omit<typeof empty, 'usage'>> & { usage?: Parameters<typeof monthUsageFromRows>[0] };
+    const decide = (counters: DecideCounters = {}, cfg: AwsAdmissionConfig = config) =>
+        decideAdmission({ config: cfg, counters: { ...empty, ...counters, usage: monthUsageFromRows(counters.usage ?? [], NOW) }, userId: U1, now: NOW });
 
     it('admits under every cap', () => {
         expect(decide({ runningCount: 1, usage: [hoursRow(U1, 99, 49 * GB), hoursRow(U2, 400, 100 * GB)] })).toEqual({ admit: true });

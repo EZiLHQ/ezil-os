@@ -44,6 +44,8 @@
 import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
 
+import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
+
 // ── Enums ────────────────────────────────────────────────────────────────
 
 export const PLACEMENT_PROVIDERS = ['cloudflare', 'aws-ec2'] as const;
@@ -1044,8 +1046,8 @@ export interface AdmissionCounters {
      */
     userOtherAwsComputers: number;
     duplicates: { computerId: string; rows: number }[];
-    /** Usage rows overlapping [monthStart, now], every user. */
-    usage: UsageRow[];
+    /** This month's usage, totalled in the database: fleet-wide and per user (`readMonthUsage`). */
+    usage: MonthUsage;
 }
 
 /**
@@ -1073,28 +1075,40 @@ export async function readCanaryComputer(
 }
 
 /**
- * Every usage row overlapping the UTC month that contains `now` (usage.ts sums them).
- * Admission reads it under its lock; session-limit enforcement (aws-receipts.ts
- * `enforceSessionLimits`) reads it without one: a cap is checked again by the next pass.
+ * This month's usage, TOTALLED IN THE DATABASE: one row per user with usage overlapping
+ * the UTC month that contains `now`, never the ledger's rows. The arithmetic is usage.ts's,
+ * exactly (`monthUsageFromRows` is the reference): a run counts from max(started_at,
+ * monthStart) to min(stopped_at ?? now, now, nextMonth), an open run until now, and its
+ * whole egress counts in every month it overlaps (NULL = 0). Admission reads it under its
+ * lock, so its size is bounded by users, not by how often computers stop and wake.
+ * Session-limit enforcement (aws-receipts.ts `enforceSessionLimits`) reads it without one:
+ * a cap is checked again by the next pass.
  */
-export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStart: Date): Promise<UsageRow[]> {
+export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStart: Date): Promise<MonthUsage> {
+    const nextMonth = utcNextMonthStart(now);
     const rows = rowsOf(
-        await db.execute(sql`/* placement:usage-month */ SELECT computer_id::text AS computer_id, user_id::text AS user_id,
-                started_at, stopped_at, egress_bytes::text AS egress_bytes
-            FROM public.ezil_compute_usage
-            WHERE started_at < ${now.toISOString()}::timestamptz
-              AND (stopped_at IS NULL OR stopped_at >= ${monthStart.toISOString()}::timestamptz)`),
+        await db.execute(sql`/* placement:usage-month */ WITH w AS (SELECT ${now.toISOString()}::timestamptz AS now_at,
+                ${monthStart.toISOString()}::timestamptz AS month_start, ${nextMonth.toISOString()}::timestamptz AS next_month)
+            SELECT u.user_id::text AS user_id,
+                COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(u.stopped_at, w.now_at), w.now_at, w.next_month)
+                    - GREATEST(u.started_at, w.month_start))), 0)), 0)::text AS seconds,
+                COALESCE(SUM(u.egress_bytes), 0)::text AS egress_bytes
+            FROM public.ezil_compute_usage u CROSS JOIN w
+            WHERE u.started_at < LEAST(w.now_at, w.next_month)
+              AND (u.stopped_at IS NULL OR u.stopped_at >= w.month_start)
+            GROUP BY u.user_id`),
     );
-    return rows.map((r) => {
-        const startedAt = timestamp(r.started_at);
-        const stoppedAt = timestamp(r.stopped_at);
-        if (!startedAt || stoppedAt === undefined) throw new Error('usage row has an invalid timestamp');
-        const egress = r.egress_bytes === null || r.egress_bytes === undefined ? null : counter(r.egress_bytes);
-        if (egress === null && r.egress_bytes !== null && r.egress_bytes !== undefined) {
-            throw new Error('usage row has an invalid egress_bytes');
-        }
-        return { computerId: String(r.computer_id), userId: String(r.user_id), startedAt, stoppedAt, egressBytes: egress };
-    });
+    const byUser = new Map<string, UsageTotals>();
+    for (const r of rows) {
+        const userId = typeof r.user_id === 'string' ? canonicalId(r.user_id) : '';
+        const seconds = typeof r.seconds === 'string' && /^\d+(\.\d+)?$/.test(r.seconds) ? Number(r.seconds) : NaN;
+        const egress = counter(r.egress_bytes);
+        if (!UUID.test(userId) || byUser.has(userId)) throw new Error('usage aggregate has an invalid user_id');
+        if (!Number.isFinite(seconds)) throw new Error('usage aggregate has invalid seconds');
+        if (egress === null) throw new Error('usage aggregate has an invalid egress_bytes');
+        byUser.set(userId, { hours: seconds / 3_600, egressBytes: egress });
+    }
+    return { global: totalsOf(byUser.values()), byUser };
 }
 
 /** Read every admission input, inside `withAdmission`. */

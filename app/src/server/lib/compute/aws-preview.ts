@@ -6,6 +6,7 @@ import {
     type CloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
 
+import { readAwsBrowserZone, type Env } from './aws-config';
 import { readPlacement, type PlacementExecutor } from './placement';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
 import type { ComputerRef, EnsureOptions } from './provider';
@@ -24,24 +25,13 @@ const unavailable = () => ({
  */
 export const AWS_BROWSER_ROUTE_TOKEN = 'aws';
 
-/**
- * The zones an AWS browser host may sit in: the Worker's own host, or its zone root
- * after removing exactly one label — the same rule as `isOwnDesktopOrigin`, so the
- * handoff and the later frame confirmation accept the same hosts.
- */
-function browserZones(workerHost: string): string[] {
-    const host = workerHost.toLowerCase();
-    const dot = host.indexOf('.');
-    return dot > 0 ? [host, host.slice(dot + 1)] : [host];
-}
-
 /** Preserve the bootstrap URL verbatim; never compose a Cloudflare bridge URL. */
-function bootstrapUrl(port: number, sandboxId: string, zones: readonly string[]) {
+function bootstrapUrl(port: number, sandboxId: string, zone: string) {
     const label = `aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}`.toLowerCase();
     return z.string().url().refine((value) => {
         const url = new URL(value);
         return url.protocol === 'https:' && !url.username && !url.password && !url.port
-            && zones.some((zone) => url.hostname === `${label}.${zone}`)
+            && url.hostname === `${label}.${zone}`
             && url.pathname === '/preview-bootstrap' && !!url.searchParams.get('token');
     });
 }
@@ -58,8 +48,15 @@ export async function requestAwsPreview(
     config: CloudflareGuacamoleConfig,
     hmacSecret: string,
     correlationId: string,
+    env: Env = process.env,
 ) {
     if (!config.isConfigured || !hmacSecret.trim()) return unavailable();
+    // The ONLY zone an AWS browser host may sit in: the Worker's configured preview root
+    // (EZIL_AWS_BROWSER_ZONE, the same value enrollment hands the host). Never derived from
+    // the Worker's own host name: `api-desktop-staging.ezil.work` and `api-desktop.ezil.org`
+    // have different shapes, and a derivation that fits one silently refuses the other.
+    const zone = readAwsBrowserZone(env);
+    if (!zone) return unavailable();
     try {
         // ensure may have observed a different epoch; sign a fresh owned placement.
         const { record: placement } = await readPlacement(db, computer.computerId);
@@ -71,7 +68,6 @@ export async function requestAwsPreview(
         const sandboxId = deriveGuacamoleSandboxId(placement.ownerUserId, placement.computerId);
         const endpoint = new URL(`${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`);
         if (endpoint.search || endpoint.hash) return unavailable();
-        const zones = browserZones(endpoint.hostname);
         const body = JSON.stringify({
             sessionId: options.sessionId,
             userId: placement.ownerUserId,
@@ -116,9 +112,9 @@ export async function requestAwsPreview(
             sandboxId: z.literal(sandboxId),
             generation: z.literal(placement.generation),
             leaseEpoch: z.literal(placement.leaseEpoch),
-            guacamoleUrl: bootstrapUrl(8181, sandboxId, zones),
-            appPreviewUrl: bootstrapUrl(3002, sandboxId, zones),
-            codePreviewUrl: bootstrapUrl(8443, sandboxId, zones),
+            guacamoleUrl: bootstrapUrl(8181, sandboxId, zone),
+            appPreviewUrl: bootstrapUrl(3002, sandboxId, zone),
+            codePreviewUrl: bootstrapUrl(8443, sandboxId, zone),
             expiresAt: z.number().int().gt(Date.now()),
             relay: z.object({
                 runtimeId: z.string().regex(/^[a-f0-9]{32}$/),

@@ -5,7 +5,7 @@
  *   1. `withAdmission` — opens the transaction; the global advisory lock is
  *      its FIRST statement, and READ COMMITTED is asserted in that statement.
  *   2. `readAdmissionCounters` — the target computer's owner, running count, the user's other AWS
- *      computers, duplicate placements, this month's usage rows.
+ *      computers, duplicate placements, this month's usage totals.
  *   3. `decideAdmission` — pure, below.
  *   4. On admit: `mintAdmissionTicket`, then `leasePlacement` (STOPPED → LEASED,
  *      lease_epoch + 1, by CAS) or `createAwsPlacement` with that ticket. All
@@ -29,7 +29,7 @@ import {
     type PlacementFields,
 } from './placement';
 import { instanceTypeForTier, isAwsTier, readAwsAdmissionConfig, type AwsAdmissionConfig, type AwsTier, type Env } from './aws-config';
-import { BYTES_PER_GB, summarizeUsage, utcMonthStart } from './usage';
+import { BYTES_PER_GB, usageFor, utcMonthStart } from './usage';
 
 export type AdmissionRefusal =
     | 'aws_disabled'
@@ -89,7 +89,7 @@ export function decideAdmission(input: {
     const { config, counters } = input;
     if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
     const { caps } = config;
-    const usage = summarizeUsage(counters.usage, input.userId, input.now);
+    const usage = usageFor(counters.usage, input.userId);
     const reasons: AdmissionRefusal[] = [];
     // The caller's pair is re-checked here: caps are per user, so admitting
     // for a computer the user does not own would bypass them.

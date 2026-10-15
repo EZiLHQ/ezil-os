@@ -40,9 +40,8 @@ import {
     type PlacementFields,
     type PlacementState,
     type UsageEffect,
-    type UsageRow,
 } from './placement';
-import { summarizeUsage, utcMonthStart } from './usage';
+import { usageFor, utcMonthStart, type MonthUsage } from './usage';
 
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
 export interface LifecycleExecutionReader {
@@ -457,15 +456,15 @@ export interface SessionLimitPolicy {
     now: Date;
     /** Hour caps from the admission config; null when they cannot be read (then only the lease binds). */
     caps: Pick<AwsAdmissionCaps, 'userMonthlyHours' | 'globalMonthlyHours'> | null;
-    /** This month's usage rows, when the caller already read them (a fleet pass reads once). */
-    usage?: readonly UsageRow[];
+    /** This month's usage totals, when the caller already read them (a fleet pass reads once). */
+    usage?: MonthUsage;
 }
 
-export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage: readonly UsageRow[] | null): SessionLimit | null {
+export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage: MonthUsage | null): SessionLimit | null {
     if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return null;
     if (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime()) return 'lease_expired';
     if (policy.caps && usage) {
-        const totals = summarizeUsage(usage, p.ownerUserId.toLowerCase(), policy.now);
+        const totals = usageFor(usage, p.ownerUserId);
         if (totals.user.hours >= policy.caps.userMonthlyHours) return 'user_hours_cap';
         if (totals.global.hours >= policy.caps.globalMonthlyHours) return 'global_hours_cap';
     }
