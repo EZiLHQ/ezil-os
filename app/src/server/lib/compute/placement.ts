@@ -133,12 +133,22 @@ export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly Pla
  */
 export const RECONCILER_TRANSITIONS: Readonly<Partial<Record<PlacementState, readonly PlacementState[]>>> = {
     RUNNING: ['STOPPED'],
+    // UNCONFIRMED / RECOVERING → RETIRED: the RELEASE of a placement that owns nothing to
+    // keep (aws-receipts.ts `settleUnconfirmedAwsPlacement`): no instance and no volume
+    // exist for it, proven by EC2 (a tag search for a placement that recorded no ids, or
+    // its recorded instance AND volume both gone). One step, guarded on the same instance
+    // id; the usage row is closed in the same transaction. Nothing is retained, so it then
+    // goes PURGE_ELIGIBLE at once, freeing the user's AWS-computer allowance.
+    UNCONFIRMED: ['RETIRED'],
+    RECOVERING: ['RETIRED'],
 };
 
 /** `last_error` of a placement whose instance was lost while its data volume survives: the next open replaces. */
 export const INSTANCE_LOST = 'instance_lost';
 /** `last_error` of a placement whose instance was lost AND whose data volume is gone: nothing to boot onto. */
 export const INSTANCE_LOST_VOLUME_MISSING = 'instance_lost_volume_missing';
+/** `last_error` of a placement released with nothing to keep: EC2 shows no instance and no volume for it. */
+export const RELEASED_NO_RESOURCES = 'released_no_resources';
 
 // ── Errors ───────────────────────────────────────────────────────────────
 

@@ -248,7 +248,30 @@ export interface Ec2VolumeDescriber {
     describeVolume(region: string, volumeId: string): Promise<Ec2VolumeView | null>;
 }
 
-export function createEc2EnrollmentDescriber(ec2For: (region: string) => RegionalClient): Ec2EnrollmentDescriber & Ec2VolumeDescriber {
+/**
+ * Every EC2 resource tagged with one computer's id (`ezil:computer-id`, set by the lifecycle
+ * helper on each instance and volume it creates), in one region: the evidence a placement
+ * that recorded NO resource ids (a provision that failed before any id was recorded) owns
+ * none, before it is released (aws-receipts.ts `settleUnconfirmedAwsPlacement`).
+ * Terminated instances and deleted volumes are gone and not listed. A listing too large to
+ * read in full throws: a partial answer is never evidence of "none".
+ */
+export interface Ec2ComputerResources {
+    instances: { instanceId: string; state: string }[];
+    volumes: { volumeId: string; state: string }[];
+}
+
+export interface Ec2ComputerResourceFinder {
+    findComputerResources(region: string, computerId: string): Promise<Ec2ComputerResources>;
+}
+
+/** Pages read per resource kind before a listing is refused as too large to be evidence. */
+const RESOURCE_SEARCH_MAX_PAGES = 10;
+const COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function createEc2EnrollmentDescriber(
+    ec2For: (region: string) => RegionalClient,
+): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder {
     return {
         async describeForEnrollment(region, instanceId) {
             assertRegion(region);
@@ -334,6 +357,46 @@ export function createEc2EnrollmentDescriber(ec2For: (region: string) => Regiona
             if (volumes.length !== 1) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
             return { volumeId, state: volumes[0]!.State ?? 'unknown' };
         },
+
+        async findComputerResources(region, computerId) {
+            assertRegion(region);
+            if (!COMPUTER_ID.test(computerId)) throw new AwsClientError('aws_config', false, 'ComputerIdInvalid');
+            const { client } = ec2For(region);
+            const Filters = [{ Name: 'tag:ezil:computer-id', Values: [computerId] }];
+            const instances: Ec2ComputerResources['instances'] = [];
+            const volumes: Ec2ComputerResources['volumes'] = [];
+            try {
+                let token: string | undefined;
+                for (let page = 0; ; page++) {
+                    if (page >= RESOURCE_SEARCH_MAX_PAGES) throw new AwsClientError('aws_error', false, 'DescribeInstancesTooMany');
+                    const out = (await client.send(new DescribeInstancesCommand({ Filters, MaxResults: 100, NextToken: token }))) as {
+                        Reservations?: { Instances?: { InstanceId?: string; State?: { Name?: string } }[] }[]; NextToken?: string;
+                    };
+                    for (const inst of (out.Reservations ?? []).flatMap((r) => r.Instances ?? [])) {
+                        const state = inst.State?.Name ?? 'unknown';
+                        if (state !== 'terminated') instances.push({ instanceId: inst.InstanceId ?? '', state });
+                    }
+                    token = out.NextToken || undefined;
+                    if (!token) break;
+                }
+                token = undefined;
+                for (let page = 0; ; page++) {
+                    if (page >= RESOURCE_SEARCH_MAX_PAGES) throw new AwsClientError('aws_error', false, 'DescribeVolumesTooMany');
+                    const out = (await client.send(new DescribeVolumesCommand({ Filters, MaxResults: 500, NextToken: token }))) as {
+                        Volumes?: { VolumeId?: string; State?: string }[]; NextToken?: string;
+                    };
+                    for (const v of out.Volumes ?? []) {
+                        const state = v.State ?? 'unknown';
+                        if (state !== 'deleted') volumes.push({ volumeId: v.VolumeId ?? '', state });
+                    }
+                    token = out.NextToken || undefined;
+                    if (!token) break;
+                }
+            } catch (error) {
+                throw toAwsClientError(error);
+            }
+            return { instances, volumes };
+        },
     };
 }
 
@@ -353,7 +416,7 @@ export interface AwsSdkFactories {
 export interface AwsSdkCollaborators {
     starter?: LifecycleStarter;
     executions?: LifecycleExecutionReader;
-    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber;
+    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder;
 }
 
 /**

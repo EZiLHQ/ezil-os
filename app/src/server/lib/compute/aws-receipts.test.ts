@@ -617,8 +617,10 @@ describe('Codex 4276508568: a deleted computer whose stop/retire failed is recov
         row({ state: 'UNCONFIRMED', instance_id: I_NEW, lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null, enroll_expires_at: null,
             last_error: 'failed:States.Timeout', ...over });
     type View = Pick<Ec2EnrollmentView, 'state'> | null | 'throw';
+    /** The retained volume `describeVolume` answers; 'none' = the describer has no volume lookup. */
+    type Vol = { state: string } | null | 'none';
     function bg(rows: Record<string, unknown>[], computers: { id: string; user_id: string; deleted_at?: Date | null }[],
-        opts: { view?: View; exec?: Exec; failStart?: boolean } = {}) {
+        opts: { view?: View; exec?: Exec; failStart?: boolean; volume?: Vol; found?: { instances: { instanceId: string; state: string }[]; volumes: { volumeId: string; state: string }[] } } = {}) {
         const fake = createFakePlacementDb({ placements: rows, computers }, { clock: () => NOW });
         const starts: { region: string; intent: LifecycleIntent }[] = [];
         const control = { view: opts.view === undefined ? ({ state: 'stopped' } as View) : opts.view, failStart: opts.failStart ?? false };
@@ -629,12 +631,15 @@ describe('Codex 4276508568: a deleted computer whose stop/retire failed is recov
             },
         };
         const describes: string[] = [];
+        const volume: Vol = opts.volume === undefined ? { state: 'available' } : opts.volume;
         const describer = {
             async describeForEnrollment(_region: string, instanceId: string) {
                 describes.push(instanceId);
                 if (control.view === 'throw') throw new Error('RequestLimitExceeded');
                 return control.view === null ? null : ({ ...control.view, instanceId } as Ec2EnrollmentView);
             },
+            ...(volume === 'none' ? {} : { describeVolume: async (_r: string, volumeId: string) => (volume ? { volumeId, ...volume } : null) }),
+            ...(opts.found ? { findComputerResources: async () => opts.found! } : {}),
         };
         const tunnels: TunnelClient = { createTunnel: async () => ({ ok: true, tunnelToken: 'tok-' + 'x'.repeat(30) }), deleteTunnel: async () => ({ ok: true }) };
         let n = 0;
@@ -689,11 +694,40 @@ describe('Codex 4276508568: a deleted computer whose stop/retire failed is recov
         expect(b.placements[0]).toMatchObject({ state: 'RETIRING' });
     });
 
-    it('an instance EC2 no longer knows is reported stuck (operator purge), with no job started', async () => {
-        const b = bg([stuck()], DELETED, { view: null });
+    it('an instance EC2 no longer knows, with no volume lookup, is reported stuck (operator purge), with no job started', async () => {
+        const b = bg([stuck()], DELETED, { view: null, volume: 'none' });
         expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 0, stuck: 1 });
         expect(b.starts).toEqual([]);
         expect(b.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('Codex 4278130057: the instance is gone but its retained volume is available → retired (the retire job accepts an absent source)', async () => {
+        const b = bg([stuck()], DELETED, { view: null });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 1, retired: 0, stuck: 0 });
+        expect(b.starts.map((x) => x.intent.operation)).toEqual(['retire']);
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+
+    it('the instance AND its volume are gone → released: RETIRED then PURGE_ELIGIBLE, no job, counted retired', async () => {
+        const b = bg([stuck()], DELETED, { view: null, volume: null });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 1, stuck: 0 });
+        expect(b.starts).toEqual([]);
+        expect(b.placements[0]).toMatchObject({ state: 'PURGE_ELIGIBLE', last_error: 'released_no_resources' });
+    });
+
+    it.each(['in-use', 'error'])('the instance is gone and its volume is %s → stuck, never released', async (state) => {
+        const b = bg([stuck()], DELETED, { view: null, volume: { state } });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ stuck: 1, retired: 0, retiresStarted: 0 });
+        expect(b.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('a deleted failed provision that recorded nothing is released only when the tag search finds nothing', async () => {
+        const none = bg([stuck({ instance_id: null, volume_id: null })], DELETED, { found: { instances: [], volumes: [] } });
+        expect(await reconcileDeletedAwsComputers(none.deps, deployments)).toMatchObject({ retired: 1, stuck: 0 });
+        expect(none.placements[0]).toMatchObject({ state: 'PURGE_ELIGIBLE' });
+        const some = bg([stuck({ instance_id: null, volume_id: null })], DELETED, { found: { instances: [{ instanceId: 'i-9', state: 'running' }], volumes: [] } });
+        expect(await reconcileDeletedAwsComputers(some.deps, deployments)).toMatchObject({ retired: 0, stuck: 1 });
+        expect(some.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
     });
 
     it('a refused StartExecution returns it to UNCONFIRMED (retire_start_failed, job cleared); the next pass retries', async () => {
@@ -708,7 +742,7 @@ describe('Codex 4276508568: a deleted computer whose stop/retire failed is recov
     it('rows that cannot progress never starve the rest: the pass rotates past them', async () => {
         const Cn = (i: number) => `c4c4c4c4-c4c4-4c4c-8c4c-${String(i).padStart(12, '0')}`;
         const rows = [1, 2, 3].map((i) => stuck({ computer_id: Cn(i), updated_at: new Date(NOW.getTime() - (10 - i) * 60_000) }));
-        const b = bg(rows, [1, 2, 3].map((i) => ({ id: Cn(i), user_id: U1, deleted_at: NOW })), { view: null });
+        const b = bg(rows, [1, 2, 3].map((i) => ({ id: Cn(i), user_id: U1, deleted_at: NOW })), { view: null, volume: 'none' });
         expect(await reconcileDeletedAwsComputers(b.deps, deployments, 2)).toMatchObject({ checked: 2, stuck: 2 });
         expect(await reconcileDeletedAwsComputers(b.deps, deployments, 2)).toMatchObject({ checked: 2, stuck: 2 });
         expect(new Set(b.describes)).toEqual(new Set([I_NEW]));
