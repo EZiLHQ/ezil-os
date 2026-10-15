@@ -2,9 +2,17 @@
 Description=EZiL: host edge (gateway contract GW-2/GW-3) - cloudflared's only ingress target; verifies gw1, relays presence and control
 Requires=ezil-enroll.service ezil-agent.service
 After=ezil-enroll.service ezil-agent.service
+# A crashed edge (an OOM kill, an uncaught socket failure) is restarted, at most 20 starts
+# per 10 minutes. Exit 2 is a refusal (runDir/stopping: the agent is stopping this host) and
+# is never restarted, so a restart never undoes a stop.
+StartLimitIntervalSec=600
+StartLimitBurst=20
 [Service]
 Type=simple
 Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
 UMask=0077
 ExecStart=/opt/ezil-host/bin/ezil-host-agent edge
 TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
