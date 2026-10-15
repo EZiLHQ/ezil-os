@@ -447,6 +447,15 @@ jobs:
       - name: Typecheck, test, offline synth
         shell: bash
         run: bash tools/test.sh infra
+      # The host agent (enrollment, guard, edge, tunnel, shutdown, unit restart policy) has its
+      # own suites under infra/host-agent/test. The static + pure-function + loopback-edge suite
+      # runs anywhere; the loop-device/netns/real-desktop suites need a privileged host with the
+      # desktop image and stay in the lead's run-all.sh gate.
+      - name: Host agent units (static, pure functions, loopback edge)
+        shell: bash
+        env:
+          EZIL_HOST_TEST_DIR: ${{ runner.temp }}/ezil-host-units
+        run: sudo -E bash infra/host-agent/test/test-units.sh
 
   tools:
     name: tools (typecheck + unit)
