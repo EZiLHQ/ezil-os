@@ -14,11 +14,11 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
-import type { Ec2VolumeDescriber } from './aws-clients';
+import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
 import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
-import { isDefiniteAwsRefusal, isExecutionAbsent } from './aws-errors';
+import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
@@ -31,6 +31,7 @@ import {
     claimAwsPlacementsToReconcile,
     PlacementIntegrityError,
     readCanaryComputer,
+    RELEASED_NO_RESOURCES,
     readMonthUsage,
     readPlacement,
     transitionPlacementAsReconciler,
@@ -136,9 +137,15 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
  * fixed by the job's digest, so repeating it is idempotent: Step Functions returns the
  * running execution, or the starter treats `ExecutionAlreadyExists` as success.
  * - `started`: it was accepted (on some attempt).
- * - `refused`: AWS answered with a refusal (`isDefiniteAwsRefusal`): nothing runs.
- * - `unknown`: no attempt got an answer (5xx, timeout, connection lost): the execution
- *   may be running. Never treat this as a refusal.
+ * - `refused`: AWS answered with a PERMANENT refusal (a definite, non-retryable error:
+ *   access, validation, capacity): nothing runs and retrying cannot help.
+ * - `unknown`: no attempt got an answer (5xx, timeout, connection lost), so the execution
+ *   may be running, OR every attempt was THROTTLED (an answered 400 ThrottlingException,
+ *   429, RequestLimitExceeded, incl. the OIDC credential fetch): known not started, but
+ *   transient. Either way the job stays recorded and pending — never undone as a refusal:
+ *   the receipt path follows the execution or, once it is settled that none exists,
+ *   re-starts a stop/retire (`settleUnknownStart`), so a mandatory lease or cap stop is
+ *   retried rather than dropped.
  */
 export async function startLifecycleJob(
     starter: LifecycleStarter,
@@ -151,7 +158,9 @@ export async function startLifecycleJob(
             await starter.start(region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
             return 'started';
         } catch (error) {
-            if (isDefiniteAwsRefusal(error)) return 'refused';
+            const e = toAwsClientError(error);
+            // A throttle is definite (nothing ran) but transient: retry it like a lost answer.
+            if (e.definite && !e.retryable) return 'refused';
             if (attempt >= START_ATTEMPTS) return 'unknown';
             await sleep(START_BACKOFF_MS[Math.min(attempt - 1, START_BACKOFF_MS.length - 1)]!);
         }
@@ -311,7 +320,7 @@ export interface GuestStopDeps extends ReceiptDeps {
      * `describeVolume` lets a lost instance be recovered onto its retained volume; without it a
      * lost instance is left for the next look rather than recorded without that check.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder>;
     /** Lower-case uuid v4. */
     newId?: () => string;
     /** Set when the pass's time budget ran out: stop before the next placement. */
@@ -564,37 +573,65 @@ export async function startRetireAsReconciler(deps: GuestStopDeps, p: Placement,
 export const RETIRE_RECONCILE_LIMIT = 20;
 
 /**
- * Recover a DELETED computer's stuck placement (UNCONFIRMED after a failed, timed-out or
- * aborted stop/retire, or RECOVERING left by an interrupted recovery) by retiring it:
- * UNCONFIRMED → RECOVERING → RETIRING with a recorded retire job, then StartExecution.
- * The lifecycle retire resolves any instance state itself (stops a running one, waits
- * on stopping/shutting-down, terminates a stopped one, finishes on a terminated one once
- * the volume is detached), so this does not choose between stop and retire.
+ * Settle an UNCONFIRMED (or RECOVERING) placement so its computer can be deleted: the user's
+ * own `computer.delete` (aws-ec2.ts `terminate`) and the background pass for a computer
+ * already deleted (`recoverDeletedAwsPlacement`) share it. Nothing is ever released while an
+ * instance could still run:
  *
- * 🔴 Only a deleted (or vanished) computer: the computer row is re-read here, and a live
- * computer's UNCONFIRMED placement is left alone (it is the owner's to recover). The
- * instance must still be visible to EC2 describe: an unknown answer (describe failed)
- * waits for the next pass; an instance EC2 no longer knows cannot be verified by the
- * retire and is reported `stuck` (operator purge) instead of failing a job every pass.
- * A refused StartExecution returns the placement to UNCONFIRMED (`retire_start_failed`),
- * so the next pass tries again.
+ * - **Nothing recorded** (no instance id, no volume id: a provision that failed before any id
+ *   was recorded): only a tag search that finds NO instance and NO volume of this computer
+ *   (`findComputerResources`) releases it; anything found is `stuck` for an operator.
+ * - **Recorded instance gone** (EC2 no longer has it, or it is terminated): its retained
+ *   volume decides. Gone too → released. `available` → retired like any other (the retire
+ *   job accepts an absent source once the volume is available and unattached). Anything
+ *   else (`in-use` elsewhere, `error`) is `stuck`; `creating`/`deleting` waits.
+ * - **Recorded instance present**: UNCONFIRMED → RECOVERING → RETIRING with a recorded retire
+ *   job; the retire job resolves any instance state. A refused start returns it to
+ *   UNCONFIRMED (`retire_start_failed`); an unknown or throttled start stays RETIRING.
+ *
+ * `released`: the placement is RETIRED (then PURGE_ELIGIBLE: nothing is retained), the epoch's
+ * tunnel fenced and the usage row closed. `retire_started`: a job that ends the instance is
+ * durably recorded, so a delete may soft-delete (`AWS_RETIREMENT_UNDERWAY`). `skipped`: an
+ * unknown answer or a lost race, try again. `stuck`: only an operator can settle it.
  */
-export async function recoverDeletedAwsPlacement(
+export async function settleUnconfirmedAwsPlacement(
     deps: GuestStopDeps,
     p: Placement,
-    deployment: LifecycleDeployment,
-): Promise<'retire_started' | 'skipped' | 'stuck'> {
-    if ((p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING') || p.provider !== 'aws-ec2' || !deps.starter || !deps.describer) return 'skipped';
-    const computer = await readCanaryComputer(deps.db, p.computerId);
-    if (computer && !computer.deleted) return 'skipped';
-    if (!p.region || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return 'stuck';
+    deployment: LifecycleDeployment | undefined,
+): Promise<'retire_started' | 'released' | 'skipped' | 'stuck'> {
+    if ((p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING') || p.provider !== 'aws-ec2' || !deps.describer) return 'skipped';
+    if (!p.region) return 'stuck';
+    if (!p.instanceId && !p.volumeId) {
+        if (!deps.describer.findComputerResources) return 'stuck';
+        let found;
+        try {
+            found = await deps.describer.findComputerResources(p.region, p.computerId.toLowerCase());
+        } catch {
+            return 'skipped'; // Unknown: try again.
+        }
+        if (found.instances.length > 0 || found.volumes.length > 0) return 'stuck';
+        return (await releaseWithoutResources(deps, p)) ? 'released' : 'skipped';
+    }
+    if (!p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return 'stuck';
     let view;
     try {
         view = await deps.describer.describeForEnrollment(p.region, p.instanceId);
     } catch {
         return 'skipped'; // Unknown: try again on the next pass.
     }
-    if (!view) return 'stuck';
+    if (!view || view.state === 'terminated') {
+        if (!deps.describer.describeVolume) return 'stuck';
+        let volume;
+        try {
+            volume = await deps.describer.describeVolume(p.region, p.volumeId);
+        } catch {
+            return 'skipped';
+        }
+        if (volume === null || volume.state === 'deleted') return (await releaseWithoutResources(deps, p)) ? 'released' : 'skipped';
+        if (volume.state === 'creating' || volume.state === 'deleting') return 'skipped';
+        if (volume.state !== 'available') return 'stuck';
+    }
+    if (!deps.starter || !deployment) return 'skipped';
     let work: LifecycleWork;
     try {
         work = buildLifecycleWork(currentGenerationIntent(p, 'retire', deployment, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
@@ -623,6 +660,48 @@ export async function recoverDeletedAwsPlacement(
     }
     if (outcome === 'unknown') await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: retiring.placement, undo: 'UNCONFIRMED' });
     return 'retire_started';
+}
+
+/**
+ * The release of a placement EC2 shows owns nothing: fence the epoch's tunnel (idempotent;
+ * a failure changes nothing), then ONE compare-and-swap guarded on the same instance id
+ * moves it to RETIRED (`RELEASED_NO_RESOURCES`) and closes any open usage row, then on to
+ * PURGE_ELIGIBLE: no volume is retained, so the user's AWS-computer allowance is freed.
+ */
+async function releaseWithoutResources(deps: GuestStopDeps, p: Placement): Promise<boolean> {
+    if (deps.tunnels) {
+        const fenced = await deps.tunnels
+            .deleteTunnel({ userId: p.ownerUserId }, { computerId: p.computerId.toLowerCase(), sandboxId: awsSandboxId(p.ownerUserId, p.computerId), generation: p.generation, leaseEpoch: p.leaseEpoch })
+            .catch(() => ({ ok: false }));
+        if (!fenced.ok) return false;
+    }
+    const retired = await transitionPlacementAsReconciler(deps.db, {
+        computerId: p.computerId,
+        expected: { generation: p.generation, leaseEpoch: p.leaseEpoch, state: p.state, instanceId: p.instanceId },
+        to: 'RETIRED',
+        fields: { lifecycleJobId: null, lifecycleDigest: null, enrollConsumedHash: null, enrollExpiresAt: null, lastError: RELEASED_NO_RESOURCES },
+        usage: { kind: 'close', observedBy: 'reconcile:released' },
+    });
+    if (!retired.ok) return false;
+    await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: retired.placement, to: 'PURGE_ELIGIBLE' });
+    return true;
+}
+
+/**
+ * A DELETED computer whose stop or retire failed (UNCONFIRMED) or whose recovery was left
+ * RECOVERING: nothing else will ever retry it (the user cannot see it any more), so the
+ * background pass settles it (`settleUnconfirmedAwsPlacement`). A live computer's
+ * placement is never touched here: only its owner's own delete settles it.
+ */
+export async function recoverDeletedAwsPlacement(
+    deps: GuestStopDeps,
+    p: Placement,
+    deployment: LifecycleDeployment,
+): Promise<'retire_started' | 'released' | 'skipped' | 'stuck'> {
+    if ((p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING') || p.provider !== 'aws-ec2' || !deps.describer) return 'skipped';
+    const computer = await readCanaryComputer(deps.db, p.computerId);
+    if (computer && !computer.deleted) return 'skipped';
+    return settleUnconfirmedAwsPlacement(deps, p, deployment);
 }
 
 /**
@@ -656,6 +735,7 @@ export async function reconcileDeletedAwsComputers(
             else if (now.state === 'UNCONFIRMED' || now.state === 'RECOVERING') {
                 const outcome = await recoverDeletedAwsPlacement(deps, now, deployment);
                 if (outcome === 'retire_started') retiresStarted += 1;
+                else if (outcome === 'released') retired += 1;
                 else if (outcome === 'stuck') stuck += 1;
             } else if (await startRetireAsReconciler(deps, now, deployment)) retiresStarted += 1;
         } catch (error) {

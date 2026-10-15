@@ -422,3 +422,42 @@ describe('real SDK clients against a stub HTTP layer (no network)', () => {
         for (const r of ec2Requests) expect(r.headers.authorization).toContain('Credential=ASIAASSUMEDKEY/');
     });
 });
+
+describe('findComputerResources: the evidence an UNCONFIRMED placement that recorded no ids owns nothing (Codex 4278130060)', () => {
+    const CID = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+    const TAG_FILTER = [{ Name: 'tag:ezil:computer-id', Values: [CID] }];
+
+    it('filters by the computer-id tag, pages through both listings, and omits terminated instances and deleted volumes', async () => {
+        const ec2 = fakeSender((c) => {
+            const i = input(c);
+            if (cmdName(c) === 'DescribeInstancesCommand') {
+                return i.NextToken === 'p2'
+                    ? { Reservations: [{ Instances: [{ InstanceId: 'i-2', State: { Name: 'stopped' } }] }] }
+                    : { Reservations: [{ Instances: [{ InstanceId: 'i-1', State: { Name: 'terminated' } }] }], NextToken: 'p2' };
+            }
+            return { Volumes: [{ VolumeId: 'vol-1', State: 'deleted' }, { VolumeId: 'vol-2', State: 'available' }] };
+        });
+        const found = await createEc2EnrollmentDescriber(regional(ec2)).findComputerResources(R, CID);
+        expect(found).toEqual({ instances: [{ instanceId: 'i-2', state: 'stopped' }], volumes: [{ volumeId: 'vol-2', state: 'available' }] });
+        for (const c of ec2.calls) expect(input(c).Filters).toEqual(TAG_FILTER);
+        expect(ec2.calls.filter((c) => cmdName(c) === 'DescribeInstancesCommand')).toHaveLength(2);
+    });
+
+    it('nothing tagged → empty (the only answer that may release a placement)', async () => {
+        const ec2 = fakeSender((c) => (cmdName(c) === 'DescribeInstancesCommand' ? { Reservations: [] } : { Volumes: [] }));
+        expect(await createEc2EnrollmentDescriber(regional(ec2)).findComputerResources(R, CID)).toEqual({ instances: [], volumes: [] });
+    });
+
+    it('a listing too long to read in full throws: a partial answer is never "none"', async () => {
+        const ec2 = fakeSender((c) => (cmdName(c) === 'DescribeInstancesCommand' ? { Reservations: [], NextToken: 'more' } : { Volumes: [] }));
+        await expect(createEc2EnrollmentDescriber(regional(ec2)).findComputerResources(R, CID)).rejects.toMatchObject({ awsName: 'DescribeInstancesTooMany' });
+    });
+
+    it('an AWS failure throws (unknown), and a malformed computer id never reaches EC2', async () => {
+        const failing = fakeSender(() => { throw awsError('RequestLimitExceeded', { $metadata: { httpStatusCode: 400 } }); });
+        await expect(createEc2EnrollmentDescriber(regional(failing)).findComputerResources(R, CID)).rejects.toMatchObject({ code: 'aws_throttled' });
+        const ec2 = fakeSender(() => ({}));
+        await expect(createEc2EnrollmentDescriber(regional(ec2)).findComputerResources(R, 'not-a-uuid')).rejects.toMatchObject({ awsName: 'ComputerIdInvalid' });
+        expect(ec2.calls).toEqual([]);
+    });
+});

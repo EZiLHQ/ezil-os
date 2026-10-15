@@ -50,8 +50,8 @@ import {
     type LifecycleWork,
 } from './aws-intent';
 import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
-import type { Ec2VolumeDescriber } from './aws-clients';
-import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
+import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
+import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 
 export const AWS_DISABLED = 'aws_disabled';
@@ -131,7 +131,7 @@ export interface AwsProviderDeps {
      * Read-only EC2 describe (the enrollment describer). Catches a guest-initiated idle
      * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder>;
     /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
     /** Backoff between StartExecution attempts whose answer was lost; tests inject an instant one. */
@@ -610,7 +610,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
          * ends the instance is durably recorded on the placement: the delete may then
          * soft-delete, and the background reconcile (aws-receipts.ts
          * `reconcileDeletedAwsComputers`, run by the sandbox-reap cron) drives it to
-         * RETIRED. Every other state answers not-ready and the delete is refused.
+         * RETIRED. An UNCONFIRMED/RECOVERING placement (a failed provision, a failed
+         * job) is settled for the delete (`settleUnconfirmedAwsPlacement`): released when
+         * EC2 shows it owns nothing (ok), or retired with a recorded job (retiring).
+         * Every other state answers not-ready and the delete is refused.
          */
         async terminate(_ctx, c): Promise<TerminateResult> {
             const cfg = configured();
@@ -627,13 +630,21 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
                 return startRetire(c, p, deployment);
             }
+            if (p.state === 'UNCONFIRMED' || p.state === 'RECOVERING') {
+                // Never soft-delete while an instance could still run with no job recorded:
+                // released only on EC2's word that nothing exists, else a recorded retire job.
+                const settled = await settleUnconfirmedAwsPlacement(reconcileDeps(), p, cfg.deployments[p.region ?? '']);
+                if (settled === 'released') return { ok: true, terminated: true, outcome: 'released' };
+                if (settled === 'retire_started') return { ok: false, terminated: false, outcome: AWS_RETIRING };
+                return { ok: false, terminated: false, outcome: 'computer_recovering' };
+            }
             const state = AWS_STATE_FOR[p.state];
             if (p.state === 'RETIRING' && p.lifecycleJobId) return { ok: false, terminated: false, outcome: AWS_RETIRING };
             // A recorded stop: once its receipt lands STOPPED, the reconcile retires a deleted computer.
             if ((p.state === 'DRAINING' || p.state === 'STOPPING') && p.lifecycleJobId) return { ok: false, terminated: false, outcome: AWS_RETIRE_AFTER_STOP };
             if (state === 'starting') return { ok: false, terminated: false, outcome: 'computer_starting' };
             if (state === 'stopping') return { ok: false, terminated: false, outcome: 'stopping' };
-            return { ok: false, terminated: false, outcome: p.state === 'RECOVERING' || p.state === 'UNCONFIRMED' ? 'computer_recovering' : 'computer_unavailable' };
+            return { ok: false, terminated: false, outcome: 'computer_unavailable' };
         },
     };
 }

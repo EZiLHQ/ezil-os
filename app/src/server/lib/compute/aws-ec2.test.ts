@@ -14,7 +14,8 @@ import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { nonceHashOf } from './aws-enroll';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { ENROLLMENT_FAILED, PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
+import { ENROLLMENT_FAILED, PLACEMENT_STATES, PlacementOwnerError, readPlacement, RELEASED_NO_RESOURCES, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
+import { AwsClientError } from './aws-errors';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -855,3 +856,175 @@ describe('Codex 4277613510: an open of a computer whose instance EC2 lost replac
         expect(calls).toEqual([]);
     });
 });
+
+describe('Codex 4278130060: a computer whose placement is UNCONFIRMED can be deleted', () => {
+    const me = { userId: U1, computerId: C1 };
+    /** A provision that failed before any id was recorded (e.g. a refused StartExecution, an EC2 capacity failure). */
+    const failedProvision = (over: Record<string, unknown> = {}) =>
+        placementRow({ computer_id: C1, region: 'ap-south-1', state: 'UNCONFIRMED', instance_type: 't3a.medium', instance_id: null, volume_id: null,
+            fs_uuid: FS, fence_token: FENCE, last_error: 'lifecycle_start_failed', ...over });
+    type Found = { instances?: { instanceId: string; state: string }[]; volumes?: { volumeId: string; state: string }[] } | 'throw';
+    const describer = (o: { found?: Found; view?: { state: string } | null; volume?: { state: string } | null } = {}) => {
+        const searches: string[] = [];
+        return {
+            searches,
+            d: {
+                describeForEnrollment: async (_r: string, instanceId: string) => (o.view ? ({ ...o.view, instanceId } as never) : null),
+                describeVolume: async (_r: string, volumeId: string) => (o.volume ? { volumeId, ...o.volume } : null),
+                ...(o.found === undefined ? {} : {
+                    findComputerResources: async (_r: string, computerId: string) => {
+                        searches.push(computerId);
+                        if (o.found === 'throw') throw new Error('RequestLimitExceeded');
+                        return { instances: (o.found as Exclude<Found, 'throw'>).instances ?? [], volumes: (o.found as Exclude<Found, 'throw'>).volumes ?? [] };
+                    },
+                }),
+            },
+        };
+    };
+
+    it('the reported case: a failed provision that recorded nothing, and EC2 shows nothing tagged for it → released; the delete proceeds', async () => {
+        const x = describer({ found: {} });
+        const { provider, placements, calls } = setup({ placements: [failedProvision()] }, { describer: x.d });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: true, terminated: true, outcome: 'released' });
+        expect(x.searches).toEqual([C1]);
+        expect(calls).toEqual([]); // no job: there is nothing to retire
+        // Nothing is retained, so it is PURGE_ELIGIBLE at once: the user's AWS-computer allowance is free.
+        expect(placements[0]).toMatchObject({ state: 'PURGE_ELIGIBLE', last_error: RELEASED_NO_RESOURCES });
+    });
+
+    it.each([
+        ['an instance', { instances: [{ instanceId: 'i-33333333333333333', state: 'running' }] }],
+        ['a volume', { volumes: [{ volumeId: 'vol-33333333333333333', state: 'available' }] }],
+        ['a stopped instance', { instances: [{ instanceId: 'i-33333333333333333', state: 'stopped' }] }],
+    ] as const)('nothing recorded but EC2 still lists %s tagged for it → never released; the delete is refused', async (_n, found) => {
+        const { provider, placements, calls } = setup({ placements: [failedProvision()] }, { describer: describer({ found: found as unknown as Found }).d });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'computer_recovering' });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'lifecycle_start_failed' });
+    });
+
+    it('a tag search that fails is unknown: nothing changes, the delete is refused', async () => {
+        const { provider, placements } = setup({ placements: [failedProvision()] }, { describer: describer({ found: 'throw' }).d });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'computer_recovering' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('without a tag search (no evidence) it is never released', async () => {
+        const { provider, placements } = setup({ placements: [failedProvision()] }, { describer: describer().d });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'computer_recovering' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('with an instance and volume recorded → UNCONFIRMED → RECOVERING → RETIRING with a retire job: the delete proceeds (retiring)', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 2, state: 'UNCONFIRMED', last_error: 'failed:States.Timeout' })] },
+            { describer: describer({ view: { state: 'stopped' } }).d });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: AWS_RETIRING });
+        expect(AWS_RETIREMENT_UNDERWAY).toContain(AWS_RETIRING);
+        expect(calls.map((c) => c.intent.operation)).toEqual(['retire']);
+        expect(placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: calls[0]!.intent.jobId, last_error: null });
+    });
+
+    it('a refused retire start returns it to UNCONFIRMED (retire_start_failed) and refuses the delete', async () => {
+        const { provider, placements } = setup({ placements: [stopped({ lease_epoch: 2, state: 'UNCONFIRMED' })] },
+            { describer: describer({ view: { state: 'stopped' } }).d, failStart: true });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'computer_recovering' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: null, last_error: 'retire_start_failed' });
+    });
+
+    it('the recorded instance AND its volume are both gone → released, no job', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 2, state: 'UNCONFIRMED' })] }, { describer: describer({ view: null, volume: null }).d });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: true, terminated: true, outcome: 'released' });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'PURGE_ELIGIBLE', last_error: RELEASED_NO_RESOURCES });
+    });
+
+    it('the recorded instance is gone but its volume is available → retired (the retire job accepts an absent source)', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 2, state: 'UNCONFIRMED' })] },
+            { describer: describer({ view: null, volume: { state: 'available' } }).d });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ outcome: AWS_RETIRING });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['retire']);
+        expect(placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+
+    it('the recorded instance is gone and its volume is attached elsewhere → never released, refused', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 2, state: 'UNCONFIRMED' })] },
+            { describer: describer({ view: null, volume: { state: 'in-use' } }).d });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'computer_recovering' });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it("another user's computer is never settled (NOT_FOUND upstream)", async () => {
+        const { provider, placements } = setup({ placements: [failedProvision()] }, { describer: describer({ found: {} }).d });
+        await expect(provider.terminate(ctx, { userId: U2, computerId: C1 })).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+});
+
+describe('Codex 4278130068: an answered throttle is retried, never treated as a refusal', () => {
+    const me = { userId: U1, computerId: C1 };
+    const HOUR = 3_600_000;
+    const throttle = (status = 400, name = 'ThrottlingException') => Object.assign(new Error('Rate exceeded'), { name, $metadata: { httpStatusCode: status } });
+    /** `fail`: the first n attempts throw `err()`, or every attempt ('always'). */
+    function throttledStarter(fail: number | 'always', err: () => unknown = () => throttle()) {
+        const calls: { name: string; operation: string }[] = [];
+        const starter: LifecycleStarter = {
+            async start(_region, work) {
+                const envelope = JSON.parse(work.input) as { document: string };
+                calls.push({ name: work.name, operation: (JSON.parse(envelope.document) as LifecycleIntent).operation });
+                if (fail === 'always' || calls.length <= fail) throw err();
+            },
+        };
+        return { starter, calls };
+    }
+
+    it('provision: one throttle, then the retry of the same execution is accepted → started, nothing undone', async () => {
+        const t = throttledStarter(1);
+        const { provider, placements } = setup({}, { starter: t.starter });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(t.calls).toHaveLength(2);
+        expect(new Set(t.calls.map((c) => c.name)).size).toBe(1);
+        expect(placements[0]).toMatchObject({ state: 'PROVISIONING', last_error: null });
+    });
+
+    it.each([
+        [400, 'ThrottlingException'],
+        [429, 'TooManyRequestsException'],
+        [400, 'RequestLimitExceeded'],
+    ] as const)('provision: every attempt throttled (%s %s) → bounded retries, then pending with its job (never UNCONFIRMED)', async (status, name) => {
+        const t = throttledStarter('always', () => throttle(status, name));
+        const { provider, placements } = setup({}, { starter: t.starter });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(t.calls).toHaveLength(START_ATTEMPTS);
+        expect(placements[0]).toMatchObject({ state: 'PROVISIONING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+    });
+
+    it('a throttled OIDC credential fetch (the app caller, answered and definite) is retried like the start itself', async () => {
+        const t = throttledStarter(2, () => new AwsClientError('aws_throttled', true, 'Throttling', true));
+        const { provider, placements } = setup({}, { starter: t.starter });
+        await provider.ensure(ctx, me, opts);
+        expect(t.calls).toHaveLength(3);
+        expect(placements[0]).toMatchObject({ state: 'PROVISIONING', last_error: null });
+    });
+
+    it('a permanent answered refusal (AccessDeniedException 400) is still refused at once, as before', async () => {
+        const t = throttledStarter('always', () => throttle(400, 'AccessDeniedException'));
+        const { provider, placements } = setup({}, { starter: t.starter });
+        await provider.ensure(ctx, me, opts);
+        expect(t.calls).toHaveLength(1);
+        expect(String(placements[0]!.last_error ?? '')).not.toMatch(/^lifecycle_start_unknown/);
+    });
+
+    it('a mandatory hour-cap stop that stays throttled is left pending (DRAINING with its job), never undone to UNCONFIRMED', async () => {
+        const running = stopped({ state: 'RUNNING', lease_epoch: 4, lease_until: new Date(NOW.getTime() + HOUR) });
+        const usage = [{ computer_id: C1, user_id: U1, instance_id: 'i-1', instance_type: 't3a.medium', started_at: new Date(NOW.getTime() - 100 * HOUR), stopped_at: NOW,
+            egress_bytes: null, observed_by: 'x', updated_at: NOW }];
+        const t = throttledStarter('always');
+        const { provider, placements } = setup({ placements: [running], usage }, { starter: t.starter });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'user_hours_cap' });
+        expect(t.calls.map((c) => c.operation)).toEqual(Array(START_ATTEMPTS).fill('stop'));
+        expect(placements[0]).toMatchObject({ state: 'DRAINING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' });
+        expect(placements[0]!.lifecycle_job_id).not.toBeNull();
+    });
+});
+

@@ -148,15 +148,25 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   Cloudflare reap under its own 60-second budget, so an AWS outage never delays or disables the Cloudflare billing
   backstop; past the budget the pass stops before its next placement and reports `aws_reconcile_timeout`) then applies receipts for
   every placement whose computer is soft-deleted or gone, starts the retire of one that reached STOPPED, and fences
-  the tunnel before RETIRED. Booting, recovering and unconfirmed states refuse the delete. A computer with no
+  the tunnel before RETIRED. Booting states refuse the delete. A computer with no
   placement deletes at once. A refused retire `StartExecution` returns to the state it came from and the delete is
   refused. The purge itself is a separate operator action (§6).
   - A deleted computer whose stop or retire then FAILS (UNCONFIRMED), or whose recovery was interrupted
     (RECOVERING), is recovered by the same background pass: it re-checks that the computer is deleted or gone,
     confirms EC2 still knows the instance, then `UNCONFIRMED → RECOVERING → RETIRING` with a new retire job (the
     retire resolves any instance state). A refused start returns it to UNCONFIRMED (`retire_start_failed`) for the
-    next pass; an instance EC2 no longer knows is counted `stuck` for an operator. A LIVE computer's UNCONFIRMED
-    placement is never touched by this path. The pass rotates (`reconciled_at`), so stuck rows never starve others.
+    next pass. A LIVE computer's UNCONFIRMED placement is never touched by this path. The pass rotates
+    (`reconciled_at`), so stuck rows never starve others.
+  - An UNCONFIRMED or RECOVERING placement is settled for a delete (`settleUnconfirmedAwsPlacement`: the owner's
+    own `computer.delete`, and the background pass above for a deleted computer), never released while an instance
+    could still run. A placement that recorded NO instance and NO volume (a provision that failed before any id was
+    recorded) is released only when an EC2 tag search (`ezil:computer-id`, instances not terminated, volumes not
+    deleted, read in full) finds nothing. A recorded instance that EC2 no longer has (or shows terminated) is settled
+    by its retained volume: gone too → released; `available` → retired (the retire job accepts an absent source);
+    `in-use`/`error` → `stuck` for an operator. Otherwise `UNCONFIRMED → RECOVERING → RETIRING` with a recorded
+    retire job, and the delete proceeds as `retiring`. A RELEASE is one reconciler-only compare-and-swap
+    (`UNCONFIRMED | RECOVERING → RETIRED`, `last_error = released_no_resources`, usage row closed, tunnel fenced),
+    then PURGE_ELIGIBLE at once: nothing is retained, so the user's AWS-computer allowance is freed.
 - Lost instance: a RUNNING row whose instance EC2 no longer has, or shows `shutting-down`/`terminated` (an external
   terminate, an EC2 failure), gets no receipt ever. The same looks (`status`, `ensure`, the fleet pass) describe its
   data volume (`DescribeVolumes`), fence the epoch's tunnel, then in ONE reconciler-only compare-and-swap close the
@@ -248,6 +258,11 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   the same name, and a provision or wake (whose input carries the never-stored enrollment nonce) moves to the undo
   state a refusal would have left (`lifecycle_start_failed`). This covers provision, wake, stop and retire, from the
   provider and from the reconciler.
+- An answered THROTTLE (400 `ThrottlingException`/`RequestLimitExceeded`, 429, a throttled OIDC credential fetch) is
+  definite (nothing ran) but transient: it gets the same bounded retries, never the refusal undo. If every attempt is
+  throttled the job stays recorded as above (`lifecycle_start_unknown:<undo>`), so a mandatory lease or hour-cap
+  stop is re-started by the settle path rather than dropped. Only a definite, non-retryable answer (access,
+  validation, capacity) is a refusal.
 
 **Errors**
 - Capacity and quota errors fail fast.
