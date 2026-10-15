@@ -40,6 +40,7 @@
  * per window-open, instead.
  */
 
+import { readBillingConfig, type BillingConfig } from '@/server/billing/config';
 import type { NativeRuntime } from '../../../../native/src/contract';
 
 /** Structural input keeps this shared transport independent of database packages. */
@@ -273,6 +274,22 @@ export interface ShellBootPayload {
     computer: ShellBootComputer;
     apps: readonly ShellBootApp[];
     desktopState: ShellDesktopState;
+    /**
+     * Opt-in shell features. ABSENT unless one is on, so a deploy with every
+     * billing flag unset serves exactly the payload it did before billing
+     * existed (docs/billing/CONTRACT.md §6).
+     */
+    features?: ShellBootFeatures;
+}
+
+export interface ShellBootFeatures {
+    /** Settings → Billing tab (`BILLING_TAB_ENABLED=1`). */
+    billing: true;
+}
+
+/** `features` for the current environment, or undefined when none is on. */
+export function shellBootFeatures(config: BillingConfig = readBillingConfig()): ShellBootFeatures | undefined {
+    return config.tabEnabled ? { billing: true } : undefined;
 }
 
 /** The same payload with no computer — the read-only `GET /api/shell/session` answer. */
@@ -315,11 +332,13 @@ export function buildShellBootPayload(input: {
     isNew: boolean;
     provider: DesktopProviderInfo | null;
 }): ShellBootPayload {
+    const features = shellBootFeatures();
     return {
         user: toShellBootUser(input.user),
         computer: toShellBootComputer(input.computer, input.isNew),
         apps: SHELL_APPS,
         desktopState: toShellDesktopState(input.provider),
+        ...(features ? { features } : {}),
     };
 }
 

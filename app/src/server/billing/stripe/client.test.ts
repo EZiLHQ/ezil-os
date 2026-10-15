@@ -1,0 +1,551 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
+import type { CheckoutRequest } from '../ports';
+import { createStripeClient, StripeRequestError } from './client';
+
+const secretKey = 'sk_test_client_fixture';
+const start = 1_799_000_000;
+const end = 1_801_000_000;
+const checkoutResult = { id: 'cs_fixture', url: 'https://checkout.stripe.com/fixture', clientSecret: null };
+const checkoutRequest: CheckoutRequest = {
+    customerId: 'cus_fixture',
+    userId: 'user_fixture',
+    sku: 'pro_monthly_v1',
+    uiMode: 'hosted',
+    automaticTax: true,
+    returnUrl: 'https://example.com/billing/return?session_id={CHECKOUT_SESSION_ID}',
+    successUrl: 'https://example.com/billing/return?session_id={CHECKOUT_SESSION_ID}&source=billing',
+    cancelUrl: 'https://example.com/settings?tab=billing',
+    idempotencyKey: 'checkout_fixture',
+};
+const customerRequest = { userId: 'user_fixture', email: 'billing+test@example.com', idempotencyKey: 'customer_fixture' };
+
+function fixture(payload: unknown, opts: { priceProMonthly?: string; apiVersion?: string } = {}) {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json(payload));
+    const client = createStripeClient({ secretKey, fetch: fetcher, ...opts });
+    return { client, fetcher };
+}
+
+function inspect(fetcher: ReturnType<typeof fixture>['fetcher'], index = 0) {
+    const [url, init] = fetcher.mock.calls[index];
+    const body = new URLSearchParams(String(init?.body ?? ''));
+    return { url, init, headers: new Headers(init?.headers), body: Object.fromEntries(body), size: body.size };
+}
+
+function commonCheckout(sku = checkoutRequest.sku) {
+    return {
+        customer: checkoutRequest.customerId,
+        client_reference_id: checkoutRequest.userId,
+        'metadata[sku]': sku,
+        'automatic_tax[enabled]': 'true',
+        'customer_update[address]': 'auto',
+        'customer_update[name]': 'auto',
+        billing_address_collection: 'auto',
+        'payment_method_types[0]': 'card',
+        'payment_method_types[1]': 'link',
+        'adaptive_pricing[enabled]': 'false',
+        'saved_payment_method_options[payment_method_save]': 'enabled',
+        success_url: checkoutRequest.successUrl,
+        cancel_url: checkoutRequest.cancelUrl,
+    };
+}
+
+function inlinePro() {
+    return {
+        ...commonCheckout(),
+        mode: 'subscription',
+        'line_items[0][quantity]': '1',
+        'line_items[0][price_data][currency]': 'usd',
+        'line_items[0][price_data][unit_amount]': '2000',
+        'line_items[0][price_data][recurring][interval]': 'month',
+        'line_items[0][price_data][tax_behavior]': 'exclusive',
+        'line_items[0][price_data][product_data][name]': 'EZiL Pro',
+        'subscription_data[metadata][sku]': 'pro_monthly_v1',
+    };
+}
+
+const subscription = {
+    id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancel_at_period_end: true,
+    metadata: { sku: 'pro_monthly_v1', user_id: 'untrusted_user' },
+};
+const expectedSubscription = {
+    id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancelAtPeriodEnd: true,
+    currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000), sku: 'pro_monthly_v1',
+};
+const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20 };
+const expectedInvoice = {
+    id: 'in_fixture', customer: 'cus_fixture', status: 'paid', subscriptionId: 'sub_fixture',
+    periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
+};
+const session = {
+    id: 'cs_fixture', customer: 'cus_fixture', client_reference_id: 'user_fixture',
+    mode: 'payment', status: 'complete', payment_status: 'paid', payment_intent: 'pi_fixture',
+    metadata: { sku: 'ai_pack_10_v1', user_id: 'untrusted_user' },
+};
+const expectedSession = {
+    id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: 'user_fixture',
+    mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_pack_10_v1',
+};
+const charge = {
+    id: 'ch_fixture', customer: 'cus_fixture', invoice: 'in_fixture', payment_intent: 'pi_fixture',
+    amount: 1084, amount_refunded: 500, refunded: false,
+};
+const expectedCharge = {
+    id: 'ch_fixture', customer: 'cus_fixture', invoiceId: 'in_fixture', paymentIntentId: 'pi_fixture',
+    amount: 1084, amountRefunded: 500, refunded: false,
+};
+
+describe('createStripeClient requests', () => {
+    it('creates a customer with informational metadata and an optional email', async () => {
+        const { client, fetcher } = fixture({ id: 'cus_fixture', metadata: { user_id: 'untrusted_user' } });
+        expect(await client.createCustomer(customerRequest)).toEqual({ id: 'cus_fixture' });
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/customers');
+        expect(sent.init?.method).toBe('POST');
+        expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
+        expect(sent.headers.get('Idempotency-Key')).toBe(customerRequest.idempotencyKey);
+        expect(sent.body).toEqual({ 'metadata[user_id]': 'user_fixture', email: customerRequest.email });
+
+        expect(await client.createCustomer({ ...customerRequest, email: null })).toEqual({ id: 'cus_fixture' });
+        expect(inspect(fetcher, 1).body).toEqual({ 'metadata[user_id]': 'user_fixture' });
+    });
+
+    it('encodes the complete inline Pro checkout form', async () => {
+        const { client, fetcher } = fixture(checkoutResult);
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual(checkoutResult);
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/checkout/sessions');
+        expect(sent.init?.method).toBe('POST');
+        expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
+        expect(sent.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
+        expect(sent.body).toEqual(inlinePro());
+        expect(sent.size).toBe(Object.keys(inlinePro()).length);
+    });
+
+    it('keeps embedded and hosted redirect parameters mutually exclusive', async () => {
+        const { client, fetcher } = fixture({ id: 'cs_embedded', client_secret: 'cs_embedded_secret_fixture' });
+        expect(await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded' })).toEqual({
+            id: 'cs_embedded', url: null, clientSecret: 'cs_embedded_secret_fixture',
+        });
+        const embedded = inspect(fetcher);
+        const { success_url, cancel_url, ...shared } = inlinePro();
+        expect(embedded.body).toEqual({
+            ...shared, ui_mode: 'embedded_page', return_url: checkoutRequest.returnUrl, redirect_on_completion: 'if_required',
+        });
+        expect(embedded.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
+        expect(embedded.body).not.toHaveProperty('success_url');
+        expect(embedded.body).not.toHaveProperty('cancel_url');
+
+        fetcher.mockResolvedValueOnce(Response.json(checkoutResult));
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual(checkoutResult);
+        const hosted = inspect(fetcher, 1).body;
+        expect(hosted).toEqual(inlinePro());
+        expect(hosted).toMatchObject({ success_url, cancel_url });
+        for (const key of ['ui_mode', 'return_url', 'redirect_on_completion']) {
+            expect(embedded.body).toHaveProperty(key);
+            expect(hosted).not.toHaveProperty(key);
+        }
+        for (const body of [embedded.body, hosted]) {
+            expect(body).toHaveProperty('saved_payment_method_options[payment_method_save]', 'enabled');
+            expect(body).not.toHaveProperty('allow_promotion_codes');
+        }
+    });
+
+    it('normalizes missing checkout fields to null while preserving provided fields', async () => {
+        const { client, fetcher } = fixture({ id: 'cs_fixture' });
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual({ id: 'cs_fixture', url: null, clientSecret: null });
+        fetcher.mockResolvedValueOnce(Response.json({ id: 'cs_fixture', url: checkoutResult.url, client_secret: 'secret_fixture' }));
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual({ ...checkoutResult, clientSecret: 'secret_fixture' });
+    });
+
+    it('lists invoices for one encoded customer and maps descriptions and nullable fields', async () => {
+        const base = { ...invoice, amount_paid: 2000, currency: 'usd', created: start };
+        const { client, fetcher } = fixture({ data: [
+            { ...base, number: 'INV-1', hosted_invoice_url: 'https://invoice.stripe.com/fixture', description: 'Invoice description', lines: { data: [{ description: 'Line description' }] } },
+            { ...base, id: 'in_line', number: null, hosted_invoice_url: null, description: null, lines: { data: [{ description: 'EZiL Pro' }] } },
+            { ...base, id: 'in_empty', status: 'draft', amount_paid: 0, lines: { data: [] } },
+            { ...base, id: 'in_no_lines' },
+        ] });
+        const mapped = { id: base.id, number: null, status: 'paid', amountPaidCents: 2000, currency: 'usd', created: new Date(start * 1000), hostedInvoiceUrl: null, description: null };
+        expect(await client.listInvoices('cus_fixture&limit=99', 12)).toEqual([
+            { ...mapped, number: 'INV-1', hostedInvoiceUrl: 'https://invoice.stripe.com/fixture', description: 'Invoice description' },
+            { ...mapped, id: 'in_line', description: 'EZiL Pro' },
+            { ...mapped, id: 'in_empty', status: 'draft', amountPaidCents: 0 },
+            { ...mapped, id: 'in_no_lines' },
+        ]);
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/invoices?customer=cus_fixture%26limit%3D99&limit=12');
+        expect(sent.init?.method).toBe('GET');
+        expect(sent.body).toEqual({});
+        fetcher.mockResolvedValueOnce(Response.json({ data: [] }));
+        expect(await client.listInvoices('cus_fixture', 12)).toEqual([]);
+    });
+
+    it.each([
+        { sku: 'ai_pack_10_v1', credit: '1000', fee: '84' },
+        { sku: 'ai_pack_25_v1', credit: '2500', fee: '161' },
+    ])('encodes separate credits and service fee items for $sku', async ({ sku, credit, fee }) => {
+        const { client, fetcher } = fixture(checkoutResult, { priceProMonthly: 'price_pro_fixture' });
+        expect(await client.createCheckoutSession({ ...checkoutRequest, sku })).toEqual(checkoutResult);
+        const expected = {
+            ...commonCheckout(sku),
+            mode: 'payment',
+            'line_items[0][quantity]': '1',
+            'line_items[0][price_data][currency]': 'usd',
+            'line_items[0][price_data][unit_amount]': credit,
+            'line_items[0][price_data][tax_behavior]': 'exclusive',
+            'line_items[0][price_data][product_data][name]': 'AI credits',
+            'line_items[1][quantity]': '1',
+            'line_items[1][price_data][currency]': 'usd',
+            'line_items[1][price_data][unit_amount]': fee,
+            'line_items[1][price_data][tax_behavior]': 'exclusive',
+            'line_items[1][price_data][product_data][name]': 'Service fee',
+            'payment_intent_data[metadata][sku]': sku,
+        };
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/checkout/sessions');
+        expect(sent.init?.method).toBe('POST');
+        expect(sent.body).toEqual(expected);
+        expect(sent.size).toBe(Object.keys(expected).length);
+        expect(sent.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
+        expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+    });
+
+    it('uses a configured Pro price in place of inline price data', async () => {
+        const inline = fixture(checkoutResult);
+        expect(await inline.client.createCheckoutSession(checkoutRequest)).toEqual(checkoutResult);
+        expect(inspect(inline.fetcher).body).toEqual(inlinePro());
+
+        const { client, fetcher } = fixture(checkoutResult, { priceProMonthly: 'price_pro_fixture' });
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual(checkoutResult);
+        expect(inspect(fetcher).body).toEqual({
+            ...commonCheckout(), mode: 'subscription',
+            'line_items[0][quantity]': '1', 'line_items[0][price]': 'price_pro_fixture',
+            'subscription_data[metadata][sku]': 'pro_monthly_v1',
+        });
+    });
+
+    it.each(['unknown_sku', 'free_v1', '', 'PRO_MONTHLY_V1'])('rejects SKU %s before making a request', async sku => {
+        const { client, fetcher } = fixture(checkoutResult);
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual(checkoutResult);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        fetcher.mockClear();
+        await expect(client.createCheckoutSession({ ...checkoutRequest, sku })).rejects.toThrow('Unknown billing SKU');
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it('creates a portal session with its return URL and an explicit version override', async () => {
+        const { client, fetcher } = fixture({ id: 'bps_fixture', url: 'https://billing.stripe.com/fixture' }, { apiVersion: '2024-06-20' });
+        expect(await client.createPortalSession({ customerId: 'cus_fixture', returnUrl: checkoutRequest.cancelUrl }))
+            .toEqual({ url: 'https://billing.stripe.com/fixture' });
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/billing_portal/sessions');
+        expect(sent.init?.method).toBe('POST');
+        expect(sent.body).toEqual({ customer: 'cus_fixture', return_url: checkoutRequest.cancelUrl });
+        expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+        expect(sent.headers.get('Stripe-Version')).toBe('2024-06-20');
+    });
+});
+
+describe('Stripe response mapping', () => {
+    it.each([
+        { name: 'legacy', current_period_start: start, current_period_end: end },
+        { name: 'modern', items: { data: [{ current_period_start: start, current_period_end: end }] } },
+        { name: 'null legacy', current_period_start: null, current_period_end: null, items: { data: [{ current_period_start: start, current_period_end: end }] } },
+        { name: 'legacy precedence', current_period_start: start, current_period_end: end, items: { data: [{ current_period_start: 10, current_period_end: 20 }] } },
+    ])('maps $name subscription periods', async shape => {
+        const { client, fetcher } = fixture({ ...subscription, ...shape, customer: { id: 'cus_fixture' } });
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual(expectedSubscription);
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/subscriptions/sub_fixture');
+        expect(sent.init?.method).toBe('GET');
+        expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.init?.body).toBeUndefined();
+    });
+
+    it('preserves epoch dates and leaves absent subscription periods and SKU null', async () => {
+        const { client, fetcher } = fixture({ ...subscription, current_period_start: 0, current_period_end: end });
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription, currentPeriodStart: new Date(0) });
+        fetcher.mockResolvedValueOnce(Response.json({ ...subscription, metadata: null, items: { data: [] } }));
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual({
+            ...expectedSubscription, currentPeriodStart: null, currentPeriodEnd: null, sku: null,
+        });
+    });
+
+    it.each([
+        { name: 'legacy', ownership: { subscription: 'sub_fixture' }, line: { subscription: 'sub_fixture' } },
+        {
+            name: 'modern',
+            ownership: { subscription: null, parent: { subscription_details: { subscription: { id: 'sub_fixture' } } } },
+            line: { parent: { type: 'subscription_item_details', subscription_item_details: { subscription: { id: 'sub_fixture' } } } },
+        },
+        { name: 'legacy line type', ownership: { subscription: { id: 'sub_fixture' } }, line: { type: 'subscription' } },
+        {
+            name: 'modern line type', ownership: { parent: { subscription_details: { subscription: 'sub_fixture' } } },
+            line: { parent: { type: 'subscription_item_details' } },
+        },
+    ])('maps the $name invoice subscription line instead of a leading adjustment', async ({ ownership, line }) => {
+        const { client, fetcher } = fixture({
+            ...invoice, ...ownership, customer: { id: 'cus_fixture' },
+            lines: { data: [
+                { type: 'invoiceitem', period: { start: 30, end: 40 } },
+                { type: 'subscription', subscription: 'sub_other', period: { start: 50, end: 60 } },
+                { ...line, period: { start, end } },
+            ] },
+        });
+        expect(await client.retrieveInvoice('in_fixture')).toEqual(expectedInvoice);
+        expect(inspect(fetcher).url).toBe('https://api.stripe.com/v1/invoices/in_fixture');
+        expect(inspect(fetcher).init?.method).toBe('GET');
+    });
+
+    it.each([
+        { subscription: null, lines: { data: [{ type: 'invoiceitem', period: { start, end } }] } },
+        { subscription: 'sub_fixture', lines: { data: [{ subscription: 'sub_other', period: { start, end } }] } },
+        { subscription: 'sub_fixture', lines: { data: [] } },
+        { subscription: 'sub_fixture' },
+    ])('leaves invoice periods null without a subscription line %#', async shape => {
+        const { client, fetcher } = fixture({
+            ...invoice, subscription: 'sub_fixture', lines: { data: [{ subscription: 'sub_fixture', period: { start, end } }] },
+        });
+        expect(await client.retrieveInvoice('in_fixture')).toEqual(expectedInvoice);
+        fetcher.mockResolvedValueOnce(Response.json({ ...invoice, ...shape }));
+        expect(await client.retrieveInvoice('in_fixture')).toEqual({
+            ...expectedInvoice, subscriptionId: shape.subscription, periodStart: null, periodEnd: null,
+        });
+    });
+
+    it.each([false, true])('maps checkout references with expansion=%s', async expanded => {
+        const { client, fetcher } = fixture({
+            ...session, customer: expanded ? { id: 'cus_fixture' } : 'cus_fixture',
+            payment_intent: expanded ? { id: 'pi_fixture' } : 'pi_fixture',
+        });
+        expect(await client.retrieveCheckoutSession('cs_fixture')).toEqual(expectedSession);
+        expect(inspect(fetcher).url).toBe('https://api.stripe.com/v1/checkout/sessions/cs_fixture');
+        expect(inspect(fetcher).init?.method).toBe('GET');
+    });
+
+    it('never substitutes metadata for the checkout client reference', async () => {
+        const { client, fetcher } = fixture(session);
+        expect(await client.retrieveCheckoutSession('cs_fixture')).toEqual(expectedSession);
+        fetcher.mockResolvedValueOnce(Response.json({
+            ...session, customer: null, client_reference_id: null, payment_intent: null,
+            metadata: { user_id: 'untrusted_user' },
+        }));
+        expect(await client.retrieveCheckoutSession('cs_fixture')).toEqual({
+            ...expectedSession, customer: null, clientReferenceId: null, paymentIntentId: null, sku: null,
+        });
+    });
+
+    it.each([false, true])('maps charge references and refund amounts with expansion=%s', async expanded => {
+        const { client, fetcher } = fixture({
+            ...charge, customer: expanded ? { id: 'cus_fixture' } : 'cus_fixture',
+            invoice: expanded ? { id: 'in_fixture' } : 'in_fixture',
+            payment_intent: expanded ? { id: 'pi_fixture' } : 'pi_fixture',
+        });
+        expect(await client.retrieveCharge('ch_fixture')).toEqual(expectedCharge);
+        expect(inspect(fetcher).url).toBe('https://api.stripe.com/v1/charges/ch_fixture');
+        expect(inspect(fetcher).init?.method).toBe('GET');
+        fetcher.mockResolvedValueOnce(Response.json({ ...charge, customer: null, invoice: null, payment_intent: null, amount_refunded: 1084, refunded: true }));
+        expect(await client.retrieveCharge('ch_fixture')).toEqual({
+            ...expectedCharge, customer: null, invoiceId: null, paymentIntentId: null, amountRefunded: 1084, refunded: true,
+        });
+    });
+
+    it('finds the invoice of a charge through Invoice Payments when the charge no longer names it', async () => {
+        const { client, fetcher } = fixture(charge);
+        fetcher.mockReset();
+        fetcher.mockResolvedValueOnce(Response.json({ ...charge, invoice: undefined, payment_intent: 'pi_fixture' }));
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ invoice: 'in_from_payments' }] }));
+        expect(await client.retrieveCharge('ch_fixture')).toEqual({ ...expectedCharge, invoiceId: 'in_from_payments' });
+        const second = fetcher.mock.calls[1][0] as string;
+        expect(second).toBe('https://api.stripe.com/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=pi_fixture&limit=1');
+        // Positive control: a charge that still names its invoice makes no second request.
+        fetcher.mockReset();
+        fetcher.mockResolvedValueOnce(Response.json(charge));
+        await client.retrieveCharge('ch_fixture');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it('encodes resource ids as a single path segment', async () => {
+        const { client, fetcher } = fixture(charge);
+        expect(await client.retrieveCharge('ch_fixture/other?expand[]=customer')).toEqual(expectedCharge);
+        expect(inspect(fetcher).url).toBe('https://api.stripe.com/v1/charges/ch_fixture%2Fother%3Fexpand%5B%5D%3Dcustomer');
+    });
+
+    it('rejects missing required customers while accepting expanded customers', async () => {
+        const { client, fetcher } = fixture({ ...subscription, customer: { id: 'cus_fixture' }, current_period_start: start, current_period_end: end });
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual(expectedSubscription);
+        fetcher.mockResolvedValueOnce(Response.json({ ...subscription, customer: null }));
+        await expect(client.retrieveSubscription('sub_fixture')).rejects.toThrow('Stripe response is missing its customer');
+    });
+});
+
+describe('Stripe request failures', () => {
+    it.each([
+        { status: 402, code: 'card_declined', type: 'card_error' },
+        { status: 400, code: 'parameter_missing', type: 'invalid_request_error' },
+    ])('maps HTTP $status without echoing credentials', async ({ status, code, type }) => {
+        const { client, fetcher } = fixture({ id: 'cus_fixture' });
+        expect(await client.createCustomer(customerRequest)).toEqual({ id: 'cus_fixture' });
+        fetcher.mockResolvedValueOnce(Response.json({ error: {
+            code, type, message: `Authorization: Bearer ${secretKey}`,
+        } }, { status, statusText: `Authorization: Bearer ${secretKey}` }));
+        const error: unknown = await client.createCustomer(customerRequest).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(StripeRequestError);
+        expect(error).toMatchObject({ name: 'StripeRequestError', status, code, type });
+        // Stripe's own message is kept for diagnosis, scrubbed of any credential.
+        expect((error as Error).message).toMatch(new RegExp(`^Stripe request failed \\(HTTP ${status}\\)`));
+        expect(inspect(fetcher, 1).headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+        expect(String(error)).not.toContain(secretKey);
+        expect(String(error)).not.toContain('Authorization');
+        expect(String(error)).not.toContain('Bearer');
+    });
+
+    it('keeps Stripe\'s parameter and message for diagnosis (positive control for the scrubbing above)', async () => {
+        const { client, fetcher } = fixture({ id: 'cus_fixture' });
+        fetcher.mockResolvedValueOnce(Response.json({ error: {
+            type: 'invalid_request_error', param: 'ui_mode', message: 'Invalid ui_mode: embedded_page.',
+        } }, { status: 400 }));
+        const error = await client.createCustomer(customerRequest).catch((e: unknown) => e) as StripeRequestError;
+        expect(error.param).toBe('ui_mode');
+        expect(error.message).toBe('Stripe request failed (HTTP 400) on ui_mode: Invalid ui_mode: embedded_page.');
+    });
+
+    it.each(['not json', '{}', '{"error":{"code":42,"type":false}}', 'null'])('maps malformed HTTP errors to null codes: %s', async body => {
+        const { client, fetcher } = fixture(charge);
+        expect(await client.retrieveCharge('ch_fixture')).toEqual(expectedCharge);
+        fetcher.mockResolvedValueOnce(new Response(body, { status: 500 }));
+        await expect(client.retrieveCharge('ch_fixture')).rejects.toMatchObject({
+            name: 'StripeRequestError', status: 500, code: null, type: null,
+        });
+    });
+
+    it('propagates a network error unchanged', async () => {
+        const { client, fetcher } = fixture(charge);
+        expect(await client.retrieveCharge('ch_fixture')).toEqual(expectedCharge);
+        const failure = new TypeError('fixture network failure');
+        fetcher.mockRejectedValueOnce(failure);
+        await expect(client.retrieveCharge('ch_fixture')).rejects.toBe(failure);
+    });
+});
+
+describe.each(['hosted', 'embedded'] as const)('Managed Payments in %s checkout', uiMode => {
+    it.each([
+        { sku: 'pro_monthly_v1', mode: 'subscription', amounts: ['2000'], names: ['EZiL Pro'] },
+        { sku: 'ai_pack_10_v1', mode: 'payment', amounts: ['1000', '84'], names: ['AI credits', 'Service fee'] },
+        { sku: 'ai_pack_25_v1', mode: 'payment', amounts: ['2500', '161'], names: ['AI credits', 'Service fee'] },
+    ])('sets eligible tax codes and excludes every incompatible field for $sku', async ({ sku, mode, amounts, names }) => {
+        const { client, fetcher } = fixture(checkoutResult);
+        const input = { ...checkoutRequest, sku, uiMode, automaticTax: true, adaptivePricing: true };
+        await client.createCheckoutSession({ ...input, managedPayments: false });
+        await client.createCheckoutSession({ ...input, managedPayments: true });
+        const ordinary = inspect(fetcher).body;
+        const sent = inspect(fetcher, 1);
+        expect(ordinary).toMatchObject({
+            'automatic_tax[enabled]': 'true',
+            'adaptive_pricing[enabled]': 'true',
+            'customer_update[name]': 'auto',
+            'customer_update[address]': 'auto',
+            'payment_method_types[0]': 'card',
+            'payment_method_types[1]': 'link',
+        });
+        expect(sent.body).toMatchObject({
+            'managed_payments[enabled]': 'true', mode,
+            customer: input.customerId, client_reference_id: input.userId,
+            'metadata[sku]': sku, billing_address_collection: 'auto',
+            'saved_payment_method_options[payment_method_save]': 'enabled',
+            [mode === 'subscription' ? 'subscription_data[metadata][sku]' : 'payment_intent_data[metadata][sku]']: sku,
+            ...(uiMode === 'embedded' ? {
+                ui_mode: 'embedded_page', return_url: input.returnUrl, redirect_on_completion: 'if_required',
+            } : { success_url: input.successUrl, cancel_url: input.cancelUrl }),
+        });
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Idempotency-Key')).toBe(input.idempotencyKey);
+        expect(ordinary).not.toHaveProperty('managed_payments[enabled]');
+        expect(MANAGED_PAYMENTS_TAX_CODE).toBe('txcd_10103000');
+        amounts.forEach((amount, index) => {
+            const prefix = `line_items[${index}][price_data]`;
+            expect(sent.body).toHaveProperty(`${prefix}[unit_amount]`, amount);
+            expect(sent.body).toHaveProperty(`${prefix}[product_data][name]`, names[index]);
+            expect(sent.body).toHaveProperty(`${prefix}[product_data][tax_code]`, MANAGED_PAYMENTS_TAX_CODE);
+            expect(ordinary).not.toHaveProperty(`${prefix}[product_data][tax_code]`);
+        });
+        expect(Object.keys(sent.body).filter(key => key.endsWith('[tax_code]'))).toHaveLength(amounts.length);
+
+        for (const forbidden of [
+            'adaptive_pricing',
+            'automatic_tax',
+            'tax_id_collection',
+            'payment_method_types',
+            'payment_method_configuration',
+            'customer_update[name]',
+            'customer_update[address]',
+            'invoice_creation',
+            'subscription_data[invoice_settings]',
+            'payment_intent_data[statement_descriptor]',
+            'payment_intent_data[statement_descriptor_suffix]',
+            'payment_intent_data[receipt_email]',
+        ]) {
+            const matches = (body: Record<string, string>) => Object.keys(body)
+                .filter(key => key === forbidden || key.startsWith(`${forbidden}[`));
+            // Some forbidden fields have never been emitted by this client.
+            // A contaminated form proves each check detects its named field.
+            const key = forbidden.endsWith(']') ? forbidden : `${forbidden}[enabled]`;
+            expect(matches({ ...sent.body, [key]: 'fixture' }), forbidden).toEqual([key]);
+            expect(matches(sent.body), forbidden).toEqual([]);
+        }
+    });
+
+    it('leaves a dashboard Pro Product responsible for its own tax code', async () => {
+        const input = { ...checkoutRequest, uiMode, managedPayments: true };
+        const inline = fixture(checkoutResult);
+        await inline.client.createCheckoutSession(input);
+        expect(inspect(inline.fetcher).body).toHaveProperty('line_items[0][price_data][product_data][tax_code]', MANAGED_PAYMENTS_TAX_CODE);
+
+        const { client, fetcher } = fixture(checkoutResult, { priceProMonthly: 'price_pro_fixture' });
+        await client.createCheckoutSession(input);
+        const body = inspect(fetcher).body;
+        expect(body).toMatchObject({
+            'managed_payments[enabled]': 'true', mode: 'subscription',
+            'line_items[0][quantity]': '1', 'line_items[0][price]': 'price_pro_fixture',
+        });
+        expect(Object.keys(body).filter(key => key.startsWith('line_items[0][price_data]'))).toEqual([]);
+    });
+});
+
+describe('automatic tax is opt-in', () => {
+    it('omits Stripe Tax and address saving when automaticTax is false (positive control: true sends both)', async () => {
+        const bodies: URLSearchParams[] = [];
+        const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+            bodies.push(new URLSearchParams(String(init?.body ?? '')));
+            return Response.json({ id: 'cs_fixture', url: null, client_secret: 'cs_secret' });
+        });
+        const client = createStripeClient({ secretKey, fetch: fetcher as unknown as typeof fetch });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: true });
+        expect(bodies[0].has('automatic_tax[enabled]')).toBe(false);
+        expect(bodies[0].has('customer_update[address]')).toBe(false);
+        expect(bodies[0].get('billing_address_collection')).toBe('auto');
+        expect(bodies[1].get('automatic_tax[enabled]')).toBe('true');
+        expect(bodies[1].get('customer_update[address]')).toBe('auto');
+    });
+
+    it('turns Adaptive Pricing off unless asked (positive control: on when adaptivePricing is true)', async () => {
+        const bodies: URLSearchParams[] = [];
+        const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+            bodies.push(new URLSearchParams(String(init?.body ?? '')));
+            return Response.json({ id: 'cs_fixture', url: null, client_secret: 'cs_secret' });
+        });
+        const client = createStripeClient({ secretKey, fetch: fetcher as unknown as typeof fetch });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false, adaptivePricing: true });
+        expect(bodies[0].get('adaptive_pricing[enabled]')).toBe('false');
+        expect(bodies[1].get('adaptive_pricing[enabled]')).toBe('true');
+    });
+});

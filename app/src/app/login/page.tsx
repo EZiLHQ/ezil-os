@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import type { Viewport } from 'next';
 
+import { readBillingConfig } from '@/server/billing/config';
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
 import { LoginForm } from './login-form';
@@ -118,6 +119,12 @@ export default async function LoginPage({
                     Privacy Policy
                 </Link>
                 .
+                {readBillingConfig().pricingPageEnabled && (
+                    <>
+                        {' '}
+                        <a href="/pricing" className="underline decoration-white/30 underline-offset-2 transition-colors hover:text-white">Plans</a>
+                    </>
+                )}
             </footer>
         </main>
     );
