@@ -327,9 +327,26 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                           ? uuidEq(r[col], v)
                           : r[col] !== null && r[col] !== undefined && String(r[col]) === String(v);
                 });
-                const sets = m[1]!.split(/,\s*/).map((assign) => {
+                // Split on top-level commas only: `GREATEST(col, $n)` holds one of its own.
+                const assignments: string[] = [];
+                let depth = 0, start = 0;
+                const setText = m[1]!;
+                for (let k = 0; k < setText.length; k++) {
+                    if (setText[k] === '(') depth++;
+                    else if (setText[k] === ')') depth--;
+                    else if (setText[k] === ',' && depth === 0) { assignments.push(setText.slice(start, k).trim()); start = k + 1; }
+                }
+                assignments.push(setText.slice(start).trim());
+                const sets = assignments.map((assign) => {
                     const inc = assign.match(/^(\w+) = (\w+) \+ (\$\d+)$/);
                     if (inc) return (r: Row) => (r[inc[1]!] = Number(r[inc[2]!]) + Number(value(inc[3]!, params)));
+                    // Postgres GREATEST ignores NULLs: NULL only when both sides are.
+                    const greatest = assign.match(/^(\w+) = GREATEST\(\1, (\$\d+::timestamptz)\)$/);
+                    if (greatest) return (r: Row) => {
+                        const cur = r[greatest[1]!], next = value(greatest[2]!, params);
+                        const a = instant(cur), b = instant(next);
+                        r[greatest[1]!] = Number.isNaN(a) ? (Number.isNaN(b) ? null : next) : Number.isNaN(b) || a >= b ? cur : next;
+                    };
                     const set = assign.match(/^(\w+) = (.+)$/);
                     if (!set) throw new Error(`fake db: unsupported assignment ${assign}`);
                     return (r: Row) => (r[set[1]!] = set[2]!.trim() === set[1] ? r[set[1]!] : value(set[2]!.trim(), params));

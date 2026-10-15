@@ -28,7 +28,7 @@ import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
-import type { ComputeProvider, ComputeStatus, ComputerRef, EnsureResult } from '@/server/lib/compute/provider';
+import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
 import { resolveTier, type EntitlementReader } from '@/server/lib/compute/tier';
 
@@ -130,6 +130,46 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
         provider: 'cloudflare-guacamole' as const,
         computeProvider: 'aws-ec2' as const,
     };
+}
+
+/** How long the shell's stop waits for an AWS stop to be confirmed (its route allows 300 s). */
+export const AWS_SHELL_STOP_BUDGET_MS = 200_000;
+/** Interval between status looks (each applies the stop's lifecycle receipt). */
+export const AWS_SHELL_STOP_POLL_MS = 5_000;
+
+/**
+ * The shell's stop contract (`POST /api/shell/stop`, e2e/hosted-continuity.mjs) for an
+ * AWS computer: a CONFIRMED answer, never "requested". An AWS stop is asynchronous (a
+ * lifecycle job), so this starts it (or finds one in flight) and polls `status`, which
+ * applies the job's receipt, until the placement is STOPPED or the budget runs out:
+ * - already STOPPED → `{ ok: true, terminated: false, outcome: 'not_running' }`;
+ * - reaches STOPPED within the budget → `{ ok: true, terminated: true, outcome: 'destroyed' }`;
+ * - still draining/stopping at the deadline → `{ ok: false, terminated: false, outcome:
+ *   'still_running' }`, the shell's "not yet" (the client asks again; never a false success);
+ * - any other answer (refused, moved to another state) is returned as a failure unchanged.
+ */
+export async function confirmAwsStop(
+    provider: ComputeProvider,
+    ctx: ComputeCtx,
+    computer: ComputerRef,
+    opts: { budgetMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<StopResult> {
+    const now = opts.now ?? Date.now;
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const deadline = now() + (opts.budgetMs ?? AWS_SHELL_STOP_BUDGET_MS);
+    const first = await provider.stop(ctx, computer, 'user');
+    if (first.ok) return { ok: true, terminated: false, outcome: 'not_running' };
+    if (!['stopping', 'placement_draining', 'placement_stopping'].includes(first.outcome ?? '')) return first;
+    while (now() < deadline) {
+        await sleep(Math.max(0, Math.min(opts.pollMs ?? AWS_SHELL_STOP_POLL_MS, deadline - now())));
+        const placementState = ((await provider.status(ctx, computer)) as AwsComputeStatus).placementState;
+        if (placementState === 'STOPPED') return { ok: true, terminated: true, outcome: 'destroyed' };
+        if (placementState !== 'DRAINING' && placementState !== 'STOPPING') {
+            const outcome = placementState ? `placement_${placementState.toLowerCase()}` : 'aws_status_unavailable';
+            return { ok: false, terminated: false, outcome, error: outcome };
+        }
+    }
+    return { ok: false, terminated: false, outcome: 'still_running' };
 }
 
 /**

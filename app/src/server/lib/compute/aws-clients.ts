@@ -160,6 +160,7 @@ const VERSION_ARN = /^arn:aws:states:([a-z0-9-]+):(\d{12}):stateMachine:([A-Za-z
 const EXECUTION_ARN = /^arn:aws:states:([a-z0-9-]+):(\d{12}):execution:([A-Za-z0-9_-]{1,80}):(computer-[0-9a-f-]{36})$/;
 const EXECUTION_NAME = /^computer-[0-9a-f-]{36}$/;
 const INSTANCE_ID = /^i-[a-f0-9]{8,17}$/;
+const VOLUME_ID = /^vol-[a-f0-9]{8,17}$/;
 
 function assertRegion(region: string): void {
     if (!AWS_REGION_PATTERN.test(region)) throw new AwsClientError('aws_config', false, 'RegionInvalid');
@@ -232,7 +233,22 @@ const tagMap = (tags: readonly Ec2Tag[] | undefined): Record<string, string> =>
  * such instance. The ZoneId comes from the instance's placement (or, for an
  * SDK response without it, `DescribeAvailabilityZones` for that zone name).
  */
-export function createEc2EnrollmentDescriber(ec2For: (region: string) => RegionalClient): Ec2EnrollmentDescriber {
+/**
+ * What a read-only `DescribeVolumes` shows about one data volume: the reconciler's check
+ * that a lost instance's retained volume still exists before it records the computer as
+ * recoverable (aws-receipts.ts `reconcileGuestStop`). null when EC2 has no such volume.
+ */
+export interface Ec2VolumeView {
+    volumeId: string;
+    /** EC2 volume state: creating | available | in-use | deleting | deleted | error. */
+    state: string;
+}
+
+export interface Ec2VolumeDescriber {
+    describeVolume(region: string, volumeId: string): Promise<Ec2VolumeView | null>;
+}
+
+export function createEc2EnrollmentDescriber(ec2For: (region: string) => RegionalClient): Ec2EnrollmentDescriber & Ec2VolumeDescriber {
     return {
         async describeForEnrollment(region, instanceId) {
             assertRegion(region);
@@ -301,6 +317,23 @@ export function createEc2EnrollmentDescriber(ec2For: (region: string) => Regiona
             };
             return view;
         },
+
+        async describeVolume(region, volumeId) {
+            assertRegion(region);
+            if (!VOLUME_ID.test(volumeId)) return null;
+            const { client } = ec2For(region);
+            let volumes: { VolumeId?: string; State?: string }[];
+            try {
+                const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: { VolumeId?: string; State?: string }[] };
+                volumes = (out.Volumes ?? []).filter((v) => v.VolumeId === volumeId);
+            } catch (error) {
+                if (nameOf(error) === 'InvalidVolume.NotFound') return null;
+                throw toAwsClientError(error);
+            }
+            if (volumes.length === 0) return null;
+            if (volumes.length !== 1) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
+            return { volumeId, state: volumes[0]!.State ?? 'unknown' };
+        },
     };
 }
 
@@ -320,7 +353,7 @@ export interface AwsSdkFactories {
 export interface AwsSdkCollaborators {
     starter?: LifecycleStarter;
     executions?: LifecycleExecutionReader;
-    describer?: Ec2EnrollmentDescriber;
+    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber;
 }
 
 /**

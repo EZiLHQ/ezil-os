@@ -121,6 +121,25 @@ export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly Pla
     CLAIMED: ['UNCONFIRMED'],
 };
 
+/**
+ * Edges only `transitionPlacementAsReconciler` may take, never a user's request.
+ *
+ * RUNNING → STOPPED: EC2 shows the RUNNING placement's instance gone, terminating or
+ * terminated (an external terminate or an EC2 failure), while its retained data volume
+ * still exists (aws-receipts.ts `reconcileGuestStop`). The tunnel is fenced and the usage
+ * row closed in the same pass, and `last_error` = `INSTANCE_LOST` makes the next open a
+ * REPLACE onto that volume. One atomic step: a multi-step detour through UNCONFIRMED could
+ * strand the row there if interrupted.
+ */
+export const RECONCILER_TRANSITIONS: Readonly<Partial<Record<PlacementState, readonly PlacementState[]>>> = {
+    RUNNING: ['STOPPED'],
+};
+
+/** `last_error` of a placement whose instance was lost while its data volume survives: the next open replaces. */
+export const INSTANCE_LOST = 'instance_lost';
+/** `last_error` of a placement whose instance was lost AND whose data volume is gone: nothing to boot onto. */
+export const INSTANCE_LOST_VOLUME_MISSING = 'instance_lost_volume_missing';
+
 // ── Errors ───────────────────────────────────────────────────────────────
 
 export type PlacementIntegrityReason =
@@ -592,6 +611,8 @@ async function casInTx(
         provider?: PlacementProvider; ownerUserId?: string; enrollNonceHash?: string; enrollUnexpired?: boolean;
         states?: readonly PlacementState[]; preserveState?: boolean; availableInstanceId?: string;
         instanceId?: string | null; lastError?: string | null; nonceConsumed?: boolean;
+        /** Timestamp fields written as GREATEST(current, new): concurrent writers can never move them back. */
+        monotonic?: readonly ('presenceAt' | 'leaseUntil')[];
     } = {},
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
@@ -604,7 +625,13 @@ async function casInTx(
         sql`lease_epoch = lease_epoch + ${bump.leaseEpoch}`,
         ...(Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[])
             .filter((k) => fields[k] !== undefined)
-            .map((k) => sql`${sql.raw(MUTABLE_COLUMNS[k][0])} = ${valueSql(k, fields[k] ?? null)}`),
+            .map((k) => {
+                const col = sql.raw(MUTABLE_COLUMNS[k][0]);
+                // GREATEST ignores NULL, so a first write still lands and a NULL is never written over a value.
+                return (guard.monotonic as readonly string[] | undefined)?.includes(k)
+                    ? sql`${col} = GREATEST(${col}, ${valueSql(k, fields[k] ?? null)})`
+                    : sql`${col} = ${valueSql(k, fields[k] ?? null)}`;
+            }),
         sql`updated_at = now()`,
     ];
     const rows = rowsOf(
@@ -663,7 +690,9 @@ export async function renewPlacementLease(
     return db.transaction((tx) =>
         casInTx(tx, input.computerId, input.expected, 'RUNNING', { generation: 0, leaseEpoch: 0 },
             { presenceAt: input.presenceAt, leaseUntil: input.leaseUntil },
-            { ownerUserId: input.ownerUserId, provider: 'aws-ec2', preserveState: true }),
+            // Monotonic: two renewals racing (two tabs, an open and a heartbeat) both win the CAS;
+            // whichever commits last must never move presence or the lease backward.
+            { ownerUserId: input.ownerUserId, provider: 'aws-ec2', preserveState: true, monotonic: ['presenceAt', 'leaseUntil'] }),
     );
 }
 
@@ -725,7 +754,8 @@ export async function transitionPlacementAsReconciler(
         usage?: UsageEffect;
     },
 ): Promise<TransitionResult> {
-    if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
+    const from = input.expected.state;
+    if (!PLACEMENT_TRANSITIONS[from]?.includes(input.to) && !RECONCILER_TRANSITIONS[from]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
     return db.transaction(async (tx) => {
         const r = await casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {},
             { instanceId: input.expected.instanceId, lastError: input.expected.lastError });

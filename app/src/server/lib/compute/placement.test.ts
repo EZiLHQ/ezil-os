@@ -37,6 +37,8 @@ import {
     readAdmissionCounters,
     withAdmission,
     PlacementIsolationError,
+    RECONCILER_TRANSITIONS,
+    renewPlacementLease,
     transitionPlacement,
     transitionPlacementAsReconciler,
     type AdmissionLock,
@@ -527,5 +529,55 @@ describe('running class', () => {
             PLACEMENT_STATES.filter((s) => !['STOPPED', 'RETIRED', 'PURGE_ELIGIBLE'].includes(s)).sort(),
         );
         expect(RUNNING_CLASS_STATES).toEqual(expect.arrayContaining(['UNCONFIRMED', 'RECOVERING', 'LEASED', 'RUNNING']));
+    });
+});
+
+describe('Codex 4277613510: RUNNING → STOPPED is the reconciler\'s alone (a lost instance)', () => {
+    const running = () => createFakePlacementDb({ placements: [placementRow({ computer_id: A, state: 'RUNNING', instance_id: 'i-11111111111111111' })] });
+
+    it('is not a user edge: a user request for it is illegal and writes nothing', async () => {
+        expect(PLACEMENT_TRANSITIONS.RUNNING).not.toContain('STOPPED');
+        expect(RECONCILER_TRANSITIONS.RUNNING).toEqual(['STOPPED']);
+        const { db, placements, statements } = running();
+        const r = await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0, state: 'RUNNING' }, to: 'STOPPED' });
+        expect(r).toEqual({ ok: false, reason: 'illegal_transition' });
+        expect(statements).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it('the reconciler takes it, guarded on the same instance', async () => {
+        const { db, placements } = running();
+        const expected = { generation: 1, leaseEpoch: 0, state: 'RUNNING' as const };
+        expect(await transitionPlacementAsReconciler(db, { computerId: A, expected: { ...expected, instanceId: 'i-99999999999999999' }, to: 'STOPPED' }))
+            .toEqual({ ok: false, reason: 'cas_conflict' });
+        expect((await transitionPlacementAsReconciler(db, { computerId: A, expected: { ...expected, instanceId: 'i-11111111111111111' }, to: 'STOPPED' })).ok).toBe(true);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED' });
+    });
+});
+
+describe('Codex 4277613532: lease renewal is monotonic', () => {
+    const T = (m: number) => new Date(Date.UTC(2026, 9, 15, 12, m));
+    const expected = { generation: 1, leaseEpoch: 0, state: 'RUNNING' as const };
+    const seeded = (over: Record<string, unknown> = {}) =>
+        createFakePlacementDb({ placements: [placementRow({ computer_id: A, state: 'RUNNING', presence_at: T(10), lease_until: T(70), ...over })] });
+
+    it('a stale renewal committing after a fresher one never moves presence or the lease backward', async () => {
+        const { db, placements, statements } = seeded();
+        expect((await renewPlacementLease(db, { computerId: A, ownerUserId: OWNER, expected, presenceAt: T(30), leaseUntil: T(90) })).ok).toBe(true);
+        // The slower request (older presence) commits second: both CAS succeed, the values only move forward.
+        expect((await renewPlacementLease(db, { computerId: A, ownerUserId: OWNER, expected, presenceAt: T(20), leaseUntil: T(80) })).ok).toBe(true);
+        expect(new Date(placements[0]!.presence_at as string | Date).getTime()).toBe(T(30).getTime());
+        expect(new Date(placements[0]!.lease_until as string | Date).getTime()).toBe(T(90).getTime());
+        const cas = statements.filter((st) => st.sql.includes('placement:cas'));
+        for (const st of cas) {
+            expect(st.sql).toMatch(/presence_at = GREATEST\(presence_at, \$\d+::timestamptz\)/);
+            expect(st.sql).toMatch(/lease_until = GREATEST\(lease_until, \$\d+::timestamptz\)/);
+        }
+    });
+
+    it('a first renewal over NULL still lands', async () => {
+        const { db, placements } = seeded({ presence_at: null, lease_until: null });
+        expect((await renewPlacementLease(db, { computerId: A, ownerUserId: OWNER, expected, presenceAt: T(5), leaseUntil: T(65) })).ok).toBe(true);
+        expect(new Date(placements[0]!.lease_until as string | Date).getTime()).toBe(T(65).getTime());
     });
 });

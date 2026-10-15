@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
+import type { Ec2VolumeDescriber } from './aws-clients';
 import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
@@ -21,6 +22,8 @@ import { isDefiniteAwsRefusal, isExecutionAbsent } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    INSTANCE_LOST,
+    INSTANCE_LOST_VOLUME_MISSING,
     LIFECYCLE_START_FAILED,
     lifecycleStartUnknownUndo,
     markLifecycleStartUnknown,
@@ -303,8 +306,12 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
 // ── Guest-initiated idle stop (R9) ───────────────────────────────────────
 
 export interface GuestStopDeps extends ReceiptDeps {
-    /** Read-only EC2 describe in the placement's region (the app caller's enrollment describer). */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'>;
+    /**
+     * Read-only EC2 describe in the placement's region (the app caller's enrollment describer).
+     * `describeVolume` lets a lost instance be recovered onto its retained volume; without it a
+     * lost instance is left for the next look rather than recorded without that check.
+     */
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber>;
     /** Lower-case uuid v4. */
     newId?: () => string;
     /** Set when the pass's time budget ran out: stop before the next placement. */
@@ -331,8 +338,53 @@ export async function reconcileGuestStop(deps: GuestStopDeps, p: Placement, depl
     } catch {
         return false; // Unknown: leave it, try again on the next look.
     }
-    if (!view || (view.state !== 'stopping' && view.state !== 'stopped')) return false;
+    if (!view || LOST_INSTANCE_STATES.has(view.state)) return recoverLostInstance(deps, p);
+    if (view.state !== 'stopping' && view.state !== 'stopped') return false;
     return startStopAsReconciler(deps, p, deployment, null);
+}
+
+/** EC2 states of an instance that is gone for good (terminate is not reversible). */
+const LOST_INSTANCE_STATES: ReadonlySet<string> = new Set(['shutting-down', 'terminated']);
+
+/**
+ * A RUNNING placement whose instance EC2 no longer has, or is terminating (an external
+ * terminate, an EC2 failure): nothing will ever send a receipt for it, so without this the
+ * row stays RUNNING, every open "succeeds" onto a dead host, and its usage row and
+ * running-capacity slot stay charged forever.
+ *
+ * In order, each step idempotent so an interrupted pass converges on the next look:
+ *  1. the retained data volume is described (an unknown answer changes nothing);
+ *  2. the epoch's tunnel is fenced (GW-1), so nothing can still reach this generation;
+ *  3. ONE compare-and-swap, guarded on the same instance, closes the usage row and moves
+ *     RUNNING → STOPPED with `INSTANCE_LOST` (the next open REPLACES onto the volume;
+ *     aws-ec2.ts forces `replace` for it), or, when the volume itself is gone, RUNNING →
+ *     UNCONFIRMED with `INSTANCE_LOST_VOLUME_MISSING`: there is nothing to boot onto.
+ * Returns true when the placement was moved.
+ */
+async function recoverLostInstance(deps: GuestStopDeps, p: Placement): Promise<boolean> {
+    if (!deps.describer?.describeVolume || !p.region || !p.volumeId) return false;
+    let volume;
+    try {
+        volume = await deps.describer.describeVolume(p.region, p.volumeId);
+    } catch {
+        return false; // Unknown: leave it, try again on the next look.
+    }
+    if (deps.tunnels) {
+        const fenced = await deps.tunnels
+            .deleteTunnel({ userId: p.ownerUserId }, { computerId: p.computerId.toLowerCase(), sandboxId: awsSandboxId(p.ownerUserId, p.computerId), generation: p.generation, leaseEpoch: p.leaseEpoch })
+            .catch(() => ({ ok: false }));
+        if (!fenced.ok) return false;
+    }
+    const usable = volume !== null && !['deleting', 'deleted', 'error'].includes(volume.state);
+    const cleared: PlacementFields = { lifecycleJobId: null, lifecycleDigest: null, enrollConsumedHash: null, enrollExpiresAt: null };
+    const r = await transitionPlacementAsReconciler(deps.db, {
+        computerId: p.computerId,
+        expected: { generation: p.generation, leaseEpoch: p.leaseEpoch, state: 'RUNNING', instanceId: p.instanceId },
+        to: usable ? 'STOPPED' : 'UNCONFIRMED',
+        fields: { ...cleared, lastError: usable ? INSTANCE_LOST : INSTANCE_LOST_VOLUME_MISSING },
+        usage: { kind: 'close', observedBy: 'reconcile:instance_lost' },
+    });
+    return r.ok;
 }
 
 /**
