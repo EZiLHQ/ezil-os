@@ -34,17 +34,27 @@ export function isPlacementReadEnabled(env: Env = process.env): boolean {
  *
  * With no row a computer resolves to Cloudflare, and only AWS admission writes
  * an aws-ec2 row, so without a cohort no computer would ever reach AWS. A
- * computer joins only when its user is listed AND it was created at or after
+ * computer joins only when its user is listed (or the list is exactly `*`,
+ * every signed-in user) AND it was created at or after
  * `EZIL_AWS_CANARY_SINCE`: an older computer may hold a Cloudflare/R2
- * workspace, and sending it to AWS would open an empty disk.
+ * workspace, and sending it to AWS would open an empty disk. Even then it goes
+ * to AWS only when admission would admit it right now (select.ts): otherwise it
+ * stays Cloudflare, so no user is handed a computer that cannot start.
  *
  * 🔴 FAIL CLOSED: a missing or malformed value (any bad list entry, or a
  * SINCE without an explicit zone) means no cohort. This is a rollout gate,
  * not a security boundary: ownership stays the placement's owner_user_id.
  */
 export interface AwsCanaryConfig {
+    /** `*` (the whole value): every signed-in user. Then `userIds` is empty. */
+    everyone: boolean;
     userIds: ReadonlySet<string>;
     since: Date;
+}
+
+/** Whether `userId` is in the cohort (`*` or listed). */
+export function inAwsCanary(canary: AwsCanaryConfig, userId: string): boolean {
+    return canary.everyone || canary.userIds.has(userId.toLowerCase());
 }
 
 const CANARY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -54,11 +64,13 @@ export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null 
     const list = env.EZIL_AWS_CANARY_USER_IDS?.trim();
     const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
     if (!list || !sinceText || !CANARY_SINCE.test(sinceText)) return null;
-    const ids = list.split(',').map((id) => id.trim().toLowerCase());
-    if (!ids.every((id) => CANARY_UUID.test(id))) return null;
     const since = new Date(sinceText);
     if (!Number.isFinite(since.getTime())) return null;
-    return { userIds: new Set(ids), since };
+    // `*` only as the WHOLE value; `*` beside ids is not a uuid, so the list is malformed.
+    if (list === '*') return { everyone: true, userIds: new Set(), since };
+    const ids = list.split(',').map((id) => id.trim().toLowerCase());
+    if (!ids.every((id) => CANARY_UUID.test(id))) return null;
+    return { everyone: false, userIds: new Set(ids), since };
 }
 
 export interface AwsAdmissionCaps {

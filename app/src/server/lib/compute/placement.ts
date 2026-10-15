@@ -1118,6 +1118,28 @@ export async function readAdmissionCounters(
     rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
 ): Promise<AdmissionCounters> {
     assertAdmissionLock(tx, lock);
+    const counters = await readCounters(tx, rawInput);
+    // Every read succeeded for this computer under this lock: admission may now mint a ticket for it.
+    COUNTED.set(lock, canonicalId(rawInput.computerId));
+    return counters;
+}
+
+/**
+ * The same admission inputs, read WITHOUT the admission lock and minting nothing:
+ * a point-in-time view for a routing pre-check (select.ts canary fallback). It can be
+ * stale by the time admission runs; admission re-reads under its lock and decides.
+ */
+export async function peekAdmissionCounters(
+    db: PlacementExecutor,
+    rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
+): Promise<AdmissionCounters> {
+    return readCounters(db, rawInput);
+}
+
+async function readCounters(
+    tx: PlacementExecutor,
+    rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
+): Promise<AdmissionCounters> {
     const input = { ...rawInput, userId: canonicalId(rawInput.userId), computerId: canonicalId(rawInput.computerId) };
     // ezil_computers is user-writable (id, deleted_at, chosen ids on insert): it is a
     // precondition here (the computer exists, is live and is the caller's), never the owner.
@@ -1170,8 +1192,6 @@ export async function readAdmissionCounters(
         else throw new Error('admission region counter returned a duplicate or invalid region');
     }
     const owner = ownerRows[0];
-    // Every read above succeeded for this computer under this lock: admission may now mint a ticket for it.
-    COUNTED.set(lock, input.computerId);
     return {
         targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
         targetPlacementOwnerId: target.record?.ownerUserId ?? null,

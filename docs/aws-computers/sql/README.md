@@ -59,6 +59,15 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
    never later be reassigned to AWS by the canary. Reads and stops never pin. With reads OFF
    nothing is pinned, so set `EZIL_AWS_CANARY_SINCE` to the moment the canary is enabled
    (with reads on): computers created before it stay on Cloudflare.
+   **Everyone (`*`).** `EZIL_AWS_CANARY_USER_IDS=*` (exactly `*`, nothing beside it; `*`
+   mixed with ids is malformed and means no cohort) puts every signed-in user in the cohort.
+   **Fallback.** A new computer goes to AWS only when admission would admit it right now
+   (a read-only, unlocked pre-check with admission's own rules: config complete, kill switch
+   off, a region below its running cap, the user has no other AWS computer, monthly caps not
+   reached). Otherwise it stays on Cloudflare and is pinned there on its first sandbox start,
+   so no user is handed a computer that cannot start. Admission still re-decides under its
+   lock; a computer that loses that race refuses once (no row written) and falls back on the
+   next open.
 
 ## Usage ledger (`ezil_compute_usage`)
 
