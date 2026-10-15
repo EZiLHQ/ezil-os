@@ -104,3 +104,15 @@ test('lifecycle refuses an alert topic outside this region, account or namespace
         assert.throws(() => lifecycleAlarms(bad), /invalid_alert_topic/, bad);
     }
 });
+
+// Live 2026-10-15: adding the forecast notification replaced the budget, and CloudFormation's
+// create-before-delete collided on the fixed name ("same name but a different internalId").
+test('a budget replacement gets a fresh name the topic policy still admits', () => {
+    const budgetName = (o: ReturnType<typeof ops>) => (o.of('AWS::Budgets::Budget')[0] as any).Budget.BudgetName as string;
+    const a = ops({ budgetEmails: [] }), b = ops({ budgetEmails: ['contact@ezil.work', 'ops@ezil.work'] });
+    assert.notEqual(budgetName(a), budgetName(b));
+    for (const name of [budgetName(a), budgetName(b)]) assert.match(name, /^ezil-pilot-monthly-[0-9a-f]{8}$/);
+    assert.equal(budgetName(a), budgetName(ops({ budgetEmails: [] })), 'stable for identical settings');
+    const policy = JSON.stringify(a.of('AWS::SNS::TopicPolicy'));
+    assert.match(policy, /budget\/ezil-pilot-monthly\*/);
+});

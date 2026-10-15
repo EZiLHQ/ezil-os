@@ -1,5 +1,6 @@
 import { CfnOutput, Stack, type StackProps, aws_budgets as budgets, aws_cloudwatch as cloudwatch, aws_dlm as dlm,
     aws_iam as iam, aws_sns as sns } from 'aws-cdk-lib';
+import { createHash } from 'node:crypto';
 import type { Construct } from 'constructs';
 import { z } from 'zod';
 import { REGION_PATTERN } from './lifecycle/deployment.js';
@@ -65,7 +66,7 @@ export class OpsStack extends Stack {
             actions: ['sns:Publish'], resources: [this.topic.topicArn],
             conditions: { StringEquals: { 'aws:SourceAccount': a }, ArnLike: { 'aws:SourceArn': sourceArn } } });
         this.topic.addToResourcePolicy(publisher('cloudwatch.amazonaws.com', `arn:aws:cloudwatch:${c.region}:${a}:alarm:ezil-${c.namespace}-*`));
-        this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:budget/ezil-${c.namespace}-monthly`));
+        this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:budget/ezil-${c.namespace}-monthly*`));
         // The founder's inboxes. Each address must confirm the AWS subscription email once.
         c.alertEmails.forEach((endpoint, i) => new sns.Subscription(this, `AlertEmail${i}`, {
             topic: this.topic, protocol: sns.SubscriptionProtocol.EMAIL, endpoint }));
@@ -130,14 +131,20 @@ export class OpsStack extends Stack {
         });
 
         // §4: budget alarms are alerts, not enforcement.
+        // Actual 50/80/100 % plus a FORECASTED 100 %: the founder hears before the month overruns.
+        const budgetNotifications = [
+            ...[50, 80, 100].map(threshold => ({ type: 'ACTUAL', threshold })),
+            { type: 'FORECASTED', threshold: 100 },
+        ];
+        // Changing a budget's notifications REPLACES it, and CloudFormation creates the new one
+        // before deleting the old: a fixed name collides ("same name but a different internalId",
+        // live 2026-10-15). The name carries a hash of what forces replacement, so a replacement
+        // always gets a fresh name; the topic policy admits the ezil-<ns>-monthly* prefix.
+        const budgetRevision = createHash('sha256').update(JSON.stringify({ budgetNotifications, emails: c.budgetEmails })).digest('hex').slice(0, 8);
         new budgets.CfnBudget(this, 'Monthly', {
-            budget: { budgetName: `ezil-${c.namespace}-monthly`, budgetType: 'COST', timeUnit: 'MONTHLY',
+            budget: { budgetName: `ezil-${c.namespace}-monthly-${budgetRevision}`, budgetType: 'COST', timeUnit: 'MONTHLY',
                 budgetLimit: { amount: c.monthlyBudgetUsd, unit: 'USD' } },
-            // Actual 50/80/100 % plus a FORECASTED 100 %: the founder hears before the month overruns.
-            notificationsWithSubscribers: [
-                ...[50, 80, 100].map(threshold => ({ type: 'ACTUAL', threshold })),
-                { type: 'FORECASTED', threshold: 100 },
-            ].map(({ type, threshold }) => ({
+            notificationsWithSubscribers: budgetNotifications.map(({ type, threshold }) => ({
                 notification: { notificationType: type, comparisonOperator: 'GREATER_THAN', threshold, thresholdType: 'PERCENTAGE' },
                 subscribers: [{ subscriptionType: 'SNS', address: this.topic.topicArn },
                     ...c.budgetEmails.map(address => ({ subscriptionType: 'EMAIL', address }))],

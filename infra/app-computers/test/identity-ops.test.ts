@@ -309,7 +309,7 @@ test('I6 ops: DLM volumes only, 12-hourly retain 14; budget 50/80/100; egress al
     const publishers = topicPolicy.PolicyDocument.Statement.map((s: any) => ({ service: s.Principal.Service, condition: s.Condition }));
     assert.deepEqual(publishers, [
         { service: 'cloudwatch.amazonaws.com', condition: { StringEquals: { 'aws:SourceAccount': A }, ArnLike: { 'aws:SourceArn': `arn:aws:cloudwatch:${R}:${A}:alarm:ezil-pilot-*` } } },
-        { service: 'budgets.amazonaws.com', condition: { StringEquals: { 'aws:SourceAccount': A }, ArnLike: { 'aws:SourceArn': `arn:aws:budgets::${A}:budget/ezil-pilot-monthly` } } },
+        { service: 'budgets.amazonaws.com', condition: { StringEquals: { 'aws:SourceAccount': A }, ArnLike: { 'aws:SourceArn': `arn:aws:budgets::${A}:budget/ezil-pilot-monthly*` } } },
     ]);
     assert.equal(of('AWS::IAM::Role').length, 0, 'ops creates no role');
     assert.throws(() => new OpsStack(new App(), 'X', { config: opsCfg, env: { account: '210987654321', region: R } }), /env must equal/);
