@@ -69,6 +69,18 @@ def enroll_or_reuse(cfg, lease):
     return "enrolled; tunnel token stored host-only; nonce wiped"
 
 
+# The long-lived steps whose units restart them (systemd Restart=): each refuses while the agent
+# is stopping this host, and its unit carries RestartPreventExitStatus=2, so a restart never
+# brings a desktop, the edge or the tunnel back while the stop flushes and powers off.
+RESTARTED_STEPS = ("desktop", "edge", "cloudflared")
+
+
+def refuse_while_stopping(cfg, name):
+    """runDir/stopping: the agent committed to stopping (exit 2 = RestartPreventExitStatus)."""
+    if os.path.exists(os.path.join(cfg.runDir, desktop.STOPPING)):
+        raise Refused(f"{name}_stopping", "the agent is stopping this host")
+
+
 def step(cfg, name, detach=False):
     if name == "lease":
         l = enrollmod.fetch_lease(cfg)
@@ -85,10 +97,7 @@ def step(cfg, name, detach=False):
         desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"))
         return "overlay mounted, netns up, spec written"
     if name == "desktop":
-        if os.path.exists(os.path.join(cfg.runDir, desktop.STOPPING)):
-            # The agent committed to stopping: the unit's Restart= must not bring a desktop
-            # back onto a volume being unmounted (exit 2 = RestartPreventExitStatus).
-            raise Refused("desktop_stopping", "the agent is stopping this host")
+        refuse_while_stopping(cfg, name)
         relay = desktop_relay(cfg, lease)
         if relay is not None:
             print(f"[desktop] relay {relay}", flush=True)
@@ -101,12 +110,14 @@ def step(cfg, name, detach=False):
     if name == "enroll":
         return enroll_or_reuse(cfg, lease)
     if name == "cloudflared":
+        refuse_while_stopping(cfg, name)
         reason, restarts = tunnel.supervise(cfg, lease)
         return f"cloudflared supervisor exit: {reason} restarts={restarts}"
     if name == "agent":
         agentmod.Agent(cfg, lease).run()
         return "agent stopped"
     if name == "edge":
+        refuse_while_stopping(cfg, name)
         from . import edge as edgemod      # gateway contract GW-2/GW-3: cloudflared's only target
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())

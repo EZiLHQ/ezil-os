@@ -103,6 +103,7 @@ check "poweroff: a failed shutdown is retried (backoff, capped, forced fallback)
 check "desktop crash: unit exited/failed -> reset + restart on the next push, bounded per window, then reported; refused while stopping" pyunit test_host_resilience.DesktopRestart
 check "guard: same instance + same epoch = reboot; another instance replaying the epoch is refused" pyunit test_host_resilience.GuardReboot
 check "enroll: a same-instance reboot reuses its own epoch's credentials; any other case enrolls" pyunit test_host_resilience.EnrollReuse
+check "host units: every long-lived unit restarts after a crash (bounded); edge/cloudflared/desktop refuse while stopping and exit 2 is never restarted" pyunit test_unit_restart_policy
 check "units: the desktop restarts on exit except on a refusal (exit 2); the agent restarts on failure" bash -c "grep -qx 'Restart=always' '$S/ezil-desktop.service' && grep -qx 'RestartPreventExitStatus=2' '$S/ezil-desktop.service' && grep -qx 'StartLimitBurst=5' '$S/ezil-desktop.service' && grep -qx 'Restart=on-failure' '$S/ezil-agent.service'"
 check "desktop step (relay mode): applied or ice_missing, desktop last in the relay boot order, no credential printed" pyunit test_ice.DesktopStep
 check "edge: real edge + real agent socket (ephemeral ports): 401 forwards nothing, strip, no smuggling, framing, WS, presence, control" pyunit test_edge.EdgeE2E

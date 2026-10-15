@@ -227,7 +227,8 @@ describe('enrollment outcomes fence receipt promotion', () => {
             expect(s.placements[0]!.last_error).toBe(ENROLLMENT_PENDING);
             await s.status(); // receipt poll between nonce consumption and the tunnel answer
             expect(s.placements[0]!.state).not.toBe('RUNNING');
-            return { ok: false, status: 502, code: 'tunnel_transport' };
+            // A DEFINITE refusal (an answered 4xx): an ambiguous answer keeps the epoch pending (below).
+            return { ok: false, status: 401, code: 'tunnel_http_401' };
         };
         expect((await s.enroll()).status).toBe(502);
         await s.status();
@@ -235,6 +236,16 @@ describe('enrollment outcomes fence receipt promotion', () => {
         expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
         expect(s.starts[0]!.intent).toMatchObject({ operation: 'replace', targetGeneration: 3, leaseEpoch: 4, previousInstanceId: I_NEW });
         expect(s.placements[0]).toMatchObject({ state: 'STARTING', instance_id: null, last_error: null });
+    });
+
+    it.each(['PROVISIONING', 'STARTING', 'MOUNTING'])('%s: an AMBIGUOUS GW-1 answer keeps the epoch pending; a receipt still cannot run it', async (state) => {
+        const s = setup([row({ state })], { status: 'SUCCEEDED', output: receiptOf() });
+        s.tunnels.createTunnel = async () => ({ ok: false, status: 502, code: 'tunnel_create_failed' });
+        expect(await s.enroll()).toMatchObject({ status: 503, body: { retryable: true } });
+        await s.status();
+        expect(s.placements[0]!.last_error).toBe(ENROLLMENT_PENDING);
+        expect(s.placements[0]!.state).not.toBe('RUNNING');
+        expect(s.placements[0]!.state).not.toBe('UNCONFIRMED');
     });
 
     it('a receipt during GW-1 success preserves its progress and the success marker', async () => {

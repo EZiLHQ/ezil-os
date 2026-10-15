@@ -302,6 +302,18 @@ const refuse = (status: number, error: string): EnrollResponse => ({ status, bod
  */
 const retryLater = (status: number, error: string): EnrollResponse => ({ status, body: { error, retryable: true } });
 
+/**
+ * A Worker tunnel answer that does not prove the Worker created NO tunnel: no answer (transport
+ * error, timeout), throttling, or a 5xx, including a 200 whose body could not be read (the client
+ * maps it to 502). The Worker may have committed the create (its creates are idempotent by name,
+ * GW-1), so the epoch must stay ENROLLMENT_PENDING with its consumed-nonce proof and the host must
+ * keep its nonce: its retry takes `pending` (exact replay of the epoch's tunnel first, a create only
+ * when the Worker answers tunnel_absent). Only an answered 4xx is a definite refusal.
+ */
+export function tunnelOutcomeUnknown(t: TunnelResult): boolean {
+    return !t.ok && (t.status === 0 || t.status === 429 || t.status >= 500);
+}
+
 const sameHash = (a: string, b: string) => {
     const x = Buffer.from(a, 'utf8');
     const y = Buffer.from(b, 'utf8');
@@ -472,7 +484,10 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
             // A concurrent completion of this same pending enrollment won the create: replay it.
             if (!t.ok && t.status === 409) t = await call({ ...request, replay: true });
         }
-        if (!t.ok) return t.status === 409 || t.status === 404 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable');
+        if (!t.ok && (t.status === 409 || t.status === 404)) return refuse(409, 'enroll_nonce_consumed');
+        // Ambiguous answers stay pending and retryable; so does any other refusal here, which leaves the
+        // epoch exactly as it was (the host's bounded retry ends it, keeping its nonce).
+        if (!t.ok) return retryLater(503, 'tunnel_unavailable');
         let done: Awaited<ReturnType<typeof finishEnrollment>>;
         try {
             done = await finishEnrollment(deps.db, { computerId: p.computerId, expected: p, success: true });
@@ -516,6 +531,9 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     } catch {
         tunnel = { ok: false, status: 0, code: 'tunnel_transport' };
     }
+    // Ambiguous (the Worker may have committed the tunnel): no finish at all. The placement keeps
+    // ENROLLMENT_PENDING and the consumed-nonce proof, and the retryable answer keeps the host's nonce.
+    if (tunnelOutcomeUnknown(tunnel)) return retryLater(503, 'tunnel_unavailable');
     let finished: Awaited<ReturnType<typeof finishEnrollment>>;
     try {
         finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });

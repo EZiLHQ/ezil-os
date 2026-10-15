@@ -231,7 +231,7 @@ describe('a valid enrollment', () => {
     });
 
     it('only a completed enrollment replays: a failed one (UNCONFIRMED) stays refused', async () => {
-        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 502, code: 'tunnel_create_failed' }) });
+        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 401, code: 'tunnel_http_401' }) });
         expect((await s.enroll()).status).toBe(502);
         expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
         expect((await s.enroll()).status).toBe(403);
@@ -432,10 +432,10 @@ describe('after the nonce is consumed', () => {
         expect((await enroll()).status).toBe(403);
     });
 
-    it('a thrown tunnel call is the same 502', async () => {
+    it('a thrown tunnel call is ambiguous: retryable 503, still pending, the consumed proof kept', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
-        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
-        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(placements[0]).toMatchObject({ state: 'STARTING', last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE) });
     });
 
     /** Make the Nth database transaction fail (1 = the consume, 2 = the completion); `commitFirst` loses only the answer. */
@@ -465,15 +465,19 @@ describe('after the nonce is consumed', () => {
         expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
     });
 
-    it('Codex PR #200: tunnel create AND completion write both fail → retryable; the retry creates the tunnel once and finishes', async () => {
+    it('Codex PR #200: tunnel create AND completion write both fail → every answer is retryable; the tunnel is created once and finishes', async () => {
         const w = workerBackedTunnels();
         const s = setup([booting()], { tunnels: w.client });
         const real = w.client.createTunnel.bind(w.client);
         let first = true;
         w.client.createTunnel = async (owner, req) => { if (first) { first = false; throw new Error('socket'); } return real(owner, req); };
         failTransaction(s.deps.db, 2);
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        // An ambiguous create attempts no finish at all (Codex 4277613521): still pending.
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
         expect(w.created).toHaveLength(0);
+        // The retry creates the tunnel; its completion write fails: still retryable.
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(w.created).toHaveLength(1);
         const again = await s.enroll();
         expect(again.status).toBe(200);
         expect(w.created).toHaveLength(1);
@@ -544,7 +548,7 @@ describe('after the nonce is consumed', () => {
     });
 
     it('a failed finish clears the consumed proof (a failed enrollment is never recoverable)', async () => {
-        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 502, code: 'tunnel_create_failed' }) });
+        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 403, code: 'tunnel_http_403' }) });
         expect((await s.enroll()).status).toBe(502);
         expect(s.placements[0]).toMatchObject({ enroll_consumed_hash: null, enroll_expires_at: null, last_error: placement.ENROLLMENT_FAILED });
     });
@@ -670,5 +674,71 @@ describe('consumeEnrollmentNonce SQL', () => {
         expect(cas[0]!.sql).toContain('state = state');
         const { record } = await readPlacement(setup().db, C1);
         expect(record?.enrollNonceHash).toBe(nonceHashOf(NONCE));
+    });
+});
+
+describe('an ambiguous Worker answer to the tunnel create keeps the enrollment recoverable (Codex 4277613521)', () => {
+    const ambiguous: [string, TunnelClient['createTunnel']][] = [
+        ['a thrown call (transport, timeout)', async () => { throw new Error('ETIMEDOUT'); }],
+        ['status 0 (no answer)', async () => ({ ok: false, status: 0, code: 'tunnel_transport' })],
+        ['429 (throttled)', async () => ({ ok: false, status: 429, code: 'tunnel_http_429' })],
+        ['500', async () => ({ ok: false, status: 500, code: 'tunnel_http_500' })],
+        ['502 (the Worker\'s own Cloudflare call failed, or an unreadable 200)', async () => ({ ok: false, status: 502, code: 'tunnel_response_malformed' })],
+        ['503', async () => ({ ok: false, status: 503, code: 'tunnel_http_503' })],
+    ];
+    it.each(ambiguous)('%s: retryable 503, no finish, still ENROLLMENT_PENDING with the consumed proof', async (_label, tunnel) => {
+        const { enroll, placements } = setup([booting()], { tunnel });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(placements[0]).toMatchObject({
+            state: 'STARTING', last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null,
+            enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId,
+        });
+    });
+
+    it.each([400, 401, 403, 409])('an answered %i is a definite refusal: 502, UNCONFIRMED, proof cleared', async (status) => {
+        const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status, code: `tunnel_http_${status}` }) });
+        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED, enroll_consumed_hash: null });
+    });
+
+    it('the Worker COMMITTED but its answer was lost: the host retry gets that exact tunnel; no second tunnel', async () => {
+        const w = workerBackedTunnels();
+        let lost = false;
+        const tokens: string[] = [];
+        const lossy: TunnelClient = {
+            createTunnel: async (owner, request) => {
+                const t = await w.client.createTunnel(owner, request);
+                if (t.ok) tokens.push(t.tunnelToken);
+                if (!request.replay && !lost) { lost = true; return { ok: false, status: 0, code: 'tunnel_transport' }; }
+                return t;
+            },
+            deleteTunnel: w.client.deleteTunnel,
+        };
+        const s = setup([booting()], { tunnels: lossy });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(w.created).toHaveLength(1);
+        const retry = await s.enroll();
+        expect(retry.status).toBe(200);
+        expect((retry.body as { tunnelToken: string }).tunnelToken).toBe(tokens[0]);
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
+    });
+
+    it('the Worker never got the request: the host retry creates the tunnel once', async () => {
+        const w = workerBackedTunnels();
+        let first = true;
+        const flaky: TunnelClient = {
+            createTunnel: async (owner, request) => {
+                if (first) { first = false; return { ok: false, status: 0, code: 'tunnel_transport' }; }
+                return w.client.createTunnel(owner, request);
+            },
+            deleteTunnel: w.client.deleteTunnel,
+        };
+        const s = setup([booting()], { tunnels: flaky });
+        expect((await s.enroll()).status).toBe(503);
+        expect(w.created).toHaveLength(0);
+        expect((await s.enroll()).status).toBe(200);
+        expect(w.created).toHaveLength(1);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
     });
 });
