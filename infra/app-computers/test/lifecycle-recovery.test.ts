@@ -142,6 +142,32 @@ for (const action of ['stopInstances', 'terminateInstances']) {
         assert.equal(result.receipt, undefined); assert.equal(result.calls.filter(c => c.action === action).length, 1);
     });
 }
+// Codex 4278130057 (recovery side): an original instance EC2 no longer knows (aged-out
+// terminated: NotFound → no rows) needs no fencing; the free retained volume is kept.
+function vanishedOriginal(operation: 'start' | 'stop' | 'retire') {
+    const f = fixture(operation); f.state.instances = [];
+    const v = f.state.volumes[0]!; v.State = 'available'; v.Attachments = [];
+    return f;
+}
+for (const operation of ['start', 'stop', 'retire'] as const) test(`recovery of ${operation} with a vanished original instance is fenced without any mutation, keeping the volume`, async () => {
+    const f = vanishedOriginal(operation);
+    const result = await run(f); assert.equal(result.error, undefined, result.cause); assert.equal(result.receipt.state, 'fenced');
+    assert.deepEqual(result.calls, []);
+    assert.equal(result.receipt.volumeId, f.state.volumes[0]!.VolumeId);
+    assert.deepEqual(result.receipt.instances.map((x: any) => [x.instanceId, x.state]), [[f.i.providerInstanceId, 'terminated']]);
+});
+test('recovery with a vanished original refuses a volume still claiming it or attached elsewhere', async () => {
+    for (const owner of ['claiming', 'elsewhere'] as const) {
+        const f = vanishedOriginal('retire'), v = f.state.volumes[0]!; v.State = 'in-use';
+        v.Attachments = [{ InstanceId: owner === 'claiming' ? f.i.providerInstanceId! : 'i-99999999999999999', VolumeId: v.VolumeId,
+            State: 'attached', Device: '/dev/sdf', DeleteOnTermination: false }];
+        const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed', owner); assert.deepEqual(result.calls, []);
+    }
+});
+test('recovery still refuses an original instance that EXISTS but is not this computer', async () => {
+    const f = fixture('retire'); f.state.instances[0]!.Tags = [];
+    const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+});
 test('delayed start is positively fenced even when the first read says stopped', async () => {
     const result = await run(fixture('start')); assert.equal(result.error, undefined);
     assert.deepEqual(result.calls.map(c => c.action), ['terminateInstances']);

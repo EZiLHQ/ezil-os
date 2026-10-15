@@ -67,12 +67,20 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         } else if (i.dataVolumeId || entered('createVolume') || launchEntered()) return wait();
         const targets: { role: 'old' | 'target'; instance: Instance; generation: number; fenceToken: string }[] = [];
         const originalId = i.previousInstanceId ?? i.providerInstanceId;
+        let gone: { instanceId: string; generation: number; fenceToken: string } | undefined;
         if (originalId) {
             const rows = await deps.instances([originalId]);
-            if (rows.length !== 1 || rows[0]?.owner !== d.accountId || rows[0].instance.InstanceId !== originalId
-                || !tagged(rows[0].instance.Tags, oldTags)) return fail();
-            targets.push({ role: 'old', instance: rows[0].instance, generation: i.previousGeneration ?? i.targetGeneration,
-                fenceToken: i.previousFenceToken ?? i.fenceToken });
+            const generation = i.previousGeneration ?? i.targetGeneration, fenceToken = i.previousFenceToken ?? i.fenceToken;
+            // EC2 no longer knowing the original instance (terminated and aged out: aws.ts answers
+            // InvalidInstanceID.NotFound with no rows) is a definite "gone": nothing to fence. An
+            // instance that exists must still be exactly this one, and a volume still claiming the
+            // gone instance is refused by the attachment check below.
+            if (rows.length === 0) gone = { instanceId: originalId, generation, fenceToken };
+            else {
+                if (rows.length !== 1 || rows[0]?.owner !== d.accountId || rows[0].instance.InstanceId !== originalId
+                    || !tagged(rows[0].instance.Tags, oldTags)) return fail();
+                targets.push({ role: 'old', instance: rows[0].instance, generation, fenceToken });
+            }
         }
         if (i.operation === 'provision' || i.operation === 'replace') {
             const rows = await deps.instances({ token: token(envelope.digest, 'instance') });
@@ -121,7 +129,8 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         if (deps.now() - began >= 600000) return fail();
         const receipt: RecoveryReceipt = { schemaVersion: 1, sourceExecutionArn, jobId: i.jobId, digest: envelope.digest,
             computerId: i.computerId, state: 'fenced', volumeId: v?.VolumeId ?? null,
-            instances: targets.map(t => ({ instanceId: t.instance.InstanceId!, generation: t.generation, fenceToken: t.fenceToken, state: 'terminated' })) };
+            instances: [...(gone ? [{ ...gone, state: 'terminated' as const }] : []),
+                ...targets.map(t => ({ instanceId: t.instance.InstanceId!, generation: t.generation, fenceToken: t.fenceToken, state: 'terminated' as const }))] };
         return { decision: 'success', receipt };
     };
 }
