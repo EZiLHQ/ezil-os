@@ -325,6 +325,14 @@ describe('ensure: wake by replace (default): a NEW instance on the SAME volume, 
         expect(placements[0]).toMatchObject({ state: 'STARTING', last_error: null, instance_id: null, enroll_nonce_hash: nonceHashOf(NONCE) });
     });
 
+    it('a STOPPED computer whose stop found the instance lost (INSTANCE_LOST) wakes by REPLACE even in start mode', async () => {
+        const { provider, calls } = setup({
+            placements: [stopped({ last_error: 'instance_lost', generation: 3, lease_epoch: 7 })],
+        }, { e: startMode() });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'replace', targetGeneration: 4, leaseEpoch: 8, previousInstanceId: 'i-11111111111111111' });
+    });
+
     it('enrollment recovery credits only its own running slot', async () => {
         const { provider, calls } = setup({ placements: [
             stopped({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED }),

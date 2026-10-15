@@ -427,9 +427,62 @@ test('a previous instance that EXISTS but is not this computer still refuses the
     const f=lifecycleFixture('replace');f.state.instances[0]!.Tags=[];
     const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
 });
-for(const operation of ['stop','start'] as const)test(`${operation}: a vanished instance is still a failure (only replace and retire may proceed without it)`,async()=>{
-    const f=lifecycleFixture(operation);f.state.instances=[];
-    const r=await run(operation,{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+test('start: a vanished instance is still a failure (only replace, retire and stop may proceed without it)',async()=>{
+    const f=lifecycleFixture('start');f.state.instances=[];
+    const r=await run('start',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
+
+// Codex 4278276831: an instance terminated externally after the placement entered DRAINING/
+// STOPPING. The stop completes as a LOST-instance stop (receipt `stopped` + `instanceLost`, the
+// retained volume kept) so the app's next wake replaces onto the volume; refusals unchanged.
+function lostStopFixture(visibleTerminated=false){
+    const f=lifecycleFixture('stop');
+    if(visibleTerminated)f.state.instances[0]!.State={Name:'terminated'};
+    else f.state.instances=[];
+    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];
+    return f;
+}
+for(const visible of [false,true])test(`stop with a ${visible?'visibly terminated':'vanished'} instance completes as a lost-instance stop on the free, owned volume`,async()=>{
+    const f=lostStopFixture(visible),volumeId=f.state.volumes[0]!.VolumeId;
+    const r=await run('stop',{fixture:f});
+    assert.equal(r.error,undefined,r.cause);assert.equal(r.receipt?.state,'stopped');assert.equal(r.receipt?.instanceLost,true);
+    assert.deepEqual(r.calls.map(c=>c.action),[]);
+    assert.equal(r.receipt.volumeId,volumeId);assert.equal(r.receipt.instanceId,f.i.providerInstanceId);
+    assert.equal(r.f.state.volumes.length,1);
+});
+test('instanceLost is valid only on a stopped receipt',async()=>{
+    const start=await run('start'),startWork={document:start.f.envelope.document,digest:start.f.digest,createdAt:new Date()};
+    assert.throws(()=>validateLifecycleReceipt(startWork,{...start.receipt,instanceLost:true}),/lifecycle_conflict/);
+    const stop=await run('stop',{fixture:lostStopFixture()}),stopWork={document:stop.f.envelope.document,digest:stop.f.digest,createdAt:new Date()};
+    assert.deepEqual(validateLifecycleReceipt(stopWork,stop.receipt),stop.receipt);
+});
+test('a normal stop carries no instanceLost marker',async()=>{
+    const r=await run('stop');assert.equal(r.error,undefined,r.cause);assert.equal(r.receipt?.state,'stopped');assert.equal(r.receipt?.instanceLost,undefined);
+});
+test('stop with a vanished instance refuses a volume attached elsewhere',async()=>{
+    const f=lostStopFixture(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:'i-99999999999999999',VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('stop',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);assert.equal(r.calls.length,0);
+});
+test('stop with a vanished instance refuses a volume still claiming it',async()=>{
+    const f=lostStopFixture(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:f.i.providerInstanceId!,VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('stop',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);assert.equal(r.calls.length,0);
+});
+test('stop with a vanished instance refuses a foreign or missing volume',async()=>{
+    const foreign=lostStopFixture();foreign.state.volumes[0]!.Tags=[];
+    const a=await run('stop',{fixture:foreign});assert.equal(a.error,'LifecycleUnconfirmed');assert.equal(a.calls.length,0);
+    const missing=lostStopFixture();missing.state.volumes=[];
+    const b=await run('stop',{fixture:missing});assert.equal(b.error,'LifecycleUnconfirmed');assert.equal(b.calls.length,0);
+});
+test('stop with a visibly terminated instance never completes while its volume is still attached',async()=>{
+    const f=lostStopFixture(true),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:f.i.providerInstanceId!,VolumeId:v.VolumeId,State:'detaching',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('stop',{fixture:f});assert.notEqual(r.receipt?.state,'stopped');assert.equal(r.calls.length,0);
+});
+test('an instance that EXISTS but is not this computer still refuses the stop',async()=>{
+    const f=lifecycleFixture('stop');f.state.instances[0]!.Tags=[];
+    const r=await run('stop',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
 });
 
 // Codex 4278130057: a computer whose instance was lost (instance_lost → STOPPED) and was then

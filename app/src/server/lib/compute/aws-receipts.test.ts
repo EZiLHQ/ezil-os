@@ -19,7 +19,7 @@ import {
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
-    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
+    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
 } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
@@ -58,7 +58,7 @@ const env = (over: Record<string, string> = {}) => ({
 
 type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null };
 
-function receiptOf(o: { jobId?: string; digest?: string; generation?: number; leaseEpoch?: number; fenceToken?: string; instanceId?: string; volumeId?: string; state?: string } = {}) {
+function receiptOf(o: { jobId?: string; digest?: string; generation?: number; leaseEpoch?: number; fenceToken?: string; instanceId?: string; volumeId?: string; state?: string; instanceLost?: true } = {}) {
     return JSON.stringify({
         schemaVersion: 1, jobId: JOB, digest: DIGEST, computerId: C1, generation: 2, leaseEpoch: 3, fenceToken: FENCE, instanceId: I_NEW, volumeId: VOL, state: 'running', ...o,
     });
@@ -332,6 +332,28 @@ describe('stop receipts', () => {
     it('DRAINING (start accepted, STOPPING not yet written) → STOPPING → STOPPED', async () => {
         const { status } = setup([stopping({ state: 'DRAINING' })], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) });
         expect(await status()).toMatchObject({ placementState: 'STOPPED' });
+    });
+
+    // Codex 4278276831: the instance was terminated externally while the stop was pending; infra
+    // completes it as a lost-instance stop (`instanceLost`). STOPPED with INSTANCE_LOST, so the
+    // next open is a REPLACE onto the retained volume even in start mode; fenced and closed as usual.
+    it('a lost-instance stop receipt lands STOPPED with INSTANCE_LOST, fenced', async () => {
+        const { status, placements, deleted } = setup([stopping()], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped', instanceLost: true }) });
+        expect(await status()).toMatchObject({ state: 'stopped', placementState: 'STOPPED' });
+        expect(placements[0]).toMatchObject({ lifecycle_job_id: null, last_error: INSTANCE_LOST });
+        expect(deleted).toHaveLength(1);
+    });
+
+    it('a normal stop receipt clears last_error (no INSTANCE_LOST)', async () => {
+        const { status, placements } = setup([stopping({ last_error: 'x' })], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) });
+        expect(await status()).toMatchObject({ placementState: 'STOPPED' });
+        expect(placements[0]).toMatchObject({ last_error: null });
+    });
+
+    it('instanceLost on a running receipt is invalid (receipt_invalid), never INSTANCE_LOST', async () => {
+        const { status, placements } = setup([row()], { status: 'SUCCEEDED', output: receiptOf({ instanceLost: true }) });
+        expect(await status()).toMatchObject({ placementState: 'UNCONFIRMED' });
+        expect(placements[0]).toMatchObject({ last_error: 'receipt_invalid' });
     });
 
     it('a stop receipt naming another instance is a conflict, no fence call', async () => {
