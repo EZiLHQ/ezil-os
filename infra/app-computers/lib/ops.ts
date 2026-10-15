@@ -16,6 +16,14 @@ export const OpsConfigSchema = z.object({
     budgetEmails: z.array(z.string().email()).max(5).default([]),
     /** Out-of-guest egress backstop: bytes sent by any one instance in 5 min. */
     egressBytesPer5Min: z.number().int().min(1_000_000).max(1_000_000_000_000),
+    /** Founder inboxes subscribed (EMAIL) to the ops alert topic: every alarm below and the budget. */
+    alertEmails: z.array(z.string().email()).max(5).default([]),
+    /** Alert when running On-Demand Standard vCPUs reach this share of the account quota. */
+    quotaAlarmPercent: z.number().int().min(1).max(100).default(80),
+    /** Alert when running On-Demand Standard vCPUs reach this many: set it near the app's
+     * EZIL_AWS_MAX_RUNNING_* × vCPU per computer, so the founder hears before new users fall
+     * back to Cloudflare (e.g. 16 = 80 % of 10 computers × 2 vCPU). */
+    capacityAlarmVcpus: z.number().int().min(1).max(100000),
 }).strict();
 export type OpsConfig = z.infer<typeof OpsConfigSchema>;
 
@@ -58,6 +66,9 @@ export class OpsStack extends Stack {
             conditions: { StringEquals: { 'aws:SourceAccount': a }, ArnLike: { 'aws:SourceArn': sourceArn } } });
         this.topic.addToResourcePolicy(publisher('cloudwatch.amazonaws.com', `arn:aws:cloudwatch:${c.region}:${a}:alarm:ezil-${c.namespace}-*`));
         this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:budget/ezil-${c.namespace}-monthly`));
+        // The founder's inboxes. Each address must confirm the AWS subscription email once.
+        c.alertEmails.forEach((endpoint, i) => new sns.Subscription(this, `AlertEmail${i}`, {
+            topic: this.topic, protocol: sns.SubscriptionProtocol.EMAIL, endpoint }));
 
         // R3: 12-hourly snapshots, 14 kept, of data volumes carrying this
         // namespace's backup tag (set only at creation; root disks lack it).
@@ -87,12 +98,47 @@ export class OpsStack extends Stack {
             alarmActions: [this.topic.topicArn], okActions: [this.topic.topicArn],
         });
 
+        // Capacity. Both alarms read the same account-wide usage metric: running On-Demand
+        // Standard (A, C, D, H, I, M, R, T, Z) vCPUs in this region, which every AWS computer
+        // tier (t3a/t3/m6i) counts against.
+        const runningVcpus = { namespace: 'AWS/Usage', metricName: 'ResourceCount', period: 300, stat: 'Maximum',
+            dimensions: [{ name: 'Service', value: 'EC2' }, { name: 'Type', value: 'Resource' },
+                { name: 'Resource', value: 'vCPU' }, { name: 'Class', value: 'Standard/OnDemand' }] };
+        const usageMetric = (id: string, returnData: boolean): cloudwatch.CfnAlarm.MetricDataQueryProperty => ({ id, returnData,
+            metricStat: { metric: { namespace: runningVcpus.namespace, metricName: runningVcpus.metricName, dimensions: runningVcpus.dimensions },
+                period: runningVcpus.period, stat: runningVcpus.stat } });
+        new cloudwatch.CfnAlarm(this, 'VcpuQuotaHigh', {
+            alarmName: `ezil-${c.namespace}-vcpu-quota-high`,
+            alarmDescription: `Running On-Demand Standard vCPUs in ${c.region} reached ${c.quotaAlarmPercent}% of the account quota. `
+                + 'New AWS computers will soon be refused by EC2. Request a higher "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" '
+                + 'quota in Service Quotas, or lower EZIL_AWS_MAX_RUNNING_* until it is granted.',
+            metrics: [usageMetric('m1', false), { id: 'e1', returnData: true, label: 'vCPU quota used (%)',
+                expression: '(m1/SERVICE_QUOTA(m1))*100' }],
+            comparisonOperator: 'GreaterThanOrEqualToThreshold', threshold: c.quotaAlarmPercent,
+            evaluationPeriods: 3, datapointsToAlarm: 2, treatMissingData: 'notBreaching',
+            alarmActions: [this.topic.topicArn], okActions: [this.topic.topicArn],
+        });
+        new cloudwatch.CfnAlarm(this, 'ComputersCapacityHigh', {
+            alarmName: `ezil-${c.namespace}-computers-capacity-high`,
+            alarmDescription: `Running On-Demand Standard vCPUs in ${c.region} reached ${c.capacityAlarmVcpus}: AWS computers are nearly at the app cap, `
+                + 'and new users will fall back to Cloudflare. Raise EZIL_AWS_MAX_RUNNING_* (and capacityAlarmVcpus) if the vCPU quota allows, '
+                + 'or request a higher quota first.',
+            metrics: [usageMetric('m1', true)],
+            comparisonOperator: 'GreaterThanOrEqualToThreshold', threshold: c.capacityAlarmVcpus,
+            evaluationPeriods: 3, datapointsToAlarm: 2, treatMissingData: 'notBreaching',
+            alarmActions: [this.topic.topicArn], okActions: [this.topic.topicArn],
+        });
+
         // §4: budget alarms are alerts, not enforcement.
         new budgets.CfnBudget(this, 'Monthly', {
             budget: { budgetName: `ezil-${c.namespace}-monthly`, budgetType: 'COST', timeUnit: 'MONTHLY',
                 budgetLimit: { amount: c.monthlyBudgetUsd, unit: 'USD' } },
-            notificationsWithSubscribers: [50, 80, 100].map(threshold => ({
-                notification: { notificationType: 'ACTUAL', comparisonOperator: 'GREATER_THAN', threshold, thresholdType: 'PERCENTAGE' },
+            // Actual 50/80/100 % plus a FORECASTED 100 %: the founder hears before the month overruns.
+            notificationsWithSubscribers: [
+                ...[50, 80, 100].map(threshold => ({ type: 'ACTUAL', threshold })),
+                { type: 'FORECASTED', threshold: 100 },
+            ].map(({ type, threshold }) => ({
+                notification: { notificationType: type, comparisonOperator: 'GREATER_THAN', threshold, thresholdType: 'PERCENTAGE' },
                 subscribers: [{ subscriptionType: 'SNS', address: this.topic.topicArn },
                     ...c.budgetEmails.map(address => ({ subscriptionType: 'EMAIL', address }))],
             })),

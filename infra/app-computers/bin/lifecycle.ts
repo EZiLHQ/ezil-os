@@ -9,7 +9,7 @@ import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
 try {
     const path=process.env.EZIL_LIFECYCLE_CONFIG;if(!path)throw new Error();
     const bytes=readFileSync(path);if(bytes.length>16384)throw new Error();
-    const config=z.object({settings:SettingsSchema,authorityKeyArn:z.string(),notificationsEnabled:z.boolean().default(false),
+    const config=z.object({settings:SettingsSchema,authorityKeyArn:z.string(),notificationsEnabled:z.boolean().default(false),alertTopicArn:z.string().optional(),
         recoveryVersionArn:z.string().optional(),recoveryEnabled:z.boolean().default(false),appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional(),
         // null omits the reservation: a new account's whole Lambda pool is 10, and any reservation then breaks the 10-unreserved minimum.
         lambdaReservedConcurrency:z.number().int().min(1).max(100).nullable().default(2)}).strict().parse(JSON.parse(bytes.toString()));

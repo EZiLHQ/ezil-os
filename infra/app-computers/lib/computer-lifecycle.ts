@@ -14,7 +14,7 @@ export class ComputerLifecycle extends Construct {
     readonly machine:states.CfnStateMachine;
     readonly version:states.CfnStateMachineVersion;
     readonly historyKey:kms.IKey;
-    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null}){
+    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this),r=d.region;
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
@@ -60,9 +60,17 @@ export class ComputerLifecycle extends Construct {
             detail:{stateMachineArn:[machineArn],status:['FAILED','TIMED_OUT','ABORTED']}},
             targets:[new GuardedTarget({queue:failures,key},{ruleArn:ruleArn(r,d.accountId,unconfirmedRule),account:d.accountId,
                 deadLetter:{queue:dlq,key},retryAttempts:2,maxEventAge:Duration.hours(1)})]});
-        new cloudwatch.Alarm(this,'UnconfirmedAlarm',{metric:failures.metricApproximateNumberOfMessagesVisible(),threshold:1,evaluationPeriods:1});
-        new cloudwatch.Alarm(this,'FailuresAlarm',{metric:new cloudwatch.Metric({namespace:'AWS/States',metricName:'ExecutionsFailed',
-            dimensionsMap:{StateMachineArn:this.machine.ref},statistic:'Sum',period:Duration.minutes(5)}),threshold:1,evaluationPeriods:1});
+        // Named under ezil-<ns>- so the ops alert topic's policy (alarm:ezil-<ns>-*) admits them.
+        // With alertTopicArn (the ops topic, founder inbox subscribed) both notify on ALARM and OK.
+        if(props.alertTopicArn!==undefined&&!new RegExp(`^arn:aws:sns:${r}:${d.accountId}:ezil-${d.namespace}-[A-Za-z0-9_-]{1,200}$`).test(props.alertTopicArn))throw new Error('invalid_alert_topic');
+        const notify=(alarm:cloudwatch.Alarm)=>{if(props.alertTopicArn){const action={bind:()=>({alarmActionArn:props.alertTopicArn!})};alarm.addAlarmAction(action);alarm.addOkAction(action);}return alarm;};
+        notify(new cloudwatch.Alarm(this,'UnconfirmedAlarm',{alarmName:`ezil-${d.namespace}-lifecycle-unconfirmed`,
+            alarmDescription:'A lifecycle execution failed, timed out or was aborted: a computer may be stuck (UNCONFIRMED). Check the unconfirmed queue and the Step Functions execution.',
+            metric:failures.metricApproximateNumberOfMessagesVisible(),threshold:1,evaluationPeriods:1}));
+        notify(new cloudwatch.Alarm(this,'FailuresAlarm',{alarmName:`ezil-${d.namespace}-lifecycle-failures`,
+            alarmDescription:'Lifecycle executions failed in the last 5 minutes (EC2 capacity, quota or permissions). Check the Step Functions execution history.',
+            metric:new cloudwatch.Metric({namespace:'AWS/States',metricName:'ExecutionsFailed',
+            dimensionsMap:{StateMachineArn:this.machine.ref},statistic:'Sum',period:Duration.minutes(5)}),threshold:1,evaluationPeriods:1}));
         new CfnOutput(this,'WorkflowVersionArn',{value:this.version.ref});
         new CfnOutput(this,'UnconfirmedQueueUrl',{value:failures.queueUrl});
     }

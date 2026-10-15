@@ -20,7 +20,7 @@ const cfg = IdentityConfigSchema.parse({ namespace: 'pilot', accountId: A, regio
     deploySubject: 'repo:example-org@1000/example-repo@2000:environment:aws-pilot', assetBucketName: `ezil-pilot-deploy-assets-${A}` });
 const BOUNDARY = `arn:aws:iam::${A}:policy/ezil/identity/ezil-pilot-boundary`, EXEC = `arn:aws:iam::${A}:role/ezil/identity/ezil-pilot-cfn-exec`;
 const json = (s: { toStatementJson(): unknown }[]) => s.map(x => x.toStatementJson());
-const opsCfg = OpsConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R, monthlyBudgetUsd: 100, egressBytesPer5Min: 3_000_000_000 });
+const opsCfg = OpsConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R, monthlyBudgetUsd: 100, egressBytesPer5Min: 3_000_000_000, capacityAlarmVcpus: 16 });
 
 const ROLES = `arn:aws:iam::${A}:role/ezil/pilot/*`;
 const BASIC = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole';
@@ -299,10 +299,11 @@ test('I6 ops: DLM volumes only, 12-hourly retain 14; budget 50/80/100; egress al
     assert.deepEqual(policy.PolicyDetails.Schedules[0].RetainRule, { Count: 14 });
     assert.equal(policy.PolicyDetails.Schedules[0].CrossRegionCopyRules, undefined); assert.equal(policy.PolicyDetails.Schedules[0].ShareRules, undefined);
     const [budget] = of('AWS::Budgets::Budget');
-    assert.deepEqual(budget.NotificationsWithSubscribers.map((n: any) => n.Notification.Threshold), [50, 80, 100]);
-    assert.ok(budget.NotificationsWithSubscribers.every((n: any) => n.Notification.NotificationType === 'ACTUAL'));
+    // Actual 50/80/100 % plus a forecasted 100 % (founder alerting, 2026-10-15; test/alerts.test.ts).
+    assert.deepEqual(budget.NotificationsWithSubscribers.map((n: any) => [n.Notification.NotificationType, n.Notification.Threshold]),
+        [['ACTUAL', 50], ['ACTUAL', 80], ['ACTUAL', 100], ['FORECASTED', 100]]);
     assert.deepEqual(budget.Budget.BudgetLimit, { Amount: 100, Unit: 'USD' });
-    const [alarm] = of('AWS::CloudWatch::Alarm');
+    const alarm = of('AWS::CloudWatch::Alarm').find((p: any) => p.AlarmName === 'ezil-pilot-egress-any-instance');
     assert.equal(alarm.Threshold, 3_000_000_000); assert.match(alarm.Metrics[0].Expression, /MAX\(NetworkOut\)/);
     const [topicPolicy] = of('AWS::SNS::TopicPolicy');
     const publishers = topicPolicy.PolicyDocument.Statement.map((s: any) => ({ service: s.Principal.Service, condition: s.Condition }));
