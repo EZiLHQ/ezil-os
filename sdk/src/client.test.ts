@@ -68,6 +68,21 @@ describe('createEzilClient', () => {
         expect(JSON.parse(url.searchParams.get('input')!)).toEqual({ json: { id: 'c1' } });
     });
 
+    it('systemInfo is a GET query of computer.systemInfo with { computerId }, returning the info', async () => {
+        const info = {
+            provider: 'aws-ec2', providerSource: 'placement',
+            machine: { vcpu: 2, memoryMiB: 4096, instanceType: 't3a.medium', region: 'us-east-1', source: 'configured' },
+            lifecycleState: 'RUNNING', usage: null,
+        } as const;
+        const { fetchImpl, seen } = stub({ body: ok(info) });
+        const got = await client(fetchImpl).computers.systemInfo('c1');
+        const url = new URL(seen[0]!.url);
+        expect(seen[0]!.init.method).toBe('GET');
+        expect(url.pathname).toBe('/api/trpc/computer.systemInfo');
+        expect(JSON.parse(url.searchParams.get('input')!)).toEqual({ json: { computerId: 'c1' } });
+        expect(got).toEqual(info);
+    });
+
     it('sends mutations as POST with the input in the body', async () => {
         const { fetchImpl, seen } = stub({ body: ok({ id: 'c2' }) });
         await client(fetchImpl).computers.rename('c2', 'Studio');

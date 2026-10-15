@@ -1009,6 +1009,33 @@ export async function getScreen (computerId, timeoutMs = SCREEN_TIMEOUT_MS) {
     return { ok: true, width: data.width, height: data.height, source: data.source ?? 'observed' };
 }
 
+/**
+ * `GET <endpoints.system>?computerId=…` — what Settings → System may say about
+ * the machine behind a computer: recorded provider, configured size, lifecycle
+ * state. Read only on the server; it never assigns a provider.
+ *
+ * NEVER THROWS. `UNSUPPORTED` when this deployment has no `system` endpoint (a
+ * shell newer than its server), so the tab says "not available" instead of
+ * calling a URL it invented.
+ *
+ * @returns {Promise<{ok:true, info:object} | {ok:false, code:string, message?:string}>}
+ */
+export async function getSystemInfo (computerId, timeoutMs = SCREEN_TIMEOUT_MS) {
+    if ( ! computerId ) return { ok: false, code: 'BAD_REQUEST', message: 'No computer.' };
+    const url = payload()?.desktopState?.endpoints?.system;
+    if ( typeof url !== 'string' || url === '' ) return { ok: false, code: 'UNSUPPORTED' };
+    const sep = url.includes('?') ? '&' : '?';
+    const res = await request(`${url}${sep}computerId=${encodeURIComponent(computerId)}`, { method: 'GET', timeoutMs });
+    if ( ! res.ok ) {
+        if ( res.code === 'TIMEOUT' ) return { ok: false, code: 'TIMEOUT' };
+        if ( res.code === 'UNAUTHORIZED' || res.status === 404 ) return { ok: false, code: 'NOT_FOUND' };
+        return { ok: false, code: 'UPSTREAM' };
+    }
+    const data = res.data ?? {};
+    if ( data.ok !== true || ! data.info || typeof data.info !== 'object' ) return { ok: false, code: 'UPSTREAM' };
+    return { ok: true, info: data.info };
+}
+
 export async function setScreen (computerId, width, height, timeoutMs = SCREEN_TIMEOUT_MS) {
     if ( ! computerId || ! Number.isInteger(width) || ! Number.isInteger(height) ) {
         return { ok: false, code: 'BAD_REQUEST', message: 'No computer, or nothing measurable.' };
@@ -1058,7 +1085,7 @@ export default {
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity, releaseDesktop,
-    screenEndpoint, setScreen, getScreen,
+    screenEndpoint, setScreen, getScreen, getSystemInfo,
     withWakeAndOneRetry,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
