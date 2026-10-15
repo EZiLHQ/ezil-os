@@ -74,8 +74,11 @@ const LifecycleReceiptSchema = z
         instanceId: z.string().regex(/^i-[a-f0-9]{17}$/),
         volumeId: z.string().regex(/^vol-[a-f0-9]{17}$/),
         state: z.enum(['running', 'stopped', 'retired']),
+        /** Infra: only on `stopped` — the instance was already gone; the next wake must REPLACE. */
+        instanceLost: z.literal(true).optional(),
     })
-    .strict();
+    .strict()
+    .refine((r) => !r.instanceLost || r.state === 'stopped', { message: 'instance_lost_on_stop_only' });
 
 /** Infra `CAPACITY_CODES` (lifecycle/errors.ts): a definite refusal, EC2 created nothing for that request. */
 export const LIFECYCLE_CAPACITY_CODES: readonly string[] = [
@@ -228,7 +231,10 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         return;
     }
     const done: PlacementFields = {
-        instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null, lastError: stopping || retiring ? null : p.lastError,
+        instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null,
+        // A stop that found its instance already gone (`instanceLost`): STOPPED with INSTANCE_LOST,
+        // so the next open is a REPLACE onto the retained volume even in start mode (aws-ec2.ts).
+        lastError: stopping ? (r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : p.lastError,
     };
     // Fence GW-1 before a stop or retire is final: the tunnel must not outlive the instance.
     // Pending until the Worker confirms, so a failure is retried on the next look. No tunnel

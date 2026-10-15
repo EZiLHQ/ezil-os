@@ -53,7 +53,10 @@ export const LifecycleReceiptSchema = z.object({
     schemaVersion: z.literal(1), jobId: uuid, digest: z.string().regex(/^[a-f0-9]{64}$/),
     computerId: uuid, generation: positive, leaseEpoch: positive, fenceToken: uuid, instanceId: instance, volumeId: volume,
     state: z.enum(['running', 'stopped', 'retired']),
-}).strict();
+    /** Only on a `stopped` receipt: the instance was already gone (terminated externally); the
+     * retained volume was verified free and this computer's, and the next wake must REPLACE. */
+    instanceLost: z.literal(true).optional(),
+}).strict().refine(r => !r.instanceLost || r.state === 'stopped', { message: 'instance_lost_on_stop_only' });
 export type LifecycleReceipt = z.infer<typeof LifecycleReceiptSchema>;
 export function validateLifecycleReceipt(work: LifecycleWork, input: unknown): LifecycleReceipt {
     const intent = parseLifecycleWork(work), parsed = LifecycleReceiptSchema.safeParse(input);

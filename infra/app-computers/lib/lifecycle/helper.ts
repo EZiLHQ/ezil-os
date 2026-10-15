@@ -72,7 +72,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
         const sourceId=i.previousInstanceId??i.providerInstanceId;
-        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,['replace','retire'].includes(i.operation)):undefined;
+        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,['replace','retire','stop'].includes(i.operation)):undefined;
         // A replace whose previous instance EC2 no longer knows (the app's instance_lost recovery)
         // has nothing to stop or terminate. The volume must not claim an attachment to it; the
         // launch below still requires the volume `available` and unattached, and its tags were
@@ -85,10 +85,23 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
             return success(i,envelope.digest,sourceId,v.VolumeId,'retired');
         }
+        // A stop whose instance EC2 no longer knows (terminated externally while the stop was
+        // pending) is a LOST-instance stop: nothing to stop, the volume is kept, and the receipt
+        // says so (`instanceLost`) so the app's next wake REPLACES onto the volume. The volume
+        // must be free, unattached and this computer's (tags checked above), or it is a failure.
+        if(!source&&sourceId&&i.operation==='stop'){
+            if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
+            return lostStop(i,envelope.digest,sourceId,v.VolumeId);
+        }
         if(source&&['stop','retire','replace'].includes(i.operation)){
             const status=source.State?.Name;
             if(status==='terminated'){
-                if(i.operation==='stop')return fail();
+                // Still visible as terminated: the same lost-instance stop once the volume has
+                // detached (wait while it does, as the retire below does).
+                if(i.operation==='stop'){
+                    if(v.State!=='available'||v.Attachments.length)return wait(phase);
+                    return lostStop(i,envelope.digest,sourceId!,v.VolumeId);
+                }
                 if(i.operation==='retire'){
                     if(v.State!=='available'||v.Attachments.length)return wait(phase);
                     return success(i,envelope.digest,sourceId!,v.VolumeId,'retired');
@@ -177,6 +190,11 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
 function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string,state:LifecycleReceipt['state']){
     return {decision:'success',receipt:{schemaVersion:1,jobId:i.jobId,digest,computerId:i.computerId,
         generation:i.targetGeneration,leaseEpoch:i.leaseEpoch,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
+}
+/** A stop whose instance is gone: a `stopped` receipt marked `instanceLost`. */
+function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string){
+    const done=success(i,digest,instanceId,volumeId,'stopped');
+    return {...done,receipt:{...done.receipt,instanceLost:true as const} satisfies LifecycleReceipt};
 }
 function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
