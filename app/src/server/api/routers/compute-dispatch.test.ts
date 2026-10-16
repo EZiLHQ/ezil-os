@@ -433,3 +433,43 @@ describe('Codex 4277613545: the shell stop of an AWS computer answers only a CON
         expect(src).toMatch(/cloudflareGuacamole\.terminate\(\{[^}]*confirm:\s*true/);
     });
 });
+
+describe('routeComputer: AWS-required accounts', () => {
+    it('a sandbox start the canary does not claim is PRECONDITION_FAILED with the reason, and nothing is pinned', async () => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const { fake, db } = routerDb([]);
+            const env = { ...AWS_ENV, EZIL_AWS_REQUIRED_USER_IDS: U1 }; // no canary configured
+            await expect(routeComputer(db, computer, { env, pinCloudflare: true })).rejects.toMatchObject({
+                code: 'PRECONDITION_FAILED',
+                message: 'aws_required:canary_unset',
+            });
+            expect(fake.placements).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('an unconfigured builder start refuses rather than making an unexplained Cloudflare pin', async () => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const { fake, db } = routerDb([]);
+            const env = { ...AWS_ENV, EZIL_AWS_REQUIRED_USER_IDS: U2 };
+            await expect(routeComputer(db, computer, { env, pinCloudflare: true })).rejects.toMatchObject({
+                code: 'PRECONDITION_FAILED', message: 'compute_placement_refused:canary_unset',
+            });
+            expect(fake.placements).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
+
+describe('routeComputer: required placement cannot bypass dispatch with reads off', () => {
+    it('founder cannot enter the legacy Cloudflare short circuit', async () => {
+        const founder = { ...computer, userId: '1ae9b1fd-880b-42ac-aebe-433b3c0ba11f' };
+        await expect(routeComputer(untouchableDb, founder, { env: {}, pinCloudflare: true })).rejects.toMatchObject({
+            code: 'PRECONDITION_FAILED', message: 'aws_required:placement_reads_disabled',
+        });
+    });
+});
