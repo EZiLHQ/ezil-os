@@ -51,13 +51,38 @@ for family, step_name in (
     assert local_family == ci_family, (family, local_family ^ ci_family)
     assert not family_paths.intersection(ci_family), family
     family_paths.update(ci_family)
-browser_paths = {
-    str(path.relative_to(root)) for path in (root / 'shell').rglob('*-test.mjs')
+shell_paths = {
+    str(path.relative_to(root)): path for path in (root / 'shell').rglob('*-test.mjs')
     if 'node_modules' not in path.parts
-    and (path.name.endswith('-browser-test.mjs') or 'PLAYWRIGHT_REQUIRE_DIR' in path.read_text())
 }
+browser_paths = {name for name, path in shell_paths.items()
+                 if path.name.endswith('-browser-test.mjs') or 'PLAYWRIGHT_REQUIRE_DIR' in path.read_text()}
 assert family_paths == browser_paths, family_paths ^ browser_paths
-assert 'shell/ezil/boot-test.mjs' in next(step['run'] for step in shell_steps if step.get('name') == 'Shell unit suites')
+# Node-only regressions need the same discovery parity as the browser families.
+# Include the embedded viewer controls, whose suite resolves jsdom from shell/.
+node_paths = set(shell_paths) - browser_paths
+node_paths.update(str(path.relative_to(root)) for path in
+                  (root / 'worker/assets/neko-branding/www').rglob('*-test.mjs')
+                  if 'node_modules' not in path.parts)
+unit_step = next(step for step in shell_steps if step.get('name') == 'Shell unit suites')
+assert 'if' not in unit_step and 'continue-on-error' not in unit_step, 'Node suites must run on every shell matrix leg'
+unit_loop = re.search(r'for t in\s+([\s\S]*?); do\s+echo "── \$t"\s+node "\$t"\s+done', unit_step['run'])
+assert unit_loop and re.search(r'^set -e\s*$', unit_step['run'], re.MULTILINE), 'Node suites must fail on the first failing file'
+ci_node_paths = unit_loop[1].replace('\\\n', ' ').split()
+assert len(ci_node_paths) == len(set(ci_node_paths)), 'Duplicate Node suite in CI'
+assert set(ci_node_paths) == node_paths, ('Node suite parity', sorted(node_paths - set(ci_node_paths)), sorted(set(ci_node_paths) - node_paths))
+unit_index = shell_steps.index(unit_step)
+for directory in ('shell', 'app'):
+    installs = [step for step in shell_steps[:unit_index]
+                if step.get('working-directory') == directory and step.get('run') == 'bun install --frozen-lockfile']
+    assert len(installs) == 1 and 'if' not in installs[0] and 'continue-on-error' not in installs[0], f'Node suites require locked {directory} dependencies'
+# Match jsdom 30's engine floor, including the Node TS loader used by feedback.
+node_setup = next(step for step in shell_steps[:unit_index] if step.get('uses', '').startswith('actions/setup-node@'))
+node_version = node_setup['with']['node-version']
+assert re.fullmatch(r'\d+\.\d+\.\d+', node_version), 'Pin the shell Node runtime'
+version = tuple(map(int, node_version.split('.')))
+assert ((22, 22, 2) <= version < (23, 0, 0) or (24, 15, 0) <= version < (25, 0, 0)
+        or version >= (26, 0, 0)), 'Shell Node version must support jsdom 30 and TypeScript imports'
 internal_triggers = workflows['macos-internal'].get('on', workflows['macos-internal'].get(True))
 assert '.github/workflows/ci.yml' in internal_triggers['pull_request']['paths']
 
