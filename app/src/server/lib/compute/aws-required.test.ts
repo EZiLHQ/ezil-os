@@ -1,133 +1,114 @@
-/**
- * AWS-required accounts (`EZIL_AWS_REQUIRED_USER_IDS`): a NEW computer that the canary or
- * admission does not claim is refused with its reason, never silently pinned to Cloudflare.
- * Existing placements and pre-SINCE computers keep their current provider.
- */
-
 import { describe, expect, it, vi } from 'vitest';
-
-import { awsRequiredUserIds, isAwsRequiredUser } from './aws-config';
-import { cloudflareComputeProvider } from './cloudflare';
+import { AWS_REQUIRED_FOUNDER_ID, awsRequiredUserIds, invalidRequiredUserConfig, isAwsRequiredUser } from './aws-config';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { AwsRequiredError, resolveComputeProvider } from './select';
+import { AwsPlacementRefusedError, AwsRequiredError, resolveComputeProvider } from './select';
 
-const userId = '11111111-1111-4111-8111-111111111111';
-const otherUser = '44444444-4444-4444-8444-444444444444';
+const userId = AWS_REQUIRED_FOUNDER_ID;
+const builder = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
 const computer = { userId, computerId };
-const SINCE = '2026-10-15T13:12:00Z';
-const ADMIT = {
+const ENV = {
+    EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_CANARY_SINCE: '2026-10-15T00:00:00Z',
     AWS_MAX_RUNNING: '2', EZIL_AWS_USER_MONTHLY_HOURS: '10', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
     EZIL_AWS_USER_MONTHLY_EGRESS_GB: '10', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '10',
     AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
 };
-const REQUIRED = {
-    EZIL_AWS_COMPUTERS_ENABLED: '1', ...ADMIT,
-    EZIL_AWS_CANARY_USER_IDS: userId, EZIL_AWS_CANARY_SINCE: SINCE,
-    EZIL_AWS_REQUIRED_USER_IDS: userId,
-};
-const created = (at: string) => ({ computers: [{ id: computerId, user_id: userId, created_at: new Date(at) }] });
-const NEW = '2026-10-16T05:30:00Z';
-
-async function refusal(env: Record<string, string | undefined>, at = NEW) {
-    const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
-    try {
-        const { db, placements } = createFakePlacementDb(created(at));
-        const error = await resolveComputeProvider(db, computer, env, {}, { pinCloudflare: true }).then(
-            () => null,
-            (err: unknown) => err,
-        );
-        return { error, placements, logs: spy.mock.calls };
-    } finally {
-        spy.mockRestore();
-    }
-}
-
-describe('AWS-required account: a new computer is refused with its reason, never pinned to Cloudflare', () => {
-    it.each([
-        { name: 'AWS flag off (placement reads on)', env: { ...REQUIRED, EZIL_AWS_COMPUTERS_ENABLED: undefined, EZIL_COMPUTE_PLACEMENT_READS: '1' }, reason: 'aws_disabled' },
-        { name: 'canary unset', env: { ...REQUIRED, EZIL_AWS_CANARY_USER_IDS: undefined }, reason: 'canary_unset' },
-        { name: 'canary list has a trailing comma', env: { ...REQUIRED, EZIL_AWS_CANARY_USER_IDS: `${userId},` }, reason: 'canary_malformed' },
-        { name: 'account not in the canary list', env: { ...REQUIRED, EZIL_AWS_CANARY_USER_IDS: otherUser }, reason: 'user_not_in_cohort' },
-        { name: 'admission refuses (no running capacity)', env: { ...REQUIRED, AWS_MAX_RUNNING: '0' }, reason: 'admission_refused:' },
-        { name: 'admission config invalid (a cap is not an integer)', env: { ...REQUIRED, EZIL_AWS_USER_MONTHLY_HOURS: '10 ' }, reason: 'admission_refused:aws_config_invalid' },
-    ])('$name', async ({ env, reason }) => {
-        const { error, placements, logs } = await refusal(env);
-        expect(error).toBeInstanceOf(AwsRequiredError);
-        expect((error as AwsRequiredError).reason.startsWith(reason)).toBe(true);
-        expect((error as AwsRequiredError).message).toBe(`aws_required:${(error as AwsRequiredError).reason}`);
-        expect(placements).toEqual([]); // no Cloudflare pin, no row of any kind
-        const refused = logs.filter((call) => call[0] === '[compute.placement] aws_required_refused');
-        expect(refused).toHaveLength(1);
-        expect(refused[0]?.[1]).toMatchObject({ computerId });
-        expect(JSON.stringify(logs)).not.toContain(userId);
-        expect(logs.some((call) => call[0] === '[compute.placement] pinned')).toBe(false);
-    });
-
-    it('still reaches AWS when the canary and admission claim it', async () => {
-        const { db, placements } = createFakePlacementDb(created(NEW));
-        expect((await resolveComputeProvider(db, computer, REQUIRED, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
-        expect(placements).toEqual([]); // the aws-ec2 provider's ensure() admits and writes, not resolve
-    });
+const start = { pinCloudflare: true };
+const seeded = (owner = userId, created = '2026-10-16T00:00:00Z') => createFakePlacementDb({
+    computers: [{ id: computerId, user_id: owner, created_at: new Date(created) }],
 });
 
-describe('AWS-required account: existing state is protected', () => {
-    it('a computer created before SINCE keeps Cloudflare (it may hold an R2 workspace) and the pin says why', async () => {
-        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
-        try {
-            const { db, placements } = createFakePlacementDb(created('2026-09-18T02:27:45Z'));
-            expect(await resolveComputeProvider(db, computer, REQUIRED, {}, { pinCloudflare: true })).toBe(cloudflareComputeProvider);
-            expect(placements.map((row) => row.provider)).toEqual(['cloudflare']);
-            expect(spy.mock.calls.find((call) => call[0] === '[compute.placement] pinned')?.[1]).toMatchObject({ canary: 'created_before_since' });
-        } finally {
-            spy.mockRestore();
-        }
-    });
-
-    it('an existing Cloudflare placement is never changed or refused', async () => {
-        const row = placementRow({ computer_id: computerId, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' });
-        const { db, placements, statements } = createFakePlacementDb({ ...created(NEW), placements: [row] });
-        expect(await resolveComputeProvider(db, computer, REQUIRED, {}, { pinCloudflare: true })).toBe(cloudflareComputeProvider);
-        expect(placements).toHaveLength(1);
-        expect(placements[0]?.provider).toBe('cloudflare');
-        expect(statements.every((statement) => !statement.sql.includes('placement:insert'))).toBe(true);
-    });
-
-    it('a read that does not start a sandbox is never refused and writes nothing', async () => {
-        const { db, placements } = createFakePlacementDb(created(NEW));
-        const env = { ...REQUIRED, EZIL_AWS_CANARY_USER_IDS: otherUser };
-        expect(await resolveComputeProvider(db, computer, env)).toBe(cloudflareComputeProvider);
+describe('founder is always AWS-required for new placement', () => {
+    it.each([
+        { name: 'placement reads disabled', env: {}, reason: 'placement_reads_disabled' },
+        { name: 'AWS disabled', env: { ...ENV, EZIL_AWS_COMPUTERS_ENABLED: '0', EZIL_COMPUTE_PLACEMENT_READS: '1' }, reason: 'aws_disabled' },
+        { name: 'cutoff absent', env: { ...ENV, EZIL_AWS_CANARY_SINCE: undefined }, reason: 'canary_unset' },
+        { name: 'cohort excludes founder', env: { ...ENV, EZIL_AWS_CANARY_USER_IDS: builder }, reason: 'user_not_in_cohort' },
+        { name: 'capacity full', env: { ...ENV, AWS_MAX_RUNNING: '0' }, reason: 'admission_refused:max_running' },
+        { name: 'invalid spending limit', env: { ...ENV, AWS_MAX_RUNNING: undefined }, reason: 'admission_refused:aws_config_invalid' },
+    ])('$name refuses without creating any placement', async ({ env, reason }) => {
+        const { db, placements } = seeded();
+        await expect(resolveComputeProvider(db, computer, env, {}, start)).rejects.toMatchObject({ name: 'AwsRequiredError', reason });
         expect(placements).toEqual([]);
     });
+
+    it.each(['*', 'bad', `${userId},bad`, `${builder},`])('malformed additional requirements %s fail closed', async (list) => {
+        const { db, placements } = seeded();
+        await expect(resolveComputeProvider(db, computer, { ...ENV, EZIL_AWS_REQUIRED_USER_IDS: list }, {}, start))
+            .rejects.toMatchObject({ name: 'AwsPlacementRefusedError', reason: 'aws_required_config_invalid' });
+        expect(placements).toEqual([]);
+        expect(isAwsRequiredUser({ EZIL_AWS_REQUIRED_USER_IDS: list }, userId)).toBe(true);
+    });
+
+    it('concurrent founder resolutions only return AWS and never write a Cloudflare pin', async () => {
+        const { db, placements } = seeded();
+        const results = await Promise.all(Array.from({ length: 6 }, () => resolveComputeProvider(db, computer, ENV, {}, start)));
+        expect(results.map((r) => r.kind)).toEqual(Array(6).fill('aws-ec2'));
+        expect(placements).toEqual([]);
+    });
+
+    it('preserves a Cloudflare pin even with malformed requirements or disabled AWS', async () => {
+        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' })] });
+        const provider = await resolveComputeProvider(db, computer, { EZIL_COMPUTE_PLACEMENT_READS: '1', EZIL_AWS_REQUIRED_USER_IDS: 'bad' }, {}, start);
+        expect(provider.kind).toBe('cloudflare');
+        expect(placements).toHaveLength(1);
+    });
+
+    it('keeps a pre-cutoff unplaced computer on Cloudflare rather than opening an empty AWS disk', async () => {
+        const { db, placements } = seeded(userId, '2026-09-18T00:00:00Z');
+        expect((await resolveComputeProvider(db, computer, ENV, {}, start)).kind).toBe('cloudflare');
+        expect(placements[0]?.provider).toBe('cloudflare');
+    });
 });
 
-describe('accounts not on the required list keep today\'s behaviour', () => {
-    it.each([
-        { name: 'another account is required, not this one', required: otherUser },
-        { name: 'list unset', required: undefined },
-        { name: '`*` is not accepted (nobody is required)', required: '*' },
-        { name: 'a malformed entry voids the list', required: `${userId},not-a-uuid` },
-    ])('$name: the refused computer is pinned to Cloudflare as before', async ({ required }) => {
-        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+describe('builders prefer AWS; fallback requires only allowed admission refusals', () => {
+    const ref = { userId: builder, computerId };
+    it('an unset cohort list prefers AWS for a new builder', async () => {
+        const { db } = seeded(builder);
+        expect((await resolveComputeProvider(db, ref, ENV, {}, start)).kind).toBe('aws-ec2');
+    });
+    it.each(['AWS_MAX_RUNNING', 'EZIL_AWS_USER_MONTHLY_HOURS', 'EZIL_AWS_GLOBAL_MONTHLY_HOURS', 'EZIL_AWS_USER_MONTHLY_EGRESS_GB', 'EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB', 'EZIL_AWS_MAX_RUNNING_US_EAST_1'])('%s cap permits a labeled Cloudflare pin', async (key) => {
+        const log = vi.spyOn(console, 'info').mockImplementation(() => {});
         try {
-            const { db, placements } = createFakePlacementDb(created(NEW));
-            const env = { ...REQUIRED, EZIL_AWS_CANARY_USER_IDS: otherUser, EZIL_AWS_REQUIRED_USER_IDS: required };
-            expect(await resolveComputeProvider(db, computer, env, {}, { pinCloudflare: true })).toBe(cloudflareComputeProvider);
-            expect(placements.map((row) => row.provider)).toEqual(['cloudflare']);
-        } finally {
-            spy.mockRestore();
-        }
+            const { db, placements } = seeded(builder);
+            expect((await resolveComputeProvider(db, ref, { ...ENV, [key]: '0' }, {}, start)).kind).toBe('cloudflare');
+            expect(placements[0]?.provider).toBe('cloudflare');
+            expect(placements[0]?.last_error).toMatch(/^cloudflare_fallback:admission_refused:/);
+            expect(log).toHaveBeenCalledWith('[compute.placement] pinned', expect.objectContaining({ provider: 'cloudflare', canary: expect.stringContaining('admission_refused:') }));
+        } finally { log.mockRestore(); }
+    });
+    it.each([
+        {}, { ...ENV, AWS_MAX_RUNNING: undefined }, { ...ENV, EZIL_AWS_CANARY_SINCE: undefined },
+        { ...ENV, EZIL_AWS_CANARY_USER_IDS: 'bad' }, { ...ENV, EZIL_AWS_REQUIRED_USER_IDS: 'bad' },
+        { ...ENV, EZIL_AWS_COMPUTERS_ENABLED: '0', EZIL_COMPUTE_PLACEMENT_READS: '1' },
+        { ...ENV, EZIL_AWS_CANARY_USER_IDS: userId },
+    ])('invalid/incomplete config %j refuses before a pin', async (env) => {
+        const { db, placements } = seeded(builder);
+        await expect(resolveComputeProvider(db, ref, env, {}, start)).rejects.toBeInstanceOf(AwsPlacementRefusedError);
+        expect(placements).toEqual([]);
+    });
+    it.each(['missing', 'deleted', 'foreign', 'duplicate'])('%s state never becomes Cloudflare fallback', async (state) => {
+        const seed = createFakePlacementDb({ computers: state === 'missing' ? [] : [{
+            id: computerId, user_id: state === 'foreign' ? userId : builder,
+            created_at: new Date('2026-10-16T00:00:00Z'), deleted_at: state === 'deleted' ? new Date() : null,
+        }] });
+        if (state === 'duplicate') seed.placements.push(placementRow({ computer_id: computerId }), placementRow({ computer_id: computerId }));
+        await expect(resolveComputeProvider(seed.db, ref, ENV, {}, start)).rejects.toThrow();
+        expect(seed.placements.every((r) => r.provider !== 'cloudflare')).toBe(true);
+    });
+    it('a kill switch cannot hide duplicate placement elsewhere in admission counters', async () => {
+        const seed = seeded(builder);
+        seed.placements.push(placementRow({ computer_id: userId }), placementRow({ computer_id: userId }));
+        await expect(resolveComputeProvider(seed.db, ref, { ...ENV, EZIL_AWS_KILL_SWITCH: '1' }, {}, start)).rejects.toBeInstanceOf(AwsPlacementRefusedError);
+        expect(seed.placements.every((r) => r.provider !== 'cloudflare')).toBe(true);
     });
 });
 
-describe('awsRequiredUserIds', () => {
-    it('parses comma-separated UUIDs, trimming and ignoring case', () => {
-        const ids = awsRequiredUserIds({ EZIL_AWS_REQUIRED_USER_IDS: ` ${userId.toUpperCase()} , ${otherUser}` });
-        expect([...ids]).toEqual([userId, otherUser]);
-        expect(isAwsRequiredUser({ EZIL_AWS_REQUIRED_USER_IDS: userId }, userId.toUpperCase())).toBe(true);
-    });
-
-    it.each([undefined, '', '   ', '*', `${userId},`, `${userId},*`, 'not-a-uuid'])('%j means nobody is required', (value) => {
-        expect(awsRequiredUserIds({ EZIL_AWS_REQUIRED_USER_IDS: value }).size).toBe(0);
+describe('required-user configuration', () => {
+    it('keeps founder plus canonical additional accounts and flags malformed config', () => {
+        expect([...awsRequiredUserIds({ EZIL_AWS_REQUIRED_USER_IDS: ` ${builder.toUpperCase()} ` })]).toEqual([userId, builder]);
+        expect(invalidRequiredUserConfig({ EZIL_AWS_REQUIRED_USER_IDS: `${builder},bad` })).toBe(true);
+        expect(isAwsRequiredUser({ EZIL_AWS_REQUIRED_USER_IDS: `${builder},bad` }, builder)).toBe(true);
+        expect(new AwsRequiredError(computerId, 'max_running').message).toBe('aws_required:max_running');
     });
 });

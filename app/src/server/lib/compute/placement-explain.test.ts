@@ -13,7 +13,7 @@ type Input = Parameters<typeof explainAwsCanary>[0];
 describe('explainAwsCanary', () => {
     const reasons: { reason: AwsCanaryExplanation['reason']; input: Input }[] = [
         { reason: 'aws_disabled', input: { env: { ...env, EZIL_AWS_COMPUTERS_ENABLED: '0' }, userId, computer } },
-        { reason: 'canary_unset', input: { env: { ...env, EZIL_AWS_CANARY_USER_IDS: undefined }, userId, computer } },
+        { reason: 'canary_unset', input: { env: { ...env, EZIL_AWS_CANARY_SINCE: undefined }, userId, computer } },
         { reason: 'canary_malformed', input: { env: { ...env, EZIL_AWS_CANARY_USER_IDS: 'not-a-uuid' }, userId, computer } },
         { reason: 'user_not_in_cohort', input: { env: { ...env, EZIL_AWS_CANARY_USER_IDS: otherUserId }, userId, computer } },
         { reason: 'computer_missing', input: { env, userId, computer: null } },
@@ -38,7 +38,7 @@ describe('explainAwsCanary', () => {
     });
 
     it.each(['EZIL_AWS_CANARY_USER_IDS', 'EZIL_AWS_CANARY_SINCE'].flatMap((key) =>
-        [undefined, '', ' \t\n '].map((value) => ({ key, value })),
+        (key === 'EZIL_AWS_CANARY_USER_IDS' ? ['', ' \t\n '] : [undefined, '', ' \t\n ']).map((value) => ({ key, value })),
     ))('$key = $value is unset', ({ key, value }) => {
         expect(explainAwsCanary({ env: { ...env, [key]: value }, userId, computer }))
             .toEqual({ eligible: false, reason: 'canary_unset' });

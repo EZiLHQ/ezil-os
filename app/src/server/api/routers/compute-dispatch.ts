@@ -21,7 +21,7 @@
 
 import { TRPCError } from '@trpc/server';
 
-import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
+import { isAwsComputersEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
@@ -29,7 +29,7 @@ import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare'
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
-import { AwsRequiredError, resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
+import { AwsPlacementRefusedError, AwsRequiredError, resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
 import { resolveTier, type EntitlementReader } from '@/server/lib/compute/tier';
 
 export type RoutedComputer =
@@ -80,8 +80,7 @@ export async function routeComputer(
     computer: ComputerRef,
     { env = process.env, entitlements, aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
 ): Promise<RoutedComputer> {
-    // Flag off: no database read at all — the pre-P3 call, unchanged.
-    if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
+    // Resolve every request, including the required-account guard with reads off.
     let provider: ComputeProvider;
     try {
         provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlements, aws), { pinCloudflare });
@@ -95,6 +94,9 @@ export async function routeComputer(
             // fall back to Cloudflare. The reason is a code (aws_disabled, user_not_in_cohort,
             // admission_refused:<code>, …), never a credential or another user's data.
             throw new TRPCError({ code: 'PRECONDITION_FAILED', message: `aws_required:${err.reason}`, cause: err });
+        }
+        if (err instanceof AwsPlacementRefusedError) {
+            throw new TRPCError({ code: 'PRECONDITION_FAILED', message: err.message, cause: err });
         }
         throw err; // duplicate/unknown placement, missing table: fail closed, never Cloudflare.
     }

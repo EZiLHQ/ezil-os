@@ -450,15 +450,26 @@ describe('routeComputer: AWS-required accounts', () => {
         }
     });
 
-    it('another account on the same deployment still falls back to Cloudflare', async () => {
+    it('an unconfigured builder start refuses rather than making an unexplained Cloudflare pin', async () => {
         const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
         try {
             const { fake, db } = routerDb([]);
             const env = { ...AWS_ENV, EZIL_AWS_REQUIRED_USER_IDS: U2 };
-            expect((await routeComputer(db, computer, { env, pinCloudflare: true })).kind).toBe('cloudflare');
-            expect(fake.placements.map((row) => row.provider)).toEqual(['cloudflare']);
+            await expect(routeComputer(db, computer, { env, pinCloudflare: true })).rejects.toMatchObject({
+                code: 'PRECONDITION_FAILED', message: 'compute_placement_refused:canary_unset',
+            });
+            expect(fake.placements).toEqual([]);
         } finally {
             spy.mockRestore();
         }
+    });
+});
+
+describe('routeComputer: required placement cannot bypass dispatch with reads off', () => {
+    it('founder cannot enter the legacy Cloudflare short circuit', async () => {
+        const founder = { ...computer, userId: '1ae9b1fd-880b-42ac-aebe-433b3c0ba11f' };
+        await expect(routeComputer(untouchableDb, founder, { env: {}, pinCloudflare: true })).rejects.toMatchObject({
+            code: 'PRECONDITION_FAILED', message: 'aws_required:placement_reads_disabled',
+        });
     });
 });

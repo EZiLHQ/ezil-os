@@ -34,14 +34,14 @@ export function isPlacementReadEnabled(env: Env = process.env): boolean {
  *
  * With no row a computer resolves to Cloudflare, and only AWS admission writes
  * an aws-ec2 row, so without a cohort no computer would ever reach AWS. A
- * computer joins only when its user is listed (or the list is exactly `*`,
+ * computer joins when its user is listed (or the list is unset or exactly `*`,
  * every signed-in user) AND it was created at or after
  * `EZIL_AWS_CANARY_SINCE`: an older computer may hold a Cloudflare/R2
  * workspace, and sending it to AWS would open an empty disk. Even then it goes
- * to AWS only when admission would admit it right now (select.ts): otherwise it
- * stays Cloudflare, so no user is handed a computer that cannot start.
+ * to AWS only when admission would admit it right now (select.ts). Builder fallback
+ * is limited to explicit admission refusals; configuration errors refuse the start.
  *
- * 🔴 FAIL CLOSED: a missing or malformed value (any bad list entry, or a
+ * 🔴 FAIL CLOSED: a missing SINCE or malformed value (any bad list entry, or a
  * SINCE without an explicit zone) means no cohort. This is a rollout gate,
  * not a security boundary: ownership stays the placement's owner_user_id.
  */
@@ -61,7 +61,7 @@ const CANARY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const CANARY_SINCE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null {
-    const list = env.EZIL_AWS_CANARY_USER_IDS?.trim();
+    const list = env.EZIL_AWS_CANARY_USER_IDS === undefined ? '*' : env.EZIL_AWS_CANARY_USER_IDS.trim();
     const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
     if (!list || !sinceText || !CANARY_SINCE.test(sinceText)) return null;
     const since = new Date(sinceText);
@@ -73,22 +73,25 @@ export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null 
     return { everyone: false, userIds: new Set(ids), since };
 }
 
-/**
- * Accounts that must run on AWS (`EZIL_AWS_REQUIRED_USER_IDS`, comma-separated user UUIDs).
- * For these users a NEW computer the canary or admission does not claim is refused with
- * its reason (select.ts `AwsRequiredError`) instead of being pinned to Cloudflare. Existing
- * placements never change, and a computer created before `EZIL_AWS_CANARY_SINCE` still
- * keeps Cloudflare: it may hold an R2 workspace that AWS would open as an empty disk, and
- * moving it is a migration (docs/AWS-COMPUTERS.md C-7), not an admission decision.
- *
- * 🔴 FAIL SAFE: unset, `*`, or any malformed entry means nobody is required, which is the
- * behaviour without this variable. This only removes the silent Cloudflare fallback.
- */
-export function awsRequiredUserIds(env: Env = process.env): ReadonlySet<string> {
+/** Founder placement is mandatory independently of optional rollout configuration. */
+export const AWS_REQUIRED_FOUNDER_ID = '1ae9b1fd-880b-42ac-aebe-433b3c0ba11f';
+
+/** Optional additions cannot remove the founder or turn malformed config into a fallback. */
+export function invalidRequiredUserConfig(env: Env = process.env): boolean {
     const list = env.EZIL_AWS_REQUIRED_USER_IDS?.trim();
-    if (!list) return new Set();
-    const ids = list.split(',').map((id) => id.trim().toLowerCase());
-    return ids.every((id) => CANARY_UUID.test(id)) ? new Set(ids) : new Set();
+    return !!list && !list.split(',').every((id) => CANARY_UUID.test(id.trim().toLowerCase()));
+}
+
+export function awsRequiredUserIds(env: Env = process.env): ReadonlySet<string> {
+    const ids = new Set([AWS_REQUIRED_FOUNDER_ID]);
+    const list = env.EZIL_AWS_REQUIRED_USER_IDS?.trim();
+    // Preserve every valid requirement even when another entry is malformed.
+    // Unplaced starts also refuse the entire malformed configuration below.
+    for (const id of list?.split(',') ?? []) {
+        const canonical = id.trim().toLowerCase();
+        if (CANARY_UUID.test(canonical)) ids.add(canonical);
+    }
+    return ids;
 }
 
 export function isAwsRequiredUser(env: Env, userId: string): boolean {

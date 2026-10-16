@@ -14,7 +14,7 @@ export type AwsCanaryCohortRefusal = 'aws_disabled' | 'canary_unset' | 'canary_m
 /** The flag, config and cohort conditions, which need no database read. Null when all pass. */
 export function explainAwsCanaryCohort({ env, userId }: { env: Env; userId: string }): { eligible: false; reason: AwsCanaryCohortRefusal } | null {
     if (!isAwsComputersEnabled(env)) return { eligible: false, reason: 'aws_disabled' };
-    if (!env.EZIL_AWS_CANARY_USER_IDS?.trim() || !env.EZIL_AWS_CANARY_SINCE?.trim()) {
+    if ((env.EZIL_AWS_CANARY_USER_IDS !== undefined && !env.EZIL_AWS_CANARY_USER_IDS.trim()) || !env.EZIL_AWS_CANARY_SINCE?.trim()) {
         return { eligible: false, reason: 'canary_unset' };
     }
     const canary = awsCanaryConfig(env);

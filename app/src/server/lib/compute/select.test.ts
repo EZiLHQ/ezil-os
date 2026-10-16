@@ -331,9 +331,6 @@ describe('resolveComputeProvider: the Cloudflare pin says why the canary did not
 
     it.each([
         { name: 'founder computer (created before SINCE)', env: CANARY, at: '2026-09-18T02:27:45Z', canary: 'created_before_since' },
-        { name: 'AWS flag off, placement reads on', env: { EZIL_COMPUTE_PLACEMENT_READS: '1' }, at: '2026-10-16T00:00:00Z', canary: 'aws_disabled' },
-        { name: 'trailing comma empties the cohort', env: { ...CANARY, EZIL_AWS_CANARY_USER_IDS: `${userId},` }, at: '2026-10-16T00:00:00Z', canary: 'canary_malformed' },
-        { name: 'user not listed', env: { ...CANARY, EZIL_AWS_CANARY_USER_IDS: '44444444-4444-4444-8444-444444444444' }, at: '2026-10-16T00:00:00Z', canary: 'user_not_in_cohort' },
         { name: 'admission refuses', env: { ...CANARY, AWS_MAX_RUNNING: '0' }, at: '2026-10-16T00:00:00Z', canary: 'admission_refused:' },
     ])('$name', async ({ env, at, canary }) => {
         const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
