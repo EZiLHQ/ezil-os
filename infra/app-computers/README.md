@@ -923,12 +923,12 @@ aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$FOUNDAT
   and optional emails. Alerts only.
 - **Retention (§6).**
   - Automation never deletes a volume.
-  - A RETIRED computer keeps its retained data volume, and with it the rolling 7-day DLM
-    snapshots, until an operator purges it.
-  - Purge must wait 14 days after RETIRED.
-  - Snapshot retention therefore follows the volume. A separate retired-only, age-based
-    policy (`ezil:retired=<ns>`, 14 days) needs a retire-time tag, and the lifecycle IAM cannot
-    set one today (retag is limited to generation and fence). That is an open item.
+  - Undeleted computers keep retained data even when inactive, cancelled or RETIRED.
+    Placement retirement is not computer deletion.
+  - Purge eligibility is held pending explicit deletion evidence and a separately
+    approved post-deletion policy. The former 14-day retirement rule is superseded.
+  - Existing rolling DLM snapshot rotation remains; it must not delete the data volume.
+    Residual storage costs remain subject to the existing size and admission limits.
 
 ### Kill-switch drill (§4)
 
@@ -977,7 +977,12 @@ It never denies `StopInstances` and never touches storage. To run the drill:
 
 ### Purge operator role (TODO design; not created this round)
 
-Purge runs per computer from the M1 tooling, after the 14-day retention:
+**HOLD:** the historical operator-role proposal below is not authorization to purge.
+No purge executor or role is introduced by the persistence change. Before this design
+can be implemented, require verified explicit computer deletion and an approved
+post-deletion policy; inactivity, cancellation and RETIRED alone never qualify.
+
+The historical proposal was per computer:
 - **Who.** A human operator role with MFA, created by the founder outside the boundary (the
   boundary denies deletion).
 - **Audit.** Every call is recorded by CloudTrail.

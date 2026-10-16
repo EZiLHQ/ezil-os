@@ -200,7 +200,9 @@ push('context menu rendered its items',
 const domHtml = window.document.documentElement.outerHTML.replace(/\/\*[\s\S]*?\*\//g, '');
 push('no "Puter" in the rendered DOM (attribution banner excluded)', !/\bputer\b/i.test(domHtml),
     (domHtml.match(/.{0,40}\bputer\b.{0,40}/i) ?? [''])[0]);
-push('no puter.com URL in the shipped bundle', !/puter\.com/i.test(bundle) && !/puter\.com/i.test(css));
+// Match a URL host, not a local RPC such as "computer.computePlacement".
+const puterUrl = /(?:https?:)?\/\/(?:[a-z0-9-]+\.)*puter\.com(?=[:/"'`\s]|$)/i;
+push('no puter.com URL in the shipped bundle', !puterUrl.test(bundle) && !puterUrl.test(css));
 
 let pass = 0;
 for (const c of checks) {

@@ -1,7 +1,8 @@
 # `@ezil-os/sdk`
 
 A typed client for the EZiL-OS computer API: list, create and delete a user's
-computers, and mint URLs for their desktop, their dev server and their editor.
+computers, inspect recorded compute placement, and mint URLs for their desktop,
+their dev server and their editor.
 
 It is a thin, honest wrapper over the same tRPC endpoint the product's own web
 app calls. It adds no capability the API does not already grant, and it is not
@@ -58,6 +59,7 @@ const { url } = await ezil.desktop.open(computer.id);
 | --- | --- |
 | `computers.list()` | Every live computer the user owns. Never the soft-deleted ones. |
 | `computers.get(id)` | One computer. `NOT_FOUND` if missing, deleted, or someone else's. |
+| `computers.computePlacement(id)` | Read recorded provider, region, state, fallback and AWS requirement. Returns `unavailable` or `unplaced` when there is no readable placement; never starts compute. |
 | `computers.create({ name })` | Creates in the lowest free slot. Throws if the user already holds two. |
 | `computers.getOrCreateDefault()` | The default computer, made on first call. Idempotent. |
 | `computers.rename(id, name)` | |

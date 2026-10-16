@@ -11,6 +11,7 @@ import superjson from 'superjson';
 
 import { createEzilClient } from './client';
 import { EzilError } from './errors';
+import type { ComputePlacement } from './types';
 
 /** A `fetch` that records what it was asked and replies with a canned body. */
 const stub = (reply: { status?: number; body: unknown }) => {
@@ -66,6 +67,25 @@ describe('createEzilClient', () => {
         expect(seen[0]!.init.method).toBe('GET');
         expect(url.pathname).toBe('/api/trpc/computer.get');
         expect(JSON.parse(url.searchParams.get('input')!)).toEqual({ json: { id: 'c1' } });
+    });
+
+    it('reads the authenticated computer placement without a mutation or a made-up default', async () => {
+        const id = '11111111-1111-4111-8111-111111111111';
+        const placed = { status: 'placed', provider: 'aws-ec2', region: 'ap-south-1', state: 'RUNNING', fallback: false, awsRequired: true } as const satisfies ComputePlacement;
+        const aws = stub({ body: ok(placed) });
+        expect(await client(aws.fetchImpl).computers.computePlacement(id)).toEqual(placed);
+        const url = new URL(aws.seen[0]!.url);
+        expect(url.pathname).toBe('/api/trpc/computer.computePlacement');
+        expect(url.searchParams.get('input')).toBe(JSON.stringify({ json: { id } }));
+        expect(aws.seen[0]!.init.method).toBe('GET');
+        expect(aws.seen[0]!.init.body).toBeUndefined();
+        expect((aws.seen[0]!.init.headers as Record<string, string>).authorization).toBe('Bearer tok');
+
+        for (const status of ['unavailable', 'unplaced'] as const) {
+            const empty = { status, provider: null, region: null, state: null, fallback: false, awsRequired: true } as const satisfies ComputePlacement;
+            const response = stub({ body: ok(empty) });
+            expect(await client(response.fetchImpl).computers.computePlacement(id)).toEqual(empty);
+        }
     });
 
     it('sends mutations as POST with the input in the body', async () => {

@@ -10,6 +10,29 @@ C-4, C-6, and §3a. The S1 spike (`feat/aws-s1-runtime-spike`) holds the runtime
 The runtime agent uses Python 3 standard library only and makes no AWS API calls.
 The AMI build uses its temporary instance role to pull the desktop image from ECR.
 
+Local persistence regression tests use temporary directories and stubbed volume probes.
+`test_data_safety.py` verifies wrong-volume, stale-epoch, missing-marker and incompatible
+image refusals without changing retained bytes. A failed or ambiguous probe, partition
+table or unsupported signature refuses rather than authorizing formatting. A no-signature
+result is confirmed with `wipefs --no-act`; it does not prove an empty disk. A provisioning
+lease can initialize only an unmounted disk whose full contents are verified zero, with
+a 1 MiB streaming buffer and monotonic deadline. A child-process timeout bounds stalled
+reads; unknown nonzero contents, read failures and incomplete scans refuse before mkfs.
+`blankVerifySeconds` defaults to 500 seconds and cannot exceed 500. This scan happens only
+before first format, never during normal stop/start/replacement of a formatted volume.
+At the existing 125 MiB/s throughput, 20 GiB needs about 164 seconds and the 50 GiB plus
+tier needs about 410 seconds of ideal read time. Plus therefore leaves only about 190
+seconds of the existing 600-second nonce window for all other provisioning work; a scan
+at its 500-second cap leaves 100 seconds. The scan does not extend that window or change
+AWS throughput. Large/slow volumes can exceed either deadline and refuse provisioning.
+Hosted timing and total startup acceptance remain blockers until tested. Do not extend
+nonce/startup/spending limits or skip this check to turn a refusal into initialization.
+`test_tool_persistence.py` verifies the retained global npm bin/package/dependency layout
+and executes a fixture command in two fresh isolated tmux servers. It does not install
+the real `opencode-ai` package or prove EC2/EBS/container lifecycle acceptance. The hosted
+20-cycle acceptance gate, including real `opencode --version` in a new tmux session,
+remains unexecuted.
+
 ## Canary serial diagnostics (default off)
 
 Set `canaryConsole: true` in the baked `/etc/ezil-host/agent.json` for a canary.
@@ -30,7 +53,7 @@ Records:
   `.ezil-last-stop.json`, projected to outcome/time/generation/epoch only. Refusal
   or error reports null metadata after unmount; no exception detail or stop reason.
 - `persistence`: after the overlay mount and after every desktop stop attempt, before
-  teardown. Reads only `/root/.ezil-canary-sentinel` and `/root/.bash_history` through
+  teardown. Reads `/root/.ezil-canary-sentinel` and `/root/.bash_history` through
   the merged overlay (the spec fixes HOME to `/root`). Reports sentinel SHA-256,
   physical history-line count (including an unterminated final line), and exact
   presence of the line `: EZIL-CANARY-HISTORY-v1`; never history or sentinel contents.
@@ -46,6 +69,29 @@ Missing/unreadable files produce explicit statuses and null measurements; symlin
 special files and oversized files are unreadable (64 KiB sentinel, 4 MiB history).
 Compare the shutdown hash/count/marker with the next boot probe. This observes persisted
 bytes; it does not establish that a live interactive shell flushed its history.
+
+The same boot/shutdown `persistence` record includes `toolStatus`
+(`absent`, `ok`, `unreadable`, or `refused`) and `toolSha256` (null unless `ok`).
+Prepare `/usr/local/bin/ezil-canary-tool` as a relative symlink, for example to
+`../lib/node_modules/ezil-canary-tool/probe`, with a regular public fixture of at most
+64 KiB at that target. The probe hashes the target through the merged rootfs without
+executing, creating or repairing it. Directory components use no-follow opens; only
+this one relative symlink is allowed. Absolute targets, traversal outside
+`/usr/local/lib/node_modules`, and nested symlinks are refused; missing targets,
+special files and oversized targets are unreadable. The initial `../lib` is allowed
+for npm's layout, and later `..` components must stay inside `node_modules`.
+Compare the tool hash at shutdown and the next boot to observe installed-tool bytes;
+the entire record stays within the 512-byte console limit.
+
+The sentinel proves the storage path, not a real tool. For real installs, set
+`canaryTools` (for example `["opencode"]`, at most 4 npm bin names) in the baked
+`agent.json`: each boot/shutdown then emits one `tool` record per name with `status`
+(`absent`, `ok`, `large`, `unreadable` or `refused`), `size`, `sha256` (only for a target
+of at most 64 KiB; a large binary such as opencode's is never read) and `version` from the
+package's own `package.json`. The same no-follow path rules apply. This shows the real
+`npm -g` install is present, the same size and the same version after each lifecycle
+event, without reinstalling; it does not prove the tool runs. Run
+`tools/lifecycle/probe.sh` in the computer's terminal for `command -v` and `--version`.
 
 These hooks need no enrollment or control key and preserve guard/enrollment requirements.
 Without an existing stop record, `lastStop` is null; its durable writer remains the agent.
