@@ -93,11 +93,14 @@ export async function resolveComputeProvider(
         const canary = await awsCanaryDecision(db, computer, env);
         if (canary.aws) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
         if (options.pinCloudflare && isPlacementDb(db)) {
-            placement = await pinCloudflare(db, computer);
+            const pin = await pinCloudflare(db, computer);
+            placement = pin.placement;
             assertPlacementOwner(placement, computer);
             // The one moment a computer's provider becomes permanent: say why the canary did
             // not claim it. No user id; the computer id is what an operator looks up.
-            console.info('[compute.placement] pinned', { computerId: computer.computerId.toLowerCase(), provider: placement.provider, canary: canary.reason });
+            // Only the request whose insert created the row logs it: a concurrent loser only re-read
+            // the winner's row (which may even be another provider's), so it has nothing to explain.
+            if (pin.created) console.info('[compute.placement] pinned', { computerId: computer.computerId.toLowerCase(), provider: placement.provider, canary: canary.reason });
         }
     }
     return providerForPlacement(placement, env, deps);
@@ -118,14 +121,14 @@ function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRe
  * lifecycle lives in the Worker); STOPPED keeps it out of every running-class count.
  * A concurrent writer's row wins (`placement_exists` → re-read), whatever its provider.
  */
-async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<ResolvedPlacement> {
+async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<{ placement: ResolvedPlacement; created: boolean }> {
     const created = await createPlacement(db, {
         computerId: computer.computerId, ownerUserId: computer.userId, provider: 'cloudflare', state: 'STOPPED',
     });
-    if (created.ok) return { provider: 'cloudflare', store: created.placement.store, record: created.placement };
+    if (created.ok) return { placement: { provider: 'cloudflare', store: created.placement.store, record: created.placement }, created: true };
     const existing = await readPlacement(db, computer.computerId);
     if (!existing.record) throw new PlacementIntegrityError('invalid_row', computer.computerId.toLowerCase());
-    return existing;
+    return { placement: existing, created: false };
 }
 
 /**

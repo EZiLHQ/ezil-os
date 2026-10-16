@@ -305,3 +305,46 @@ describe("read-only probe", () => {
 		expect(data.project.files).toEqual({ one: null, two: null });
 	});
 });
+
+describe("review fixes (PR #203)", () => {
+	it("a tool that stops answering --version is lost even with the same bytes", () => {
+		const after = snapshot();
+		after.tools.commands.opencode.version = null as unknown as string;
+		expect(classify(snapshot(), after).classification).toBe("lost");
+	});
+
+	it("a changed but present version string is not loss", () => {
+		const after = snapshot();
+		after.tools.commands.opencode.version = "1.1";
+		expect(classify(snapshot(), after).classification).toBe("same_process");
+	});
+
+	it("a matching sentinel in another pid namespace is not a resumed checkpoint", () => {
+		const after = snapshot();
+		after.identity.boot_id = "boot-2";
+		after.identity.pid_namespace = "pid:[4026532999]";
+		expect(classify(snapshot(), after, { providerTransition: true }).classification).toBe("recreated_shell");
+		const resumed = snapshot();
+		resumed.identity.boot_id = "boot-2";
+		expect(classify(snapshot(), resumed, { providerTransition: true }).classification).toBe("resumed_checkpoint");
+	});
+
+	it("the history marker must be a whole line, not a later export of it", () => {
+		const home = `${process.env.TMPDIR ?? "/tmp"}/ezil-lc-marker-${process.pid}-${Date.now()}`;
+		require("node:fs").mkdirSync(home, { recursive: true });
+		const run = (history: string) => {
+			require("node:fs").writeFileSync(`${home}/.bash_history`, history);
+			const child = Bun.spawnSync(["/bin/bash", `${import.meta.dir}/probe.sh`], {
+				env: { PATH: "/usr/bin:/bin", HOME: home, EZIL_LC_TOOLS: "missing-lifecycle-tool", EZIL_LC_MARKER: "ezil-lifecycle-123" },
+			});
+			expect(child.exitCode).toBe(0);
+			return JSON.parse(child.stdout.toString()).config.bash_history.marker_present;
+		};
+		try {
+			expect(run('ls\nexport EZIL_LC_MARKER="ezil-lifecycle-123"\n')).toBe(false);
+			expect(run("ls\nezil-lifecycle-123\n")).toBe(true);
+		} finally {
+			require("node:fs").rmSync(home, { recursive: true, force: true });
+		}
+	}, 30_000); // runs the real probe twice with real commands on PATH
+});

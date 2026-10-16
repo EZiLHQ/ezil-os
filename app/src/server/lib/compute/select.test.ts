@@ -364,3 +364,24 @@ describe('resolveComputeProvider: the Cloudflare pin says why the canary did not
         }
     });
 });
+
+describe('resolveComputeProvider: only the request that inserts the Cloudflare pin logs it (PR #203 review)', () => {
+    const CANARY = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: userId, EZIL_AWS_CANARY_SINCE: '2026-10-15T13:12:00Z' };
+    it.each(['cloudflare', 'aws-ec2'])('a concurrent %s writer wins the insert: no pinned line', async (winner) => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const fake = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date('2026-09-18T02:27:45Z') }] });
+            // The other request commits its row after this one's first read and before its insert.
+            const raced = { ...fake.db, transaction: async (fn: Parameters<typeof fake.db.transaction>[0]) => {
+                if (!fake.placements.length) fake.placements.push(placementRow({ computer_id: computerId, owner_user_id: userId, provider: winner, workspace_store: winner === 'cloudflare' ? 'r2' : 'ebs', region: winner === 'aws-ec2' ? 'us-east-1' : null }));
+                return fake.db.transaction(fn);
+            } };
+            await resolveComputeProvider(raced as typeof fake.db, computer, CANARY, {}, { pinCloudflare: true });
+            expect(fake.placements).toHaveLength(1);
+            expect(fake.placements[0]?.provider).toBe(winner);
+            expect(spy.mock.calls.filter((call) => call[0] === '[compute.placement] pinned')).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
