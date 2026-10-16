@@ -513,27 +513,34 @@ await test('desktop cancellation propagates to the bridge and closes a bitmap de
     assert.equal(closed, 1);
 });
 
-await test('editor interruption removes global listeners and ignores encoding completed after cancellation', async () => {
+await test('editor cancellation removes listeners and prevents retries when an oversized encoding completes later', async () => {
     const originalEncode = window.HTMLCanvasElement.prototype.toBlob;
     const originalAdd = window.addEventListener, originalRemove = window.removeEventListener;
     const listeners = new Set();
     window.addEventListener = function (type, fn, options) { listeners.add(fn); return originalAdd.call(this, type, fn, options); };
     window.removeEventListener = function (type, fn, options) { listeners.delete(fn); return originalRemove.call(this, type, fn, options); };
     try {
-        for (const type of ['abort', 'ezil:teardown', 'popstate', 'pagehide', 'hashchange']) {
-            const controller = new AbortController(); let encode;
-            window.HTMLCanvasElement.prototype.toBlob = callback => { encode = callback; };
+        for (const type of ['cancel-button', 'Escape', 'cancel', 'close', 'abort', 'ezil:teardown', 'popstate', 'pagehide', 'hashchange']) {
+            const controller = new AbortController();
+            const encodes = [];
+            window.HTMLCanvasElement.prototype.toBlob = callback => { encodes.push(callback); };
             const pending = open_redact_editor(canvas(), { signal: controller.signal });
             action('confirm').click();
-            assert.equal(typeof encode, 'function');
+            assert.equal(encodes.length, 1);
+            const editor = document.querySelector('.ezil-redact-editor');
             if (type === 'abort') controller.abort();
+            else if (type === 'cancel-button') action('cancel').click();
+            else if (type === 'Escape') key(editor, 'Escape');
+            else if (type === 'cancel') editor.dispatchEvent(new window.Event('cancel', { cancelable: true }));
+            else if (type === 'close') editor.close();
             else window.dispatchEvent(new window.Event(type));
             assert.equal(await pending, null);
             assert.equal(document.querySelector('.ezil-redact-editor'), null);
             assert.equal(listeners.size, 0);
             const focus = document.activeElement;
-            encode(new Blob(['fixture'], { type: 'image/webp' }));
+            encodes[0](new Blob([new Uint8Array(1.5 * 1024 * 1024 + 1)], { type: 'image/webp' }));
             for (let i = 0; i < 10; i++) await Promise.resolve();
+            assert.equal(encodes.length, 1, `${type} must not start another encode for a discarded screenshot`);
             assert.equal(document.querySelector('.ezil-redact-editor'), null);
             assert.equal(document.activeElement, focus);
         }

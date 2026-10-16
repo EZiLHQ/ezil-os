@@ -51,13 +51,16 @@ export function flatten (sourceCanvas, boxes = [], crop = null) {
 }
 
 /** @returns {Promise<Blob|null>} WebP q0.8, or JPEG; lower quality until within limit. */
-export async function encode_under_limit (canvas, limit) {
-    if (!(limit > 0)) return null;
+export async function encode_under_limit (canvas, limit, { signal } = {}) {
+    if (!(limit > 0) || signal?.aborted) return null;
     try {
         const type = canvas.toDataURL('image/webp', 0.8).startsWith('data:image/webp')
             ? 'image/webp' : 'image/jpeg';
         for (let step = 8; step >= 1; step--) {
             const blob = await new Promise(resolve => canvas.toBlob(resolve, type, step / 10));
+            // The browser's in-flight encode cannot be cancelled, but a closed
+            // editor must not start another quality pass for discarded pixels.
+            if (signal?.aborted) return null;
             // Browsers may silently substitute PNG; never mislabel that payload.
             if (!blob || blob.type !== type) return null;
             if (blob.size > 0 && blob.size <= limit) return blob;
@@ -113,6 +116,7 @@ export async function open_redact_editor (_canvas, { signal } = {}) {
     const button = action => dialog.querySelector(`[data-action="${action}"]`);
     let boxes = [], crop = null, selected = null, tool = 'redact';
     let history = [], gesture = null, busy = false, settled = false;
+    const encodingController = new AbortController();
     const snapshot = () => ({ boxes: boxes.map(box => ({ ...box })), crop: crop && { ...crop }, selected });
     const restore = state => { boxes = state.boxes; crop = state.crop; selected = state.selected; };
     const remember = state => {
@@ -234,6 +238,7 @@ export async function open_redact_editor (_canvas, { signal } = {}) {
         function finish (result) {
             if (settled) return;
             settled = true;
+            encodingController.abort();
             signal?.removeEventListener('abort', abort);
             for (const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange']) view.removeEventListener(type, abort);
             view.removeEventListener('resize', resize);
@@ -329,7 +334,7 @@ export async function open_redact_editor (_canvas, { signal } = {}) {
                         ctx.drawImage(output, 0, 0, scaled.width, scaled.height);
                         output = scaled;
                     }
-                    const blob = await encode_under_limit(output, IMAGE_BYTES_MAX);
+                    const blob = await encode_under_limit(output, IMAGE_BYTES_MAX, { signal: encodingController.signal });
                     if (settled) return;
                     if (blob) { finish({ blob, contentType: blob.type, width: output.width, height: output.height }); return; }
                     status.textContent = 'Could not prepare an image under 1.5 MiB. Try a smaller crop.';
