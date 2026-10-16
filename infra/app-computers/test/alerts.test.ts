@@ -142,6 +142,10 @@ test('existingBudgetName refuses budget emails rather than replacing the live bu
     assert.throws(() => ops({ budgetEmails: ['contact@ezil.work'], existingBudgetName: 'ezil-pilot-monthly' }), /would replace it/);
 });
 
+test('existingBudgetName must be this stack\'s own namespace budget', () => {
+    assert.throws(() => ops({ budgetEmails: [], existingBudgetName: 'ezil-prod-monthly' }), /must be ezil-pilot-monthly for namespace pilot/);
+});
+
 test('existingBudgetName must be an ezil-<ns>-monthly name', () => {
     for (const name of ['ezil-pilot-monthly-1234abcd', 'other-budget', 'ezil-pilot-monthly ']) {
         assert.throws(() => OpsConfigSchema.parse({ ...base, existingBudgetName: name }));

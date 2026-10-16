@@ -149,6 +149,11 @@ export class OpsStack extends Stack {
         // live 2026-10-15). The name carries a hash of what forces replacement, so a replacement
         // always gets a fresh name; the topic policy admits the ezil-<ns>-monthly* prefix.
         const budgetRevision = createHash('sha256').update(JSON.stringify({ budgetNotifications, emails: c.budgetEmails })).digest('hex').slice(0, 8);
+        if (c.existingBudgetName !== undefined && c.existingBudgetName !== `ezil-${c.namespace}-monthly`) {
+            // Only this stack's own budget may be kept: another namespace's name would replace or
+            // collide with that stack's budget and route its alerts to this topic.
+            throw new Error(`existingBudgetName must be ezil-${c.namespace}-monthly for namespace ${c.namespace}`);
+        }
         if (c.existingBudgetName && c.budgetEmails.length > 0) {
             throw new Error('existingBudgetName keeps the live topic-only budget; budgetEmails would replace it');
         }
