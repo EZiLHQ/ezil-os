@@ -15,6 +15,13 @@ export const OpsConfigSchema = z.object({
     /** Monthly cost budget in USD; alerts at 50/80/100 % of actual spend. */
     monthlyBudgetUsd: z.number().int().min(1).max(100000),
     budgetEmails: z.array(z.string().email()).max(5).default([]),
+    /**
+     * Keep an EXISTING budget exactly as it is live: this exact name and the ACTUAL 50/80/100 %
+     * notifications to the topic only (the definition deployed before 2026-10-15). Any change to
+     * a budget's notifications or name REPLACES it, so set this to update the stack (e.g. to add
+     * alarms) without deleting the live budget or its history. Unset: the revision-named budget below.
+     */
+    existingBudgetName: z.string().regex(/^ezil-[a-z0-9-]+-monthly$/).optional(),
     /** Out-of-guest egress backstop: bytes sent by any one instance in 5 min. */
     egressBytesPer5Min: z.number().int().min(1_000_000).max(1_000_000_000_000),
     /** Founder inboxes subscribed (EMAIL) to the ops alert topic: every alarm below and the budget. */
@@ -141,10 +148,15 @@ export class OpsStack extends Stack {
         // live 2026-10-15). The name carries a hash of what forces replacement, so a replacement
         // always gets a fresh name; the topic policy admits the ezil-<ns>-monthly* prefix.
         const budgetRevision = createHash('sha256').update(JSON.stringify({ budgetNotifications, emails: c.budgetEmails })).digest('hex').slice(0, 8);
+        if (c.existingBudgetName && c.budgetEmails.length > 0) {
+            throw new Error('existingBudgetName keeps the live topic-only budget; budgetEmails would replace it');
+        }
+        // The live budget's own notifications, unchanged, when it is being kept (existingBudgetName).
+        const liveNotifications = c.existingBudgetName ? [50, 80, 100].map(threshold => ({ type: 'ACTUAL', threshold })) : budgetNotifications;
         new budgets.CfnBudget(this, 'Monthly', {
-            budget: { budgetName: `ezil-${c.namespace}-monthly-${budgetRevision}`, budgetType: 'COST', timeUnit: 'MONTHLY',
+            budget: { budgetName: c.existingBudgetName ?? `ezil-${c.namespace}-monthly-${budgetRevision}`, budgetType: 'COST', timeUnit: 'MONTHLY',
                 budgetLimit: { amount: c.monthlyBudgetUsd, unit: 'USD' } },
-            notificationsWithSubscribers: budgetNotifications.map(({ type, threshold }) => ({
+            notificationsWithSubscribers: liveNotifications.map(({ type, threshold }) => ({
                 notification: { notificationType: type, comparisonOperator: 'GREATER_THAN', threshold, thresholdType: 'PERCENTAGE' },
                 subscribers: [{ subscriptionType: 'SNS', address: this.topic.topicArn },
                     ...c.budgetEmails.map(address => ({ subscriptionType: 'EMAIL', address }))],
