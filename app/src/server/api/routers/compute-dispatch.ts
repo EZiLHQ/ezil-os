@@ -29,7 +29,7 @@ import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare'
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
-import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
+import { AwsRequiredError, resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
 import { resolveTier, type EntitlementReader } from '@/server/lib/compute/tier';
 
 export type RoutedComputer =
@@ -89,6 +89,12 @@ export async function routeComputer(
         if (err instanceof PlacementOwnerError) {
             // NOT_FOUND, never FORBIDDEN — a foreign computer must look absent.
             throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+        }
+        if (err instanceof AwsRequiredError) {
+            // The account must run on AWS and AWS did not admit this computer: say why, never
+            // fall back to Cloudflare. The reason is a code (aws_disabled, user_not_in_cohort,
+            // admission_refused:<code>, …), never a credential or another user's data.
+            throw new TRPCError({ code: 'PRECONDITION_FAILED', message: `aws_required:${err.reason}`, cause: err });
         }
         throw err; // duplicate/unknown placement, missing table: fail closed, never Cloudflare.
     }

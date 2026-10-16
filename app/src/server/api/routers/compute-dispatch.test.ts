@@ -433,3 +433,32 @@ describe('Codex 4277613545: the shell stop of an AWS computer answers only a CON
         expect(src).toMatch(/cloudflareGuacamole\.terminate\(\{[^}]*confirm:\s*true/);
     });
 });
+
+describe('routeComputer: AWS-required accounts', () => {
+    it('a sandbox start the canary does not claim is PRECONDITION_FAILED with the reason, and nothing is pinned', async () => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const { fake, db } = routerDb([]);
+            const env = { ...AWS_ENV, EZIL_AWS_REQUIRED_USER_IDS: U1 }; // no canary configured
+            await expect(routeComputer(db, computer, { env, pinCloudflare: true })).rejects.toMatchObject({
+                code: 'PRECONDITION_FAILED',
+                message: 'aws_required:canary_unset',
+            });
+            expect(fake.placements).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('another account on the same deployment still falls back to Cloudflare', async () => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const { fake, db } = routerDb([]);
+            const env = { ...AWS_ENV, EZIL_AWS_REQUIRED_USER_IDS: U2 };
+            expect((await routeComputer(db, computer, { env, pinCloudflare: true })).kind).toBe('cloudflare');
+            expect(fake.placements.map((row) => row.provider)).toEqual(['cloudflare']);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
