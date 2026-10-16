@@ -183,6 +183,19 @@ describe('checkIceConfig passes when a Cloudflare Realtime TURN key is configure
 });
 
 describe('resolveTurnTtlSeconds (bounded ephemeral TTL)', () => {
+  it('keeps expiry valid against a slower Neko clock without extending TURN credentials', async () => {
+    const { turnCredentialExpiresAt, resolveTurnTtlSeconds } = await import('./desktop-mode');
+    const issuedAt = 1700000000000;
+    for (const ttl of [undefined, '300', '1800', '999999']) {
+      const expiresAt = turnCredentialExpiresAt(issuedAt, ttl);
+      expect(expiresAt).toBeLessThan(issuedAt + resolveTurnTtlSeconds(ttl) * 1000);
+      // Mirror Neko's lifetime contract under bounded clock lag and mint latency.
+      for (const containerNow of [issuedAt - 4000, issuedAt, issuedAt + 20000]) {
+        expect(expiresAt).toBeGreaterThan(containerNow + 60000);
+        expect(expiresAt).toBeLessThanOrEqual(containerNow + 1800000);
+      }
+    }
+  });
   it('defaults to 1800s when unset/invalid', async () => {
     const { resolveTurnTtlSeconds } = await import('./desktop-mode');
     expect(resolveTurnTtlSeconds(undefined)).toBe(1800);

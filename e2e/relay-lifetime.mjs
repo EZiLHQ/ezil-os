@@ -1,5 +1,20 @@
 import assert from 'node:assert/strict';
 
+/** Fail on backend renewal rejection before starting the long lifetime hold. */
+export async function verifyRelayRefresh({ expectedRuntimeId, readRelay, refreshRelay, verifyViewer, now = Date.now }) {
+  const valid = state => state?.ok === true && state.runtimeId === expectedRuntimeId
+    && Number.isSafeInteger(state.expiresAt) && state.expiresAt > now() + 60000;
+  const before = await readRelay();
+  assert.ok(valid(before), 'Relay refresh baseline unavailable or stale');
+  const refreshed = await refreshRelay(expectedRuntimeId);
+  assert.ok(valid(refreshed), 'Relay refresh rejected or changed runtime');
+  assert.ok(refreshed.expiresAt > before.expiresAt, 'Relay refresh did not advance credential expiry');
+  await verifyViewer();
+  const confirmed = await readRelay();
+  assert.ok(valid(confirmed) && confirmed.expiresAt >= refreshed.expiresAt, 'Relay refresh not committed');
+  return { initialExpiresAt: before.expiresAt, finalExpiresAt: confirmed.expiresAt };
+}
+
 /** Require credential renewal during this hold, after earlier reconnect tests. */
 export async function verifyRelayLifetime({ durationMs, expectedRuntimeId, readRelay, verifyViewer,
   now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), intervalMs = 30000 }) {

@@ -65,7 +65,7 @@ export async function relayOperation(container: RelayContainer, admin: string, p
     frontend: JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_FRONTEND!),
     backend: JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_BACKEND!),
   }) });
-  if (!refreshed.ok) throw new RelayFailure(refreshed.status === 409 ? 'relay_runtime_changed' : refreshed.status === 422 ? 'relay_negotiation_busy' : 'relay_refresh_failed', [409,422].includes(refreshed.status) ? 409 : 502);
+  if (!refreshed.ok) throw new RelayFailure(refreshed.status === 400 ? 'relay_configuration_rejected' : refreshed.status === 409 ? 'relay_runtime_changed' : refreshed.status === 422 ? 'relay_negotiation_busy' : 'relay_refresh_failed', [409,422].includes(refreshed.status) ? 409 : 502);
   const applied = readRelayState(await refreshed.json());
   if (applied.runtimeId !== current.runtimeId || applied.expiresAt < minted.expiresAt) throw new RelayFailure('relay_refresh_unconfirmed');
   return applied;
