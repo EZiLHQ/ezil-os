@@ -47,6 +47,9 @@ export async function confirm_close ({ shared }) {
 
     return new Promise(resolve => {
         let finished = false;
+        const reclaim = () => setTimeout(() => {
+            if ( ! finished && dialog.open && ! dialog.contains(document.activeElement) ) minimize.focus();
+        }, 0);
         const teardown = () => finish('cancel');
         const finish = choice => {
             // Native close and shell teardown can follow the same click;
@@ -54,6 +57,8 @@ export async function confirm_close ({ shared }) {
             if ( finished ) return;
             finished = true;
             window.removeEventListener('ezil:teardown', teardown);
+            window.removeEventListener('blur', reclaim);
+            document.removeEventListener('focusin', reclaim);
             // Only confirming Close consents to skipping later confirmations;
             // Escape and Minimise must not turn a future red click destructive.
             if ( choice === 'close' && checkbox.checked ) {
@@ -71,9 +76,20 @@ export async function confirm_close ({ shared }) {
         }, { once: true });
         dialog.addEventListener('close', () => finish('cancel'), { once: true });
         window.addEventListener('ezil:teardown', teardown);
+        // 🔴 The red-light click keeps bubbling after this opens: UIWindow's
+        // window-focus handler (src/UI/UIWindow.js ~4479) then calls
+        // iframe.contentWindow.focus(), and browsing-context focus is NOT
+        // stopped by the modal's inert background. Focus left in the stream
+        // sends Escape (and every keystroke) to the remote desktop while this
+        // modal is up — floating-controls-browser-test "close confirm: cancel"
+        // caught it. While open, focus that escapes the dialog is taken back:
+        // the top window blurs when a child frame takes focus.
+        window.addEventListener('blur', reclaim);
+        document.addEventListener('focusin', reclaim);
         try {
             dialog.showModal();
             minimize.focus();
+            reclaim();
         } catch {
             // If modality is unavailable, keep the window and its yellow exit;
             // failure to show the warning is not permission to close it.

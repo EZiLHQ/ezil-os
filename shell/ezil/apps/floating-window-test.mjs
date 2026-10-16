@@ -140,6 +140,28 @@ await test('modal wording, accessible description, default focus, Escape and foc
     assert.equal(await result, 'cancel'); assert.equal(document.querySelector('dialog'), null);
     assert.equal(document.activeElement.id, 'red'); assert.equal(window.localStorage.length, 0); dom.window.close();
 });
+await test('focus that escapes the open modal (e.g. into the stream) is taken back', async () => {
+    const dom = modal_dom(); const result = confirm_close({ shared: false });
+    const dialog = document.querySelector('dialog');
+    assert.equal(document.activeElement.textContent, 'Minimise instead');
+    // UIWindow's bubbling window-focus handler refocuses the page behind the modal.
+    document.getElementById('red').focus();
+    document.dispatchEvent(new window.FocusEvent('focusin'));
+    await new Promise((r) => setTimeout(r, 5));
+    assert.ok(dialog.contains(document.activeElement), 'focus returned to the dialog');
+    // A child frame taking focus blurs the top window: same reclaim.
+    document.getElementById('red').focus();
+    window.dispatchEvent(new window.FocusEvent('blur'));
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(document.activeElement.textContent, 'Minimise instead');
+    dialog.dispatchEvent(new window.Event('cancel', { cancelable: true }));
+    assert.equal(await result, 'cancel');
+    // After close, nothing is reclaimed any more.
+    document.getElementById('red').focus();
+    window.dispatchEvent(new window.FocusEvent('blur'));
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(document.activeElement.id, 'red'); dom.window.close();
+});
 await test('Minimise does not save skip; Close saves skip; shared and remembered closes bypass modal', async () => {
     const dom = modal_dom(); let result = confirm_close({ shared: false });
     document.querySelector('input').checked = true; document.querySelector('dialog button').click();
