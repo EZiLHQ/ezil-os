@@ -76,6 +76,7 @@ if ( ! window.crypto?.getRandomValues ) {
 // to compare the DOM against at the exact moment the request leaves.
 const calls = [];
 let listRows = [];
+let placementInfo = { status: 'placed', provider: 'aws-ec2', region: 'ap-south-1', fallback: false };
 window.fetch = async (url, opts = {}) => {
     const u = String(url);
     const rec = { url: u, method: opts.method ?? 'GET', at: calls.length, domAtCall: {} };
@@ -99,6 +100,11 @@ window.fetch = async (url, opts = {}) => {
     });
 
     if ( u.includes('/api/trpc/computer.list') ) return json({ result: { data: { json: listRows } } });
+    if ( u.includes('/api/trpc/computer.computePlacement') ) {
+        return placementInfo === null
+            ? json({ error: { json: { message: 'unavailable', data: { code: 'PRECONDITION_FAILED' } } } }, 412)
+            : json({ result: { data: { json: placementInfo } } });
+    }
     if ( u.includes('/api/trpc/computer.delete') ) {
         const id = JSON.parse(opts.body ?? '{}').json?.id;
         listRows = listRows.filter(c => c.id !== id);
@@ -244,6 +250,8 @@ push('Settings still opens on Computers',
 const rows = qa('.window[data-app="settings"] .ezil-settings-row');
 push('two slot rows, always — the cap is structural', rows.length === 2, `${rows.length} rows`);
 push('slot 1 shows the computer', rows[0]?.textContent.includes('My computer'));
+push('Settings shows actual AWS compute and region, regardless of Cloudflare transport',
+    rows[0]?.querySelector('[data-role="compute-provider"]')?.textContent === 'AWS · ap-south-1');
 push('slot 2 is an empty slot offering New', rows[1]?.classList.contains('ezil-settings-row-empty')
     && !! rows[1]?.querySelector('[data-action="create"]'));
 push('the active computer is marked, not offered a Switch button',
@@ -742,6 +750,27 @@ click(rowE2?.querySelector('[data-action="switch"]'));
 await settle(20, 40);
 push('Open relaunches the desktop for the current computer (c-e)',
     q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
+
+// Provider observations are separate from the computer list and fail closed.
+for (const [info, expected] of [
+    [{ status: 'placed', provider: 'cloudflare', fallback: true }, 'Cloudflare · AWS fallback'],
+    [{ status: 'placed', provider: 'cloudflare', fallback: false }, 'Cloudflare · Existing placement'],
+    [{ status: 'unplaced', provider: null, awsRequired: true }, 'Unplaced · AWS required'],
+    [{ status: 'placed', provider: 'unknown' }, 'Compute provider unavailable'],
+    [null, 'Compute provider unavailable'],
+    [{ status: 'placed', provider: 'aws-ec2', region: '<img src=x onerror=alert(1)>' }, 'AWS · <img src=x onerror=alert(1)>'],
+]) {
+    placementInfo = info;
+    $('.window[data-app="settings"]').close();
+    await settle(2);
+    await ezil.registry.launch('settings', ctx);
+    await settle();
+    const provider = q('.window[data-app="settings"] [data-role="compute-provider"]');
+    push(`provider label: ${expected}`, provider?.textContent === expected);
+    push('provider metadata never injects HTML', provider?.querySelector('img') === null);
+}
+push('provider observation uses read-only queries',
+    calls.filter(c => c.url.includes('computer.computePlacement')).every(c => c.method === 'GET'));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.

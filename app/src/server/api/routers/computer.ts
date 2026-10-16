@@ -34,6 +34,8 @@ import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { AWS_RETIREMENT_UNDERWAY } from '@/server/lib/compute/aws-ec2';
 import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
+import { readComputerPlacementInfo } from '@/server/lib/compute/placement-info';
+import { PlacementIntegrityError, PlacementOwnerError, placementOwnerTrpcError, placementTrpcError } from '@/server/lib/compute/placement';
 import { routeComputer } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
 import {
@@ -76,8 +78,8 @@ async function terminateComputerSandbox(provider: CloudflareComputeProvider, com
 
 /**
  * An AWS computer's retirement is under way before its row is soft-deleted: the
- * provider's `terminate` is retire (C-3: the data volume is kept for the 14-day
- * retention window, §6 / F6 — nothing is deleted). One user delete is enough:
+ * provider's `terminate` is retire (C-3: retained data is kept; post-deletion
+ * retention policy is on hold, §6 — nothing is purged). One user delete is enough:
  * once a lifecycle job that ends the instance is durably recorded on the placement
  * (`AWS_RETIREMENT_UNDERWAY`), or the computer is already RETIRED, the row is
  * soft-deleted and the sandbox-reap cron's background reconcile drives the
@@ -118,6 +120,25 @@ export const computerRouter = createTRPCRouter({
             orderBy: (row, { asc }) => [asc(row.slot)],
         });
     }),
+
+    /** Read-only provider observation for Settings; never resolves an unplaced computer to a default. */
+    computePlacement: protectedProcedure
+        .input(z.object({ id: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            const owned = await ctx.db.query.computers.findFirst({
+                where: liveOwnedComputer(ctx.user.id, input.id),
+                columns: { id: true },
+            });
+            if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            try {
+                return await readComputerPlacementInfo(ctx.db, { userId: ctx.user.id, computerId: input.id });
+            } catch (error) {
+                if (error instanceof PlacementOwnerError) throw placementOwnerTrpcError(error);
+                if (error instanceof PlacementIntegrityError) throw placementTrpcError(error);
+                // Placement/database details are not user-visible; never substitute Cloudflare.
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Compute provider unavailable' });
+            }
+        }),
 
     /**
      * Create a new computer in the caller's lowest free slot. Throws the

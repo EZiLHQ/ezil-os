@@ -1,6 +1,6 @@
 # Lifecycle acceptance
 
-Lifecycle events have **not been executed**. They need separate approval. Use staging test computers only for M4/M6; never use a user's computer without consent. The local probe and fixture tests validate tooling, not provider lifecycle behavior.
+Hosted lifecycle events have **not been executed**. They need separate approval for exact computers, writes and spending. Existing staging shares production authentication and database; it is not isolated. Never run destructive or replacement tests on an existing user computer. Local probes and fixtures validate tooling, not provider lifecycle behavior. Preserve the **20-cycle hosted acceptance** gate from AWS-COMPUTERS.md before rollout. Cloudflare migration remains deferred.
 
 Installed-command survival is not running-process survival. A restored executable can have the same path and hash with a new inode while its former process is gone.
 
@@ -27,10 +27,12 @@ The computer has no checkout of this repository. Paste `tools/lifecycle/probe.sh
 
 ## Running the matrix
 
-After approval, run the probe in the same interactive terminal before and after **each** event below. Store snapshots on the operator's machine or approved durable storage outside the layer being tested. The probe writes no files and emits one JSON object; redirection by the operator saves it.
+After separate hosted approval, install `opencode-ai` once and run the probe inside interactive Bash in tmux before and after **each** event below. For M2–M5, a new tmux server/session is allowed; type `opencode --version` there without reinstalling. This accepts saved command availability, not survival of the old tmux process. Seed nonsecret project files, `.bashrc`, `/workspace/.ezil/settings.json` and a history marker before the first measurement. Store snapshots on the operator's machine or approved durable storage outside the layer being tested. The probe writes no files and emits one JSON object; redirection by the operator saves it.
 
 ```bash
-# In the staging computer's interactive Bash, before the event:
+# In the approved test computer's interactive Bash inside tmux, before the event:
+# Copy the actual provider from authenticated Settings/placement evidence:
+export EZIL_LC_PROVIDER='aws'
 export EZIL_LC_TOOLS='opencode'
 export EZIL_LC_PROJECT=/workspace/my-project
 export EZIL_LC_FILES='package.json README.md'
@@ -43,7 +45,7 @@ printf 'Keep this sentinel PID for the after probe: %s\n' "$EZIL_LC_SENTINEL_PID
 bash /workspace/.ezil-probe.sh > /approved-durable-location/M1a-before.json
 
 # Perform the separately approved event. In the reconnected terminal:
-# Re-export the SAME tool, project, file list, marker, and original sentinel PID
+# Re-export the SAME provider, tool, project, file list, marker, and original sentinel PID
 # if the terminal opened a new shell. Do not start a replacement sentinel.
 bash /workspace/.ezil-probe.sh > /approved-durable-location/M1a-after.json
 
@@ -51,18 +53,19 @@ bash /workspace/.ezil-probe.sh > /approved-durable-location/M1a-after.json
 bun tools/lifecycle/classify.ts M1a-before.json M1a-after.json --expect same_process
 ```
 
-`EZIL_LC_TOOLS` defaults to `opencode`. Tool and project-file lists are whitespace separated (no shell evaluation or glob expansion; file names with whitespace are unsupported). Leave `EZIL_LC_PROJECT` unset to omit project checks. Only select nonsecret project files and a nonsecret marker. The probe hashes config/history without printing contents or the marker; it never emits process arguments or arbitrary environment values. Identity includes HOME and the two Cloudflare IDs only when set, and tool inspection includes PATH. Run it as the ordinary terminal user; root is not needed. It needs Bash 5 and coreutils; unavailable commands or unreadable files produce `null`. Python 3 is optional for JSON escaping. Tool version commands run under `timeout 10`; choose tools whose `--version` is read-only. The parent `$PPID` is the shell under test, so invoke with `bash ...` directly in that shell, without `exec` or a pipeline wrapper that changes its parent.
+`EZIL_LC_TOOLS` defaults to `opencode`. Tool and project-file lists are whitespace separated (no shell evaluation or glob expansion; file names with whitespace are unsupported). A populated Git project and file list are required for persistence acceptance; omitting them produces insufficient evidence. `EZIL_LC_PROVIDER` must be `aws` or `cloudflare`, copied from actual placement evidence. It is operator-supplied context, not proof from a cloud query; retain the independent provider observation alongside the snapshots. Only select nonsecret project files and a nonsecret marker. The probe hashes config/history without printing contents or the marker; it never emits process arguments or arbitrary environment values. Identity includes HOME and the two Cloudflare IDs only when set, and tool inspection includes PATH. Run it as the ordinary terminal user; root is not needed. It needs Bash 5 and coreutils; unavailable commands or unreadable files produce `null`. Python 3 is optional for JSON escaping. Tool version commands run under `timeout 10`; choose tools whose `--version` is read-only. The parent `$PPID` is the shell under test, so invoke with `bash ...` directly in that shell, without `exec` or a pipeline wrapper that changes its parent.
 
 The JSON has `identity`, `processes`, `tools`, `config`, `project`, and `mounts` sections. Each process records numeric `pid`, string `starttime`, and `comm`; code-server, PTY host, and tmux lists are `null` when absent. Tools are keyed under `tools.commands`, with `path`, `realpath`, `version`, `sha256`, and `stat` (`inode`, `links`, `size`). Config objects are `bashrc`, `bash_history`, and `settings`; history also records `lines` and `marker_present`. Project has `HEAD` and file hashes keyed under `files`. Exact mount points are inspected; a directory on its parent's mount is reported as `null`.
 
 The classifier evaluates, in order:
 
-1. `lost`: a tool path/resolved path/hash, bashrc/settings hash, project HEAD/file hash changes (including becoming null), or a previously present history marker is missing. History hash changes alone allow normal history growth.
-2. `same_process`: boot ID, PID namespace and shell PID/starttime match, along with the sentinel when requested. The boot ID is the host kernel's, so containers on one host share it; the PID namespace tells them apart.
-3. `resumed_checkpoint`: `--provider-transition` was explicitly supplied and sentinel PID/starttime match. This is expected only for EC2 hibernation; the operator must verify the provider transition separately. `same_process` still takes precedence.
-4. `recreated_shell`: files/tools compare equal, but boot or shell/sentinel identity differs. Missing process identity also falls here, since absent evidence cannot prove survival.
+1. `lost`: tool paths/bytes change or execution stops answering; project/config bytes change; history loses the marker, shrinks, or changes at the same line count; provider changes without an explicit transition.
+2. `insufficient_evidence`: required observations are missing or invalid. Required evidence includes provider, boot/PID namespace and shell identity, opencode path/hash/version, npm prefix/PATH, configuration/history hashes and marker, and project HEAD/file hashes. Two null hashes never prove persistence.
+3. `same_process`: boot ID, PID namespace and shell PID/starttime match, with the sentinel when requested.
+4. `resumed_checkpoint`: an explicitly observed provider transition plus matching PID namespace and sentinel identity. Hibernation is off and this is outside current acceptance.
+5. `recreated_shell`: required saved-state evidence matches but process identity changed. This is the expected M2–M5 success case.
 
-Output is `{classification, expected, pass, diffs:[{path,before,after}]}`. With `--expect`, a match exits 0 and a mismatch exits 1; without it the classifier exits 0. Diffs include observational changes such as inode, PTY host, tmux, mounts, history, and version. An unchanged tmux server cannot prove an unchanged shell. Missing and null fields compare equally; two unobservable file hashes do not prove those bytes survived. Keep the same probe inputs and inspect nulls and diffs before treating a result as lifecycle evidence. Malformed JSON or CLI arguments exit 1.
+Output includes `{classification, expected, pass, diffs, missingEvidence}`. Insufficient evidence always fails. Without `--expect`, loss fails; with it, the expected classification must match. Diffs retain observational changes such as inode, PTY host, tmux, mounts and version. A surviving tmux server does not prove a surviving shell. Malformed input/arguments fail. Inspect every result and the independent provider observations before claiming lifecycle acceptance.
 
 C = Cloudflare; A = AWS. These are expected outcomes, with unconfirmed and known-gap entries preserved:
 
@@ -72,12 +75,12 @@ C = Cloudflare; A = AWS. These are expected outcomes, with unconfirmed and known
 | M1b browser close 5–9 min | kept | kept | ptyHost UNCONFIRMED; tmux same |
 | M2 idle stop (C 10 min, A 600 s + load<0.5) | C restored from R2; A kept on EBS | kept only if saved before stop | lost -> new shell |
 | M3 code-server /restart (C) / systemctl restart ezil-desktop (A) | kept | kept | ptyHost lost; tmux C same (inferred), A lost |
-| M4 container replacement (C staging rollout; A wake=replace) | C restored; A kept, new instance id, same data volume id | kept | lost |
-| M5 host stop/start (A; C host restart observe-only) | kept | kept | lost (hibernation off) |
+| M4 resource replacement (separately authorized test computer) | Container-only: same host/volume; AWS instance replacement: new instance, same retained volume | kept | lost |
+| M5 EC2 stop/start in place (A; C host restart observe-only) | same instance and data volume; bytes kept | kept | lost (hibernation off) |
 | M6 image upgrade (C new digest; A new lower) | C cross-image restore; A expected FAIL lower_digest_mismatch (known gap) | kept | lost |
 | M7 oversize npm -g (> 512 MiB, C) | not saved; notice shown; stop completes | — | — |
 
-“Lost” in the terminal column means process loss, usually classifier `recreated_shell` when files survive. Use `--expect recreated_shell` for M2–M5 and a successful C M6 restore. M1b needs observation rather than an assumed PTY result. A M6's `lower_digest_mismatch` must be checked in provider evidence; the classifier detects any resulting file loss but cannot diagnose that provider error. M4 instance/data-volume IDs and M6 image digests need separate provider observations: the probe does not query metadata APIs. M7's notice, snapshot size limit, and stop completion also need separate provider evidence; this probe cannot prove them alone.
+“Lost” in the terminal column means process loss, usually classifier `recreated_shell` when files survive. Use `--expect recreated_shell` for M2–M5 and a successful C M6 restore. M1b needs observation rather than an assumed PTY result. A M6's `lower_digest_mismatch` must be checked in provider evidence; the classifier detects any resulting file loss but cannot diagnose that provider error. M4/M5 instance/data-volume IDs and M6 image digests need separate provider observations: the probe does not query metadata APIs. M7's notice, snapshot size limit, and stop completion also need separate provider evidence; this probe cannot prove them alone.
 
 Local validation from the worktree root:
 
@@ -87,4 +90,4 @@ bash -n tools/lifecycle/probe.sh
 EZIL_LC_TOOLS=bash bash tools/lifecycle/probe.sh | python3 -m json.tool > /dev/null
 ```
 
-The sandbox check selects `bash` to avoid invoking an AI CLI. `tools/test.sh tools` uses recursive Bun discovery and finds this suite, and `tools/tsconfig.json` includes `lifecycle/*.ts`, so `bun run --cwd tools typecheck` checks it.
+The sandbox smoke check selects `bash` to avoid invoking an AI CLI. It validates probe JSON only and cannot satisfy opencode persistence acceptance. `tools/test.sh tools` uses recursive Bun discovery and finds this suite, and `tools/tsconfig.json` includes `lifecycle/*.ts`, so `bun run --cwd tools typecheck` checks it.
