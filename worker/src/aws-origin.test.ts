@@ -15,11 +15,15 @@ import {
   gatewayPayload,
   handleAwsBrowserHost,
   handleAwsPreview,
+  mintAwsBootstrapToken,
+  mintAwsPreviewCookie,
   parseAwsBrowserHost,
   proxyToAwsOrigin,
   resolveAwsOriginZone,
   sendAwsControl,
   signGatewayHeader,
+  verifyAwsBootstrapToken,
+  verifyAwsPreviewCookie,
   verifyGatewayHeader,
   type AwsTunnelRecord,
   type FetchLike,
@@ -177,6 +181,73 @@ describe('proxyToAwsOrigin', () => {
   });
 });
 
+describe('AWS browser capabilities', () => {
+  const now = 1_791_964_800_000;
+  // Same first 16 UUID hex chars, hence the same shortened sandbox ID.
+  const otherComputer = '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0c';
+
+  it('bootstrap binds the port, full computer identity and current tunnel epoch', async () => {
+    const current = record();
+    const token = await mintAwsBootstrapToken(SECRET, current, 8181, now);
+    expect(await verifyAwsBootstrapToken(token, [SECRET], current, 8181, now)).toBe(true);
+    expect(await verifyAwsBootstrapToken(token, ['old-secret', SECRET], current, 8181, now)).toBe(true);
+    for (const [changed, port] of [
+      [current, 8443],
+      [record({ computerId: otherComputer }), 8181],
+      [record({ generation: 2 }), 8181],
+      [record({ leaseEpoch: 3 }), 8181],
+      [record({ sandboxId: 'guac-aaaa-bbbb' }), 8181],
+    ] as const) {
+      expect(await verifyAwsBootstrapToken(token, [SECRET], changed, port, now)).toBe(false);
+    }
+    expect(await verifyAwsBootstrapToken(token, ['other-secret'], current, 8181, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken(undefined, [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken('ab1.not-a-timestamp.bad', [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken(token.slice(0, -1) + (token.endsWith('0') ? '1' : '0'), [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken(await mintPreviewBootstrapToken(SECRET, SID, now), [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsPreviewCookie(token, [SECRET], current, 8181, now)).toBe(false);
+  });
+
+  it('cookie binds the same identity and port, and rejects legacy and tampered values', async () => {
+    const current = record();
+    const cookie = await mintAwsPreviewCookie(SECRET, current, 8181, now);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now)).toBe(true);
+    for (const [changed, port] of [
+      [current, 3002],
+      [record({ computerId: otherComputer }), 8181],
+      [record({ generation: 2 }), 8181],
+      [record({ leaseEpoch: 3 }), 8181],
+    ] as const) {
+      expect(await verifyAwsPreviewCookie(cookie, [SECRET], changed, port, now)).toBe(false);
+    }
+    expect(await verifyAwsPreviewCookie(cookie.replace('.' + now + '.', '.' + (now + 1) + '.'), [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsPreviewCookie('ac1.not-a-timestamp.bad', [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsPreviewCookie(await mintPreviewCookie(SECRET, SID, now), [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken(cookie, [SECRET], current, 8181, now)).toBe(false);
+  });
+
+  it('enforces exact age and future-skew bounds for both capability kinds', async () => {
+    const current = record();
+    const bootstrap = await mintAwsBootstrapToken(SECRET, current, 8181, now);
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now + 300_000)).toBe(true);
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now + 300_001)).toBe(false);
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now - 10_000)).toBe(true);
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now - 10_001)).toBe(false);
+    const cookie = await mintAwsPreviewCookie(SECRET, current, 8181, now);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now + 3_600_000)).toBe(true);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now + 3_600_001)).toBe(false);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now - 10_000)).toBe(true);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now - 10_001)).toBe(false);
+  });
+
+  it('malformed or missing current record fields cannot mint a capability', async () => {
+    for (const invalid of [record({ computerId: 'x' }), record({ generation: 0 }), record({ leaseEpoch: 0 })]) {
+      await expect(mintAwsBootstrapToken(SECRET, invalid, 8181, now)).rejects.toThrow('aws_preview_invalid_binding');
+    }
+    await expect(mintAwsPreviewCookie(SECRET, record(), 9223, now)).rejects.toThrow('aws_preview_invalid_binding');
+  });
+});
+
 describe('handleAwsBrowserHost', () => {
   const host = `aws-8181-${SID}-aws.${ROOT}`;
   const deps = (over: Partial<Parameters<typeof handleAwsBrowserHost>[2]> = {}) => {
@@ -185,6 +256,10 @@ describe('handleAwsBrowserHost', () => {
   };
   const call = (path: string, d: Parameters<typeof handleAwsBrowserHost>[2], init: RequestInit = {}) =>
     handleAwsBrowserHost(new Request(`https://${host}${path}`, init), new URL(`https://${host}${path}`), d);
+  const callPort = (port: number, path: string, d: Parameters<typeof handleAwsBrowserHost>[2], init: RequestInit = {}) => {
+    const target = `https://aws-${port}-${SID}-aws.${ROOT}${path}`;
+    return handleAwsBrowserHost(new Request(target, init), new URL(target), d);
+  };
 
   it('disabled routing answers 404 and never forwards', async () => {
     const { f, d } = deps({ routingEnabled: false });
@@ -194,29 +269,62 @@ describe('handleAwsBrowserHost', () => {
   it('no secret fails closed (401), unlike the CF local-dev bypass', async () => {
     const { f, d } = deps({ secrets: [] });
     expect((await call('/', d))!.status).toBe(401);
+    expect((await call('/preview-bootstrap?token=abc', d))!.status).toBe(401);
     expect(f.calls.length).toBe(0);
   });
-  it('bootstrap: a valid token sets the sandbox-bound cookie and redirects same-origin only', async () => {
-    const { d } = deps();
-    const token = await mintPreviewBootstrapToken(SECRET, SID);
+  it('bootstrap: a valid port-bound token sets a port-bound cookie and redirects same-origin only', async () => {
+    const { f, d } = deps();
+    const token = await mintAwsBootstrapToken(SECRET, record(), 8181);
     const ok = (await call(`/preview-bootstrap?token=${encodeURIComponent(token)}&path=/desk?x=1`, d))!;
     expect(ok.status).toBe(302);
     expect(ok.headers.get('location')).toBe('/desk?x=1');
-    expect(ok.headers.get('set-cookie')).toMatch(/^ezil_preview=guac-.*HttpOnly; Secure; SameSite=None; Partitioned; Path=\/$/);
+    expect(ok.headers.get('set-cookie')).toMatch(/^ezil_preview=ac1\..*HttpOnly; Secure; SameSite=None; Partitioned; Path=\/$/);
     const open = (await call(`/preview-bootstrap?token=${encodeURIComponent(token)}&path=//evil.com/x`, d))!;
     expect(open.headers.get('location')).toBe('/');
-    const wrong = await mintPreviewBootstrapToken(SECRET, 'guac-other-sandbox');
+    const wrong = await mintAwsBootstrapToken(SECRET, record({ sandboxId: 'guac-other-sandbox' }), 8181);
     expect((await call(`/preview-bootstrap?token=${encodeURIComponent(wrong)}`, d))!.status).toBe(401);
+    expect((await callPort(8443, `/preview-bootstrap?token=${encodeURIComponent(token)}`, d))!.status).toBe(401);
+    const cookie = ok.headers.get('set-cookie')!.split(';')[0]!;
+    expect((await callPort(8443, '/vscode', d, { headers: { cookie } }))!.status).toBe(401);
+    expect(f.calls.length).toBe(0);
+  });
+  it('accepts a record whose origin check refreshed during lookup', async () => {
+    let now = 1_791_964_800_000;
+    const token = await mintAwsBootstrapToken(SECRET, record(), 8181, now);
+    const { d } = deps({
+      lookup: async () => { now += 1; return record({ originVerifiedAt: now }); },
+      nowMs: () => now,
+    });
+    expect((await call(`/preview-bootstrap?token=${encodeURIComponent(token)}`, d))!.status).toBe(302);
+  });
+  it('a replaced epoch or full computer cannot refresh an old bootstrap into a new cookie', async () => {
+    const oldToken = await mintAwsBootstrapToken(SECRET, record(), 8181);
+    const oldCookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record(), 8181)}`;
+    const legacyToken = await mintPreviewBootstrapToken(SECRET, SID);
+    const legacyCookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    for (const replacement of [record({ leaseEpoch: 3 }), record({ computerId: '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0c' })]) {
+      const { f, d } = deps({ lookup: async () => replacement });
+      for (const token of [oldToken, legacyToken]) {
+        const res = (await call(`/preview-bootstrap?token=${encodeURIComponent(token)}`, d))!;
+        expect(res.status).toBe(401);
+        expect(res.headers.get('set-cookie')).toBeNull();
+      }
+      for (const cookie of [oldCookie, legacyCookie]) {
+        expect((await call('/desk', d, { headers: { cookie } }))!.status).toBe(401);
+        expect((await call('/ws', d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(401);
+      }
+      expect(f.calls.length).toBe(0);
+    }
   });
   it('no or wrong-sandbox cookie: 401 and nothing forwarded', async () => {
     const { f, d } = deps();
     expect((await call('/', d))!.status).toBe(401);
-    const other = await mintPreviewCookie(SECRET, 'guac-aaaa-bbbb');
+    const other = await mintAwsPreviewCookie(SECRET, record({ sandboxId: 'guac-aaaa-bbbb' }), 8181);
     expect((await call('/', d, { headers: { cookie: `ezil_preview=${other}` } }))!.status).toBe(401);
     expect(f.calls.length).toBe(0);
   });
   it('valid cookie but no record, a record for another sandbox, or an unverified origin: 502', async () => {
-    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    const cookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record(), 8181)}`;
     for (const lookup of [async () => null, async () => record({ sandboxId: 'guac-x-y' }), async () => record({ originVerified: false })]) {
       const { f, d } = deps({ lookup });
       const res = (await call('/', d, { headers: { cookie } }))!;
@@ -227,7 +335,7 @@ describe('handleAwsBrowserHost', () => {
   });
   it('stale, legacy and future verification snapshots never forward HTTP or WebSockets', async () => {
     const now = Date.now();
-    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    const cookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record(), 8181)}`;
     for (const originVerifiedAt of [undefined, now - 60_000, now + 1]) {
       for (const upgrade of [false, true]) {
         const { f, d } = deps({ nowMs: () => now, lookup: async () => record({ originVerifiedAt }) });
@@ -238,10 +346,10 @@ describe('handleAwsBrowserHost', () => {
       }
     }
   });
-  it('auto-connects across tunnel epochs without a credential in the browser URL', async () => {
+  it('auto-connects within one tunnel epoch and fences the old cookie when the epoch changes', async () => {
     let epoch = 2;
     const { f, d } = deps({ lookup: async () => record({ leaseEpoch: epoch }) });
-    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    let cookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record(), 8181)}`;
     const redirect = (await call('/', d, { headers: { cookie } }))!;
     expect(redirect.status).toBe(302);
     const path = '/?usr=EZiL&pwd=ezil-preview&embed=1';
@@ -253,13 +361,18 @@ describe('handleAwsBrowserHost', () => {
     const { user } = await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID);
     expect(path).not.toContain(user);
     const ws = '/ws?password=ezil-preview&username=EZiL';
-    for (epoch of [2, 3]) {
-      await call(ws, d, { headers: { cookie, upgrade: 'websocket' } });
-      const target = new URL(f.calls[f.calls.length - 1]!.url);
-      expect(target.hostname).toBe(`c-${SID}-g1-e${epoch}.${ZONE}`);
-      expect(target.searchParams.get('password')).toBe(user);
-      expect(target.searchParams.get('username')).toBe('EZiL');
-    }
+    await call(ws, d, { headers: { cookie, upgrade: 'websocket' } });
+    expect(new URL(f.calls[f.calls.length - 1]!.url).hostname).toBe(`c-${SID}-g1-e2.${ZONE}`);
+    epoch = 3;
+    const forwarded = f.calls.length;
+    expect((await call(ws, d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(401);
+    expect(f.calls.length).toBe(forwarded);
+    cookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record({ leaseEpoch: 3 }), 8181)}`;
+    expect((await call(ws, d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(200);
+    const target = new URL(f.calls[f.calls.length - 1]!.url);
+    expect(target.hostname).toBe(`c-${SID}-g1-e3.${ZONE}`);
+    expect(target.searchParams.get('password')).toBe(user);
+    expect(target.searchParams.get('username')).toBe('EZiL');
   });
 });
 
@@ -312,13 +425,22 @@ describe('handleAwsPreview', () => {
       expect(checked).toBe(age === 59_999 ? 0 : 1);
     }
   });
-  it('success: browser URLs on the AWS hostnames with a sandbox-bound bootstrap token; no key in the body', async () => {
-    const res = await handleAwsPreview(claims(), deps());
-    const body = (await res.json()) as Record<string, string>;
+  it('success: browser URLs carry distinct port-bound bootstrap tokens; no key in the body', async () => {
+    const now = 1_791_964_800_000;
+    const res = await handleAwsPreview(claims(), deps({
+      nowMs: () => now, lookup: async () => record({ originVerifiedAt: now }),
+    }));
+    const body = (await res.json()) as { provider: string; guacamoleUrl: string; codePreviewUrl: string; appPreviewUrl: string; expiresAt: number };
     expect(body.provider).toBe('aws-ec2');
     expect(new URL(body.guacamoleUrl!).hostname).toBe(`aws-8181-${SID}-aws.${ROOT}`);
     expect(new URL(body.codePreviewUrl!).hostname).toBe(`aws-8443-${SID}-aws.${ROOT}`);
     expect(new URL(body.appPreviewUrl!).hostname).toBe(`aws-3002-${SID}-aws.${ROOT}`);
+    const tokens = [body.guacamoleUrl!, body.codePreviewUrl!, body.appPreviewUrl!]
+      .map((value) => new URL(value).searchParams.get('token'));
+    expect(new Set(tokens).size).toBe(3);
+    expect(tokens.every((token) => token?.startsWith('ab1.'))).toBe(true);
+    expect(body.expiresAt).toBe(now + 300_000);
+    expect(tokens.every((token) => token?.split('.')[1] === String(now))).toBe(true);
     expect(JSON.stringify(body)).not.toContain(vectors.controlKeyBase64);
   });
   it('no secret: 401', async () => {
