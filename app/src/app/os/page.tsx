@@ -105,9 +105,12 @@ export default async function Page() {
 
     if (!ctx.user) {
         // Same gate as `src/app/computers/layout.tsx` and
-        // `src/app/computer/layout.tsx`. The pathname is known statically here,
-        // so it is used directly rather than read back from `x-pathname`.
-        redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(Routes.OS)}`);
+        // `src/app/computer/layout.tsx`. This page also serves the `/app/<name>`
+        // deep link (`src/app/app/[name]/page.tsx`); that arrival keeps its path
+        // and query through sign-in (the middleware's `x-return-url`), every
+        // other one returns to `/os`. `safeReturnUrl` still vets it on the way back.
+        const arrival = heads.get('x-return-url') ?? '';
+        redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(arrival.startsWith('/app/') ? arrival : Routes.OS)}`);
     }
 
     const user = ctx.user;

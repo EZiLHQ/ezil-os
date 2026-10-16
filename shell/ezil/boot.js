@@ -83,6 +83,7 @@ import { PuterBackendRemovedError, puter } from '../src/ezil-stubs.js';
 import session from './session.js';
 import registry from './apps/registry.js';
 import { warm } from './warm.js';
+import { takeDeepLink } from './deep-link.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
 let nativePersistence = null;
 
@@ -902,6 +903,23 @@ async function build (payload) {
     // nobody can see.
     console.info(`[${PHASE}] resolved ${apps.length} app(s); opening none automatically`,
         apps.map(a => a.id));
+
+    // 🔴 THE ONE EXCEPTION: the URL itself names an app (`/app/<name>`, see
+    // `deep-link.js`). Taken once per page load, so a rebuild never reopens
+    // it, and only an app this computer actually offers (`apps`, already
+    // intersected with the server's list) is opened. An unknown name opens
+    // nothing, as before; the address bar is `/os` either way.
+    // ADDED BY EZIL 2026-10-14 (Open in EZiL OS deep link).
+    const link = takeDeepLink();
+    if ( link ) {
+        if ( apps.some(a => a.id === link.app) ) {
+            console.info(`[${PHASE}] deep link opens "${link.app}"`);
+            // The Works launch code is minted for the Code window only; no other app sees it.
+            void registry.launch(link.app, { ...ctx, deepLink: link.app === 'code' ? link : { ...link, launchCode: null } });
+        } else {
+            console.info(`[${PHASE}] deep link names "${link.app}", which this computer does not offer; opening nothing`);
+        }
+    }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire
     // `warm()` SILENTLY, right here, the instant the desktop painted — well
