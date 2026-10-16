@@ -3,7 +3,7 @@
 Order (each step refuses before anything is written):
   1. resolve the block device from the lease's volumeId (Nitro NVMe serial under
      /dev/disk/by-id), require a block device, read its filesystem UUID;
-  2. provision only: an EMPTY device (no filesystem) with lease.provision=true is
+  2. provision only: an unformatted device verified entirely zero with lease.provision=true is
      formatted with the control plane's fsUuid;
   3. device UUID must equal lease.fsUuid; mount it READ-ONLY, nosuid,nodev;
   4. refuse on a failed/in-progress rebase state;
@@ -17,10 +17,12 @@ The marker is a bug fence, not a security fence (C-4): guest root can rewrite it
 """
 import glob
 import json
+import math
 import os
 import re
 import stat
 import subprocess
+import sys
 import time
 
 from . import canary, config as cfgmod
@@ -149,8 +151,44 @@ def device_for_volume(cfg, volume_id):
 
 
 def fs_uuid(dev):
-    r = subprocess.run(["blkid", "-p", "-s", "UUID", "-o", "value", dev], capture_output=True, text=True)
-    return r.stdout.strip() or None
+    """An ext4 UUID, or None after successful independent no-signature probing.
+
+    A failed probe is not an empty disk. Read all tags so a partition table or a
+    filesystem lacking a UUID cannot become permission to format a used volume.
+    """
+    try:
+        r = subprocess.run(["blkid", "-p", "-o", "export", dev],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Refused("volume_signature_unreadable", dev) from e
+    if r.returncode == 2 and not r.stdout.strip() and not r.stderr.strip():
+        # blkid also returns this for a missing/unreadable device. Its result alone
+        # must never authorize mkfs. wipefs --no-act fails if initialization/read
+        # fails and also sees signatures without filesystem UUIDs.
+        try:
+            probe = subprocess.run(["wipefs", "--no-act", "--json", dev],
+                                   capture_output=True, text=True, timeout=10)
+            if probe.returncode != 0 or probe.stderr.strip():
+                raise Refused("volume_signature_unreadable", dev)
+            signatures = json.loads(probe.stdout)
+            if not isinstance(signatures, dict) or not isinstance(signatures.get("signatures"), list):
+                raise Refused("volume_signature_unreadable", dev)
+            if signatures["signatures"]:
+                raise Refused("volume_signature_unsupported", dev)
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            raise Refused("volume_signature_unreadable", dev) from e
+        return None  # unformatted, not proof that every byte on the disk is zero
+    if r.returncode != 0 or r.stderr.strip():
+        raise Refused("volume_signature_unreadable", dev)
+    tags = {}
+    for line in r.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key in tags:
+            raise Refused("volume_signature_unreadable", dev)
+        tags[key] = value
+    if tags.get("TYPE") != "ext4" or "PTTYPE" in tags or not tags.get("UUID"):
+        raise Refused("volume_signature_unsupported", dev)
+    return tags["UUID"]
 
 
 def is_mounted(path):
@@ -161,19 +199,46 @@ def mount_opts(path):
     return subprocess.run(["findmnt", "-n", "-o", "OPTIONS", "--target", path], capture_output=True, text=True).stdout.strip()
 
 
+def verify_blank_device(cfg, dev):
+    """Never infer blankness from a missing signature on a damaged/unknown disk."""
+    seconds = cfg.get("blankVerifySeconds", 300)
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or not 0 < seconds <= 300):
+        raise Refused("volume_blank_timeout_invalid")
+    try:
+        mounted = subprocess.run(["findmnt", "-rn", "--source", dev],
+                                 capture_output=True, text=True, timeout=5)
+        if mounted.returncode == 0:
+            raise Refused("volume_device_busy", dev)
+        if mounted.returncode != 1 or mounted.stdout.strip() or mounted.stderr.strip():
+            raise Refused("volume_mount_unknown", dev)
+        result = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "zero_check.py"), dev, str(seconds)],
+                                capture_output=True, text=True, timeout=seconds)
+    except subprocess.TimeoutExpired as e:
+        raise Refused("volume_blank_timeout", dev) from e
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Refused("volume_blank_unreadable", dev) from e
+    if result.returncode != 0 or result.stdout.strip() or result.stderr.strip():
+        code = result.stdout.strip()
+        if code not in ("volume_not_blank", "volume_blank_timeout", "volume_blank_unreadable"):
+            code = "volume_blank_unreadable"
+        raise Refused(code, dev)
+
+
 def mount_data(cfg, lease, mode="ro"):
     dev = wait_device_for_volume(cfg, lease["volumeId"])
+    if is_mounted(cfg.dataMount):
+        raise Refused("data_mount_busy", cfg.dataMount)
     uuid = fs_uuid(dev)
     if uuid is None:
         if not lease.get("provision"):
             raise Refused("volume_has_no_filesystem", dev)
+        verify_blank_device(cfg, dev)
         subprocess.run(["mkfs.ext4", "-q", "-F", "-U", lease["fsUuid"], "-L", "ezil-data", dev], check=True)
         uuid = fs_uuid(dev)
     if uuid != lease["fsUuid"]:
         raise Refused("fs_uuid_mismatch", f"device={uuid} lease={lease['fsUuid']}")
     os.makedirs(cfg.dataMount, mode=0o755, exist_ok=True)
-    if is_mounted(cfg.dataMount):
-        raise Refused("data_mount_busy", cfg.dataMount)
     subprocess.run(["mount", "-o", f"{mode},{MOUNT_OPTS}", dev, cfg.dataMount], check=True)
     return dev
 

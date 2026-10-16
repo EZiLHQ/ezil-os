@@ -3,9 +3,11 @@
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -143,6 +145,69 @@ class ToolRebase(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.upper / self.link))
         self.assert_package_unchanged()
         self.assertEqual(image_bin.read_bytes(), b"new image tool\n")
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux required for isolated new-session fixture")
+class NewTmuxToolFixture(unittest.TestCase):
+    """Exercise a retained npm layout in two real fresh tmux servers, without installing
+    opencode or claiming an EBS/container lifecycle happened. The executable is a fixture
+    which requires retained package metadata and a dependency to answer --version.
+    """
+
+    def test_command_runs_without_reinstall_in_each_new_server(self):
+        with tempfile.TemporaryDirectory(prefix="ezil-tmux-tool-") as tmp:
+            root = Path(tmp)
+            upper = root / "data/root/upper"
+            home = upper / "root"
+            home.mkdir(parents=True)
+            bin_dir = upper / "usr/local/bin"
+            bin_dir.mkdir(parents=True)
+            package = upper / "usr/local/lib/node_modules/opencode-ai"
+            (package / "bin").mkdir(parents=True)
+            dependency = package / "node_modules/runtime/version"
+            dependency.parent.mkdir(parents=True)
+            dependency.write_text("fixture-opencode-1.0\n")
+            (package / "package.json").write_text('{"name":"opencode-ai","version":"fixture-1.0"}\n')
+            executable = package / "bin/opencode"
+            executable.write_text('#!/bin/bash\nset -e\n[[ $1 == --version ]]\n'
+                                  'package=$(dirname "$(dirname "$(readlink -f "$0")")")\n'
+                                  'test -r "$package/package.json"\n'
+                                  'cat "$package/node_modules/runtime/version"\n')
+            executable.chmod(0o755)
+            (bin_dir / "opencode").symlink_to("../lib/node_modules/opencode-ai/bin/opencode")
+            script = root / "probe.sh"
+            script.write_text('set -e\ntest -n "$TMUX"\ncommand -v opencode\n'
+                              'readlink -f "$(command -v opencode)"\n'
+                              'sha256sum "$(command -v opencode)"\nopencode --version\nprintf "%s\\n" "$HOME"\n')
+            env = {"HOME": str(home), "PATH": f"{bin_dir}:/usr/bin:/bin", "TERM": "dumb"}
+            observations, pids = [], []
+            for index in range(2):
+                socket = str(root / f"tmux-{index}.sock")
+                result, done = root / f"result-{index}", root / f"done-{index}"
+                command = ["tmux", "-S", socket, "-f", "/dev/null"]
+                try:
+                    subprocess.run([*command, "new-session", "-d", "-s", "fixture", "/bin/bash", "--noprofile", "--norc", "-c",
+                                    '/bin/bash --noprofile --norc "$1" > "$2" 2>&1; printf "%s" "$?" > "$3"; exec sleep 30',
+                                    "fixture", str(script), str(result), str(done)], env=env, check=True, capture_output=True)
+                    deadline = time.monotonic() + 5
+                    while not done.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(done.exists(), "new tmux session must finish its tool probe")
+                    self.assertEqual(done.read_text(), "0", result.read_text())
+                    pids.append(subprocess.run([*command, "display-message", "-p", "#{pid}"],
+                                               env=env, check=True, capture_output=True, text=True).stdout.strip())
+                    observations.append(result.read_text().splitlines())
+                finally:
+                    subprocess.run([*command, "kill-server"], env=env, capture_output=True, check=False)
+            self.assertNotEqual(*pids)
+            self.assertEqual(observations[0], observations[1])
+            self.assertEqual(observations[0][0], str(bin_dir / "opencode"))
+            self.assertEqual(observations[0][1], str(executable))
+            self.assertEqual(observations[0][3:], ["fixture-opencode-1.0", str(home)])
+            # Keeping the executable alone does not satisfy tool persistence.
+            dependency.unlink()
+            broken = subprocess.run([str(bin_dir / "opencode"), "--version"], env=env, capture_output=True)
+            self.assertNotEqual(broken.returncode, 0)
 
 
 if __name__ == "__main__":

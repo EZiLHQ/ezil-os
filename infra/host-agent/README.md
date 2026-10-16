@@ -10,6 +10,27 @@ C-4, C-6, and §3a. The S1 spike (`feat/aws-s1-runtime-spike`) holds the runtime
 The runtime agent uses Python 3 standard library only and makes no AWS API calls.
 The AMI build uses its temporary instance role to pull the desktop image from ECR.
 
+Local persistence regression tests use temporary directories and stubbed volume probes.
+`test_data_safety.py` verifies wrong-volume, stale-epoch, missing-marker and incompatible
+image refusals without changing retained bytes. A failed or ambiguous probe, partition
+table or unsupported signature refuses rather than authorizing formatting. A no-signature
+result is confirmed with `wipefs --no-act`; it does not prove an empty disk. A provisioning
+lease can initialize only an unmounted disk whose full contents are verified zero, with
+a 1 MiB streaming buffer and monotonic deadline. A child-process timeout bounds stalled
+reads; unknown nonzero contents, read failures and incomplete scans refuse before mkfs.
+`blankVerifySeconds` defaults to 300 seconds and cannot exceed 300. This scan happens only
+before first format, never during normal stop/start/replacement of a formatted volume.
+At 125 MiB/s a 20 GiB volume needs about 164 seconds of ideal read time. Large/slow
+volumes can exceed the scan deadline and then refuse provisioning; existing total
+startup/enrollment/nonce deadlines still apply. Hosted timing and startup acceptance
+are unconfirmed. Do not raise startup/spending
+limits or skip this check to turn that refusal into a destructive initialization.
+`test_tool_persistence.py` verifies the retained global npm bin/package/dependency layout
+and executes a fixture command in two fresh isolated tmux servers. It does not install
+the real `opencode-ai` package or prove EC2/EBS/container lifecycle acceptance. The hosted
+20-cycle acceptance gate, including real `opencode --version` in a new tmux session,
+remains unexecuted.
+
 ## Canary serial diagnostics (default off)
 
 Set `canaryConsole: true` in the baked `/etc/ezil-host/agent.json` for a canary.

@@ -138,6 +138,13 @@ file_json /proc/sys/kernel/random/boot_id
 printf ',"hostname":'; command_json hostname
 printf ',"pid_namespace":'; command_json readlink /proc/self/ns/pid
 printf ',"uid":'; command_json id -u
+printf ',"provider":'
+# This is an explicit observation from authenticated Settings/placement, not an
+# inference from Cloudflare's transport variables or the guest's hostname.
+case ${EZIL_LC_PROVIDER:-} in
+    aws|cloudflare) json_string "$EZIL_LC_PROVIDER" ;;
+    *) printf 'null' ;;
+esac
 printf ',"home":'
 if [[ ${HOME+x} ]]; then json_string "$HOME"; else printf 'null'; fi
 if [[ ${CLOUDFLARE_DEPLOYMENT_ID+x} ]]; then

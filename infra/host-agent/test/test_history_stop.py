@@ -162,6 +162,29 @@ class HistoryInjection(unittest.TestCase):
         self.assertIn("echo ezil-unit-$((40+2))", before, "line must be in HISTFILE while the shell is still open")
         self.assertIn("echo ezil-unit-$((40+2))", after)
 
+    def test_concurrent_shells_append_and_a_fresh_shell_restores_both(self):
+        env = {"PROMPT_COMMAND": desktop.HISTORY_PROMPT}
+        shells = [Shell(self.home, env) for _ in range(2)]
+        try:
+            for sh, marker in zip(shells, (": history-one", ": history-two")):
+                sh.run(marker)
+                sh.expect(b"EZPROMPT$ ")
+            # Both lines were flushed with both shells alive; killing either must not
+            # overwrite the other's history. The new process reads the retained file.
+            self.assertIn(": history-one", shells[0].history())
+            self.assertIn(": history-two", shells[0].history())
+        finally:
+            for sh in shells:
+                sh.kill()
+        fresh = Shell(self.home, env)
+        try:
+            fresh.run("history")
+            fresh.expect(b": history-one")
+            fresh.expect(b": history-two")
+            fresh.expect(b"EZPROMPT$ ")
+        finally:
+            fresh.kill()
+
     def test_prompt_command_survives_vscode_style_wrapping(self):
         # VS Code's bash integration stores the inherited PROMPT_COMMAND and evals it
         # from its own prompt function: mimic that wrapper in an rc file.

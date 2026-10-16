@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-export const CLASSES = ["lost", "same_process", "resumed_checkpoint", "recreated_shell"] as const;
+export const CLASSES = ["lost", "insufficient_evidence", "same_process", "resumed_checkpoint", "recreated_shell"] as const;
 export type Classification = (typeof CLASSES)[number];
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type RecordValue = { [key: string]: Json };
@@ -21,6 +21,7 @@ export interface Result {
 	readonly expected: Classification | null;
 	readonly pass: boolean;
 	readonly diffs: readonly Diff[];
+	readonly missingEvidence: readonly string[];
 }
 
 function object(value: Json | undefined): RecordValue {
@@ -58,14 +59,58 @@ function sameProcess(before: Json, after: Json): boolean {
 		pid === at(after, "pid") && starttime === at(after, "starttime");
 }
 
+function missingEvidence(snapshot: Json, side: string): string[] {
+	const missing: string[] = [];
+	const need = (valid: boolean, ...path: string[]) => { if (!valid) missing.push(`${side}.${path.join(".")}`); };
+	const text = (...path: string[]) => {
+		const value = at(snapshot, ...path);
+		need(typeof value === "string" && value.trim().length > 0, ...path);
+	};
+	const hash = (...path: string[]) => {
+		const value = at(snapshot, ...path);
+		need(typeof value === "string" && /^[a-f0-9]{64}$/.test(value), ...path);
+	};
+	need(["aws", "cloudflare"].includes(String(at(snapshot, "identity", "provider"))), "identity", "provider");
+	text("identity", "boot_id");
+	text("identity", "pid_namespace");
+	need(sameProcess(at(snapshot, "processes", "shell"), at(snapshot, "processes", "shell")), "processes", "shell");
+	for (const field of ["bashrc", "settings"]) hash("config", field, "sha256");
+	hash("config", "bash_history", "sha256");
+	const historyLines = at(snapshot, "config", "bash_history", "lines");
+	need(typeof historyLines === "number" && Number.isInteger(historyLines) && historyLines > 0, "config", "bash_history", "lines");
+	need(at(snapshot, "config", "bash_history", "marker_present") === true, "config", "bash_history", "marker_present");
+	text("tools", "npm_prefix");
+	text("tools", "PATH");
+	const commands = Object.keys(object(at(snapshot, "tools", "commands")));
+	need(commands.includes("opencode"), "tools", "commands", "opencode");
+	for (const name of commands) {
+		for (const field of ["path", "realpath", "version"]) text("tools", "commands", name, field);
+		hash("tools", "commands", name, "sha256");
+	}
+	text("project", "path");
+	text("project", "HEAD");
+	const files = Object.keys(object(at(snapshot, "project", "files")));
+	need(files.length > 0, "project", "files");
+	for (const file of files) hash("project", "files", file);
+	return missing;
+}
+
 /** File survival is decided before process survival; inode changes are evidence of restoration. */
 export function classify(before: Json, after: Json, options: Options = {}): Result {
 	const diffs = differences(before, after);
+	const missing = [...missingEvidence(before, "before"), ...missingEvidence(after, "after")];
 	const changed = (...path: string[]) => at(before, ...path) !== at(after, ...path);
 	let lost = changed("config", "bashrc", "sha256") || changed("config", "settings", "sha256") ||
 		changed("project", "HEAD") ||
 		(at(before, "config", "bash_history", "marker_present") === true &&
 			at(after, "config", "bash_history", "marker_present") !== true);
+	lost ||= !options.providerTransition && changed("identity", "provider") &&
+		at(before, "identity", "provider") !== null && at(after, "identity", "provider") !== null;
+	const beforeLines = at(before, "config", "bash_history", "lines");
+	const afterLines = at(after, "config", "bash_history", "lines");
+	if (typeof beforeLines === "number" && typeof afterLines === "number") {
+		lost ||= afterLines < beforeLines || (afterLines === beforeLines && changed("config", "bash_history", "sha256"));
+	}
 	for (const name of keys(at(before, "tools", "commands"), at(after, "tools", "commands"))) {
 		for (const field of ["path", "realpath", "sha256"]) {
 			lost ||= changed("tools", "commands", name, field);
@@ -89,12 +134,15 @@ export function classify(before: Json, after: Json, options: Options = {}): Resu
 	const sameSentinel = sameProcess(sentinelBefore, sentinelAfter);
 	let classification: Classification;
 	if (lost) classification = "lost";
+	else if (missing.length > 0) classification = "insufficient_evidence";
 	else if (sameBoot && samePidNs && sameProcess(at(before, "processes", "shell"), at(after, "processes", "shell")) &&
 		(!sentinelGiven || sameSentinel)) classification = "same_process";
 	else if (options.providerTransition && samePidNs && sameSentinel) classification = "resumed_checkpoint";
 	else classification = "recreated_shell";
 	const expected = options.expected ?? null;
-	return { classification, expected, pass: expected === null || classification === expected, diffs };
+	return { classification, expected,
+		pass: classification !== "insufficient_evidence" && (expected === null ? classification !== "lost" : classification === expected),
+		diffs, missingEvidence: missing };
 }
 
 export function parseArgs(args: readonly string[]): { beforePath: string; afterPath: string; options: Options } {

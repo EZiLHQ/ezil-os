@@ -4,7 +4,7 @@ import { classify, parseArgs } from "./classify.ts";
 
 function snapshot() {
 	return {
-		identity: { boot_id: "boot-1", pid_namespace: "pid:[4026532001]", hostname: "staging" },
+		identity: { provider: "aws", boot_id: "boot-1", pid_namespace: "pid:[4026532001]", hostname: "staging" },
 		processes: {
 			shell: { pid: 100, starttime: "1000", comm: "bash" },
 			sentinel_requested: true,
@@ -18,21 +18,21 @@ function snapshot() {
 			commands: {
 				opencode: {
 					path: "/usr/local/bin/opencode", realpath: "/usr/local/lib/opencode",
-					sha256: "tool-sha", version: "1.0", stat: { inode: "10", links: "1", size: "100" },
+					sha256: "a".repeat(64), version: "1.0", stat: { inode: "10", links: "1", size: "100" },
 				},
 			},
 		},
 		config: {
-			bashrc: { sha256: "bashrc-sha" }, settings: { sha256: "settings-sha" },
-			bash_history: { sha256: "history-sha", lines: 10, marker_present: true },
+			bashrc: { sha256: "b".repeat(64) }, settings: { sha256: "c".repeat(64) },
+			bash_history: { sha256: "d".repeat(64), lines: 10, marker_present: true },
 		},
-		project: { path: "/workspace/project", HEAD: "commit-1", files: { "package.json": "project-sha" } },
+		project: { path: "/workspace/project", HEAD: "commit-1", files: { "package.json": "e".repeat(64) } },
 	};
 }
 
 describe("lifecycle classification", () => {
 	it("recognizes the same shell and sentinel on the same boot", () => {
-		expect(classify(snapshot(), snapshot())).toEqual({ classification: "same_process", expected: null, pass: true, diffs: [] });
+		expect(classify(snapshot(), snapshot())).toEqual({ classification: "same_process", expected: null, pass: true, diffs: [], missingEvidence: [] });
 	});
 
 	it("accepts the same shell when no sentinel was requested", () => {
@@ -90,14 +90,14 @@ describe("lifecycle classification", () => {
 
 	it("does not infer checkpoint survival from missing sentinels", () => {
 		const before = { ...snapshot(), processes: { shell: snapshot().processes.shell } };
-		const after = { ...before, identity: { boot_id: "boot-2" } };
+		const after = { ...before, identity: { ...snapshot().identity, boot_id: "boot-2" } };
 		expect(classify(before, after, { providerTransition: true }).classification).toBe("recreated_shell");
 	});
 
 	it("does not equate null shell and boot identities with survival", () => {
 		const missing = { identity: { boot_id: null }, processes: { shell: null, sentinel: null } };
-		expect(classify(missing, missing).classification).toBe("recreated_shell");
-		expect(classify({}, {}).classification).toBe("recreated_shell");
+		expect(classify(missing, missing).classification).toBe("insufficient_evidence");
+		expect(classify({}, {}).classification).toBe("insufficient_evidence");
 	});
 
 	it("does not equate two null sentinels when one was requested", () => {
@@ -108,8 +108,39 @@ describe("lifecycle classification", () => {
 	it("detects a missing shell and a missing sentinel independently", () => {
 		for (const field of ["shell", "sentinel"]) {
 			const after = { ...snapshot(), processes: { ...snapshot().processes, [field]: null } };
-			expect(classify(snapshot(), after).classification).toBe("recreated_shell");
+			expect(classify(snapshot(), after).classification).toBe(field === "shell" ? "insufficient_evidence" : "recreated_shell");
 		}
+	});
+
+	it("fails incomplete baselines even if both snapshots are identically incomplete", () => {
+		const incomplete = [
+			{},
+			{ ...snapshot(), identity: { ...snapshot().identity, provider: null } },
+			{ ...snapshot(), config: { ...snapshot().config, settings: { sha256: null } } },
+			{ ...snapshot(), config: { ...snapshot().config, bashrc: { sha256: "not-a-sha256" } } },
+			{ ...snapshot(), config: { ...snapshot().config, bash_history: { marker_present: false } } },
+			{ ...snapshot(), tools: { ...snapshot().tools, commands: {} } },
+			{ ...snapshot(), tools: { ...snapshot().tools, commands: { opencode: { path: null, realpath: null, sha256: null, version: null } } } },
+			{ ...snapshot(), tools: { ...snapshot().tools, commands: { opencode: { ...snapshot().tools.commands.opencode, version: "" } } } },
+			{ ...snapshot(), project: { ...snapshot().project, files: { "package.json": null } } },
+		];
+		for (const missing of incomplete) {
+			const result = classify(missing, structuredClone(missing), { expected: "recreated_shell" });
+			expect(result.classification).toBe("insufficient_evidence");
+			expect(result.pass).toBe(false);
+			expect(result.missingEvidence.length).toBeGreaterThan(0);
+		}
+	});
+
+	it("does not make missing evidence pass by expecting that classification", () => {
+		expect(classify({}, {}, { expected: "insufficient_evidence" }).pass).toBe(false);
+	});
+
+	it("reports data loss as a failed acceptance without an expectation", () => {
+		const after = snapshot();
+		after.tools.commands.opencode.sha256 = "0".repeat(64);
+		expect(classify(snapshot(), after).pass).toBe(false);
+		expect(classify(snapshot(), after, { expected: "lost" }).pass).toBe(true);
 	});
 
 	it("does not use PTY or tmux changes as evidence of shell death", () => {
@@ -193,15 +224,31 @@ describe("lifecycle classification", () => {
 
 	it("permits history growth when the marker remains", () => {
 		const after = snapshot();
-		after.config.bash_history.sha256 = "appended-history";
+		after.config.bash_history.sha256 = "f".repeat(64);
 		after.config.bash_history.lines = 11;
 		expect(classify(snapshot(), after).classification).toBe("same_process");
 	});
 
-	it("treats missing and null optional fields equally", () => {
+	it("rejects history truncation or same-length replacement even if the marker remains", () => {
+		for (const lines of [1, 10]) {
+			const after = snapshot();
+			after.config.bash_history.lines = lines;
+			after.config.bash_history.sha256 = "0".repeat(64);
+			expect(classify(snapshot(), after).classification).toBe("lost");
+		}
+	});
+
+	it("rejects an unexpected provider swap", () => {
+		const after = snapshot();
+		after.identity.provider = "cloudflare";
+		expect(classify(snapshot(), after).classification).toBe("lost");
+		expect(classify(snapshot(), after, { providerTransition: true }).classification).toBe("same_process");
+	});
+
+	it("does not accept missing or null persistence evidence", () => {
 		const minimal = { identity: snapshot().identity, processes: { shell: snapshot().processes.shell } };
 		const withNulls = { ...minimal, project: null, config: { settings: { sha256: null } }, tools: { commands: { missing: null } } };
-		expect(classify(minimal, withNulls)).toEqual({ classification: "same_process", expected: null, pass: true, diffs: [] });
+		expect(classify(minimal, withNulls)).toMatchObject({ classification: "insufficient_evidence", expected: null, pass: false, diffs: [] });
 	});
 
 	it("gives file loss precedence over checkpoint and process survival", () => {
@@ -238,12 +285,12 @@ describe("CLI", () => {
 
 	it("prints JSON and exits according to --expect using read-only JSON fixtures", () => {
 		const fixture = `${import.meta.dir}/../package.json`;
-		for (const [flags, exitCode, pass] of [[[], 0, true], [["--expect", "recreated_shell"], 0, true], [["--expect", "same_process"], 1, false]] as const) {
+		for (const [flags, exitCode, pass] of [[[], 1, false], [["--expect", "recreated_shell"], 1, false], [["--expect", "same_process"], 1, false]] as const) {
 			const child = Bun.spawnSync([process.execPath, `${import.meta.dir}/classify.ts`, fixture, fixture, ...flags]);
 			expect(child.exitCode).toBe(exitCode);
 			expect(child.stderr.toString()).toBe("");
-			expect(JSON.parse(child.stdout.toString())).toEqual({
-				classification: "recreated_shell", expected: flags[1] ?? null, pass, diffs: [],
+			expect(JSON.parse(child.stdout.toString())).toMatchObject({
+				classification: "insufficient_evidence", expected: flags[1] ?? null, pass, diffs: [],
 			});
 		}
 	});
@@ -266,6 +313,7 @@ describe("read-only probe", () => {
 		const data = probe();
 		expect(data.identity.boot_id).toBeNull();
 		expect(data.identity.uid).toBeNull();
+		expect(data.identity.provider).toBeNull();
 		expect(data.tools.npm_prefix).toBeNull();
 		expect(data.tools.commands["missing-lifecycle-tool"]).toEqual({
 			path: null, realpath: null, version: null, sha256: null, stat: null,
@@ -273,6 +321,13 @@ describe("read-only probe", () => {
 		expect(data.config.bashrc.sha256).toBeNull();
 		expect(data.project).toBeNull();
 		expect(Object.values(data.mounts)).toEqual([null, null, null, null]);
+	});
+
+	it("only records an explicit valid provider observation, never Cloudflare transport metadata", () => {
+		for (const provider of ["aws", "cloudflare"]) {
+			expect(probe({ EZIL_LC_PROVIDER: provider, CLOUDFLARE_DEPLOYMENT_ID: "transport-only" }).identity.provider).toBe(provider);
+		}
+		expect(probe({ EZIL_LC_PROVIDER: "unknown", CLOUDFLARE_DEPLOYMENT_ID: "transport-only" }).identity.provider).toBeNull();
 	});
 
 	it("escapes quotes, backslashes, controls and Unicode without Python", () => {
