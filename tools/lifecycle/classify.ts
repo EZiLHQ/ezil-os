@@ -70,6 +70,9 @@ export function classify(before: Json, after: Json, options: Options = {}): Resu
 		for (const field of ["path", "realpath", "sha256"]) {
 			lost ||= changed("tools", "commands", name, field);
 		}
+		// A tool that answered --version before and no longer answers is lost, even with the same
+		// bytes (a runtime dependency or its environment went away). A changed version string is not.
+		lost ||= at(before, "tools", "commands", name, "version") !== null && at(after, "tools", "commands", name, "version") === null;
 	}
 	for (const name of keys(at(before, "project", "files"), at(after, "project", "files"))) {
 		lost ||= changed("project", "files", name);
@@ -88,7 +91,7 @@ export function classify(before: Json, after: Json, options: Options = {}): Resu
 	if (lost) classification = "lost";
 	else if (sameBoot && samePidNs && sameProcess(at(before, "processes", "shell"), at(after, "processes", "shell")) &&
 		(!sentinelGiven || sameSentinel)) classification = "same_process";
-	else if (options.providerTransition && sameSentinel) classification = "resumed_checkpoint";
+	else if (options.providerTransition && samePidNs && sameSentinel) classification = "resumed_checkpoint";
 	else classification = "recreated_shell";
 	const expected = options.expected ?? null;
 	return { classification, expected, pass: expected === null || classification === expected, diffs };

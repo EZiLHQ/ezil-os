@@ -180,7 +180,8 @@ else
 fi
 printf ',"marker_present":'
 if [[ ${EZIL_LC_MARKER+x} && -r ${HOME:-}/.bash_history ]] && command -v grep >/dev/null 2>&1; then
-    grep -Fq -- "$EZIL_LC_MARKER" "${HOME:-}/.bash_history" 2>/dev/null
+    # Whole line only: an `export EZIL_LC_MARKER=…` line saved later must not count as the marker.
+    grep -Fxq -- "$EZIL_LC_MARKER" "${HOME:-}/.bash_history" 2>/dev/null
     rc=$?
     case $rc in 0) printf 'true';; 1) printf 'false';; *) printf 'null';; esac
 else
