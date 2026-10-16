@@ -81,6 +81,7 @@ c=config.DEFAULTS['userDataCopies']
 assert '/var/lib/cloud/instances/*/obj.pkl' in c and '/run/cloud-init/instance-data-sensitive.json' in c and '/var/lib/cloud/instances/*/user-data.txt.i' in c"
 pyunit() { (cd "$HA/test" && python3 -m unittest -q "$@"); }
 check "canary: default off, public console schema, persistence and lifecycle ordering" pyunit test_canary
+check "tools: npm -g prefix, PATH and HOME live on the retained overlay; a rebase keeps user npm packages" pyunit test_tool_persistence
 check "enroll: the app's browser-host binding (sandboxId, zone) lands in the lease; a malformed one stores nothing" pyunit test_enroll_routing
 check "enroll: the nonce is re-sent only after an answer that consumed nothing; bounded; kept when retrying ends" pyunit test_boot_retries.EnrollRetry
 check "enroll: a 200 retires the nonce only after its credentials are durable; malformed/write error/crash keep it and the replay converges" pyunit test_enroll_durability

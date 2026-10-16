@@ -25,9 +25,10 @@
  */
 
 import { precheckAdmission } from './admission';
-import { awsCanaryConfig, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
+import { isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
+import { explainAwsCanary, explainAwsCanaryCohort } from './placement-explain';
 import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 
@@ -89,10 +90,14 @@ export async function resolveComputeProvider(
     const deps = isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined;
     if (!placement.record) {
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
-        if (await isAwsCanary(db, computer, env)) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+        const canary = await awsCanaryDecision(db, computer, env);
+        if (canary.aws) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
         if (options.pinCloudflare && isPlacementDb(db)) {
             placement = await pinCloudflare(db, computer);
             assertPlacementOwner(placement, computer);
+            // The one moment a computer's provider becomes permanent: say why the canary did
+            // not claim it. No user id; the computer id is what an operator looks up.
+            console.info('[compute.placement] pinned', { computerId: computer.computerId.toLowerCase(), provider: placement.provider, canary: canary.reason });
         }
     }
     return providerForPlacement(placement, env, deps);
@@ -128,16 +133,18 @@ async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<Re
  * `EZIL_AWS_CANARY_USER_IDS`, and its live row is the caller's and was created at or
  * after `EZIL_AWS_CANARY_SINCE` (aws-config.ts `awsCanaryConfig`). The computer row is
  * read only once the cheap checks pass, so other users cost no query. A failed read throws.
+ * `reason` names the first failed condition (placement-explain.ts), or the admission refusal.
  */
-async function isAwsCanary(db: PlacementExecutor, computer: ComputerRef, env: Env): Promise<boolean> {
-    if (!isAwsComputersEnabled(env)) return false;
-    const canary = awsCanaryConfig(env);
+async function awsCanaryDecision(db: PlacementExecutor, computer: ComputerRef, env: Env): Promise<{ aws: boolean; reason: string }> {
     const userId = computer.userId.toLowerCase();
-    if (!canary || !inAwsCanary(canary, userId)) return false;
+    const cohort = explainAwsCanaryCohort({ env, userId });
+    if (cohort) return { aws: false, reason: cohort.reason };
     const row = await readCanaryComputer(db, computer.computerId);
-    if (row === null || row.deleted || row.userId !== userId || row.createdAt.getTime() < canary.since.getTime()) return false;
+    const explained = explainAwsCanary({ env, userId, computer: row });
+    if (!explained.eligible) return { aws: false, reason: explained.reason };
     // Graceful fallback: AWS only when admission would admit it now (capacity, one AWS
     // computer per user, monthly caps, kill switch). Otherwise it stays Cloudflare and is
     // pinned there on its first sandbox start, so no one gets a computer that cannot start.
-    return (await precheckAdmission(db, { userId, computerId: computer.computerId, env })).admit;
+    const admission = await precheckAdmission(db, { userId, computerId: computer.computerId, env });
+    return admission.admit ? { aws: true, reason: 'admitted' } : { aws: false, reason: `admission_refused:${admission.reason}` };
 }
