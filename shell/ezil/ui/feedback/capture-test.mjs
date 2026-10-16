@@ -291,14 +291,19 @@ await test('tier C resolves null when bridge never responds (controlled 4000ms t
 
 await test('shell snapshot filters every iframe/private subtree and feedback UI, then paints opaque placeholders', async () => {
     const root = document.getElementById('ezil-os-root');
+    // Puter appends windows to <body>, outside #ezil-os-root: the snapshot must
+    // cover them (a body-level window's stream iframe is masked too).
+    const win = document.createElement('div'); win.className = 'window';
+    win.innerHTML = '<iframe class="window-app-iframe"></iframe>';
+    document.body.appendChild(win);
     root.innerHTML = '<iframe></iframe><iframe></iframe><input><textarea></textarea>'
         + '<div contenteditable>private text</div><div data-ezil-private><span>secret</span></div>'
         + '<dialog open>feedback</dialog><button id="ezil-feedback-chip">Feedback</button>';
-    const elements = Array.from(root.children);
+    const elements = [...Array.from(root.children), win.firstElementChild];
     elements.forEach((el, i) => { el.getBoundingClientRect = () => ({ left: 10, top: 20 + 40 * i,
         right: 210, bottom: 50 + 40 * i, width: 200, height: 30 }); });
     snapshotDom = async (element, options) => {
-        assert.equal(element, root); assert.equal(options.dpr, 1); assert.equal(options.clip, 'viewport');
+        assert.equal(element, document.body); assert.equal(options.dpr, 1); assert.equal(options.clip, 'viewport');
         for (const el of elements) {
             if (el.matches('dialog, #ezil-feedback-chip')) assert.ok(options.exclude.some(selector => el.matches(selector)));
             assert.equal(options.filter(el), false);
@@ -308,9 +313,10 @@ await test('shell snapshot filters every iframe/private subtree and feedback UI,
     };
     const result = await capture_shell_snapshot();
     const calls = result.getContext('2d').calls;
-    assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#808080').length, 2);
+    assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#808080').length, 3);
     assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#000000').length, 4);
-    assert.equal(calls.filter(c => c.op === 'fillText' && c.args[0] === 'Desktop stream not captured').length, 2);
+    assert.equal(calls.filter(c => c.op === 'fillText' && c.args[0] === 'Desktop stream not captured').length, 3);
+    win.remove();
     assert.equal(root.querySelector('[contenteditable]').textContent, 'private text');
     snapshotDom = async () => { throw new Error('snapshot unavailable'); };
     assert.equal(await capture_shell_snapshot(), null);

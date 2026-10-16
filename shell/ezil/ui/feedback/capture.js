@@ -19,7 +19,11 @@ const FEEDBACK_UI = 'dialog, #ezil-feedback-chip, .ezil-feedback-chip, '
 /** Tier A: exclude private subtrees before snapdom can read or clone them. */
 export async function capture_shell_snapshot () {
     try {
-        const root = document.getElementById('ezil-os-root') || document.body;
+        // 🔴 The whole body, not #ezil-os-root: Puter appends every window and
+        // the taskbar directly to <body> (UIWindow / UITaskbar), so the root
+        // holds only the wallpaper and a root snapshot showed no windows at
+        // all. Feedback UI is excluded and frames/private fields masked below.
+        const root = document.body;
         if (!root) return null;
         const view = document.defaultView;
         const width = document.documentElement.clientWidth || view.innerWidth;
