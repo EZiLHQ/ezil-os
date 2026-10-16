@@ -216,7 +216,12 @@ export function awsBrowserUrl(port: number, sandboxId: string, zoneRoot: string,
 
 /** AWS capabilities never share a signed payload with Cloudflare preview auth. */
 type AwsBrowserCapabilityKind = 'bootstrap' | 'cookie';
+type AwsBrowserCapabilityClaims = Pick<AwsTunnelRecord, 'computerId' | 'generation' | 'leaseEpoch'> & { ts: number };
 const AWS_CAPABILITY_PREFIX = { bootstrap: 'ab1', cookie: 'ac1' } as const;
+const AWS_CAPABILITY_FORMAT = {
+  bootstrap: /^ab1\.([1-9][0-9]{0,15})\.([a-f0-9-]{36})\.([1-9][0-9]{0,15})\.([1-9][0-9]{0,15})\.([0-9a-f]{64})$/,
+  cookie: /^ac1\.([1-9][0-9]{0,15})\.([a-f0-9-]{36})\.([1-9][0-9]{0,15})\.([1-9][0-9]{0,15})\.([0-9a-f]{64})$/,
+} as const;
 const AWS_CAPABILITY_MAX_AGE_MS = {
   bootstrap: PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
   cookie: PREVIEW_COOKIE_TTL_S * 1000,
@@ -229,39 +234,57 @@ function validAwsBrowserBinding(record: AwsTunnelRecord, port: number, sandboxId
     && AWS_EDGE_PORTS.includes(port);
 }
 
-function awsCapabilityPayload(kind: AwsBrowserCapabilityKind, ts: number, record: AwsTunnelRecord, port: number): string {
-  if (!Number.isSafeInteger(ts) || ts <= 0 || !validAwsBrowserBinding(record, port, record.sandboxId)) {
+function awsCapabilityPayload(
+  kind: AwsBrowserCapabilityKind, claims: AwsBrowserCapabilityClaims, sandboxId: string, port: number,
+): string {
+  if (!Number.isSafeInteger(claims.ts) || claims.ts <= 0 || !isRoutableSandboxId(sandboxId)
+    || !isComputerId(claims.computerId) || !isEpoch(claims.generation) || !isEpoch(claims.leaseEpoch)
+    || !AWS_EDGE_PORTS.includes(port)) {
     throw new Error('aws_preview_invalid_binding');
   }
-  return ['ezil-aws-browser', kind, 'v1', ts, record.sandboxId, record.computerId,
-    record.generation, record.leaseEpoch, port].join('|');
+  return ['ezil-aws-browser', kind, 'v1', claims.ts, sandboxId, claims.computerId,
+    claims.generation, claims.leaseEpoch, port].join('|');
+}
+
+function awsCapabilityFresh(kind: AwsBrowserCapabilityKind, ts: number, nowMs: number): boolean {
+  return Number.isSafeInteger(nowMs) && Number.isSafeInteger(ts)
+    && ts <= nowMs + AWS_CAPABILITY_FUTURE_SKEW_MS && ts >= nowMs - AWS_CAPABILITY_MAX_AGE_MS[kind];
+}
+
+function awsCapabilityMatchesRecord(claims: AwsBrowserCapabilityClaims, record: AwsTunnelRecord, port: number, sandboxId: string): boolean {
+  return validAwsBrowserBinding(record, port, sandboxId)
+    && record.computerId === claims.computerId
+    && record.generation === claims.generation
+    && record.leaseEpoch === claims.leaseEpoch;
 }
 
 async function mintAwsCapability(
   kind: AwsBrowserCapabilityKind, secret: string, record: AwsTunnelRecord, port: number, nowMs: number,
 ): Promise<string> {
   if (!secret.trim()) throw new Error('hmac_secret_not_configured');
-  const mac = await hmacSha256Hex(secret, awsCapabilityPayload(kind, nowMs, record, port));
-  return `${AWS_CAPABILITY_PREFIX[kind]}.${nowMs}.${mac}`;
+  if (!validAwsBrowserBinding(record, port, record.sandboxId)) throw new Error('aws_preview_invalid_binding');
+  const claims = { ts: nowMs, computerId: record.computerId, generation: record.generation, leaseEpoch: record.leaseEpoch };
+  const mac = await hmacSha256Hex(secret, awsCapabilityPayload(kind, claims, record.sandboxId, port));
+  return `${AWS_CAPABILITY_PREFIX[kind]}.${nowMs}.${record.computerId}.${record.generation}.${record.leaseEpoch}.${mac}`;
 }
 
 async function verifyAwsCapability(
   kind: AwsBrowserCapabilityKind, value: string | undefined, secrets: string[],
-  record: AwsTunnelRecord, port: number, nowMs: number,
-): Promise<boolean> {
+  sandboxId: string, port: number, nowMs: number,
+): Promise<AwsBrowserCapabilityClaims | null> {
   const candidates = secrets.filter((secret) => secret && secret.trim());
-  if (!value || candidates.length === 0 || !validAwsBrowserBinding(record, port, record.sandboxId)) return false;
-  const match = new RegExp(`^${AWS_CAPABILITY_PREFIX[kind]}\\.([1-9][0-9]{0,15})\\.([0-9a-f]{64})$`).exec(value);
-  if (!match) return false;
-  const ts = Number(match[1]);
-  if (!Number.isSafeInteger(nowMs) || !Number.isSafeInteger(ts)
-    || ts > nowMs + AWS_CAPABILITY_FUTURE_SKEW_MS || ts < nowMs - AWS_CAPABILITY_MAX_AGE_MS[kind]) return false;
-  const payload = awsCapabilityPayload(kind, ts, record, port);
+  if (!value || candidates.length === 0) return null;
+  const match = AWS_CAPABILITY_FORMAT[kind].exec(value);
+  if (!match) return null;
+  const claims = { ts: Number(match[1]), computerId: match[2]!, generation: Number(match[3]), leaseEpoch: Number(match[4]) };
+  if (!awsCapabilityFresh(kind, claims.ts, nowMs)) return null;
+  let payload: string;
+  try { payload = awsCapabilityPayload(kind, claims, sandboxId, port); } catch { return null; }
   let matched = false;
   for (const candidate of candidates) {
-    if (timingSafeEqualHex(await hmacSha256Hex(candidate, payload), match[2]!)) matched = true;
+    if (timingSafeEqualHex(await hmacSha256Hex(candidate, payload), match[5]!)) matched = true;
   }
-  return matched;
+  return matched ? claims : null;
 }
 
 /** Five-minute bootstrap capability for exactly one AWS browser host and tunnel epoch. */
@@ -270,9 +293,9 @@ export async function mintAwsBootstrapToken(secret: string, record: AwsTunnelRec
 }
 
 export async function verifyAwsBootstrapToken(
-  token: string | undefined, secrets: string[], record: AwsTunnelRecord, port: number, nowMs = Date.now(),
-): Promise<boolean> {
-  return verifyAwsCapability('bootstrap', token, secrets, record, port, nowMs);
+  token: string | undefined, secrets: string[], sandboxId: string, port: number, nowMs = Date.now(),
+): Promise<AwsBrowserCapabilityClaims | null> {
+  return verifyAwsCapability('bootstrap', token, secrets, sandboxId, port, nowMs);
 }
 
 /** One-hour host-only cookie value; the cookie name and browser attributes stay unchanged. */
@@ -281,9 +304,9 @@ export async function mintAwsPreviewCookie(secret: string, record: AwsTunnelReco
 }
 
 export async function verifyAwsPreviewCookie(
-  cookie: string | undefined, secrets: string[], record: AwsTunnelRecord, port: number, nowMs = Date.now(),
-): Promise<boolean> {
-  return verifyAwsCapability('cookie', cookie, secrets, record, port, nowMs);
+  cookie: string | undefined, secrets: string[], sandboxId: string, port: number, nowMs = Date.now(),
+): Promise<AwsBrowserCapabilityClaims | null> {
+  return verifyAwsCapability('cookie', cookie, secrets, sandboxId, port, nowMs);
 }
 
 function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -378,17 +401,30 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   const secrets = deps.secrets.filter((s) => s && s.trim());
   if (secrets.length === 0) return json({ ok: false, error: 'hmac_secret_not_configured' }, 401);
   const { port, sandboxId } = route;
+  const bootstrap = request.method === 'GET' && url.pathname === '/preview-bootstrap';
+  const nowBeforeLookup = deps.nowMs();
+  const token = bootstrap ? url.searchParams.get('token') ?? undefined : undefined;
+  const capability = bootstrap
+    ? await verifyAwsBootstrapToken(token, secrets, sandboxId, port, nowBeforeLookup)
+    : await verifyAwsPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId, port, nowBeforeLookup);
+  if (!capability) {
+    return bootstrap
+      ? json({ ok: false, error: token ? 'preview_bootstrap_token_invalid' : 'preview_bootstrap_token_missing' }, 401)
+      : json({ ok: false, error: 'aws_preview_auth_required' }, 401);
+  }
+
   const record = await deps.lookup(sandboxId);
   // A lookup may refresh originVerifiedAt. Read the clock afterwards so that
   // a just-verified record is never mistaken for a future snapshot.
   const now = deps.nowMs();
-  if (!record || !validAwsBrowserBinding(record, port, sandboxId) || !isAwsOriginFresh(record, now)) return unavailable();
+  if (!awsCapabilityFresh(bootstrap ? 'bootstrap' : 'cookie', capability.ts, now)) {
+    return bootstrap
+      ? json({ ok: false, error: 'preview_bootstrap_token_invalid' }, 401)
+      : json({ ok: false, error: 'aws_preview_auth_required' }, 401);
+  }
+  if (!record || !awsCapabilityMatchesRecord(capability, record, port, sandboxId) || !isAwsOriginFresh(record, now)) return unavailable();
 
-  if (request.method === 'GET' && url.pathname === '/preview-bootstrap') {
-    const token = url.searchParams.get('token') ?? undefined;
-    if (!await verifyAwsBootstrapToken(token, secrets, record, port, now)) {
-      return json({ ok: false, error: token ? 'preview_bootstrap_token_invalid' : 'preview_bootstrap_token_missing' }, 401);
-    }
+  if (bootstrap) {
     // Same-origin only: a `//host` or absolute `path` must not become an open redirect.
     const raw = url.searchParams.get('path') || '/';
     const dest = new URL(raw.startsWith('/') && !raw.startsWith('//') ? raw : '/', url);
@@ -398,8 +434,6 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; ') } });
   }
 
-  const cookieOk = await verifyAwsPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, record, port, now);
-  if (!cookieOk) return json({ ok: false, error: 'aws_preview_auth_required' }, 401);
   if (!deps.zone) return unavailable();
   if (port === AWS_DESKTOP_PORT && request.method === 'GET') {
     // Reuse CF's usr/pwd/embed auto-connect, but keep the real password

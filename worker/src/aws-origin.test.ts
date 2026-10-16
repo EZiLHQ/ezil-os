@@ -189,55 +189,55 @@ describe('AWS browser capabilities', () => {
   it('bootstrap binds the port, full computer identity and current tunnel epoch', async () => {
     const current = record();
     const token = await mintAwsBootstrapToken(SECRET, current, 8181, now);
-    expect(await verifyAwsBootstrapToken(token, [SECRET], current, 8181, now)).toBe(true);
-    expect(await verifyAwsBootstrapToken(token, ['old-secret', SECRET], current, 8181, now)).toBe(true);
-    for (const [changed, port] of [
-      [current, 8443],
-      [record({ computerId: otherComputer }), 8181],
-      [record({ generation: 2 }), 8181],
-      [record({ leaseEpoch: 3 }), 8181],
-      [record({ sandboxId: 'guac-aaaa-bbbb' }), 8181],
-    ] as const) {
-      expect(await verifyAwsBootstrapToken(token, [SECRET], changed, port, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken(token, [SECRET], SID, 8181, now)).toEqual({
+      ts: now, computerId: CID, generation: 1, leaseEpoch: 2,
+    });
+    expect(await verifyAwsBootstrapToken(token, ['old-secret', SECRET], SID, 8181, now)).not.toBeNull();
+    expect(await verifyAwsBootstrapToken(token, [SECRET], SID, 8443, now)).toBeNull();
+    expect(await verifyAwsBootstrapToken(token, [SECRET], 'guac-aaaa-bbbb', 8181, now)).toBeNull();
+    for (const [field, value] of [[2, otherComputer], [3, '2'], [4, '3']] as const) {
+      const tampered = token.split('.');
+      tampered[field] = value;
+      expect(await verifyAwsBootstrapToken(tampered.join('.'), [SECRET], SID, 8181, now)).toBeNull();
     }
-    expect(await verifyAwsBootstrapToken(token, ['other-secret'], current, 8181, now)).toBe(false);
-    expect(await verifyAwsBootstrapToken(undefined, [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsBootstrapToken('ab1.not-a-timestamp.bad', [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsBootstrapToken(token.slice(0, -1) + (token.endsWith('0') ? '1' : '0'), [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsBootstrapToken(await mintPreviewBootstrapToken(SECRET, SID, now), [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsPreviewCookie(token, [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsBootstrapToken(token, ['other-secret'], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsBootstrapToken(undefined, [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsBootstrapToken('ab1.not-a-timestamp.bad', [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsBootstrapToken(token.slice(0, -1) + (token.endsWith('0') ? '1' : '0'), [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsBootstrapToken(await mintPreviewBootstrapToken(SECRET, SID, now), [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsPreviewCookie(token, [SECRET], SID, 8181, now)).toBeNull();
   });
 
   it('cookie binds the same identity and port, and rejects legacy and tampered values', async () => {
     const current = record();
     const cookie = await mintAwsPreviewCookie(SECRET, current, 8181, now);
-    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now)).toBe(true);
-    for (const [changed, port] of [
-      [current, 3002],
-      [record({ computerId: otherComputer }), 8181],
-      [record({ generation: 2 }), 8181],
-      [record({ leaseEpoch: 3 }), 8181],
-    ] as const) {
-      expect(await verifyAwsPreviewCookie(cookie, [SECRET], changed, port, now)).toBe(false);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], SID, 8181, now)).toEqual({
+      ts: now, computerId: CID, generation: 1, leaseEpoch: 2,
+    });
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], SID, 3002, now)).toBeNull();
+    for (const [field, value] of [[2, otherComputer], [3, '2'], [4, '3']] as const) {
+      const tampered = cookie.split('.');
+      tampered[field] = value;
+      expect(await verifyAwsPreviewCookie(tampered.join('.'), [SECRET], SID, 8181, now)).toBeNull();
     }
-    expect(await verifyAwsPreviewCookie(cookie.replace('.' + now + '.', '.' + (now + 1) + '.'), [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsPreviewCookie('ac1.not-a-timestamp.bad', [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsPreviewCookie(await mintPreviewCookie(SECRET, SID, now), [SECRET], current, 8181, now)).toBe(false);
-    expect(await verifyAwsBootstrapToken(cookie, [SECRET], current, 8181, now)).toBe(false);
+    expect(await verifyAwsPreviewCookie(cookie.replace('.' + now + '.', '.' + (now + 1) + '.'), [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsPreviewCookie('ac1.not-a-timestamp.bad', [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsPreviewCookie(await mintPreviewCookie(SECRET, SID, now), [SECRET], SID, 8181, now)).toBeNull();
+    expect(await verifyAwsBootstrapToken(cookie, [SECRET], SID, 8181, now)).toBeNull();
   });
 
   it('enforces exact age and future-skew bounds for both capability kinds', async () => {
     const current = record();
     const bootstrap = await mintAwsBootstrapToken(SECRET, current, 8181, now);
-    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now + 300_000)).toBe(true);
-    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now + 300_001)).toBe(false);
-    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now - 10_000)).toBe(true);
-    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], current, 8181, now - 10_001)).toBe(false);
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], SID, 8181, now + 300_000)).not.toBeNull();
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], SID, 8181, now + 300_001)).toBeNull();
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], SID, 8181, now - 10_000)).not.toBeNull();
+    expect(await verifyAwsBootstrapToken(bootstrap, [SECRET], SID, 8181, now - 10_001)).toBeNull();
     const cookie = await mintAwsPreviewCookie(SECRET, current, 8181, now);
-    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now + 3_600_000)).toBe(true);
-    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now + 3_600_001)).toBe(false);
-    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now - 10_000)).toBe(true);
-    expect(await verifyAwsPreviewCookie(cookie, [SECRET], current, 8181, now - 10_001)).toBe(false);
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], SID, 8181, now + 3_600_000)).not.toBeNull();
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], SID, 8181, now + 3_600_001)).toBeNull();
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], SID, 8181, now - 10_000)).not.toBeNull();
+    expect(await verifyAwsPreviewCookie(cookie, [SECRET], SID, 8181, now - 10_001)).toBeNull();
   });
 
   it('malformed or missing current record fields cannot mint a capability', async () => {
@@ -272,6 +272,38 @@ describe('handleAwsBrowserHost', () => {
     expect((await call('/preview-bootstrap?token=abc', d))!.status).toBe(401);
     expect(f.calls.length).toBe(0);
   });
+  it('rejects missing, bad-MAC, wrong-port, expired and legacy capabilities before lookup', async () => {
+    const now = 1_791_964_800_000;
+    const current = record({ originVerifiedAt: now });
+    const bootstrap = await mintAwsBootstrapToken(SECRET, current, 8181, now);
+    const cookie = await mintAwsPreviewCookie(SECRET, current, 8181, now);
+    let lookups = 0;
+    const { f, d } = deps({
+      nowMs: () => now,
+      lookup: async () => { lookups++; return current; },
+    });
+    for (const token of [
+      undefined, 'malformed', bootstrap.slice(0, -1) + (bootstrap.endsWith('0') ? '1' : '0'),
+      await mintAwsBootstrapToken(SECRET, current, 8443, now),
+      await mintAwsBootstrapToken(SECRET, current, 8181, now - 300_001),
+      await mintPreviewBootstrapToken(SECRET, SID, now),
+    ]) {
+      const path = token === undefined ? '/preview-bootstrap' : `/preview-bootstrap?token=${encodeURIComponent(token)}`;
+      expect((await call(path, d))!.status).toBe(401);
+    }
+    for (const value of [
+      undefined, 'malformed', cookie.slice(0, -1) + (cookie.endsWith('0') ? '1' : '0'),
+      await mintAwsPreviewCookie(SECRET, current, 8443, now),
+      await mintAwsPreviewCookie(SECRET, current, 8181, now - 3_600_001),
+      await mintPreviewCookie(SECRET, SID, now),
+    ]) {
+      const headers = value === undefined ? {} : { cookie: `ezil_preview=${value}` };
+      expect((await call('/desk', d, { headers }))!.status).toBe(401);
+      expect((await call('/ws', d, { headers: { ...headers, upgrade: 'websocket' } }))!.status).toBe(401);
+    }
+    expect(lookups).toBe(0);
+    expect(f.calls.length).toBe(0);
+  });
   it('bootstrap: a valid port-bound token sets a port-bound cookie and redirects same-origin only', async () => {
     const { f, d } = deps();
     const token = await mintAwsBootstrapToken(SECRET, record(), 8181);
@@ -297,22 +329,47 @@ describe('handleAwsBrowserHost', () => {
     });
     expect((await call(`/preview-bootstrap?token=${encodeURIComponent(token)}`, d))!.status).toBe(302);
   });
+  it('does not mint or forward if a valid capability expires during lookup', async () => {
+    const issuedAt = 1_791_964_800_000;
+    const current = record({ originVerifiedAt: issuedAt });
+    const token = await mintAwsBootstrapToken(SECRET, current, 8181, issuedAt);
+    const cookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, current, 8181, issuedAt)}`;
+    for (const [elapsed, path, headers] of [
+      [300_001, `/preview-bootstrap?token=${encodeURIComponent(token)}`, {}],
+      [3_600_001, '/desk', { cookie }],
+    ] as const) {
+      let now = issuedAt;
+      let lookups = 0;
+      const { f, d } = deps({
+        lookup: async () => { lookups++; now += elapsed; return record({ originVerifiedAt: now }); },
+        nowMs: () => now,
+      });
+      const res = (await call(path, d, { headers }))!;
+      expect(res.status).toBe(401);
+      expect(res.headers.get('set-cookie')).toBeNull();
+      expect(lookups).toBe(1);
+      expect(f.calls.length).toBe(0);
+    }
+  });
   it('a replaced epoch or full computer cannot refresh an old bootstrap into a new cookie', async () => {
     const oldToken = await mintAwsBootstrapToken(SECRET, record(), 8181);
     const oldCookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record(), 8181)}`;
     const legacyToken = await mintPreviewBootstrapToken(SECRET, SID);
     const legacyCookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
     for (const replacement of [record({ leaseEpoch: 3 }), record({ computerId: '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0c' })]) {
-      const { f, d } = deps({ lookup: async () => replacement });
-      for (const token of [oldToken, legacyToken]) {
-        const res = (await call(`/preview-bootstrap?token=${encodeURIComponent(token)}`, d))!;
-        expect(res.status).toBe(401);
-        expect(res.headers.get('set-cookie')).toBeNull();
-      }
-      for (const cookie of [oldCookie, legacyCookie]) {
-        expect((await call('/desk', d, { headers: { cookie } }))!.status).toBe(401);
-        expect((await call('/ws', d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(401);
-      }
+      let lookups = 0;
+      const { f, d } = deps({ lookup: async () => { lookups++; return replacement; } });
+      const oldBootstrap = (await call(`/preview-bootstrap?token=${encodeURIComponent(oldToken)}`, d))!;
+      expect(oldBootstrap.status).toBe(502);
+      expect(oldBootstrap.headers.get('set-cookie')).toBeNull();
+      expect(lookups).toBe(1);
+      expect((await call(`/preview-bootstrap?token=${encodeURIComponent(legacyToken)}`, d))!.status).toBe(401);
+      expect(lookups).toBe(1);
+      expect((await call('/desk', d, { headers: { cookie: oldCookie } }))!.status).toBe(502);
+      expect((await call('/ws', d, { headers: { cookie: oldCookie, upgrade: 'websocket' } }))!.status).toBe(502);
+      expect(lookups).toBe(3);
+      expect((await call('/desk', d, { headers: { cookie: legacyCookie } }))!.status).toBe(401);
+      expect(lookups).toBe(3);
       expect(f.calls.length).toBe(0);
     }
   });
@@ -365,7 +422,7 @@ describe('handleAwsBrowserHost', () => {
     expect(new URL(f.calls[f.calls.length - 1]!.url).hostname).toBe(`c-${SID}-g1-e2.${ZONE}`);
     epoch = 3;
     const forwarded = f.calls.length;
-    expect((await call(ws, d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(401);
+    expect((await call(ws, d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(502);
     expect(f.calls.length).toBe(forwarded);
     cookie = `ezil_preview=${await mintAwsPreviewCookie(SECRET, record({ leaseEpoch: 3 }), 8181)}`;
     expect((await call(ws, d, { headers: { cookie, upgrade: 'websocket' } }))!.status).toBe(200);
