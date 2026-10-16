@@ -7,7 +7,7 @@ Remote main observed during the publication audit: `74f5a88cf795858b934f4f0f9ffc
 
 ## Behavior
 
-AWS bootstrap tokens and browser cookies use separate signed purposes and bind to the requested port, sandbox identifier, full computer UUID, generation and lease epoch. A truncated DNS sandbox identifier alone cannot authorize another computer. The handler verifies signature and lifetime before any tunnel lookup, then checks the authenticated binding against the current tunnel record and rechecks expiration after lookup. Rejected credentials cannot invoke origin verification or forward a request.
+AWS bootstrap tokens and browser cookies use separate signed purposes and bind to the requested port, sandbox identifier, full computer UUID, generation and lease epoch. A truncated DNS sandbox identifier alone cannot authorize another computer. The handler verifies signature and lifetime before any tunnel lookup, then checks the authenticated binding against the current tunnel record and rechecks expiration after lookup. Credentials that fail signature, port, format or lifetime checks cannot invoke origin verification or forward a request. A still-valid signed capability for a replaced record is rejected after lookup and cannot mint a cookie or forward.
 
 Each returned AWS URL has a separate five-minute bootstrap capability. The response advertises that actual lifetime; a successfully issued browser cookie lasts one hour. Old AWS bootstrap links and cookies require fresh preview URLs. Cloudflare authentication helpers, stored computer data and provider placement are unchanged by this security repair.
 
