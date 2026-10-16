@@ -18,7 +18,8 @@ export function register_capture_target (iframe, origin) {
 }
 
 /** @returns {Promise<Blob|null>} */
-export async function request_frame_capture ({ timeoutMs = 4000 } = {}) {
+export async function request_frame_capture ({ timeoutMs = 4000, signal } = {}) {
+    if (signal?.aborted) return null;
     // Replacing a request settles its promise too, so rapid clicks never leave
     // listeners or images waiting behind a newer preview
     // (docs/FEEDBACK-CONTROLS-CONTRACT.md:82).
@@ -39,10 +40,12 @@ export async function request_frame_capture ({ timeoutMs = 4000 } = {}) {
                 if (settled) return;
                 settled = true;
                 window.removeEventListener('message', on_message);
+                signal?.removeEventListener('abort', abort);
                 clearTimeout(timer);
                 if (pending_capture === settle) pending_capture = null;
                 resolve(blob);
             }
+            const abort = () => settle(null);
             function on_message (ev) {
                 const d = ev.data;
                 // Unrelated traffic must not cancel a legitimate in-flight
@@ -54,6 +57,7 @@ export async function request_frame_capture ({ timeoutMs = 4000 } = {}) {
             }
             pending_capture = settle;
             window.addEventListener('message', on_message);
+            signal?.addEventListener('abort', abort, { once: true });
             timer = setTimeout(() => settle(null), Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 4000);
             try {
                 source.postMessage({ source: 'ezil-shell', type: 'frame_capture_request', nonce }, origin);

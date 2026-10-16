@@ -145,3 +145,23 @@ test('missing targets, wildcard origins and postMessage failures return null wit
     assert.equal(await h.request_frame_capture(), null);
     assert.equal(h.listeners.size, 0);
 });
+
+test('cancellation removes the listener and stale replies cannot complete a later capture', async t => {
+    const h = await harness(t);
+    h.register_capture_target(h.iframe, origin);
+    const controller = new AbortController();
+    const pending = h.request_frame_capture({ signal: controller.signal });
+    const nonce = h.sent[0].data.nonce;
+    controller.abort();
+    assert.equal(await pending, null);
+    assert.equal(h.listeners.size, 0);
+    assert.equal(await h.request_frame_capture({ signal: controller.signal }), null);
+    assert.equal(h.sent.length, 1, 'already cancelled requests send nothing');
+    const next = h.request_frame_capture();
+    h.reply({ nonce, blob: new h.win.Blob(['old']) });
+    assert.equal(h.listeners.size, 1);
+    const blob = new h.win.Blob(['new']);
+    h.reply({ blob });
+    assert.equal(await next, blob);
+    assert.equal(h.listeners.size, 0);
+});

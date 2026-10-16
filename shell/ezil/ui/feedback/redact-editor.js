@@ -70,7 +70,8 @@ export async function encode_under_limit (canvas, limit) {
  * @param {HTMLCanvasElement} _canvas
  * @returns {Promise<{blob: Blob, contentType: string, width: number, height: number} | null>}
  */
-export async function open_redact_editor (_canvas) {
+export async function open_redact_editor (_canvas, { signal } = {}) {
+    if (signal?.aborted) return null;
     let source;
     try { source = flatten(_canvas); } catch { return null; }
     const doc = source.ownerDocument;
@@ -233,6 +234,8 @@ export async function open_redact_editor (_canvas) {
         function finish (result) {
             if (settled) return;
             settled = true;
+            signal?.removeEventListener('abort', abort);
+            for (const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange']) view.removeEventListener(type, abort);
             view.removeEventListener('resize', resize);
             view.removeEventListener('pointermove', drag_move);
             view.removeEventListener('pointerup', drag_end);
@@ -240,11 +243,16 @@ export async function open_redact_editor (_canvas) {
             view.removeEventListener('touchmove', touch_move);
             view.removeEventListener('touchend', touch_end);
             view.removeEventListener('touchcancel', touch_end);
+            if (gesture) {
+                try { stage.releasePointerCapture(gesture.id); } catch { /* Already released. */ }
+                gesture = null;
+            }
             try { dialog.close(); } catch { /* Detached dialogs can already be closed. */ }
             dialog.remove();
             if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
             resolve(result);
         }
+        const abort = () => finish(null);
 
         dialog.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
         dialog.addEventListener('close', () => finish(null));
@@ -326,6 +334,7 @@ export async function open_redact_editor (_canvas) {
                     if (blob) { finish({ blob, contentType: blob.type, width: output.width, height: output.height }); return; }
                     status.textContent = 'Could not prepare an image under 1.5 MiB. Try a smaller crop.';
                 } catch {
+                    if (settled) return;
                     status.textContent = 'Could not prepare this screenshot. Try again or cancel.';
                 }
                 busy = false;
@@ -334,6 +343,8 @@ export async function open_redact_editor (_canvas) {
             }
         });
         try {
+            signal?.addEventListener('abort', abort, { once: true });
+            for (const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange']) view.addEventListener(type, abort);
             const size = fit_long_edge(source.width, source.height, LONG_EDGE_MAX);
             preview.width = size.width; preview.height = size.height;
             const ctx = preview.getContext('2d');

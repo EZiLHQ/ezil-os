@@ -17,8 +17,9 @@ const FEEDBACK_UI = 'dialog, #ezil-feedback-chip, .ezil-feedback-chip, '
     + '[id^="ezil-feedback-"], .ezil-feedback-dialog, .ezil-redact-editor';
 
 /** Tier A: exclude private subtrees before snapdom can read or clone them. */
-export async function capture_shell_snapshot () {
+export async function capture_shell_snapshot ({ signal } = {}) {
     try {
+        if (signal?.aborted) return null;
         // 🔴 The whole body, not #ezil-os-root: Puter appends every window and
         // the taskbar directly to <body> (UIWindow / UITaskbar), so the root
         // holds only the wallpaper and a root snapshot showed no windows at
@@ -32,8 +33,9 @@ export async function capture_shell_snapshot () {
         if (!size.width || !size.height) return null;
         const masks = new Map();
         let unsafe = false;
-        const snapdom = await load_snapdom();
-        const snapshot = await snapdom(root, {
+        const snapdom = await with_timeout(load_snapdom(), null, signal);
+        if (signal?.aborted) return null;
+        const snapshot = await with_timeout(snapdom(root, {
             // Viewport coordinates also work for the fixed-position shell windows.
             clip: 'viewport', dpr: 1, scale: Math.min(1, 1920 / Math.max(width, height)),
             cache: 'disabled', burst: false, embedFonts: false,
@@ -53,9 +55,10 @@ export async function capture_shell_snapshot () {
                     return false;
                 }
             },
-        });
-        if (unsafe) return null;
-        const captured = await snapshot.toCanvas();
+        }), null, signal);
+        if (unsafe || signal?.aborted) return null;
+        const captured = await with_timeout(snapshot.toCanvas(), null, signal);
+        if (signal?.aborted) return null;
         const canvas = document.createElement('canvas');
         canvas.width = size.width;
         canvas.height = size.height;
@@ -101,12 +104,20 @@ export function tab_capture_supported () {
         || /Android|iOS/i.test(nav.userAgentData?.platform || ''));
 }
 
-function with_timeout (promise, timeoutMs = 4000) {
-    let timer;
+function with_timeout (promise, timeoutMs = 4000, signal) {
+    let timer, abort;
     return Promise.race([
         promise,
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Capture timed out')), timeoutMs); }),
-    ]).finally(() => clearTimeout(timer));
+        new Promise((_, reject) => {
+            abort = () => reject(new Error('Capture cancelled'));
+            if (signal?.aborted) { abort(); return; }
+            signal?.addEventListener('abort', abort, { once: true });
+            if (timeoutMs !== null) timer = setTimeout(() => reject(new Error('Capture timed out')), timeoutMs);
+        }),
+    ]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+    });
 }
 
 function next_paint () {
@@ -124,7 +135,7 @@ function image_to_canvas (image, width = image.width, height = image.height) {
     return canvas;
 }
 
-async function video_frame (stream) {
+async function video_frame (stream, signal) {
     const video = document.createElement('video');
     video.muted = true;
     video.autoplay = true;
@@ -144,7 +155,8 @@ async function video_frame (stream) {
         video.srcObject = stream;
         const playing = video.play();
         if (video.readyState >= 2) ready();
-        await with_timeout(Promise.all([loaded, playing]));
+        await with_timeout(Promise.all([loaded, playing]), 4000, signal);
+        if (signal?.aborted) return null;
         return image_to_canvas(video, video.videoWidth, video.videoHeight);
     } finally {
         video.removeEventListener('loadeddata', ready);
@@ -155,57 +167,77 @@ async function video_frame (stream) {
     }
 }
 
-/** Tier B. MUST be called synchronously from a click handler. @param {{hide?: () => () => void}} [_opts] */
-export async function capture_tab_frame (_opts) {
+/** Tier B. MUST be called synchronously from a click handler. */
+export async function capture_tab_frame ({ hide, signal } = {}) {
     let stream, restore;
+    let finished = false;
+    const stop = value => {
+        for (const track of value.getTracks()) {
+            try { track.stop(); } catch { /* Attempt every track even if one fails. */ }
+        }
+    };
     try {
-        if (!tab_capture_supported()) return null;
-        // Keep this as the FIRST await: getDisplayMedia needs transient activation.
-        stream = await navigator.mediaDevices.getDisplayMedia({
+        if (signal?.aborted || !tab_capture_supported()) return null;
+        // Invoke the picker before any await to preserve transient activation.
+        // A browser picker cannot be dismissed programmatically. If granted
+        // after cancellation, stop its stream without displaying an editor.
+        const acquiring = navigator.mediaDevices.getDisplayMedia({
             video: { displaySurface: 'browser' }, audio: false,
             preferCurrentTab: true, selfBrowserSurface: 'include',
             surfaceSwitching: 'exclude', monitorTypeSurfaces: 'exclude',
+        }).then(value => {
+            if (finished || signal?.aborted) { stop(value); return null; }
+            stream = value;
+            return value;
         });
-        restore = _opts?.hide?.();
-        await with_timeout(next_paint().then(next_paint));
+        await with_timeout(acquiring, null, signal);
+        if (!stream || signal?.aborted) return null;
+        restore = hide?.();
+        await with_timeout(next_paint().then(next_paint), 4000, signal);
+        if (signal?.aborted) return null;
         const track = stream.getVideoTracks()[0];
         if (!track) return null;
         const Capture = globalThis.ImageCapture;
-        if (typeof Capture !== 'function') return await video_frame(stream);
-        let bitmap, finished = false;
+        if (typeof Capture !== 'function') return await video_frame(stream, signal);
+        let bitmap, frameFinished = false;
         try {
-            bitmap = await with_timeout(new Capture(track).grabFrame().then(frame => {
-                if (finished) { frame.close?.(); return null; }
+            await with_timeout(new Capture(track).grabFrame().then(frame => {
+                if (frameFinished || signal?.aborted) { frame.close?.(); return null; }
+                bitmap = frame;
                 return frame;
-            }));
-            return bitmap ? image_to_canvas(bitmap) : null;
+            }), 4000, signal);
+            return bitmap && !signal?.aborted ? image_to_canvas(bitmap) : null;
         } finally {
-            finished = true;
+            frameFinished = true;
             bitmap?.close?.();
         }
     } catch {
         return null;
     } finally {
-        if (stream) {
-            for (const track of stream.getTracks()) {
-                try { track.stop(); } catch { /* Attempt every track even if one fails. */ }
-            }
-        }
+        finished = true;
+        if (stream) stop(stream);
         try { if (typeof restore === 'function') restore(); } catch { /* Capture stays non-throwing. */ }
     }
 }
 
 /** Tier C: cooperative in-frame capture of the remote desktop. */
-export async function capture_desktop_frame () {
+export async function capture_desktop_frame ({ signal } = {}) {
     let bitmap;
+    let finished = false;
     try {
-        const blob = await with_timeout(request_frame_capture({ timeoutMs: 4000 }));
-        if (!blob || typeof globalThis.createImageBitmap !== 'function') return null;
-        bitmap = await createImageBitmap(blob);
-        return image_to_canvas(bitmap);
+        if (signal?.aborted) return null;
+        const blob = await with_timeout(request_frame_capture({ timeoutMs: 4000, signal }), 4000, signal);
+        if (!blob || signal?.aborted || typeof globalThis.createImageBitmap !== 'function') return null;
+        await with_timeout(createImageBitmap(blob).then(frame => {
+            if (finished || signal?.aborted) { frame.close?.(); return null; }
+            bitmap = frame;
+            return frame;
+        }), 4000, signal);
+        return bitmap && !signal?.aborted ? image_to_canvas(bitmap) : null;
     } catch {
         return null;
     } finally {
+        finished = true;
         bitmap?.close?.();
     }
 }

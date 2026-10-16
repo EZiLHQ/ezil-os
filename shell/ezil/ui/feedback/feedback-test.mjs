@@ -31,6 +31,8 @@ iframe.src = 'https://HOST_SECRET.token.example.test/';
 document.body.append(iframe);
 
 const captureCalls = [];
+const captureOptions = [];
+const editorOptions = [];
 let supported = true;
 let nextCanvas = () => Promise.resolve(document.createElement('canvas'));
 const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJx8AAAAASUVORK5CYII=', 'base64');
@@ -39,7 +41,8 @@ globalThis.__feedbackCapture = {
     supported: () => supported,
     capture: (kind, options) => {
         captureCalls.push(kind);
-        if ( options ) {
+        captureOptions.push(options);
+        if ( options?.hide ) {
             const restore = options.hide();
             assert.equal(typeof restore, 'function');
             assert.equal(window.getComputedStyle(document.querySelector('dialog')).visibility, 'hidden');
@@ -47,18 +50,18 @@ globalThis.__feedbackCapture = {
         }
         return nextCanvas();
     },
-    edit: canvas => { assert.equal(canvas.tagName, 'CANVAS'); captureCalls.push('editor'); return Promise.resolve(editorResult()); },
+    edit: (canvas, options) => { assert.equal(canvas.tagName, 'CANVAS'); captureCalls.push('editor'); editorOptions.push(options); return Promise.resolve(editorResult()); },
 };
 const captureUrl = new URL('./capture.js', import.meta.url).href;
 const editorUrl = new URL('./redact-editor.js', import.meta.url).href;
 const hooks = registerHooks({ load (url, context, next) {
     if ( url === captureUrl ) return { format: 'module', shortCircuit: true, source: `
         export const tab_capture_supported = () => globalThis.__feedbackCapture.supported();
-        export const capture_shell_snapshot = () => globalThis.__feedbackCapture.capture('shell');
+        export const capture_shell_snapshot = options => globalThis.__feedbackCapture.capture('shell', options);
         export const capture_tab_frame = options => globalThis.__feedbackCapture.capture('tab', options);
-        export const capture_desktop_frame = () => globalThis.__feedbackCapture.capture('desktop');` };
+        export const capture_desktop_frame = options => globalThis.__feedbackCapture.capture('desktop', options);` };
     if ( url === editorUrl ) return { format: 'module', shortCircuit: true,
-        source: 'export const open_redact_editor = canvas => globalThis.__feedbackCapture.edit(canvas);' };
+        source: 'export const open_redact_editor = (canvas, options) => globalThis.__feedbackCapture.edit(canvas, options);' };
     return next(url, context);
 } });
 
@@ -275,6 +278,100 @@ try {
         current().dispatchEvent(new window.Event('cancel', { cancelable: true }));
         assert.equal(current(), null);
         assert.equal(document.activeElement.id, 'opener');
+    });
+    await check('teardown and navigation close the form, abort pending captures and leave Back unhandled', async () => {
+        const count = calls.length;
+        for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) {
+            open(); setDescription('Interrupted report'); change('screenshot', true);
+            let finish;
+            nextCanvas = () => new Promise(resolve => { finish = resolve; });
+            const button = current().querySelector('[data-capture="shell"]');
+            const captures = captureCalls.length;
+            button.click(); button.click();
+            assert.equal(captureCalls.length, captures + 1);
+            const { signal } = captureOptions.at(-1);
+            const event = new window.Event(type, { cancelable: true });
+            window.dispatchEvent(event);
+            assert.equal(event.defaultPrevented, false);
+            assert.equal(current(), null);
+            assert.equal(signal.aborted, true);
+            finish(document.createElement('canvas'));
+            await tick();
+            assert.equal(current(), null);
+            assert.equal(captureCalls.length, captures + 1, 'late capture must not open editor');
+        }
+        nextCanvas = () => Promise.resolve(document.createElement('canvas'));
+        assert.equal(calls.length, count);
+        assert.equal(document.querySelector('.ezil-feedback-chip'), null);
+        feedback.mount_feedback_chip();
+        window.dispatchEvent(new window.Event('pagehide'));
+        assert.equal(document.querySelector('.ezil-feedback-chip'), null);
+        window.dispatchEvent(new window.Event('pageshow'));
+        assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1);
+    });
+    await check('cancelled capture cannot unlock or reveal a newer pending capture', async () => {
+        open(); setDescription('Recapture'); change('screenshot', true);
+        let oldFinish, newFinish;
+        nextCanvas = () => new Promise(resolve => { oldFinish = resolve; });
+        current().querySelector('[data-capture="shell"]').click();
+        const oldSignal = captureOptions.at(-1).signal;
+        change('screenshot', false);
+        assert.equal(oldSignal.aborted, true);
+        assert.equal(current().classList.contains('ezil-feedback-capturing'), false);
+        change('screenshot', true);
+        nextCanvas = () => new Promise(resolve => { newFinish = resolve; });
+        current().querySelector('[data-capture="shell"]').click();
+        oldFinish(document.createElement('canvas')); await tick();
+        assert.equal(current().querySelector('[data-capture="shell"]').disabled, true);
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        assert.equal(current().classList.contains('ezil-feedback-capturing'), true);
+        assert.equal(status(), 'Preparing screenshot…');
+        assert.equal(payload().screenshot, null);
+        newFinish(document.createElement('canvas'));
+        await until(() => payload().screenshot !== null);
+        nextCanvas = () => Promise.resolve(document.createElement('canvas'));
+        close();
+    });
+    await check('editor Cancel returns to the draft; closing the form aborts editing and discards late edits', async () => {
+        open(); setDescription('Keep this draft'); change('screenshot', true);
+        const originalEditor = editorResult;
+        editorResult = () => null;
+        current().querySelector('[data-capture="shell"]').click();
+        await until(() => !current().querySelector('[type="submit"]').disabled);
+        assert.equal(form().elements.description.value, 'Keep this draft');
+        assert.equal(payload().screenshot, null);
+        let finish;
+        editorResult = () => new Promise(resolve => { finish = resolve; });
+        current().querySelector('[data-capture="shell"]').click();
+        await until(() => !!finish);
+        const { signal } = editorOptions.at(-1);
+        close();
+        assert.equal(signal.aborted, true);
+        finish(originalEditor()); await tick();
+        assert.equal(current(), null);
+        editorResult = originalEditor;
+        open();
+        assert.equal(form().elements.description.value, '');
+        assert.equal(payload().screenshot, null);
+        close();
+    });
+    await check('closing during submission is truthful and late success cannot change a new draft', async () => {
+        open(); setDescription('Submitted report');
+        let finish;
+        respond = () => new Promise(resolve => { finish = resolve; });
+        const count = calls.length;
+        send(); send();
+        assert.equal(calls.length, count + 1);
+        assert.equal(current().querySelector('[data-action="cancel"]').textContent, 'Close');
+        assert.match(status(), /Closing this window does not cancel the report/);
+        const sentId = JSON.parse(calls.at(-1).body).clientRequestId;
+        close(); open(); setDescription('New draft');
+        finish({ status: 201, json: async () => ({ id: reportId }) }); await tick();
+        assert.equal(form().elements.description.value, 'New draft');
+        assert.notEqual(payload().clientRequestId, sentId);
+        assert.equal(status(), '');
+        assert.equal(calls.length, count + 1);
+        close();
     });
     await check('screenshot and tab support flags hide unavailable controls; disabled feedback stays dark', async () => {
         supported = false;

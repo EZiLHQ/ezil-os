@@ -263,7 +263,7 @@ await test('video fallback captures a loaded frame and removes video on success 
 });
 
 await test('tier C passes 4000ms, handles null/rejection, decodes blob and closes bitmap', async () => {
-    requestFrame = async options => { assert.deepEqual(options, { timeoutMs: 4000 }); return null; };
+    requestFrame = async options => { assert.deepEqual(options, { timeoutMs: 4000, signal: undefined }); return null; };
     assert.equal(await capture_desktop_frame(), null);
     requestFrame = async () => { throw new Error('bridge failed'); };
     assert.equal(await capture_desktop_frame(), null);
@@ -429,6 +429,118 @@ await test('native cancel event resolves null and removes dialog', async () => {
     document.querySelector('dialog.ezil-redact-editor').dispatchEvent(new window.Event('cancel', { cancelable: true }));
     assert.equal(await pending, null);
     assert.equal(document.querySelector('dialog.ezil-redact-editor'), null);
+});
+
+await test('already cancelled capture/editor requests do not invoke a picker, bridge or snapshot', async () => {
+    const controller = new AbortController(); controller.abort();
+    const options = { signal: controller.signal };
+    snapshotDom = () => assert.fail('snapshot after cancellation');
+    requestFrame = () => assert.fail('frame request after cancellation');
+    set_nav({ mediaDevices: { getDisplayMedia: () => assert.fail('picker after cancellation') } });
+    assert.equal(await capture_shell_snapshot(options), null);
+    assert.equal(await capture_tab_frame(options), null);
+    assert.equal(await capture_desktop_frame(options), null);
+    assert.equal(await open_redact_editor(canvas(), options), null);
+    assert.equal(document.querySelector('.ezil-redact-editor'), null);
+});
+
+await test('cancelling a pending picker returns promptly and stops a stream granted later exactly once', async () => {
+    const controller = new AbortController(), stream = fake_stream();
+    let grant, hidden = 0;
+    set_nav({ mediaDevices: { getDisplayMedia: () => new Promise(resolve => { grant = resolve; }) } });
+    const pending = capture_tab_frame({ signal: controller.signal, hide: () => { hidden++; } });
+    assert.equal(typeof grant, 'function', 'picker starts in click stack');
+    controller.abort();
+    assert.equal(await pending, null);
+    grant(stream); await Promise.resolve();
+    all_stopped(stream);
+    assert.equal(hidden, 0);
+});
+
+await test('cancellation while grabbing a frame stops tracks, restores UI and closes a late bitmap', async () => {
+    const controller = new AbortController(), stream = fake_stream();
+    let deliver, closed = 0, restored = 0;
+    set_nav({ mediaDevices: { getDisplayMedia: async () => stream } }); paints();
+    globalThis.ImageCapture = class { grabFrame () { return new Promise(resolve => { deliver = resolve; }); } };
+    const pending = capture_tab_frame({ signal: controller.signal, hide: () => () => restored++ });
+    for (let i = 0; i < 50 && !deliver; i++) await Promise.resolve();
+    assert.equal(typeof deliver, 'function');
+    controller.abort();
+    assert.equal(await pending, null);
+    all_stopped(stream); assert.equal(restored, 1);
+    deliver({ width: 100, height: 100, close: () => closed++ });
+    await Promise.resolve();
+    assert.equal(closed, 1);
+});
+
+await test('cancellation during video readiness removes the hidden video and stops all tracks', async () => {
+    delete globalThis.ImageCapture;
+    const controller = new AbortController(), stream = fake_stream();
+    set_nav({ mediaDevices: { getDisplayMedia: async () => stream } }); paints();
+    window.HTMLMediaElement.prototype.play = () => new Promise(() => {});
+    const pending = capture_tab_frame({ signal: controller.signal });
+    for (let i = 0; i < 50 && !document.querySelector('video'); i++) await Promise.resolve();
+    assert.ok(document.querySelector('video'));
+    controller.abort();
+    assert.equal(await pending, null);
+    assert.equal(document.querySelector('video'), null);
+    all_stopped(stream);
+});
+
+await test('shell cancellation discards a pending snapshot before any canvas render', async () => {
+    const controller = new AbortController(); let deliver;
+    snapshotDom = () => new Promise(resolve => { deliver = resolve; });
+    const pending = capture_shell_snapshot({ signal: controller.signal });
+    for (let i = 0; i < 30 && !deliver; i++) await Promise.resolve();
+    assert.equal(typeof deliver, 'function');
+    controller.abort();
+    assert.equal(await pending, null);
+    deliver({ toCanvas: () => assert.fail('cancelled snapshot rendered') });
+    await Promise.resolve();
+});
+
+await test('desktop cancellation propagates to the bridge and closes a bitmap decoded later', async () => {
+    const controller = new AbortController(); let deliver, closed = 0;
+    requestFrame = async ({ signal }) => { assert.equal(signal, controller.signal); return new Blob(['fixture']); };
+    globalThis.createImageBitmap = () => new Promise(resolve => { deliver = resolve; });
+    const pending = capture_desktop_frame({ signal: controller.signal });
+    for (let i = 0; i < 30 && !deliver; i++) await Promise.resolve();
+    assert.equal(typeof deliver, 'function');
+    controller.abort();
+    assert.equal(await pending, null);
+    deliver({ width: 100, height: 100, close: () => closed++ });
+    await Promise.resolve();
+    assert.equal(closed, 1);
+});
+
+await test('editor interruption removes global listeners and ignores encoding completed after cancellation', async () => {
+    const originalEncode = window.HTMLCanvasElement.prototype.toBlob;
+    const originalAdd = window.addEventListener, originalRemove = window.removeEventListener;
+    const listeners = new Set();
+    window.addEventListener = function (type, fn, options) { listeners.add(fn); return originalAdd.call(this, type, fn, options); };
+    window.removeEventListener = function (type, fn, options) { listeners.delete(fn); return originalRemove.call(this, type, fn, options); };
+    try {
+        for (const type of ['abort', 'ezil:teardown', 'popstate', 'pagehide', 'hashchange']) {
+            const controller = new AbortController(); let encode;
+            window.HTMLCanvasElement.prototype.toBlob = callback => { encode = callback; };
+            const pending = open_redact_editor(canvas(), { signal: controller.signal });
+            action('confirm').click();
+            assert.equal(typeof encode, 'function');
+            if (type === 'abort') controller.abort();
+            else window.dispatchEvent(new window.Event(type));
+            assert.equal(await pending, null);
+            assert.equal(document.querySelector('.ezil-redact-editor'), null);
+            assert.equal(listeners.size, 0);
+            const focus = document.activeElement;
+            encode(new Blob(['fixture'], { type: 'image/webp' }));
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            assert.equal(document.querySelector('.ezil-redact-editor'), null);
+            assert.equal(document.activeElement, focus);
+        }
+    } finally {
+        window.HTMLCanvasElement.prototype.toBlob = originalEncode;
+        window.addEventListener = originalAdd; window.removeEventListener = originalRemove;
+    }
 });
 
 dom.window.close();

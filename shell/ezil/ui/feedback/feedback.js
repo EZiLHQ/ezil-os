@@ -11,6 +11,21 @@ const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-
 let chipObserver = null;
 let activeDialog = null;
 
+function unmount_feedback_chip () {
+    chipObserver?.disconnect();
+    chipObserver = null;
+    document.querySelector('button.ezil-feedback-chip')?.remove();
+    window.removeEventListener('ezil:teardown', unmount_feedback_chip);
+    window.removeEventListener('pagehide', suspend_feedback_chip);
+    window.removeEventListener('pageshow', mount_feedback_chip);
+}
+
+function suspend_feedback_chip () {
+    unmount_feedback_chip();
+    // A page restored from the back/forward cache does not run shell boot.
+    window.addEventListener('pageshow', mount_feedback_chip, { once: true });
+}
+
 function endpoint () { return globalThis.window?.__EZIL_BOOT__?.desktopState?.endpoints?.feedback; }
 
 /** @returns {boolean} true when the boot payload exposes endpoints.feedback */
@@ -47,14 +62,25 @@ export function mount_feedback_chip () {
     chipObserver = new MutationObserver(sync);
     chipObserver.observe(document.body, { subtree: true, childList: true, attributes: true,
         attributeFilter: ['class', 'style', 'hidden'] });
+    window.addEventListener('ezil:teardown', unmount_feedback_chip);
+    window.addEventListener('pagehide', suspend_feedback_chip);
     sync();
 }
 
-function read_blob (blob) {
+function read_blob (blob, signal) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result).split(',')[1]);
-        reader.onerror = () => reject(new Error('image_read_failed'));
+        const abort = () => { reader.abort(); finish(new Error('image_read_cancelled')); };
+        function finish (error, data) {
+            signal.removeEventListener('abort', abort);
+            reader.onload = reader.onerror = null;
+            if ( error ) reject(error);
+            else resolve(data);
+        }
+        if ( signal.aborted ) { abort(); return; }
+        signal.addEventListener('abort', abort, { once: true });
+        reader.onload = () => finish(null, String(reader.result).split(',')[1]);
+        reader.onerror = () => finish(new Error('image_read_failed'));
         reader.readAsDataURL(blob);
     });
 }
@@ -134,6 +160,18 @@ export function open_feedback_dialog (_opts) {
     let captureGeneration = 0;
     let closed = false;
     let restoreCapture = null;
+    let captureController = null;
+
+    function cancel_capture () {
+        ++captureGeneration;
+        captureController?.abort();
+        captureController = null;
+        restoreCapture?.();
+        restoreCapture = null;
+        capturing = false;
+        for ( const button of dialog.querySelectorAll('[data-capture]') ) button.disabled = false;
+        if ( result.textContent === 'Preparing screenshot…' ) result.textContent = '';
+    }
 
     function refresh () {
         if ( sending || sent || closed ) return;
@@ -164,19 +202,26 @@ export function open_feedback_dialog (_opts) {
     // backdrop from capture. FCAPTURE owns when to call the returned restore.
     function hide () {
         dialog.classList.add('ezil-feedback-capturing');
-        const restore = () => { dialog.classList.remove('ezil-feedback-capturing'); };
+        const restore = () => {
+            if ( restoreCapture !== restore ) return;
+            dialog.classList.remove('ezil-feedback-capturing');
+            restoreCapture = null;
+        };
         restoreCapture = restore;
         return restore;
     }
 
-    async function finish_capture (capture, generation) {
+    async function finish_capture (capture, generation, signal) {
+        const current = () => ! closed && generation === captureGeneration && ! signal.aborted;
         try {
             const canvas = await capture;
+            if ( ! current() ) return;
             restoreCapture?.();
-            if ( closed || generation !== captureGeneration || ! screenshotConsent.checked ) return;
+            if ( ! screenshotConsent.checked ) return;
             if ( ! canvas ) { result.textContent = 'No screenshot captured. You can try another capture option.'; return; }
-            const edited = await open_redact_editor(canvas);
-            if ( ! edited || closed || generation !== captureGeneration || ! screenshotConsent.checked ) {
+            const edited = await open_redact_editor(canvas, { signal });
+            if ( ! current() ) return;
+            if ( ! edited || ! screenshotConsent.checked ) {
                 result.textContent = '';
                 return;
             }
@@ -186,29 +231,27 @@ export function open_feedback_dialog (_opts) {
                 result.textContent = 'The screenshot is too large or unsupported. Crop it further and try again.';
                 return;
             }
-            const dataBase64 = await read_blob(edited.blob);
-            if ( closed || generation !== captureGeneration || ! screenshotConsent.checked ) return;
+            const dataBase64 = await read_blob(edited.blob, signal);
+            if ( ! current() || ! screenshotConsent.checked ) return;
             screenshot = { contentType: edited.contentType, dataBase64 };
             const image = dialog.querySelector('.ezil-feedback-image');
             image.querySelector('img').src = `data:${screenshot.contentType};base64,${dataBase64}`;
             image.hidden = false;
             result.textContent = '';
         } catch {
-            if ( ! closed ) result.textContent = 'Could not capture a screenshot. Try another capture option.';
+            if ( current() ) result.textContent = 'Could not capture a screenshot. Try another capture option.';
         } finally {
-            restoreCapture?.();
-            capturing = false;
-            if ( result.textContent === 'Preparing screenshot…' ) result.textContent = '';
-            for ( const button of dialog.querySelectorAll('[data-capture]') ) button.disabled = false;
-            refresh();
+            if ( current() ) { cancel_capture(); refresh(); }
         }
     }
 
     for ( const button of dialog.querySelectorAll('[data-capture]') ) {
         button.addEventListener('click', () => {
-            if ( capturing || sending || ! screenshotConsent.checked ) return;
+            if ( capturing || sending || sent || closed || ! screenshotConsent.checked ) return;
             capturing = true;
             const generation = ++captureGeneration;
+            captureController = new AbortController();
+            const { signal } = captureController;
             for ( const el of dialog.querySelectorAll('[data-capture]') ) el.disabled = true;
             result.textContent = 'Preparing screenshot…';
             refresh();
@@ -216,22 +259,22 @@ export function open_feedback_dialog (_opts) {
             // activation for getDisplayMedia. All three paths use the editor.
             let capture;
             try {
-                if ( button.dataset.capture === 'tab' ) capture = capture_tab_frame({ hide });
+                if ( button.dataset.capture === 'tab' ) capture = capture_tab_frame({ hide, signal });
                 else {
                     hide();
-                    capture = button.dataset.capture === 'shell' ? capture_shell_snapshot() : capture_desktop_frame();
+                    capture = button.dataset.capture === 'shell' ? capture_shell_snapshot({ signal }) : capture_desktop_frame({ signal });
                 }
             } catch (error) { capture = Promise.reject(error); }
-            void finish_capture(capture, generation);
+            void finish_capture(capture, generation, signal);
         });
     }
     dialog.querySelector('[data-action="remove-screenshot"]')?.addEventListener('click', () => {
-        ++captureGeneration;
+        cancel_capture();
         clear_screenshot();
         refresh();
     });
     screenshotConsent?.addEventListener('change', () => {
-        if ( ! screenshotConsent.checked ) { ++captureGeneration; clear_screenshot(); }
+        if ( ! screenshotConsent.checked ) { cancel_capture(); clear_screenshot(); }
     });
     form.addEventListener('input', refresh);
     form.addEventListener('change', refresh);
@@ -244,11 +287,13 @@ export function open_feedback_dialog (_opts) {
         sending = true;
         fields.disabled = true;
         submit.disabled = true;
-        result.textContent = 'Sending…';
+        cancel.textContent = 'Close';
+        result.textContent = 'Sending… Closing this window does not cancel the report.';
         try {
             // The exact, visible preview string is also the request body.
             const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
                 headers: { 'Content-Type': 'application/json' }, body: serialized });
+            if ( closed ) return;
             if ( response.status !== 201 && response.status !== 200 ) {
                 result.textContent = error_copy(response.status);
                 return;
@@ -269,6 +314,7 @@ export function open_feedback_dialog (_opts) {
         } finally {
             sending = false;
             fields.disabled = false;
+            if ( ! sent ) cancel.textContent = 'Cancel';
             refresh();
         }
     });
@@ -276,8 +322,8 @@ export function open_feedback_dialog (_opts) {
     function cleanup () {
         if ( closed ) return;
         closed = true;
-        ++captureGeneration;
-        restoreCapture?.();
+        cancel_capture();
+        for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.removeEventListener(type, close);
         clear_screenshot();
         dialog.remove();
         if ( activeDialog === dialog ) activeDialog = null;
@@ -287,6 +333,7 @@ export function open_feedback_dialog (_opts) {
     cancel.addEventListener('click', close);
     dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
     dialog.addEventListener('close', cleanup);
+    for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.addEventListener(type, close);
     refresh();
     dialog.showModal();
     description.focus();

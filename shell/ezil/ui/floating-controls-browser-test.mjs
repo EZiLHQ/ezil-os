@@ -62,6 +62,7 @@ async function eventually (name, read, accept, timeout = 4000) {
 const icons = fs.readFileSync(path.join(OS, 'icons.js'), 'utf8');
 const bundle = fs.readFileSync(path.join(OS, 'bundle.min.js'), 'utf8');
 const css = fs.readFileSync(path.join(OS, 'bundle.min.css'), 'utf8');
+const snapdom = fs.readFileSync(path.join(OS, 'vendor/snapdom-3.3.4.mjs'), 'utf8');
 const HOST = 'https://ezil-floating-controls-test.invalid';
 const DOC_HTML = `<!doctype html><html class="h-full"><head>
  <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -175,6 +176,9 @@ async function boot (ctx, options, errors) {
         if ( url.origin === HOST && url.pathname === '/os' ) {
             return route.fulfill({ contentType: 'text/html', body: DOC_HTML });
         }
+        if ( url.origin === HOST && url.pathname === '/os/vendor/snapdom-3.3.4.mjs' ) {
+            return route.fulfill({ contentType: 'text/javascript', body: snapdom });
+        }
         // Match the actual path, never a frame URL inside confirm=frame's query.
         if ( url.origin === HOST && url.pathname === '/frame' ) {
             return route.fulfill({ contentType: 'text/html', body: fakeStream(applied) });
@@ -206,8 +210,10 @@ async function boot (ctx, options, errors) {
         apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
         desktopState: {
             provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
-            endpoints: { ...ENDPOINTS, ...(options.screen ? { screen: SCREEN_ENDPOINT } : {}) },
-            ...(options.flag === 'absent' ? {} : { ui: { floatingControls: options.flag !== false } }),
+            endpoints: { ...ENDPOINTS, ...(options.screen ? { screen: SCREEN_ENDPOINT } : {}),
+                ...(options.feedback ? { feedback: '/api/shell/feedback' } : {}) },
+            ...(options.flag === 'absent' ? {} : { ui: { floatingControls: options.flag !== false,
+                feedbackScreenshots: !!options.feedback } }),
         },
     };
     await page.goto(`${HOST}/os`, { waitUntil: 'load' });
@@ -672,6 +678,46 @@ async function reducedMotionCase ({ page }, label) {
     }
 }
 
+async function feedbackLifecycleCase ({ page, requests }, label) {
+    const form = page.locator('.ezil-feedback-dialog');
+    const editor = page.locator('.ezil-redact-editor');
+    const open = async () => {
+        await reveal(page);
+        await page.locator(`${DRAWER} .ezil-drawer-feedback`).click();
+        await form.waitFor({ state: 'visible' });
+    };
+    await open();
+    await form.locator('textarea').fill('Synthetic lifecycle check');
+    await form.locator('[name="screenshot"]').check();
+    await form.getByRole('button', { name: 'Capture EZiL OS window' }).click();
+    await editor.waitFor({ state: 'visible' });
+    push(`${label}: capture opens the real editor above the modal form`,
+        await editor.evaluate(el => el.matches(':modal')) && await form.evaluate(el => el.matches(':modal')));
+    await editor.getByRole('button', { name: 'Cancel screenshot', exact: true }).click();
+    await editor.waitFor({ state: 'detached' });
+    push(`${label}: editor Cancel keeps the description and attaches no image`,
+        await form.locator('textarea').inputValue() === 'Synthetic lifecycle check'
+        && JSON.parse(await form.locator('pre').textContent()).screenshot === null);
+    await form.getByRole('button', { name: 'Capture EZiL OS window' }).click();
+    await editor.waitFor({ state: 'visible' });
+    await page.evaluate(() => window.dispatchEvent(new PopStateEvent('popstate', { state: history.state })));
+    await editor.waitFor({ state: 'detached' });
+    await form.waitFor({ state: 'detached' });
+    push(`${label}: Back closes both native modals and returns input to the shell`,
+        await page.locator('dialog:modal').count() === 0);
+    await open();
+    push(`${label}: reopening starts a new draft with consent off`,
+        await form.locator('textarea').inputValue() === ''
+        && !await form.locator('[name="screenshot"]').isChecked()
+        && !await form.locator('[name="diagnostics"]').isChecked());
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('ezil:teardown')));
+    await form.waitFor({ state: 'detached' });
+    push(`${label}: teardown removes the form and feedback chip`,
+        await page.locator('.ezil-feedback-chip').count() === 0);
+    push(`${label}: capture and interruption never submit a report`,
+        requests.every(req => req.path !== '/api/shell/feedback'));
+}
+
 const scenarios = [
     { name: 'flag=false', options: { flag: false, legacy: true }, context: { viewport: { width: 1400, height: 1000 } }, test: legacyCase },
     { name: 'flag absent', options: { flag: 'absent', legacy: true }, context: { viewport: { width: 1400, height: 1000 } }, test: legacyCase },
@@ -686,6 +732,8 @@ const scenarios = [
         name: `close confirm: ${action}`, test: (fixture, label) => closeCase(fixture, label, action),
     })),
     { name: 'reduced motion', context: { reducedMotion: 'reduce' }, test: reducedMotionCase },
+    { name: 'feedback lifecycle desktop', options: { feedback: true }, test: feedbackLifecycleCase },
+    { name: 'feedback lifecycle phone', options: { feedback: true }, context: PHONE, test: feedbackLifecycleCase },
 ];
 
 let browser;

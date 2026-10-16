@@ -79,7 +79,7 @@ Focus-chromium progress text → `set_status`. On stream frame attach call
 ```
 classify_frame_controls_message(ev, { origin, source }) → null | { type: 'edge_reveal' | 'controls_hotkey' }
 register_capture_target(iframe: HTMLIFrameElement, origin: string) → void
-request_frame_capture({ timeoutMs = 4000 } = {}) → Promise<Blob | null>
+request_frame_capture({ timeoutMs = 4000, signal } = {}) → Promise<Blob | null>
 ```
 Wire (shell→frame): `{ source:'ezil-shell', type:'frame_capture_request', nonce }` sent with
 targetOrigin = registered origin. Frame→shell: `{ source:'ezil-mobile', type:'edge_reveal' }`,
@@ -96,15 +96,23 @@ list_my_reports() → Promise<Array<ReportSummary>>
 delete_my_report(id) → Promise<boolean>
 ```
 `shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics() → Diagnostics` (§3 shape only).
+Teardown, history navigation and page exit close the form and any nested editor,
+cancel pending captures, and discard late results without suppressing shell Back.
+Editor Cancel returns to the draft; form Cancel discards it. Once submission starts,
+the button says Close and explains that closing does not cancel the sent request.
 
 ### `shell/ezil/ui/feedback/capture.js` + `redact-editor.js` (lane FCAPTURE)
 ```
-capture_shell_snapshot() → Promise<HTMLCanvasElement | null>      // tier A, iframes → grey box
+capture_shell_snapshot({ signal } = {}) → Promise<HTMLCanvasElement | null> // tier A, iframes → grey box
 tab_capture_supported() → boolean
-capture_tab_frame({ hide }) → Promise<HTMLCanvasElement | null>   // tier B; MUST be called synchronously from a click
-capture_desktop_frame() → Promise<HTMLCanvasElement | null>       // tier C via request_frame_capture
-open_redact_editor(canvas) → Promise<{ blob: Blob, contentType: string, width: number, height: number } | null>
+capture_tab_frame({ hide, signal } = {}) → Promise<HTMLCanvasElement | null> // tier B; MUST be called synchronously from a click
+capture_desktop_frame({ signal } = {}) → Promise<HTMLCanvasElement | null>  // tier C via request_frame_capture
+open_redact_editor(canvas, { signal } = {}) → Promise<{ blob: Blob, contentType: string, width: number, height: number } | null>
 ```
+`signal` is an optional AbortSignal. Cancellation resolves null, removes waiting
+listeners and stops acquired media tracks. A browser picker cannot be dismissed by
+the page; a stream granted after cancellation is stopped immediately. Late decoded
+bitmaps are closed and never reopen an editor or attach to another draft.
 
 ## 3. Wire format — `app/src/server/feedback/types.ts` is authoritative (zod)
 POST `/api/shell/feedback` (JSON):

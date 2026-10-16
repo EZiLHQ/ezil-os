@@ -396,6 +396,18 @@ const cycle = (page) => page.evaluate(async ({ settle_ms }) => {
     };
     const samples = [];
     const t0 = performance.now();
+    // Record the renderer's transition timing so an intermittent miss has
+    // evidence beyond a final-size rerun. These listeners do not force style
+    // or layout, and the checkpoint and assertions below remain unchanged.
+    const transitions = [];
+    const record = event => {
+        if (event.target === el && ['width', 'height'].includes(event.propertyName)) {
+            transitions.push({ type: event.type, property: event.propertyName,
+                t: performance.now() - t0, elapsed: event.elapsedTime });
+        }
+    };
+    const transitionEvents = ['transitionrun', 'transitionstart', 'transitionend', 'transitioncancel'];
+    for (const type of transitionEvents) el.addEventListener(type, record);
     document.querySelector('.taskbar-item[data-app="desktop"]')
         ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     const measure = () => {
@@ -419,7 +431,8 @@ const cycle = (page) => page.evaluate(async ({ settle_ms }) => {
     for ( let i = 1; i < after.length; i++ ) {
         snap = Math.max(snap, Math.abs(after[i].w - after[i - 1].w));
     }
-    return { orig, final, settled, snap };
+    for (const type of transitionEvents) el.removeEventListener(type, record);
+    return { orig, final, settled, snap, transitions };
 }, { settle_ms: FLICKER_SETTLE_MS });
 
 for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
@@ -431,20 +444,24 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
         c1.orig.w === c1.final.w && c1.orig.w > 0,
         `snapshot=${c1.orig.w}x${c1.orig.h} final=${c1.final.w}x${c1.final.h}`);
     push(`${L} 🔴 settled at its final size by ${FLICKER_SETTLE_MS}ms — nothing left to snap to`,
-        !c1.settled.fullbleed && c1.settled.w === c1.final.w, JSON.stringify({ settled: c1.settled, final: c1.final }));
+        !c1.settled.fullbleed && c1.settled.w === c1.final.w,
+        JSON.stringify({ settled: c1.settled, final: c1.final, transitions: c1.transitions }));
     push(`${L} 🔴 no single-frame jump after the transition (the snap itself)`,
         c1.snap === 0, `largest post-transition frame delta = ${c1.snap}px`);
 
     // THE STORM. Three cycles back to back, each starting while the previous
     // restore's inline transition may still be live.
     let worst = 0, mismatched = 0;
+    const misses = [];
     for ( let i = 0; i < 3; i++ ) {
         const c = await cycle(page);
         worst = Math.max(worst, c.snap);
         if ( c.settled.fullbleed || c.settled.w !== c.final.w ) mismatched++;
+        if ( c.snap || c.settled.fullbleed || c.settled.w !== c.final.w ) misses.push(c);
     }
     push(`${L} 🔴 three back-to-back minimise/restore cycles never snap`,
-        worst === 0 && mismatched === 0, `worst delta=${worst}px, unsettled cycles=${mismatched}`);
+        worst === 0 && mismatched === 0, `worst delta=${worst}px, unsettled cycles=${mismatched}`
+            + (misses.length ? `, timing=${JSON.stringify(misses)}` : ''));
 
     push(`${L} no uncaught page errors across the storm`,
         state.errors.length === 0, JSON.stringify(state.errors.slice(0, 2)));
