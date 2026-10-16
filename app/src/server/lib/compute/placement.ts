@@ -1211,9 +1211,9 @@ async function readCounters(
 /**
  * Read-only input to the purge dry run (§6): every STOPPED or RETIRED AWS
  * placement and when it last changed. Only aws-ec2 rows retain a volume: a
- * `cloudflare` row (a pinned Cloudflare computer, select.ts) is never a candidate. For RETIRED, `updated_at` is the
- * retirement stamp (C-2 has no `retired_at`); a later write only delays
- * eligibility, which is the safe direction.
+ * `cloudflare` row (a pinned Cloudflare computer, select.ts) is never a candidate.
+ * These are inventory observations, not deletion authorization. Neither
+ * RETIRED nor updated_at proves explicit computer deletion (retention.ts).
  */
 export async function readRetentionCandidates(db: PlacementExecutor): Promise<{ computerId: string; state: PlacementState; updatedAt: Date }[]> {
     const rows = rowsOf(

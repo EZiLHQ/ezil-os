@@ -37,7 +37,7 @@ pre-booted hosts.
 | R8 | Single writer per computer, enforced by compare-and-swap on a generation number under a per-computer advisory lock. EBS single-attach is the physical fence. A reviewed migration-grammar extension adds UNIQUE indexes (required before Stage B). The engine copies in sibling repositories have diverged, so the extension is ported to each one separately with shared test vectors. |
 | R9 | Idle stop may be guest-initiated, but caps are not. Lease renewal comes only from gateway-observed, authenticated user presence. Hour, egress and lease limits are enforced by the control plane: warn, then flush, then stop, regardless of what the guest reports. |
 | R10 | Instance types come from a closed allowlist, chosen by the computer's **tier** (2026-10-14, superseding "no burstable types"): **free** = 2 vCPU / 4 GiB (`t3a.medium`, then `t3.medium`), launched with *standard* CPU credits so it throttles to its baseline instead of billing surplus CPU; **plus** = 2 vCPU / 8 GiB (`m6i.large`). One 4 vCPU / 8 GiB type stays for benchmarks only. The app records the tier's first type at creation (`AWS_TIERS`, app `aws-config.ts`); the region deployment's allowlist must contain it or the intent is refused. |
-| R11 | Volume sizes come from an allowlist or range, with capped online growth. Automation never deletes volumes or snapshots and never force-detaches. Purge is a separate operator action. |
+| R11 | Volume sizes come from an allowlist or range, with capped online growth. Lifecycle automation never deletes retained volumes or force-detaches. Undeleted computers retain their data regardless of inactivity or placement retirement. Scheduled DLM backup rotation stays bounded; it does not delete the data volume. Destructive purge is held pending a separate explicit-deletion policy (§6). |
 | R12 | Hibernation is off. |
 | R13 | Provider and store are chosen **per computer**. No global store flip is used to migrate a subset of computers. An unknown value fails closed. |
 | R14 | No new shell provider tag. A hosted AWS computer presents as a hosted computer. |
@@ -568,11 +568,24 @@ The app calls AWS only through `app/src/server/lib/compute/aws-clients.ts`:
 
 ## 6. Retention, cancellation, rollback
 
-- **Cancellation** stops compute immediately. Encrypted volumes and snapshots stay
-  recoverable for **14 days**, with residual storage cost disclosed. After that a computer
-  becomes `PURGE_ELIGIBLE`.
-- **Purge tooling** ships as eligibility listing plus dry-run only.
-- **Rollback window** is 14 days after migration. The rules in C-7 apply.
+- **Undeleted computers retain data.** Inactivity, compute stop, subscription cancellation,
+  failed provisioning and placement `RETIRED` state do not authorize purging retained data.
+  Cancellation may stop compute; it does not mean the computer was explicitly deleted.
+- **Deletion policy is held.** The former 14-day retirement/cancellation eligibility rule
+  is removed. `retention.ts` returns no purge candidates, including in dry runs, until
+  explicit deletion evidence and a separate post-deletion policy are approved. No purge
+  executor is introduced. Releasing a placement proved to have no retained resources
+  remains distinct from purging retained data.
+- **Storage costs remain bounded and visible.** Existing volume-size, admission and budget
+  controls remain; retained disks incur storage charges. DLM may rotate older backups
+  under its existing schedule while the computer's data volume remains intact.
+- **Migration is deferred.** Existing Cloudflare computers stay pinned and accessible.
+  Any future Cloudflare/AWS cutover must verify a complete export before swapping,
+  fence concurrent writers and preserve new AWS writes on rollback (C-7). A stop that
+  reports `systemChangesNotSaved` cannot serve as a successful migration checkpoint.
+- **Local software rollback** retains placement reads, provider pins and data volumes.
+  An image change needs a verified snapshot and compatible rebase; never format a
+  retained volume or reopen a stale provider copy as a rollback shortcut.
 
 ## 7. Acceptance before enabling
 

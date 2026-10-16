@@ -1,21 +1,21 @@
 /**
  * Purge eligibility, DRY RUN ONLY (docs/AWS-COMPUTERS.md §6, R11).
  *
- * Lists computers whose retained volume may be purged by the separate,
- * operator-run purge action. Performs no write of any kind: it does not even
+ * Retained data is on hold until an explicit-deletion retention policy exists.
+ * Performs no write of any kind: it does not even
  * move a placement to PURGE_ELIGIBLE. The pure function never mutates its
  * input; `listPurgeEligible` issues only `placement.ts`'s read-only query.
  *
- * Eligible when, 14 days or more ago, either:
- *   - the placement became RETIRED (its `updated_at`, see `readRetentionCandidates`), or
- *   - the computer was cancelled (`cancelledAt`, injected: C-2 has no
- *     cancellation column) and the placement is not in a running-class state.
+ * Inactivity, cancellation and RETIRED placement state are NOT proof that the
+ * user deleted the computer. They must never make an undeleted computer's data
+ * eligible. There is no durable deletion receipt or approved post-deletion
+ * policy here yet, so even the dry run returns no purge candidates. A future
+ * policy must verify explicit deletion; do not reinstate an age-only rule.
  */
 
-import { readRetentionCandidates, RUNNING_CLASS_STATES, type PlacementExecutor, type PlacementState } from './placement';
+import { readRetentionCandidates, type PlacementExecutor, type PlacementState } from './placement';
 
-export const PURGE_AFTER_DAYS = 14;
-const DAY_MS = 86_400_000;
+export const PURGE_POLICY_STATUS = 'held_pending_explicit_deletion_policy';
 
 export interface RetentionCandidate {
     computerId: string;
@@ -28,31 +28,18 @@ export interface Cancellation {
     cancelledAt: Date;
 }
 
-export interface PurgeEligible {
-    computerId: string;
-    basis: 'retired' | 'cancelled';
-    since: Date;
-}
+/** No candidate can be authorized by the current policy. */
+export type PurgeEligible = never;
 
 export function purgeEligibility(input: {
     placements: readonly RetentionCandidate[];
     cancellations: readonly Cancellation[];
     now: Date;
 }): PurgeEligible[] {
-    const cutoff = input.now.getTime() - PURGE_AFTER_DAYS * DAY_MS;
-    const cancelled = new Map(input.cancellations.map((c) => [c.computerId, c.cancelledAt] as const));
-    const out: PurgeEligible[] = [];
-    for (const p of input.placements) {
-        if (p.state === 'RETIRED' && p.updatedAt.getTime() <= cutoff) {
-            out.push({ computerId: p.computerId, basis: 'retired', since: new Date(p.updatedAt.getTime()) });
-            continue;
-        }
-        const at = cancelled.get(p.computerId);
-        if (at && at.getTime() <= cutoff && p.state !== 'PURGE_ELIGIBLE' && !RUNNING_CLASS_STATES.includes(p.state)) {
-            out.push({ computerId: p.computerId, basis: 'cancelled', since: new Date(at.getTime()) });
-        }
-    }
-    return out;
+    // Keep the dry-run call shape for existing operators, without interpreting
+    // legacy cancellation records as deletion authorization.
+    void input;
+    return [];
 }
 
 export async function listPurgeEligible(
