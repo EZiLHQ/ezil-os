@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import time
@@ -14,6 +15,12 @@ SENTINEL = ".ezil-canary-sentinel"
 HISTORY_MARKER = b": EZIL-CANARY-HISTORY-v1"
 SENTINEL_LIMIT = 65536
 HISTORY_LIMIT = 4 * 1024 * 1024
+TOOL = "ezil-canary-tool"
+TOOL_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")   # an npm bin name; never a path
+VERSION = re.compile(r"[0-9A-Za-z.+-]{1,32}")
+PACKAGE_LIMIT = 65536
+PACKAGE_DEPTH_LIMIT = 64
+MAX_TOOLS = 4
 
 
 def enabled(cfg):
@@ -76,6 +83,130 @@ def _read_json(parent, name):
         return {}
 
 
+def _tool_path(rootfs, target):
+    """Resolve one npm-style link, checking even directories cancelled by '..'."""
+    if target.startswith("/") or target.split("/")[-1] in ("", ".", ".."):
+        raise Refused("bad_tool_target")
+    parts = ["usr", "local", "bin"]
+    base = ["usr", "local", "lib", "node_modules"]
+    entered = False
+    for comp in target.split("/"):
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            # The initial ../lib is normal for npm; once inside node_modules, stay there.
+            if len(parts) <= (len(base) if entered else 2):
+                raise Refused("tool_target_escape")
+            fd = open_dir_below(rootfs, "/".join(parts))
+            os.close(fd)
+            parts.pop()
+        else:
+            parts.append(comp)
+        entered = entered or parts == base
+    if parts[:len(base)] != base or len(parts) <= len(base):
+        raise Refused("tool_target_escape")
+    return parts
+
+
+def _inspect_tool(rootfs, name, hash_limit):
+    """(status, sha256, size, package dir parts) for /usr/local/bin/<name>, an npm-style link.
+
+    status: absent | ok | large (a regular file over hash_limit: size only, never read) |
+    unreadable | refused. The package dir is node_modules/<pkg> or node_modules/@scope/<pkg>."""
+    found = False
+    try:
+        parent = open_dir_below(rootfs, "usr/local/bin")
+        try:
+            st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            found = True
+            if not stat.S_ISLNK(st.st_mode):
+                return "refused", None, None, None
+            target = os.readlink(name, dir_fd=parent)
+        finally:
+            os.close(parent)
+        parts = _tool_path(rootfs, target)
+        parent = open_dir_below(rootfs, "/".join(parts[:-1]))
+        try:
+            st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(st.st_mode):
+                return "refused", None, None, None
+            if not stat.S_ISREG(st.st_mode):
+                return "unreadable", None, None, None
+            package = parts[:6] if parts[4].startswith("@") else parts[:5]
+            if st.st_size > hash_limit:
+                return "large", None, st.st_size, package
+            raw = read_regular_at(parent, parts[-1], st, limit=hash_limit)
+            if raw is None:
+                return "unreadable", None, None, None
+            return "ok", hashlib.sha256(raw).hexdigest(), st.st_size, package
+        finally:
+            os.close(parent)
+    except FileNotFoundError:
+        return ("unreadable" if found else "absent"), None, None, None
+    except Refused as error:
+        if isinstance(error.__cause__, FileNotFoundError):
+            return ("unreadable" if found else "absent"), None, None, None
+        if isinstance(error.__cause__, PermissionError):
+            return "unreadable", None, None, None
+        return "refused", None, None, None
+    except OSError:
+        return "unreadable", None, None, None
+
+
+def _read_tool(rootfs):
+    """The synthetic sentinel: hashed in full, so an oversized one is unreadable."""
+    status, digest, _size, _package = _inspect_tool(rootfs, TOOL, SENTINEL_LIMIT)
+    return ("unreadable" if status == "large" else status), digest
+
+
+def _package_json_within_depth(raw):
+    """Bound JSON containers before parsing, regardless of the interpreter's recursion limit."""
+    text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > PACKAGE_DEPTH_LIMIT:
+                return False
+        elif char in "]}":
+            depth -= 1
+    return True  # json.loads validates syntax, including mismatched delimiters and quotes.
+
+
+def _package_version(rootfs, package):
+    """The `version` of node_modules/<pkg>/package.json, bounded and validated, else None."""
+    try:
+        parent = open_dir_below(rootfs, "/".join(package))
+        try:
+            st = os.stat("package.json", dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > PACKAGE_LIMIT:
+                return None
+            raw = read_regular_at(parent, "package.json", st, limit=PACKAGE_LIMIT)
+        finally:
+            os.close(parent)
+        version = json.loads(raw).get("version") if raw is not None and _package_json_within_depth(raw) else None
+    except (OSError, Refused, ValueError, AttributeError, RecursionError):
+        return None
+    return version if isinstance(version, str) and VERSION.fullmatch(version) else None
+
+
+def _tool_names(cfg):
+    names = cfg.get("canaryTools")
+    if not isinstance(names, list):
+        return []
+    return [n for n in names[:MAX_TOOLS] if isinstance(n, str) and TOOL_NAME.fullmatch(n)]
+
+
 def guard_result(cfg, verdict):
     if not enabled(cfg):
         return
@@ -119,13 +250,26 @@ def probe(cfg, phase):
         pass
     lines = history.split(b"\n") if history is not None else None
     count = None if lines is None else len(lines) - int(history.endswith(b"\n") or not history)
+    rootfs = os.path.join(cfg.runDir, "rootfs")
+    tool_status, tool_sha256 = _read_tool(rootfs)
     _emit(cfg, "persistence", {
         "phase": _choice(phase, ("boot", "shutdown")),
         "sentinel": sentinel_status,
         "sentinelSha256": hashlib.sha256(sentinel).hexdigest() if sentinel is not None else None,
         "history": history_status, "historyLines": count,
         "historyMarker": HISTORY_MARKER in lines if lines is not None else None,
+        "toolStatus": tool_status,
+        "toolSha256": tool_sha256,
     })
+    # Real installed tools (canaryTools, e.g. ["opencode"]): presence, size and package
+    # version after each boot/shutdown. A large binary is never read; only its size is.
+    for name in _tool_names(cfg):
+        status, digest, size, package = _inspect_tool(rootfs, name, SENTINEL_LIMIT)
+        _emit(cfg, "tool", {
+            "phase": _choice(phase, ("boot", "shutdown")), "name": name, "status": status,
+            "sha256": digest, "size": _integer(size),
+            "version": _package_version(rootfs, package) if package is not None else None,
+        })
 
 
 def desktop_started(cfg, wait_seconds=10):

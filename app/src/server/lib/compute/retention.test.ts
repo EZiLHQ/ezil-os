@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { readRetentionCandidates } from './placement';
-import { listPurgeEligible, PURGE_AFTER_DAYS, purgeEligibility, type RetentionCandidate } from './retention';
+import { PLACEMENT_STATES, readRetentionCandidates } from './placement';
+import { listPurgeEligible, PURGE_POLICY_STATUS, purgeEligibility, type RetentionCandidate } from './retention';
 
 const NOW = new Date('2026-10-30T00:00:00Z');
 const daysAgo = (d: number) => new Date(NOW.getTime() - d * 86_400_000);
@@ -32,21 +32,28 @@ describe('purge eligibility (§6, dry run)', () => {
         { computerId: 'already', cancelledAt: daysAgo(300) },
     ];
 
-    it('RETIRED or cancelled for 14+ days, never running, never twice', () => {
-        expect(PURGE_AFTER_DAYS).toBe(14);
-        expect(purgeEligibility({ placements, cancellations, now: NOW })).toEqual([
-            { computerId: 'retired-14', basis: 'retired', since: daysAgo(14) },
-            { computerId: 'cancelled-20', basis: 'cancelled', since: daysAgo(20) },
-        ]);
+    it('retirement and cancellation never authorize deletion of retained data', () => {
+        expect(PURGE_POLICY_STATUS).toBe('held_pending_explicit_deletion_policy');
+        expect(purgeEligibility({ placements, cancellations, now: NOW })).toEqual([]);
+    });
+
+    it.each(PLACEMENT_STATES)('protects an undeleted computer in %s regardless of age or cancellation', (state) => {
+        const computerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        expect(purgeEligibility({
+            placements: [{ computerId, state, updatedAt: daysAgo(3650) }],
+            cancellations: [{ computerId, cancelledAt: daysAgo(3650) }],
+            now: NOW,
+        })).toEqual([]);
+    });
+
+    it('cannot turn absent or invalid time evidence into purge permission', () => {
+        expect(purgeEligibility({ placements, cancellations: [], now: new Date('invalid') })).toEqual([]);
     });
 
     it('never mutates its input', () => {
         const input = deepFreeze({ placements: structuredClone(placements), cancellations: structuredClone(cancellations), now: new Date(NOW) });
         const before = structuredClone(input);
-        const out = purgeEligibility(input);
-        expect(input).toEqual(before);
-        // Returned dates are copies: mutating them cannot reach back into the input.
-        out[0]!.since.setTime(0);
+        expect(purgeEligibility(input)).toEqual([]);
         expect(input).toEqual(before);
     });
 
@@ -66,7 +73,7 @@ describe('purge eligibility (§6, dry run)', () => {
         const { db, statements, placements: rows } = createFakePlacementDb({ placements: seed });
         const before = structuredClone(rows);
         const out = await listPurgeEligible(db, { cancellations: [], now: NOW });
-        expect(out.map((o) => o.computerId)).toEqual(['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']);
+        expect(out).toEqual([]);
         expect(statements).toHaveLength(1);
         expect(statements[0]!.sql.replace(/\/\*[\s\S]*?\*\//, '').trim()).toMatch(/^SELECT\b/);
         expect(statements[0]!.sql).not.toMatch(/\b(UPDATE|INSERT|DELETE|TRUNCATE)\b/i);
