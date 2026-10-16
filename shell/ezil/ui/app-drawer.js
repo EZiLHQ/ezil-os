@@ -464,8 +464,24 @@ function attach_floating_drawer (el_window, options) {
             pointer_inside = false;
             schedule_collapse();
         });
+        // A pointer tap toggles from the state the pill was in when the press
+        // BEGAN. The press itself opens the pill (focusin), so judging by
+        // `opened_at` alone made a slow tap — click arriving >500 ms after the
+        // press, routine on a busy phone — read as a second tap and close the
+        // pill it had just opened. Keyboard activation (detail 0) keeps the
+        // focus-then-Enter rule below.
+        let toggle_press_expanded = null;
+        toggle.addEventListener('pointerdown', () => {
+            toggle_press_expanded = ! drawer.classList.contains('collapsed');
+        });
         toggle.addEventListener('click', (e) => {
             e.stopPropagation();
+            const was_expanded = toggle_press_expanded;
+            toggle_press_expanded = null;
+            if ( e.detail !== 0 && was_expanded !== null ) {
+                if ( was_expanded ) collapse(); else reveal();
+                return;
+            }
             if ( drawer.classList.contains('collapsed') || Date.now() - opened_at < 500 ) reveal();
             else collapse();
         });
@@ -497,6 +513,28 @@ function attach_floating_drawer (el_window, options) {
                 if ( ! e.repeat ) e.target.click();
             } else if ( e.key === 'Tab' && ! menu.hidden ) close_menu(true);
         });
+
+        // 🔴 One tap opens the pill: the press lands on the grabber, the pill
+        // grows out from the centre (0.45 s), and the click that ends the SAME
+        // tap is hit-tested against the new layout. On a slow device that click
+        // can land on a traffic light sliding under the finger — a tap meant to
+        // open the controls asked to close the Browser. A pointer click only
+        // activates the control its press started on. Keyboard and programmatic
+        // activation (detail 0) carry no press and are unaffected.
+        let press_button = null;
+        drawer.addEventListener('pointerdown', (e) => {
+            press_button = e.target instanceof Element ? e.target.closest('button') : null;
+        }, true);
+        drawer.addEventListener('click', (e) => {
+            const target = e.target instanceof Element ? e.target.closest('button') : null;
+            const pressed = press_button;
+            press_button = null;
+            if ( e.detail === 0 || ! target || ! pressed ) return;
+            if ( target !== pressed ) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        }, true);
 
         // Same latch as the legacy tray (app-drawer.js:249): touch must
         // activate its window before the stream's next gesture arrives.

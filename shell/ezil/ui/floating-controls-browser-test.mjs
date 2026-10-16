@@ -470,6 +470,47 @@ async function phoneTapCase ({ page }, label) {
     push(`${label}: the tapped pill is still open after the auto-hide delay`, await expanded() === 'true');
     push(`${label}: its traffic lights are tappable`, await page.locator(RED).isVisible()
         && await page.locator(YELLOW).isVisible());
+    // A SLOW tap (click >500 ms after the press, as on a busy phone) must still
+    // leave the pill open; a tap that starts on an open pill closes it.
+    const slowTap = (delay) => page.evaluate(async ({ grabber, delay }) => {
+        const g = document.querySelector(grabber);
+        g.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch', isPrimary: true }));
+        g.focus();
+        await new Promise((r) => setTimeout(r, delay));
+        g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+    }, { grabber: GRABBER, delay });
+    await page.evaluate((sel) => document.querySelector(sel).ezil_controls.collapse(), DRAWER);
+    await page.evaluate(() => document.activeElement?.blur());
+    await sleep(200);
+    await slowTap(700);
+    await sleep(200);
+    push(`${label}: a slow tap (click 700 ms after the press) leaves the pill open`, await expanded() === 'true');
+    await slowTap(50);
+    await sleep(200);
+    push(`${label}: a tap that starts on the open pill closes it`, await expanded() === 'false');
+    await page.evaluate((sel) => document.querySelector(sel).ezil_controls.reveal(), DRAWER);
+    // The tap that opens the pill must not activate a control that slid under
+    // the finger while the pill grew (deterministic replay of the slow-device
+    // race: press on the grabber, pill expands, the click lands on red).
+    await page.evaluate(({ grabber, red }) => {
+        const g = document.querySelector(grabber), r = document.querySelector(red);
+        g.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch', isPrimary: true }));
+        r.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+    }, { grabber: GRABBER, red: RED });
+    await sleep(400);
+    push(`${label}: a click that began on the grabber never triggers red`,
+        await page.locator('dialog.ezil-close-confirm').count() === 0 && await page.locator(WIN).isVisible());
+    // Positive control: a press that starts AND ends on red still asks to close.
+    await page.evaluate((red) => {
+        const r = document.querySelector(red);
+        r.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch', isPrimary: true }));
+        r.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+    }, RED);
+    await eventually(`${label}: a real press on red still opens the close confirmation`,
+        () => page.locator('dialog.ezil-close-confirm').count(), (v) => v === 1);
+    await page.keyboard.press('Escape');
+    await page.locator('dialog.ezil-close-confirm').waitFor({ state: 'detached' }).catch(() => {});
+    await page.evaluate((sel) => document.querySelector(sel).ezil_controls.reveal(), DRAWER);
     // A tap in the stream (outside the pill) dismisses it.
     const frame = await page.locator(`${WIN} .window-app-iframe`).boundingBox();
     await page.touchscreen.tap(frame.x + frame.width / 2, frame.y + frame.height * 0.75);
