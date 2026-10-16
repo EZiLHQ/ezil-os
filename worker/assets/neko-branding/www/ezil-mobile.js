@@ -1,5 +1,5 @@
 /*
- * ezil-mobile.js — the two things only code inside the stream's own document
+ * ezil-mobile.js — the things only code inside the stream's own document
  * can do.
  *
  * Loaded by /var/www/index.html, so it runs IN the desktop's own origin, in
@@ -8,7 +8,7 @@
  * the shell can neither reach this document nor postMessage into a client
  * that does not listen. This file is the only lever there is.
  *
- * TWO INDEPENDENT CONCERNS LIVE HERE, AND THEY ARE GATED DIFFERENTLY:
+ * THESE INDEPENDENT CONCERNS ARE GATED DIFFERENTLY:
  *
  *   1. THE BLACK-PICTURE DETECTOR — runs on EVERY device. It is the only code
  *      in the product that can read the decoded picture, because the `<video>`
@@ -17,8 +17,11 @@
  *      problem, so it must never end up behind the touch gate.
  *   2. THE ON-SCREEN-KEYBOARD AFFORDANCE — touch devices only, a hard no-op
  *      otherwise. Everything from the `isTouchDevice()` gate down is this.
+ *   3. FRAME CONTROLS / CAPTURE — all devices, before the touch gate. Only
+ *      capture carries pixels, and it requires an allow-listed parent origin.
  *
- * They share only `NS` and the `postMessage` convention. Keep it that way.
+ * Capture reuses the detector's decoded-video guard; keyboard behavior remains
+ * independent. They use the same `NS` and `postMessage` convention.
  *
  * The rest of this header is about (2).
  *
@@ -135,7 +138,7 @@
 
 
     // ═══════════════════════════════════════════════════════════════════════
-    // CONCERN 1 of 2 — THE BLACK-PICTURE DETECTOR.
+    // CONCERN 1 — THE BLACK-PICTURE DETECTOR.
     //
     // 🔴 THIS HALF RUNS ON EVERY DEVICE. The touch gate below it belongs to
     // the keyboard affordance and to nothing else. A black desktop is not a
@@ -526,14 +529,21 @@
         }
     }
 
-    // The shell's side of the request. Deliberately narrow: it answers exactly
-    // two message types from the parent and ignores everything else, including
-    // anything that does not carry our own namespace.
+    // The shell's side of the request. Deliberately narrow: it answers only the
+    // vitals types and the frame-capture request from the parent, and ignores
+    // everything else, including anything that does not carry our namespace.
+    // ONE message listener on purpose: frame capture is dispatched from here to
+    // `handleFrameCaptureRequest` (below), which re-checks parent, origin
+    // allowlist and nonce itself, rather than registering a second listener.
     try {
         window.addEventListener('message', function (ev) {
             var d = ev && ev.data;
             if (!d || d.source !== 'ezil-shell') return;
             if (ev.source !== window.parent) return;
+            if (d.type === 'frame_capture_request') {
+                if (typeof handleFrameCaptureRequest === 'function') handleFrameCaptureRequest(ev);
+                return;
+            }
             if (d.type === 'viewer_probe') {
                 if (viewerAttempt && d.attempt === viewerAttempt) {
                     viewerNeedsVitals = true;
@@ -547,6 +557,138 @@
     } catch (e) {
         warn('vitals-listen-failed', String((e && e.message) || e));
     }
+
+    // The shell cannot see input or video inside this cross-origin document
+    // (docs/FEEDBACK-CONTROLS-CONTRACT.md:79). Keep this above the touch gate.
+    // Worker-owned config is loaded before this script; never infer permission
+    // from a referrer, query string, or the first sender's claimed origin.
+    var shellOrigins = [];
+    try {
+        shellOrigins = window.EZIL_SHELL_ORIGINS === undefined
+            ? ['https://os.ezil.org', 'https://ezil-os.vercel.app', 'http://localhost:*', 'http://127.0.0.1:*']
+            : (Array.isArray(window.EZIL_SHELL_ORIGINS) ? window.EZIL_SHELL_ORIGINS.slice() : []);
+    } catch (e) { /* malformed configuration leaves capture disabled */ }
+
+    function allowedShellOrigin(origin) {
+        try {
+            var url = new URL(origin);
+            if (url.origin !== origin || (url.protocol !== 'https:' && url.protocol !== 'http:')) return false;
+            return shellOrigins.some(function (allowed) {
+                if (allowed === origin) return true;
+                // Only these two literal loopback patterns allow arbitrary
+                // ports. Suffix matches would also trust attacker hostnames.
+                return url.protocol === 'http:' &&
+                    ((allowed === 'http://localhost:*' && url.hostname === 'localhost') ||
+                     (allowed === 'http://127.0.0.1:*' && url.hostname === '127.0.0.1'));
+            });
+        } catch (e) { return false; }
+    }
+
+    function postControls(type) {
+        try {
+            if (window.parent && window.parent !== window) {
+                // These notifications carry no pixels or user data. Capture
+                // below always replies to the validated request's exact origin.
+                window.parent.postMessage({ source: NS, type: type }, '*');
+            }
+        } catch (e) { /* closing parent: controls must not interrupt the stream */ }
+    }
+
+    var edgeSince = null;
+    var edgeTimer = null;
+    var lastEdgeReveal = -Infinity;
+    function cancelEdgeDwell() {
+        try { clearTimeout(edgeTimer); } catch (e) {}
+        edgeTimer = null;
+        edgeSince = null;
+    }
+    try {
+        window.addEventListener('pointermove', function (ev) {
+            try {
+                if (ev.pointerType !== 'mouse' || ev.clientY > 2 || ev.clientY < 0) {
+                    cancelEdgeDwell();
+                    return;
+                }
+                var now = Date.now();
+                if (edgeSince === null) edgeSince = now;
+                if (edgeTimer !== null) return;
+                edgeTimer = setTimeout(function () {
+                    edgeTimer = null;
+                    if (edgeSince === null) return;
+                    lastEdgeReveal = Date.now();
+                    postControls('edge_reveal');
+                }, Math.max(250 - (now - edgeSince), 1500 - (now - lastEdgeReveal), 0));
+            } catch (e) { cancelEdgeDwell(); }
+        }, true);
+        // Leaving the frame or tab breaks continuity even without another
+        // pointermove. Child-to-child pointerout events do not leave the frame.
+        window.addEventListener('pointerout', function (ev) {
+            if (!ev.relatedTarget) cancelEdgeDwell();
+        }, true);
+        window.addEventListener('pointercancel', cancelEdgeDwell, true);
+        window.addEventListener('blur', cancelEdgeDwell, true);
+        document.addEventListener('visibilitychange', function () {
+            if (document.hidden) cancelEdgeDwell();
+        });
+    } catch (e) { /* controls are optional; leave the existing stream running */ }
+
+    try {
+        document.addEventListener('keydown', function (ev) {
+            try {
+                // D9 default: Ctrl+Alt+Shift+ArrowUp reveals/focuses controls.
+                // Document capture precedes the textarea's remote input handler
+                // (this file:34) while preserving the keyboard guard at window.
+                if (ev.key !== 'ArrowUp' || !ev.ctrlKey || !ev.altKey || !ev.shiftKey || ev.metaKey) return;
+                ev.preventDefault();
+                ev.stopPropagation();
+                ev.stopImmediatePropagation();
+                postControls('controls_hotkey');
+            } catch (e) { /* a malformed event must not break remote input */ }
+        }, true);
+    } catch (e) { /* controls are optional */ }
+
+    var lastCapture = -Infinity;
+    var captureBusy = false;
+    // Called by the single message listener above for `frame_capture_request`.
+    var handleFrameCaptureRequest = function (ev) {
+            try {
+                var d = ev.data;
+                if (ev.source !== window.parent || !allowedShellOrigin(ev.origin) ||
+                    !d || d.source !== 'ezil-shell' || d.type !== 'frame_capture_request' ||
+                    typeof d.nonce !== 'string' || d.nonce.length > 64) return;
+                var nonce = d.nonce;
+                var origin = ev.origin;
+                var parent = ev.source;
+                function reply(blob) {
+                    try {
+                        parent.postMessage({ source: NS, type: 'frame_capture_result', nonce: nonce, blob: blob }, origin);
+                    } catch (e) { /* parent may have navigated while PNG encoding ran */ }
+                }
+                var now = Date.now();
+                if (captureBusy || now - lastCapture < 2000) { reply(null); return; }
+                lastCapture = now;
+                captureBusy = true;
+                try {
+                    // Reuse the detector's decoded-frame guard: drawing before
+                    // HAVE_CURRENT_DATA would fabricate an empty screenshot.
+                    var video = liveVideo();
+                    if (!video) throw new Error('no decoded frame');
+                    var shot = document.createElement('canvas');
+                    shot.width = video.videoWidth;
+                    shot.height = video.videoHeight;
+                    var context = shot.getContext('2d');
+                    if (!context) throw new Error('no canvas context');
+                    context.drawImage(video, 0, 0, shot.width, shot.height);
+                    shot.toBlob(function (blob) {
+                        captureBusy = false;
+                        reply(blob || null);
+                    }, 'image/png');
+                } catch (e) {
+                    captureBusy = false;
+                    reply(null);
+                }
+            } catch (e) { /* untrusted messages must not interrupt the player */ }
+    };
 
     // ── The loop ────────────────────────────────────────────────────────────
     var pictureTimer = null;
@@ -631,7 +773,7 @@
     // than working around.)
 
     // ═══════════════════════════════════════════════════════════════════════
-    // CONCERN 2 of 2 — THE ON-SCREEN-KEYBOARD AFFORDANCE. Touch devices only.
+    // CONCERN 2 — THE ON-SCREEN-KEYBOARD AFFORDANCE. Touch devices only.
     // Everything below this banner is the keyboard and nothing else; the
     // `return` in the gate exits the keyboard half, not the file. The
     // detector above has already been started and is unaffected by it.

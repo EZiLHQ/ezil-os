@@ -106,6 +106,8 @@ import { WORKER_DESKTOP_READY_TIMEOUT_MS } from './preview-timeouts';
 export { ContainerProxy } from '@cloudflare/sandbox';
 
 interface Env extends SandboxEnv {
+  /** Comma-separated shell origins for frame capture; unset uses the page's production/loopback defaults. */
+  EZIL_SHELL_ORIGINS?: string;
   /** Approved bare preview zone; unset preserves production's ezil.org routing. */
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
@@ -1056,6 +1058,15 @@ async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<C
   }
 }
 
+// The page needs deployment configuration, not the API's wildcard CORS policy
+// (worker/src/index.ts:761). JSON serialization keeps env values out of executable
+// code; an explicitly empty list disables capture instead of adding defaults.
+export function nekoShellOriginsScript(origins: string | undefined): string {
+  const value = origins === undefined ? 'undefined' : JSON.stringify(origins.split(',').map(s => s.trim()).filter(Boolean))
+    .replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  return `window.EZIL_SHELL_ORIGINS = ${value};\n`;
+}
+
 async function ensureDesktop(
   sandbox: Sandbox<unknown>,
   hostname: string,
@@ -1078,6 +1089,19 @@ async function ensureDesktop(
 ): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
+  if (mode === 'neko') {
+    // Refresh even on warm previews so a deployment can narrow the allowlist.
+    // The image loads this before ezil-mobile.js (assets/neko-branding/Dockerfile:124).
+    // Use the SDK's file API, never shell interpolation or caller-supplied origins.
+    // Best-effort: this file only narrows frame capture. A failed write must
+    // never block opening the desktop — the page then uses its built-in
+    // production/loopback defaults (ezil-mobile.js), exactly as a standalone image does.
+    try {
+      await sandbox.writeFile('/var/www/ezil-shell-origins.js', nekoShellOriginsScript(iceEnv?.EZIL_SHELL_ORIGINS));
+    } catch (err) {
+      console.warn(`[ensureDesktop] shell-origins config not written; page defaults apply: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   const exposed = await sandbox.getExposedPorts(hostname);
   const already = exposed.find((p) => p.port === port);
   if (already) {
@@ -3815,6 +3839,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const nekoCreds = await deriveNekoCredentials(this.env, sandboxId);
       iceEnv = {
         ...(iceEnv ?? {}),
+        ...(this.env.EZIL_SHELL_ORIGINS !== undefined ? { EZIL_SHELL_ORIGINS: this.env.EZIL_SHELL_ORIGINS } : {}),
         NEKO_MEMBER_MULTIUSER_USER_PASSWORD: nekoCreds.user,
         NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: nekoCreds.admin,
         NEKO_PASSWORD: nekoCreds.user,
@@ -4344,6 +4369,7 @@ async function handlePreview(
     const nekoCreds = await deriveNekoCredentials(env, sandboxId);
     iceEnv = {
       ...(iceEnv ?? {}),
+      ...(env.EZIL_SHELL_ORIGINS !== undefined ? { EZIL_SHELL_ORIGINS: env.EZIL_SHELL_ORIGINS } : {}),
       NEKO_MEMBER_MULTIUSER_USER_PASSWORD: nekoCreds.user,
       NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: nekoCreds.admin,
       NEKO_PASSWORD: nekoCreds.user,

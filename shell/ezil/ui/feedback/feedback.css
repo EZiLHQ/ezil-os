@@ -1,0 +1,102 @@
+/* feedback.css — EZiL-authored. Below popovers (9999999), above ordinary windows. */
+.ezil-feedback-chip {
+    position: fixed;
+    top: max(8px, env(safe-area-inset-top));
+    right: max(8px, env(safe-area-inset-right));
+    z-index: 9999996;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 36px;
+    padding: 7px 12px;
+    border: 1px solid #d7dbe4;
+    border-radius: 24px;
+    background: #fff;
+    color: #24334c;
+    box-shadow: 0 2px 10px #0002;
+    font: 600 13px/1.3 system-ui, sans-serif;
+    cursor: pointer;
+}
+.ezil-feedback-chip svg { width: 19px; height: 19px; }
+.ezil-feedback-chip:focus-visible,
+.ezil-feedback-dialog :focus-visible { outline: 3px solid #3479d5; outline-offset: 3px; }
+.ezil-feedback-dialog {
+    box-sizing: border-box;
+    width: min(560px, calc(100vw - 24px));
+    max-height: calc(100dvh - 32px);
+    margin: auto;
+    padding: 24px;
+    overflow: auto;
+    border: 1px solid #d7dbe4;
+    border-radius: 16px;
+    background: #fff;
+    color: #24334c;
+    box-shadow: 0 16px 60px #0004;
+    font: 14px/1.5 system-ui, sans-serif;
+}
+.ezil-feedback-dialog::backdrop { background: #11182780; }
+.ezil-feedback-dialog.ezil-feedback-capturing { visibility: hidden; }
+.ezil-feedback-dialog.ezil-feedback-capturing::backdrop { background: transparent; }
+.ezil-feedback-dialog [hidden] { display: none !important; }
+.ezil-feedback-dialog h2 { font-size: 21px; margin: 0 0 16px; }
+.ezil-feedback-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.ezil-feedback-category { border: 0; padding: 0; margin: 0 0 16px; }
+.ezil-feedback-category label { display: inline-flex; gap: 4px; align-items: center; margin-right: 16px; }
+.ezil-feedback-category legend { margin-bottom: 6px; }
+.ezil-feedback-dialog textarea {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    margin-top: 6px;
+    padding: 10px;
+    resize: vertical;
+    border: 1px solid #aab3c2;
+    border-radius: 6px;
+    font: inherit;
+    color: inherit;
+    background: #fff;
+}
+.ezil-feedback-dialog input { accent-color: #245fae; }
+.ezil-feedback-muted { color: #5c687b; margin: 4px 0 12px; }
+.ezil-feedback-warning { padding: 10px; background: #fff2d4; color: #654600; border-radius: 6px; }
+.ezil-feedback-consent { display: flex; align-items: center; gap: 6px; margin: 12px 0; }
+.ezil-feedback-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.ezil-feedback-dialog button {
+    border: 1px solid #aab3c2;
+    border-radius: 7px;
+    background: #f7f8fb;
+    color: inherit;
+    padding: 8px 12px;
+    font: inherit;
+    cursor: pointer;
+}
+.ezil-feedback-dialog button[type="submit"] { background: #245fae; border-color: #245fae; color: #fff; }
+.ezil-feedback-dialog button:disabled { opacity: .55; cursor: default; }
+.ezil-feedback-preview { margin-top: 16px; }
+.ezil-feedback-preview summary { cursor: pointer; }
+.ezil-feedback-preview pre {
+    max-height: 230px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding: 10px;
+    background: #f2f4f8;
+    font-size: 12px;
+    user-select: text;
+}
+.ezil-feedback-image img { display: block; max-width: 100%; max-height: 240px; margin: 12px 0; object-fit: contain; }
+.ezil-feedback-result { overflow-wrap: anywhere; }
+.ezil-feedback-reports { padding-left: 20px; }
+.ezil-feedback-reports li { margin: 12px 0; overflow-wrap: anywhere; }
+.ezil-feedback-reports p { margin: 4px 0; white-space: pre-wrap; }
+@media (max-width: 499px) {
+    .ezil-feedback-chip span { display: none; }
+    .ezil-feedback-chip { width: 36px; padding: 7px; }
+    .ezil-feedback-dialog { padding: 18px; }
+}
+@media (any-pointer: coarse) {
+    .ezil-feedback-chip { min-width: 44px; min-height: 44px; }
+    .ezil-feedback-dialog button, .ezil-feedback-dialog summary,
+    .ezil-feedback-consent, .ezil-feedback-category label { min-height: 44px; }
+}

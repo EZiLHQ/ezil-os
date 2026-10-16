@@ -60,6 +60,14 @@ If you believe an attribution is missing or inaccurate, please open an issue
 
 ---
 
+### SnapDOM (`zumerlab/snapdom`)
+- **URL:** https://github.com/zumerlab/snapdom
+- **License:** MIT (`shell/src/lib/snapdom-3.3.4/LICENSE.txt`).
+- **Used for:** Feedback screenshot tier A — a DOM snapshot of the shell only
+  (cross-origin iframes are never captured; they are replaced by a placeholder).
+- **Version:** 3.3.4, vendored unmodified as `shell/src/lib/snapdom-3.3.4/snapdom.mjs`
+  (npm `@zumer/snapdom@3.3.4` `dist/snapdom.mjs`; sha256 in `SHA256SUMS`).
+
 ## 2. Desktop / sandbox container image (`worker/Dockerfile`)
 
 ### Apache Guacamole (`apache/guacamole-client`, `apache/guacamole-server`)
