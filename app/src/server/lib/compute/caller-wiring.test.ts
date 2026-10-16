@@ -43,6 +43,7 @@ vi.mock('@/app/api/cron/sandbox-reap/handler', () => ({
 import { GET as reapGET } from '@/app/api/cron/sandbox-reap/route';
 import { cloudflareGuacamoleRouter } from '@/server/api/routers/cloudflare-guacamole';
 import { computerRouter } from '@/server/api/routers/computer';
+import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
     deriveGuacamoleSandboxId,
     mintSandboxPreviewToken,
@@ -84,11 +85,15 @@ afterEach(() => {
     vi.restoreAllMocks();
 });
 
-const owner = () =>
-    cloudflareGuacamoleRouter.createCaller({
-        user: { id: userId },
-        db: { query: { computers: { findFirst: async () => ({ id: computerId }) } } },
-    } as never);
+const owner = (pinned = true) => {
+    vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', pinned ? '1' : '0');
+    vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '0');
+    const fake = createFakePlacementDb({ placements: pinned ? [placementRow({
+        computer_id: computerId, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2',
+    })] : [] });
+    const db = Object.assign(fake.db, { query: { computers: { findFirst: async () => ({ id: computerId }) } } });
+    return cloudflareGuacamoleRouter.createCaller({ user: { id: userId }, db } as never);
+};
 
 describe('router lifecycle procedures address the owner-derived sandbox', () => {
     it('status → GET /sandbox/:name/status', async () => {
@@ -213,5 +218,18 @@ describe('P3: sandbox-reap asks each candidate\'s placement only when placement 
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
         await reapGET(new Request('https://app.example/api/cron/sandbox-reap'));
         expect(typeof (captured.reapDeps as { providerOf?: unknown }).providerOf).toBe('function');
+    });
+});
+
+describe('legacy non-start calls retain Cloudflare behavior when reads are off', () => {
+    it('status and activity still address the owner-derived sandbox', async () => {
+        reply = { ok: true, guacamoleRunning: true };
+        const caller = owner(false);
+        await caller.status({ computerId });
+        await caller.reportActivity({ computerId, lastInputAgoMs: 10 });
+        expect(calls.map(({ method, url }) => ({ method, url }))).toEqual([
+            { method: 'GET', url: `${base}/sandbox/${sandbox}/status` },
+            { method: 'POST', url: `${base}/sandbox/${sandbox}/activity` },
+        ]);
     });
 });
