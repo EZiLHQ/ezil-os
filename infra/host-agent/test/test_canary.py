@@ -539,6 +539,18 @@ class RealToolProbe(unittest.TestCase):
         [event] = self.events()
         self.assertIsNone(event["version"])
 
+    def test_deeply_nested_package_json_cannot_disrupt_boot_or_shutdown_probe(self):
+        self.install(b"tool")
+        body = b'{"version":"1.19.0","nested":' + b"[" * 16384 + b"0" + b"]" * 16384 + b"}"
+        self.assertLessEqual(len(body), canary.PACKAGE_LIMIT)
+        with self.assertRaises(RecursionError):
+            json.loads(body)
+        (self.package / "package.json").write_bytes(body)
+        for phase in ("boot", "shutdown"):
+            with self.subTest(phase=phase):
+                [event] = self.events(phase)
+                self.assertEqual((event["status"], event["version"], event["phase"]), ("ok", None, phase))
+
     def test_bin_link_escaping_node_modules_is_refused_and_unread(self):
         (self.bin / "opencode").symlink_to("/etc/shadow")
         with mock.patch.object(canary, "read_regular_at", side_effect=AssertionError("unsafe read")):

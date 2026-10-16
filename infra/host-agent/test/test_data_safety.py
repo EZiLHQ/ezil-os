@@ -142,6 +142,37 @@ class BlankDiskCheck(unittest.TestCase):
             self.assertEqual(read.call_count, 1)
             self.assertLessEqual(read.call_args.args[1], zero_check.CHUNK_BYTES)
 
+    def test_tier_scan_timing_at_configured_throughput_stays_within_scan_budget(self):
+        # Simulate full 20/50 GiB reads at existing 125 MiB/s without opening or
+        # allocating either volume. Every read reuses one bounded zero buffer.
+        zeros = bytes(zero_check.CHUNK_BYTES)
+        throughput = 125 * 1024**2
+        for gib, ideal_seconds in ((20, 163.84), (50, 409.6)):
+            now, offset, largest = 0.0, 0, 0
+            size = gib * 1024**3
+
+            def read(fd, count, position):
+                nonlocal now, offset, largest
+                self.assertEqual((fd, position), (99, offset))
+                self.assertLessEqual(count, zero_check.CHUNK_BYTES)
+                offset += count
+                now += count / throughput
+                largest = max(largest, count)
+                return zeros[:count]
+
+            with self.subTest(gib=gib), mock.patch.object(zero_check.os, "open", return_value=99), \
+                 mock.patch.object(zero_check.os, "lseek", return_value=size), \
+                 mock.patch.object(zero_check.os, "pread", new=read), \
+                 mock.patch.object(zero_check.os, "close"):
+                self.assertIsNone(zero_check.verify("/dev/simulated", config.DEFAULTS["blankVerifySeconds"], lambda: now))
+            self.assertEqual(offset, size)
+            self.assertEqual(largest, zero_check.CHUNK_BYTES)
+            self.assertAlmostEqual(now, ideal_seconds, places=6)
+            self.assertLess(now, config.DEFAULTS["blankVerifySeconds"])
+            # This is only scan headroom: other provisioning consumes the same
+            # existing 600s nonce window; total hosted readiness is still unproven.
+            self.assertGreater(600 - now, 190 if gib == 50 else 430)
+
     def test_unknown_used_disk_refuses_before_mkfs_and_preserves_bytes(self):
         self.disk.write_bytes(b"unknown filesystem or corrupted prior data")
         original = self.disk.read_bytes()
@@ -172,11 +203,11 @@ class BlankDiskCheck(unittest.TestCase):
 
     def test_stalled_read_child_is_bounded_and_invalid_budgets_refuse(self):
         with mock.patch.object(guard.subprocess, "run", side_effect=[
-                subprocess.CompletedProcess([], 1, "", ""), subprocess.TimeoutExpired("zero_check", 300)]) as run:
+                subprocess.CompletedProcess([], 1, "", ""), subprocess.TimeoutExpired("zero_check", 500)]) as run:
             with self.assertRaisesRegex(Refused, "volume_blank_timeout"):
                 guard.verify_blank_device({}, str(self.disk))
-            self.assertEqual(run.call_args.kwargs["timeout"], 300)
-        for seconds in (0, -1, True, 301, float("inf"), float("nan"), "60"):
+            self.assertEqual(run.call_args.kwargs["timeout"], 500)
+        for seconds in (0, -1, True, 501, float("inf"), float("nan"), "60"):
             with self.subTest(seconds=seconds), mock.patch.object(guard.subprocess, "run") as run:
                 with self.assertRaisesRegex(Refused, "volume_blank_timeout_invalid"):
                     guard.verify_blank_device({"blankVerifySeconds": seconds}, str(self.disk))

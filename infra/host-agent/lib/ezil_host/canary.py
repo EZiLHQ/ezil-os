@@ -170,7 +170,7 @@ def _package_version(rootfs, package):
         finally:
             os.close(parent)
         version = json.loads(raw).get("version") if raw is not None else None
-    except (OSError, Refused, ValueError, AttributeError):
+    except (OSError, Refused, ValueError, AttributeError, RecursionError):
         return None
     return version if isinstance(version, str) and VERSION.fullmatch(version) else None
 

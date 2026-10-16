@@ -17,7 +17,7 @@ DEFAULTS = {
     "apparmorProfile": "ezil-desktop",
     "deviceByIdDir": "/dev/disk/by-id",
     "dataDeviceName": "/dev/sdf",              # EC2 attachment name, not the Nitro guest path
-    "blankVerifySeconds": 300,                 # bounded full zero scan; only before first format
+    "blankVerifySeconds": 500,                 # bounded full zero scan; only before first format
     "imdsUrl": "http://169.254.169.254",
     "enrollUrl": None,                         # https://<app>/api/internal/computers/enroll
     "caFile": None,                            # None = system trust store

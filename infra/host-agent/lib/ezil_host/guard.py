@@ -201,9 +201,9 @@ def mount_opts(path):
 
 def verify_blank_device(cfg, dev):
     """Never infer blankness from a missing signature on a damaged/unknown disk."""
-    seconds = cfg.get("blankVerifySeconds", 300)
+    seconds = cfg.get("blankVerifySeconds", 500)
     if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
-            or not math.isfinite(seconds) or not 0 < seconds <= 300):
+            or not math.isfinite(seconds) or not 0 < seconds <= 500):
         raise Refused("volume_blank_timeout_invalid")
     try:
         mounted = subprocess.run(["findmnt", "-rn", "--source", dev],

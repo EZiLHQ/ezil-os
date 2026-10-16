@@ -18,13 +18,15 @@ result is confirmed with `wipefs --no-act`; it does not prove an empty disk. A p
 lease can initialize only an unmounted disk whose full contents are verified zero, with
 a 1 MiB streaming buffer and monotonic deadline. A child-process timeout bounds stalled
 reads; unknown nonzero contents, read failures and incomplete scans refuse before mkfs.
-`blankVerifySeconds` defaults to 300 seconds and cannot exceed 300. This scan happens only
+`blankVerifySeconds` defaults to 500 seconds and cannot exceed 500. This scan happens only
 before first format, never during normal stop/start/replacement of a formatted volume.
-At 125 MiB/s a 20 GiB volume needs about 164 seconds of ideal read time. Large/slow
-volumes can exceed the scan deadline and then refuse provisioning; existing total
-startup/enrollment/nonce deadlines still apply. Hosted timing and startup acceptance
-are unconfirmed. Do not raise startup/spending
-limits or skip this check to turn that refusal into a destructive initialization.
+At the existing 125 MiB/s throughput, 20 GiB needs about 164 seconds and the 50 GiB plus
+tier needs about 410 seconds of ideal read time. Plus therefore leaves only about 190
+seconds of the existing 600-second nonce window for all other provisioning work; a scan
+at its 500-second cap leaves 100 seconds. The scan does not extend that window or change
+AWS throughput. Large/slow volumes can exceed either deadline and refuse provisioning.
+Hosted timing and total startup acceptance remain blockers until tested. Do not extend
+nonce/startup/spending limits or skip this check to turn a refusal into initialization.
 `test_tool_persistence.py` verifies the retained global npm bin/package/dependency layout
 and executes a fixture command in two fresh isolated tmux servers. It does not install
 the real `opencode-ai` package or prove EC2/EBS/container lifecycle acceptance. The hosted
