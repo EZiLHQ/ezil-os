@@ -73,7 +73,8 @@ export class OpsStack extends Stack {
             actions: ['sns:Publish'], resources: [this.topic.topicArn],
             conditions: { StringEquals: { 'aws:SourceAccount': a }, ArnLike: { 'aws:SourceArn': sourceArn } } });
         this.topic.addToResourcePolicy(publisher('cloudwatch.amazonaws.com', `arn:aws:cloudwatch:${c.region}:${a}:alarm:ezil-${c.namespace}-*`));
-        this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:budget/ezil-${c.namespace}-monthly*`));
+        // A kept live budget (existingBudgetName) keeps the exact ARN it was granted; a revision-named one needs the prefix.
+        this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:budget/${c.existingBudgetName ?? `ezil-${c.namespace}-monthly*`}`));
         // The founder's inboxes. Each address must confirm the AWS subscription email once.
         c.alertEmails.forEach((endpoint, i) => new sns.Subscription(this, `AlertEmail${i}`, {
             topic: this.topic, protocol: sns.SubscriptionProtocol.EMAIL, endpoint }));

@@ -133,6 +133,9 @@ test('existingBudgetName keeps the live budget byte-for-byte and still adds both
     assert.deepEqual(o.of('AWS::Budgets::Budget'), [LIVE_PILOT_BUDGET]);
     assert.ok(alarm(o, 'ezil-pilot-vcpu-quota-high'));
     assert.ok(alarm(o, 'ezil-pilot-computers-capacity-high'));
+    const policy = JSON.stringify(o.of('AWS::SNS::TopicPolicy'));
+    assert.match(policy, /budget\/ezil-pilot-monthly"/, 'the live budget keeps its exact publish grant');
+    assert.doesNotMatch(policy, /budget\/ezil-pilot-monthly\*/);
 });
 
 test('existingBudgetName refuses budget emails rather than replacing the live budget', () => {
