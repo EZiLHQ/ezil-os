@@ -179,7 +179,7 @@ await page.route('**/*', async (route) => {
     if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
     if ( url.includes('/api/') ) return json({ ok: true });
     if ( url.startsWith(HOST) ) return route.fulfill({ status: 404, body: '' });
-    return route.continue();
+    return route.abort();
 });
 
 await page.goto(`${HOST}/os`, { waitUntil: 'load' });

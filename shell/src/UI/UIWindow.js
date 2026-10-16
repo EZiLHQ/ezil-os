@@ -4277,12 +4277,28 @@ $.fn.makeWindowInvisible = async function (options) {
     });
 };
 
+// MODIFIED BY EZIL 2026-10-16: an interrupted minimise/restore must not leave
+// its 250ms cleanup armed against the next animation. The durations stay the
+// same; only the current geometry transition owns its cleanup.
+const geometry_transition_cleanup = new WeakMap();
+function cancel_geometry_transition_cleanup (el) {
+    clearTimeout(geometry_transition_cleanup.get(el));
+    geometry_transition_cleanup.delete(el);
+}
+function schedule_geometry_transition_cleanup (el, reset_transform = false) {
+    geometry_transition_cleanup.set(el, setTimeout(() => {
+        geometry_transition_cleanup.delete(el);
+        $(el).css({ transition: 'none', ...(reset_transform ? { transform: 'none' } : {}) });
+    }, 250));
+}
+
 $.fn.showWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
             window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: true } }));
             // show window
             const el_window = this;
+            cancel_geometry_transition_cleanup(el_window);
 
             // Stay-on-top windows (every fullpage/dashboard app window) are
             // CREATED in the 99999999+ z band; restore must re-raise them
@@ -4377,9 +4393,7 @@ $.fn.showWindow = async function (options) {
 
             // remove `transitions` a good while after setting css to make sure
             // it doesn't interfere with an ongoing animation
-            setTimeout(() => {
-                $(el_window).css('transition', 'none');
-            }, 250);
+            schedule_geometry_transition_cleanup(el_window);
         }
     });
     return this;
@@ -5234,6 +5248,7 @@ function morph_window_from_tile (el_window, tile, morph_options = {}) {
 $.fn.hideWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
+            cancel_geometry_transition_cleanup(this);
             window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: false } }));
             // get taskbar item location
             let taskbar_item_pos = $(`.taskbar .taskbar-item[data-app="${$(this).attr('data-app')}"]`).position();
@@ -5446,12 +5461,7 @@ $.fn.hideWindow = async function (options) {
 
             // remove transitions a good while after setting css to make sure
             // it doesn't interfere with an ongoing animation
-            setTimeout(() => {
-                $(this).css({
-                    'transition': 'none',
-                    'transform': 'none',
-                });
-            }, 250);
+            schedule_geometry_transition_cleanup(this, true);
 
             // reset the tab title (the URL is not touched — apps never
             // rewrite it on the desktop) — only if this window owned it

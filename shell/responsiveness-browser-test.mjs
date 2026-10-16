@@ -258,7 +258,7 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
         if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
         if ( url.includes('/api/') ) return json({ ok: true });
         if ( url.startsWith(HOST) ) return route.fulfill({ status: 404, body: '' });
-        return route.continue();
+        return route.abort();
     });
 
     await page.goto(`${HOST}/os`, { waitUntil: 'load' });
@@ -385,17 +385,30 @@ for ( const shape of SHAPES ) {
 // a restore lands on top of a transition that has not finished.
 const FLICKER_SETTLE_MS = 210;
 
-/** One minimise + restore, sampled across the restore. */
-const cycle = (page) => page.evaluate(async ({ settle_ms }) => {
+/** One minimise + restore, optionally interrupted before it finishes. */
+const cycle = (page, { interrupt_ms = 0, hidden_ms = 650 } = {}) => page.evaluate(async ({ settle_ms, interrupt_ms, hidden_ms }) => {
     const el = document.querySelector('.window[data-app="desktop"]');
-    el.querySelector('.window-head .window-minimize-btn')?.click();
+    const minimise = () => el.querySelector('.window-head .window-minimize-btn')?.click();
+    const restore = () => document.querySelector('.taskbar-item[data-app="desktop"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    minimise();
     await new Promise((r) => setTimeout(r, 650));
+    let interrupted = null;
+    if ( interrupt_ms ) {
+        restore();
+        await new Promise((r) => setTimeout(r, interrupt_ms));
+        const r = el.getBoundingClientRect();
+        interrupted = { w: r.width, h: r.height };
+        minimise();
+        await new Promise((r) => setTimeout(r, hidden_ms));
+    }
     const orig = {
         w: Number(el.getAttribute('data-orig-width')),
         h: Number(el.getAttribute('data-orig-height')),
     };
     const samples = [];
     const t0 = performance.now();
+    const timeline0 = document.timeline.currentTime;
     // Record the renderer's transition timing so an intermittent miss has
     // evidence beyond a final-size rerun. These listeners do not force style
     // or layout, and the checkpoint and assertions below remain unchanged.
@@ -403,37 +416,55 @@ const cycle = (page) => page.evaluate(async ({ settle_ms }) => {
     const record = event => {
         if (event.target === el && ['width', 'height'].includes(event.propertyName)) {
             transitions.push({ type: event.type, property: event.propertyName,
-                t: performance.now() - t0, elapsed: event.elapsedTime });
+                t: performance.now() - t0, timeline: document.timeline.currentTime - timeline0,
+                elapsed: event.elapsedTime });
         }
     };
     const transitionEvents = ['transitionrun', 'transitionstart', 'transitionend', 'transitioncancel'];
     for (const type of transitionEvents) el.addEventListener(type, record);
-    document.querySelector('.taskbar-item[data-app="desktop"]')
-        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    restore();
     const measure = () => {
         const r = el.getBoundingClientRect();
         return { t: performance.now() - t0, w: Math.round(r.width), h: Math.round(r.height),
-            fullbleed: el.classList.contains('ezil-fullbleed') };
+            fullbleed: el.classList.contains('ezil-fullbleed'),
+            // Wall time can reach 210ms while a delayed rendering frame still
+            // samples the 200ms animation at 183ms. Keep the strict checkpoint;
+            // record the browser's clock and target to explain any shortfall.
+            timeline: document.timeline.currentTime - timeline0,
+            animations: el.getAnimations().filter(a => ['width', 'height'].includes(a.transitionProperty))
+                .map(a => ({ property: a.transitionProperty, start: a.startTime - timeline0,
+                    time: a.currentTime, duration: a.effect.getTiming().duration,
+                    keyframes: a.effect.getKeyframes().map(k => k[a.transitionProperty]) })) };
     };
     // A 20ms polling loop can stop at 192ms before its next sample passes
     // 210ms. Measure the checkpoint itself, before the 220ms full-bleed
     // callback can conceal a wrong restore target.
     const checkpoint = new Promise(resolve => setTimeout(() => resolve(measure()),
         Math.max(0, settle_ms - (performance.now() - t0))));
+    let restore_animations = [];
     for ( let i = 0; i < 32; i++ ) {
         samples.push(measure());
+        if ( i === 0 ) {
+            restore_animations = el.getAnimations().filter(a => ['width', 'height'].includes(a.transitionProperty))
+                .map(a => a.finished.then(
+                    () => ({ property: a.transitionProperty, outcome: 'finished', t: performance.now() - t0 }),
+                    () => ({ property: a.transitionProperty, outcome: 'cancelled', t: performance.now() - t0 }),
+                ));
+        }
         await new Promise((r2) => setTimeout(r2, 20));
     }
     const final = samples[samples.length - 1];
     const settled = await checkpoint;
     const after = [settled, ...samples.filter(s => s.t > settled.t)];
-    let snap = 0;
+    let snap = 0, snapHeight = 0;
     for ( let i = 1; i < after.length; i++ ) {
         snap = Math.max(snap, Math.abs(after[i].w - after[i - 1].w));
+        snapHeight = Math.max(snapHeight, Math.abs(after[i].h - after[i - 1].h));
     }
     for (const type of transitionEvents) el.removeEventListener(type, record);
-    return { orig, final, settled, snap, transitions };
-}, { settle_ms: FLICKER_SETTLE_MS });
+    return { orig, final, settled, snap, snapHeight, transitions, interrupted,
+        restoreAnimations: await Promise.all(restore_animations) };
+}, { settle_ms: FLICKER_SETTLE_MS, interrupt_ms, hidden_ms });
 
 for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     const L = `[flicker ${shape.label}]`;
@@ -449,8 +480,8 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     push(`${L} 🔴 no single-frame jump after the transition (the snap itself)`,
         c1.snap === 0, `largest post-transition frame delta = ${c1.snap}px`);
 
-    // THE STORM. Three cycles back to back, each starting while the previous
-    // restore's inline transition may still be live.
+    // Repetition after each restore has settled. The interrupted cases below
+    // separately exercise animations that actually overlap.
     let worst = 0, mismatched = 0;
     const misses = [];
     for ( let i = 0; i < 3; i++ ) {
@@ -462,6 +493,28 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     push(`${L} 🔴 three back-to-back minimise/restore cycles never snap`,
         worst === 0 && mismatched === 0, `worst delta=${worst}px, unsettled cycles=${mismatched}`
             + (misses.length ? `, timing=${JSON.stringify(misses)}` : ''));
+
+    // The phone layout pins the window to the viewport even mid-restore; the
+    // two desktop shapes exercise the geometry animation and its interruption.
+    const interruptions = shape.width >= 1024
+        ? [{ interrupt_ms: 40, hidden_ms: 650 }, { interrupt_ms: 100, hidden_ms: 100 }] : [];
+    for ( const { interrupt_ms, hidden_ms } of interruptions ) {
+        const c = await cycle(page, { interrupt_ms, hidden_ms });
+        const label = `${L} restore interrupted at ${interrupt_ms}ms, hidden for ${hidden_ms}ms`;
+        push(`${label}: the interruption occurred while the window was growing`,
+            c.interrupted.w > 0 && c.interrupted.w < c.final.w, JSON.stringify(c.interrupted));
+        push(`${label}: the restore target survives the interruption`,
+            c.orig.w === c.final.w && c.orig.h === c.final.h,
+            `snapshot=${c.orig.w}x${c.orig.h} final=${c.final.w}x${c.final.h}`);
+        push(`${label}: the new animation finishes without an old cleanup cancelling it`,
+            c.restoreAnimations.length === 2 && c.restoreAnimations.every(a => a.outcome === 'finished'),
+            JSON.stringify(c.restoreAnimations));
+        push(`${label}: settled by ${FLICKER_SETTLE_MS}ms with no later jump on either axis`,
+            !c.settled.fullbleed && c.final.fullbleed
+                && c.settled.w === c.final.w && c.settled.h === c.final.h
+                && c.snap === 0 && c.snapHeight === 0,
+            JSON.stringify(c));
+    }
 
     push(`${L} no uncaught page errors across the storm`,
         state.errors.length === 0, JSON.stringify(state.errors.slice(0, 2)));

@@ -1986,7 +1986,19 @@ export async function openDesktopWindow (ctx = {}) {
      * intact (`reset_window_size_and_position` consumes it), so a later close
      * still restores the pre-full-bleed geometry correctly.
      */
+    let restore_fullbleed_timer = null;
     function minimise_to_taskbar (el) {
+        if ( is_minimized(el) ) return;
+        // A second minimise can interrupt showWindow's growth. Preserve its
+        // destination: hideWindow otherwise snapshots the intermediate box,
+        // and the next restore grows to that small box before full-bleed snaps
+        // it to the viewport. Only an in-flight restore owns this snapshot.
+        const restore_geometry = restore_fullbleed_timer !== null && !el.classList.contains(FULLBLEED_CLASS)
+            ? Object.fromEntries(['width', 'height', 'top', 'left']
+                .map(axis => [`data-orig-${axis}`, el.getAttribute(`data-orig-${axis}`)]))
+            : null;
+        clearTimeout(restore_fullbleed_timer);
+        restore_fullbleed_timer = null;
         restore_floating_focus();
         schedule_floating_measure.cancel();
         // Guarded, because this handler is now reachable from a window that
@@ -2001,6 +2013,7 @@ export async function openDesktopWindow (ctx = {}) {
             window.exit_fullpage_chrome(el);
         }
         $(el).hideWindow();
+        if ( restore_geometry ) $(el).attr(restore_geometry);
     }
 
     // ── the two window-control hooks ───────────────────────────────────────
@@ -2062,7 +2075,11 @@ export async function openDesktopWindow (ctx = {}) {
             // re-checks `disposed` and the minimised state itself, and
             // restores `data-is_fullpage` (which exit_fullpage_mode removed)
             // so a later close() still knows to bring the taskbar back.
-            setTimeout(() => go_fullbleed('restored from the taskbar'), 220);
+            clearTimeout(restore_fullbleed_timer);
+            restore_fullbleed_timer = setTimeout(() => {
+                restore_fullbleed_timer = null;
+                go_fullbleed('restored from the taskbar');
+            }, 220);
             // 🔴 And RECONCILE. A restore is the one moment this side knows it
             // may have been away while something else changed the desktop
             // underneath it — a troubleshoot restart resets the container to
@@ -2329,6 +2346,8 @@ export async function openDesktopWindow (ctx = {}) {
     /** Everything that must stop, whichever way this window ends. */
     const dispose = () => {
         disposed = true;
+        clearTimeout(restore_fullbleed_timer);
+        restore_fullbleed_timer = null;
         floating_fullscreen?.dispose();
         schedule_floating_measure.cancel();
         restore_floating_focus();
