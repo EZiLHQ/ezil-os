@@ -458,6 +458,24 @@ async function keyboardCase ({ page }, label) {
     push(`${label}: Escape restores grabber focus`, await page.locator(GRABBER).evaluate((el) => el === document.activeElement));
 }
 
+async function phoneTapCase ({ page }, label) {
+    // Real input, not the contract's reveal(): the pill is the only exit from
+    // full-bleed, so a finger must be able to open it and it must stay open.
+    const expanded = () => page.locator(GRABBER).getAttribute('aria-expanded');
+    push(`${label}: starts collapsed`, await expanded() === 'false');
+    await page.locator(GRABBER).tap();
+    await sleep(200);
+    push(`${label}: a tap on the grabber opens the pill`, await expanded() === 'true');
+    await sleep(1700);
+    push(`${label}: the tapped pill is still open after the auto-hide delay`, await expanded() === 'true');
+    push(`${label}: its traffic lights are tappable`, await page.locator(RED).isVisible()
+        && await page.locator(YELLOW).isVisible());
+    // A tap in the stream (outside the pill) dismisses it.
+    const frame = await page.locator(`${WIN} .window-app-iframe`).boundingBox();
+    await page.touchscreen.tap(frame.x + frame.width / 2, frame.y + frame.height * 0.75);
+    await eventually(`${label}: a tap in the stream dismisses the pill`, expanded, (v) => v === 'false');
+}
+
 async function phoneCase ({ page }, label) {
     const media = await page.evaluate(() => ({ coarse: matchMedia('(pointer: coarse)').matches,
         hover: matchMedia('(hover: hover)').matches, phone: document.body.classList.contains('device-phone'),
@@ -620,6 +638,7 @@ const scenarios = [
     { name: 'traffic lights and overflow', test: trafficCase },
     { name: 'keyboard', test: keyboardCase },
     { name: 'phone', context: PHONE, test: phoneCase },
+    { name: 'phone tap', context: PHONE, test: phoneTapCase },
     { name: 'hybrid', options: { hybrid: true }, test: hybridCase },
     { name: 'fullscreen', options: { screen: true }, test: fullscreenCase },
     ...['cancel', 'minimize', 'close'].map((action) => ({

@@ -504,7 +504,20 @@ function attach_floating_drawer (el_window, options) {
         $(drawer).on('pointerdown mousedown', (e) => {
             if ( e.type === 'pointerdown' ) pointer_press_pending = true;
             else if ( pointer_press_pending ) { pointer_press_pending = false; return; }
-            setTimeout(() => $(el_window).focusWindow(), 0);
+            const pressed = e.target instanceof Element ? e.target.closest('button') : null;
+            setTimeout(() => {
+                $(el_window).focusWindow();
+                // 🔴 focusWindow focuses the stream iframe (src/UI/UIWindow.js
+                // ~4479). A press on the pill is not a press in the stream: on
+                // touch, `frame_press` below read that focus move as a stream
+                // tap and collapsed the pill the user was opening, so a tap
+                // could never open it (the only exit from full-bleed). Keep
+                // focus on the pressed control; the focusin it fires also
+                // clears the focusout collapse timer.
+                if ( pressed && drawer.contains(pressed) && ! drawer.contains(document.activeElement) ) {
+                    pressed.focus({ preventScroll: true });
+                }
+            }, 0);
         });
         const fine = window.matchMedia('(hover: hover) and (pointer: fine)');
         const coarse = window.matchMedia('(any-pointer: coarse)');
