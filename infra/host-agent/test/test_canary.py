@@ -267,5 +267,305 @@ class ConsoleWriter(unittest.TestCase):
         close.assert_called_once_with(99)
 
 
+class ToolProbe(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
+        self.cfg.update(canaryConsole=True, runDir=str(self.root / "run"))
+        self.rootfs = Path(desktop.merged(self.cfg))
+        self.home = self.rootfs / "root"
+        self.home.mkdir(parents=True)
+        self.link = self.rootfs / "usr/local/bin/ezil-canary-tool"
+        self.link.parent.mkdir(parents=True)
+        self.package = self.rootfs / "usr/local/lib/node_modules/canary-fixture"
+        self.package.mkdir(parents=True)
+        self.target = self.package / "tool"
+        self.relative = "../lib/node_modules/canary-fixture/tool"
+        writer = mock.patch.object(canary, "_write_console")
+        self.writer = writer.start()
+        self.addCleanup(writer.stop)
+
+    def record(self, phase="boot"):
+        self.writer.reset_mock()
+        canary.probe(self.cfg, phase)
+        self.writer.assert_called_once()  # A silently dropped oversize line is a failure.
+        line = self.writer.call_args.args[0]
+        self.assertLessEqual(len(line), 512)
+        self.assertEqual(line.count(b"\n"), 1)
+        record = json.loads(line[len(canary.PREFIX):])
+        self.assertEqual(record["event"], "persistence")
+        return record
+
+    def assert_status(self, expected):
+        record = self.record()
+        self.assertEqual(record["toolStatus"], expected)
+        self.assertIsNone(record["toolSha256"])
+
+    def assert_no_file_read(self, expected):
+        real_open = os.open
+
+        def directories_only(path, flags, *args, **kwargs):
+            self.assertTrue(flags & os.O_DIRECTORY, "probe tried to open a file")
+            self.assertTrue(flags & os.O_NOFOLLOW)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(canary, "read_regular_at", side_effect=AssertionError("unsafe read")), \
+             mock.patch.object(canary.os, "open", side_effect=directories_only):
+            self.assert_status(expected)
+
+    def test_relative_tool_hash_survives_shutdown_and_fresh_boot_probe(self):
+        body = b"#!/bin/sh\necho synthetic-public-tool-fixture\n"
+        self.target.write_bytes(body)
+        self.link.symlink_to(self.relative)
+        for phase in ("shutdown", "boot"):
+            self.cfg = config.Config(dict(self.cfg))
+            with mock.patch.object(canary, "read_regular_at", wraps=canary.read_regular_at) as read:
+                record = self.record(phase)
+            read.assert_called_once()
+            self.assertEqual(record["phase"], phase)
+            self.assertEqual(record["toolStatus"], "ok")
+            self.assertEqual(record["toolSha256"], hashlib.sha256(body).hexdigest())
+            self.assertNotIn(body, self.writer.call_args.args[0])
+        self.assertEqual(os.readlink(self.link), self.relative)
+        self.assertEqual(self.target.read_bytes(), body)
+
+    def test_absent_tool_and_missing_bin_directory_are_not_created(self):
+        self.assert_status("absent")
+        self.assertFalse(self.link.exists())
+        self.link.parent.rmdir()
+        self.assert_status("absent")
+        self.assertFalse(self.link.parent.exists())
+
+    def test_absolute_shadow_target_is_refused_without_opening_any_file(self):
+        self.link.symlink_to("/etc/shadow")
+        self.assert_no_file_read("refused")
+
+    def test_relative_escape_and_escape_then_reentry_are_refused(self):
+        for target in ("../../../../etc/shadow", "../lib/node_modules/../../../etc/shadow",
+                       "../lib/node_modules/../node_modules/canary-fixture/tool",
+                       "../lib/node_modules-other/tool"):
+            with self.subTest(target=target):
+                self.link.symlink_to(target)
+                self.assert_no_file_read("refused")
+                self.link.unlink()
+
+    def test_parent_within_node_modules_is_allowed(self):
+        (self.package / "subdir").mkdir()
+        body = b"public fixture"
+        self.target.write_bytes(body)
+        self.link.symlink_to("../lib/node_modules/canary-fixture/subdir/.././tool")
+        record = self.record()
+        self.assertEqual(record["toolStatus"], "ok")
+        self.assertEqual(record["toolSha256"], hashlib.sha256(body).hexdigest())
+
+    def test_loop_and_nested_symlink_targets_are_refused(self):
+        self.link.symlink_to(self.link.name)
+        self.assert_no_file_read("refused")
+        self.link.unlink()
+        self.link.symlink_to(self.relative)
+        regular = self.package / "regular"
+        regular.write_bytes(b"public fixture")
+        for target in ("tool", "regular", "/etc/shadow"):
+            with self.subTest(target=target):
+                self.target.symlink_to(target)
+                self.assert_no_file_read("refused")
+                self.target.unlink()
+
+    def test_symlinked_parent_components_are_refused(self):
+        self.target.write_bytes(b"public fixture")
+        self.link.symlink_to(self.relative)
+        for rel in ("usr", "usr/local", "usr/local/bin", "usr/local/lib",
+                    "usr/local/lib/node_modules", "usr/local/lib/node_modules/canary-fixture"):
+            with self.subTest(parent=rel):
+                path = self.rootfs / rel
+                saved = self.root / "saved"
+                path.rename(saved)
+                path.symlink_to(saved, target_is_directory=True)
+                try:
+                    self.assert_no_file_read("refused")
+                finally:
+                    path.unlink()
+                    saved.rename(path)
+
+    def test_dotdot_does_not_hide_a_nested_symlink(self):
+        self.target.write_bytes(b"public fixture")
+        (self.package / "alias").symlink_to(".", target_is_directory=True)
+        self.link.symlink_to("../lib/node_modules/canary-fixture/alias/../tool")
+        self.assert_no_file_read("refused")
+
+    def test_fifo_and_directory_targets_are_unreadable_without_opening(self):
+        self.link.symlink_to(self.relative)
+        os.mkfifo(self.target)
+        self.assert_no_file_read("unreadable")
+        self.target.unlink()
+        self.target.mkdir()
+        self.assert_no_file_read("unreadable")
+
+    def test_dangling_and_oversized_targets_are_unreadable(self):
+        self.link.symlink_to(self.relative)
+        self.assert_no_file_read("unreadable")
+        self.package.rmdir()
+        self.assert_no_file_read("unreadable")
+        self.package.mkdir()
+        self.target.write_bytes(b"x" * (canary.SENTINEL_LIMIT + 1))
+        self.assert_no_file_read("unreadable")
+
+    def test_tool_entry_must_be_a_symlink(self):
+        self.link.write_bytes(b"public fixture")
+        self.assert_no_file_read("refused")
+
+    def test_read_failure_is_unreadable(self):
+        self.target.write_bytes(b"public fixture")
+        self.link.symlink_to(self.relative)
+        with mock.patch.object(canary, "read_regular_at", return_value=None):
+            self.assert_status("unreadable")
+
+    def test_symlink_swap_before_read_never_opens_its_target(self):
+        self.target.write_bytes(b"public fixture")
+        self.link.symlink_to(self.relative)
+        read = canary.read_regular_at
+
+        def replace_with_link(*args, **kwargs):
+            self.target.unlink()
+            self.target.symlink_to("/etc/shadow")
+            return read(*args, **kwargs)
+
+        with mock.patch.object(canary, "read_regular_at", side_effect=replace_with_link), \
+             mock.patch.object(canary.os, "read", side_effect=AssertionError("host file read")):
+            self.assert_status("unreadable")
+
+    def test_largest_probe_values_emit_one_line_below_console_limit(self):
+        self.target.write_bytes(b"t" * canary.SENTINEL_LIMIT)
+        self.link.symlink_to(self.relative)
+        (self.home / canary.SENTINEL).write_bytes(b"s" * canary.SENTINEL_LIMIT)
+        (self.home / ".bash_history").write_bytes(b"\n" * canary.HISTORY_LIMIT)
+        record = self.record("shutdown")
+        self.assertEqual(record["historyLines"], canary.HISTORY_LIMIT)
+        self.assertIs(record["historyMarker"], False)
+        self.assertEqual(len(record["sentinelSha256"]), 64)
+        self.assertEqual(len(record["toolSha256"]), 64)
+        # Also bound every status with all longest measurements present (a conservative ceiling).
+        for status in ("absent", "ok", "unreadable", "refused"):
+            self.writer.reset_mock()
+            fields = dict(record, sentinel="unreadable", history="unreadable", toolStatus=status,
+                          historyLines=(1 << 63) - 1)
+            fields.pop("v")
+            fields.pop("event")
+            canary._emit(self.cfg, "persistence", fields)
+            self.writer.assert_called_once()
+            self.assertLessEqual(len(self.writer.call_args.args[0]), 512)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealToolProbe(unittest.TestCase):
+    """canaryTools: the real installed tool (e.g. opencode) after each boot/shutdown, never its bytes when large."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
+        self.cfg.update(canaryConsole=True, runDir=str(self.root / "run"), canaryTools=["opencode"])
+        self.rootfs = Path(desktop.merged(self.cfg))
+        (self.rootfs / "root").mkdir(parents=True)
+        self.bin = self.rootfs / "usr/local/bin"
+        self.bin.mkdir(parents=True)
+        self.package = self.rootfs / "usr/local/lib/node_modules/opencode-ai"
+        (self.package / "bin").mkdir(parents=True)
+        writer = mock.patch.object(canary, "_write_console")
+        self.writer = writer.start()
+        self.addCleanup(writer.stop)
+
+    def install(self, body, version="1.19.0", name="opencode"):
+        (self.package / "bin" / name).write_bytes(body)
+        (self.package / "package.json").write_text(json.dumps({"name": "opencode-ai", "version": version}))
+        (self.bin / name).symlink_to(f"../lib/node_modules/opencode-ai/bin/{name}")
+
+    def events(self, phase="boot"):
+        self.writer.reset_mock()
+        canary.probe(self.cfg, phase)
+        lines = [call.args[0] for call in self.writer.call_args_list]
+        for line in lines:
+            self.assertLessEqual(len(line), 512)
+        records = [json.loads(line[len(canary.PREFIX):]) for line in lines]
+        self.assertEqual(records[0]["event"], "persistence")
+        return [r for r in records if r["event"] == "tool"]
+
+    def test_large_binary_reports_size_and_version_without_reading_it(self):
+        self.install(b"\x7fELF" + b"x" * (canary.SENTINEL_LIMIT + 10))
+        read = mock.patch.object(canary, "read_regular_at", wraps=canary.read_regular_at)
+        with read as spy:
+            [event] = self.events("shutdown")
+        self.assertEqual(event, {"v": 1, "event": "tool", "phase": "shutdown", "name": "opencode", "status": "large",
+                                 "sha256": None, "size": canary.SENTINEL_LIMIT + 14, "version": "1.19.0"})
+        self.assertEqual([call.args[1] for call in spy.call_args_list], ["package.json"])
+
+    def test_small_launcher_is_hashed(self):
+        body = b"#!/usr/bin/env node\nrequire('../dist/cli.js')\n"
+        self.install(body)
+        [event] = self.events()
+        self.assertEqual((event["status"], event["sha256"], event["size"], event["version"]),
+                         ("ok", hashlib.sha256(body).hexdigest(), len(body), "1.19.0"))
+
+    def test_absent_tool_is_reported_and_nothing_is_created(self):
+        [event] = self.events()
+        self.assertEqual((event["status"], event["size"], event["version"]), ("absent", None, None))
+        self.assertFalse((self.bin / "opencode").exists())
+
+    def test_off_by_default_and_invalid_names_are_ignored(self):
+        self.install(b"tool")
+        self.cfg["canaryTools"] = []
+        self.assertEqual(self.events(), [])
+        self.cfg["canaryTools"] = ["../opencode", "/usr/bin/env", "Opencode", "x" * 65, 7, "", "opencode"]
+        self.assertEqual([e["name"] for e in self.events()], [])  # the valid name sits past MAX_TOOLS
+        self.cfg["canaryTools"] = "opencode"
+        self.assertEqual(self.events(), [])
+
+    def test_hostile_or_malformed_package_json_gives_no_version(self):
+        self.install(b"tool")
+        manifest = self.package / "package.json"
+        for body in (b"not json", b'["1.0.0"]', b'{"version": 1}', b'{"version": "1.0.0; rm -rf /"}',
+                     b'{"version": "' + b"9" * 40 + b'"}', b"{" + b" " * (canary.PACKAGE_LIMIT + 1) + b"}"):
+            manifest.write_bytes(body)
+            [event] = self.events()
+            self.assertEqual((event["status"], event["version"]), ("ok", None))
+        manifest.unlink()
+        manifest.symlink_to("/etc/hostname")
+        [event] = self.events()
+        self.assertIsNone(event["version"])
+
+    def test_bin_link_escaping_node_modules_is_refused_and_unread(self):
+        (self.bin / "opencode").symlink_to("/etc/shadow")
+        with mock.patch.object(canary, "read_regular_at", side_effect=AssertionError("unsafe read")):
+            [event] = self.events()
+        self.assertEqual((event["status"], event["version"]), ("refused", None))
+
+    def test_scoped_package_version_and_worst_case_line_length(self):
+        name = "a" * 64
+        scoped = self.rootfs / "usr/local/lib/node_modules/@scope/pkg"
+        (scoped / "bin").mkdir(parents=True)
+        (scoped / "bin" / name).write_bytes(b"y" * 32)
+        (scoped / "package.json").write_text(json.dumps({"version": "9" * 32}))
+        (self.bin / name).symlink_to(f"../lib/node_modules/@scope/pkg/bin/{name}")
+        self.cfg["canaryTools"] = [name]
+        [event] = self.events("shutdown")
+        self.assertEqual((event["status"], event["version"]), ("ok", "9" * 32))
+
+    def test_oversized_or_special_package_json_is_never_opened(self):
+        self.install(b"tool")
+        manifest = self.package / "package.json"
+        manifest.write_bytes(b'{"version": "1.0.0"}' + b" " * canary.PACKAGE_LIMIT)
+        opened = []
+        real = canary.read_regular_at
+        with mock.patch.object(canary, "read_regular_at", side_effect=lambda *a, **k: opened.append(a[1]) or real(*a, **k)):
+            [event] = self.events()
+            manifest.unlink()
+            os.mkfifo(manifest)
+            [fifo] = self.events()
+        self.assertEqual((event["version"], fifo["version"]), (None, None))
+        self.assertNotIn("package.json", opened)
