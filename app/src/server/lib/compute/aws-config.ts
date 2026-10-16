@@ -73,6 +73,28 @@ export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null 
     return { everyone: false, userIds: new Set(ids), since };
 }
 
+/**
+ * Accounts that must run on AWS (`EZIL_AWS_REQUIRED_USER_IDS`, comma-separated user UUIDs).
+ * For these users a NEW computer the canary or admission does not claim is refused with
+ * its reason (select.ts `AwsRequiredError`) instead of being pinned to Cloudflare. Existing
+ * placements never change, and a computer created before `EZIL_AWS_CANARY_SINCE` still
+ * keeps Cloudflare: it may hold an R2 workspace that AWS would open as an empty disk, and
+ * moving it is a migration (docs/AWS-COMPUTERS.md C-7), not an admission decision.
+ *
+ * 🔴 FAIL SAFE: unset, `*`, or any malformed entry means nobody is required, which is the
+ * behaviour without this variable. This only removes the silent Cloudflare fallback.
+ */
+export function awsRequiredUserIds(env: Env = process.env): ReadonlySet<string> {
+    const list = env.EZIL_AWS_REQUIRED_USER_IDS?.trim();
+    if (!list) return new Set();
+    const ids = list.split(',').map((id) => id.trim().toLowerCase());
+    return ids.every((id) => CANARY_UUID.test(id)) ? new Set(ids) : new Set();
+}
+
+export function isAwsRequiredUser(env: Env, userId: string): boolean {
+    return awsRequiredUserIds(env).has(userId.toLowerCase());
+}
+
 export interface AwsAdmissionCaps {
     maxRunning: number;
     userMonthlyHours: number;

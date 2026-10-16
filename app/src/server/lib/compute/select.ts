@@ -25,7 +25,7 @@
  */
 
 import { precheckAdmission } from './admission';
-import { isPlacementReadEnabled, type Env } from './aws-config';
+import { isAwsRequiredUser, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
 import { explainAwsCanary, explainAwsCanaryCohort } from './placement-explain';
@@ -92,6 +92,13 @@ export async function resolveComputeProvider(
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
         const canary = await awsCanaryDecision(db, computer, env);
         if (canary.aws) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+        if (options.pinCloudflare && canary.reason !== 'created_before_since' && isAwsRequiredUser(env, computer.userId)) {
+            // An AWS-required account (aws-config.ts `awsRequiredUserIds`) never has a new
+            // computer silently pinned to Cloudflare: nothing is written, nothing starts, and
+            // the caller gets the reason the canary or admission refused.
+            console.info('[compute.placement] aws_required_refused', { computerId: computer.computerId.toLowerCase(), canary: canary.reason });
+            throw new AwsRequiredError(computer.computerId.toLowerCase(), canary.reason);
+        }
         if (options.pinCloudflare && isPlacementDb(db)) {
             placement = await pinCloudflare(db, computer);
             assertPlacementOwner(placement, computer);
@@ -101,6 +108,14 @@ export async function resolveComputeProvider(
         }
     }
     return providerForPlacement(placement, env, deps);
+}
+
+/** A new computer of an AWS-required account that AWS did not admit. `reason` is the canary/admission refusal. */
+export class AwsRequiredError extends Error {
+    constructor(readonly computerId: string, readonly reason: string) {
+        super(`aws_required:${reason}`);
+        this.name = 'AwsRequiredError';
+    }
 }
 
 function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRef): void {
