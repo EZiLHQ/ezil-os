@@ -778,7 +778,11 @@ push('provider observation uses read-only queries',
 const offOrigin = calls.filter(c => /^https?:\/\//.test(c.url) && ! (new URL(c.url).hostname === 'ezil.local'));
 push('🔴 every request this window made was same-origin', offOrigin.length === 0,
     JSON.stringify(offOrigin.map(c => c.url)));
-push('no puter.* or socket.io traffic', ! calls.some(c => /puter\.com|socket\.io/.test(c.url)));
+push('no puter.* or socket.io traffic', ! calls.some(c => {
+    const url = new URL(c.url, 'https://ezil.local');
+    // Match the destination host, not "computer.computePlacement" in a local RPC path.
+    return /(^|\.)puter\.com$/.test(url.hostname) || /socket\.io/.test(url.hostname + url.pathname);
+}));
 push('no uncaught page errors during the whole run', uncaught.length === 0,
     uncaught.slice(0, 2).join(' | '));
 
