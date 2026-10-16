@@ -40,6 +40,21 @@ Local logs:
 - `/tmp/ezil-port-tools.log`
 - `/tmp/ezil-port-bundle-check.log`
 
+## PR207 review iteration
+
+The later Codex review at 15:02 UTC on `f3548f6` superseded the earlier no-findings summary with two P2 findings. Both were reproduced before repair and addressed locally in `b6cf8216505bbea13465b626eabca4b8f9409f77`:
+
+- [Provider transition evidence](https://github.com/EZiLHQ/ezil-os/pull/207#discussion_r4296059704): `--provider-transition` now requires different observed providers before classifying a surviving sentinel as `resumed_checkpoint`. Same-provider recreation fails an expected-checkpoint acceptance. Positive fixtures now record an actual provider change.
+- [JSON nesting portability](https://github.com/EZiLHQ/ezil-os/pull/207#discussion_r4296059694): package metadata has an explicit maximum container depth of 64, checked before parsing with encoding, quote and escape handling. A permissive-parser mock proves that deeply nested metadata is rejected without invoking the parser; boundary tests accept 64 and refuse 65. Local Python is 3.12.3; no Python 3.14 runtime run is claimed.
+
+The SDK CI failure was repaired in `cd564f72b3b8163469732aeaabbe09cc39d62f1c`. The public client now exposes the authenticated GET `computers.computePlacement(id, opts)` and its truthful placed/unplaced/unavailable projection; the API coverage guard remains intact. SDK typecheck and 21 tests passed, as did MCP typecheck and 33 tests. Independent SDK review reported no findings.
+
+Full tools typecheck and all 273 tests passed in the integration worktree. The implementation lane's first tools run passed 272 tests but exceeded an existing 30-second real-probe timeout once (38.6 seconds); the unchanged test passed in 8.88 seconds on integration rerun. No timeout or assertion was weakened. The official host-agent `test-units.sh` passed all 67 checks in the implementation lane. Focused regression checks passed after failing before the fixes. Independent review of the four-file P2 repair reported no findings. The Worker and app sources remain identical to the full-suite-tested security implementation above.
+
+Integration logs: `/tmp/ezil-pr207-sdk-final.log`, `/tmp/ezil-pr207-mcp-final.log`, `/tmp/ezil-pr207-tools-final.log`, and `/tmp/ezil-pr207-host-final.log`. These remain local fixture results; the 20-cycle hosted acceptance is unexecuted.
+
+The external ready-for-review event at 14:54:38 UTC was followed by conversion back to draft at 15:01:01 UTC. GitHub runs `38915799115` and `38919604997` both skipped image publication, staging deployment and production deployment; the ready-event admission refused because CI had failed. The deployment query for `f3548f6` returned no records. No workload cancellation or rollback was performed, and these receipts do not attest to unrelated external cloud activity. Vercel project/team access returned an explicit 403 denial; no further access retry or deployment is authorized.
+
 ## Draft publication boundary
 
 The audited workflows and `app/vercel.json` are unchanged from main. Vercel Git deployment is disabled. A new feature-branch push and draft PR run ordinary GitHub CI, CodeQL, DCO, labels and an internal macOS DMG artifact build. They do not admit image publication, staging deployment or hosted continuity tests: `preview.yml` rejects draft PRs before those jobs. The required Hosted continuity PR gate deliberately fails in that state. DCO remains unresolved; no founder signoff was added.
