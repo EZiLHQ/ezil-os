@@ -19,6 +19,7 @@ TOOL = "ezil-canary-tool"
 TOOL_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")   # an npm bin name; never a path
 VERSION = re.compile(r"[0-9A-Za-z.+-]{1,32}")
 PACKAGE_LIMIT = 65536
+PACKAGE_DEPTH_LIMIT = 64
 MAX_TOOLS = 4
 
 
@@ -158,6 +159,30 @@ def _read_tool(rootfs):
     return ("unreadable" if status == "large" else status), digest
 
 
+def _package_json_within_depth(raw):
+    """Bound JSON containers before parsing, regardless of the interpreter's recursion limit."""
+    text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > PACKAGE_DEPTH_LIMIT:
+                return False
+        elif char in "]}":
+            depth -= 1
+    return True  # json.loads validates syntax, including mismatched delimiters and quotes.
+
+
 def _package_version(rootfs, package):
     """The `version` of node_modules/<pkg>/package.json, bounded and validated, else None."""
     try:
@@ -169,7 +194,7 @@ def _package_version(rootfs, package):
             raw = read_regular_at(parent, "package.json", st, limit=PACKAGE_LIMIT)
         finally:
             os.close(parent)
-        version = json.loads(raw).get("version") if raw is not None else None
+        version = json.loads(raw).get("version") if raw is not None and _package_json_within_depth(raw) else None
     except (OSError, Refused, ValueError, AttributeError, RecursionError):
         return None
     return version if isinstance(version, str) and VERSION.fullmatch(version) else None

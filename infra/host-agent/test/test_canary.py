@@ -543,13 +543,32 @@ class RealToolProbe(unittest.TestCase):
         self.install(b"tool")
         body = b'{"version":"1.19.0","nested":' + b"[" * 16384 + b"0" + b"]" * 16384 + b"}"
         self.assertLessEqual(len(body), canary.PACKAGE_LIMIT)
-        with self.assertRaises(RecursionError):
-            json.loads(body)
         (self.package / "package.json").write_bytes(body)
         for phase in ("boot", "shutdown"):
             with self.subTest(phase=phase):
                 [event] = self.events(phase)
                 self.assertEqual((event["status"], event["version"], event["phase"]), ("ok", None, phase))
+        package = list(self.package.relative_to(self.rootfs).parts)
+        # Simulate a parser that accepts this depth, as Python 3.14 can.
+        with mock.patch.object(canary.json, "loads", return_value={"version": "1.19.0"}) as parser:
+            self.assertIsNone(canary._package_version(str(self.rootfs), package))
+            parser.assert_not_called()
+
+    def test_package_json_depth_boundary_ignores_brackets_and_escapes_in_strings(self):
+        self.install(b"tool")
+        manifest = self.package / "package.json"
+        # The root object counts as one level. Quotes and backslashes in the
+        # string must not make its many brackets look like nesting.
+        noisy = '"\\' + '[' * 65 + ']' * 65 + '{' * 65 + '}' * 65
+        encoded = json.dumps(noisy).encode()
+        for arrays, version in ((63, "1.19.0"), (64, None)):
+            with self.subTest(arrays=arrays):
+                body = (b'{"version":"1.19.0","nested":' + b'[' * arrays + encoded
+                        + b']' * arrays + b'}')
+                self.assertLessEqual(len(body), canary.PACKAGE_LIMIT)
+                manifest.write_bytes(body)
+                [event] = self.events()
+                self.assertEqual(event["version"], version)
 
     def test_bin_link_escaping_node_modules_is_refused_and_unread(self):
         (self.bin / "opencode").symlink_to("/etc/shadow")

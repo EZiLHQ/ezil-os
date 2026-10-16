@@ -137,7 +137,7 @@ export function classify(before: Json, after: Json, options: Options = {}): Resu
 	else if (missing.length > 0) classification = "insufficient_evidence";
 	else if (sameBoot && samePidNs && sameProcess(at(before, "processes", "shell"), at(after, "processes", "shell")) &&
 		(!sentinelGiven || sameSentinel)) classification = "same_process";
-	else if (options.providerTransition && samePidNs && sameSentinel) classification = "resumed_checkpoint";
+	else if (options.providerTransition && changed("identity", "provider") && samePidNs && sameSentinel) classification = "resumed_checkpoint";
 	else classification = "recreated_shell";
 	const expected = options.expected ?? null;
 	return { classification, expected,

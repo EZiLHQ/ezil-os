@@ -73,6 +73,7 @@ describe("lifecycle classification", () => {
 
 	it("recognizes a provider checkpoint when the sentinel survived across boots", () => {
 		const after = snapshot();
+		after.identity.provider = "cloudflare";
 		after.identity.boot_id = "boot-2";
 		after.processes.shell.pid = 200;
 		expect(classify(snapshot(), after, { providerTransition: true }).classification).toBe("resumed_checkpoint");
@@ -80,8 +81,18 @@ describe("lifecycle classification", () => {
 
 	it("recognizes a provider checkpoint with a changed shell on the same boot", () => {
 		const after = snapshot();
+		after.identity.provider = "cloudflare";
 		after.processes.shell.pid = 200;
 		expect(classify(snapshot(), after, { providerTransition: true }).classification).toBe("resumed_checkpoint");
+	});
+
+	it("does not call a same-provider recreation a checkpoint even when requested", () => {
+		const after = snapshot();
+		after.identity.boot_id = "boot-2";
+		after.processes.shell.pid = 200;
+		const result = classify(snapshot(), after, { providerTransition: true, expected: "resumed_checkpoint" });
+		expect(result.classification).toBe("recreated_shell");
+		expect(result.pass).toBe(false);
 	});
 
 	it("gives same_process precedence over the provider flag", () => {
@@ -380,6 +391,7 @@ describe("review fixes (PR #203)", () => {
 		after.identity.pid_namespace = "pid:[4026532999]";
 		expect(classify(snapshot(), after, { providerTransition: true }).classification).toBe("recreated_shell");
 		const resumed = snapshot();
+		resumed.identity.provider = "cloudflare";
 		resumed.identity.boot_id = "boot-2";
 		expect(classify(snapshot(), resumed, { providerTransition: true }).classification).toBe("resumed_checkpoint");
 	});
