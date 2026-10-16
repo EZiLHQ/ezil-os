@@ -1,0 +1,35 @@
+/* Native top-layer modality stays above the full-bleed stream; build-shell.sh:89
+   includes this sheet automatically with the other EZiL styles. */
+.ezil-close-confirm {
+    box-sizing: border-box;
+    width: min(440px, calc(100vw - 32px));
+    max-height: calc(100dvh - 32px);
+    margin: auto;
+    padding: 24px;
+    overflow: auto;
+    border: 1px solid #72777f;
+    border-radius: 16px;
+    background: #202329;
+    color: #fff;
+    font: 15px/1.5 system-ui, sans-serif;
+    box-shadow: 0 20px 60px #0008;
+}
+.ezil-close-confirm::backdrop { background: #0008; }
+.ezil-close-confirm h2 { margin: 0 0 12px; font-size: 20px; }
+.ezil-close-confirm p { margin: 0 0 20px; }
+.ezil-close-confirm label { display: flex; align-items: center; gap: 10px; }
+.ezil-close-confirm input { width: 18px; height: 18px; accent-color: #92baff; }
+.ezil-close-confirm-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+.ezil-close-confirm button {
+    flex: 1 1 auto;
+    min-height: 44px;
+    padding: 10px 16px;
+    border: 1px solid #9298a2;
+    border-radius: 8px;
+    color: #fff;
+    background: #373d47;
+    cursor: pointer;
+    font: inherit;
+}
+.ezil-close-confirm button:last-child { background: #a12832; border-color: #ec8089; }
+.ezil-close-confirm :focus-visible { outline: 3px solid #9dc2ff; outline-offset: 3px; }

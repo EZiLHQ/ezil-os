@@ -1,0 +1,263 @@
+/* floating-controls.css — EZiL-authored.
+ * Only the opted-in full-bleed window changes. The stream's top/height still
+ * come from ezil-shell.css:750; revealing chrome never changes that variable.
+ * Hybrid devices keep the strip: a mouse must not take away a touch exit
+ * (docs/FEEDBACK-CONTROLS-CONTRACT.md:56). */
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls.ezil-mode-overlay {
+    --ezil-control-strip-height: 0px;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls.ezil-mode-strip {
+    --ezil-control-strip-height: 43px;
+}
+
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls > .ezil-floating-drawer {
+    --ezil-control-target: 24px;
+    --ezil-pill-row: 32px;
+    --ezil-pill-grabber: 8px;
+    --shut-w: 56px;
+    --shut-h: 20px;
+    box-sizing: border-box;
+    top: 1px;
+    bottom: auto;
+    /* Equal side reserves keep the title centred without overlapping either
+     * button group, including the optional Feedback action. */
+    width: min(520px, calc(100% - max(8px, env(safe-area-inset-left, 0px)) - max(8px, env(safe-area-inset-right, 0px))));
+    left: max(8px, env(safe-area-inset-left, 0px));
+    right: max(8px, env(safe-area-inset-right, 0px));
+    margin-inline: auto;
+    transform: none;
+    height: calc(var(--ezil-pill-row) + var(--ezil-pill-grabber) + 2px);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 16px;
+    background: rgba(24, 24, 28, 0.78);
+    z-index: 600;
+    overflow: visible;
+    transition: width 0.3s ease, height 0.3s ease, opacity 0.15s ease;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls > .ezil-floating-drawer.collapsed {
+    top: calc((var(--ezil-control-strip-height) - var(--shut-h)) / 2);
+    width: var(--shut-w);
+    height: var(--shut-h);
+    border-radius: 12px;
+    opacity: 0.75;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls > .ezil-floating-drawer.ezil-mode-overlay {
+    top: max(6px, env(safe-area-inset-top, 0px));
+}
+
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-clip {
+    position: static;
+    overflow: visible;
+    pointer-events: auto;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-controls {
+    position: static;
+    transform: none;
+    display: grid;
+    grid-template-columns: minmax(max-content, 1fr) minmax(0, 1fr) minmax(max-content, 1fr);
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    height: var(--ezil-pill-row);
+    padding: 0 6px;
+    filter: none;
+    opacity: 1;
+    transition: opacity 0.15s ease;
+}
+/* 🔴 #90's failure mode: while collapsed, the (statically laid out) clip still
+ * spans the full pill-row height and overflows the 16px tongue invisibly — it
+ * caught taps ~20px below the visible tongue (floating-controls-browser-test
+ * "no invisible drawer pad"). Collapsed, it neither paints outside the tongue
+ * nor takes input; the grabber is a sibling and stays the only target. */
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .collapsed .dashboard-app-drawer-clip {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .collapsed .dashboard-app-drawer-controls {
+    visibility: hidden;
+    pointer-events: none;
+    transform: none;
+    filter: none;
+    opacity: 0;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-lights,
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-actions,
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-identity {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-actions {
+    justify-content: flex-end;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-identity {
+    justify-content: center;
+    gap: 6px;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-icon {
+    width: 18px;
+    height: 18px;
+    margin: 0;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-icon[hidden] {
+    display: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-title {
+    display: block;
+    flex: 0 1 auto;
+    width: auto;
+    min-width: 0;
+    margin: 0;
+    text-align: center;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-btn {
+    box-sizing: border-box;
+    width: var(--ezil-control-target);
+    height: var(--ezil-control-target);
+    margin: 0;
+    border-radius: 7px;
+    font: 500 12px/1.2 ui-sans-serif, system-ui, sans-serif;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-feedback {
+    width: auto;
+    min-width: var(--ezil-control-target);
+    padding: 0 5px;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-overflow {
+    font-size: 22px;
+}
+
+/* The actual button is the hit pad; the inner 12px disc uses the same tokens
+ * as the head (src/css/ezil-tokens.css:103). No overlapping pseudo hit pads. */
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-lights button {
+    position: relative;
+    background: transparent;
+    border-radius: 50%;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-lights button::before {
+    content: '';
+    position: absolute;
+    width: var(--win-ctl-size);
+    height: var(--win-ctl-size);
+    border-radius: 50%;
+    background: var(--ezil-traffic-color);
+    box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.35);
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-close {
+    --ezil-traffic-color: var(--win-ctl-close);
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-minimize {
+    --ezil-traffic-color: var(--win-ctl-minimise);
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-expand {
+    --ezil-traffic-color: var(--win-ctl-expand);
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-lights button > span {
+    position: relative;
+    color: var(--win-ctl-glyph);
+    font-weight: 700;
+    opacity: 0;
+    pointer-events: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-lights:hover button > span,
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-traffic-lights button:focus > span {
+    opacity: 1;
+}
+
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-toggle {
+    inset: var(--ezil-pill-row) 0 0;
+    border-radius: inherit;
+    width: 100%;
+    transition: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .collapsed .dashboard-app-drawer-toggle {
+    inset: 0;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-toggle::after {
+    /* dashboard.css:149 adds 14px of invisible hit area. In overlay mode it
+     * would cover the remote address bar again; the visible tongue IS the hit box. */
+    content: none;
+    display: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .dashboard-app-drawer-grabber {
+    width: 20px;
+    height: 3px;
+    opacity: 0.8;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-status {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    padding: 6px 10px;
+    border-radius: 8px;
+    background: rgba(24, 24, 28, 0.94);
+    font-size: 12px;
+    text-align: center;
+    overflow-wrap: anywhere;
+    pointer-events: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-status:empty {
+    padding: 0;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .collapsed .ezil-drawer-status {
+    /* Keep the live region available to AT while the visual tray is shut. */
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    width: max-content;
+    min-width: min(180px, 100%);
+    max-width: 100%;
+    max-height: min(360px, 60vh);
+    overflow-y: auto;
+    padding: 4px;
+    box-sizing: border-box;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 10px;
+    background: #1f1f1f;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+    z-index: 1;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-menu[hidden] {
+    display: none;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-drawer-menu button {
+    width: 100%;
+    height: auto;
+    min-height: var(--ezil-control-target);
+    padding: 7px 10px;
+    justify-content: flex-start;
+    text-align: left;
+}
+.ezil-desktop-window.ezil-fullbleed.ezil-floating-controls button:focus-visible {
+    outline: 2px solid var(--color-offwhite);
+    outline-offset: 1px;
+}
+@media (pointer: coarse), (any-pointer: coarse) {
+    .ezil-desktop-window.ezil-fullbleed.ezil-floating-controls.ezil-mode-strip {
+        --ezil-control-strip-height: 59px;
+    }
+    .ezil-desktop-window.ezil-fullbleed.ezil-floating-controls > .ezil-floating-drawer {
+        --ezil-control-target: 44px;
+        --ezil-pill-row: 48px;
+        --shut-h: 44px;
+        --shut-w: 68px;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-floating-drawer,
+    .ezil-desktop-window.ezil-fullbleed.ezil-floating-controls .ezil-floating-drawer * {
+        /* Beats dashboard.css:321's !important while excluding size/position. */
+        transition: opacity 0.15s ease !important;
+    }
+}

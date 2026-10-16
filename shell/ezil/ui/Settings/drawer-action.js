@@ -24,8 +24,8 @@
 // un-ship the guarantee. So the button is added from the owned side instead.
 //
 // This is safe and deterministic, not a race, because of an OBSERVED ordering:
-// `openDesktopWindow` calls `attach_app_drawer` at `desktop-window.js:474` and
-// returns the window at :523 with no `await` in between, so by the time
+// `openDesktopWindow` calls `attach_app_drawer` at `desktop-window.js:2062` and
+// returns the window with no `await` in between, so by the time
 // `registry.launch()`'s `await app.open(ctx)` resolves, the drawer is already a
 // child of the returned element. The bounded retry below exists only so that a
 // future refactor which made that attach asynchronous would degrade to a short
@@ -90,6 +90,37 @@ function inject (drawer, el_window, onOpen) {
     // `desktop-window.js` declared itself — either way, nothing to do.
     if ( drawer.classList.contains(MARKER_CLASS) ) return true;
     if ( drawer.querySelector('.dashboard-app-drawer-settings') ) {
+        drawer.classList.add(MARKER_CLASS);
+        return true;
+    }
+
+    // Floating controls keep secondary actions in their keyboard menu;
+    // injecting a gear into the traffic lights breaks the pinned layout
+    // (docs/FEEDBACK-CONTROLS-CONTRACT.md:65). Leave the legacy path below.
+    if ( drawer.classList.contains('ezil-floating-drawer') ) {
+        drawer.ezil_controls.add_overflow_item({
+            id: 'settings', label: 'Settings', className: 'dashboard-app-drawer-settings',
+            onClick: () => {
+                try {
+                    el_window._dashboard_drawer_collapse?.();
+                } catch ( err ) {
+                    console.error(`[${PHASE}] collapse threw`, err);
+                    telemetry.capture({
+                        eventClass: 'window_error', site: 'ezil-os:settings/drawer-action#collapse', code: 'collapse_threw',
+                        detail: err,
+                    });
+                }
+                try {
+                    onOpen();
+                } catch ( err ) {
+                    console.error(`[${PHASE}] "Settings" handler threw`, err);
+                    telemetry.capture({
+                        eventClass: 'window_error', site: 'ezil-os:settings/drawer-action#open', code: 'settings_handler_threw',
+                        detail: err,
+                    });
+                }
+            },
+        });
         drawer.classList.add(MARKER_CLASS);
         return true;
     }

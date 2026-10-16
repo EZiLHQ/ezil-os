@@ -103,6 +103,10 @@ export function attach_app_drawer (el_window, options = {}) {
         return null;
     }
 
+    // The opt-in branch keeps the Puter tray below unchanged. Full-bleed's
+    // only exit must fail closed to windowed mode (desktop-window.js:2070).
+    if ( options.variant === 'floating' ) return attach_floating_drawer(el_window, options);
+
     const icon = options.icon || window.icons?.['app.svg'] || '';
     const title = options.title || '';
     const actions = Array.isArray(options.actions) ? options.actions : [];
@@ -284,3 +288,294 @@ export function attach_app_drawer (el_window, options = {}) {
 }
 
 export default attach_app_drawer;
+
+// Floating chrome follows docs/FEEDBACK-CONTROLS-CONTRACT.md:28. It shares
+// upstream's timer/intro conventions, but owns its DOM so legacy geometry,
+// action order and focus behaviour cannot change when the flag is absent.
+function attach_floating_drawer (el_window, options) {
+    let drawer;
+    const cleanups = [];
+    try {
+        drawer = document.createElement('div');
+        drawer.className = 'dashboard-app-drawer ezil-app-drawer ezil-floating-drawer collapsed';
+        drawer.innerHTML = `
+            <button type="button" class="dashboard-app-drawer-toggle" aria-expanded="false" aria-label="Window controls" title="Window controls">
+                <span class="dashboard-app-drawer-grabber" aria-hidden="true"></span>
+            </button>
+            <div class="dashboard-app-drawer-clip">
+                <div class="dashboard-app-drawer-controls" role="toolbar" aria-label="Window controls" aria-hidden="true">
+                    <div class="ezil-traffic-lights"></div>
+                    <div class="ezil-drawer-identity">
+                        <img class="dashboard-app-drawer-icon" alt="" draggable="false">
+                        <span class="dashboard-app-drawer-title"></span>
+                    </div>
+                    <div class="ezil-drawer-actions"></div>
+                </div>
+            </div>
+            <div class="ezil-drawer-status" aria-live="polite" aria-atomic="true"></div>
+            <div class="ezil-drawer-menu" role="menu" aria-label="More window controls" hidden></div>`;
+        const toggle = drawer.querySelector('.dashboard-app-drawer-toggle');
+        const controls = drawer.querySelector('.dashboard-app-drawer-controls');
+        const lights = drawer.querySelector('.ezil-traffic-lights');
+        const actions = drawer.querySelector('.ezil-drawer-actions');
+        const menu = drawer.querySelector('.ezil-drawer-menu');
+        const status = drawer.querySelector('.ezil-drawer-status');
+        const icon = drawer.querySelector('.dashboard-app-drawer-icon');
+        icon.src = options.icon || window.icons?.['app.svg'] || '';
+        icon.hidden = ! (options.icon || window.icons?.['app.svg']);
+        drawer.querySelector('.dashboard-app-drawer-title').textContent = options.title || '';
+
+        let collapse_timer = null;
+        let opened_at = 0;
+        let previous_focus = null;
+        let restoring_focus = false;
+        let pointer_inside = false;
+        let roving_button;
+        const toolbar_buttons = () => Array.from(controls.querySelectorAll('button'));
+        const update_tabindex = () => {
+            for ( const button of toolbar_buttons() ) {
+                button.tabIndex = ! drawer.classList.contains('collapsed') && button === roving_button ? 0 : -1;
+            }
+        };
+        const reveal = (from = document.activeElement) => {
+            clearTimeout(collapse_timer);
+            if ( drawer.classList.contains('collapsed') ) {
+                previous_focus = from;
+                opened_at = Date.now();
+            }
+            drawer.classList.remove('collapsed');
+            toggle.setAttribute('aria-expanded', 'true');
+            controls.removeAttribute('aria-hidden');
+            update_tabindex();
+        };
+        const close_menu = (focus = false) => {
+            menu.hidden = true;
+            overflow_button.setAttribute('aria-expanded', 'false');
+            if ( focus ) overflow_button.focus();
+        };
+        const collapse = (restore = drawer.contains(document.activeElement)) => {
+            clearTimeout(collapse_timer);
+            close_menu();
+            drawer.classList.add('collapsed');
+            toggle.setAttribute('aria-expanded', 'false');
+            controls.setAttribute('aria-hidden', 'true');
+            update_tabindex();
+            if ( restore ) {
+                // focusin normally reveals. Suppress only the focus we restore
+                // ourselves, or Escape's fallback would reopen the same tray
+                // (docs/FEEDBACK-CONTROLS-CONTRACT.md:53).
+                restoring_focus = true;
+                const target = previous_focus?.isConnected && ! drawer.contains(previous_focus)
+                    && previous_focus !== document.body ? previous_focus : toggle;
+                target.focus();
+                if ( document.activeElement !== target ) toggle.focus();
+                restoring_focus = false;
+            }
+        };
+        const schedule_collapse = (ms = 1500) => {
+            clearTimeout(collapse_timer);
+            collapse_timer = setTimeout(() => {
+                // Timers queued by pointerleave/intro must not hide a keyboard
+                // user's controls or an open menu; the legacy timer at
+                // app-drawer.js:148 predates this keyboard toolbar.
+                if ( ! pointer_inside && ! drawer.contains(document.activeElement) && menu.hidden ) collapse();
+            }, ms);
+        };
+        const flash = () => { reveal(); schedule_collapse(2600); };
+        const invoke = (handler) => {
+            try { handler(); }
+            catch (err) {
+                console.error(`[${PHASE}] floating handler threw`, err);
+                telemetry.capture({ eventClass: 'window_error', site: 'ezil-os:ui/app-drawer#handler',
+                    code: 'drawer_handler_threw', detail: err });
+            }
+        };
+        const button = (parent, label, className, glyph, handler, retract = true) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `dashboard-app-drawer-btn ${className}`;
+            btn.title = label;
+            btn.setAttribute('aria-label', label);
+            btn.tabIndex = -1;
+            const mark = document.createElement('span');
+            mark.setAttribute('aria-hidden', 'true');
+            mark.textContent = glyph;
+            btn.append(mark);
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if ( retract ) collapse();
+                invoke(handler);
+            });
+            parent.append(btn);
+            return btn;
+        };
+        const traffic = options.traffic || {};
+        roving_button = button(lights, 'Close', 'dashboard-app-drawer-close', '×',
+            traffic.on_close ?? (() => $(el_window).close()));
+        button(lights, 'Minimise', 'dashboard-app-drawer-minimize', '−', traffic.on_minimize);
+        const expand_button = traffic.expand_supported
+            ? button(lights, 'Enter full screen', 'ezil-traffic-expand', '+', traffic.on_expand, false) : null;
+        const set_fullscreen = (active) => {
+            if ( ! expand_button ) return;
+            expand_button.setAttribute('aria-pressed', String(!! active));
+            const label = active ? 'Exit full screen' : 'Enter full screen';
+            expand_button.setAttribute('aria-label', label);
+            expand_button.title = label;
+            expand_button.firstElementChild.textContent = active ? '−' : '+';
+        };
+        set_fullscreen(false);
+        const overflow_button = button(actions, 'More window controls', 'ezil-drawer-overflow', '⋯', () => {
+            if ( ! menu.hidden ) { close_menu(true); return; }
+            reveal();
+            menu.hidden = false;
+            overflow_button.setAttribute('aria-expanded', 'true');
+            menu.firstElementChild?.focus();
+        }, false);
+        overflow_button.setAttribute('aria-haspopup', 'menu');
+        overflow_button.setAttribute('aria-expanded', 'false');
+        if ( typeof options.on_feedback === 'function' ) {
+            button(actions, 'Feedback', 'ezil-drawer-feedback', 'Feedback', options.on_feedback);
+        }
+        const overflow_items = new Map();
+        const add_overflow_item = (item) => {
+            if ( overflow_items.has(item.id) ) return;
+            const btn = button(menu, item.label, item.className || '', item.label, item.onClick);
+            btn.setAttribute('role', 'menuitem');
+            overflow_items.set(item.id, btn);
+        };
+        for ( const item of options.overflow || [] ) add_overflow_item(item);
+
+        drawer.addEventListener('focusin', (e) => {
+            if ( restoring_focus ) return;
+            reveal(e.relatedTarget);
+            if ( controls.contains(e.target) && e.target.matches('button') ) {
+                roving_button = e.target;
+                update_tabindex();
+            }
+        });
+        drawer.addEventListener('focusout', () => schedule_collapse());
+        drawer.addEventListener('pointerenter', (e) => {
+            if ( e.pointerType !== 'mouse' ) return;
+            pointer_inside = true;
+            reveal();
+        });
+        drawer.addEventListener('pointerleave', (e) => {
+            if ( e.pointerType !== 'mouse' ) return;
+            pointer_inside = false;
+            schedule_collapse();
+        });
+        toggle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if ( drawer.classList.contains('collapsed') || Date.now() - opened_at < 500 ) reveal();
+            else collapse();
+        });
+        drawer.addEventListener('keydown', (e) => {
+            if ( e.key === 'Escape' ) {
+                e.preventDefault();
+                e.stopPropagation();
+                if ( ! menu.hidden ) close_menu(true);
+                else collapse(true);
+                return;
+            }
+            const in_menu = menu.contains(e.target);
+            const buttons = in_menu ? Array.from(menu.children) : toolbar_buttons();
+            const index = buttons.indexOf(e.target);
+            const backwards = in_menu ? 'ArrowUp' : 'ArrowLeft';
+            const forwards = in_menu ? 'ArrowDown' : 'ArrowRight';
+            if ( index >= 0 && [backwards, forwards, 'Home', 'End'].includes(e.key) ) {
+                e.preventDefault();
+                e.stopPropagation();
+                const next = e.key === 'Home' ? 0 : e.key === 'End' ? buttons.length - 1
+                    : (index + (e.key === backwards ? -1 : 1) + buttons.length) % buttons.length;
+                buttons[next].focus();
+            } else if ( (e.key === 'Enter' || e.key === ' ') && e.target.matches('button') ) {
+                // Prevent the native follow-up click so each key activates
+                // exactly once, including Space (the toolbar in
+                // docs/FEEDBACK-CONTROLS-CONTRACT.md:53).
+                e.preventDefault();
+                e.stopPropagation();
+                if ( ! e.repeat ) e.target.click();
+            } else if ( e.key === 'Tab' && ! menu.hidden ) close_menu(true);
+        });
+
+        // Same latch as the legacy tray (app-drawer.js:249): touch must
+        // activate its window before the stream's next gesture arrives.
+        let pointer_press_pending = false;
+        $(drawer).on('pointerdown mousedown', (e) => {
+            if ( e.type === 'pointerdown' ) pointer_press_pending = true;
+            else if ( pointer_press_pending ) { pointer_press_pending = false; return; }
+            setTimeout(() => $(el_window).focusWindow(), 0);
+        });
+        const fine = window.matchMedia('(hover: hover) and (pointer: fine)');
+        const coarse = window.matchMedia('(any-pointer: coarse)');
+        const update_mode = () => {
+            const overlay = fine.matches && ! coarse.matches
+                && ! document.body.matches('.device-phone, .device-tablet');
+            // Contract puts the mode on the drawer; mirror it on the parent
+            // so the sibling stream inherits strip height (ezil-shell.css:750).
+            for ( const element of [drawer, el_window] ) {
+                element.classList.toggle('ezil-mode-overlay', overlay);
+                element.classList.toggle('ezil-mode-strip', ! overlay);
+            }
+        };
+        for ( const query of [fine, coarse] ) {
+            query.addEventListener('change', update_mode);
+            cleanups.push(() => query.removeEventListener('change', update_mode));
+        }
+        const outside_press = (e) => {
+            if ( ! drawer.contains(e.target) && (coarse.matches || e.pointerType === 'touch') ) collapse();
+        };
+        document.addEventListener('pointerdown', outside_press);
+        cleanups.push(() => document.removeEventListener('pointerdown', outside_press));
+        // A tap in the stream never bubbles out of its iframe. The shell's
+        // focus moves to that element instead; dismiss without stealing it
+        // back (the stream frame is selected in desktop-window.js:597).
+        let blur_timer;
+        const frame_press = () => {
+            clearTimeout(blur_timer);
+            blur_timer = setTimeout(() => {
+                if ( coarse.matches && document.activeElement?.tagName === 'IFRAME' ) collapse(false);
+            }, 0);
+        };
+        window.addEventListener('blur', frame_press);
+        cleanups.push(() => window.removeEventListener('blur', frame_press), () => clearTimeout(blur_timer));
+        let connected = el_window.isConnected;
+        const observer = new MutationObserver((records) => {
+            connected ||= drawer.isConnected;
+            if ( connected && ! drawer.isConnected ) {
+                for ( const cleanup of cleanups ) cleanup();
+                return;
+            }
+            if ( records.some(record => record.target === document.body && record.type === 'attributes') ) update_mode();
+        });
+        observer.observe(document.body, { attributes: true, attributeFilter: ['class'], childList: true, subtree: true });
+        cleanups.push(() => observer.disconnect(), () => clearTimeout(collapse_timer));
+
+        drawer.ezil_controls = {
+            set_status: (text) => { status.textContent = text; },
+            set_fullscreen,
+            reveal: () => reveal(),
+            collapse: () => collapse(),
+            focus_grabber: () => toggle.focus(),
+            add_overflow_item,
+        };
+        el_window.append(drawer);
+        el_window.classList.add('ezil-floating-controls');
+        update_mode();
+        el_window._dashboard_drawer_collapse = () => collapse();
+        el_window._ezil_drawer_flash = flash;
+        if ( options.flash_on_attach !== false ) {
+            let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(flash); });
+            cleanups.push(() => cancelAnimationFrame(frame));
+        }
+        return drawer;
+    } catch (err) {
+        for ( const cleanup of cleanups ) cleanup();
+        drawer?.remove();
+        el_window.classList.remove('ezil-floating-controls', 'ezil-mode-overlay', 'ezil-mode-strip');
+        console.error(`[${PHASE}] floating drawer did not attach`, err);
+        telemetry.capture({ eventClass: 'window_error', site: 'ezil-os:ui/app-drawer#attach',
+            code: 'drawer_attach_failed', detail: err });
+        return null;
+    }
+}

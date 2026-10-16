@@ -1,3 +1,4 @@
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
 
 import { handleTelemetryMaintenance } from './maintenance-handler';
@@ -106,7 +107,7 @@ describe('handleTelemetryMaintenance: retention AND the spool drain, isolated fr
         expect(res.status).toBe(500);
         const body = await res.json();
         expect(body.ok).toBe(false);
-        expect(body.failed).toEqual(['maintenance']);
+        expect(body.failed).toEqual(['maintenance', 'feedback']);
         expect(drain.drainPage).toHaveBeenCalled();
         expect(body.drain).toBeDefined();
         consoleSpy.mockRestore();
@@ -138,7 +139,7 @@ describe('handleTelemetryMaintenance: retention AND the spool drain, isolated fr
             drain: drainDeps({ drainPage: vi.fn().mockRejectedValue(new Error('worker exploded')) }),
         });
         expect(res.status).toBe(500);
-        expect((await res.json()).failed).toEqual(['maintenance', 'drain']);
+        expect((await res.json()).failed).toEqual(['maintenance', 'feedback', 'drain']);
         consoleSpy.mockRestore();
     });
 
@@ -158,12 +159,13 @@ describe('handleTelemetryMaintenance: retention AND the spool drain, isolated fr
         consoleSpy.mockRestore();
     });
 
-    it('omitting `drain` keeps the retention-only behaviour byte for byte', async () => {
+    it('omitting `drain` still runs both retention jobs', async () => {
         const res = await handleTelemetryMaintenance(req(`Bearer ${secret}`), { cronSecret: secret, db: makeDb([]) });
         expect(res.status).toBe(200);
         const body = await res.json();
         expect(body.ok).toBe(true);
         expect(body.drain).toBeUndefined();
+        expect(body.feedback).toHaveProperty('attachments');
     });
 
     it('does not run the drain for an unauthenticated caller — the 404 comes first', async () => {
@@ -175,5 +177,110 @@ describe('handleTelemetryMaintenance: retention AND the spool drain, isolated fr
         });
         expect(res.status).toBe(404);
         expect(drain.drainPage).not.toHaveBeenCalled();
+    });
+});
+
+describe('feedback retention shares the cron and isolates failures', () => {
+    const secret = 'x'.repeat(32);
+
+    function dbWithFailures(fail: 'telemetry' | 'feedback' | null) {
+        const order: string[] = [];
+        const db: RetentionDb = { execute: vi.fn(async (q) => {
+            const sql = new PgDialect().sqlToQuery(q).sql;
+            const job = sql.includes('ezil_feedback_') ? 'feedback' : 'telemetry';
+            order.push(job);
+            if (job === fail) throw new Error(`${job} unavailable`);
+            // The presence probe (to_regclass) answers "all tables exist".
+            if (sql.includes('to_regclass')) return [{ reports: true, attachments: true, access_log: true }];
+            return [];
+        }) };
+        return { db, order };
+    }
+
+    it('runs telemetry, feedback, then the drain and reports all three', async () => {
+        const { db, order } = dbWithFailures(null);
+        const drain = drainDeps({ drainPage: vi.fn(async () => {
+            order.push('drain');
+            return { ok: true, objects: [], truncated: false };
+        }) });
+        const res = await handleTelemetryMaintenance(req(`Bearer ${secret}`), { cronSecret: secret, db, drain });
+        expect(res.status).toBe(200);
+        expect(order).toEqual(['telemetry', 'telemetry', 'telemetry', 'telemetry', 'feedback', 'feedback', 'feedback', 'feedback', 'drain']);
+        expect(await res.json()).toMatchObject({ ok: true, result: { events: { deletedRows: 0 } }, feedback: {
+            attachments: { deletedRows: 0, hitBudget: false },
+            reports: { deletedRows: 0, hitBudget: false },
+            accessLog: { deletedRows: 0, hitBudget: false },
+        }, drain: { pagesDrained: 1 } });
+    });
+
+    it.each(['telemetry', 'feedback'] as const)('%s failure does not hide or prevent the other retention job or drain', async (fail) => {
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+            const { db, order } = dbWithFailures(fail);
+            const drain = drainDeps();
+            const res = await handleTelemetryMaintenance(req(`Bearer ${secret}`), { cronSecret: secret, db, drain });
+            expect(res.status).toBe(500);
+            const body = await res.json();
+            expect(body.failed).toEqual([fail === 'telemetry' ? 'maintenance' : 'feedback']);
+            expect(order).toContain('telemetry');
+            expect(order).toContain('feedback');
+            expect(body[fail === 'telemetry' ? 'feedback' : 'result']).toBeDefined();
+            expect(body[fail === 'telemetry' ? 'result' : 'feedback']).toBeUndefined();
+            expect(body.drain).toBeDefined();
+            expect(drain.drainPage).toHaveBeenCalled();
+        } finally {
+            consoleSpy.mockRestore();
+        }
+    });
+
+    it.each([undefined, 'wrong'])('does not run either retention job without authorization (%s)', async (token) => {
+        const { db } = dbWithFailures(null);
+        const res = await handleTelemetryMaintenance(req(token), { cronSecret: secret, db });
+        expect(res.status).toBe(404);
+        expect(db.execute).not.toHaveBeenCalled();
+    });
+});
+
+describe('feedback retention before the feedback SQL is registered', () => {
+    const secret = 'x'.repeat(32);
+
+    it('skips (200, not 500) when no feedback table exists, running no DELETE', async () => {
+        const seen: string[] = [];
+        const db: RetentionDb = { execute: vi.fn(async (q) => {
+            const sql = new PgDialect().sqlToQuery(q).sql;
+            seen.push(sql);
+            if (sql.includes('to_regclass')) return [{ reports: false, attachments: false, access_log: false }];
+            // A DELETE against a missing table is exactly what Postgres would reject.
+            if (sql.includes('ezil_feedback_')) throw new Error('relation "ezil_feedback_reports" does not exist');
+            return [];
+        }) };
+        const res = await handleTelemetryMaintenance(req(`Bearer ${secret}`), { cronSecret: secret, db });
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.failed).toBeUndefined();
+        expect(body.feedback).toEqual({
+            attachments: { deletedRows: 0, hitBudget: false, skipped: true },
+            reports: { deletedRows: 0, hitBudget: false, skipped: true },
+            accessLog: { deletedRows: 0, hitBudget: false, skipped: true },
+        });
+        expect(seen.filter((s) => /DELETE FROM ezil_feedback_/.test(s))).toEqual([]);
+    });
+
+    it('prunes reports + access log without touching attachments when only 0003 exists', async () => {
+        const seen: string[] = [];
+        const db: RetentionDb = { execute: vi.fn(async (q) => {
+            const sql = new PgDialect().sqlToQuery(q).sql;
+            seen.push(sql);
+            if (sql.includes('to_regclass')) return [{ reports: true, attachments: false, access_log: true }];
+            if (sql.includes('ezil_feedback_attachments')) throw new Error('relation "ezil_feedback_attachments" does not exist');
+            return [];
+        }) };
+        const res = await handleTelemetryMaintenance(req(`Bearer ${secret}`), { cronSecret: secret, db });
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.feedback.attachments).toEqual({ deletedRows: 0, hitBudget: false, skipped: true });
+        expect(body.feedback.reports).toEqual({ deletedRows: 0, hitBudget: false });
+        expect(seen.some((s) => /DELETE FROM ezil_feedback_reports/.test(s))).toBe(true);
+        expect(seen.some((s) => /DELETE FROM ezil_feedback_access_log/.test(s))).toBe(true);
     });
 });
