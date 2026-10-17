@@ -132,7 +132,13 @@ assert continuity['timeout-minutes'] == 90
 assert continuity['env']['EZIL_E2E_COMPUTER_ID'] == '${{ secrets.EZIL_E2E_COMPUTER_ID }}'
 assert 'full' in continuity['env']['EZIL_CONTINUITY_MODE'] and 'short' in continuity['env']['EZIL_CONTINUITY_MODE']
 assert jobs['preview']['timeout-minutes'] >= 150
-assert jobs['preview']['needs'] == ['trust', 'images']
+assert jobs['preview']['needs'] == ['trust', 'images', 'pr-ci']
+# Images may build during PR CI, but staging must still wait for that CI. pr-ci
+# runs for every admitted source, so production never inherits a skipped need.
+assert jobs['pr-ci']['needs'] == 'trust' and jobs['pr-ci']['name'] == 'Require passing PR CI'
+assert jobs['pr-ci']['if'] == "needs.trust.outputs.allowed == 'true'"
+assert not any('actions/checkout' in step.get('uses', '') for step in jobs['pr-ci']['steps'])
+assert 'pr-ci' in jobs['summary']['needs']
 assert jobs['images']['if'] == "needs.trust.outputs.allowed == 'true'"
 assert workflows['preview'].get('on', workflows['preview'].get(True))['workflow_run']['branches'] == ['main']
 assert 'Hosted continuity PR gate' in jobs['summary']['name']

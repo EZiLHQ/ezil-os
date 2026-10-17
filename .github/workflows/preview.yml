@@ -146,25 +146,11 @@ jobs:
               if (initial.state !== 'open' || initial.draft || initial.base.ref !== 'main' ||
                   initial.base.repo.full_name.toLowerCase() !== fullName.toLowerCase() ||
                   initial.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) { deny('PR must be open, ready and from this repository to main'); return; }
-              const sha = initial.head.sha;
-              for (let attempt = 0; attempt < 120; attempt++) {
-                const { data } = await github.rest.actions.listWorkflowRuns({
-                  ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'pull_request', per_page: 20,
-                });
-                const ci = data.workflow_runs.find(run => run.head_sha === sha && run.path === '.github/workflows/ci.yml');
-                if (ci?.status === 'completed') {
-                  if (ci.conclusion !== 'success') { deny(`PR CI concluded ${ci.conclusion}`); return; }
-                  const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
-                  if (current.state !== 'open' || current.head.sha !== sha ||
-                      current.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) return;
-                  core.setOutput('sha', sha);
-                  core.setOutput('allowed', 'true');
-                  core.setOutput('reason', 'Trusted current PR CI passed');
-                  return;
-                }
-                await new Promise(resolve => setTimeout(resolve, 20000));
-              }
-              core.setFailed('Timed out waiting for public CI on this PR commit');
+              // Images build from this commit while public CI runs. Staging still
+              // waits for "Require passing PR CI" on the same commit.
+              core.setOutput('sha', initial.head.sha);
+              core.setOutput('allowed', 'true');
+              core.setOutput('reason', 'Trusted current PR source; staging requires its CI');
               return;
             }
             const run = context.payload.workflow_run;
@@ -187,7 +173,8 @@ jobs:
 
   preview:
     name: Deploy and verify staging
-    needs: [trust, images]
+    # pr-ci passes only after this pull request's own public CI succeeded.
+    needs: [trust, images, pr-ci]
     if: needs.trust.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -508,6 +495,49 @@ jobs:
     with:
       source: ${{ needs.trust.outputs.sha }}
     secrets: inherit
+
+  pr-ci:
+    name: Require passing PR CI
+    needs: trust
+    # Runs for every admitted source so no later job inherits a skipped need.
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      # No checkout, artifacts, caches, environments or deployment secrets here.
+      - uses: actions/github-script@v8
+        env:
+          SOURCE_SHA: ${{ needs.trust.outputs.sha }}
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') { core.info('Tested source was admitted by trust'); return; }
+            const repo = context.repo;
+            const fullName = `${repo.owner}/${repo.repo}`;
+            const sha = process.env.SOURCE_SHA;
+            const number = context.payload.pull_request?.number;
+            if (!/^[a-f0-9]{40}$/.test(sha || '') || !number) { core.setFailed('Admitted PR source missing'); return; }
+            for (let attempt = 0; attempt < 120; attempt++) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'pull_request', per_page: 20,
+              });
+              const ci = data.workflow_runs.find(run => run.head_sha === sha && run.path === '.github/workflows/ci.yml');
+              if (ci?.status === 'completed') {
+                if (ci.conclusion !== 'success') { core.setFailed(`PR CI concluded ${ci.conclusion}`); return; }
+                const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
+                if (current.state !== 'open' || current.head.sha !== sha ||
+                    current.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) {
+                  core.setFailed('PR changed while CI ran; its newer commit has its own run'); return;
+                }
+                core.info('Trusted current PR CI passed');
+                return;
+              }
+              await new Promise(resolve => setTimeout(resolve, 20000));
+            }
+            core.setFailed('Timed out waiting for public CI on this PR commit');
 
   production:
     name: Deploy main after staging passes
@@ -862,7 +892,7 @@ jobs:
     permissions:
       contents: read
     if: always()
-    needs: [trust, preview, images, production]
+    needs: [trust, pr-ci, preview, images, production]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -874,6 +904,7 @@ jobs:
           PRODUCTION_REQUIRED: ${{ needs.trust.outputs.production }}
           MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
           IMAGE_RESULT: ${{ needs.images.result }}
+          PR_CI_RESULT: ${{ needs.pr-ci.result }}
           PREVIEW_RESULT: ${{ needs.preview.result }}
           PREVIEW_URL: ${{ needs.preview.outputs.url }}
           PREVIEW_WORKER: ${{ needs.preview.outputs.worker_version }}
@@ -887,7 +918,7 @@ jobs:
             const e = process.env;
             core.summary.addHeading('Cloud deployment');
             core.summary.addRaw(`Source SHA: ${e.SOURCE_SHA || 'not admitted'}\n\n`);
-            core.summary.addRaw(`Admission: ${e.ADMISSION_REASON || 'not admitted'}. Images: ${e.IMAGE_RESULT}\n\n`);
+            core.summary.addRaw(`Admission: ${e.ADMISSION_REASON || 'not admitted'}. PR CI: ${e.PR_CI_RESULT}. Images: ${e.IMAGE_RESULT}\n\n`);
             if (e.TRUSTED !== 'true') core.summary.addRaw('No deployment: failed, stale, unsupported or untrusted CI source. Fork PRs receive public CI only.\n\n');
             core.summary.addTable([
               [{ data: 'Target', header: true }, { data: 'Result', header: true },
@@ -904,6 +935,7 @@ jobs:
             }
             await core.summary.write();
             if (e.TRUSTED !== 'true') core.setFailed(`No deployment performed: ${e.ADMISSION_REASON}`);
+            else if (e.PR_CI_RESULT !== 'success') core.setFailed(`No deployment performed: PR CI ${e.PR_CI_RESULT}`);
             else if (e.PREVIEW_RESULT !== 'success' || (e.PRODUCTION_REQUIRED === 'true' &&
                      (e.IMAGE_RESULT !== 'success' || e.PRODUCTION_RESULT !== 'success'))) {
               core.setFailed('Required deployments or tested images did not succeed');
