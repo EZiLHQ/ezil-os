@@ -1,9 +1,11 @@
 import { cloudflareGuacamoleRouter } from './routers/cloudflare-guacamole';
 import { computerRouter } from './routers/computer';
+import { computeRouter } from './routers/compute';
 import { createCallerFactory, createTRPCRouter } from './trpc';
 
 export const appRouter = createTRPCRouter({
     computer: computerRouter,
+    compute: computeRouter,
     cloudflareGuacamole: cloudflareGuacamoleRouter,
 });
 

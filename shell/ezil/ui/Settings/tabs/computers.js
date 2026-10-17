@@ -18,6 +18,8 @@ import UIAlert from '../../../../src/UI/UIAlert.js';
 import registry from '../../../apps/registry.js';
 import session from '../../../session.js';
 import trpc from '../trpc.js';
+import { mountComputeSize } from '../../Billing/compute-size.js';
+import { text as billingText } from '../../Billing/text.js';
 
 const PHASE = 'ezil-os:settings/computers';
 
@@ -639,6 +641,27 @@ export default {
         }
         bind($win, ctx);
         void load($win);
+        // Opt-in integration: computeSize supplies getShapes/changeShape/onUpgrade.
+        // C1 specifies no mutation route, so the host owns that operation.
+        if ( ! isNative(ctx) ) mountComputeSize($win.find('[data-pane="computers"] .ezil-settings-pane-body').get(0), {
+            ...ctx?.computeSize,
+            config: ctx?.config,
+            getShapes: ctx?.computeSize?.getShapes ?? (async () => {
+                const result = await trpc.query('compute.shapes');
+                if ( ! result.ok ) throw new Error(result.message);
+                return result.data;
+            }),
+            getComputer: () => computers.find(computer => computer.id === sessionComputerId) ?? ctx?.computer ?? session.payload()?.computer,
+            confirmChange: async ({ message }) => await UIAlert({
+                message,
+                type: 'warning',
+                body_icon: ALERT_WARNING_ICON,
+                buttons: [
+                    { label: billingText('compute_confirm'), value: 'confirm', type: 'primary' },
+                    { label: billingText('compute_cancel'), value: 'cancel', type: 'secondary' },
+                ],
+            }) === 'confirm',
+        });
     },
 
     onActivate ($win) {
