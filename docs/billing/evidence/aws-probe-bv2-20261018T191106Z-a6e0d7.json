@@ -1,0 +1,96 @@
+{
+  "run_id": "bv2-20261018T191106Z-a6e0d7",
+  "identity_arn": "arn:aws:sts::<account>:assumed-role/AWSReservedSSO_AdministratorAccess_<id>/<founder SSO session>",
+  "started": "2026-10-18T19:11:06.759741+00:00",
+  "rows": {
+    "A_cold_boot_mumbai_std2": {
+      "instance": "i-03e824fd1eee3432a",
+      "type": "m6i.large",
+      "run_to_running_s": 6.0,
+      "run_to_guest_boot_s": 12.4,
+      "guest_nproc": 2,
+      "guest_memkb": 7962872,
+      "attach_to_data_ready_s": 1.7,
+      "new_fs": true,
+      "note": "guest boot = first init-script line; product desktop/editor readiness is NOT measured here"
+    },
+    "B_warm_attach_mumbai": {
+      "attach_to_data_ready_s": 1.8,
+      "marker_preserved": true,
+      "note": "warm path = pre-booted clean host + attach + mount; excludes tunnel/desktop start"
+    },
+    "C_size_transitions_mumbai": [
+      {
+        "to": "m6i.xlarge",
+        "size": "cmp-4",
+        "stop_s": 43.5,
+        "start_to_guest_boot_s": 9.8,
+        "start_to_data_ready_s": 9.9,
+        "guest_nproc": 4,
+        "nproc_ok": true,
+        "guest_memgib": 15.3,
+        "marker_preserved": true
+      },
+      {
+        "to": "m6i.2xlarge",
+        "size": "cmp-8",
+        "stop_s": 21.5,
+        "start_to_guest_boot_s": 9.6,
+        "start_to_data_ready_s": 9.7,
+        "guest_nproc": 8,
+        "nproc_ok": true,
+        "guest_memgib": 30.8,
+        "marker_preserved": true
+      }
+    ],
+    "D_regional_recovery_mumbai_to_us": {
+      "rpo_point": "2026-10-18T19:15:37.837000+00:00",
+      "mumbai_writer_fenced_s": 49.3,
+      "snapshot_complete_s": 52.9,
+      "cross_region_copy_s": 25.6,
+      "us_attach_to_data_ready_s": 2.4,
+      "rto_outage_to_us_data_ready_s": 107.0,
+      "marker_preserved": true,
+      "new_fs_in_us": false,
+      "note": "data written after the snapshot start is NOT in the replica (RPO = snapshot point); fencing here = writer stopped before restore"
+    }
+  },
+  "estimated_spend_usd": 0.071,
+  "cleanup": {
+    "ap-south-1": {
+      "terminated": [
+        "i-03e824fd1eee3432a"
+      ],
+      "volumes_deleted": [
+        "vol-009b82b51fa1ec2d6",
+        "vol-0c09e611cfaefa572"
+      ],
+      "snapshots_deleted": [
+        "snap-01d35f2305723b98a"
+      ],
+      "remaining": {
+        "instances": [],
+        "volumes": [],
+        "snapshots": []
+      }
+    },
+    "us-east-1": {
+      "terminated": [
+        "i-0690f6d925e449f8f"
+      ],
+      "volumes_deleted": [
+        "vol-08cb620de67ed1234",
+        "vol-0ab88390c89f9b2c6"
+      ],
+      "snapshots_deleted": [
+        "snap-06b8dd5634ad5abf5"
+      ],
+      "remaining": {
+        "instances": [],
+        "volumes": [],
+        "snapshots": []
+      }
+    }
+  },
+  "finished": "2026-10-18T19:19:47.629759+00:00"
+}
