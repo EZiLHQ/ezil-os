@@ -193,3 +193,15 @@ describe('probeTmuxKeepAlive: the I/O half fails to NO hold', () => {
     expect(method).toContain('tmux_probe_failed');
   });
 });
+
+describe('runSystemFlush: an oversized system layer waits out the interval (held computers would re-walk it)', () => {
+  const sys = between('private async runSystemFlush(', '/** Superseded checkpoint generations');
+
+  it('advances SYSTEM_LAST_FLUSH_AT_KEY on too_large, so routine cycles do not re-walk up to 512 MiB every 10-60 s', () => {
+    expect(sys).toContain("|| system.skippedReason === 'too_large') {\n        await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, Date.now());");
+  });
+
+  it('final checkpoints still ignore the clock', () => {
+    expect(sys).toContain('if (!final && Date.now() - last < SYSTEM_FLUSH_INTERVAL_MS) return undefined;');
+  });
+});

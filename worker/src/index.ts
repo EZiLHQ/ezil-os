@@ -2839,7 +2839,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     try {
       const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
         log: (message) => console.error(`[system_flush] ${message}`) });
-      if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy') {
+      // `too_large` stays too large until the user deletes something, so it
+      // waits out the interval too. Re-walking up to 512 MiB on every 10-60 s
+      // cycle was already waste for a present user; SIGNAL C's hold
+      // (./tmux-keepalive.ts) can stretch it over hours with nobody there.
+      // Final checkpoints ignore this clock.
+      if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy'
+        || system.skippedReason === 'too_large') {
         await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, Date.now());
       }
       if (system.ok || system.skippedReason === 'too_large') {
