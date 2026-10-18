@@ -255,6 +255,37 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
         expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toHaveLength(2);
     });
 
+    it('acknowledges a refund on an overage invoice without writing a grant', async () => {
+        const value = invoice(subscription(a), { metadataKind: 'overage', billingReason: 'manual', subscriptionId: null });
+        stripe.invoices.set(value.id, value);
+        const charge: StripeCharge = {
+            id: `ch_${randomUUID()}`, customer: a.customerId, invoiceId: value.id, paymentIntentId: null,
+            amount: 25, amountRefunded: 25, refunded: true,
+        };
+        stripe.charges.set(charge.id, charge);
+        const sourceId = `re_${randomUUID()}`;
+        const reversal = event('refund.created', { id: sourceId, charge: charge.id });
+        expect(await deliver(reversal)).toEqual({ receipt: 'new', outcome: 'review:refund_on_overage_invoice' });
+        expect(await deliver(reversal)).toEqual({ receipt: 'processed', outcome: 'duplicate' });
+        expect(await store.grantsBySource('invoice', value.id)).toEqual([]);
+        expect(await store.grantsBySource('refund', sourceId)).toEqual([]);
+        expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toEqual([]);
+    });
+
+    it('settles a paid overage subscription_cycle with a valid base line without a plan_period grant', async () => {
+        const sub = subscription(a);
+        const value = invoice(sub, { metadataKind: 'overage', status: 'paid', subscriptionId: sub.id,
+            billingReason: 'subscription_cycle', lines: [line(sub, 'standard_monthly_v2')] });
+        stripe.invoices.set(value.id, value);
+        const record = await store.upsertOverageInvoice({ userId: a.userId, subscriptionId: sub.id,
+            periodStart: START, periodEnd: END, ratingVersion: 2, stdSecondsOver: BigInt(3600), cents: 25 });
+        await store.attachOverageStripeInvoice(record.row.id, value.id);
+        expect((await deliver(invoiceEvent(value))).outcome).toBe('applied');
+        expect(await store.grantsBySource('invoice', value.id)).toEqual([]);
+        expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toEqual([]);
+        expect((await store.overageInvoiceByStripeId(value.id))?.status).toBe('paid');
+    });
+
     it.each(['invoice.payment_failed', 'invoice.payment_action_required'])('never grants for overage and disables consent on %s', async failureType => {
         await paid(a, 'compute_monthly_v2');
         await acceptOverage(a);

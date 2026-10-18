@@ -925,6 +925,115 @@ describe('v2 webhook grants', () => {
         expect(await processStripeEvent(paid, f.deps)).toBe('ignored');
     });
 
+    it.each(['standard_monthly_v2', 'compute_monthly_v2'] as const)(
+        'settles a paid overage subscription_cycle with a valid %s base line without granting', async sku => {
+            const f = v2Fixture(sku);
+            await seedOverage(f);
+            f.stripe.invoice.subscriptionId = 'sub_local';
+            f.stripe.invoice.billingReason = 'subscription_cycle';
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(f.store.grants.size).toBe(0);
+            expect(f.store.outbox.size).toBe(0);
+            expect(f.store.overageInvoices[0].status).toBe('paid');
+        },
+    );
+
+    describe.each([
+        ['refund', refund], ['dispute', dispute], ['dispute restore', () => dispute(true)],
+    ] as const)('%s without an original grant', (kind, makeEvent) => {
+        it.each(['manual', 'subscription_cycle'])('reviews an overage invoice with billing reason %s without writes', async billingReason => {
+            const f = v2Fixture();
+            await seedOverage(f);
+            f.stripe.invoice.subscriptionId = 'sub_local';
+            f.stripe.invoice.billingReason = billingReason;
+            f.stripe.charge.invoiceId = 'in_local';
+            const before = structuredClone({
+                overages: f.store.overageInvoices, consents: f.store.consents, issues: f.store.issues,
+            });
+            expect(await processStripeEvent(makeEvent(), f.deps)).toBe(
+                kind === 'refund' ? 'review:refund_on_overage_invoice' : 'review:dispute_on_overage_invoice',
+            );
+            expect(f.stripe.reads).toEqual(['charge:ch_local', 'invoice:in_local']);
+            expect(f.store.writes).toEqual([]);
+            expect(f.store.grants.size).toBe(0);
+            expect(f.store.outbox.size).toBe(0);
+            expect({ overages: f.store.overageInvoices, consents: f.store.consents, issues: f.store.issues }).toEqual(before);
+        });
+
+        it.each([
+            { billingReason: 'manual' }, { billingReason: null }, { billingReason: 'subscription_threshold' },
+            { billingReason: 'subscription_update' }, { status: 'open' }, { status: 'void' },
+            { status: 'uncollectible' }, { subscriptionId: null },
+        ])('ignores an invoice that cannot grant: %j', async fields => {
+            const { store, stripe, deps } = v2Fixture();
+            Object.assign(stripe.invoice, fields);
+            stripe.charge.invoiceId = 'in_local';
+            expect(await processStripeEvent(makeEvent(), deps)).toBe('ignored');
+            expect(stripe.reads).toEqual(['charge:ch_local', 'invoice:in_local']);
+            expect(store.writes).toEqual([]);
+        });
+
+        it.each(['missing credit', 'nonpositive compute', 'foreign compute', 'foreign credit', 'invalid compute period', 'downgrade'])(
+            'ignores a non-upgrade subscription_update: %s', async scenario => {
+                const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+                stripe.charge.invoiceId = 'in_local';
+                stripe.invoice.billingReason = 'subscription_update';
+                const compute = { ...baseLine('compute_monthly_v2'), periodStart: now };
+                const credit = { ...baseLine('standard_monthly_v2'), amount: -1000 };
+                stripe.invoice.lines = [compute, credit];
+                if (scenario === 'missing credit') stripe.invoice.lines = [compute];
+                if (scenario === 'nonpositive compute') compute.amount = 0;
+                if (scenario === 'foreign compute') compute.subscriptionId = 'sub_foreign';
+                if (scenario === 'foreign credit') credit.subscriptionId = 'sub_foreign';
+                if (scenario === 'invalid compute period') compute.periodEnd = now;
+                if (scenario === 'downgrade') { compute.amount = -5000; credit.amount = 1000; }
+                expect(await processStripeEvent(makeEvent(), deps)).toBe('ignored');
+                expect(store.writes).toEqual([]);
+            },
+        );
+
+        it('ignores a charge with neither invoice nor payment intent', async () => {
+            const { store, stripe, deps } = fixture();
+            stripe.charge.paymentIntentId = null;
+            expect(await processStripeEvent(makeEvent(), deps)).toBe('ignored');
+            expect(stripe.reads).toEqual(['charge:ch_local']);
+            expect(store.sourceReads).toEqual([]);
+            expect(store.writes).toEqual([]);
+        });
+
+        it.each(['subscription_create', 'subscription_cycle', 'upgrade', 'top-up'] as const)(
+            'retries before a %s grant, then applies once', async scenario => {
+                const { store, stripe, deps } = v2Fixture(scenario === 'upgrade' ? 'compute_monthly_v2' : 'standard_monthly_v2');
+                if (scenario !== 'top-up') {
+                    stripe.charge.invoiceId = 'in_local';
+                    stripe.invoice.billingReason = scenario === 'upgrade' ? 'subscription_update' : scenario;
+                }
+                if (scenario === 'upgrade') {
+                    stripe.invoice.lines = [
+                        { ...baseLine('compute_monthly_v2'), subscriptionId: null, periodStart: now },
+                        { ...baseLine('standard_monthly_v2'), subscriptionId: null, amount: 0, periodStart: now },
+                    ];
+                }
+                expect(await processStripeEvent(makeEvent(), deps)).toBe(
+                    kind === 'refund' ? 'failed:no_grant_for_refund' : 'failed:no_grant_for_dispute',
+                );
+                expect(store.writes).toEqual([]);
+                expect(await processStripeEvent(scenario === 'top-up' ? checkout(false) : paidV2(), deps)).toBe('applied');
+                const original = [...store.grants.values()][0];
+                expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
+                const writes = [...store.writes];
+                expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
+                expect(store.writes).toEqual(writes);
+                expect([...store.grants.values()]).toEqual([original, expect.objectContaining({
+                    kind: kind === 'refund' ? 'revoke' : kind === 'dispute' ? 'suspend' : 'restore',
+                    meter: original.meter, subscriptionId: original.subscriptionId,
+                    amount: kind === 'dispute restore' ? original.amount : -original.amount,
+                    periodStart: original.periodStart, periodEnd: original.periodEnd,
+                })]);
+            },
+        );
+    });
+
     it('resolves paid manual invoice issues even without a subscription', async () => {
         const { store, stripe, deps } = v2Fixture();
         stripe.invoice.subscriptionId = null;

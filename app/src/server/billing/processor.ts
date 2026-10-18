@@ -4,7 +4,7 @@
  * effect; stable ledger/outbox keys let a retry finish an interrupted delivery.
  */
 import { findPack, PRO_PLAN } from './catalog';
-import type { BillingStore, ProcessorDeps, StripeSubscription, UsageEvent } from './ports';
+import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, UsageEvent } from './ports';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { offerBySku } from './v2/catalog';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
@@ -38,6 +38,23 @@ function validPeriod(start: Date | null, end: Date | null): boolean {
         && Number.isFinite(end.getTime()) && end > start;
 }
 
+/** Share eligibility and the selected upgrade line with missing-grant retries. */
+function invoiceGrantKind(invoice: StripeInvoice):
+    | { kind: 'period' | 'overage' | 'none' }
+    | { kind: 'upgrade'; compute: StripeInvoice['lines'][number] } {
+    if (invoice.metadataKind === 'overage') return { kind: 'overage' };
+    if (invoice.status !== 'paid' || invoice.subscriptionId === null) return { kind: 'none' };
+    if (PERIOD_GRANT_BILLING_REASONS.some(reason => reason === invoice.billingReason)) return { kind: 'period' };
+    if (invoice.billingReason === UPGRADE_GRANT_BILLING_REASON) {
+        const ownedLines = invoice.lines.filter(line => line.subscriptionId === invoice.subscriptionId || line.subscriptionId === null);
+        const compute = ownedLines.find(line => line.lookupKey === CATALOG_V2.compute_monthly_v2.stripeLookupKey
+            && line.amount > 0 && validPeriod(line.periodStart, line.periodEnd));
+        const credit = ownedLines.find(line => line.lookupKey === CATALOG_V2.standard_monthly_v2.stripeLookupKey);
+        if (compute && credit) return { kind: 'upgrade', compute };
+    }
+    return { kind: 'none' };
+}
+
 async function applyAction(action: BillingAction, event: StripeEventLike, deps: ProcessorDeps): Promise<string> {
     const { store, stripe } = deps;
     switch (action.type) {
@@ -54,8 +71,9 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
         case 'grant_period': {
             const invoice = await stripe.retrieveInvoice(action.invoiceId);
             if (invoice.status !== 'paid') return 'ignored';
+            const grant = invoiceGrantKind(invoice);
             const eventCreated = new Date(event.created * 1000);
-            if (invoice.metadataKind === 'overage') {
+            if (grant.kind === 'overage') {
                 const result = await store.setOverageInvoiceStatus(invoice.id, 'paid');
                 await store.resolvePaymentIssue(invoice.id, eventCreated);
                 return result === 'updated' ? 'applied' : 'ignored';
@@ -71,7 +89,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             const offer = subscription.sku === null ? undefined : offerBySku(subscription.sku);
             if (!offer) return 'review:unknown_sku';
 
-            if (PERIOD_GRANT_BILLING_REASONS.some(reason => reason === invoice.billingReason)) {
+            if (grant.kind === 'period') {
                 if (offer.sku === PRO_PLAN.sku) {
                     const { periodStart, periodEnd } = invoice;
                     if (!validPeriod(periodStart, periodEnd)) return 'review:invalid_period';
@@ -109,15 +127,8 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 }
                 return 'applied';
             }
-            if (invoice.billingReason === UPGRADE_GRANT_BILLING_REASON) {
-                const ownedLines = invoice.lines.filter(line => line.subscriptionId === subscription.id || line.subscriptionId === null);
-                const compute = ownedLines.find(line => line.lookupKey === CATALOG_V2.compute_monthly_v2.stripeLookupKey
-                    && line.amount > 0 && validPeriod(line.periodStart, line.periodEnd));
-                const credit = ownedLines.find(line => line.lookupKey === CATALOG_V2.standard_monthly_v2.stripeLookupKey);
-                if (!compute || !credit) {
-                    await store.resolvePaymentIssue(invoice.id, eventCreated);
-                    return 'ignored';
-                }
+            if (grant.kind === 'upgrade') {
+                const { compute } = grant;
                 const { currentPeriodStart: periodStart, currentPeriodEnd } = subscription;
                 if (!validPeriod(periodStart, currentPeriodEnd)) return 'review:invalid_period';
                 const effectiveAt = compute.periodStart!;
@@ -230,6 +241,16 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     ? await store.grantsBySource('payment_intent', charge.paymentIntentId)
                     : [];
             if (originals.length === 0) {
+                if (charge.invoiceId !== null) {
+                    const invoice = await stripe.retrieveInvoice(charge.invoiceId);
+                    const { kind } = invoiceGrantKind(invoice);
+                    if (kind === 'overage') {
+                        return action.type === 'revoke' ? 'review:refund_on_overage_invoice' : 'review:dispute_on_overage_invoice';
+                    }
+                    if (kind !== 'period' && kind !== 'upgrade') return 'ignored';
+                } else if (charge.paymentIntentId === null) {
+                    return 'ignored';
+                }
                 return action.type === 'revoke' ? 'failed:no_grant_for_refund' : 'failed:no_grant_for_dispute';
             }
             if (originals.some(grant => grant.userId !== userId)) return 'review:customer_mismatch';
