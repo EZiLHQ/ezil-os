@@ -73,6 +73,7 @@
 
 import { describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { TMUX_KEEPALIVE_MAX_MS, TMUX_SESSIONS_PROBE_COMMAND } from './tmux-keepalive';
 
 // Must be registered before `./index.ts` is imported — see `route-auth.test.ts`.
 mock.module('cloudflare:workers', () => ({
@@ -115,8 +116,12 @@ interface FakeOptions {
   running?: boolean;
   /** `/proc/loadavg` line the busy probe should observe. */
   loadavg?: string;
-  /** Make the busy probe's `exec` reject. */
+  /** Make the busy probe's `exec` reject (and the tmux probe's: the container is gone). */
   execThrows?: boolean;
+  /** Sessions the tmux probe reports (default 0, i.e. no tmux server). */
+  tmuxSessions?: number;
+  /** Make only the tmux probe's `exec` reject. */
+  tmuxProbeThrows?: boolean;
   /** Files the container reports under the mount path. */
   files?: Array<{ name: string; size: number; modifiedAt: string }>;
   /** Make `listFiles` reject — i.e. a container that went away mid-cycle. */
@@ -226,6 +231,10 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
           return { exitCode: 0, stdout: JSON.stringify({ sha256, entries: files.length, chunks: [{ size: 5, sha256 }] }) };
         }
         return { exitCode: 0, stdout: '' };
+      }
+      if (command === TMUX_SESSIONS_PROBE_COMMAND) {
+        if (opts.execThrows || opts.tmuxProbeThrows) throw new Error('container gone');
+        return { exitCode: 0, stdout: `${opts.tmuxSessions ?? 0}\n` };
       }
       if (opts.execThrows) throw new Error('container gone');
       return { exitCode: 0, stdout: opts.loadavg ?? '0.00 0.01 0.05 1/123 456\n' };
@@ -659,7 +668,8 @@ describe('preserved invariant: final flush before stop, and stop only if it work
     // The busy probe having run proves the idle branch really was taken, so
     // the surviving reschedule below is the idle-retry path rather than the
     // wrapper swallowing an early throw.
-    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ') && !c.startsWith('bash /usr/local/bin/editor-state.sh')).length).toBe(1);
+    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ') && !c.startsWith('bash /usr/local/bin/editor-state.sh')
+      && c !== TMUX_SESSIONS_PROBE_COMMAND).length).toBe(1);
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });
@@ -682,6 +692,90 @@ describe('preserved invariant: final flush before stop, and stop only if it work
 
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
+  });
+});
+
+describe('🔴 SIGNAL C: live tmux sessions hold the idle stop, bounded', () => {
+  const idleFor = (ms: number) => hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() - ms });
+  const files = [{ name: 'a.ts', size: 5, modifiedAt: '2026-08-01T00:00:00.000Z' }];
+  const probes = (fake: FakeDO) => fake.calls.execs.filter((c) => c === TMUX_SESSIONS_PROBE_COMMAND).length;
+
+  it('🔴 idle, quiet, one tmux session: not stopped, still checkpointed, rescheduled', async () => {
+    const fake = await makeFake({ storage: idleFor(2 * IDLE_STOP_MS), tmuxSessions: 1, files });
+
+    await runAlarmCycle(fake);
+
+    expect(probes(fake)).toBe(1);
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.destroys).toBe(0);
+    // The routine checkpoint ran (the held computer's files keep being saved)…
+    expect(fake.calls.r2Puts).toContain(`${PREFIX}/.ezil-snapshots/latest.json`);
+    // …and the loop stays alive on the ordinary backoff ladder.
+    expect(fake.calls.scheduled).toHaveLength(1);
+    expect(fake.calls.scheduled[0]!.callback).toBe(FLUSH_CALLBACK);
+  });
+
+  it('🔴 a window-close release (presence backdated 30 minutes) does not kill the session', async () => {
+    const fake = await makeFake({ storage: idleFor(30 * 60_000 + 5_000), tmuxSessions: 2 });
+
+    await runAlarmCycle(fake);
+
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.scheduled).toHaveLength(1);
+  });
+
+  it('the hold ends at the cap: past eight hours the ordinary final flush and stop apply', async () => {
+    const fake = await makeFake({ storage: idleFor(TMUX_KEEPALIVE_MAX_MS + 60_000), tmuxSessions: 1, files });
+
+    await runAlarmCycle(fake);
+
+    expect(fake.calls.r2Puts).toContain(`${PREFIX}/.ezil-snapshots/latest.json`);
+    expect(fake.calls.stops).toBe(1);
+    expect(fake.calls.scheduled).toEqual([]);
+  });
+
+  it('no tmux session: the quiet idle computer stops exactly as before', async () => {
+    const fake = await makeFake({ storage: idleFor(2 * IDLE_STOP_MS), tmuxSessions: 0 });
+
+    await runAlarmCycle(fake);
+
+    expect(probes(fake)).toBe(1);
+    expect(fake.calls.stops).toBe(1);
+  });
+
+  it('🔴 a tmux probe that cannot answer never holds: the quiet idle computer still stops', async () => {
+    const fake = await makeFake({ storage: idleFor(2 * IDLE_STOP_MS), tmuxProbeThrows: true });
+
+    await runAlarmCycle(fake);
+
+    expect(probes(fake)).toBe(1);
+    expect(fake.calls.stops).toBe(1);
+  });
+
+  it('a held computer is not stopped even when its CPU is also busy', async () => {
+    const fake = await makeFake({ storage: idleFor(2 * IDLE_STOP_MS), tmuxSessions: 1, loadavg: '3.50 2.10 1.00 4/123 456\n' });
+
+    await runAlarmCycle(fake);
+
+    expect(fake.calls.stops).toBe(0);
+  });
+
+  it('a present user costs nothing: no tmux probe while activity is fresh', async () => {
+    const fake = await makeFake({ storage: idleFor(60_000), tmuxSessions: 1 });
+
+    await runAlarmCycle(fake);
+
+    expect(probes(fake)).toBe(0);
+    expect(fake.calls.stops).toBe(0);
+  });
+
+  it('a stopped container is never probed (the probe cannot start one)', async () => {
+    const fake = await makeFake({ storage: idleFor(2 * IDLE_STOP_MS), tmuxSessions: 1, running: false });
+
+    await runAlarmCycle(fake);
+
+    expect(fake.calls.execs).toEqual([]);
+    expect(fake.calls.stops).toBe(0);
   });
 });
 
