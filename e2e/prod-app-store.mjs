@@ -8,7 +8,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
-const app = process.env.EZIL_E2E_APP ?? 'https://os.ezil.org';
+const app = process.env.EZIL_E2E_APP ?? 'https://os.ezil.work';
 const email = process.env.EZIL_E2E_EMAIL;
 const password = process.env.EZIL_E2E_PASSWORD;
 if (!email || !password) {

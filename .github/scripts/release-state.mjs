@@ -5,11 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-// The public production origin. `legacyAlias` is the Vercel alias that served
-// production before os.ezil.org; it keeps resolving to the same deployment and
-// is verified alongside the canonical host until it is retired.
-export const canonical = 'https://os.ezil.org';
-export const legacyAlias = 'https://ezil-os.vercel.app';
+// The public production origin (Vercel project `ezil-os-preview`, team ezil1;
+// moved from os.ezil.org on 2026-10-18). `legacyAlias` is that project's own
+// production alias; it resolves to the same deployment and is verified
+// alongside the canonical host.
+export const canonical = 'https://os.ezil.work';
+export const legacyAlias = 'https://ezil-os-preview-ezil1.vercel.app';
 // Keep only validated public identity, never provider env/configuration fields.
 export function vercelIdentity(app, project) {
   assert.equal(app.projectId, project, 'Vercel project differs');
