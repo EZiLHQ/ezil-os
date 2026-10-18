@@ -244,7 +244,7 @@ Mobbin research dated **2026-10-18**, supplied with the v2 brief:
 
 Mobbin had no direct machine-size radio-card reference in this research. The Compute selector follows native radio cards, informed by Mintlify/Klaviyo choice cards; it is not attributed to a machine selector screenshot.
 
-### Billing tab: hierarchy and action ownership
+### Billing tab: hierarchy and action gates
 
 The header offers Manage billing only when `actions.portal`. The main stack is:
 
@@ -281,14 +281,16 @@ All purchase and mutation controls use the server's action flags, including at c
 
 Plan labels are EZiL Free, EZiL Standard, EZiL Compute and EZiL Pro. Free shows $0. Standard/Compute use the matching offer's price; legacy Pro uses `estimate.subscriptionCents` when available. The plan card's allowance comes from the offer when one matches the SKU, otherwise from the meter. The usage meter itself always uses the DTO allowance, including prorated grants.
 
-| `plan.status` | Chip and supporting line |
-| --- | --- |
-| `free` | Current |
-| `active` | Active; “Renews <renewsAt>” |
-| `cancels` | Cancels <date>; “Your plan ends <cancelsAt>. You can resume before then.” |
-| `past_due` | Payment failed |
-| `incomplete` | Payment incomplete |
-| `upgrade_pending` | Upgrade pending |
+| `plan.status` | Chip and supporting line | Chip colour (`settings.css`) |
+| --- | --- | --- |
+| `free` | Current | Neutral: `--surface-2` background, `--muted` text |
+| `active` | Active; “Renews <renewsAt>” | Accent tint, `#4fd8de` text |
+| `cancels` | Cancels <date>; “Your plan ends <cancelsAt>. You can resume before then.” | Warning tint and `--warn` text |
+| `past_due` | Payment failed | Danger tint and `--danger` text |
+| `incomplete` | Payment incomplete | Warning tint and `--warn` text |
+| `upgrade_pending` | Upgrade pending | Warning tint and `--warn` text |
+
+When the plan is cancelling and `actions.cancel` permits it, Resume plan is the primary action; any eligible Compute upgrade is secondary.
 
 A pending upgrade additionally says “Compute starts once payment is confirmed. This upgrade expires <expiresAt>.” A scheduled downgrade says “Switches to Standard on <effectiveAt>.” It is read-only: there is no undo procedure. Legacy Pro adds “Your original Pro plan, honoured as sold.”
 
@@ -309,17 +311,17 @@ Invoice URLs are resolved at click time and validated as HTTP(S); links opened b
 | `over_cap` | Danger colour; compute reports the amount over or storage reports over allowance. The bar clamps at 100%. |
 | `unavailable` | No progress bar. Unavailable AI says “Coming soon” / “AI assistant coming soon”, with no amounts or credit-ready claim. |
 
-Paid compute shows used standard-hours rounded up to one decimal and the allowance; Free uses floored hours/minutes and “of <N> h”. Reset dates are UTC. Included time left uses only allowed sizes from `remainingActualSecondsBySize`, with whole hours floored (minutes when below an hour); no included time produces an explicit empty message. Paid plans explain “1 standard-hour = 1 hour at 2 vCPU”; Compute also explains the 4/8 vCPU weights. These numbers are driven by the catalog/DTOs.
+Paid compute shows used standard-hours rounded up to one decimal and the allowance; Free uses floored hours/minutes and “of <N> h”. When usage exceeds the allowance, “· N over” follows the allowance, with N in standard-hours rounded up. Reset dates are UTC. A single “Included time left: ≈ <time> at 2 vCPU · …” line uses only allowed sizes from `remainingActualSecondsBySize`, with whole hours floored (minutes when below an hour), wrapping as needed. When all remaining values are zero, it reads “No included time left this period.” Paid plans explain “1 standard-hour = 1 hour at 2 vCPU”; Compute also explains the 4/8 vCPU weights. These numbers are driven by the catalog/DTOs.
 
 Storage keeps the existing v1 quota and measured-at display; no future storage target is offered. Available AI retains the v1 balance behavior, while unavailable AI has no dollar amount. Loading uses skeletons and `aria-busy`; a summary error has Retry. Invoices load independently with their own loading, empty and Retry states. The inline action error is `role="alert"`; tRPC failures map `message` (the billing code), not `code` (the transport code), through shared `errorCopy` with a plain fallback.
 
 ### Computer size and sessions
 
-Compute renders one native radio inside a label per allowed size: CPU/GiB, “Uses N standard-hour(s) per hour”, and approximate included time left. Changing it calls `selectSize`, locks controls until completion, restores the old selection on failure, and announces “Size saved.” on success. It promises no timing for when the change takes effect.
+Compute uses `fieldset[data-role="size-selector"]` with one native radio inside a label per allowed size: CPU/GiB, “Uses N standard-hour(s) per hour”, and approximate included time left. Changing it calls `selectSize`, locks controls until completion, restores the old selection on failure, and announces “Size saved.” on success. It promises no timing for when the change takes effect.
 
-Free displays its actual 2 vCPU / 6 GiB size. Standard and legacy Pro display 2 vCPU / 8 GiB, plus the larger-size upgrade action only when allowed. **Implementation discrepancy:** the current locked-plan UI is a static `<section data-role="size-selector">` with `[data-role="size-locked"]`, not the checked disabled native radio/fieldset required by the shared spec. Compute does use the pinned fieldset and radio selectors. This is recorded for the shell owner; marketing does not change that implementation.
+Standard, legacy Pro and Free show their included size as a static card: `section[data-role="size-selector"]` containing `[data-role="size-locked"]`, captioned “Included with <plan name>”. Free displays its actual 2 vCPU · 6 GiB size; Standard and legacy Pro display 2 vCPU · 8 GiB. The section adds one “Upgrade to Compute for 4 or 8 vCPU” button only when `actions.upgrade`. This is a deliberate design decision after the rendered review: a checked, disabled radio read as a broken control.
 
-The session note is “Sessions run up to 6 hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.” The Billing tab derives the duration from `session.maxSeconds`. When `activeDeadline` exists, the countdown says “This session saves and restarts in <duration>.” and refreshes every 30 seconds. It warns at `warnSeconds[0]`; after the deadline it says “This session is saving and restarting now.” Reload, deactivation, window removal and close clear the interval. The public FAQ also explains idle sleep after 10 minutes, the editor state on disk, and that restarting does not reset the allowance.
+The session note appears in a muted callout card: “Sessions run up to 6 hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.” The Billing tab derives the duration from `session.maxSeconds`. When `activeDeadline` exists, the countdown says “This session saves and restarts in <duration>.” and refreshes every 30 seconds. It warns at `warnSeconds[0]`; after the deadline it says “This session is saving and restarting now.” Reload, deactivation, window removal and close clear the interval. The public FAQ also explains idle sleep after 10 minutes, the editor state on disk, and that restarting does not reset the allowance.
 
 ### Overage, consent and separate estimates
 
@@ -341,7 +343,7 @@ The displayed amount follows the input. Submit remains disabled unless consent i
 
 The estimate never adds subscription and usage into one total. A non-Free plan with both date and amount shows “Next charge on <date>: <$X> subscription before tax.” Missing either shows “No upcoming subscription charge.” Compute with enabled or accrued overage shows “Usage so far: <$Y>, billed separately.” Enabled overage also shows “At your cap: up to <$Z>, billed separately.” Free has no estimate section.
 
-Invoices are newest first, at most 12, with Subscription / Usage / Other badges. Paid invoices use `amountPaidCents`; all others use `amountDueCents`. Missing descriptions fall back to `EZiL <kind>`. Money formatting is BigInt-safe; server text is encoded or assigned through `textContent`. An invalid URL leaves a readable invoice row with “Link unavailable”.
+Invoices are newest first, at most 12, with Subscription / Usage / Other badges. In a narrow container, each invoice stacks date + kind pill, description, then amount · status · View. At a container width of 640px or more, it becomes one row: date, description, kind pill, amount, status, View. Paid invoices use `amountPaidCents`; all others use `amountDueCents`. Missing descriptions fall back to `EZiL <kind>`. Money formatting is BigInt-safe; server text is encoded or assigned through `textContent`. An invalid URL leaves a readable invoice row with “Link unavailable”.
 
 ### Sheets and payment outcomes
 
@@ -350,12 +352,12 @@ The shared frame is a page-level modal, outside Settings geometry, with a compac
 | Sheet | Review and result behavior |
 | --- | --- |
 | New subscription checkout | `openUpgradeSheet({ sku, offer, sizes, ... })` reviews Standard or Compute with catalog price, standard-hours, offered sizes and a session line. Compute mentions optional overage is off. Stripe supplies the payable total/tax. The compact order summary collapses; Embedded Checkout mounts alongside it when there is room. |
-| Compute upgrade | Preview shows each signed invoice line, Due now, the remaining-period grant rounded down, end date and “Your usage so far carries over.” Pay echoes the preview's `prorationDate`; no client amount is sent. Preview failure has Retry and no Pay action. |
+| Compute upgrade | Preview shows each signed invoice line, Due now, the remaining-period grant rounded down, end date and “Your usage so far carries over.” Pay echoes the preview's `prorationDate`; no client amount is sent. Not now is the secondary dismiss button. Preview failure has Retry and no Pay action. |
 | Upgrade: `applied` | “You're on EZiL Compute”; Done refreshes the tab. |
 | Upgrade: `requires_action` | Ask for bank confirmation; show the validated invoice link when present and explain that the plan changes once payment is confirmed. |
 | Upgrade: `payment_failed` | Explain the failed payment and, when supplied, the held-upgrade expiry date/time in UTC. Offer the validated invoice link. A null expiry does not invent a deadline. |
-| Downgrade | Before confirmation, show how Standard changes the allowance and size, removes larger sizes and overage, and takes effect at period end. Confirm says Switch on <date>; success uses the returned `effectiveAt`. Keep Compute dismisses without a mutation. |
-| Cancel | Explain that the plan stays active until period end, then moves to Free; resume is possible before then. Cancel plan is the danger action; Keep plan dismisses. Success uses `cancelsAt`. Resume in the tab directly sends `cancel:false`. |
+| Downgrade | Before confirmation, show how Standard changes the allowance and size, removes larger sizes and overage, and takes effect at period end. Confirm says Switch on <date>; success uses the returned `effectiveAt`. Keep Compute is the secondary dismiss button, with no mutation. |
+| Cancel | Explain that the plan stays active until period end, then moves to Free; resume is possible before then. Cancel plan is the danger action; Keep plan is the secondary dismiss button. Success uses `cancelsAt`. Resume in the tab directly sends `cancel:false`. |
 | Overage | The explicit cap/consent flow above; success uses the returned cap. |
 
 Checkout creates only a v2 sellable SKU. A Stripe loader failure retries the same session. The current Stripe Embedded Checkout initializer is preferred with the older initializer retained as fallback. A redirect DTO opens HTTPS checkout in a new tab. While the form is open, a 4-second status watcher can notice a paid session even when Stripe omits its completion callback. Confirmation polls every 1.5 seconds, with a 60-second bound; success requires the exact purchased SKU in `billing.summary`. A timeout distinguishes known payment receipt from unconfirmed payment, and never grants locally. Closing destroys the Stripe instance and ignores late responses. The checkout session line currently uses the pinned six-hour text; unlike the Billing tab, its supplied `OfferDTO` has no session policy field.
@@ -391,11 +393,17 @@ All five specified copy-ban sites use these **16 terms in this order** (`vcpu` i
 
 The sites are `shell/ezil/ui/Settings/billing-test.mjs`, `shell/ezil/ui/Settings/upgrade-sheet-test.mjs`, `app/src/app/(marketing)/pricing/pricing.test.ts`, `e2e/billing-e2e-lib.mjs` (`scanCopy` array), and `e2e/billing-e2e.test.mjs` (positive controls). Substring matching is case-insensitive; whitespace within phrases is normalized. The required session sentence passes. Pricing scans content, metadata, rendered HTML/accessibility labels and comment-free sources, including both storage and Free-policy branches.
 
-Keep §1's tokens, 12px cards, 8px controls, 999px pills, tabular numerals, 2px accent focus-visible outlines and reduced motion. Shell layout uses the existing Settings container queries with wrapping and zero minimum widths for 360–1280px windows. Every control has an accessible name; selectable sizes use native labelled radios and an announced status. Meters carry named progressbar semantics, numeric bounds and usage text; unavailable meters omit the bar. Sheets have a labelled dialog with `aria-modal`, focus trapping/restoration and native labelled number/checkbox inputs. Server strings use `html_encode` or `textContent`; money is formatted without unsafe BigInt conversion. Browser overflow and visual checks remain the manager's validation step.
+Keep §1's tokens, 12px cards, 8px controls, 999px pills, tabular numerals, 2px accent focus-visible outlines and reduced motion. Shell layout uses the existing Settings container queries with wrapping and zero minimum widths for 360–1280px windows. Every control has an accessible name; selectable sizes use native labelled radios and an announced status. Meters carry named progressbar semantics, numeric bounds and usage text; unavailable meters omit the bar. Sheets have a labelled dialog with `aria-modal`, focus trapping/restoration and native labelled number/checkbox inputs. Server strings use `html_encode` or `textContent`; money is formatted without unsafe BigInt conversion.
+
+`e2e/billing-v2-screens.mjs` boots the committed shell bundle in headless Chromium behind `page.route`-style interception on `http://localhost` (implemented with `context.route` to cover popups). It uses no listening port or Stripe connection: a fake `window.Stripe` supplies the payment placeholder, and v2 DTO fixtures answer tRPC. It captures every tab state (15), every sheet state (10), and pricing/home including the Free effective-date variant at 390×844 and 1280×800. Page errors, missing selectors, horizontal overflow or banned copy fail the run. Usage (output must be outside the repository):
+
+```sh
+PLAYWRIGHT_REQUIRE_DIR=<dir with playwright> node e2e/billing-v2-screens.mjs --out <dir> [--only <substring>]
+```
 
 ### v2 pinned selectors
 
-Shell selectors are scoped to `.ezil-settings-pane[data-pane="billing"]`, except page-level sheets. This table preserves the shared-spec pins; the locked-plan fieldset discrepancy is called out above.
+Shell selectors are scoped to `.ezil-settings-pane[data-pane="billing"]`, except page-level sheets. This table records the implemented selectors, including both computer-size forms.
 
 | Element | Selector |
 | --- | --- |
@@ -407,7 +415,7 @@ Shell selectors are scoped to `.ezil-settings-pane[data-pane="billing"]`, except
 | Plan actions | `[data-role="plan-actions"]` with `[data-action="upgrade"]`, `[data-action="downgrade"]`, `[data-action="cancel"]`, `[data-action="resume"]` |
 | Plan picker | `[data-role="plan-picker"]`, `[data-action="checkout"][data-sku="standard_monthly_v2\|compute_monthly_v2"]` |
 | Compute meter | `[data-meter="compute"].is-<MeterState>`, `[role="progressbar"]`, `[data-role="size-hours"] [data-size="<SizeCode>"]` |
-| Size selector | `fieldset[data-role="size-selector"]`, `input[type="radio"][name="ezil-billing-size"][value="<SizeCode>"]`, `[data-role="size-locked"]`, `[data-role="size-status"]` |
+| Size selector | Compute: `fieldset[data-role="size-selector"]` with `input[type="radio"][name="ezil-billing-size"][value="<SizeCode>"]`; otherwise: `section[data-role="size-selector"]` containing `[data-role="size-locked"]`; both: `[data-role="size-status"]` |
 | Session | `[data-role="session-note"]`, `[data-role="session-countdown"]` |
 | Overage | `[data-role="overage"][data-enabled="true\|false"]`, `[data-action="overage"]`, `[data-action="overage-off"]`, `[data-role="overage-paused"][data-reason="cap_reached\|payment_failed"]` |
 | Estimate | `[data-role="estimate"]` |
@@ -426,6 +434,8 @@ Shell selectors are scoped to `.ezil-settings-pane[data-pane="billing"]`, except
 
 The pipe-separated values above enumerate alternatives; they are not literal CSS attribute values.
 
-### Integration work outside B1c ownership
+### Open integration items
 
-`e2e/billing-home.mjs` still targets the Pro CTA/card and v1 allowance text; its assertions need to follow the three public cards. `e2e/billing-checkout.mjs` still supplies a v1 fake and asserts `pro_monthly_v1`, so it cannot validate the v2 checkout. `CONTRACT.md` §8 still bans `vcpu`; v2's list above is authoritative for these surfaces. Those files, the shell implementation discrepancy above, screenshot scripts and generated shell bundles are left to their owners. No new DTO fields were invented.
+`e2e/billing-home.mjs` still targets the Pro CTA/card and v1 allowance text; its assertions need to follow the three public cards. `e2e/billing-checkout.mjs` still supplies a v1 fake and asserts `pro_monthly_v1`, so it cannot validate the v2 checkout. `CONTRACT.md` §8 still bans `vcpu`; v2's list above is authoritative for these surfaces.
+
+A `requires_action` renewal has no hosted-invoice URL in `PlanSummaryV2`; only `pendingUpgrade.hostedInvoiceUrl` is supplied. The UI therefore falls back to the newest open subscription invoice with a valid URL in history, then the portal when `actions.portal` permits it. The checkout sheet's session line is fixed six-hour text because `OfferDTO` carries no session policy. No new DTO fields were invented.

@@ -154,7 +154,7 @@ function overageHtml (summary) {
     return `<section class="ezil-billing-card ezil-billing-overage" data-role="overage" data-enabled="${overage.enabled}"><h4>Usage beyond your allowance</h4>
         ${overage.enabled ? paragraph(`On · up to ${dollars(overage.capCents)} a period at ${dollars(overage.centsPerStdHour)} per standard-hour.`) + paragraph(`Accrued this period: ${dollars(overage.accruedCents)}.`)
             : paragraph(`Off. When your ${allowance} standard-hours are used up, your computer saves and pauses until the next period.`)}
-        ${changed ? paragraph('The overage terms changed. Review them to keep overage on.') : ''}
+        ${changed ? paragraph('The overage terms changed. Review them to keep overage on.', 'ezil-billing-warning') : ''}
         ${overage.pausedReason ? `<p class="ezil-billing-warning" data-role="overage-paused" data-reason="${encode(overage.pausedReason)}">${encode(overage.pausedReason === 'cap_reached'
             ? `Overage reached your ${dollars(overage.capCents)} cap. Your computer saves and pauses until the next period, or raise the cap.`
             : "Overage is off because a usage invoice wasn't paid.")}</p>` : ''}

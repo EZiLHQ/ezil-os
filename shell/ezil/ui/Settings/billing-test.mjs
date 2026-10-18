@@ -574,6 +574,7 @@ try {
     assert.equal(text().includes('The overage terms changed.'), false);
     summary.overage.acceptedVersion = 'old'; await refresh();
     contains('[data-role="overage"]', 'The overage terms changed. Review them to keep overage on.');
+    assert.equal(q('[data-role="overage"] p.ezil-billing-warning').textContent, 'The overage terms changed. Review them to keep overage on.');
     assert.equal(q('[data-action="overage"]').textContent, 'Review terms');
     click(q('[data-action="overage"]')); assert.equal(sheets.at(-1).kind, 'overage'); await closeSheet();
     for ( const [reason, copy] of [['cap_reached', 'Overage reached your $25.00 cap. Your computer saves and pauses until the next period, or raise the cap.'], ['payment_failed', "Overage is off because a usage invoice wasn't paid."]] ) {
