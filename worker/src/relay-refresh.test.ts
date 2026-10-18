@@ -84,3 +84,24 @@ describe('relay refresh failure handling', () => {
     await expect(relayOperation(f.container, 'test-admin', {})).rejects.toThrow('relay_logout_failed');
   });
 });
+
+describe('relayExpiryFor: the desktop accepts the renewal despite clock lag', () => {
+  // neko/relay.go validateRelayRequest, evaluated on the DESKTOP's clock.
+  const desktopAccepts = (expiry: number, desktopNow: number) => expiry > desktopNow + 60_000 && expiry <= desktopNow + 1_800_000;
+  const issuedAt = 1_792_000_000_000;
+
+  it('the full 30-minute lifetime is refused by a desktop clock 1 ms behind (the reopen failure)', () => {
+    expect(desktopAccepts(issuedAt + 1800 * 1000, issuedAt - 1)).toBe(false);
+  });
+
+  it('is accepted with the desktop clock up to 59 s behind or several minutes ahead', async () => {
+    const { relayExpiryFor } = await import('./relay-refresh');
+    const expiry = relayExpiryFor(issuedAt, 1800);
+    for (const lag of [-59_000, -1, 0, 1, 500, 120_000]) expect(desktopAccepts(expiry, issuedAt + lag)).toBe(true);
+  });
+
+  it('stays above the desktop minimum at the shortest TTL', async () => {
+    const { relayExpiryFor } = await import('./relay-refresh');
+    expect(desktopAccepts(relayExpiryFor(issuedAt, 300), issuedAt)).toBe(true);
+  });
+});

@@ -1,4 +1,4 @@
-import { relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
+import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
 import { RuntimeLifecycleMonitor } from './runtime-lifecycle';
 import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
@@ -2546,7 +2546,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const issuedAt = Date.now();
           const servers = await generateTurnCredentials(this.env, signal);
           if (!servers) throw new RelayFailure('turn_unavailable');
-          return { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 };
+          return { servers, expiresAt: relayExpiryFor(issuedAt, resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS)) };
         } } : {}) });
       }));
       return { ok: true, ...state };
