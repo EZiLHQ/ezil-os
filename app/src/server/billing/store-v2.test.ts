@@ -89,6 +89,20 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         issue: 'payment_failed', hostedInvoiceUrl: 'https://invoice.example/test', eventCreated: instant(10), ...overrides,
     });
 
+    it('reads the latest usage interval for just that computer, including closed intervals', async () => {
+        expect(await store.latestIntervalFor(computerId)).toBeNull();
+        await store.openInterval(userId, computerId, instant(0), 'start');
+        expect(await store.latestIntervalFor(computerId)).toEqual({ endedAt: null });
+        await store.closeInterval(computerId, instant(10), 'stop');
+        expect(await store.latestIntervalFor(computerId)).toEqual({ endedAt: instant(10) });
+        await store.openInterval(userId, secondComputerId, instant(30), 'start');
+        expect(await store.latestIntervalFor(computerId)).toEqual({ endedAt: instant(10) });
+        await store.openInterval(userId, computerId, instant(20), 'start');
+        expect(await store.latestIntervalFor(computerId)).toEqual({ endedAt: null });
+        await store.closeInterval(computerId, instant(40), 'stop');
+        expect(await store.latestIntervalFor(computerId)).toEqual({ endedAt: instant(40) });
+    });
+
     it('opens once, rounds ready up/end down, closes once and starts a new epoch after close', async () => {
         const opened = await store.openEpoch(epoch(instant(0.001)));
         expect(opened).toMatchObject({ status: 'opened', epoch: {

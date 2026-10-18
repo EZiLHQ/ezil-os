@@ -19,13 +19,15 @@ const invoice2024 = {
     id: 'in_fixture', customer: 'cus_fixture', subscription: 'sub_fixture',
     lines: { data: [{ subscription: 'sub_fixture', period: { start, end } }] },
 };
-const invoice2025 = {
-    id: 'in_fixture', customer: 'cus_fixture',
+const invoiceEndive = {
+    id: 'in_fixture', customer: 'cus_fixture', billing_reason: 'subscription_cycle', status: 'paid', metadata: {},
+    hosted_invoice_url: 'https://invoice.stripe.com/fixture',
     parent: { type: 'subscription_details', subscription_details: { subscription: 'sub_fixture' } },
     lines: { data: [{
+        id: 'il_base', amount: 2000, pricing: { price_details: { price: 'price_standard' } },
         parent: {
             type: 'subscription_item_details',
-            subscription_item_details: { subscription: 'sub_fixture' },
+            subscription_item_details: { subscription: 'sub_fixture', proration: false },
         },
         period: { start, end },
     }] },
@@ -43,6 +45,7 @@ const grant: BillingAction = {
 const sync: BillingAction = {
     type: 'sync_subscription', subscriptionId: 'sub_fixture', eventId, eventCreated: new Date(created * 1000),
 };
+const failedSync: BillingAction = { ...sync, invoiceIssue: { invoiceId: 'in_fixture', issue: 'payment_failed' } };
 const charge = { id: 'ch_fixture', refunds: { data: [{ id: 're_first' }, { id: 're_second' }] } };
 const dispute = { id: 'dp_fixture', charge: 'ch_fixture', status: 'won' };
 const restore: BillingAction = { type: 'restore', chargeId: 'ch_fixture', disputeId: 'dp_fixture', eventId };
@@ -57,10 +60,10 @@ const fixtures: { name: string; input: StripeEventLike; expected: BillingAction[
         expected: [paid],
     },
     { name: 'invoice.paid (2024)', input: event('invoice.paid', invoice2024), expected: [grant] },
-    { name: 'invoice.paid (2025+)', input: event('invoice.paid', invoice2025), expected: [grant] },
+    { name: 'invoice.paid (2026-09-30.endive)', input: event('invoice.paid', invoiceEndive), expected: [grant] },
     {
         name: 'invoice.payment_failed',
-        input: event('invoice.payment_failed', { id: 'in_fixture', subscription: 'sub_fixture' }), expected: [sync],
+        input: event('invoice.payment_failed', invoiceEndive), expected: [failedSync],
     },
     { name: 'customer.subscription.created', input: event('customer.subscription.created', { id: 'sub_fixture' }), expected: [sync] },
     { name: 'customer.subscription.updated', input: event('customer.subscription.updated', { id: 'sub_fixture' }), expected: [sync] },
@@ -93,11 +96,15 @@ describe('planStripeEvent', () => {
         { subscription: null },
         { parent: null },
         { parent: { type: 'quote_details', quote_details: { quote: 'qt_fixture' } } },
-    ])('ignores a one-off invoice %#', shape => {
+    ])('reconciles a one-off invoice %#', shape => {
         expect(planStripeEvent(event('invoice.paid', invoice2024))).toEqual([grant]);
-        expect(planStripeEvent(event('invoice.paid', { id: 'in_oneoff', customer: 'cus_fixture', ...shape }))).toEqual([]);
-        expect(planStripeEvent(event('invoice.payment_failed', invoice2024))).toEqual([sync]);
-        expect(planStripeEvent(event('invoice.payment_failed', { id: 'in_oneoff', ...shape }))).toEqual([]);
+        expect(planStripeEvent(event('invoice.paid', { id: 'in_oneoff', customer: 'cus_fixture', ...shape }))).toEqual([
+            { ...grant, invoiceId: 'in_oneoff', subscriptionId: null, periodStart: null, periodEnd: null },
+        ]);
+        expect(planStripeEvent(event('invoice.payment_failed', invoice2024))).toEqual([failedSync]);
+        expect(planStripeEvent(event('invoice.payment_failed', { id: 'in_oneoff', ...shape }))).toEqual([
+            { type: 'invoice_issue', invoiceId: 'in_oneoff', issue: 'payment_failed', eventCreated: new Date(created * 1000) },
+        ]);
     });
 
     it.each([
@@ -115,7 +122,7 @@ describe('planStripeEvent', () => {
         expect(planStripeEvent(event('charge.dispute.closed', { ...dispute, status }))).toEqual([]);
     });
 
-    it.each([invoice2024, invoice2025])('chooses the matching subscription line before the first line %#', invoice => {
+    it.each([invoice2024, invoiceEndive])('chooses the matching subscription line before the first line %#', invoice => {
         expect(planStripeEvent(event('invoice.paid', {
             ...invoice,
             lines: { data: [
@@ -126,15 +133,15 @@ describe('planStripeEvent', () => {
         }))).toEqual([grant]);
     });
 
-    it.each([invoice2024, invoice2025])('falls back to the first line period without a matching subscription %#', invoice => {
+    it.each([invoice2024, invoiceEndive])('does not fall back to an untyped first line %#', invoice => {
         expect(planStripeEvent(event('invoice.paid', {
             ...invoice, lines: { data: [{ period: { start, end } }, { period: { start: 10, end: 20 } }] },
-        }))).toEqual([grant]);
+        }))).toEqual([{ ...grant, periodStart: null, periodEnd: null }]);
     });
 
     it('uses the modern parent when the legacy subscription is null', () => {
-        expect(planStripeEvent(event('invoice.paid', { ...invoice2025, subscription: null }))).toEqual([grant]);
-        expect(planStripeEvent(event('invoice.payment_failed', invoice2025))).toEqual([sync]);
+        expect(planStripeEvent(event('invoice.paid', { ...invoiceEndive, subscription: null }))).toEqual([grant]);
+        expect(planStripeEvent(event('invoice.payment_failed', invoiceEndive))).toEqual([failedSync]);
     });
 
     it('reduces expanded references to Stripe ids', () => {
@@ -142,7 +149,7 @@ describe('planStripeEvent', () => {
             ...checkout, customer: { id: 'cus_fixture' }, payment_intent: { id: 'pi_fixture' },
         }))).toEqual([link, paid]);
         expect(planStripeEvent(event('invoice.paid', {
-            ...invoice2025, customer: { id: 'cus_fixture' },
+            ...invoiceEndive, customer: { id: 'cus_fixture' },
             parent: { subscription_details: { subscription: { id: 'sub_fixture' } } },
             lines: { data: [
                 { period: { start: 10, end: 20 } },
@@ -168,7 +175,7 @@ describe('planStripeEvent', () => {
     });
 
     it('leaves the event unchanged', () => {
-        const input = event('invoice.paid', invoice2025);
+        const input = event('invoice.paid', invoiceEndive);
         const before = JSON.stringify(input);
         expect(planStripeEvent(input)).toEqual([grant]);
         expect(JSON.stringify(input)).toBe(before);
@@ -180,14 +187,13 @@ describe('planStripeEvent', () => {
         { name: 'missing session id', type: 'checkout.session.async_payment_succeeded', valid: checkout, invalid: { ...checkout, id: '' }, message: 'checkout.session.id must be a non-empty string' },
         { name: 'missing checkout mode', type: 'checkout.session.completed', valid: checkout, invalid: { ...checkout, mode: null }, message: 'checkout.session.mode must be a non-empty string' },
         { name: 'malformed subscription', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, subscription: {} }, message: 'invoice.subscription.id must be a non-empty string' },
-        { name: 'malformed parent', type: 'invoice.paid', valid: invoice2025, invalid: { ...invoice2025, parent: [] }, message: 'invoice.parent must be an object' },
+        { name: 'malformed parent', type: 'invoice.paid', valid: invoiceEndive, invalid: { ...invoiceEndive, parent: [] }, message: 'invoice.parent must be an object' },
         { name: 'missing lines', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: null }, message: 'invoice.lines must be an object' },
         { name: 'non-array lines', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: {} } }, message: 'invoice.lines.data must be an array' },
-        { name: 'empty lines', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [] } }, message: 'invoice.lines.data must contain a billing period' },
         { name: 'null line', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [null] } }, message: 'invoice.lines.data[0] must be an object' },
-        { name: 'missing period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{}] } }, message: 'invoice.lines.data[0].period must be an object' },
-        { name: 'string period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ period: { start: String(start), end } }] } }, message: 'invoice.lines.data[0].period.start must be a non-negative Unix timestamp in seconds' },
-        { name: 'reversed period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ period: { start: end, end: start } }] } }, message: 'invoice.lines.data[0].period.end must be after its start' },
+        { name: 'missing period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ type: 'subscription' }] } }, message: 'invoice.lines.data[0].period must be an object' },
+        { name: 'string period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ type: 'subscription', period: { start: String(start), end } }] } }, message: 'invoice.lines.data[0].period.start must be a non-negative Unix timestamp in seconds' },
+        { name: 'reversed period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ type: 'subscription', period: { start: end, end: start } }] } }, message: 'invoice.lines.data[0].period.end must be after its start' },
         { name: 'empty subscription id', type: 'customer.subscription.updated', valid: { id: 'sub_fixture' }, invalid: { id: '' }, message: 'subscription.id must be a non-empty string' },
         { name: 'refund without charge', type: 'refund.created', valid: { id: 're_fixture', charge: 'ch_fixture' }, invalid: { id: 're_fixture' }, message: 'refund.charge must be an object' },
         { name: 'missing refund id', type: 'charge.refunded', valid: charge, invalid: { ...charge, refunds: { data: [{}] } }, message: 'charge.refunds.data[0].id must be a non-empty string' },
@@ -227,5 +233,43 @@ describe('refunds on current Stripe API versions', () => {
         expect(planStripeEvent(event('charge.refunded', { id: 'ch_live', refunded: true }))).toEqual([]);
         expect(planStripeEvent(event('charge.refunded', { id: 'ch_live', refunds: { data: [{ id: 're_old' }] } })))
             .toEqual([{ type: 'revoke', chargeId: 'ch_live', refundId: 're_old', eventId }]);
+    });
+});
+
+
+describe('endive invoice issues and pending updates', () => {
+    it.each([
+        ['invoice.payment_action_required', 'requires_action'],
+        ['invoice.voided', 'voided'],
+        ['invoice.marked_uncollectible', 'uncollectible'],
+    ])('plans %s', (type, issue) => {
+        expect(planStripeEvent(event(type, invoiceEndive))).toEqual([
+            { type: 'invoice_issue', invoiceId: 'in_fixture', issue, eventCreated: new Date(created * 1000) },
+        ]);
+    });
+
+    it('plans a standalone overage payment failure', () => {
+        expect(planStripeEvent(event('invoice.payment_failed', {
+            ...invoiceEndive, parent: null, metadata: { kind: 'overage' }, billing_reason: 'manual',
+        }))).toEqual([{ type: 'invoice_issue', invoiceId: 'in_fixture', issue: 'payment_failed', eventCreated: new Date(created * 1000) }]);
+    });
+
+    it.each(['applied', 'expired'])('plans pending_update_%s', outcome => {
+        expect(planStripeEvent(event(`customer.subscription.pending_update_${outcome}`, {
+            id: 'sub_fixture', pending_update: null, items: { data: [{ price: { id: 'price_compute', lookup_key: 'ezil_compute_monthly_v2' } }] },
+        }))).toEqual([{ type: 'plan_change', subscriptionId: 'sub_fixture', outcome, eventCreated: new Date(created * 1000) }]);
+    });
+
+    it.each([{ type: 'subscription' }, { parent: { type: 'subscription_item_details' } }])('selects a typed subscription line without ownership', typed => {
+        expect(planStripeEvent(event('invoice.paid', { ...invoiceEndive, lines: { data: [
+            { type: 'invoiceitem', period: { start: 10, end: 20 } },
+            { ...typed, period: { start, end } },
+        ] } }))).toEqual([grant]);
+    });
+
+    it('keeps empty line periods null and ignores invoice.created', () => {
+        expect(planStripeEvent(event('invoice.paid', { ...invoiceEndive, lines: { data: [] } })))
+            .toEqual([{ ...grant, periodStart: null, periodEnd: null }]);
+        expect(planStripeEvent(event('invoice.created', invoiceEndive))).toEqual([]);
     });
 });

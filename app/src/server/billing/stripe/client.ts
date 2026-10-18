@@ -1,5 +1,6 @@
 import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
 import type { StripeApi, StripeCheckoutSession } from '../ports';
+import { offerByLookupKey, offerBySku } from '../v2/catalog';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
@@ -8,7 +9,8 @@ const STRIPE_API_VERSION = '2026-03-25.dahlia';
 type FormValue = string | number | boolean | undefined | FormValue[] | { [key: string]: FormValue };
 type FormFields = { [key: string]: FormValue };
 type StripeReference = string | { id: string } | null;
-type Metadata = { sku?: string };
+type Metadata = { sku?: string; kind?: string };
+type Price = { id: string; lookup_key?: string | null; active?: boolean };
 
 interface SubscriptionResponse {
     id: string;
@@ -17,17 +19,23 @@ interface SubscriptionResponse {
     cancel_at_period_end: boolean;
     current_period_start?: number | null;
     current_period_end?: number | null;
-    items?: { data: { current_period_start?: number | null; current_period_end?: number | null }[] };
+    items?: { data: { price?: Price | null; current_period_start?: number | null; current_period_end?: number | null }[] };
+    pending_update?: { expires_at?: number | null } | null;
     metadata?: Metadata | null;
 }
 
 interface InvoiceLine {
+    id: string;
+    amount?: number;
+    price?: Price | string | null;
+    pricing?: { price_details?: { price?: Price | string | null } | null } | null;
+    proration?: boolean;
     description?: string | null;
     type?: string;
     subscription?: StripeReference;
     parent?: {
         type?: string;
-        subscription_item_details?: { subscription?: StripeReference } | null;
+        subscription_item_details?: { subscription?: StripeReference; proration?: boolean } | null;
     } | null;
     period?: { start?: number | null; end?: number | null } | null;
 }
@@ -36,6 +44,9 @@ interface InvoiceResponse {
     id: string;
     customer: StripeReference;
     status: string;
+    billing_reason?: string | null;
+    metadata?: Metadata | null;
+    hosted_invoice_url?: string | null;
     subscription?: StripeReference;
     parent?: { subscription_details?: { subscription?: StripeReference } | null } | null;
     lines?: { data: InvoiceLine[] };
@@ -123,7 +134,9 @@ function requiredCustomer(value: StripeReference): string {
 }
 
 function date(value: number | null | undefined): Date | null {
-    return value == null ? null : new Date(value * 1000);
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null;
+    const result = new Date(value * 1000);
+    return Number.isFinite(result.getTime()) ? result : null;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -184,7 +197,9 @@ export function createStripeClient(opts: {
 
         async createCheckoutSession(input) {
             const pack = findPack(input.sku);
-            if (input.sku !== PRO_PLAN.sku && pack === undefined) throw new Error('Unknown billing SKU');
+            const offer = offerBySku(input.sku);
+            const lookupKey = offer?.sellable ? offer.stripeLookupKey : null;
+            if (input.sku !== PRO_PLAN.sku && !lookupKey && pack === undefined) throw new Error('Unknown billing SKU');
 
             const fields: FormFields = {
                 customer: input.customerId,
@@ -219,7 +234,15 @@ export function createStripeClient(opts: {
                     cancel_url: input.cancelUrl,
                 }),
             };
-            if (input.sku === PRO_PLAN.sku) {
+            if (lookupKey) {
+                const query = new URLSearchParams({ 'lookup_keys[]': lookupKey, active: 'true', limit: '1' });
+                const prices = await request<{ data?: Price[] }>(`/prices?${query}`);
+                const price = prices.data?.find(item => item.lookup_key === lookupKey && item.active === true && item.id);
+                if (!price) throw new Error(`No active Stripe Price for lookup key ${lookupKey}`);
+                fields.mode = 'subscription';
+                fields.line_items = [{ quantity: 1, price: price.id }];
+                fields.subscription_data = { metadata: { sku: input.sku } };
+            } else if (input.sku === PRO_PLAN.sku) {
                 fields.mode = 'subscription';
                 fields.line_items = [{
                     quantity: 1,
@@ -288,7 +311,13 @@ export function createStripeClient(opts: {
 
         async retrieveSubscription(id) {
             const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(id)}`);
-            const item = subscription.items?.data[0];
+            const data = subscription.items?.data ?? [];
+            const items = data.map(item => ({ priceId: referenceId(item.price), lookupKey: item.price?.lookup_key ?? null }));
+            const metadataSku = subscription.metadata?.sku;
+            const itemOffer = items.map(item => item.lookupKey ? offerByLookupKey(item.lookupKey) : undefined).find(Boolean);
+            const sku = metadataSku && offerBySku(metadataSku) ? metadataSku : itemOffer?.sku ?? null;
+            const offer = sku ? offerBySku(sku) : undefined;
+            const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
             return {
                 id: subscription.id,
                 customer: requiredCustomer(subscription.customer),
@@ -296,7 +325,9 @@ export function createStripeClient(opts: {
                 cancelAtPeriodEnd: subscription.cancel_at_period_end,
                 currentPeriodStart: date(subscription.current_period_start ?? item?.current_period_start),
                 currentPeriodEnd: date(subscription.current_period_end ?? item?.current_period_end),
-                sku: subscription.metadata?.sku ?? null,
+                sku,
+                items,
+                pendingUpdateExpiresAt: date(subscription.pending_update?.expires_at),
             };
         },
 
@@ -304,6 +335,20 @@ export function createStripeClient(opts: {
             const invoice = await request<InvoiceResponse>(`/invoices/${encodeURIComponent(id)}`);
             const subscriptionId = referenceId(invoice.subscription ?? invoice.parent?.subscription_details?.subscription);
             const lines = invoice.lines?.data ?? [];
+            const priceFor = (line: InvoiceLine) => line.pricing?.price_details?.price ?? line.price;
+            // Expanded keys need no request; each remaining Price id is fetched once per invoice read.
+            const lookupKeys = new Map<string, string | null>();
+            for (const line of lines) {
+                const price = priceFor(line);
+                if (price && typeof price === 'object' && (typeof price.lookup_key === 'string' || price.lookup_key === null)) {
+                    lookupKeys.set(price.id, price.lookup_key);
+                }
+            }
+            const priceIds = new Set(lines.map(line => referenceId(priceFor(line))).filter((id): id is string => id !== null));
+            await Promise.all([...priceIds].filter(id => !lookupKeys.has(id)).map(async id => {
+                const price = await request<Price>(`/prices/${encodeURIComponent(id)}`);
+                lookupKeys.set(id, price.lookup_key ?? null);
+            }));
             // An invoice can start with a fee or adjustment. Only its subscription
             // line describes the entitlement window, never invoice.period_start/end.
             const line = subscriptionId === null ? undefined : (
@@ -317,6 +362,18 @@ export function createStripeClient(opts: {
                 customer: requiredCustomer(invoice.customer),
                 status: invoice.status,
                 subscriptionId,
+                billingReason: invoice.billing_reason ?? null,
+                metadataKind: invoice.metadata?.kind ?? null,
+                hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
+                lines: lines.map(item => ({
+                    id: item.id,
+                    lookupKey: lookupKeys.get(referenceId(priceFor(item)) ?? '') ?? null,
+                    subscriptionId: lineSubscription(item),
+                    proration: (item.parent?.subscription_item_details?.proration ?? item.proration) === true,
+                    amount: typeof item.amount === 'number' && Number.isSafeInteger(item.amount) ? item.amount : 0,
+                    periodStart: date(item.period?.start),
+                    periodEnd: date(item.period?.end),
+                })),
                 periodStart: date(line?.period?.start),
                 periodEnd: date(line?.period?.end),
             };

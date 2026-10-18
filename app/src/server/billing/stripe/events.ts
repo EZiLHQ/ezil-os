@@ -19,13 +19,16 @@ export type BillingAction =
     | {
         type: 'grant_period';
         invoiceId: string;
-        subscriptionId: string;
+        subscriptionId: string | null;
         customerId: string;
-        periodStart: Date;
-        periodEnd: Date;
+        periodStart: Date | null;
+        periodEnd: Date | null;
         eventId: string;
     }
-    | { type: 'sync_subscription'; subscriptionId: string; eventId: string; eventCreated: Date }
+    | { type: 'sync_subscription'; subscriptionId: string; eventId: string; eventCreated: Date;
+        invoiceIssue?: { invoiceId: string; issue: 'payment_failed' } }
+    | { type: 'invoice_issue'; invoiceId: string; issue: 'payment_failed' | 'requires_action' | 'voided' | 'uncollectible'; eventCreated: Date }
+    | { type: 'plan_change'; subscriptionId: string; outcome: 'applied' | 'expired'; eventCreated: Date }
     | { type: 'revoke'; chargeId: string; refundId: string; eventId: string }
     | { type: 'suspend' | 'restore'; chargeId: string; disputeId: string; eventId: string };
 
@@ -129,21 +132,27 @@ export function planStripeEvent(event: StripeEventLike): BillingAction[] {
             return [topup(payload, eventId)];
         case 'invoice.paid': {
             const subscriptionId = invoiceSubscription(payload);
-            if (subscriptionId === null) return [];
-            const lines = list(object(payload.lines, 'invoice.lines').data, 'invoice.lines.data');
-            if (lines.length === 0) throw new TypeError('invoice.lines.data must contain a billing period');
+            // Standalone paid invoices also need reconciliation (notably overage).
+            const lines = subscriptionId === null && payload.lines == null ? []
+                : list(object(payload.lines, 'invoice.lines').data, 'invoice.lines.data');
             const records = lines.map((line, index) => object(line, `invoice.lines.data[${index}]`));
-            const index = records.findIndex((line, index) => (
+            const ownedIndex = subscriptionId === null ? -1 : records.findIndex((line, index) => (
                 lineSubscription(line, `invoice.lines.data[${index}]`) === subscriptionId
             ));
-            // Some older payloads omit line ownership. The first line's period
-            // remains the contract fallback, never the invoice's own period.
-            const selectedIndex = index < 0 ? 0 : index;
-            const path = `invoice.lines.data[${selectedIndex}].period`;
-            const period = object(records[selectedIndex].period, path);
-            const periodStart = date(period.start, `${path}.start`);
-            const periodEnd = date(period.end, `${path}.end`);
-            if (periodEnd <= periodStart) throw new TypeError(`${path}.end must be after its start`);
+            const selectedIndex = ownedIndex >= 0 ? ownedIndex : records.findIndex((line, index) => (
+                lineSubscription(line, `invoice.lines.data[${index}]`) === null
+                && (line.type === 'subscription' || (line.parent != null
+                    && object(line.parent, 'line.parent').type === 'subscription_item_details'))
+            ));
+            let periodStart: Date | null = null;
+            let periodEnd: Date | null = null;
+            if (selectedIndex >= 0) {
+                const path = `invoice.lines.data[${selectedIndex}].period`;
+                const period = object(records[selectedIndex].period, path);
+                periodStart = date(period.start, `${path}.start`);
+                periodEnd = date(period.end, `${path}.end`);
+                if (periodEnd <= periodStart) throw new TypeError(`${path}.end must be after its start`);
+            }
             return [{
                 type: 'grant_period',
                 invoiceId: text(payload.id, 'invoice.id'),
@@ -156,8 +165,20 @@ export function planStripeEvent(event: StripeEventLike): BillingAction[] {
         }
         case 'invoice.payment_failed': {
             const subscriptionId = invoiceSubscription(payload);
-            return subscriptionId === null ? [] : [{ type: 'sync_subscription', subscriptionId, eventId, eventCreated }];
+            const invoiceIssue = { invoiceId: text(payload.id, 'invoice.id'), issue: 'payment_failed' as const };
+            return subscriptionId === null ? [{ type: 'invoice_issue', ...invoiceIssue, eventCreated }]
+                : [{ type: 'sync_subscription', subscriptionId, eventId, eventCreated, invoiceIssue }];
         }
+        case 'invoice.payment_action_required':
+        case 'invoice.voided':
+        case 'invoice.marked_uncollectible':
+            return [{ type: 'invoice_issue', invoiceId: text(payload.id, 'invoice.id'), eventCreated,
+                issue: eventType === 'invoice.payment_action_required' ? 'requires_action'
+                    : eventType === 'invoice.voided' ? 'voided' : 'uncollectible' }];
+        case 'customer.subscription.pending_update_applied':
+        case 'customer.subscription.pending_update_expired':
+            return [{ type: 'plan_change', subscriptionId: text(payload.id, 'subscription.id'), eventCreated,
+                outcome: eventType === 'customer.subscription.pending_update_applied' ? 'applied' : 'expired' }];
         case 'customer.subscription.created':
         case 'customer.subscription.updated':
         case 'customer.subscription.deleted':

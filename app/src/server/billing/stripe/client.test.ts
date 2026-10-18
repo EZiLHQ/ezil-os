@@ -72,10 +72,12 @@ const subscription = {
 const expectedSubscription = {
     id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancelAtPeriodEnd: true,
     currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000), sku: 'pro_monthly_v1',
+    pendingUpdateExpiresAt: null,
 };
 const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20 };
 const expectedInvoice = {
     id: 'in_fixture', customer: 'cus_fixture', status: 'paid', subscriptionId: 'sub_fixture',
+    billingReason: null, metadataKind: null, hostedInvoiceUrl: null,
     periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
 };
 const session = {
@@ -260,7 +262,7 @@ describe('Stripe response mapping', () => {
         { name: 'legacy precedence', current_period_start: start, current_period_end: end, items: { data: [{ current_period_start: 10, current_period_end: 20 }] } },
     ])('maps $name subscription periods', async shape => {
         const { client, fetcher } = fixture({ ...subscription, ...shape, customer: { id: 'cus_fixture' } });
-        expect(await client.retrieveSubscription('sub_fixture')).toEqual(expectedSubscription);
+        expect(await client.retrieveSubscription('sub_fixture')).toMatchObject(expectedSubscription);
         const sent = inspect(fetcher);
         expect(sent.url).toBe('https://api.stripe.com/v1/subscriptions/sub_fixture');
         expect(sent.init?.method).toBe('GET');
@@ -271,9 +273,9 @@ describe('Stripe response mapping', () => {
 
     it('preserves epoch dates and leaves absent subscription periods and SKU null', async () => {
         const { client, fetcher } = fixture({ ...subscription, current_period_start: 0, current_period_end: end });
-        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription, currentPeriodStart: new Date(0) });
+        expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({ ...expectedSubscription, currentPeriodStart: new Date(0) });
         fetcher.mockResolvedValueOnce(Response.json({ ...subscription, metadata: null, items: { data: [] } }));
-        expect(await client.retrieveSubscription('sub_fixture')).toEqual({
+        expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({
             ...expectedSubscription, currentPeriodStart: null, currentPeriodEnd: null, sku: null,
         });
     });
@@ -299,7 +301,7 @@ describe('Stripe response mapping', () => {
                 { ...line, period: { start, end } },
             ] },
         });
-        expect(await client.retrieveInvoice('in_fixture')).toEqual(expectedInvoice);
+        expect(await client.retrieveInvoice('in_fixture')).toMatchObject(expectedInvoice);
         expect(inspect(fetcher).url).toBe('https://api.stripe.com/v1/invoices/in_fixture');
         expect(inspect(fetcher).init?.method).toBe('GET');
     });
@@ -313,9 +315,9 @@ describe('Stripe response mapping', () => {
         const { client, fetcher } = fixture({
             ...invoice, subscription: 'sub_fixture', lines: { data: [{ subscription: 'sub_fixture', period: { start, end } }] },
         });
-        expect(await client.retrieveInvoice('in_fixture')).toEqual(expectedInvoice);
+        expect(await client.retrieveInvoice('in_fixture')).toMatchObject(expectedInvoice);
         fetcher.mockResolvedValueOnce(Response.json({ ...invoice, ...shape }));
-        expect(await client.retrieveInvoice('in_fixture')).toEqual({
+        expect(await client.retrieveInvoice('in_fixture')).toMatchObject({
             ...expectedInvoice, subscriptionId: shape.subscription, periodStart: null, periodEnd: null,
         });
     });
@@ -380,7 +382,7 @@ describe('Stripe response mapping', () => {
 
     it('rejects missing required customers while accepting expanded customers', async () => {
         const { client, fetcher } = fixture({ ...subscription, customer: { id: 'cus_fixture' }, current_period_start: start, current_period_end: end });
-        expect(await client.retrieveSubscription('sub_fixture')).toEqual(expectedSubscription);
+        expect(await client.retrieveSubscription('sub_fixture')).toMatchObject(expectedSubscription);
         fetcher.mockResolvedValueOnce(Response.json({ ...subscription, customer: null }));
         await expect(client.retrieveSubscription('sub_fixture')).rejects.toThrow('Stripe response is missing its customer');
     });
@@ -547,5 +549,118 @@ describe('automatic tax is opt-in', () => {
         await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false, adaptivePricing: true });
         expect(bodies[0].get('adaptive_pricing[enabled]')).toBe('false');
         expect(bodies[1].get('adaptive_pricing[enabled]')).toBe('true');
+    });
+});
+
+describe('v2 Stripe response mapping and checkout', () => {
+    const standardKey = 'ezil_standard_monthly_v2';
+    const computeKey = 'ezil_compute_monthly_v2';
+    const line = (id: string, price: unknown) => ({ id, amount: 2000, pricing: { price_details: { price } },
+        parent: { type: 'subscription_item_details', subscription_item_details: { subscription: 'sub_fixture', proration: true } },
+        period: { start, end } });
+
+    it('resolves each distinct endive Price id once per invoice read and maps every line', async () => {
+        const data = [line('il_first', 'price_fee'), line('il_base', 'price_standard'), line('il_credit', 'price_standard')];
+        const { client, fetcher } = fixture(null);
+        fetcher.mockImplementation(async url => {
+            const path = new URL(String(url)).pathname;
+            if (path === '/v1/prices/price_fee') return Response.json({ id: 'price_fee', lookup_key: 'fee' });
+            if (path === '/v1/prices/price_standard') return Response.json({ id: 'price_standard', lookup_key: standardKey });
+            return Response.json({ ...invoice, billing_reason: 'subscription_cycle', metadata: { kind: 'subscription' },
+                hosted_invoice_url: 'https://invoice.stripe.com/fixture',
+                parent: { subscription_details: { subscription: 'sub_fixture' } }, lines: { data } });
+        });
+        const mapped = await client.retrieveInvoice('in_fixture');
+        expect(mapped).toEqual({ ...expectedInvoice, billingReason: 'subscription_cycle', metadataKind: 'subscription',
+            hostedInvoiceUrl: 'https://invoice.stripe.com/fixture', lines: data.map((item, index) => ({
+                id: item.id, amount: 2000, lookupKey: index === 0 ? 'fee' : standardKey, subscriptionId: 'sub_fixture',
+                proration: true, periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
+            })) });
+        expect(fetcher).toHaveBeenCalledTimes(3);
+        expect(fetcher.mock.calls.filter(([url]) => String(url).endsWith('/prices/price_standard'))).toHaveLength(1);
+        await client.retrieveInvoice('in_fixture');
+        expect(fetcher).toHaveBeenCalledTimes(6); // Cache lasts one retrieval only.
+    });
+
+    it('uses expanded modern and legacy Price lookup keys without extra fetches', async () => {
+        const { client, fetcher } = fixture({ ...invoice, subscription: 'sub_fixture', lines: { data: [
+            line('il_modern', { id: 'price_standard', lookup_key: standardKey }),
+            { id: 'il_legacy', price: { id: 'price_compute', lookup_key: computeKey },
+                subscription: 'sub_fixture', proration: true, amount: -1000, period: { start, end } },
+            line('il_repeated_id', 'price_standard'),
+            line('il_without_key', { id: 'price_without_key', lookup_key: null }),
+        ] } });
+        const result = await client.retrieveInvoice('in_fixture');
+        expect(result.lines.map(item => item.lookupKey)).toEqual([standardKey, computeKey, standardKey, null]);
+        expect(result.lines[1]).toMatchObject({ amount: -1000, proration: true, subscriptionId: 'sub_fixture' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it('retrieves unexpanded Price objects and preserves null keys and invalid periods defensively', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ ...invoice, subscription: 'sub_fixture', lines: { data: [
+            { ...line('il_base', { id: 'price_base' }), period: { start: 'bad', end: -1 } },
+        ] } })).mockResolvedValueOnce(Response.json({ id: 'price_base', lookup_key: null }));
+        expect((await client.retrieveInvoice('in_fixture')).lines).toEqual([{
+            id: 'il_base', amount: 2000, subscriptionId: 'sub_fixture', lookupKey: null, proration: true,
+            periodStart: null, periodEnd: null,
+        }]);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([undefined, { sku: 'unknown_sku' }])('infers SKU from the first recognized subscription item with metadata %j', async metadata => {
+        const { client, fetcher } = fixture({ ...subscription, metadata, pending_update: { expires_at: end }, items: { data: [
+            { price: { id: 'price_unrelated', lookup_key: 'unrelated' }, current_period_start: 10, current_period_end: 20 },
+            { price: { id: 'price_compute', lookup_key: computeKey }, current_period_start: start, current_period_end: end },
+            { price: { id: 'price_standard', lookup_key: standardKey } },
+        ] } });
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription, sku: 'compute_monthly_v2',
+            pendingUpdateExpiresAt: new Date(end * 1000), items: [
+                { priceId: 'price_unrelated', lookupKey: 'unrelated' },
+                { priceId: 'price_compute', lookupKey: computeKey }, { priceId: 'price_standard', lookupKey: standardKey },
+            ] });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it('honors known metadata SKU and maps null pending updates and unknown items', async () => {
+        const { client, fetcher } = fixture({ ...subscription, current_period_start: start, current_period_end: end,
+            pending_update: null, items: { data: [{ price: { id: 'price_compute', lookup_key: computeKey } }] } });
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription,
+            items: [{ priceId: 'price_compute', lookupKey: computeKey }] });
+        fetcher.mockResolvedValueOnce(Response.json({ ...subscription, metadata: { sku: 'toString' }, pending_update: null,
+            items: { data: [{ price: { id: 'price_unknown', lookup_key: 'unknown' } }, {}] } }));
+        expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({ sku: null, pendingUpdateExpiresAt: null,
+            items: [{ priceId: 'price_unknown', lookupKey: 'unknown' }, { priceId: null, lookupKey: null }] });
+    });
+
+    it.each(['standard_monthly_v2', 'compute_monthly_v2'])('resolves the active Price by lookup key for %s checkout', async sku => {
+        const lookupKey = `ezil_${sku}`;
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ id: 'price_v2', active: true, lookup_key: lookupKey }] }))
+            .mockResolvedValueOnce(Response.json({ id: 'cs_fixture', url: checkoutResult.url }));
+        expect(await client.createCheckoutSession({ ...checkoutRequest, sku })).toEqual(checkoutResult);
+        const lookup = inspect(fetcher);
+        const url = new URL(String(lookup.url));
+        expect(url.pathname).toBe('/v1/prices');
+        expect(Object.fromEntries(url.searchParams)).toEqual({ 'lookup_keys[]': lookupKey, active: 'true', limit: '1' });
+        expect(lookup.init?.method).toBe('GET');
+        expect(inspect(fetcher, 1).body).toMatchObject({ mode: 'subscription', 'line_items[0][price]': 'price_v2',
+            'line_items[0][quantity]': '1', 'subscription_data[metadata][sku]': sku });
+        expect(inspect(fetcher, 1).headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(inspect(fetcher, 1).body).not.toHaveProperty('line_items[0][price_data][unit_amount]');
+    });
+
+    it.each([[], [{ id: 'price_disabled', active: false, lookup_key: standardKey }],
+        [{ id: 'price_wrong', active: true, lookup_key: computeKey }]])('rejects missing or inactive matching Prices %#', async (...data) => {
+        const { client, fetcher } = fixture({ data });
+        await expect(client.createCheckoutSession({ ...checkoutRequest, sku: 'standard_monthly_v2' }))
+            .rejects.toThrow(`No active Stripe Price for lookup key ${standardKey}`);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['free_v2', 'free_v1_legacy', 'unknown'])('rejects unsellable or unknown SKU %s before requesting Stripe', async sku => {
+        const { client, fetcher } = fixture(null);
+        await expect(client.createCheckoutSession({ ...checkoutRequest, sku })).rejects.toThrow('Unknown billing SKU');
+        expect(fetcher).not.toHaveBeenCalled();
     });
 });

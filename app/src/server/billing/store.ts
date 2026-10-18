@@ -375,6 +375,13 @@ export function createBillingStore(db: Database): BillingStore {
             return inserted.length > 0 ? 'queued' : 'duplicate';
         },
 
+        async latestIntervalFor(computerId) {
+            const [row] = await db.select({ endedAt: billingUsageIntervals.endedAt })
+                .from(billingUsageIntervals).where(eq(billingUsageIntervals.computerId, computerId))
+                .orderBy(desc(billingUsageIntervals.startedAt), desc(billingUsageIntervals.id)).limit(1);
+            return row ?? null;
+        },
+
         async openInterval(userId, computerId, at, source) {
             await db.insert(billingUsageIntervals).values({
                 userId, computerId, startedAt: at, lastSeenAt: at, source,

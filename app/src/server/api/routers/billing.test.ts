@@ -79,6 +79,7 @@ function fixture() {
         upsertSubscription: vi.fn(async () => 'applied' as const),
         insertGrant: vi.fn(async () => 'inserted' as const),
         enqueueOutbox: vi.fn(async () => 'queued' as const),
+        latestIntervalFor: vi.fn<BillingStore['latestIntervalFor']>().mockResolvedValue(null),
         openInterval: vi.fn(async () => {}),
         touchInterval: vi.fn(async () => {}),
         closeInterval: vi.fn(async () => {}),

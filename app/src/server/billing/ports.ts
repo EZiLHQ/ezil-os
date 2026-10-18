@@ -210,6 +210,7 @@ export interface BillingStore {
     enqueueOutbox(item: OutboxInsert): Promise<'queued' | 'duplicate'>;
 
     // usage ingest (computer ownership already checked by the caller)
+    latestIntervalFor(computerId: string): Promise<{ endedAt: Date | null } | null>;
     openInterval(userId: string, computerId: string, at: Date, source: string): Promise<void>;
     touchInterval(computerId: string, at: Date): Promise<void>;
     closeInterval(computerId: string, at: Date, reason: string): Promise<void>;
@@ -227,7 +228,9 @@ export interface StripeSubscription {
     cancelAtPeriodEnd: boolean;
     currentPeriodStart: Date | null;
     currentPeriodEnd: Date | null;
-    /** `subscription_data.metadata.sku` set by our own checkout. */
+    items: { priceId: string | null; lookupKey: string | null }[];
+    pendingUpdateExpiresAt: Date | null;
+    /** Known catalog SKU from metadata or the first recognized item lookup key. */
     sku: string | null;
 }
 
@@ -236,6 +239,18 @@ export interface StripeInvoice {
     customer: string;
     status: string;
     subscriptionId: string | null;
+    billingReason: string | null;
+    metadataKind: string | null;
+    hostedInvoiceUrl: string | null;
+    lines: {
+        id: string;
+        lookupKey: string | null;
+        subscriptionId: string | null;
+        proration: boolean;
+        amount: number;
+        periodStart: Date | null;
+        periodEnd: Date | null;
+    }[];
     periodStart: Date | null;
     periodEnd: Date | null;
 }

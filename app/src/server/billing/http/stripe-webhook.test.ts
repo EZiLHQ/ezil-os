@@ -149,3 +149,29 @@ describe('Stripe webhook HTTP handler', () => {
         expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, 'failed: temporary failure');
     });
 });
+
+describe('retryable processor outcomes', () => {
+    it.each(['failed:no_grant_for_refund', 'failed:no_grant_for_dispute'])('keeps %s retryable until the later delivery applies', async outcome => {
+        const f = fixture();
+        let recorded: string | null = null;
+        f.store.recordEvent.mockImplementation(async () => recorded === null ? 'new' : recorded.startsWith('failed') ? 'unprocessed' : 'processed');
+        f.store.markEventProcessed.mockImplementation(async (_id, value) => { recorded = value; });
+        f.process.mockResolvedValueOnce(outcome).mockResolvedValue('applied');
+        const response = await handleStripeWebhook(request(), f.deps, f.process);
+        expect(response.status).toBe(500);
+        expect(await response.json()).toEqual({ error: 'processing_failed' });
+        expect(recorded).toBe(outcome);
+        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, outcome);
+        expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);
+        expect(recorded).toBe('applied');
+        expect(await (await handleStripeWebhook(request(), f.deps, f.process)).json()).toEqual({ received: true, duplicate: true });
+        expect(f.process).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['applied', 'ignored', 'review:no_base_line', 'unattributed:customer'])('acknowledges ordinary outcome %s', async outcome => {
+        const f = fixture();
+        f.process.mockResolvedValue(outcome);
+        expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);
+        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, outcome);
+    });
+});
