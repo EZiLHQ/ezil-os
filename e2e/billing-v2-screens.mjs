@@ -3,7 +3,7 @@
  * Usage: node e2e/billing-v2-screens.mjs --out /tmp/billing-v2 [--only compute]
  * No server, listening port, Stripe connection, or external browser requests.
  * passed/failed count state × viewport runs; files lists every PNG actually saved.
- * Tabs: <state>-<width>-<1..5>.png. Sheets: <state>-<width>.png,
+ * Tabs: <state>-<width>-<1..8>.png. Sheets: <state>-<width>.png,
  * optionally <state>-<width>-2.png. Marketing: <state>-<width>.png (full page).
  */
 import assert from 'node:assert/strict';
@@ -372,13 +372,19 @@ async function checkState(page, f, sheetSelector) {
     for (const selector of ['[data-meter="compute"]', '[data-meter="storage"]', '[data-meter="ai"]', '[data-role="size-selector"]', '[data-role="session-note"]', '[data-role="invoices"]']) await exists(`${PANE} ${selector}`);
     if (family === 'free') {
         await exists(`${PANE} [data-role="plan-picker"]`);
-        await exists(`${PANE} input[value="free-cf"]:checked:disabled`);
+        await exists(`${PANE} section[data-role="size-selector"] [data-role="size-locked"]`);
+        assert.equal(await pane.locator('[data-role="size-selector"] input').count(), 0);
+        await contains(pane.locator('[data-role="size-locked"]'), '2 vCPU · 6 GiB');
+        await contains(pane.locator('[data-role="size-locked"]'), 'Included with EZiL Free');
         await contains(pane.locator('[data-role="plan-card"]'), name === 'free-legacy-8h' ? '8 h each month' : '2 h each month');
     }
     if (name === 'free-v2-low') await exists(`${PANE} [data-meter="compute"].is-low`);
     if (name === 'standard-active') {
-        await exists(`${PANE} input[value="std-2"]:checked:disabled`);
-        await contains(pane.locator('[data-role="size-locked"]'), 'Upgrade to Compute for 4 or 8 vCPU');
+        await exists(`${PANE} section[data-role="size-selector"] [data-role="size-locked"]`);
+        assert.equal(await pane.locator('[data-role="size-selector"] input').count(), 0);
+        await contains(pane.locator('[data-role="size-locked"]'), '2 vCPU · 8 GiB');
+        await contains(pane.locator('[data-role="size-locked"]'), 'Included with EZiL Standard');
+        await contains(pane.locator('[data-role="size-selector"] [data-action="upgrade"]'), 'Upgrade to Compute for 4 or 8 vCPU');
     }
     if (family === 'compute') assert.equal(await pane.locator('[data-role="size-selector"] input').count(), 3);
     if (name === 'compute-active') {
@@ -490,7 +496,7 @@ async function captureShell(page, f, out, width, sheetSelector, problems) {
     const scroller = sheetSelector ? page.locator(sheetSelector) : page.locator(`${PANE}`).locator('xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " ezil-settings-content ")][1]');
     assert.equal(await scroller.count(), 1, 'Expected the actual content scroll container');
     await scroller.evaluate(el => { el.scrollTop = 0; });
-    const maximum = sheetSelector ? 2 : 5;
+    const maximum = sheetSelector ? 2 : 8;
     for (let part = 1; part <= maximum; part++) {
         const suffix = sheetSelector && part === 1 ? '' : `-${part}`;
         const file = path.join(out, `${f.name}-${width}${suffix}.png`);

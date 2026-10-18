@@ -65,6 +65,12 @@ function paymentHtml ({ plan, actions }) {
 
 function planHtml (summary) {
     const { plan, compute, actions, estimate } = summary;
+    const resume = plan.status === 'cancels';
+    const planActions = [
+        actions.upgrade ? actionHtml('upgrade', 'Upgrade to Compute', ! (resume && actions.cancel)) : '',
+        actions.downgrade ? actionHtml('downgrade', 'Switch to Standard') : '',
+        actions.cancel ? actionHtml(resume ? 'resume' : 'cancel', resume ? 'Resume plan' : 'Cancel plan', resume) : '',
+    ].join('');
     const offer = offerFor(summary, plan.sku);
     const allowance = stdHoursLabel(offer?.allowanceStdSeconds ?? compute.allowanceStdSeconds);
     const codes = plan.family === 'free' ? ['free-cf'] : offer?.sizes ?? compute.allowedSizes;
@@ -81,11 +87,7 @@ function planHtml (summary) {
         ${plan.pendingUpgrade ? paragraph(`Compute starts once payment is confirmed. This upgrade expires ${dateLabel(plan.pendingUpgrade.expiresAt)}.`) : ''}
         ${plan.family === 'pro_legacy' ? paragraph('Your original Pro plan, honoured as sold.') : ''}
         ${plan.family !== 'free' ? paragraph('USD · before applicable tax', 'ezil-billing-note') : ''}
-        <div class="ezil-billing-actions" data-role="plan-actions">
-            ${actions.upgrade ? actionHtml('upgrade', 'Upgrade to Compute', true) : ''}
-            ${actions.downgrade ? actionHtml('downgrade', 'Switch to Standard') : ''}
-            ${actions.cancel ? actionHtml(plan.status === 'cancels' ? 'resume' : 'cancel', plan.status === 'cancels' ? 'Resume plan' : 'Cancel plan') : ''}
-        </div></section>`;
+        <div class="ezil-billing-actions" data-role="plan-actions">${planActions}</div></section>`;
 }
 
 function pickerHtml (summary) {
@@ -94,9 +96,9 @@ function pickerHtml (summary) {
     return `<section class="ezil-billing-picker" data-role="plan-picker"><h3>Choose a plan</h3><div class="ezil-billing-offers">${offers.map(offer => {
         const allowance = stdHoursLabel(offer.allowanceStdSeconds);
         return `<article class="ezil-billing-card"><h4>${encode(planName(offer.family))}</h4>
-            ${paragraph(`${dollars(offer.priceCents, { compact: true })}/month · before tax`, 'ezil-billing-offer-price')}
-            ${paragraph(`${allowance} standard-hours each billing period`)}${paragraph(sizesLine(summary, offer.sizes))}
-            ${offer.family === 'compute' && offer.overage ? paragraph(`Optional usage beyond ${allowance} standard-hours at ${dollars(offer.overage.centsPerStdHour)} each — off unless you turn it on.`) : ''}
+            <p class="ezil-billing-offer-price"><strong>${encode(dollars(offer.priceCents, { compact: true }))}</strong><span>/month · before tax</span></p>
+            <ul class="ezil-billing-offer-allowances"><li>${encode(`${allowance} standard-hours each billing period`)}</li><li>${encode(sizesLine(summary, offer.sizes))}</li></ul>
+            ${offer.family === 'compute' && offer.overage ? paragraph(`Optional usage beyond ${allowance} standard-hours at ${dollars(offer.overage.centsPerStdHour)} each — off unless you turn it on.`, 'ezil-billing-offer-note') : ''}
             ${actionHtml('checkout', `Choose ${offer.family === 'standard' ? 'Standard' : 'Compute'}`, true, offer.sku)}</article>`;
     }).join('')}</div></section>`;
 }
@@ -115,26 +117,32 @@ function computeHtml (summary) {
     const { compute, plan } = summary;
     const free = plan.family === 'free';
     const usage = free ? durationLabel(compute.usedStdSeconds) : stdHoursLabel(compute.usedStdSeconds, { round: 'up' });
-    const allowance = `of ${stdHoursLabel(compute.allowanceStdSeconds)}${free ? ' h' : ' standard-hours'}`;
+    const over = compute.usedStdSeconds - compute.allowanceStdSeconds;
+    const allowance = `of ${stdHoursLabel(compute.allowanceStdSeconds)}${free ? ' h' : ' standard-hours'}${over > 0 ? ` · ${stdHoursLabel(over, { round: 'up' })} over` : ''}`;
     const sizes = compute.allowedSizes.map(code => sizeFor(summary, code));
     const weights = sizes.filter(size => size.weight > 1).map(size => `${size.vcpu} vCPU uses ${size.weight} per hour`).join('; ');
     const note = free ? '' : '1 standard-hour = 1 hour at 2 vCPU.' + (plan.family === 'compute' && weights ? ` ${weights}.` : '');
-    const remaining = `<div data-role="size-hours"><p>Included time left</p><ul>${sizes.map(size => `<li data-size="${encode(size.code)}">${encode(`≈ ${includedTime(compute.remainingActualSecondsBySize[size.code] ?? 0)} at ${size.vcpu} vCPU`)}</li>`).join('')}</ul></div>`;
+    const empty = sizes.every(size => (compute.remainingActualSecondsBySize[size.code] ?? 0) === 0);
+    const remaining = `<p data-role="size-hours">${empty ? 'No included time left this period.' : `Included time left: ${sizes.map(size => `<span data-size="${encode(size.code)}">${encode(`≈ ${includedTime(compute.remainingActualSecondsBySize[size.code] ?? 0)} at ${size.vcpu} vCPU`)}</span>`).join(' · ')}`}</p>`;
     return compute.allowedSizes.length ? meterHtml('compute', 'Compute', compute.state, usage, allowance,
         percent(BigInt(compute.usedStdSeconds), BigInt(compute.allowanceStdSeconds)), `Resets ${dateLabel(compute.resetsAt)} (UTC)`, note, remaining) : '';
 }
 
 function selectorHtml (summary) {
     const { plan, compute, actions } = summary;
-    const selectable = plan.family === 'compute';
-    const codes = selectable ? compute.allowedSizes : [plan.family === 'free' ? 'free-cf' : 'std-2'];
+    if ( plan.family !== 'compute' ) {
+        const size = sizeFor(summary, plan.family === 'free' ? 'free-cf' : 'std-2');
+        return `<section class="ezil-billing-card ezil-billing-sizes" data-role="size-selector"><h4>Computer size</h4>
+            <div class="ezil-billing-size" data-role="size-locked"><span><strong>${encode(sizeLabel(size))}</strong><span>${encode(`Included with ${planName(plan.family)}`)}</span></span></div>
+            ${actions.upgrade ? `<div class="ezil-billing-actions">${actionHtml('upgrade', 'Upgrade to Compute for 4 or 8 vCPU')}</div>` : ''}
+            <p data-role="size-status" aria-live="polite"></p></section>`;
+    }
     return `<fieldset class="ezil-billing-card ezil-billing-sizes" data-role="size-selector"><legend>Computer size</legend>
-        <div class="ezil-billing-size-options">${codes.map(code => {
+        <div class="ezil-billing-size-options">${compute.allowedSizes.map(code => {
         const size = sizeFor(summary, code);
-        return `<label class="ezil-billing-size"><input type="radio" name="ezil-billing-size" value="${encode(code)}"${! selectable || code === compute.selectedSize ? ' checked' : ''}${! selectable || ! actions.selectSize ? ' disabled' : ''}>
-            <span><strong>${encode(sizeLabel(size))}</strong>${selectable ? `<span>${encode(`Uses ${size.weight} standard-hour${size.weight === 1 ? '' : 's'} per hour`)}</span><span>${encode(`≈ ${includedTime(compute.remainingActualSecondsBySize[code] ?? 0)} included left`)}</span>` : ''}</span></label>`;
+        return `<label class="ezil-billing-size"><input type="radio" name="ezil-billing-size" value="${encode(code)}"${code === compute.selectedSize ? ' checked' : ''}${! actions.selectSize ? ' disabled' : ''}>
+            <span><strong>${encode(sizeLabel(size))}</strong><span>${encode(`Uses ${size.weight} standard-hour${size.weight === 1 ? '' : 's'} per hour`)}</span><span>${encode(`≈ ${includedTime(compute.remainingActualSecondsBySize[code] ?? 0)} included left`)}</span></span></label>`;
     }).join('')}</div>
-        ${! selectable ? `<p data-role="size-locked">${plan.family !== 'free' && actions.upgrade ? `Upgrade to Compute for 4 or 8 vCPU ${actionHtml('upgrade', 'Upgrade to Compute')}` : 'Included computer size.'}</p>` : ''}
         <p data-role="size-status" aria-live="polite"></p></fieldset>`;
 }
 
@@ -143,7 +151,7 @@ function overageHtml (summary) {
     if ( ! overage?.available ) return '';
     const allowance = stdHoursLabel(offerFor(summary, 'compute_monthly_v2').allowanceStdSeconds);
     const changed = overage.enabled && overage.acceptedVersion !== overage.termsVersion;
-    return `<section class="ezil-billing-card ezil-billing-overage" data-role="overage" data-enabled="${overage.enabled}"><h3>Usage beyond your allowance</h3>
+    return `<section class="ezil-billing-card ezil-billing-overage" data-role="overage" data-enabled="${overage.enabled}"><h4>Usage beyond your allowance</h4>
         ${overage.enabled ? paragraph(`On · up to ${dollars(overage.capCents)} a period at ${dollars(overage.centsPerStdHour)} per standard-hour.`) + paragraph(`Accrued this period: ${dollars(overage.accruedCents)}.`)
             : paragraph(`Off. When your ${allowance} standard-hours are used up, your computer saves and pauses until the next period.`)}
         ${changed ? paragraph('The overage terms changed. Review them to keep overage on.') : ''}
@@ -155,7 +163,7 @@ function overageHtml (summary) {
 
 function estimateHtml ({ plan, estimate, overage }) {
     if ( plan.family === 'free' ) return '';
-    return `<section class="ezil-billing-card ezil-billing-estimate" data-role="estimate"><h3>Next charges</h3>
+    return `<section class="ezil-billing-card ezil-billing-estimate" data-role="estimate"><h4>Next charges</h4>
         ${paragraph(estimate.subscriptionCents != null && estimate.nextChargeAt != null
         ? `Next charge on ${dateLabel(estimate.nextChargeAt)}: ${dollars(estimate.subscriptionCents)} subscription before tax.` : 'No upcoming subscription charge.')}
         ${plan.family === 'compute' && overage && (overage.enabled || overage.accruedCents > 0) ? paragraph(`Usage so far: ${dollars(estimate.accruedOverageCents)}, billed separately.`) : ''}
@@ -186,7 +194,7 @@ function summaryHtml (summary) {
     return `<header class="ezil-billing-header"><div><h3>Plan &amp; usage</h3><p class="ezil-settings-lead">Your plan, compute and what renews when.</p></div>
         ${actions.portal ? actionHtml('portal', 'Manage billing') : ''}</header>
         ${paymentHtml(summary)}${planHtml(summary)}${pickerHtml(summary)}${computeHtml(summary)}${selectorHtml(summary)}
-        <section class="ezil-billing-session"><p data-role="session-note">${encode(`Sessions run up to ${compute.session.maxSeconds / 3600} hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.`)}</p>
+        <section class="ezil-billing-card ezil-billing-session"><p data-role="session-note">${encode(`Sessions run up to ${compute.session.maxSeconds / 3600} hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.`)}</p>
             ${compute.session.activeDeadline ? '<p data-role="session-countdown" aria-live="polite"></p>' : ''}</section>
         ${overageHtml(summary)}${estimateHtml(summary)}
         <div class="ezil-billing-meters">
@@ -207,10 +215,11 @@ function invoicesHtml (rows) {
         try { url = webUrl(row.url); } catch { /* A missing link must not hide an invoice. */ }
         const description = row.description || `EZiL ${row.kind}`;
         const status = row.status.replaceAll('_', ' ');
-        return `<li class="ezil-billing-invoice"><time datetime="${encode(row.created)}">${dateLabel(row.created, true)}</time>
-            <span>${encode(description)}</span><span class="ezil-settings-pill" data-role="invoice-kind" data-kind="${encode(row.kind)}">${encode({ subscription: 'Subscription', overage: 'Usage', other: 'Other' }[row.kind])}</span>
-            <span>${encode(dollars(row.status === 'paid' ? row.amountPaidCents : row.amountDueCents))}</span><span>${encode(status.charAt(0).toUpperCase() + status.slice(1))}</span>
-            ${url ? `<a href="${encode(url)}" target="_blank" rel="noopener" aria-label="${encode(`View invoice ${description} (opens in a new tab)`)}">View ↗</a>` : '<span class="ezil-billing-note">Link unavailable</span>'}</li>`;
+        return `<li class="ezil-billing-invoice"><div class="ezil-billing-invoice-heading"><time datetime="${encode(row.created)}">${dateLabel(row.created, true)}</time>
+            <span class="ezil-settings-pill" data-role="invoice-kind" data-kind="${encode(row.kind)}">${encode({ subscription: 'Subscription', overage: 'Usage', other: 'Other' }[row.kind])}</span></div>
+            <span class="ezil-billing-invoice-description">${encode(description)}</span>
+            <div class="ezil-billing-invoice-details"><span class="ezil-billing-invoice-amount">${encode(dollars(row.status === 'paid' ? row.amountPaidCents : row.amountDueCents))}</span><span class="ezil-billing-invoice-status">${encode(status.charAt(0).toUpperCase() + status.slice(1))}</span>
+            <span class="ezil-billing-invoice-link">${url ? `<a href="${encode(url)}" target="_blank" rel="noopener" aria-label="${encode(`View invoice ${description} (opens in a new tab)`)}">View ↗</a>` : '<span class="ezil-billing-note">Link unavailable</span>'}</span></div></li>`;
     }).join('')}</ul>`;
 }
 

@@ -7,6 +7,36 @@ import { JSDOM } from 'jsdom';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
+const css = fs.readFileSync(path.join(here, 'settings.css'), 'utf8');
+// jsdom cannot compute container queries or color-mix; inspect the authored
+// declarations and calculate WCAG contrast from the actual window tokens.
+function cssRule (selector, last = false, property) {
+    const rules = [...css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+        .filter(([, selectors, body]) => selectors.split(',').some(value => value.trim() === selector)
+            && (! property || body.includes(`${property}:`)));
+    const rule = last ? rules.at(-1) : rules[0];
+    assert.ok(rule, `CSS rule exists: ${selector}`);
+    return Object.fromEntries(rule[2].split(';').filter(value => value.trim()).map(value => {
+        const colon = value.indexOf(':');
+        return [value.slice(0, colon).trim(), value.slice(colon + 1).trim()];
+    }));
+}
+const tokens = cssRule('.ezil-settings-window');
+function rgb (value) {
+    const variable = value.match(/^var\((--[\w-]+)\)$/);
+    if ( variable ) return rgb(tokens[variable[1]]);
+    const mix = value.match(/^color-mix\(in srgb, (.+) (\d+)%, (.+)\)$/);
+    if ( mix ) {
+        const front = rgb(mix[1]), back = rgb(mix[3]), alpha = Number(mix[2]) / 100;
+        return front.map((channel, i) => channel * alpha + back[i] * (1 - alpha));
+    }
+    assert.match(value, /^#[\da-f]{6}$/i);
+    return value.slice(1).match(/../g).map(channel => parseInt(channel, 16) / 255);
+}
+function luminance (color) {
+    return rgb(color).map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+        .reduce((sum, channel, i) => sum + channel * [0.2126, 0.7152, 0.0722][i], 0);
+}
 const { build } = require(require.resolve('esbuild', { paths: [path.resolve(here, '../../../../app')] }));
 const out = process.env.EZIL_SHELL_OUT_DIR || path.resolve(here, '../../../../app/public/os');
 const dom = new JSDOM('<!doctype html><body><div class="desktop"></div></body>', {
@@ -143,6 +173,7 @@ function audit () {
         assert.ok(element.getAttribute('aria-label') || (element.type === 'radio' ? [...element.labels].map(label => label.textContent).join('').trim() : element.textContent.trim()), 'control has an accessible name');
     }
     assert.ok(qa('.ezil-billing-header .ezil-settings-btn-primary, [data-role="plan-card"] .ezil-settings-btn-primary, [data-role="billing-nudge"] .ezil-settings-btn-primary').length <= 1, 'at most one primary on the main surface');
+    assert.equal(qa('.ezil-billing-card h3, .ezil-billing-meter h3').length, 0, 'card headings use h4');
     assert.deepEqual(errors, []);
     audited++;
 }
@@ -166,6 +197,34 @@ function has (selector, expected = true) { assert.equal(!!q(selector), expected,
 function contains (selector, copy) { assert.ok(q(selector)?.textContent.includes(copy), `${selector} includes ${copy}`); }
 
 try {
+    for ( const [status, token, tint] of [
+        ['active', '--accent', 18], ['free', '--muted', 0], ['cancels', '--warn', 12],
+        ['incomplete', '--warn', 12], ['upgrade_pending', '--warn', 12], ['past_due', '--danger', 12],
+    ] ) {
+        const rule = cssRule(`.ezil-settings-billing [data-role="plan-status"][data-status="${status}"]`);
+        assert.equal(rule.color, status === 'active' ? '#4fd8de' : `var(${token})`);
+        assert.equal(rule.background, tint ? `color-mix(in srgb, var(${token}) ${tint}%, var(--surface))` : 'var(--surface-2)');
+        const light = luminance(rule.color), dark = luminance(rule.background);
+        assert.ok((Math.max(light, dark) + 0.05) / (Math.min(light, dark) + 0.05) >= 4.5, `${status} chip reaches 4.5:1`);
+    }
+    assert.equal(cssRule('.ezil-settings-billing [data-role="plan-actions"]:empty').display, 'none');
+    for ( const selector of ['.ezil-billing-card h4', '.ezil-billing-meter h4', '.ezil-billing-sizes legend'] ) {
+        const rule = cssRule(selector);
+        assert.equal(rule['font-size'], '16px'); assert.equal(rule['font-weight'], '600');
+        assert.equal(rule.color, 'var(--text)'); assert.equal(rule['text-transform'], 'none');
+    }
+    assert.equal(cssRule('.ezil-billing-session', true)['font-size'], '13px');
+    assert.equal(cssRule('.ezil-billing-session', true).color, 'var(--muted)');
+    assert.equal(cssRule('.ezil-billing-session [data-role="session-countdown"]').color, 'var(--text)');
+    assert.equal(cssRule('.ezil-billing-session [data-role="session-countdown"].ezil-billing-warning').color, 'var(--warn)');
+    assert.equal(cssRule('.ezil-billing-invoice time')['white-space'], 'nowrap');
+    const pill = cssRule('.ezil-billing-invoice [data-role="invoice-kind"]');
+    assert.equal(pill['justify-self'], 'start'); assert.equal(pill.width, 'max-content');
+    assert.equal(cssRule('.ezil-billing-invoice', false, 'grid-template-columns')['grid-template-columns'], 'minmax(0, 1fr)');
+    assert.equal(cssRule('.ezil-billing-invoice-heading', true).display, 'contents');
+    assert.equal(cssRule('.ezil-billing-invoice-details', true).display, 'contents');
+    pass('status colour rules and AA contrast, shared card headings, empty actions and responsive invoice/session styles');
+
     assert.ok(banned.test('unlimited'), 'copy scan positive control');
     for ( const term of window.billingFormat.BANNED_COPY ) assert.ok(banned.test(term));
     const f = window.billingFormat;
@@ -240,7 +299,10 @@ try {
         assert.equal(q('[data-role="plan-status"]').dataset.status, status);
         assert.equal(q('[data-role="plan-status"]').textContent, chip);
         if ( status === 'active' ) contains('[data-role="plan-card"]', 'Renews Nov 1');
-        if ( status === 'cancels' ) contains('[data-role="plan-card"]', 'Your plan ends Nov 1. You can resume before then.');
+        if ( status === 'cancels' ) {
+            contains('[data-role="plan-card"]', 'Your plan ends Nov 1. You can resume before then.');
+            has('[data-action="resume"].ezil-settings-btn-primary');
+        }
         has('[data-action="resume"]', status === 'cancels');
         has('[data-action="cancel"]', status !== 'cancels');
     }
@@ -266,8 +328,12 @@ try {
         assert.equal(qa('[data-role="size-selector"] input:not(:disabled)').length, 0);
     }
     summary = v2(); summary.plan.status = 'cancels'; summary.plan.cancelsAt = END;
+    summary.actions.upgrade = true;
     await refresh(); has('[data-action="resume"]');
+    has('[data-action="resume"].ezil-settings-btn-primary');
+    has('[data-role="plan-actions"] [data-action="upgrade"].ezil-settings-btn-primary', false);
     summary.actions.cancel = false; await refresh(); has('[data-action="resume"]', false);
+    has('[data-role="plan-actions"] [data-action="upgrade"].ezil-settings-btn-primary');
     pass('every action flag has positive and negative controls');
 
     summary = v2('free');
@@ -277,6 +343,7 @@ try {
     summary.catalog.offers.reverse();
     await refresh();
     const cards = qa('[data-role="plan-picker"] article');
+    assert.ok(q('[data-role="plan-actions"]').matches(':empty'), 'Free plan actions are truly empty for CSS hiding');
     assert.equal(cards.length, 2);
     assert.ok(cards[0].textContent.includes('EZiL Standard'));
     assert.ok(cards[0].textContent.includes('$27.50/month · before tax'));
@@ -285,6 +352,15 @@ try {
     assert.ok(cards[1].textContent.includes('$123.45/month · before tax'));
     assert.ok(cards[1].textContent.includes('2, 4 or 8 vCPU · up to 32 GiB'));
     assert.ok(cards[1].textContent.includes('Optional usage beyond 600 standard-hours at $0.25 each — off unless you turn it on.'));
+    for ( const card of cards ) {
+        assert.ok(card.querySelector('.ezil-billing-offer-price strong'));
+        assert.equal(card.querySelector('.ezil-billing-offer-price span').textContent, '/month · before tax');
+        assert.equal(card.querySelectorAll('.ezil-billing-offer-allowances li').length, 2);
+        assert.equal(card.lastElementChild.dataset.action, 'checkout');
+    }
+    assert.equal(cssRule('.ezil-billing-offer-price strong')['font-size'], '24px');
+    assert.ok(parseInt(cssRule('.ezil-billing-offer-allowances').gap, 10) <= 6);
+    assert.equal(cssRule('.ezil-billing-offers button')['margin-top'], 'auto');
     assert.equal(qa('[data-role="plan-picker"] .ezil-settings-btn-primary').length, 2);
     for ( const sku of ['standard_monthly_v2', 'compute_monthly_v2'] ) {
         const button = q(`[data-action="checkout"][data-sku="${sku}"]`), before = sheets.length;
@@ -337,6 +413,10 @@ try {
     contains('[data-role="size-hours"] [data-size="cmp-8"]', '≈ 125 h at 8 vCPU');
     contains('[data-role="size-hours"] [data-size="cmp-4"]', '≈ 250 h at 4 vCPU');
     contains('[data-role="size-hours"] [data-size="std-2"]', '≈ 500 h at 2 vCPU');
+    assert.equal(q('[data-role="size-hours"]').textContent, 'Included time left: ≈ 500 h at 2 vCPU · ≈ 250 h at 4 vCPU · ≈ 125 h at 8 vCPU');
+    assert.equal(q('[data-role="size-hours"]').tagName, 'P');
+    assert.ok(qa('[data-role="size-hours"] [data-size]').every(element => element.tagName === 'SPAN'));
+    has('[data-role="size-hours"] ul', false);
     has('[data-role="size-hours"] [data-size="free-cf"]', false);
     contains('[data-meter="compute"]', '1 standard-hour = 1 hour at 2 vCPU.');
     contains('[data-meter="compute"]', '4 vCPU uses 2 per hour; 8 vCPU uses 4 per hour.');
@@ -352,7 +432,22 @@ try {
         assert.equal(q('[data-role="size-hours"] [data-size="std-2"]').textContent, `≈ ${label} at 2 vCPU`);
         assert.equal(q('input[value="std-2"]').closest('label').querySelector('span > span:last-child').textContent, `≈ ${label} included left`);
     }
-    pass('included time floors minutes below one hour and shows whole hours in lists and radios');
+    pass('compact included-time line floors minutes below one hour and whole hours in the line and radios');
+    summary = v2();
+    summary.compute.remainingStdSeconds = 0;
+    summary.compute.remainingActualSecondsBySize = { 'std-2': 0, 'cmp-4': 0, 'cmp-8': 0, 'free-cf': 999 };
+    for ( const [over, caption] of [[0, 'of 500 standard-hours'], [360000, 'of 500 standard-hours · 100 over'], [360001, 'of 500 standard-hours · 100.1 over']] ) {
+        summary.compute.usedStdSeconds = summary.compute.allowanceStdSeconds + over;
+        await refresh();
+        assert.equal(q('[data-role="size-hours"]').textContent, 'No included time left this period.');
+        assert.equal(q('[data-meter="compute"] .ezil-billing-allowance').textContent, caption);
+        assert.equal(q('[data-meter="compute"] [role="progressbar"]').getAttribute('aria-valuenow'), '100');
+    }
+    summary.compute.remainingActualSecondsBySize['std-2'] = 120;
+    await refresh();
+    contains('[data-role="size-hours"]', 'Included time left: ≈ 2 m at 2 vCPU');
+    assert.equal(qa('[data-role="size-hours"] [data-size]').length, 3, 'mixed zero/nonzero sizes remain visible');
+    pass('zero included-time message, allowed sizes only and rounded-up over-allowance caption');
     for ( const meter of ['compute', 'storage', 'ai'] ) for ( const state of ['ok', 'low', 'exhausted', 'over_cap', 'unavailable'] ) {
         summary = v2(); summary[meter].state = state;
         await refresh();
@@ -405,32 +500,42 @@ try {
     assert.ok(qa('[data-role="size-selector"] input').every(el => !el.disabled));
     const beforeSame = calls.length;
     changeSize('cmp-8'); await settle(); assert.equal(calls.length, beforeSame);
-    await fixture(v2('standard'));
-    contains('[data-role="size-selector"]', '2 vCPU · 8 GiB');
-    assert.equal(qa('[data-role="size-selector"] input').length, 1);
-    assert.equal(q('[data-role="size-selector"] input').disabled, true);
-    assert.equal(q('[data-role="size-selector"] input').checked, true);
-    contains('[data-role="size-locked"]', 'Upgrade to Compute for 4 or 8 vCPU');
-    summary.actions.upgrade = false; await refresh();
-    assert.equal(q('[data-role="size-locked"]').textContent.includes('Upgrade to Compute'), false);
-    await fixture(v2('pro_legacy'));
-    contains('[data-role="size-selector"]', '2 vCPU · 8 GiB');
-    assert.equal(q('[data-role="size-selector"] input').disabled, true);
+    for ( const [family, name, size] of [['standard', 'EZiL Standard', '2 vCPU · 8 GiB'], ['pro_legacy', 'EZiL Pro', '2 vCPU · 8 GiB'], ['free', 'EZiL Free', '2 vCPU · 6 GiB']] ) {
+        for ( const upgrade of [true, false] ) {
+            summary = v2(family); summary.actions.upgrade = upgrade; summary.actions.selectSize = true;
+            await refresh();
+            assert.equal(q('[data-role="size-selector"]').tagName, 'SECTION');
+            assert.equal(q('[data-role="size-selector"] h4').textContent, 'Computer size');
+            assert.equal(qa('[data-role="size-selector"] input').length, 0);
+            contains('[data-role="size-locked"]', size);
+            contains('[data-role="size-locked"]', `Included with ${name}`);
+            const upgrades = qa('[data-role="size-selector"] [data-action="upgrade"]');
+            assert.equal(upgrades.length, Number(upgrade));
+            if ( upgrade ) {
+                assert.equal(upgrades[0].textContent, 'Upgrade to Compute for 4 or 8 vCPU');
+                assert.equal(q('[data-role="size-selector"]').textContent.split('Upgrade to Compute').length, 2, 'upgrade copy appears once');
+                click(upgrades[0]); assert.equal(sheets.at(-1).kind, 'upgrade'); await closeSheet();
+            }
+        }
+    }
     await fixture(v2('free'));
     for ( const selector of ['[data-role="plan-card"]', '[data-role="size-selector"]'] ) {
         contains(selector, '2 vCPU · 6 GiB'); assert.doesNotMatch(q(selector).textContent, /8 GiB/);
     }
-    // A portal mutation must restore the pre-existing locked state.
+    // A portal mutation must preserve the static size card.
     summary.actions.portal = true; await refresh();
     mutation = () => reply({ url: 'https://billing.example.test/session' });
     click(q('[data-action="portal"]')); await settle();
-    assert.equal(q('[data-role="size-selector"] input').disabled, true);
+    assert.equal(qa('[data-role="size-selector"] input').length, 0);
+    contains('[data-role="size-locked"]', 'Included with EZiL Free');
     pass('native size controls, pending lock, successful save without reload, rollback and locked plans');
 
     summary = v2(); summary.compute.session.activeDeadline = new Date(now + (2 * 3600 + 14 * 60) * 1000).toISOString();
     await refresh();
     assert.equal(q('[data-role="session-note"]').textContent, 'Sessions run up to 6 hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.');
     assert.equal(q('[data-role="session-countdown"]').textContent, 'This session saves and restarts in 2 h 14 m.');
+    assert.ok(q('[data-role="session-note"]').closest('.ezil-billing-card'));
+    assert.equal(q('[data-role="session-note"]').nextElementSibling, q('[data-role="session-countdown"]'));
     assert.equal(intervals.size, 1);
     assert.equal(q('[data-role="session-countdown"]').classList.contains('ezil-billing-warning'), false);
     const firstTimer = [...intervals.keys()][0];
@@ -663,6 +768,10 @@ try {
     assert.ok(qa('.ezil-billing-invoice')[1].textContent.includes('$23.45'), 'open invoice uses due amount');
     assert.equal(q('.ezil-billing-invoice a').target, '_blank'); assert.equal(q('.ezil-billing-invoice a').rel, 'noopener');
     assert.equal(q('.ezil-billing-invoice a').href, 'https://invoice.example.test/13');
+    assert.deepEqual([...q('.ezil-billing-invoice-heading').children].map(element => element.tagName), ['TIME', 'SPAN']);
+    assert.equal(q('.ezil-billing-invoice-heading [data-role="invoice-kind"]').dataset.kind, 'overage');
+    assert.equal(q('.ezil-billing-invoice-description').textContent, '<img src=x onerror=alert(1)>');
+    assert.deepEqual([...q('.ezil-billing-invoice-details').children].map(element => element.textContent), ['$9007199254740993.00', 'Paid', 'View ↗']);
     for ( const [kind, label] of [['subscription', 'Subscription'], ['overage', 'Usage'], ['other', 'Other']] ) assert.equal(q(`[data-role="invoice-kind"][data-kind="${kind}"]`).textContent, label);
     history[13].url = 'javascript:alert(1)'; await refresh(); assert.equal(q('.ezil-billing-invoice').querySelector('a'), null); contains('.ezil-billing-invoice', 'Link unavailable');
     for ( const kind of ['subscription', 'overage', 'other'] ) {

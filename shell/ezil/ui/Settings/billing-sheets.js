@@ -110,6 +110,8 @@ export function openComputeUpgradeSheet (options) {
             node('p', 'USD. Any applicable tax appears on the invoice.').className = 'ezil-upgrade-caption';
             node('p', `Adds ${stdHoursLabel(data.grantStdSeconds, { round: 'down' })} standard-hours for the rest of this period (until ${dateLabel(data.periodEnd)}). Your usage so far carries over.`);
             node('p', 'Your plan changes once payment is confirmed.');
+            const actions = node('div', null);
+            actions.className = 'ezil-billing-sheet-actions';
             button(`Pay ${money(data.amountDueCents)} and upgrade`, 'confirm', () => {
                 void request('billing.confirmUpgrade', { toSku: COMPUTE, prorationDate: data.prorationDate }, confirmation => {
                     if ( confirmation.status === 'applied' ) result(["You're on EZiL Compute"]);
@@ -125,7 +127,8 @@ export function openComputeUpgradeSheet (options) {
                     ], { invoice: confirmation.hostedInvoiceUrl, pending: true });
                     else throw new Error('unavailable');
                 });
-            });
+            }, actions);
+            button('Not now', 'not-now', sheet.close, actions).className = 'ezil-billing-sheet-secondary';
         }, () => {
             body.replaceChildren();
             button('Retry', 'retry', preview);
@@ -145,11 +148,14 @@ export function openDowngradeSheet (options) {
     const removed = compute.sizes.filter(code => ! standard.sizes.includes(code))
         .map(code => summary.catalog.sizes.find(size => size.code === code).vcpu).join(' and ');
     sheet.node('p', `You keep EZiL Compute until ${dateLabel(summary.plan.periodEnd)}. From then: ${stdHoursLabel(standard.allowanceStdSeconds)} standard-hours each billing period on a ${sizeLabel(size)} computer; ${removed} vCPU and overage end.`);
+    const actions = sheet.node('div', null);
+    actions.className = 'ezil-billing-sheet-actions';
     sheet.button(`Switch on ${dateLabel(summary.plan.periodEnd)}`, 'confirm', () => {
         void sheet.request('billing.scheduleDowngrade', { toSku: STANDARD }, data => {
             sheet.result([`Scheduled. You switch to Standard on ${dateLabel(data.effectiveAt)}.`]);
         });
-    });
+    }, actions);
+    sheet.button('Keep Compute', 'keep', sheet.close, actions).className = 'ezil-billing-sheet-secondary';
     return sheet.handle;
 }
 

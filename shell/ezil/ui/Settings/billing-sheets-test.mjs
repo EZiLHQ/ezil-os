@@ -213,6 +213,26 @@ test('upgrade: preview shows signed invoice lines, amount and floored grant', as
     assert.match(h.text(), /Adds 212.5 standard-hours for the rest of this period \(until Nov 1\). Your usage so far carries over./);
     assert.equal(h.q('[data-action="confirm"]').textContent, 'Pay $43.21 and upgrade');
 });
+for ( const [kind, action, label] of [['upgrade', 'not-now', 'Not now'], ['downgrade', 'keep', 'Keep Compute']] ) {
+    test(`${kind}: secondary ${label} closes without a request or refresh`, async h => {
+        await h.ready(kind);
+        const secondary = h.q(`[data-action="${action}"]`);
+        assert.equal(secondary.textContent, label);
+        assert.ok(secondary.classList.contains('ezil-billing-sheet-secondary'));
+        assert.equal(secondary.previousElementSibling, h.q('[data-action="confirm"]'), 'primary comes first');
+        const before = h.calls.length;
+        secondary.click();
+        await settle();
+        assert.equal(h.calls.length, before, 'dismissal sends no request');
+        assert.equal(h.count(procedures[kind]), 0, 'plan was not changed');
+        assert.equal(h.done, 0);
+        assert.equal(h.closed, 1);
+        assert.equal(h.q('[role="dialog"]'), null);
+        assert.equal(h.doc.activeElement, h.q('#opener'));
+        h.handle.close();
+        assert.equal(h.closed, 1);
+    });
+}
 for ( const status of ['applied', 'requires_action', 'payment_failed'] ) {
     test(`upgrade: ${status} result and Done`, async h => {
         await h.ready('upgrade');
