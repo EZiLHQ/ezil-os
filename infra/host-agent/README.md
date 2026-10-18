@@ -110,6 +110,15 @@ Then the agent marks `runDir/stopping` (so the desktop's `Restart=` cannot bring
 stops the desktop, unmounts the overlay, syncs, unmounts the data volume and runs
 `shutdown -h now`, retried until the OS accepts it. A blocked idle stop clears the mark.
 
+**Terminal work (SIGNAL C).** Before checking load or marking a stop, the agent probes the
+running desktop through `runc exec` with the Worker's `terminal-keepalive.ts` script. Any
+tmux session or terminal foreground job holds an idle stop for up to 8 hours after last
+presence; idle prompts and background jobs do not count. A held cycle sets no mark and
+flushes nothing; it logs `idle stop held: tmuxSessions/terminalJobs=<t>/<j>` and the check
+repeats. The probe times out after 30 s;
+a stopped desktop, probe failure, malformed output or expired cap leaves the ordinary
+idle path in charge. Control-plane stops and fences still proceed.
+
 **Stop outcome is recorded, never assumed.** `desktop.stop()` first hangs up the terminal
 shells (below), then sends TERM, waits the grace, and only then KILLs. It returns:
 - `absent` if nothing was running;

@@ -10,6 +10,9 @@ control plane's, from gateway-observed presence (R9). Caps are enforced by the c
 plane regardless of what this agent reports; this agent only:
   * idle-stops (guest-initiated, allowed by R9) when the #183 predicate holds:
       A. no presence for idle.inactivitySeconds  (worker isIdleStopDue)
+         then, before B: a tmux session or a terminal running a foreground job in the
+         desktop HOLDS the due stop (held_terminal: no marker, no flush) for at most 8 h
+         of idle; unknown = no hold (worker SIGNAL C, terminal-keepalive.ts; terminal_work)
       B. host 1-min load below idle.load1Busy, strictly parsed; unknown = busy
          (worker CONTAINER_BUSY_LOAD1 / parseLoadAvg1)
       C. a SUCCESSFUL final flush; busy (dpkg/apt lock held in the guest) or stale
@@ -45,7 +48,7 @@ import subprocess
 import threading
 import time
 
-from . import canary, desktop, guard, tunnel
+from . import canary, desktop, guard, terminal_work, tunnel
 from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -425,6 +428,27 @@ class Agent:
             delay = min(delay * 2, cap)
 
     # ------------------------------------------------------------------- loop
+    def _terminal_hold(self, idle_seconds):
+        """SIGNAL C: does terminal work in the running desktop hold this otherwise-due idle
+        stop? Probed only once idle is due. Never raises: an exception escaping tick() ends
+        the agent, systemd restarts it and the new agent counts boot as presence, so a crash
+        loop would never idle-stop, the opposite of "unknown means no hold". Any failure
+        here, even of the log line, is no hold."""
+        try:
+            if self._desktop_state() != "running":
+                keep_alive, work, reason = False, None, "desktop_not_running"
+            else:
+                keep_alive, work, reason = terminal_work.verdict(terminal_work.probe(self.cfg), idle_seconds)
+            if keep_alive:
+                t, j = work
+                self.log(f"idle stop held: tmuxSessions/terminalJobs={t}/{j} reason={reason} idle={int(idle_seconds)}s")
+            elif reason != "no_terminal_work":
+                counts = f"{work[0]}/{work[1]}" if work is not None else None
+                self.log(f"terminal hold: none (tmuxSessions/terminalJobs={counts or 'unknown'} reason={reason})")
+            return keep_alive
+        except Exception:  # noqa: BLE001 — a crash must not renew presence on restart
+            return False
+
     def tick(self):
         with self.lock:
             req = self.stop_request
@@ -443,6 +467,8 @@ class Agent:
         now = self.clock()
         if not idle_due(self.last_presence, now, self.cfg.idle["inactivitySeconds"]):
             return "active"
+        if self._terminal_hold(now - self.last_presence):
+            return "held_terminal"
         try:
             with open("/proc/loadavg") as f:
                 load1 = parse_load1(f.read())
