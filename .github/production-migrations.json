@@ -20,6 +20,11 @@
       "path": "app/drizzle/0002_os_access.sql",
       "sha256": "4c98ec14cc82f82851905cb133218a458836b97bbaa44fc65c4fcba02f0ad397",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0003_billing.sql",
+      "sha256": "6ee4818b61db34fd88297d02535074043f238f5966b7d29ab402d87202acf9c7",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {
