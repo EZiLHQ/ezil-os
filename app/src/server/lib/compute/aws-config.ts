@@ -76,6 +76,17 @@ export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null 
 /** Founder placement is mandatory independently of optional rollout configuration. */
 export const AWS_REQUIRED_FOUNDER_ID = '1ae9b1fd-880b-42ac-aebe-433b3c0ba11f';
 
+/**
+ * Owner-approved dev test account (2026-10-18). Its own computers start on Cloudflare
+ * when AWS does not take them, so Cloudflare computers can be tested end to end while
+ * AWS is unavailable. No other account is affected, and no configuration enables this.
+ */
+export const CLOUDFLARE_DEV_ACCOUNT_ID = 'eae88991-4271-40d0-938b-5d1d26b14786';
+
+export function isCloudflareDevAccount(userId: string): boolean {
+    return userId.toLowerCase() === CLOUDFLARE_DEV_ACCOUNT_ID;
+}
+
 /** Optional additions cannot remove the founder or turn malformed config into a fallback. */
 export function invalidRequiredUserConfig(env: Env = process.env): boolean {
     const list = env.EZIL_AWS_REQUIRED_USER_IDS?.trim();

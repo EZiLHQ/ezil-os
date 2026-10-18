@@ -8,7 +8,7 @@
  */
 
 import { precheckAdmission, type AdmissionRefusal } from './admission';
-import { invalidRequiredUserConfig, isAwsRequiredUser, isPlacementReadEnabled, type Env } from './aws-config';
+import { invalidRequiredUserConfig, isAwsRequiredUser, isCloudflareDevAccount, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
 import { explainAwsCanary, explainAwsCanaryCohort } from './placement-explain';
@@ -83,6 +83,11 @@ export async function resolveComputeProvider(
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
         const canary = await awsCanaryDecision(db, computer, env);
         if (canary.aws) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+        // aws-config.ts `CLOUDFLARE_DEV_ACCOUNT_ID`: the one dev account may start its own
+        // computer on Cloudflare when AWS did not take it. The canary may have refused before
+        // reading the row, so the computer itself is checked first.
+        const devAccount = options.pinCloudflare === true && isCloudflareDevAccount(computer.userId);
+        if (devAccount) await assertOwnLiveComputer(db, computer);
         if (options.pinCloudflare && canary.reason !== 'created_before_since' && isAwsRequiredUser(env, computer.userId)) {
             // An AWS-required account (aws-config.ts `awsRequiredUserIds`) never has a new
             // computer silently pinned to Cloudflare: nothing is written, nothing starts, and
@@ -90,12 +95,13 @@ export async function resolveComputeProvider(
             console.info('[compute.placement] aws_required_refused', { computerId: computer.computerId.toLowerCase(), canary: canary.reason });
             throw new AwsRequiredError(computer.computerId.toLowerCase(), canary.reason);
         }
-        if (options.pinCloudflare && canary.reason !== 'created_before_since' && !canary.fallbackAllowed) {
+        if (options.pinCloudflare && !devAccount && canary.reason !== 'created_before_since' && !canary.fallbackAllowed) {
             throw new AwsPlacementRefusedError(canary.reason);
         }
         if (options.pinCloudflare && !isPlacementDb(db)) throw new AwsPlacementRefusedError('placement_writer_unavailable');
         if (options.pinCloudflare && isPlacementDb(db)) {
-            const pin = await pinCloudflare(db, computer, canary.fallbackAllowed ? canary.reason : undefined);
+            const pin = await pinCloudflare(db, computer,
+                canary.fallbackAllowed ? canary.reason : devAccount ? `dev_account:${canary.reason}` : undefined);
             placement = pin.placement;
             assertPlacementOwner(placement, computer);
             // The one moment a computer's provider becomes permanent: say why the canary did
@@ -122,6 +128,15 @@ export class AwsRequiredError extends Error {
         super(`aws_required:${reason}`);
         this.name = 'AwsRequiredError';
     }
+}
+
+/** Only the dev account's own, live computer may take the Cloudflare start. */
+async function assertOwnLiveComputer(db: PlacementExecutor, computer: ComputerRef): Promise<void> {
+    const row = await readCanaryComputer(db, computer.computerId);
+    const refusal = row === null ? 'computer_missing'
+        : row.deleted ? 'computer_deleted'
+            : row.userId !== computer.userId.toLowerCase() ? 'owner_mismatch' : null;
+    if (refusal) throw new AwsPlacementRefusedError(refusal);
 }
 
 function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRef): void {

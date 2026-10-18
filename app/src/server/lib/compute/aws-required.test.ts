@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AWS_REQUIRED_FOUNDER_ID, awsRequiredUserIds, invalidRequiredUserConfig, isAwsRequiredUser } from './aws-config';
+import { AWS_REQUIRED_FOUNDER_ID, CLOUDFLARE_DEV_ACCOUNT_ID, awsRequiredUserIds, invalidRequiredUserConfig, isAwsRequiredUser, isCloudflareDevAccount } from './aws-config';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { AwsPlacementRefusedError, AwsRequiredError, resolveComputeProvider } from './select';
 
@@ -101,6 +101,83 @@ describe('builders prefer AWS; fallback requires only allowed admission refusals
         seed.placements.push(placementRow({ computer_id: userId }), placementRow({ computer_id: userId }));
         await expect(resolveComputeProvider(seed.db, ref, { ...ENV, EZIL_AWS_KILL_SWITCH: '1' }, {}, start)).rejects.toBeInstanceOf(AwsPlacementRefusedError);
         expect(seed.placements.every((r) => r.provider !== 'cloudflare')).toBe(true);
+    });
+});
+
+describe('dev account: its own computers start on Cloudflare when AWS does not take them', () => {
+    const dev = CLOUDFLARE_DEV_ACCOUNT_ID;
+    const devRef = { userId: dev, computerId };
+    const AWS_OFF = { ...ENV, EZIL_AWS_COMPUTERS_ENABLED: '2', EZIL_COMPUTE_PLACEMENT_READS: '1' };
+
+    it('pins a labelled Cloudflare placement for the dev account while AWS is off', async () => {
+        const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const { db, placements } = seeded(dev);
+            expect((await resolveComputeProvider(db, devRef, AWS_OFF, {}, start)).kind).toBe('cloudflare');
+            expect(placements).toHaveLength(1);
+            expect(placements[0]).toMatchObject({ provider: 'cloudflare', owner_user_id: dev, last_error: 'cloudflare_fallback:dev_account:aws_disabled' });
+        } finally { log.mockRestore(); }
+    });
+
+    it('matches the id case-insensitively and nothing else', () => {
+        expect(isCloudflareDevAccount(dev.toUpperCase())).toBe(true);
+        expect(isCloudflareDevAccount(builder)).toBe(false);
+        expect(isCloudflareDevAccount(userId)).toBe(false);
+    });
+
+    it('changes nothing for any other account: builder and founder still refuse before any pin', async () => {
+        const other = seeded(builder);
+        await expect(resolveComputeProvider(other.db, { userId: builder, computerId }, AWS_OFF, {}, start)).rejects.toBeInstanceOf(AwsPlacementRefusedError);
+        expect(other.placements).toEqual([]);
+        const founder = seeded();
+        await expect(resolveComputeProvider(founder.db, computer, AWS_OFF, {}, start)).rejects.toMatchObject({ name: 'AwsRequiredError', reason: 'aws_disabled' });
+        expect(founder.placements).toEqual([]);
+    });
+
+    it('still goes to AWS when AWS admits the dev account', async () => {
+        const { db, placements } = seeded(dev);
+        expect((await resolveComputeProvider(db, devRef, ENV, {}, start)).kind).toBe('aws-ec2');
+        expect(placements).toEqual([]);
+    });
+
+    it('reads and stops never pin, even for the dev account', async () => {
+        const { db, placements } = seeded(dev);
+        expect((await resolveComputeProvider(db, devRef, AWS_OFF, {}, {})).kind).toBe('cloudflare');
+        expect(placements).toEqual([]);
+    });
+
+    it('cannot pin without placement reads', async () => {
+        const { db, placements } = seeded(dev);
+        await expect(resolveComputeProvider(db, devRef, { EZIL_COMPUTE_PLACEMENT_READS: undefined }, {}, start))
+            .rejects.toMatchObject({ name: 'AwsPlacementRefusedError', reason: 'placement_reads_disabled' });
+        expect(placements).toEqual([]);
+    });
+
+    it.each([
+        { state: 'missing', reason: 'computer_missing' },
+        { state: 'foreign', reason: 'owner_mismatch' },
+        { state: 'deleted', reason: 'computer_deleted' },
+    ])('a $state computer is refused, never pinned', async ({ state, reason }) => {
+        const seed = createFakePlacementDb({ computers: state === 'missing' ? [] : [{
+            id: computerId, user_id: state === 'foreign' ? builder : dev,
+            created_at: new Date('2026-10-16T00:00:00Z'), deleted_at: state === 'deleted' ? new Date() : null,
+        }] });
+        await expect(resolveComputeProvider(seed.db, devRef, AWS_OFF, {}, start)).rejects.toMatchObject({ name: 'AwsPlacementRefusedError', reason });
+        expect(seed.placements).toEqual([]);
+    });
+
+    it('stays AWS-required if the owner lists it as required', async () => {
+        const { db, placements } = seeded(dev);
+        await expect(resolveComputeProvider(db, devRef, { ...AWS_OFF, EZIL_AWS_REQUIRED_USER_IDS: dev }, {}, start))
+            .rejects.toMatchObject({ name: 'AwsRequiredError', reason: 'aws_disabled' });
+        expect(placements).toEqual([]);
+    });
+
+    it('an existing AWS placement is never changed', async () => {
+        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, owner_user_id: dev, provider: 'aws-ec2' })] });
+        await resolveComputeProvider(db, devRef, AWS_OFF, {}, start).catch(() => undefined);
+        expect(placements).toHaveLength(1);
+        expect(placements[0]?.provider).toBe('aws-ec2');
     });
 });
 
