@@ -1,14 +1,17 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
-// only the server's summary can confirm that the webhook has granted Pro.
+// only the server's summary can confirm the purchased plan.
+import { openSheetFrame } from './sheet-frame.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy } from './billing-format.js';
 
-const sheets = new WeakMap();
 let stripePromise = null;
 
 /** Keep return-link parsing independent of boot and preserve unrelated keys. */
 export function parseBillingDeepLink (search) {
     const params = new URLSearchParams(search);
     if ( params.get('settings') !== 'billing' ) return null;
-    const openUpgrade = params.get('upgrade') === 'pro';
+    const upgrade = params.get('upgrade');
+    const openUpgrade = upgrade === 'standard' ? 'standard_monthly_v2'
+        : upgrade === 'compute' ? 'compute_monthly_v2' : upgrade === 'pro';
     params.delete('settings');
     params.delete('upgrade');
     const remaining = params.toString();
@@ -47,7 +50,7 @@ export async function defaultLoadStripe (publishableKey, { signal } = {}) {
 
 /** The shell client returns an envelope; injected clients may return wire data. */
 function unwrap (result) {
-    if ( result?.ok === false ) throw new Error(result.message || 'Could not reach billing. Try again.');
+    if ( result?.ok === false ) throw new Error(errorCopy(result.message));
     return result?.ok === true ? result.data : result;
 }
 
@@ -58,14 +61,19 @@ function unwrap (result) {
  */
 /** How often an open payment form re-checks its session (see watchSession). */
 const WATCH_INTERVAL_MS = 4000;
+export const CONFIRM_POLL_MS = 1500;
+export const CONFIRM_DEADLINE_MS = 60000;
 
-export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = defaultLoadStripe, now = Date.now }) {
+// CheckoutStatusDTO is a string; accept the older envelope during rollout too.
+const checkoutStatus = result => {
+    const data = unwrap(result);
+    return typeof data === 'string' ? data : data?.status;
+};
+
+export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
-    const existing = sheets.get(doc);
-    if ( existing ) return existing;
-    const opener = doc.activeElement;
     const controller = new win.AbortController();
     let closed = false;
     let checkout = null;
@@ -77,95 +85,63 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
     let finished = false;
     let deadline = 0;
     const timers = new Set();
-    const backdrop = doc.createElement('div');
-    backdrop.className = 'ezil-upgrade-backdrop';
-    backdrop.innerHTML = `
-        <div class="ezil-upgrade-sheet" data-role="upgrade-sheet" role="dialog" aria-modal="true" aria-labelledby="ezil-upgrade-title" tabindex="-1">
-            <span data-focus-edge="start" tabindex="0"></span>
-            <button type="button" class="ezil-upgrade-close" data-action="close-sheet" aria-label="Close upgrade sheet">×</button>
-            <div class="ezil-upgrade-columns">
-                <details class="ezil-upgrade-summary" open>
-                    <summary><span id="ezil-upgrade-title">Upgrade to EZiL Pro</span><span class="ezil-upgrade-compact-title" hidden>EZiL Pro · $20/month · before applicable tax</span></summary>
-                    <p class="ezil-upgrade-price">$20 <span>/month</span></p>
-                    <p class="ezil-upgrade-caption">USD · before applicable tax<br>Any applicable tax is shown before you pay</p>
-                    <ul class="ezil-upgrade-allowances">
-                        <li><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>20 h workspace time each month</span></li>
-                        <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18M7 17h2"/></svg><span>2 GB storage today · 20 GB soon</span></li>
-                        <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg><span>$3 AI credits each month — AI assistant coming soon</span></li>
-                    </ul>
-                    <p>Same standard computer and AI assistant as Free.</p>
-                    <hr>
-                    <div class="ezil-upgrade-total"><strong>Due today</strong><span>Total shown in the payment form</span></div>
-                    <p class="ezil-upgrade-caption">Renews monthly until you cancel in Settings → Billing.</p>
-                    <p class="ezil-upgrade-security"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Payments are processed securely by Stripe.</span></p>
-                </details>
-                <section class="ezil-upgrade-payment" aria-label="Secure payment">
-                    <div data-role="checkout-state" role="status" aria-live="polite"></div>
-                    <div id="ezil-embedded-checkout"></div>
-                </section>
-            </div>
-            <span data-focus-edge="end" tabindex="0"></span>
+    const name = planName(offer.family);
+    const price = dollars(offer.priceCents, { compact: true });
+    const allowance = `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
+    const frame = openSheetFrame({
+        container, title: `Subscribe to ${name}`, role: 'upgrade-sheet', onClose,
+        canDismissBackdrop: () => ! busy && ! (confirming && ! finished),
+        dispose: () => {
+            closed = true;
+            clearTimers();
+            controller.abort();
+            destroy(checkout);
+            checkout = null;
+        },
+        onCompact: (matches, dialog) => {
+            const summary = dialog.querySelector('details');
+            if ( ! summary ) return;
+            summary.open = ! matches;
+            summary.querySelector('#ezil-upgrade-title').hidden = matches;
+            summary.querySelector('.ezil-upgrade-compact-title').hidden = ! matches;
+        },
+    });
+    if ( frame.existing ) return frame.existing;
+    const { dialog, close, focusFirst } = frame;
+    frame.content.innerHTML = `
+        <div class="ezil-upgrade-columns">
+            <details class="ezil-upgrade-summary" open>
+                <summary><span id="ezil-upgrade-title"></span><span class="ezil-upgrade-compact-title" hidden></span></summary>
+                <p class="ezil-upgrade-price"><span data-role="price"></span> <span>/month</span></p>
+                <p class="ezil-upgrade-caption">USD · before applicable tax<br>Any applicable tax is shown before you pay</p>
+                <ul class="ezil-upgrade-allowances"></ul>
+                <hr>
+                <div class="ezil-upgrade-total"><strong>Due today</strong><span>Total shown in the payment form</span></div>
+                <p class="ezil-upgrade-caption">Renews monthly until you cancel in Settings → Billing.</p>
+                <p class="ezil-upgrade-security"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Payments are processed securely by Stripe.</span></p>
+            </details>
+            <section class="ezil-upgrade-payment" aria-label="Secure payment">
+                <div data-role="checkout-state" role="status" aria-live="polite"></div>
+                <div id="ezil-embedded-checkout"></div>
+            </section>
         </div>`;
-    // The viewport owns the payment geometry; Settings only owns its lifetime.
-    const oldOverflow = doc.body.style.overflow;
-    doc.body.style.overflow = 'hidden';
-    doc.body.append(backdrop);
-    const dialog = backdrop.querySelector('[role="dialog"]');
+    dialog.querySelector('#ezil-upgrade-title').textContent = `Subscribe to ${name}`;
+    dialog.querySelector('.ezil-upgrade-compact-title').textContent = `${name} · ${price}/month · before applicable tax`;
+    dialog.querySelector('[data-role="price"]').textContent = price;
+    const offeredSizes = offer.sizes.map(code => sizes.find(size => size.code === code));
+    const cpus = offeredSizes.map(size => size.vcpu);
+    const sizeCopy = offeredSizes.length === 1 ? `${sizeLabel(offeredSizes[0])} computer`
+        : `${cpus.slice(0, -1).join(', ')} or ${cpus.at(-1)} vCPU computers, up to ${Math.max(...offeredSizes.map(size => size.memoryGiB))} GiB`;
+    const lines = [allowance, sizeCopy, 'Sessions run up to 6 hours; files and installed tools are kept'];
+    if ( offer.family === 'compute' && offer.overage ) lines.push(`Optional usage beyond ${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours at ${dollars(offer.overage.centsPerStdHour, { compact: true })} each — off unless you turn it on`);
+    for ( const line of lines ) {
+        const li = doc.createElement('li');
+        li.textContent = line;
+        dialog.querySelector('.ezil-upgrade-allowances').append(li);
+    }
     const state = dialog.querySelector('[data-role="checkout-state"]');
     const mount = dialog.querySelector('#ezil-embedded-checkout');
-    const summary = dialog.querySelector('details');
-    const compact = win.matchMedia?.('(max-width: 759px)');
-    const onCompact = event => {
-        backdrop.classList.toggle('is-compact', event.matches);
-        summary.open = ! event.matches;
-        summary.querySelector('#ezil-upgrade-title').hidden = event.matches;
-        summary.querySelector('.ezil-upgrade-compact-title').hidden = ! event.matches;
-    };
-    const onResize = () => onCompact({ matches: win.innerWidth < 760 });
-    onResize();
-    compact?.addEventListener('change', onCompact);
-    win.addEventListener('resize', onResize);
-
-    // Inert siblings keep pointer and assistive-technology navigation in the
-    // modal, including when the caller supplies a pane rather than a window.
-    const inert = [];
-    for ( let node = backdrop; node.parentElement; node = node.parentElement ) {
-        for ( const sibling of node.parentElement.children ) {
-            if ( sibling !== node && ! sibling.hasAttribute('inert') ) {
-                sibling.setAttribute('inert', '');
-                inert.push(sibling);
-            }
-        }
-        if ( node.parentElement === doc.body ) break;
-    }
-    const focusable = () => [...dialog.querySelectorAll('button, summary, a[href], iframe, [tabindex]')]
-        .filter(el => ! el.disabled && ! el.hidden && el.tabIndex >= 0 && ! el.dataset.focusEdge
-            && ! el.closest('[hidden]'));
-    const focusFirst = () => (focusable()[0] ?? dialog).focus();
-    const focusLast = () => (focusable().at(-1) ?? dialog).focus();
-    const onFocus = event => {
-        if ( ! dialog.contains(event.target) || event.target.dataset.focusEdge === 'end' ) focusFirst();
-        else if ( event.target.dataset.focusEdge === 'start' ) focusLast();
-    };
-    const onKey = event => {
-        if ( event.key === 'Escape' ) {
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            close();
-        } else if ( event.key === 'Tab' ) {
-            const elements = focusable();
-            const first = elements[0];
-            const last = elements.at(-1);
-            if ( event.shiftKey && doc.activeElement === first ) { event.preventDefault(); focusLast(); }
-            else if ( ! event.shiftKey && doc.activeElement === last ) { event.preventDefault(); focusFirst(); }
-        }
-    };
-    doc.addEventListener('keydown', onKey, true);
-    doc.addEventListener('focusin', onFocus, true);
-    const observer = new win.MutationObserver(() => {
-        if ( ! backdrop.isConnected || ! container.isConnected ) close();
-    });
-    observer.observe(doc.body, { childList: true, subtree: true });
+    frame.refreshCompact();
 
     function clearTimers () {
         for ( const timer of timers ) win.clearTimeout(timer);
@@ -186,24 +162,6 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
     function destroy (instance) {
         try { instance?.destroy(); } catch { /* Teardown must still restore focus. */ }
     }
-    function close () {
-        if ( closed ) return;
-        closed = true;
-        clearTimers();
-        controller.abort();
-        destroy(checkout);
-        checkout = null;
-        observer.disconnect();
-        compact?.removeEventListener('change', onCompact);
-        win.removeEventListener('resize', onResize);
-        doc.removeEventListener('keydown', onKey, true);
-        doc.removeEventListener('focusin', onFocus, true);
-        for ( const sibling of inert ) sibling.removeAttribute('inert');
-        backdrop.remove();
-        doc.body.style.overflow = oldOverflow;
-        sheets.delete(doc);
-        if ( opener?.isConnected ) opener.focus();
-    }
     function show (message, label, action) {
         const hadFocus = state.contains(doc.activeElement);
         state.replaceChildren();
@@ -215,7 +173,7 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
             button.type = 'button';
             button.textContent = label;
             button.dataset.action = 'retry';
-            button.addEventListener('click', action);
+            button.addEventListener('click', () => { if ( ! closed && ! busy ) action(); });
             state.append(button);
         }
         if ( hadFocus ) focusFirst();
@@ -227,11 +185,11 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         show(paid ? 'Payment received — your plan updates in a moment.'
             : 'We could not confirm your payment yet. Check Settings → Billing in a moment.');
     }
-    function success (summary) {
+    function success () {
         finished = true;
         clearTimers();
         mount.hidden = true;
-        show("You're on EZiL Pro", 'Done', () => {
+        show(`You're on ${name}`, 'Done', () => {
             try { onDone?.(); } finally { close(); }
         });
         state.dataset.role = 'upgrade-success';
@@ -241,9 +199,7 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         icon.setAttribute('aria-hidden', 'true');
         state.prepend(icon);
         const allowances = doc.createElement('p');
-        const storage = Number(summary.meters?.storage?.capBytes) >= 20000000000
-            ? '20 GB storage' : '2 GB storage today · 20 GB soon';
-        allowances.textContent = `20 h workspace time · ${storage} · $3 AI credits each month. AI assistant coming soon.`;
+        allowances.textContent = allowance;
         state.querySelector('button').before(allowances);
         state.querySelector('button').focus();
     }
@@ -252,15 +208,15 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         if ( now() >= deadline ) { timedOut(); return; }
         try {
             if ( ! paid ) {
-                const status = unwrap(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
+                const status = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
                 if ( closed || finished ) return;
-                if ( status.status === 'expired' ) {
+                if ( status === 'expired' ) {
                     finished = true;
                     clearTimers();
                     show('This checkout has expired. Close the sheet and try again.');
                     return;
                 }
-                if ( status.status !== 'complete' ) { later(() => { void poll(); }, 1500); return; }
+                if ( status !== 'complete' ) { later(() => { void poll(); }, CONFIRM_POLL_MS); return; }
                 paid = true;
                 confirming = true;
                 show('Confirming your payment…');
@@ -268,9 +224,9 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
             const summary = unwrap(await trpc.query('billing.summary'));
             if ( closed || finished ) return;
             if ( now() >= deadline ) { timedOut(); return; }
-            if ( summary?.plan?.id === 'pro' ) { success(summary); return; }
+            if ( summary?.plan?.sku === sku ) { success(); return; }
         } catch { /* A transient read failure must not imply that payment failed. */ }
-        if ( ! closed && ! finished ) later(() => { void poll(); }, 1500);
+        if ( ! closed && ! finished ) later(() => { void poll(); }, CONFIRM_POLL_MS);
     }
     /**
      * Stripe's form can lose its own confirmation (seen in a real run: "Your
@@ -283,9 +239,9 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
     async function watchSession () {
         if ( closed || polling || finished ) return;
         try {
-            const status = unwrap(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
+            const status = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
             if ( closed || polling || finished ) return;
-            if ( status.status === 'complete' ) { startPolling(true); return; }
+            if ( status === 'complete' ) { startPolling(true); return; }
         } catch { /* A failed check is retried on the next tick. */ }
         if ( ! closed && ! polling && ! finished ) watchTimer = later(watchSession, WATCH_INTERVAL_MS);
     }
@@ -295,8 +251,8 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         stopWatching();
         // onComplete starts verification; checkoutStatus still confirms receipt.
         if ( completed ) { confirming = true; mount.hidden = true; show('Confirming your payment…'); }
-        deadline = now() + 30000;
-        later(timedOut, 30000);
+        deadline = now() + CONFIRM_DEADLINE_MS;
+        later(timedOut, CONFIRM_DEADLINE_MS);
         void poll();
     }
     async function embed () {
@@ -350,14 +306,7 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         } finally { busy = false; }
         if ( ! closed && session?.mode === 'embedded' ) void embed();
     }
-    const handle = { close };
-    sheets.set(doc, handle);
-    // A stray click outside the form must not dismiss receipt verification.
-    backdrop.addEventListener('click', event => {
-        if ( event.target === backdrop && ! (confirming && ! finished) ) close();
-    });
-    dialog.querySelector('[data-action="close-sheet"]').addEventListener('click', close);
     focusFirst();
     void create();
-    return handle;
+    return frame.handle;
 }

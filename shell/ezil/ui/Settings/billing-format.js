@@ -12,6 +12,12 @@ export function dateLabel (iso, year = false) {
         : '—';
 }
 
+export function dateTimeLabel (iso) {
+    const time = Date.parse(iso ?? '');
+    if ( ! Number.isFinite(time) ) return '—';
+    return `${dateLabel(iso, true)} at ${new Date(time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'UTC' })} UTC`;
+}
+
 export function durationLabel (seconds) {
     const minutes = Math.floor(Math.max(0, seconds) / 60);
     const hours = Math.floor(minutes / 60);

@@ -197,11 +197,15 @@ try {
     assert.equal(new Set(Object.keys(errorTable).map(code => f.errorCopy(code))).size, 12);
     for ( const code of ['NETWORK', 'unknown', 'toString', undefined] ) assert.equal(f.errorCopy(code), fallback);
     assert.equal(f.errorCopy('cap_out_of_range', 7500), 'Choose a cap between $0 and $75.');
-    // Verify the owned sheet file really remains a placeholder, outside the bundle stub.
-    const placeholder = await import(`data:text/javascript,${encodeURIComponent(fs.readFileSync(path.join(here, 'billing-sheets.js'), 'utf8'))}`);
-    assert.equal(Object.keys(placeholder).length, 4);
-    for ( const fn of Object.values(placeholder) ) assert.throws(fn, /^Error: unavailable$/);
-    pass('shared formatting, 12 distinct error mappings, safe URLs and sheet placeholders');
+    // Bundle the real module separately from the tab's injected sheet stubs.
+    const sheetBundle = await build({
+        stdin: { contents: "import * as sheets from './billing-sheets.js'; window.realBillingSheets = sheets;", resolveDir: here },
+        bundle: true, write: false, format: 'iife', target: 'es2022',
+    });
+    window.eval(sheetBundle.outputFiles[0].text);
+    assert.deepEqual(Object.keys(window.realBillingSheets).sort(), ['openComputeUpgradeSheet', 'openDowngradeSheet', 'openCancelSheet', 'openOverageSheet'].sort());
+    for ( const fn of Object.values(window.realBillingSheets) ) assert.equal(typeof fn, 'function');
+    pass('shared formatting, 12 distinct error mappings, safe URLs and sheet exports');
 
     await open();
     assert.deepEqual(qa('.ezil-settings-tab').map(tab => tab.dataset.tab), ['account', 'billing', 'computers', 'system', 'appearance', 'about', 'troubleshoot']);
@@ -338,6 +342,17 @@ try {
     contains('[data-meter="compute"]', '4 vCPU uses 2 per hour; 8 vCPU uses 4 per hour.');
     summary.compute.allowedSizes = ['std-2', 'cmp-8']; await refresh();
     has('[data-role="size-hours"] [data-size="cmp-4"]', false);
+    for ( const [seconds, label] of [[59, '0 m'], [2759, '45 m'], [3599, '59 m'], [3600, '1 h'], [7199, '1 h']] ) {
+        summary = v2();
+        summary.compute.remainingStdSeconds = seconds;
+        summary.compute.usedStdSeconds = summary.compute.allowanceStdSeconds - seconds;
+        summary.compute.remainingActualSecondsBySize = Object.fromEntries(summary.compute.allowedSizes.map(code =>
+            [code, Math.floor(seconds / summary.catalog.sizes.find(size => size.code === code).weight)]));
+        await refresh();
+        assert.equal(q('[data-role="size-hours"] [data-size="std-2"]').textContent, `≈ ${label} at 2 vCPU`);
+        assert.equal(q('input[value="std-2"]').closest('label').querySelector('span > span:last-child').textContent, `≈ ${label} included left`);
+    }
+    pass('included time floors minutes below one hour and shows whole hours in lists and radios');
     for ( const meter of ['compute', 'storage', 'ai'] ) for ( const state of ['ok', 'low', 'exhausted', 'over_cap', 'unavailable'] ) {
         summary = v2(); summary[meter].state = state;
         await refresh();

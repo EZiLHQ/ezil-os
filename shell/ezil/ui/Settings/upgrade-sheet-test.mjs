@@ -1,15 +1,32 @@
 // upgrade-sheet-test.mjs — EZiL-authored. Like the Settings harness, this
-// drives DOM controls in jsdom with no transport. Evaluate the standalone
-// module so fake Stripe and a deterministic clock exercise every race.
+// drives DOM controls in jsdom with no transport. Bundle the real modules
+// so fake Stripe and a deterministic clock exercise every race.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { JSDOM } from 'jsdom';
 
-const source = fs.readFileSync(new URL('./upgrade-sheet.js', import.meta.url), 'utf8');
+const here = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+const { build } = require(require.resolve('esbuild', { paths: [path.resolve(here, '../../../../app')] }));
+const source = (await build({
+    stdin: { contents: "import * as checkout from './upgrade-sheet.js'; window.sheetApi = checkout;", resolveDir: here },
+    bundle: true, write: false, format: 'iife', target: 'es2022',
+})).outputFiles[0].text;
 const css = fs.readFileSync(new URL('./upgrade-sheet.css', import.meta.url), 'utf8');
 const embedded = { mode: 'embedded', sessionId: 'cs_test', clientSecret: 'test_client_secret', publishableKey: 'pk_test' };
-const pro = { plan: { id: 'pro' }, meters: { storage: { capBytes: '20000000000' } } };
-const free = { plan: { id: 'free' } };
+const standard = { enabled: true, version: 2, plan: { sku: 'standard_monthly_v2' } };
+const sizes = [
+    { code: 'std-2', vcpu: 2, memoryGiB: 8, weight: 1 },
+    { code: 'cmp-4', vcpu: 4, memoryGiB: 16, weight: 2 },
+    { code: 'cmp-8', vcpu: 8, memoryGiB: 32, weight: 4 },
+];
+const offer = { sku: 'standard_monthly_v2', family: 'standard', priceCents: 2300, currency: 'usd', interval: 'month', allowanceStdSeconds: 63 * 3600, sizes: ['std-2'], overage: null };
+const computeOffer = { ...offer, sku: 'compute_monthly_v2', family: 'compute', priceCents: 12345, allowanceStdSeconds: 510 * 3600, sizes: sizes.map(size => size.code), overage: { centsPerStdHour: 30, defaultCapCents: 2500, maxCapCents: 10000 } };
+const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|fair\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai/i;
+const free = { enabled: true, version: 2, plan: { sku: 'free_v2' } };
 const settle = async () => { for ( let i = 0; i < 20; i++ ) await Promise.resolve(); };
 const deferred = () => {
     let resolve;
@@ -18,7 +35,7 @@ const deferred = () => {
 };
 
 function harness () {
-    const dom = new JSDOM('<!doctype html><body><button id="opener">Upgrade to Pro</button><main id="container"></main></body>', {
+    const dom = new JSDOM('<!doctype html><body><button id="opener">Subscribe to Standard</button><main id="container"></main></body>', {
         runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://example.test/os',
     });
     const { window } = dom;
@@ -46,7 +63,13 @@ function harness () {
         time = end;
         await settle();
     };
-    window.eval(`${source.replace(/^export /gm, '')}\nwindow.sheetApi = { openUpgradeSheet, parseBillingDeepLink, defaultLoadStripe };`);
+    window.eval(source);
+    const rendered = [];
+    const observer = new window.MutationObserver(() => {
+        const sheet = document.querySelector('[data-role="upgrade-sheet"]');
+        if ( sheet ) rendered.push(sheet.textContent);
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     const calls = [];
     const opens = [];
     window.open = (...args) => { opens.push(args); return null; };
@@ -55,17 +78,19 @@ function harness () {
     let mounted = 0;
     let loaded = 0;
     let done = 0;
+    let closed = 0;
     const h = {
-        dom, window, document, timers, tick, calls, opens,
+        dom, window, document, timers, tick, calls, opens, rendered,
         q: selector => document.querySelector(selector),
         text: () => document.querySelector('[data-role="upgrade-sheet"]')?.textContent ?? '',
         create: async () => embedded,
-        status: async () => ({ status: 'complete' }),
-        summary: async () => pro,
+        status: async () => 'complete',
+        summary: async () => standard,
         get mounted () { return mounted; },
         get destroyed () { return destroyed; },
         get loaded () { return loaded; },
         get done () { return done; },
+        get closed () { return closed; },
         complete: () => complete(),
         count: method => calls.filter(call => call.method === method).length,
         click: selector => {
@@ -104,8 +129,8 @@ function harness () {
     };
     h.open = (options = {}) => {
         h.handle = window.sheetApi.openUpgradeSheet({
-            container: h.q('#container'), sku: 'pro_monthly_v1', trpc: h.trpc,
-            onDone: () => { done++; }, loadStripe: h.loadStripe, now: () => time, ...options,
+            container: h.q('#container'), sku: offer.sku, offer, sizes, trpc: h.trpc,
+            onDone: () => { done++; }, onClose: () => { closed++; }, loadStripe: h.loadStripe, now: () => time, ...options,
         });
         return h.handle;
     };
@@ -161,7 +186,7 @@ test('backdrop dismisses idle checkout but preserves confirmation until it finis
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), confirming, 'receipt verification also keeps the dialog open');
     assert.equal(h.destroyed, 1, 'only the earlier idle checkout was destroyed');
-    h.summary = async () => pro;
+    h.summary = async () => standard;
     await h.tick(1500);
     assert.ok(h.q('[data-role="upgrade-success"]'));
     h.click('.ezil-upgrade-backdrop');
@@ -186,7 +211,7 @@ test('redirect polling allows dismissal before payment and protects a received p
     const sheet = h.q('[data-role="upgrade-sheet"]');
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), sheet);
-    await h.tick(30000);
+    await h.tick(60000);
     assert.match(h.text(), /Payment received — your plan updates in a moment/);
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'timeout releases the protected dialog above');
@@ -199,7 +224,7 @@ test('viewport width controls the compact class at 760px and resize cleanup rele
     const summary = h.q('details');
     assert.ok(backdrop.classList.contains('is-compact'));
     assert.equal(summary.open, false, 'desktop expansion is the positive control below');
-    assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Pro · $20/month · before applicable tax');
+    assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Standard · $23/month · before applicable tax');
     assert.equal(h.q('.ezil-upgrade-compact-title').hidden, false);
     h.window.innerWidth = 760;
     h.window.dispatchEvent(new h.window.Event('resize'));
@@ -221,25 +246,24 @@ test('viewport width controls the compact class at 760px and resize cleanup rele
 test('embedded payment verifies status, waits for the webhook, then Done refreshes and closes', async h => {
     let summaries = 0;
     h.create = async () => ({ ok: true, data: embedded });
-    h.summary = async () => ({ ok: true, data: ++summaries === 1 ? free : pro });
+    h.summary = async () => ({ ok: true, data: ++summaries === 1 ? free : standard });
     h.open();
     assert.equal(h.q('[role="dialog"]').getAttribute('aria-modal'), 'true');
     await settle();
     assert.equal(h.mounted, 1);
     assert.equal(h.calls[0].method, 'billing.createCheckout');
-    assert.equal(h.calls[0].input.sku, 'pro_monthly_v1');
+    assert.equal(h.calls[0].input.sku, 'standard_monthly_v2');
     h.complete();
     assert.match(h.text(), /Confirming your payment…/);
     await settle();
     assert.equal(h.count('billing.checkoutStatus'), 1);
     assert.equal(h.calls.find(call => call.method === 'billing.checkoutStatus').input.sessionId, 'cs_test');
-    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'free summary cannot grant Pro; positive control after webhook below');
+    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'free summary cannot grant Standard; positive control after webhook below');
     assert.ok(h.timers.size > 0, 'confirmation has scheduled its next read and deadline');
     await h.tick(1500);
     assert.ok(h.q('[data-role="upgrade-success"]'));
-    assert.match(h.text(), /You're on EZiL Pro/);
-    assert.match(h.text(), /20 GB storage · \$3 AI credits each month/);
-    assert.match(h.text(), /AI assistant coming soon/);
+    assert.match(h.text(), /You're on EZiL Standard/);
+    assert.match(h.text(), /63 standard-hours each billing period/);
     assert.ok(h.q('[data-action="done"]'));
     h.click('[data-action="done"]');
     assert.equal(h.done, 1);
@@ -343,29 +367,29 @@ test('redirect checkout opens a safe new tab and polls pending → complete ever
     assert.ok(h.q('[data-role="upgrade-success"]'));
 });
 
-test('summary that never grants Pro gets the honest timeout, not a success claim', async h => {
+test('summary that never grants Standard gets the honest timeout, not a success claim', async h => {
     h.summary = async () => free;
     h.open();
     await settle();
     h.complete();
     await settle();
     assert.ok(h.timers.size > 0);
-    await h.tick(29999);
+    await h.tick(59999);
     assert.match(h.text(), /Confirming your payment…/);
     await h.tick(1);
     assert.match(h.text(), /Payment received — your plan updates in a moment\./);
-    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'a timely Pro response supplies the success control below');
+    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'a timely Standard response supplies the success control below');
     assert.equal(h.timers.size, 0, 'deadline was active above');
     const reads = h.count('billing.summary');
     await h.tick(60000);
     assert.equal(h.count('billing.summary'), reads, 'positive summary reads stop at the deadline');
     h.handle.close();
-    h.summary = async () => pro;
+    h.summary = async () => standard;
     h.open();
     await settle();
     h.complete();
     await settle();
-    assert.ok(h.q('[data-role="upgrade-success"]'), 'a timely Pro summary does produce success');
+    assert.ok(h.q('[data-role="upgrade-success"]'), 'a timely Standard summary does produce success');
 });
 
 test('hung status and late summary cannot outrun the total deadline', async h => {
@@ -376,7 +400,7 @@ test('hung status and late summary cannot outrun the total deadline', async h =>
     h.complete();
     await settle();
     assert.equal(h.count('billing.checkoutStatus'), 1);
-    await h.tick(30000);
+    await h.tick(60000);
     assert.match(h.text(), /We could not confirm your payment yet/);
     pending.resolve({ status: 'complete' });
     await settle();
@@ -390,13 +414,13 @@ test('hung status and late summary cannot outrun the total deadline', async h =>
     h.complete();
     await settle();
     assert.equal(h.count('billing.summary'), 1);
-    await h.tick(30000);
-    summary.resolve(pro);
+    await h.tick(60000);
+    summary.resolve(standard);
     await settle();
     assert.match(h.text(), /Payment received — your plan updates in a moment/);
-    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'timely Pro response succeeds in the control below');
+    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'timely Standard response succeeds in the control below');
     h.handle.close();
-    h.summary = async () => pro;
+    h.summary = async () => standard;
     h.open();
     await settle();
     h.complete();
@@ -409,8 +433,8 @@ test('createCheckout errors are escaped inline and Retry creates a working sessi
     h.create = async () => ++attempts === 1 ? { ok: false, message: '<img src=x onerror=alert(1)> unavailable' } : embedded;
     h.open();
     await settle();
-    assert.match(h.text(), /<img src=x onerror=alert\(1\)> unavailable/);
-    assert.equal(h.q('[data-role="checkout-state"] img'), null, 'message is visible text above, never executable markup');
+    assert.match(h.text(), /Could not reach billing. Try again./);
+    assert.equal(h.q('[data-role="checkout-state"] img'), null, 'unrecognized server errors map to safe fallback copy');
     assert.equal(h.q('[data-action="retry"]').textContent, 'Retry');
     h.click('[data-action="retry"]');
     await settle();
@@ -502,7 +526,7 @@ test('a paid session is noticed even when Stripe never calls onComplete', async 
     await h.tick(4000);
     await settle();
     assert.ok(h.count('billing.checkoutStatus') >= 1, 'the watcher asked the server about the session');
-    assert.match(h.text(), /Confirming your payment|You're on EZiL Pro|Payment received/);
+    assert.match(h.text(), /Confirming your payment|You're on EZiL Standard|Payment received/);
 });
 
 test('closing while the default script loads cancels its timeout', async h => {
@@ -579,18 +603,18 @@ test('redirect schemes are checked before opening; HTTPS is the positive control
 
 test('copy keeps gated allowances honest and every control has a name', async h => {
     Object.defineProperty(h.window, 'innerWidth', { value: 390 });
-    h.summary = async () => ({ ...pro, meters: { storage: { capBytes: '2000000000' } } });
+    h.summary = async () => standard;
     h.open();
     await settle();
     assert.equal(h.q('details').open, false, 'mobile summary collapses; desktop control follows');
     assert.match(h.text(), /USD · before applicable tax/);
-    assert.match(h.text(), /2 GB storage today · 20 GB soon/);
+    assert.match(h.text(), /63 standard-hours each billing period/);
     h.complete();
     await settle();
     const success = h.q('[data-role="upgrade-success"]');
     assert.ok(success);
-    assert.match(success.textContent, /2 GB storage today · 20 GB soon/);
-    assert.doesNotMatch(h.text(), /faster|instant|unlimited|priority|vcpu|gpu|heavy use|fair use|gpt|claude|gemini|llama/i, 'positive rendered price, allowances and success asserted above');
+    assert.match(success.textContent, /63 standard-hours each billing period/);
+    assert.doesNotMatch(h.text(), banned, 'positive rendered price, allowances and success asserted above');
     for ( const control of h.document.querySelectorAll('button, summary, iframe') ) {
         assert.ok(control.getAttribute('aria-label') || control.getAttribute('title') || control.textContent.trim());
     }
@@ -602,10 +626,111 @@ test('copy keeps gated allowances honest and every control has a name', async h 
     assert.equal(h.q('details').open, true);
 });
 
+test('Standard and Compute checkout copy comes from the offer and sizes', async h => {
+    h.open();
+    await settle();
+    assert.match(h.text(), /Subscribe to EZiL Standard/);
+    assert.match(h.text(), /\$23 \/month/);
+    assert.match(h.text(), /63 standard-hours each billing period/);
+    assert.match(h.text(), /2 vCPU · 8 GiB computer/);
+    assert.doesNotMatch(h.text(), /Optional usage|\$20|\$3 AI|storage|Same standard computer/);
+    h.handle.close();
+    h.window.innerWidth = 390;
+    h.open({ sku: computeOffer.sku, offer: computeOffer });
+    await settle();
+    assert.match(h.text(), /Subscribe to EZiL Compute/);
+    assert.match(h.text(), /2, 4 or 8 vCPU computers, up to 32 GiB/);
+    assert.match(h.text(), /Optional usage beyond 510 standard-hours at \$0.30 each — off unless you turn it on/);
+    assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Compute · $123.45/month · before applicable tax');
+    assert.match(h.text(), /Sessions run up to 6 hours; files and installed tools are kept/);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input))), [
+        { sku: offer.sku }, { sku: computeOffer.sku },
+    ]);
+});
+
+test('success requires the purchased SKU even when another paid plan is present', async h => {
+    h.open({ sku: computeOffer.sku, offer: computeOffer });
+    await settle();
+    h.complete();
+    await settle();
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    h.summary = async () => ({ plan: { id: 'pro' } });
+    await h.tick(1500);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    h.summary = async () => ({ plan: { sku: computeOffer.sku } });
+    await h.tick(1500);
+    assert.match(h.q('[data-role="upgrade-success"]').textContent, /You're on EZiL Compute/);
+    assert.match(h.q('[data-role="upgrade-success"]').textContent, /510 standard-hours each billing period/);
+});
+
+test('v2 deep links select Standard and Compute, and legacy pro remains supported', async h => {
+    const parse = h.window.sheetApi.parseBillingDeepLink;
+    for ( const [value, expected] of [['standard', offer.sku], ['compute', computeOffer.sku], ['pro', true], ['other', false], ['__proto__', false], ['constructor', false]] ) {
+        const result = parse(`?view=files&settings=billing&upgrade=${value}&view=recent`);
+        assert.equal(result.openUpgrade, expected);
+        assert.equal(result.search, '?view=files&view=recent');
+    }
+    assert.equal(h.window.sheetApi.CONFIRM_POLL_MS, 1500);
+    assert.equal(h.window.sheetApi.CONFIRM_DEADLINE_MS, 60000);
+});
+
+for ( const way of ['Escape', '×', 'backdrop', 'handle', 'Done', 'owner removed', 'backdrop removed'] ) {
+    test(`onClose runs once for ${way}`, async h => {
+        h.open();
+        await settle();
+        if ( way === 'Done' ) { h.complete(); await settle(); h.click('[data-action="done"]'); }
+        else if ( way === 'Escape' ) h.key('Escape');
+        else if ( way === '×' ) h.click('[data-action="close-sheet"]');
+        else if ( way === 'backdrop' ) h.click('.ezil-upgrade-backdrop');
+        else if ( way === 'owner removed' ) h.q('#container').remove();
+        else if ( way === 'backdrop removed' ) h.q('.ezil-upgrade-backdrop').remove();
+        else h.handle.close();
+        await settle();
+        h.handle.close();
+        assert.equal(h.closed, 1);
+        assert.equal(h.done, way === 'Done' ? 1 : 0);
+        assert.equal(h.q('[role="dialog"]'), null);
+        assert.equal(h.document.activeElement, h.q('#opener'));
+    });
+}
+
+test('backdrop does not dismiss an in-flight checkout mutation', async h => {
+    const pending = deferred();
+    h.create = () => pending.promise;
+    h.open();
+    h.click('.ezil-upgrade-backdrop');
+    assert.ok(h.q('[role="dialog"]'));
+    assert.equal(h.closed, 0);
+    pending.resolve(embedded);
+    await settle();
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.closed, 1);
+});
+
+test('a late summary after close leaves both the old and reopened sheet untouched', async h => {
+    const pending = deferred();
+    h.summary = () => pending.promise;
+    h.open();
+    await settle();
+    h.complete();
+    await settle();
+    const old = h.q('[role="dialog"]');
+    h.handle.close();
+    const oldHTML = old.innerHTML;
+    h.open();
+    await settle();
+    const currentHTML = h.q('[role="dialog"]').innerHTML;
+    pending.resolve(standard);
+    await settle();
+    assert.equal(old.innerHTML, oldHTML);
+    assert.equal(h.q('[role="dialog"]').innerHTML, currentHTML);
+    assert.equal(h.done, 0);
+});
+
 let failed = 0;
 for ( const { name, fn } of tests ) {
     const h = harness();
-    try { await fn(h); console.log(`PASS ${name}`); }
+    try { await fn(h); await settle(); for ( const state of h.rendered ) assert.doesNotMatch(state, banned); console.log(`PASS ${name}`); }
     catch (error) { failed++; console.error(`FAIL ${name}\n${error.stack}`); }
     finally { h.cleanup(); }
 }

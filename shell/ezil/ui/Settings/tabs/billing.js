@@ -23,7 +23,7 @@ const encode = value => html_encode(String(value));
 const sizeFor = (summary, code) => summary.catalog.sizes.find(size => size.code === code);
 const offerFor = (summary, sku) => summary.catalog.offers.find(offer => offer.sku === sku);
 const paragraph = (copy, className = '') => `<p class="${className}">${encode(copy)}</p>`;
-const wholeHours = seconds => `${Math.floor(Math.max(0, seconds) / 3600)} h`;
+const includedTime = seconds => durationLabel(seconds >= 3600 ? Math.floor(seconds / 3600) * 3600 : seconds);
 
 function actionHtml (action, label, primary = false, sku) {
     return `<button type="button" class="ezil-settings-btn${primary ? ' ezil-settings-btn-primary' : ''}" data-action="${action}"${sku ? ` data-sku="${encode(sku)}"` : ''}>${encode(label)}</button>`;
@@ -119,7 +119,7 @@ function computeHtml (summary) {
     const sizes = compute.allowedSizes.map(code => sizeFor(summary, code));
     const weights = sizes.filter(size => size.weight > 1).map(size => `${size.vcpu} vCPU uses ${size.weight} per hour`).join('; ');
     const note = free ? '' : '1 standard-hour = 1 hour at 2 vCPU.' + (plan.family === 'compute' && weights ? ` ${weights}.` : '');
-    const remaining = `<div data-role="size-hours"><p>Included time left</p><ul>${sizes.map(size => `<li data-size="${encode(size.code)}">${encode(`≈ ${wholeHours(compute.remainingActualSecondsBySize[size.code] ?? 0)} at ${size.vcpu} vCPU`)}</li>`).join('')}</ul></div>`;
+    const remaining = `<div data-role="size-hours"><p>Included time left</p><ul>${sizes.map(size => `<li data-size="${encode(size.code)}">${encode(`≈ ${includedTime(compute.remainingActualSecondsBySize[size.code] ?? 0)} at ${size.vcpu} vCPU`)}</li>`).join('')}</ul></div>`;
     return compute.allowedSizes.length ? meterHtml('compute', 'Compute', compute.state, usage, allowance,
         percent(BigInt(compute.usedStdSeconds), BigInt(compute.allowanceStdSeconds)), `Resets ${dateLabel(compute.resetsAt)} (UTC)`, note, remaining) : '';
 }
@@ -132,7 +132,7 @@ function selectorHtml (summary) {
         <div class="ezil-billing-size-options">${codes.map(code => {
         const size = sizeFor(summary, code);
         return `<label class="ezil-billing-size"><input type="radio" name="ezil-billing-size" value="${encode(code)}"${! selectable || code === compute.selectedSize ? ' checked' : ''}${! selectable || ! actions.selectSize ? ' disabled' : ''}>
-            <span><strong>${encode(sizeLabel(size))}</strong>${selectable ? `<span>${encode(`Uses ${size.weight} standard-hour${size.weight === 1 ? '' : 's'} per hour`)}</span><span>${encode(`≈ ${wholeHours(compute.remainingActualSecondsBySize[code] ?? 0)} included left`)}</span>` : ''}</span></label>`;
+            <span><strong>${encode(sizeLabel(size))}</strong>${selectable ? `<span>${encode(`Uses ${size.weight} standard-hour${size.weight === 1 ? '' : 's'} per hour`)}</span><span>${encode(`≈ ${includedTime(compute.remainingActualSecondsBySize[code] ?? 0)} included left`)}</span>` : ''}</span></label>`;
     }).join('')}</div>
         ${! selectable ? `<p data-role="size-locked">${plan.family !== 'free' && actions.upgrade ? `Upgrade to Compute for 4 or 8 vCPU ${actionHtml('upgrade', 'Upgrade to Compute')}` : 'Included computer size.'}</p>` : ''}
         <p data-role="size-status" aria-live="polite"></p></fieldset>`;
