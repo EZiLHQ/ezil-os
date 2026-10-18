@@ -73,7 +73,7 @@
 
 import { describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { TMUX_KEEPALIVE_MAX_MS, TMUX_SESSIONS_PROBE_COMMAND } from './tmux-keepalive';
+import { TERMINAL_KEEPALIVE_MAX_MS, TERMINAL_WORK_PROBE_COMMAND } from './terminal-keepalive';
 
 // Must be registered before `./index.ts` is imported — see `route-auth.test.ts`.
 mock.module('cloudflare:workers', () => ({
@@ -120,7 +120,9 @@ interface FakeOptions {
   execThrows?: boolean;
   /** Sessions the tmux probe reports (default 0, i.e. no tmux server). */
   tmuxSessions?: number;
-  /** Make only the tmux probe's `exec` reject. */
+  /** Code/desktop terminals the probe reports as running a foreground job (default 0). */
+  terminalJobs?: number;
+  /** Make only the terminal-work probe's `exec` reject. */
   tmuxProbeThrows?: boolean;
   /** Files the container reports under the mount path. */
   files?: Array<{ name: string; size: number; modifiedAt: string }>;
@@ -232,9 +234,9 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
         }
         return { exitCode: 0, stdout: '' };
       }
-      if (command === TMUX_SESSIONS_PROBE_COMMAND) {
+      if (command === TERMINAL_WORK_PROBE_COMMAND) {
         if (opts.execThrows || opts.tmuxProbeThrows) throw new Error('container gone');
-        return { exitCode: 0, stdout: `${opts.tmuxSessions ?? 0}\n` };
+        return { exitCode: 0, stdout: `${opts.tmuxSessions ?? 0} ${opts.terminalJobs ?? 0}\n` };
       }
       if (opts.execThrows) throw new Error('container gone');
       return { exitCode: 0, stdout: opts.loadavg ?? '0.00 0.01 0.05 1/123 456\n' };
@@ -669,7 +671,7 @@ describe('preserved invariant: final flush before stop, and stop only if it work
     // the surviving reschedule below is the idle-retry path rather than the
     // wrapper swallowing an early throw.
     expect(fake.calls.execs.filter(c => !c.startsWith('python3 ') && !c.startsWith('bash /usr/local/bin/editor-state.sh')
-      && c !== TMUX_SESSIONS_PROBE_COMMAND).length).toBe(1);
+      && c !== TERMINAL_WORK_PROBE_COMMAND).length).toBe(1);
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });
@@ -695,10 +697,10 @@ describe('preserved invariant: final flush before stop, and stop only if it work
   });
 });
 
-describe('🔴 SIGNAL C: live tmux sessions hold the idle stop, bounded', () => {
+describe('🔴 SIGNAL C: terminal work (tmux sessions, running terminal jobs) holds the idle stop, bounded', () => {
   const idleFor = (ms: number) => hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() - ms });
   const files = [{ name: 'a.ts', size: 5, modifiedAt: '2026-08-01T00:00:00.000Z' }];
-  const probes = (fake: FakeDO) => fake.calls.execs.filter((c) => c === TMUX_SESSIONS_PROBE_COMMAND).length;
+  const probes = (fake: FakeDO) => fake.calls.execs.filter((c) => c === TERMINAL_WORK_PROBE_COMMAND).length;
 
   it('🔴 idle, quiet, one tmux session: not stopped, still checkpointed, rescheduled', async () => {
     const fake = await makeFake({ storage: idleFor(2 * IDLE_STOP_MS), tmuxSessions: 1, files });
@@ -725,7 +727,7 @@ describe('🔴 SIGNAL C: live tmux sessions hold the idle stop, bounded', () => 
   });
 
   it('the hold ends at the cap: past eight hours the ordinary final flush and stop apply', async () => {
-    const fake = await makeFake({ storage: idleFor(TMUX_KEEPALIVE_MAX_MS + 60_000), tmuxSessions: 1, files });
+    const fake = await makeFake({ storage: idleFor(TERMINAL_KEEPALIVE_MAX_MS + 60_000), tmuxSessions: 1, files });
 
     await runAlarmCycle(fake);
 
@@ -758,6 +760,16 @@ describe('🔴 SIGNAL C: live tmux sessions hold the idle stop, bounded', () => 
     await runAlarmCycle(fake);
 
     expect(fake.calls.stops).toBe(0);
+  });
+
+  it('🔴 a plain Code terminal running a job (no tmux) holds the stop too', async () => {
+    const fake = await makeFake({ storage: idleFor(30 * 60_000 + 5_000), terminalJobs: 1 });
+
+    await runAlarmCycle(fake);
+
+    expect(probes(fake)).toBe(1);
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.scheduled).toHaveLength(1);
   });
 
   it('a present user costs nothing: no tmux probe while activity is fresh', async () => {

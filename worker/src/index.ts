@@ -66,7 +66,7 @@ import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOri
 import { awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
-import { TMUX_SESSIONS_PROBE_COMMAND, tmuxKeepAliveFromProbe } from './tmux-keepalive';
+import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
 // `type Sandbox` import above stays untouched — every existing `Sandbox<unknown>`
@@ -2842,7 +2842,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // `too_large` stays too large until the user deletes something, so it
       // waits out the interval too. Re-walking up to 512 MiB on every 10-60 s
       // cycle was already waste for a present user; SIGNAL C's hold
-      // (./tmux-keepalive.ts) can stretch it over hours with nobody there.
+      // (./terminal-keepalive.ts) can stretch it over hours with nobody there.
       // Final checkpoints ignore this clock.
       if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy'
         || system.skippedReason === 'too_large') {
@@ -3079,16 +3079,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const clocks = await this.activityClocks();
     const lastActivityAt = clocks.effective;
     const now = Date.now();
-    // 🔴 SIGNAL C (./tmux-keepalive.ts) — live tmux sessions hold an otherwise-due
-    // stop, bounded by `TMUX_KEEPALIVE_MAX_MS`. A held cycle is not the busy path's bare
-    // reschedule: it falls through to the routine checkpoint below, so files
-    // keep being saved while the computer stays up for those sessions.
-    const tmuxHold = isIdleStopDue({ lastActivityAt, now })
-      ? await this.probeTmuxKeepAlive(now - lastActivityAt)
+    // 🔴 SIGNAL C (./terminal-keepalive.ts) — tmux sessions and terminals running a
+    // foreground job hold an otherwise-due stop, bounded by `TERMINAL_KEEPALIVE_MAX_MS`.
+    // A held cycle is not the busy path's bare reschedule: it falls through to the
+    // routine checkpoint below, so files keep being saved while the computer stays up.
+    const terminalHold = isIdleStopDue({ lastActivityAt, now })
+      ? await this.probeTerminalKeepAlive(now - lastActivityAt)
       : null;
-    if (tmuxHold?.keepAlive) {
+    if (terminalHold?.keepAlive) {
       bootLog('workspace_flush', 'start', {
-        detail: `idle_hold_tmux,${tmuxHold.detail},idleMs=${now - lastActivityAt}`,
+        detail: `idle_hold_terminal,${terminalHold.detail},idleMs=${now - lastActivityAt}`,
       });
     } else if (isIdleStopDue({ lastActivityAt, now })) {
       // 🔴 SIGNAL B — "no work" is the OTHER half of the owner requirement.
@@ -3149,7 +3149,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         }
         bootLog('workspace_flush', 'end', {
           status: 'ok',
-          detail: `idle_stop,${busy.detail},${tmuxHold?.detail ?? 'tmuxSessions=unprobed'},idleMs=${now - lastActivityAt}`,
+          detail: `idle_stop,${busy.detail},${terminalHold?.detail ?? 'terminalWork=unprobed'},idleMs=${now - lastActivityAt}`,
         });
         // A NEW, separate state from `WORKSPACE_TERMINATED_KEY` — deliberately
         // NOT written here. See that key's doc comment: the next
@@ -3465,24 +3465,25 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
 
   /**
-   * SIGNAL C's I/O half (see ./tmux-keepalive.ts). Called only from
+   * SIGNAL C's I/O half (see ./terminal-keepalive.ts). Called only from
    * the idle branch after `containerIsRunning()`, so it cannot start a
    * container. An exec error becomes `null`, which means NO hold.
    */
-  private async probeTmuxKeepAlive(idleMs: number): Promise<{ keepAlive: boolean; detail: string }> {
+  private async probeTerminalKeepAlive(idleMs: number): Promise<{ keepAlive: boolean; detail: string }> {
     let probe: { exitCode: number; stdout: string } | null = null;
     try {
-      const res = await this.exec(TMUX_SESSIONS_PROBE_COMMAND, { origin: 'internal' });
+      const res = await this.exec(TERMINAL_WORK_PROBE_COMMAND, { origin: 'internal' });
       probe = { exitCode: res.exitCode, stdout: res.stdout ?? '' };
     } catch (err) {
       console.error(
-        `[ezil-boot] phase=workspace_flush event=tmux_probe_failed error=workspace_operation_failed`,
+        `[ezil-boot] phase=workspace_flush event=terminal_probe_failed error=workspace_operation_failed`,
       );
     }
-    const verdict = tmuxKeepAliveFromProbe({ probe, idleMs });
+    const verdict = terminalKeepAliveFromProbe({ probe, idleMs });
+    const work = verdict.work === null ? 'unknown' : `${verdict.work.tmuxSessions}/${verdict.work.runningTerminalJobs}`;
     return {
       keepAlive: verdict.keepAlive,
-      detail: `tmuxSessions=${verdict.sessions === null ? 'unknown' : verdict.sessions},tmuxReason=${verdict.reason}`,
+      detail: `tmuxSessions/terminalJobs=${work},terminalReason=${verdict.reason}`,
     };
   }
 

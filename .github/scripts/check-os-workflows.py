@@ -153,7 +153,7 @@ assert any('test-editor-state-linux.sh' in step.get('run', '') for step in workf
 for name in ('Test the returned production URL', 'Test the canonical production URL'):
     assert 'prod-lifecycle' in production[positions[name]]['run']
 assert 'Hosted production persistence verification' in positions
-assert production[positions['Hosted production persistence verification']]['env']['EZIL_E2E_APP'] == 'https://os.ezil.org'
+assert production[positions['Hosted production persistence verification']]['env']['EZIL_E2E_APP'] == 'https://os.ezil.work'
 assert production[positions['Hosted production persistence verification']]['env']['EZIL_CONTINUITY_IDENTITY_APP'] == '${{ steps.app.outputs.url }}'
 production_config = production[positions['Validate production configuration']]
 for key in ('EZIL_E2E_COMPUTER_ID', 'EZIL_E2E_WORKSPACE_PATH', 'EZIL_E2E_R2_BUCKET', 'EZIL_E2E_R2_PREFIX'):

@@ -3,7 +3,7 @@
  * The EZiL OS invite CLI — the only sanctioned way to write `ezil_os_access`.
  *
  * 🔴 THE APP NO LONGER ENFORCES THIS LIST. Anyone can sign up with Google at
- * os.ezil.org. `add` is still how to create an email/password account (it sends
+ * os.ezil.work. `add` is still how to create an email/password account (it sends
  * a Supabase invite that lands on `/auth/invited`), and the table still records
  * who was invited; `revoke` no longer keeps anyone out. Wherever the text below
  * says the gate "refuses" or "turns away", that describes the removed gate.
@@ -220,7 +220,7 @@ Environment (read by name; never printed)
                               unless --no-invite. NEXT_PUBLIC_SUPABASE_URL is
                               accepted as a fallback.
   EZIL_OS_ORIGIN              invite redirect target; default
-                              https://os.ezil.org
+                              https://os.ezil.work
                               (the link lands on <origin>/auth/invited, which
                               must be in the project's Redirect URLs list).
 
@@ -339,7 +339,7 @@ const sendInvite = async (email: string): Promise<void> => {
 		);
 	}
 
-	const origin = (process.env.EZIL_OS_ORIGIN ?? 'https://os.ezil.org').replace(/\/+$/, '');
+	const origin = (process.env.EZIL_OS_ORIGIN ?? 'https://os.ezil.work').replace(/\/+$/, '');
 	// 🔴 `/auth/invited`, NOT `/auth/callback`. See this file's header: an
 	// invite is not a PKCE flow, so the verify redirect carries the session in
 	// the URL fragment and `/auth/callback` (a server handler reading `?code=`)

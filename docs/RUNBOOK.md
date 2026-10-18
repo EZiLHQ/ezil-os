@@ -1,7 +1,8 @@
 # Operating EZiL-OS — the runbook
 
 **Status: deployed and live**, not a pre-launch plan. App at
-`https://os.ezil.org` (Vercel; legacy alias `ezil-os.vercel.app`), Worker at `api-desktop.ezil.org`
+`https://os.ezil.work` (Vercel project `ezil-os-preview`, team ezil1; production
+alias `ezil-os-preview-ezil1.vercel.app`), Worker at `api-desktop.ezil.org`
 (Cloudflare), container image **v8**. OBSERVED this session: an
 unauthenticated request to the app root gets a real `307 -> /login` from a
 live Vercel deployment (`curl -sD- https://ezil-os.vercel.app/`); the Worker
@@ -25,6 +26,13 @@ system, which is out of scope for a docs-only pass.
 ---
 
 ## What is live (as of 2026-10-01)
+
+> **2026-10-18:** production moved to `https://os.ezil.work`, which is the
+> canonical origin in `.github/scripts/release-state.mjs` and in every
+> production E2E step. `os.ezil.org` serves the `ezil-os-landing` Worker. The
+> notes below about `os.ezil.org` and the `ezil-os` project describe the
+> earlier setup. CI needs `VERCEL_ORG_ID`/`VERCEL_PROJECT_ID` for that project
+> and a `VERCEL_TOKEN` scoped to team ezil1.
 
 - **App**: Vercel project `ezil-os`, canonical at `https://os.ezil.org`.
   - The host is a Vercel project domain behind a **DNS-only** (grey-cloud)
