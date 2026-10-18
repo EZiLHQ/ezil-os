@@ -20,6 +20,27 @@ type Interval = {
 
 /** Match the database's unique keys so replay tests exercise persisted effects. */
 class MemoryStore implements BillingStore {
+    // v2 is exercised by the real-Postgres store suite.
+    grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
+    openEpoch: BillingStore['openEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    closeEpoch: BillingStore['closeEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    epochsFor: BillingStore['epochsFor'] = async () => { throw new Error('Unused v2 store stub'); };
+    recordConsent: BillingStore['recordConsent'] = async () => { throw new Error('Unused v2 store stub'); };
+    latestConsent: BillingStore['latestConsent'] = async () => { throw new Error('Unused v2 store stub'); };
+    upsertOverageInvoice: BillingStore['upsertOverageInvoice'] = async () => { throw new Error('Unused v2 store stub'); };
+    attachOverageStripeInvoice: BillingStore['attachOverageStripeInvoice'] = async () => { throw new Error('Unused v2 store stub'); };
+    setOverageInvoiceStatus: BillingStore['setOverageInvoiceStatus'] = async () => { throw new Error('Unused v2 store stub'); };
+    overageInvoiceByStripeId: BillingStore['overageInvoiceByStripeId'] = async () => { throw new Error('Unused v2 store stub'); };
+    overageInvoicesFor: BillingStore['overageInvoicesFor'] = async () => { throw new Error('Unused v2 store stub'); };
+    recordPlanChange: BillingStore['recordPlanChange'] = async () => { throw new Error('Unused v2 store stub'); };
+    setPlanChangeState: BillingStore['setPlanChangeState'] = async () => { throw new Error('Unused v2 store stub'); };
+    openPlanChanges: BillingStore['openPlanChanges'] = async () => { throw new Error('Unused v2 store stub'); };
+    recordPaymentIssue: BillingStore['recordPaymentIssue'] = async () => { throw new Error('Unused v2 store stub'); };
+    resolvePaymentIssue: BillingStore['resolvePaymentIssue'] = async () => { throw new Error('Unused v2 store stub'); };
+    openPaymentIssues: BillingStore['openPaymentIssues'] = async () => { throw new Error('Unused v2 store stub'); };
+    setSizePreference: BillingStore['setSizePreference'] = async () => { throw new Error('Unused v2 store stub'); };
+    sizePreference: BillingStore['sizePreference'] = async () => { throw new Error('Unused v2 store stub'); };
+    userCreatedAt: BillingStore['userCreatedAt'] = async () => { throw new Error('Unused v2 store stub'); };
     customers = new Map<string, string>([['cus_local', 'user_local']]);
     computers = new Map<string, string>([['computer_local', 'user_local']]);
     subscriptions = new Map<string, SubscriptionUpsert>();
@@ -81,7 +102,7 @@ class MemoryStore implements BillingStore {
     async insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'> {
         const key = [grant.sourceType, grant.sourceId, grant.meter, grant.kind].join(':');
         if (this.grants.has(key)) return 'duplicate';
-        this.grants.set(key, { ...grant, id: key, createdAt: now });
+        this.grants.set(key, { ...grant, subscriptionId: grant.subscriptionId ?? null, id: key, createdAt: now });
         this.writes.push(key);
         return 'inserted';
     }
