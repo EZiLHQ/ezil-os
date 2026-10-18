@@ -4,6 +4,17 @@ export interface RelayState { runtimeId: string; expiresAt: number }
 export type RelayResult = ({ ok: true } & RelayState) | { ok: false; error: string; status: number };
 // Keep queue time and TCP work within the existing 30-second forwarding budget.
 export const RELAY_OPERATION_DEADLINE_MS = 27_000;
+/**
+ * The desktop (neko/relay.go `validateRelayRequest`) refuses an expiry more than 30 min
+ * ahead of ITS clock, and the TTL is capped at exactly 30 min. Asking for the full
+ * lifetime therefore failed with 400 whenever the container clock lagged the Worker's,
+ * and a computer kept up past its first relay lifetime could never be reopened. Claim
+ * one minute less: the credentials stay valid for the full TTL, renewal just comes earlier.
+ */
+export const RELAY_CLOCK_MARGIN_MS = 60_000;
+export function relayExpiryFor(issuedAt: number, ttlSeconds: number): number {
+  return issuedAt + ttlSeconds * 1000 - RELAY_CLOCK_MARGIN_MS;
+}
 export function remainingRelayBudget(requestedAt: number, now = Date.now()): number {
   const remaining = RELAY_OPERATION_DEADLINE_MS - (now - requestedAt);
   if (remaining <= 0) throw new RelayFailure('relay_busy', 409);
@@ -65,6 +76,9 @@ export async function relayOperation(container: RelayContainer, admin: string, p
     frontend: JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_FRONTEND!),
     backend: JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_BACKEND!),
   }) });
+  // The desktop's status is the only clue to which of its checks refused (400 lifetime or
+  // servers, 500 renegotiation); without it every refusal reads as relay_refresh_failed.
+  if (!refreshed.ok) console.error(`[ezil-boot] phase=relay_refresh event=post_rejected status=${refreshed.status}`);
   if (!refreshed.ok) throw new RelayFailure(refreshed.status === 409 ? 'relay_runtime_changed' : refreshed.status === 422 ? 'relay_negotiation_busy' : 'relay_refresh_failed', [409,422].includes(refreshed.status) ? 409 : 502);
   const applied = readRelayState(await refreshed.json());
   if (applied.runtimeId !== current.runtimeId || applied.expiresAt < minted.expiresAt) throw new RelayFailure('relay_refresh_unconfirmed');
