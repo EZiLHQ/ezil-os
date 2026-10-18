@@ -192,8 +192,9 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
             const delivery = event(type, { id: a.subscriptionId }, END);
             expect((await deliver(delivery)).outcome).toBe('applied');
             expect(await store.openPlanChanges(a.userId)).toEqual([]);
-            expect(await client`select state, effective_at from ezil_billing_plan_changes where user_id = ${a.userId}::uuid`)
-                .toEqual([expect.objectContaining({ state: 'applied', effective_at: END })]);
+            const changes = await client`select state, effective_at from ezil_billing_plan_changes where user_id = ${a.userId}::uuid`;
+            expect(changes).toEqual([expect.objectContaining({ state: 'applied' })]);
+            expect(new Date(changes[0].effective_at).getTime()).toBe(END.getTime());
             await deliver({ ...delivery, id: `evt_${randomUUID()}` });
             expect(await store.openPlanChanges(a.userId)).toEqual([]);
         });
