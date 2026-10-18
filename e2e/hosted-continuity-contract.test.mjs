@@ -19,7 +19,7 @@ test('stale recovery uses an authorized runtime stop and still requires real 410
 test('missing isolated computer exits nonzero and names the prerequisite before cloud access',()=>{
     const directory=mkdtempSync(join(tmpdir(),'ezil-missing-prerequisite-'));
     try {
-        const env={...process.env,EZIL_E2E_APP:'https://os.ezil.org',EZIL_CONTINUITY_MODE:'short'};
+        const env={...process.env,EZIL_E2E_APP:'https://os.ezil.work',EZIL_CONTINUITY_MODE:'short'};
         delete env.EZIL_E2E_COMPUTER_ID;
         const result=spawnSync(process.execPath,[fileURLToPath(new URL('./hosted-continuity.mjs',import.meta.url))],{
             cwd:directory,env,encoding:'utf8',timeout:10000,

@@ -716,7 +716,7 @@ jobs:
       - name: Hosted production persistence verification
         timeout-minutes: 25
         env:
-          EZIL_E2E_APP: https://os.ezil.org
+          EZIL_E2E_APP: https://os.ezil.work
           EZIL_CONTINUITY_IDENTITY_APP: ${{ steps.app.outputs.url }}
           EZIL_CONTINUITY_MODE: essential
           EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
@@ -747,7 +747,7 @@ jobs:
       - name: Test the canonical production URL
         timeout-minutes: 22
         env:
-          EZIL_E2E_APP: https://os.ezil.org
+          EZIL_E2E_APP: https://os.ezil.work
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
@@ -833,7 +833,7 @@ jobs:
         if: always() && steps.production_lease.outcome == 'success'
         timeout-minutes: 7
         env:
-          EZIL_E2E_APP: https://os.ezil.org
+          EZIL_E2E_APP: https://os.ezil.work
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
