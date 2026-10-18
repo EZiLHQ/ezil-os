@@ -634,7 +634,7 @@
     background: var(--surface);
 }
 
-.ezil-billing-plan.is-pro { border-color: var(--accent); }
+.ezil-billing-plan[data-family="compute"] { border-color: var(--accent); }
 .ezil-billing-plan p { margin: 8px 0 0; }
 .ezil-billing-plan-heading h4 { margin: 0; font-size: 16px; color: var(--text); text-transform: none; letter-spacing: normal; }
 .ezil-billing-price { margin-left: auto; font-size: 20px; font-weight: 600; line-height: 28px; }
@@ -651,7 +651,7 @@
     min-width: 0;
     padding: 16px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 12px;
     background: var(--surface-2);
 }
 
@@ -690,8 +690,42 @@
 .ezil-billing-nudge p { flex: 1 1 180px; margin: 0; }
 .ezil-billing-actions,
 .ezil-billing-footer { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
-.ezil-billing-pack { display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 0; }
-.ezil-billing-pack select { width: 100%; min-width: 0; padding: 8px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; font: inherit; }
+.ezil-billing-payment { margin-bottom: 16px; }
+.ezil-billing-payment p { margin: 0 0 12px; }
+.ezil-billing-payment.is-warn { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, var(--surface)); }
+.ezil-billing-payment.is-danger { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
+.ezil-billing-warning { color: var(--warn); }
+.ezil-billing-picker,
+.ezil-billing-sizes,
+.ezil-billing-overage,
+.ezil-billing-estimate,
+.ezil-billing-session,
+.ezil-billing-meter[data-meter="compute"] { margin: 16px 0 0; }
+.ezil-billing-offers,
+.ezil-billing-size-options { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.ezil-billing-offers .ezil-billing-card { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+.ezil-billing-offers p { margin: 0; }
+.ezil-billing-offers button { margin-top: auto; }
+.ezil-billing-offers h4 { color: var(--text); font-size: 16px; text-transform: none; letter-spacing: normal; }
+.ezil-billing-sizes legend { padding: 0 6px; font-weight: 600; }
+.ezil-billing-size { display: flex; align-items: flex-start; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.ezil-billing-size:has(input:checked) { border-color: var(--accent); }
+.ezil-billing-size input { accent-color: var(--accent); flex-shrink: 0; margin: 3px 0; }
+.ezil-billing-size > span { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ezil-billing-size > span > span { color: var(--muted); font-size: 12px; }
+.ezil-settings-billing button { max-width: 100%; white-space: normal; border-radius: 8px; }
+.ezil-settings-billing :is(button, input):disabled { cursor: default; opacity: .6; }
+.ezil-settings-billing [data-role="size-hours"] ul { padding-left: 20px; margin: 8px 0; }
+.ezil-settings-billing [data-role="size-status"]:empty { margin: 0; }
+.ezil-billing-price,
+.ezil-billing-offer-price,
+.ezil-billing-usage,
+.ezil-billing-invoice,
+.ezil-billing-estimate,
+.ezil-billing-overage,
+.ezil-billing-size,
+.ezil-settings-billing [data-role="size-hours"],
+.ezil-settings-billing [data-role="session-countdown"] { font-variant-numeric: tabular-nums; }
 .ezil-settings-billing .ezil-settings-error { flex-wrap: wrap; }
 .ezil-billing-action-error { color: var(--danger); }
 .ezil-billing-action-error:empty { display: none; }
@@ -707,11 +741,13 @@
 .ezil-billing-skeleton span:nth-child(2) { height: 32px; width: 90%; }
 
 @container ezil-settings-window (min-width: 640px) {
-    .ezil-billing-meters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .ezil-billing-meters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @container (min-width: 640px) {
-    .ezil-billing-invoice { grid-template-columns: 96px minmax(0, 1fr) auto auto auto; align-items: baseline; }
+    .ezil-billing-offers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ezil-billing-size-options { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .ezil-billing-invoice { grid-template-columns: 96px minmax(0, 1fr) auto auto auto auto; align-items: baseline; }
 }
 
 /* A narrow Settings window keeps every tab reachable without stealing most
