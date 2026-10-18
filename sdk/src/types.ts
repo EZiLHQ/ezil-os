@@ -24,6 +24,22 @@ export interface Computer {
     metadata: unknown;
 }
 
+/** Recorded compute state returned by `computer.computePlacement` for a placed computer. */
+export type ComputePlacementState =
+    | 'PROVISIONING' | 'STOPPED' | 'LEASED' | 'STARTING' | 'MOUNTING' | 'RUNNING'
+    | 'DRAINING' | 'STOPPING' | 'UNCONFIRMED' | 'RECOVERING'
+    | 'RETIRING' | 'RETIRED' | 'PURGE_ELIGIBLE' | 'WARMING' | 'READY' | 'CLAIMED';
+
+/**
+ * A read-only observation of a computer's recorded provider placement.
+ * Unplaced and unavailable are distinct; neither implies a Cloudflare default.
+ * No store, infrastructure identifiers, or internal error details are exposed.
+ */
+export type ComputePlacement =
+    | { status: 'unavailable' | 'unplaced'; provider: null; region: null; state: null; fallback: false; awsRequired: boolean }
+    | { status: 'placed'; provider: 'cloudflare'; region: null; state: ComputePlacementState; fallback: boolean; awsRequired: boolean }
+    | { status: 'placed'; provider: 'aws-ec2'; region: string | null; state: ComputePlacementState; fallback: false; awsRequired: boolean };
+
 /** Result of `desktop.status` — a cheap poll that never boots anything. */
 export interface DesktopStatus {
     ok: boolean;

@@ -19,7 +19,7 @@ mock.module('cloudflare:workers', () => ({
 import vectors from './aws-gateway.vectors.json';
 import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-origin';
 import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
-import { deriveNekoCredentials, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { deriveNekoCredentials, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 import { sha256Hex } from './aws-ice';
 
 const worker = (await import('./index')).default;
@@ -187,6 +187,9 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     const b = await worker.fetch(new Request(boot.toString()), e);
     expect(b.status).toBe(302);
     const cookie = b.headers.get('set-cookie')!.split(';')[0]!;
+    const codeBoot = await worker.fetch(new Request(pv.codePreviewUrl!), e);
+    expect(codeBoot.status).toBe(302);
+    const codeCookie = codeBoot.headers.get('set-cookie')!.split(';')[0]!;
 
     const seen: Array<{ url: string; headers: Headers }> = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -208,7 +211,7 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     const codeHost = `aws-8443-${SID}-aws.ezil.work`;
     for (const upgrade of [false, true]) {
       const headers = new Headers({
-        cookie, origin: `https://${codeHost}`, host: 'evil.example',
+        cookie: codeCookie, origin: `https://${codeHost}`, host: 'evil.example',
         'x-forwarded-host': 'evil.example, other.example', 'x-forwarded-proto': 'http',
         forwarded: 'host=evil.example;proto=http',
       });
@@ -243,10 +246,14 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
       const e = env({ AWS_ROUTING_ENABLED: '1' }, tunnelFetch, () => now);
       expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
       const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
-      expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+      const preview = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+      expect(preview.status).toBe(200);
+      const previewUrls = (await preview.json()) as { codePreviewUrl: string };
+      const bootstrap = await worker.fetch(new Request(previewUrls.codePreviewUrl), e);
+      expect(bootstrap.status).toBe(302);
       expect(host.bad).toEqual([]);
       expect(checks).toBe(1);
-      const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+      const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]!;
       let forwarded = 0;
       globalThis.fetch = (async () => { forwarded++; return new Response('origin'); }) as typeof fetch;
       origins = ['13.200.1.2', '203.0.113.9'];

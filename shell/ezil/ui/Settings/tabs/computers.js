@@ -47,6 +47,7 @@ let loading = false;
 let loadError = null;
 let editingId = null;
 let busyId = null; // a switch/delete in flight for this computer id
+let loadGeneration = 0;
 
 const DESKTOP_SELECTOR = '.window[data-app="desktop"]';
 
@@ -298,6 +299,17 @@ async function closeSandboxWindows (id) {
     if ( openDesktopComputerId() === null ) activeComputerId = null;
 }
 
+function computeLabel (info) {
+    if (info?.status === 'placed' && info.provider === 'aws-ec2') {
+        return `AWS${info.region ? ` · ${info.region}` : ''}`;
+    }
+    if (info?.status === 'placed' && info.provider === 'cloudflare') {
+        return `Cloudflare · ${info.fallback === true ? 'AWS fallback' : 'Existing placement'}`;
+    }
+    if (info?.status === 'unplaced') return `Unplaced · ${info.awsRequired ? 'AWS required' : 'Provider selected on first start'}`;
+    return 'Compute provider unavailable';
+}
+
 function rowHtml (slot, computer) {
     if ( ! computer ) {
         return `
@@ -344,6 +356,7 @@ function rowHtml (slot, computer) {
             <span class="ezil-settings-row-slot">${slot}</span>
             <div class="ezil-settings-row-meta">
                 <div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
+                ${isNative() ? '' : `<div class="ezil-settings-row-sub" data-role="compute-provider">${html_encode(computeLabel(computer.compute))}</div>`}
                 <div class="ezil-settings-row-sub">${isNative() ? (computer.available === false ? 'Folder unavailable — locate it to continue' : computer.kind === 'attached' ? 'Original folder · edits stay in place' : 'EZiL-managed project') : (isActive ? (desktopClosed ? 'Your current computer' : 'Active now') : (when ? `Active ${when}` : 'Never opened'))}</div>
             </div>
             <div class="ezil-settings-row-actions">
@@ -391,10 +404,12 @@ function render ($win) {
 }
 
 async function load ($win) {
+    const generation = ++loadGeneration;
     loading = true;
     loadError = null;
     render($win);
     const res = await trpc.query('computer.list');
+    if (generation !== loadGeneration) return;
     loading = false;
     if ( ! res.ok ) {
         loadError = res.code === 'UNAUTHORIZED'
@@ -403,7 +418,13 @@ async function load ($win) {
         render($win);
         return;
     }
-    computers = Array.isArray(res.data) ? res.data : [];
+    const rows = Array.isArray(res.data) ? res.data : [];
+    const withPlacement = isNative() ? rows : await Promise.all(rows.map(async computer => {
+        const observed = await trpc.query('computer.computePlacement', { id: computer.id });
+        return { ...computer, compute: observed.ok ? observed.data : null };
+    }));
+    if (generation !== loadGeneration) return;
+    computers = withPlacement;
     render($win);
 }
 

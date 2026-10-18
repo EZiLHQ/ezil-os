@@ -37,7 +37,7 @@ pre-booted hosts.
 | R8 | Single writer per computer, enforced by compare-and-swap on a generation number under a per-computer advisory lock. EBS single-attach is the physical fence. A reviewed migration-grammar extension adds UNIQUE indexes (required before Stage B). The engine copies in sibling repositories have diverged, so the extension is ported to each one separately with shared test vectors. |
 | R9 | Idle stop may be guest-initiated, but caps are not. Lease renewal comes only from gateway-observed, authenticated user presence. Hour, egress and lease limits are enforced by the control plane: warn, then flush, then stop, regardless of what the guest reports. |
 | R10 | Instance types come from a closed allowlist, chosen by the computer's **tier** (2026-10-14, superseding "no burstable types"): **free** = 2 vCPU / 4 GiB (`t3a.medium`, then `t3.medium`), launched with *standard* CPU credits so it throttles to its baseline instead of billing surplus CPU; **plus** = 2 vCPU / 8 GiB (`m6i.large`). One 4 vCPU / 8 GiB type stays for benchmarks only. The app records the tier's first type at creation (`AWS_TIERS`, app `aws-config.ts`); the region deployment's allowlist must contain it or the intent is refused. |
-| R11 | Volume sizes come from an allowlist or range, with capped online growth. Automation never deletes volumes or snapshots and never force-detaches. Purge is a separate operator action. |
+| R11 | Volume sizes come from an allowlist or range, with capped online growth. Lifecycle automation never deletes retained volumes or force-detaches. Undeleted computers retain their data regardless of inactivity or placement retirement. Scheduled DLM backup rotation stays bounded; it does not delete the data volume. Destructive purge is held pending a separate explicit-deletion policy (§6). |
 | R12 | Hibernation is off. |
 | R13 | Provider and store are chosen **per computer**. No global store flip is used to migrate a subset of computers. An unknown value fails closed. |
 | R14 | No new shell provider tag. A hosted AWS computer presents as a hosted computer. |
@@ -141,7 +141,7 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - First boot: `PROVISIONING → RUNNING`. The infra provision launches and boots the instance, so the user's first open
   goes straight in, and the receipt lands RUNNING. `PROVISIONING → STOPPED` stays for a provision that ends stopped.
 - Failure path: `UNCONFIRMED → RECOVERING → STOPPED`.
-- Retirement: `RUNNING | STOPPED → RETIRING → RETIRED → PURGE_ELIGIBLE`. ONE `computer.delete` is enough: a
+- Retirement: `RUNNING | STOPPED → RETIRING → RETIRED`. Retained-data purge is held (§6). ONE `computer.delete` is enough: a
   RUNNING or STOPPED computer gets the lifecycle `retire` job (a running instance is stopped gracefully first, then
   terminated; the data volume is kept), and once that job — or an already-recorded stop — is on the placement the
   row is soft-deleted. The sandbox-reap cron's AWS job (`runAwsBackgroundReconcile`; it runs concurrently with the
@@ -472,7 +472,10 @@ volume as hostile input.
 |---|---|
 | Placement reads | `EZIL_COMPUTE_PLACEMENT_READS=1` turns on per-computer placement reads. It is **one-way**: once on (or once AWS has been enabled) it must never be turned off, or computers on EBS would start on Cloudflare. Absent means no placement statements at all |
 | AWS enable | `EZIL_AWS_COMPUTERS_ENABLED=1` gates AWS admission and the AWS provider, and implies placement reads. Absent means an `aws-ec2` computer refuses (`aws_disabled`); it never falls back to Cloudflare |
-| Canary cohort | `EZIL_AWS_CANARY_USER_IDS` (comma-separated user UUIDs, or exactly `*` for every signed-in user) and `EZIL_AWS_CANARY_SINCE` (ISO-8601 instant with an explicit zone). With AWS enabled, a computer with **no placement row** goes to AWS only when its user is listed and its `ezil_computers.created_at` is at or after SINCE; older computers stay on Cloudflare because they may hold an R2 workspace. Even then it goes to AWS only if a read-only admission pre-check (same rules as admission: capacity, one AWS computer per user, monthly caps, kill switch) would admit it; otherwise it stays on Cloudflare. Any malformed value (including `*` beside ids) means no cohort. A rollout gate, not a security boundary: ownership stays `owner_user_id` |
+| AWS preference and cohort | With AWS enabled, an unset `EZIL_AWS_CANARY_USER_IDS` means all new builders; an explicit comma-separated UUID list or `*` remains an intentional rollout gate. `EZIL_AWS_CANARY_SINCE` must be a valid timestamp with a zone. Existing pins always win. Unplaced pre-cutoff computers stay Cloudflare to protect possible old data; post-cutoff computers prefer AWS. Missing/invalid config or placement reads/writer refuse startup rather than creating an unsafe unpinned computer. No hosted flags are changed by the local implementation. |
+| Founder requirement | `1ae9b1fd-880b-42ac-aebe-433b3c0ba11f` is always AWS-required for new computers. `EZIL_AWS_REQUIRED_USER_IDS` adds requirements but cannot remove the founder. Malformed additions refuse unplaced starts. Existing Cloudflare pins retain their data and provider; migration is separate. |
+| Builder fallback | Only explicit admission refusals for capacity, one-AWS-computer limit, hour/egress caps or kill switch permit Cloudflare fallback. Every simultaneous refusal must be allowed; config, database, ownership and integrity failures never fall back. New fallback pins record their cause in existing placement metadata. A race won by another placement reuses that winner; it does not overwrite the pin. |
+| Settings provider | Authenticated `computer.computePlacement({id})` checks the live computer owner and recorded placement owner; it returns actual provider, region, state, fallback flag and AWS requirement. No admission/start/pin occurs. Missing placement is Unplaced; disabled reads/errors are unavailable. Historical CF pins are labeled Existing placement, not assigned an invented fallback cause. |
 | Browser zone | `EZIL_AWS_BROWSER_ZONE`: the zone the Worker serves AWS browser hosts on (`aws-<port>-<sandboxId>-aws.<zone>`, e.g. `ezil.org`); lower-case DNS name, at least two labels, no trailing dot. Enrollment returns it with the routable sandbox id (`guac-<user>-<computer>`) and the host's edge trusts `x-forwarded-host` only for those hosts. Unset or malformed: enrollment answers 503 `enroll_unavailable` before the nonce is touched. It is also the ONLY zone the app's AWS preview handoff accepts (never derived from the Worker's host name: staging `api-desktop-staging.ezil.work` → `ezil.work`, production `api-desktop.ezil.org` → `ezil.org`), and the frame confirmation accepts AWS hosts on it; unset or malformed, every AWS preview answers `aws_preview_unavailable` |
 | Running computers | `AWS_MAX_RUNNING`; pilot value 2 (all regions together) |
 | Running per region | `EZIL_AWS_MAX_RUNNING_<REGION>` (e.g. `_AP_SOUTH_1`) for each region in `AWS_REGIONS`; required, no default. Set it from the region's **verified** Running On-Demand Standard vCPU quota minus every other workload in that quota, divided by 2 vCPU. Admission counts running-class rows per region under the admission lock. A region with no rows counts 0, and a running row without a region counts against every region |
@@ -568,11 +571,24 @@ The app calls AWS only through `app/src/server/lib/compute/aws-clients.ts`:
 
 ## 6. Retention, cancellation, rollback
 
-- **Cancellation** stops compute immediately. Encrypted volumes and snapshots stay
-  recoverable for **14 days**, with residual storage cost disclosed. After that a computer
-  becomes `PURGE_ELIGIBLE`.
-- **Purge tooling** ships as eligibility listing plus dry-run only.
-- **Rollback window** is 14 days after migration. The rules in C-7 apply.
+- **Undeleted computers retain data.** Inactivity, compute stop, subscription cancellation,
+  failed provisioning and placement `RETIRED` state do not authorize purging retained data.
+  Cancellation may stop compute; it does not mean the computer was explicitly deleted.
+- **Deletion policy is held.** The former 14-day retirement/cancellation eligibility rule
+  is removed. `retention.ts` returns no purge candidates, including in dry runs, until
+  explicit deletion evidence and a separate post-deletion policy are approved. No purge
+  executor is introduced. Releasing a placement proved to have no retained resources
+  remains distinct from purging retained data.
+- **Storage costs remain bounded and visible.** Existing volume-size, admission and budget
+  controls remain; retained disks incur storage charges. DLM may rotate older backups
+  under its existing schedule while the computer's data volume remains intact.
+- **Migration is deferred.** Existing Cloudflare computers stay pinned and accessible.
+  Any future Cloudflare/AWS cutover must verify a complete export before swapping,
+  fence concurrent writers and preserve new AWS writes on rollback (C-7). A stop that
+  reports `systemChangesNotSaved` cannot serve as a successful migration checkpoint.
+- **Local software rollback** retains placement reads, provider pins and data volumes.
+  An image change needs a verified snapshot and compatible rebase; never format a
+  retained volume or reopen a stale provider copy as a rollback shortcut.
 
 ## 7. Acceptance before enabling
 

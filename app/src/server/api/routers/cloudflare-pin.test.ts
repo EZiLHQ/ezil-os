@@ -2,7 +2,7 @@
  * Codex PR #200 (4277908733): a computer that already ran on Cloudflare keeps its workspace
  * in R2, so it must never be reassigned to AWS by the canary (an empty EBS volume would make
  * the workspace look lost). With placement reads on, every procedure that STARTS a sandbox
- * records a `cloudflare` placement row BEFORE the sandbox starts; the canary only ever
+ * records a `cloudflare` placement row BEFORE an allowed legacy/fallback sandbox start; AWS only ever
  * claims a computer with NO row. Reads and stops never pin.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -73,7 +73,13 @@ const STARTS: [string, (c: ReturnType<typeof harness>['call']) => Promise<unknow
     ['restartDesktop', (c) => c.restartDesktop({ computerId })],
 ];
 
-describe('reads on: a no-row computer is pinned to Cloudflare before its sandbox starts', () => {
+describe('reads on: a pre-cutoff computer is pinned to Cloudflare before its sandbox starts', () => {
+    beforeEach(() => {
+        // The computer predates rollout and may already have an R2 workspace.
+        vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '1');
+        vi.stubEnv('EZIL_AWS_CANARY_USER_IDS', '*');
+        vi.stubEnv('EZIL_AWS_CANARY_SINCE', '2026-10-16T00:00:00Z');
+    });
     it.each(STARTS)('%s writes exactly one cloudflare row owned by the session user, before the start', async (_name, start) => {
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
         const h = harness();
@@ -94,11 +100,12 @@ describe('reads on: a no-row computer is pinned to Cloudflare before its sandbox
         vi.stubEnv('EZIL_AWS_CANARY_USER_IDS', userId);
         vi.stubEnv('EZIL_AWS_CANARY_SINCE', '2026-10-01T00:00:00Z');
         const before = h.atStart.length;
+        const canaryReads = h.fake.statements.filter((s) => s.sql.includes('placement:canary-computer')).length;
         await h.call.previewUrl({ sessionId, computerId }).catch(() => undefined);
         // Served by Cloudflare again (the sandbox start was requested), no second row, no canary read.
         expect(h.atStart.length).toBe(before + 1);
         expect(h.inserts()).toHaveLength(1);
-        expect(h.fake.statements.some((s) => s.sql.includes('placement:canary-computer'))).toBe(false);
+        expect(h.fake.statements.filter((s) => s.sql.includes('placement:canary-computer'))).toHaveLength(canaryReads);
     });
 
     it('a no-row computer the canary claims is NOT pinned to Cloudflare (the canary is checked first)', async () => {
@@ -144,11 +151,26 @@ describe('reads on: a no-row computer is pinned to Cloudflare before its sandbox
     });
 });
 
-describe('reads off: unchanged, no database statement at all', () => {
-    it.each(STARTS)('%s issues no placement statement', async (_name, start) => {
+describe('unsafe unplaced starts fail before any Cloudflare request', () => {
+    it.each(STARTS)('%s refuses when placement reads are off', async (_name, start) => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '0');
+        vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '0');
         const h = harness();
-        await start(h.call).catch(() => undefined);
-        expect(h.atStart.length).toBeGreaterThan(0);
+        await expect(start(h.call)).rejects.toMatchObject({
+            code: 'PRECONDITION_FAILED', message: 'compute_placement_refused:placement_reads_disabled',
+        });
+        expect(h.atStart).toEqual([]);
         expect(h.fake.statements).toEqual([]);
+    });
+
+    it.each(STARTS)('%s refuses when AWS is disabled and no placement exists', async (_name, start) => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '0');
+        const h = harness();
+        await expect(start(h.call)).rejects.toMatchObject({
+            code: 'PRECONDITION_FAILED', message: 'compute_placement_refused:aws_disabled',
+        });
+        expect(h.atStart).toEqual([]);
+        expect(h.inserts()).toEqual([]);
     });
 });
