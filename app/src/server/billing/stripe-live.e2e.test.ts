@@ -87,6 +87,7 @@ describe.skipIf(!enabled)('Stripe test-mode round trip (live, opt-in)', () => {
     const client = createStripeClient({ secretKey: secret });
     const userId = randomUUID();
     const deps: BillingDeps = {
+        usage: null,
         config: { ...readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1' }), stripeSecret: secret, stripeWebhookSecret: WEBHOOK_SECRET },
         store,
         stripe: client,

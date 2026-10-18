@@ -39,6 +39,8 @@ class MemoryStore implements BillingStore {
         this.consents.push(row);
         return row;
     };
+    consentAsOf: BillingStore['consentAsOf'] = async () => { throw new Error('Unused v2 store stub'); };
+    markOverageInvoiceOpen: BillingStore['markOverageInvoiceOpen'] = async () => { throw new Error('Unused v2 store stub'); };
     latestConsent: BillingStore['latestConsent'] = async (userId, subscriptionId) => [...this.consents].reverse()
         .find(row => row.userId === userId && row.subscriptionId === subscriptionId) ?? null;
     upsertOverageInvoice: BillingStore['upsertOverageInvoice'] = async input => {
@@ -1227,5 +1229,40 @@ describe('late usage heartbeat', () => {
         await ingestUsageEvents([usage('start', 150), usage('heartbeat', 180)], { store });
         expect(store.intervals).toHaveLength(2);
         expect(store.intervals[1]).toMatchObject({ endedAt: null, lastSeenAt: new Date(now.getTime() + 180000) });
+    });
+});
+
+describe('scheduled downgrade completion', () => {
+    it.each(['customer.subscription.updated', 'customer.subscription.pending_update_applied'])('applies a matching scheduled downgrade on %s once', async type => {
+        const { store, stripe, deps } = fixture();
+        stripe.subscription.sku = 'standard_monthly_v2';
+        stripe.subscription.currentPeriodStart = periodEnd;
+        await store.recordPlanChange({ userId: 'user_local', subscriptionId: 'sub_local', kind: 'downgrade',
+            fromSku: 'compute_monthly_v2', toSku: 'standard_monthly_v2', state: 'scheduled', stripeScheduleId: 'sched_local',
+            stripeInvoiceId: null, hostedInvoiceUrl: null, effectiveAt: periodEnd, expiresAt: null });
+        const write = vi.spyOn(store, 'setPlanChangeState');
+        await processStripeEvent(event(type, { id: 'sub_local' }), deps);
+        expect(store.planChanges[0]).toMatchObject({ state: 'applied', effectiveAt: periodEnd });
+        expect(store.grants.size).toBe(0);
+        await processStripeEvent(event(type, { id: 'sub_local' }), deps);
+        expect(write.mock.calls.filter(([input]) => input.kind === 'downgrade')).toEqual([[{
+            userId: 'user_local', subscriptionId: 'sub_local', kind: 'downgrade', state: 'applied', effectiveAt: periodEnd,
+        }]]);
+    });
+
+    it.each(['wrong sku', 'other subscription', 'other user', 'pending', 'canceled', 'stale', 'conflict'])('does not complete a downgrade for %s', async scenario => {
+        const { store, stripe, deps } = fixture();
+        stripe.subscription.sku = 'standard_monthly_v2';
+        await store.recordPlanChange({ userId: 'user_local', subscriptionId: 'sub_local', kind: 'downgrade',
+            fromSku: 'compute_monthly_v2', toSku: 'standard_monthly_v2', state: 'scheduled', stripeScheduleId: 'sched_local',
+            stripeInvoiceId: null, hostedInvoiceUrl: null, effectiveAt: periodEnd, expiresAt: null });
+        if (scenario === 'wrong sku') stripe.subscription.sku = 'compute_monthly_v2';
+        if (scenario === 'other subscription') store.planChanges[0].subscriptionId = 'sub_other';
+        if (scenario === 'other user') store.planChanges[0].userId = 'user_other';
+        if (scenario === 'pending' || scenario === 'canceled') store.planChanges[0].state = scenario;
+        if (scenario === 'stale' || scenario === 'conflict') vi.spyOn(store, 'upsertSubscription').mockResolvedValue(scenario);
+        const before = { ...store.planChanges[0] };
+        await processStripeEvent(event('customer.subscription.updated', { id: 'sub_local' }), deps);
+        expect(store.planChanges[0]).toEqual(before);
     });
 });

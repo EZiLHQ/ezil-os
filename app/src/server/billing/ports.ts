@@ -143,6 +143,8 @@ export interface PlanChangeStateUpdate {
     state: PlanChangeState;
     stripeInvoiceId?: string | null;
     effectiveAt?: Date | null;
+    hostedInvoiceUrl?: string | null;
+    expiresAt?: Date | null;
 }
 
 export interface PaymentIssueInsert {
@@ -170,9 +172,13 @@ export interface BillingStore {
     epochsFor(userId: string, since: Date): Promise<ComputeEpoch[]>;
     /** Appends each distinct decision once; exact replays retain the original identity. */
     recordConsent(input: OverageConsentInsert): Promise<OverageConsentRow>;
+    /** Latest acceptance strictly before the exclusive period end; ties use audit identity. */
+    consentAsOf(userId: string, subscriptionId: string, at: Date): Promise<OverageConsentRow | null>;
     latestConsent(userId: string, subscriptionId: string): Promise<OverageConsentRow | null>;
     upsertOverageInvoice(input: OverageInvoiceInsert): Promise<{ status: 'inserted' | 'exists'; row: OverageInvoiceRow }>;
     attachOverageStripeInvoice(id: string, stripeInvoiceId: string): Promise<void>;
+    /** Only pending rows become open; webhook outcomes are preserved. */
+    markOverageInvoiceOpen(stripeInvoiceId: string): Promise<void>;
     setOverageInvoiceStatus(stripeInvoiceId: string, status: OverageInvoiceStatus): Promise<'updated' | 'not_found'>;
     overageInvoiceByStripeId(stripeInvoiceId: string): Promise<OverageInvoiceRow | null>;
     overageInvoicesFor(userId: string): Promise<OverageInvoiceRow[]>;

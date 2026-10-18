@@ -130,6 +130,15 @@ export function createBillingStore(db: Database): BillingStore {
             return row;
         },
 
+        async consentAsOf(userId, subscriptionId, at) {
+            const [row] = await db.select().from(billingOverageConsents).where(and(
+                eq(billingOverageConsents.userId, userId),
+                eq(billingOverageConsents.subscriptionId, subscriptionId),
+                lt(billingOverageConsents.acceptedAt, at),
+            )).orderBy(desc(billingOverageConsents.acceptedAt), desc(billingOverageConsents.id)).limit(1);
+            return row ?? null;
+        },
+
         async latestConsent(userId, subscriptionId) {
             const [row] = await db.select().from(billingOverageConsents).where(and(
                 eq(billingOverageConsents.userId, userId),
@@ -160,6 +169,12 @@ export function createBillingStore(db: Database): BillingStore {
             ));
         },
 
+        async markOverageInvoiceOpen(stripeInvoiceId) {
+            await db.update(billingOverageInvoices).set({ status: 'open', updatedAt: sql`now()` }).where(and(
+                eq(billingOverageInvoices.stripeInvoiceId, stripeInvoiceId), eq(billingOverageInvoices.status, 'pending'),
+            ));
+        },
+
         async setOverageInvoiceStatus(stripeInvoiceId, status) {
             const rows = await db.update(billingOverageInvoices).set({ status, updatedAt: sql`now()` })
                 .where(eq(billingOverageInvoices.stripeInvoiceId, stripeInvoiceId))
@@ -184,8 +199,8 @@ export function createBillingStore(db: Database): BillingStore {
             return rows.length > 0 ? 'inserted' : 'exists';
         },
 
-        async setPlanChangeState({ userId, subscriptionId, kind, state, stripeInvoiceId, effectiveAt }) {
-            await db.update(billingPlanChanges).set({ state, stripeInvoiceId, effectiveAt, updatedAt: sql`now()` })
+        async setPlanChangeState({ userId, subscriptionId, kind, state, stripeInvoiceId, effectiveAt, hostedInvoiceUrl, expiresAt }) {
+            await db.update(billingPlanChanges).set({ state, stripeInvoiceId, effectiveAt, hostedInvoiceUrl, expiresAt, updatedAt: sql`now()` })
                 .where(and(
                     eq(billingPlanChanges.userId, userId),
                     eq(billingPlanChanges.subscriptionId, subscriptionId),

@@ -161,6 +161,15 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             if (userId === null) return 'unattributed:customer';
             const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
             if (result === 'conflict') return 'review:customer_mismatch';
+            if (result === 'applied') {
+                const changes = await store.openPlanChanges(userId);
+                const downgrade = changes.find(change => change.subscriptionId === subscription.id
+                    && change.kind === 'downgrade' && change.state === 'scheduled' && change.toSku === subscription.sku);
+                if (downgrade) await store.setPlanChangeState({
+                    userId, subscriptionId: subscription.id, kind: 'downgrade', state: 'applied',
+                    effectiveAt: subscription.currentPeriodStart,
+                });
+            }
             if (action.type === 'plan_change') {
                 await store.setPlanChangeState({ userId, subscriptionId: subscription.id, kind: 'upgrade', state: action.outcome });
             } else if (action.invoiceIssue) {

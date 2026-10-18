@@ -176,6 +176,28 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
             planChanges, storage, sizePreference, hasCustomer: customer !== null });
     }
 
+    it.each(['customer.subscription.updated', 'customer.subscription.pending_update_applied'])
+        ('applies a scheduled downgrade on %s only after the matching subscription upsert', async type => {
+            await paid(a, 'compute_monthly_v2');
+            await store.recordPlanChange({ userId: a.userId, subscriptionId: a.subscriptionId, kind: 'downgrade',
+                fromSku: 'compute_monthly_v2', toSku: 'standard_monthly_v2', state: 'scheduled',
+                stripeScheduleId: 'sched_fixture', stripeInvoiceId: null, hostedInvoiceUrl: null, effectiveAt: END, expiresAt: null });
+            expect((await deliver(event(type, { id: a.subscriptionId }))).outcome).toBe('applied');
+            expect((await store.openPlanChanges(a.userId))[0].state).toBe('scheduled');
+            const renewed = { ...subscription(a), currentPeriodStart: END, currentPeriodEnd: new Date('2026-12-01T00:00:00Z') };
+            stripe.subscriptions.set(a.subscriptionId, renewed);
+            // The older event must not apply a change when its upsert was rejected as stale.
+            await deliver(event(type, { id: a.subscriptionId }, START));
+            expect((await store.openPlanChanges(a.userId))[0].state).toBe('scheduled');
+            const delivery = event(type, { id: a.subscriptionId }, END);
+            expect((await deliver(delivery)).outcome).toBe('applied');
+            expect(await store.openPlanChanges(a.userId)).toEqual([]);
+            expect(await client`select state, effective_at from ezil_billing_plan_changes where user_id = ${a.userId}::uuid`)
+                .toEqual([expect.objectContaining({ state: 'applied', effective_at: END })]);
+            await deliver({ ...delivery, id: `evt_${randomUUID()}` });
+            expect(await store.openPlanChanges(a.userId)).toEqual([]);
+        });
+
     it('replays the same event and invoice once, also deduplicating distinct invoices for one subscription period', async () => {
         const value = invoice(subscription(a));
         stripe.invoices.set(value.id, value);
