@@ -77,6 +77,9 @@ export async function handleStripeWebhook(request: Request, deps: BillingDeps, p
         if (recorded === 'processed') return Response.json({ received: true, duplicate: true });
         const outcome = await process(event, { store: deps.store, stripe: deps.stripe, now: deps.now });
         await deps.store.markEventProcessed(event.id, outcome);
+        if (outcome.startsWith('failed:')) {
+            return Response.json({ error: 'processing_failed' }, { status: 500 });
+        }
         return Response.json({ received: true });
     } catch (error) {
         const message = (error instanceof Error ? error.message : 'processing failed').replace(/[\r\n\t]/g, ' ').slice(0, 160);

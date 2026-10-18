@@ -9,6 +9,7 @@
  * Stripe payload's metadata.
  */
 import type { IntervalRow, SubscriptionRow } from './meters';
+import type { ComputeEpoch, EpochEndReason, GrantKindV2, GRANT_METER_COMPUTE, SizeCode } from './v2/contract';
 
 // ── Store (implemented by `store.ts` over drizzle) ───────────────────────────
 
@@ -30,8 +31,8 @@ export interface SubscriptionUpsert {
     stripeEventCreated: Date;
 }
 
-export type GrantMeter = 'workspace_seconds' | 'ai_usd_micro';
-export type GrantKind = 'pro_period' | 'topup' | 'revoke' | 'suspend' | 'restore';
+export type GrantMeter = 'workspace_seconds' | 'ai_usd_micro' | typeof GRANT_METER_COMPUTE;
+export type GrantKind = 'pro_period' | 'topup' | GrantKindV2;
 export type GrantSource = 'invoice' | 'payment_intent' | 'refund' | 'dispute';
 
 export interface GrantInsert {
@@ -44,9 +45,11 @@ export interface GrantInsert {
     periodEnd: Date | null;
     sourceType: GrantSource;
     sourceId: string;
+    subscriptionId?: string | null;
 }
 
 export interface GrantRow extends GrantInsert {
+    subscriptionId: string | null;
     id: string;
     createdAt: Date;
 }
@@ -59,7 +62,130 @@ export interface OutboxInsert {
     payload: Record<string, unknown>;
 }
 
+export interface OpenEpochInput {
+    userId: string;
+    computerId: string;
+    subscriptionId: string | null;
+    size: SizeCode;
+    readyAt: Date;
+}
+
+export interface CloseEpochInput {
+    computerId: string;
+    endedAt: Date;
+    reason: EpochEndReason;
+    overheadSeconds?: number;
+}
+
+export interface OverageConsentInsert {
+    userId: string;
+    subscriptionId: string;
+    enabled: boolean;
+    capCents: number;
+    termsVersion: string;
+    catalogVersion: number;
+    rateCentsPerStdHour: number;
+    actor: string;
+    acceptedAt: Date;
+}
+
+export interface OverageConsentRow extends OverageConsentInsert {
+    id: bigint;
+}
+
+export type OverageInvoiceStatus = 'pending' | 'open' | 'paid' | 'payment_failed' | 'requires_action' | 'void' | 'uncollectible';
+
+export interface OverageInvoiceInsert {
+    userId: string;
+    subscriptionId: string;
+    periodStart: Date;
+    periodEnd: Date;
+    ratingVersion: number;
+    stdSecondsOver: bigint;
+    cents: number;
+}
+
+export interface OverageInvoiceRow extends OverageInvoiceInsert {
+    id: string;
+    stripeInvoiceId: string | null;
+    status: OverageInvoiceStatus;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+export type PlanChangeKind = 'upgrade' | 'downgrade' | 'cancel';
+export type PlanChangeState = 'pending' | 'requires_action' | 'payment_failed' | 'scheduled' | 'applied' | 'expired' | 'canceled';
+
+export interface PlanChangeInsert {
+    userId: string;
+    subscriptionId: string;
+    kind: PlanChangeKind;
+    fromSku: string;
+    toSku: string | null;
+    stripeInvoiceId: string | null;
+    stripeScheduleId: string | null;
+    hostedInvoiceUrl: string | null;
+    state: PlanChangeState;
+    effectiveAt: Date | null;
+    expiresAt: Date | null;
+}
+
+export interface PlanChangeRow extends PlanChangeInsert {
+    id: string;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+export interface PlanChangeStateUpdate {
+    userId: string;
+    subscriptionId: string;
+    kind: PlanChangeKind;
+    state: PlanChangeState;
+    stripeInvoiceId?: string | null;
+    effectiveAt?: Date | null;
+}
+
+export interface PaymentIssueInsert {
+    stripeInvoiceId: string;
+    userId: string;
+    subscriptionId: string | null;
+    invoiceKind: 'subscription' | 'upgrade' | 'overage';
+    issue: 'payment_failed' | 'requires_action' | 'voided' | 'uncollectible';
+    hostedInvoiceUrl: string | null;
+    eventCreated: Date;
+}
+
+export interface PaymentIssueRow extends Omit<PaymentIssueInsert, 'eventCreated'> {
+    stripeEventCreated: Date;
+    resolvedAt: Date | null;
+    updatedAt: Date;
+}
+
 export interface BillingStore {
+    // v2 ledger, compute and payment state
+    grantsForPeriod(userId: string, window: { start: Date; end: Date }, meters: GrantMeter[]): Promise<GrantRow[]>;
+    openEpoch(input: OpenEpochInput): Promise<{ status: 'opened' | 'exists'; epoch: ComputeEpoch }>;
+    /** Computer ownership is checked by the caller, as for closeInterval. */
+    closeEpoch(input: CloseEpochInput): Promise<'closed' | 'not_open'>;
+    epochsFor(userId: string, since: Date): Promise<ComputeEpoch[]>;
+    /** Appends each distinct decision once; exact replays retain the original identity. */
+    recordConsent(input: OverageConsentInsert): Promise<OverageConsentRow>;
+    latestConsent(userId: string, subscriptionId: string): Promise<OverageConsentRow | null>;
+    upsertOverageInvoice(input: OverageInvoiceInsert): Promise<{ status: 'inserted' | 'exists'; row: OverageInvoiceRow }>;
+    attachOverageStripeInvoice(id: string, stripeInvoiceId: string): Promise<void>;
+    setOverageInvoiceStatus(stripeInvoiceId: string, status: OverageInvoiceStatus): Promise<'updated' | 'not_found'>;
+    overageInvoiceByStripeId(stripeInvoiceId: string): Promise<OverageInvoiceRow | null>;
+    overageInvoicesFor(userId: string): Promise<OverageInvoiceRow[]>;
+    recordPlanChange(input: PlanChangeInsert): Promise<'inserted' | 'exists'>;
+    setPlanChangeState(input: PlanChangeStateUpdate): Promise<void>;
+    openPlanChanges(userId: string): Promise<PlanChangeRow[]>;
+    recordPaymentIssue(input: PaymentIssueInsert): Promise<void>;
+    resolvePaymentIssue(stripeInvoiceId: string, eventCreated: Date): Promise<void>;
+    openPaymentIssues(userId: string): Promise<PaymentIssueRow[]>;
+    setSizePreference(userId: string, size: SizeCode): Promise<void>;
+    sizePreference(userId: string): Promise<SizeCode | null>;
+    userCreatedAt(userId: string): Promise<Date | null>;
+
     // reads
     stripeCustomerFor(userId: string): Promise<string | null>;
     userForStripeCustomer(stripeCustomerId: string): Promise<string | null>;
@@ -80,11 +206,12 @@ export interface BillingStore {
      */
     recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed'>;
     markEventProcessed(eventId: string, outcome: string): Promise<void>;
-    upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale'>;
+    upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale' | 'conflict'>;
     insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'>;
     enqueueOutbox(item: OutboxInsert): Promise<'queued' | 'duplicate'>;
 
     // usage ingest (computer ownership already checked by the caller)
+    latestIntervalFor(computerId: string): Promise<{ endedAt: Date | null } | null>;
     openInterval(userId: string, computerId: string, at: Date, source: string): Promise<void>;
     touchInterval(computerId: string, at: Date): Promise<void>;
     closeInterval(computerId: string, at: Date, reason: string): Promise<void>;
@@ -102,7 +229,9 @@ export interface StripeSubscription {
     cancelAtPeriodEnd: boolean;
     currentPeriodStart: Date | null;
     currentPeriodEnd: Date | null;
-    /** `subscription_data.metadata.sku` set by our own checkout. */
+    items: { priceId: string | null; lookupKey: string | null }[];
+    pendingUpdateExpiresAt: Date | null;
+    /** Known catalog SKU from metadata or the first recognized item lookup key. */
     sku: string | null;
 }
 
@@ -111,6 +240,18 @@ export interface StripeInvoice {
     customer: string;
     status: string;
     subscriptionId: string | null;
+    billingReason: string | null;
+    metadataKind: string | null;
+    hostedInvoiceUrl: string | null;
+    lines: {
+        id: string;
+        lookupKey: string | null;
+        subscriptionId: string | null;
+        proration: boolean;
+        amount: number;
+        periodStart: Date | null;
+        periodEnd: Date | null;
+    }[];
     periodStart: Date | null;
     periodEnd: Date | null;
 }

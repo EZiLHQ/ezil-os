@@ -4,10 +4,13 @@ import { PRO_PLAN } from './catalog';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
     StorageSample, StripeApi, StripeCharge, StripeCheckoutSession, StripeInvoice,
-    StripeSubscription, SubscriptionUpsert, UsageEvent,
+    StripeSubscription, SubscriptionUpsert, UsageEvent, OverageConsentRow, OverageInvoiceRow, PlanChangeRow, PaymentIssueRow,
 } from './ports';
 import { ingestUsageEvents, processStripeEvent } from './processor';
+import { createStripeClient } from './stripe/client';
 import type { StripeEventLike } from './stripe/events';
+import { CATALOG_V2, OVERAGE_PRICE_LOOKUP_KEY, OVERAGE_TERMS_VERSION } from './v2/contract';
+import { upgradeGrantStdSeconds } from './v2/rating';
 
 const now = new Date('2026-10-11T12:00:00.000Z');
 const periodStart = new Date('2026-10-01T00:00:00.000Z');
@@ -20,6 +23,80 @@ type Interval = {
 
 /** Match the database's unique keys so replay tests exercise persisted effects. */
 class MemoryStore implements BillingStore {
+    // Unused compute-epoch methods remain outside this webhook fake.
+    grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
+    openEpoch: BillingStore['openEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    closeEpoch: BillingStore['closeEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    epochsFor: BillingStore['epochsFor'] = async () => { throw new Error('Unused v2 store stub'); };
+    recordConsent: BillingStore['recordConsent'] = async input => {
+        const key = JSON.stringify(input);
+        const previous = this.consents.find(row => {
+            const { id: _id, ...fields } = row;
+            return JSON.stringify(fields) === key;
+        });
+        if (previous) return previous;
+        const row = { ...input, id: BigInt(this.consents.length + 1) };
+        this.consents.push(row);
+        return row;
+    };
+    latestConsent: BillingStore['latestConsent'] = async (userId, subscriptionId) => [...this.consents].reverse()
+        .find(row => row.userId === userId && row.subscriptionId === subscriptionId) ?? null;
+    upsertOverageInvoice: BillingStore['upsertOverageInvoice'] = async input => {
+        const previous = this.overageInvoices.find(row => row.userId === input.userId && row.subscriptionId === input.subscriptionId
+            && row.periodStart.getTime() === input.periodStart.getTime() && row.ratingVersion === input.ratingVersion);
+        if (previous) return { status: 'exists', row: previous };
+        const row: OverageInvoiceRow = { ...input, id: `overage_${this.overageInvoices.length}`, status: 'pending', stripeInvoiceId: null, createdAt: now, updatedAt: now };
+        this.overageInvoices.push(row);
+        return { status: 'inserted', row };
+    };
+    attachOverageStripeInvoice: BillingStore['attachOverageStripeInvoice'] = async (id, stripeInvoiceId) => {
+        const row = this.overageInvoices.find(row => row.id === id);
+        if (row && (row.stripeInvoiceId === null || row.stripeInvoiceId === stripeInvoiceId)) row.stripeInvoiceId = stripeInvoiceId;
+    };
+    setOverageInvoiceStatus: BillingStore['setOverageInvoiceStatus'] = async (id, status) => {
+        const row = this.overageInvoices.find(row => row.stripeInvoiceId === id);
+        if (!row) return 'not_found';
+        row.status = status;
+        return 'updated';
+    };
+    overageInvoiceByStripeId: BillingStore['overageInvoiceByStripeId'] = async id => this.overageInvoices.find(row => row.stripeInvoiceId === id) ?? null;
+    overageInvoicesFor: BillingStore['overageInvoicesFor'] = async userId => this.overageInvoices.filter(row => row.userId === userId);
+    recordPlanChange: BillingStore['recordPlanChange'] = async input => {
+        if (this.planChanges.some(row => row.subscriptionId === input.subscriptionId && row.kind === input.kind && this.isOpenChange(row))) return 'exists';
+        this.planChanges.push({ ...input, id: `change_${this.planChanges.length}`, createdAt: now, updatedAt: now });
+        return 'inserted';
+    };
+    setPlanChangeState: BillingStore['setPlanChangeState'] = async input => {
+        for (const row of this.planChanges.filter(row => row.userId === input.userId
+            && row.subscriptionId === input.subscriptionId && row.kind === input.kind && this.isOpenChange(row))) {
+            row.state = input.state;
+            if (input.stripeInvoiceId !== undefined) row.stripeInvoiceId = input.stripeInvoiceId;
+            if (input.effectiveAt !== undefined) row.effectiveAt = input.effectiveAt;
+        }
+    };
+    openPlanChanges: BillingStore['openPlanChanges'] = async userId => this.planChanges.filter(row => row.userId === userId && this.isOpenChange(row));
+    recordPaymentIssue: BillingStore['recordPaymentIssue'] = async ({ eventCreated, ...input }) => {
+        const previous = this.issues.get(input.stripeInvoiceId);
+        if (previous && (previous.userId !== input.userId || previous.stripeEventCreated > eventCreated
+            || (previous.resolvedAt !== null && previous.resolvedAt >= eventCreated))) return;
+        this.issues.set(input.stripeInvoiceId, { ...input, stripeEventCreated: eventCreated, resolvedAt: null, updatedAt: now });
+    };
+    resolvePaymentIssue: BillingStore['resolvePaymentIssue'] = async (id, eventCreated) => {
+        const row = this.issues.get(id);
+        if (row && row.stripeEventCreated <= eventCreated) {
+            row.resolvedAt = eventCreated;
+            row.stripeEventCreated = eventCreated;
+        }
+    };
+    openPaymentIssues: BillingStore['openPaymentIssues'] = async userId => [...this.issues.values()].filter(row => row.userId === userId && row.resolvedAt === null);
+    setSizePreference: BillingStore['setSizePreference'] = async () => { throw new Error('Unused v2 store stub'); };
+    sizePreference: BillingStore['sizePreference'] = async () => { throw new Error('Unused v2 store stub'); };
+    userCreatedAt: BillingStore['userCreatedAt'] = async () => { throw new Error('Unused v2 store stub'); };
+    consents: OverageConsentRow[] = [];
+    overageInvoices: OverageInvoiceRow[] = [];
+    planChanges: PlanChangeRow[] = [];
+    issues = new Map<string, PaymentIssueRow>();
+    isOpenChange(row: PlanChangeRow) { return ['pending', 'requires_action', 'payment_failed', 'scheduled'].includes(row.state); }
     customers = new Map<string, string>([['cus_local', 'user_local']]);
     computers = new Map<string, string>([['computer_local', 'user_local']]);
     subscriptions = new Map<string, SubscriptionUpsert>();
@@ -69,8 +146,9 @@ class MemoryStore implements BillingStore {
     }
     async recordEvent() { return 'new' as const; }
     async markEventProcessed() {}
-    async upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale'> {
+    async upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale' | 'conflict'> {
         const previous = this.subscriptions.get(row.stripeSubscriptionId);
+        if (previous && previous.userId !== row.userId) return 'conflict';
         if (previous && previous.stripeEventCreated > row.stripeEventCreated) return 'stale';
         if (JSON.stringify(previous) !== JSON.stringify(row)) {
             this.subscriptions.set(row.stripeSubscriptionId, { ...row });
@@ -81,7 +159,10 @@ class MemoryStore implements BillingStore {
     async insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'> {
         const key = [grant.sourceType, grant.sourceId, grant.meter, grant.kind].join(':');
         if (this.grants.has(key)) return 'duplicate';
-        this.grants.set(key, { ...grant, id: key, createdAt: now });
+        if (grant.kind === 'plan_period' && grant.subscriptionId != null && grant.periodStart != null
+            && [...this.grants.values()].some(row => row.kind === 'plan_period' && row.subscriptionId === grant.subscriptionId
+                && row.meter === grant.meter && row.periodStart?.getTime() === grant.periodStart!.getTime())) return 'duplicate';
+        this.grants.set(key, { ...grant, subscriptionId: grant.subscriptionId ?? null, id: key, createdAt: now });
         this.writes.push(key);
         return 'inserted';
     }
@@ -90,6 +171,10 @@ class MemoryStore implements BillingStore {
         this.outbox.set(item.eventKey, item);
         this.writes.push(item.eventKey);
         return 'queued';
+    }
+    async latestIntervalFor(computerId: string) {
+        return this.intervals.filter(row => row.computerId === computerId)
+            .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())[0] ?? null;
     }
     async openInterval(userId: string, computerId: string, at: Date, source: string) {
         this.usageCalls.push(`open:${source}`);
@@ -121,10 +206,11 @@ class MemoryStripe implements StripeApi {
     reads: string[] = [];
     subscription: StripeSubscription = {
         id: 'sub_local', customer: 'cus_local', sku: PRO_PLAN.sku, status: 'active',
-        cancelAtPeriodEnd: false, currentPeriodStart: periodStart, currentPeriodEnd: periodEnd,
+        cancelAtPeriodEnd: false, currentPeriodStart: periodStart, currentPeriodEnd: periodEnd, items: [], pendingUpdateExpiresAt: null,
     };
     invoice: StripeInvoice = {
         id: 'in_local', customer: 'cus_local', status: 'paid', subscriptionId: 'sub_local', periodStart, periodEnd,
+        billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null, lines: [],
     };
     session: StripeCheckoutSession = {
         id: 'cs_local', customer: 'cus_local', clientReferenceId: 'user_local',
@@ -417,9 +503,9 @@ describe('processStripeEvent', () => {
         expect([...store.grants.values()][1].kind).toBe('revoke');
     });
 
-    it.each([refund, dispute, () => dispute(true)])('reviews a correction with missing or mismatched originals %#', async makeEvent => {
+    it.each([refund, dispute, () => dispute(true)])('retries missing originals and reviews ownership mismatches %#', async makeEvent => {
         const { store, deps } = fixture();
-        expect(await processStripeEvent(makeEvent(), deps)).toMatch(/^review:no_grant_for_/);
+        expect(await processStripeEvent(makeEvent(), deps)).toMatch(/^failed:no_grant_for_/);
         expect(store.writes).toEqual([]);
         await seedTopup(store);
         const original = [...store.grants.values()][0];
@@ -573,5 +659,565 @@ describe('ingestUsageEvents', () => {
         expect(store.intervals).toEqual([]);
         expect(await ingestUsageEvents([usage('start')], { store })).toEqual({ accepted: 1, rejected: 0 });
         expect(store.intervals).toHaveLength(1);
+    });
+});
+
+function v2Fixture(sku: 'standard_monthly_v2' | 'compute_monthly_v2' = 'standard_monthly_v2') {
+    const f = fixture();
+    f.stripe.subscription.sku = sku;
+    f.stripe.subscription.items = [{ priceId: 'price_base', lookupKey: CATALOG_V2[sku].stripeLookupKey }];
+    f.stripe.invoice.lines = [baseLine(sku)];
+    return f;
+}
+function baseLine(sku: 'standard_monthly_v2' | 'compute_monthly_v2'): StripeInvoice['lines'][number] {
+    return { id: `il_${sku}`, lookupKey: CATALOG_V2[sku].stripeLookupKey, subscriptionId: 'sub_local',
+        proration: false, amount: CATALOG_V2[sku].priceCents, periodStart, periodEnd };
+}
+function paidV2() {
+    return event('invoice.paid', { id: 'in_local', customer: 'cus_payload', billing_reason: 'subscription_cycle',
+        parent: { subscription_details: { subscription: 'sub_payload' } }, lines: { data: [] } });
+}
+function issueEvent(type: string, subscription = false) {
+    return event(type, { id: 'in_local', customer: 'cus_payload', metadata: { user_id: 'attacker' },
+        parent: subscription ? { subscription_details: { subscription: 'sub_local' } } : null });
+}
+async function seedChange(store: MemoryStore) {
+    await store.recordPlanChange({ userId: 'user_local', subscriptionId: 'sub_local', kind: 'upgrade',
+        fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2', stripeInvoiceId: 'in_local', stripeScheduleId: null,
+        hostedInvoiceUrl: 'https://invoice.stripe.com/local', state: 'pending', effectiveAt: null, expiresAt: periodEnd });
+}
+async function seedOverage(f: ReturnType<typeof fixture>) {
+    f.stripe.invoice.metadataKind = 'overage';
+    f.stripe.invoice.subscriptionId = null;
+    f.stripe.invoice.billingReason = 'manual';
+    f.stripe.invoice.hostedInvoiceUrl = 'https://invoice.stripe.com/local';
+    const { row } = await f.store.upsertOverageInvoice({ userId: 'user_local', subscriptionId: 'sub_local',
+        periodStart, periodEnd, ratingVersion: 1, stdSecondsOver: BigInt(1440), cents: 10 });
+    await f.store.attachOverageStripeInvoice(row.id, 'in_local');
+    await f.store.recordConsent({ userId: 'user_local', subscriptionId: 'sub_local', enabled: true, capCents: 4200,
+        termsVersion: OVERAGE_TERMS_VERSION, catalogVersion: 2, rateCentsPerStdHour: 25, actor: 'user', acceptedAt: periodStart });
+}
+
+describe('v2 webhook grants', () => {
+    it.each(['legacy period', 'v2 period', 'upgrade', 'sync', 'failed invoice', 'plan applied', 'plan expired'] as const)(
+        'reviews subscription ownership conflicts before any further write: %s', async scenario => {
+            const { store, stripe, deps } = scenario === 'legacy period' ? fixture() : v2Fixture('compute_monthly_v2');
+            const ownerRow: SubscriptionUpsert = {
+                stripeSubscriptionId: 'sub_local', userId: 'user_owner', status: 'active', sku: 'standard_monthly_v2',
+                currentPeriodStart: periodStart, currentPeriodEnd: periodEnd, cancelAtPeriodEnd: false,
+                stripeEventCreated: periodStart,
+            };
+            store.subscriptions.set('sub_local', ownerRow);
+            await seedChange(store);
+            store.planChanges[0].userId = 'user_owner';
+            await store.recordPaymentIssue({ stripeInvoiceId: 'in_local', userId: 'user_owner', subscriptionId: 'sub_local',
+                invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, eventCreated: periodStart });
+            let delivery = scenario === 'legacy period' ? invoice() : paidV2();
+            if (scenario === 'upgrade') {
+                stripe.invoice.billingReason = 'subscription_update';
+                stripe.invoice.lines = [
+                    { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+                    { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+                ];
+            } else if (scenario === 'sync') {
+                delivery = sync();
+            } else if (scenario === 'failed invoice') {
+                stripe.invoice.status = 'open';
+                delivery = issueEvent('invoice.payment_failed', true);
+            } else if (scenario === 'plan applied' || scenario === 'plan expired') {
+                delivery = event(`customer.subscription.pending_update_${scenario === 'plan applied' ? 'applied' : 'expired'}`, { id: 'sub_local' });
+            }
+            const writes = [
+                vi.spyOn(store, 'insertGrant'), vi.spyOn(store, 'enqueueOutbox'), vi.spyOn(store, 'setPlanChangeState'),
+                vi.spyOn(store, 'recordPaymentIssue'), vi.spyOn(store, 'resolvePaymentIssue'),
+            ];
+            expect(await processStripeEvent(delivery, deps)).toBe('review:customer_mismatch');
+            for (const write of writes) expect(write).not.toHaveBeenCalled();
+            expect(store.subscriptions.get('sub_local')).toEqual(ownerRow);
+            expect(store.planChanges[0].state).toBe('pending');
+            expect(store.issues.get('in_local')?.resolvedAt).toBeNull();
+            expect(store.writes).toEqual([]);
+        },
+    );
+
+    it('grants a Compute cycle and saves the Compute SKU despite stale Standard metadata', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        const client = createStripeClient({ secretKey: 'sk_test_fixture', fetch: vi.fn<typeof fetch>().mockResolvedValue(
+            Response.json({
+                id: 'sub_local', customer: 'cus_local', status: 'active', cancel_at_period_end: false,
+                metadata: { sku: 'standard_monthly_v2' },
+                items: { data: [{ price: { id: 'price_compute', lookup_key: 'ezil_compute_monthly_v2' },
+                    current_period_start: periodStart.getTime() / 1000, current_period_end: periodEnd.getTime() / 1000 }] },
+            }),
+        ) });
+        vi.spyOn(stripe, 'retrieveSubscription').mockImplementation(client.retrieveSubscription);
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expect.objectContaining({
+            kind: 'plan_period', meter: 'compute_std_seconds', amount: BigInt(1_800_000),
+            subscriptionId: 'sub_local', periodStart, periodEnd,
+        })]);
+        expect(store.subscriptions.get('sub_local')?.sku).toBe('compute_monthly_v2');
+    });
+
+    it.each(['standard_monthly_v2', 'compute_monthly_v2'] as const)('grants %s once per invoice and subscription period on create/cycle', async sku => {
+        for (const billingReason of ['subscription_create', 'subscription_cycle']) {
+            const { store, stripe, deps } = v2Fixture(sku);
+            stripe.invoice.billingReason = billingReason;
+            expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+            expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+            stripe.invoice.id = 'in_second';
+            const second = paidV2();
+            second.data.object.id = 'in_second';
+            expect(await processStripeEvent(second, deps)).toBe('applied');
+            expect([...store.grants.values()]).toEqual([expect.objectContaining({
+                sourceId: 'in_local', sourceType: 'invoice', subscriptionId: 'sub_local', kind: 'plan_period',
+                meter: 'compute_std_seconds', amount: BigInt(CATALOG_V2[sku].allowanceStdSeconds), periodStart, periodEnd,
+            })]);
+            expect(store.outbox.size).toBe(0);
+            expect(store.subscriptions.get('sub_local')?.sku).toBe(sku);
+        }
+    });
+
+    it('finds the base lookup key after unrelated and foreign lines, using its period', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        const base = { ...baseLine('standard_monthly_v2'), subscriptionId: null };
+        stripe.invoice.lines = [
+            { ...base, lookupKey: OVERAGE_PRICE_LOOKUP_KEY, periodStart: now },
+            { ...base, subscriptionId: 'sub_foreign', periodStart: now }, base,
+        ];
+        stripe.invoice.periodStart = now; // Neither the v1 selection nor the event is authoritative for v2.
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()][0]).toMatchObject({ amount: BigInt(216000), periodStart, periodEnd });
+    });
+
+    it.each([
+        [], [{ ...baseLine('standard_monthly_v2'), lookupKey: 'unrecognized' }],
+        [{ ...baseLine('standard_monthly_v2'), subscriptionId: 'sub_foreign' }],
+        [{ ...baseLine('standard_monthly_v2'), periodEnd: periodStart }],
+        [{ ...baseLine('standard_monthly_v2'), periodStart: null }],
+    ])('reviews missing or invalid base lines %#', async (...lines) => {
+        const { store, stripe, deps } = v2Fixture();
+        stripe.invoice.lines = lines;
+        expect(await processStripeEvent(paidV2(), deps)).toBe('review:no_base_line');
+        expect(store.grants.size).toBe(0);
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it.each([
+        { billingReason: 'manual' }, { billingReason: null }, { billingReason: 'subscription_threshold' },
+        { status: 'open' }, { subscriptionId: null },
+    ])('does not grant for re-read facts %j', async fields => {
+        const { store, stripe, deps } = v2Fixture();
+        Object.assign(stripe.invoice, fields);
+        expect(await processStripeEvent(paidV2(), deps)).toBe('ignored');
+        expect(store.grants.size).toBe(0);
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it('keeps legacy manual invoices from granting or enqueuing AI', async () => {
+        const { store, stripe, deps } = fixture();
+        stripe.invoice.billingReason = 'manual';
+        expect(await processStripeEvent(invoice(), deps)).toBe('ignored');
+        expect(store.grants.size).toBe(0);
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it('grants only the prorated Standard → Compute difference and closes the pending change', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        await seedChange(store);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+        ];
+        const expected = upgradeGrantStdSeconds({ fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
+            periodStart: periodStart.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: now.toISOString() });
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expect.objectContaining({
+            kind: 'upgrade_prorated', amount: BigInt(expected), meter: 'compute_std_seconds',
+            periodStart, periodEnd, subscriptionId: 'sub_local', sourceType: 'invoice', sourceId: 'in_local',
+        })]);
+        expect(expected).toBeLessThan(CATALOG_V2.compute_monthly_v2.allowanceStdSeconds - CATALOG_V2.standard_monthly_v2.allowanceStdSeconds);
+        expect(store.planChanges[0]).toMatchObject({ state: 'applied', effectiveAt: now });
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it.each(['renewed subscription period', 'different proration end', 'effective date before current period'])('reviews an upgrade with %s without granting or applying the plan change', async scenario => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        await seedChange(store);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+        ];
+        if (scenario === 'renewed subscription period') {
+            stripe.subscription.currentPeriodStart = periodEnd;
+            stripe.subscription.currentPeriodEnd = new Date('2026-12-01T00:00:00Z');
+        } else if (scenario === 'different proration end') {
+            stripe.invoice.lines[1].periodEnd = new Date(periodEnd.getTime() - 1000);
+        } else {
+            stripe.subscription.currentPeriodStart = new Date(now.getTime() + 1000);
+        }
+        const setPlanChangeState = vi.spyOn(store, 'setPlanChangeState');
+        expect(await processStripeEvent(paidV2(), deps)).toBe('review:upgrade_period_mismatch');
+        expect(store.grants.size).toBe(0);
+        expect(store.subscriptions.size).toBe(0);
+        expect(store.planChanges[0]).toMatchObject({ state: 'pending', effectiveAt: null });
+        expect(setPlanChangeState).not.toHaveBeenCalled();
+        expect(store.writes).toEqual([]);
+    });
+
+    it('uses the proration line end when subscription ends agree to whole seconds', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.subscription.currentPeriodEnd = new Date(periodEnd.getTime() + 500);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+        ];
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()][0].periodEnd).toEqual(periodEnd);
+    });
+
+    it.each(['missing credit', 'nonpositive compute', 'foreign credit', 'downgrade'])('ignores subscription_update: %s', async scenario => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.invoice.billingReason = 'subscription_update';
+        const compute = { ...baseLine('compute_monthly_v2'), proration: true, periodStart: now };
+        const credit = { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true };
+        stripe.invoice.lines = [compute, credit];
+        if (scenario === 'missing credit') stripe.invoice.lines = [compute];
+        if (scenario === 'nonpositive compute') compute.amount = 0;
+        if (scenario === 'foreign credit') credit.subscriptionId = 'sub_foreign';
+        if (scenario === 'downgrade') { compute.amount = -5000; credit.amount = 1000; }
+        expect(await processStripeEvent(paidV2(), deps)).toBe('ignored');
+        expect(store.grants.size).toBe(0);
+        expect(store.planChanges).toEqual([]);
+    });
+
+    it('recognizes an upgrade from its line keys even when the credit is zero and proration flags are absent', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), amount: 0, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), periodStart: now },
+        ];
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        const expected = upgradeGrantStdSeconds({ fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
+            periodStart: periodStart.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: now.toISOString() });
+        expect([...store.grants.values()][0]).toMatchObject({ kind: 'upgrade_prorated', amount: BigInt(expected) });
+    });
+
+    it('settles a standalone overage invoice and resolves its issue without granting', async () => {
+        const f = v2Fixture('compute_monthly_v2');
+        await seedOverage(f);
+        f.stripe.invoice.status = 'open';
+        expect(await processStripeEvent(issueEvent('invoice.payment_failed'), f.deps)).toBe('applied');
+        f.stripe.invoice.status = 'paid';
+        const paid = issueEvent('invoice.paid');
+        expect(await processStripeEvent(paid, f.deps)).toBe('applied');
+        expect(f.store.overageInvoices[0].status).toBe('paid');
+        expect(await f.store.openPaymentIssues('user_local')).toEqual([]);
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+        expect(f.stripe.reads.every(read => read.startsWith('invoice:'))).toBe(true);
+        f.store.overageInvoices = [];
+        expect(await processStripeEvent(paid, f.deps)).toBe('ignored');
+    });
+
+    it.each(['standard_monthly_v2', 'compute_monthly_v2'] as const)(
+        'settles a paid overage subscription_cycle with a valid %s base line without granting', async sku => {
+            const f = v2Fixture(sku);
+            await seedOverage(f);
+            f.stripe.invoice.subscriptionId = 'sub_local';
+            f.stripe.invoice.billingReason = 'subscription_cycle';
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(f.store.grants.size).toBe(0);
+            expect(f.store.outbox.size).toBe(0);
+            expect(f.store.overageInvoices[0].status).toBe('paid');
+        },
+    );
+
+    describe.each([
+        ['refund', refund], ['dispute', dispute], ['dispute restore', () => dispute(true)],
+    ] as const)('%s without an original grant', (kind, makeEvent) => {
+        it.each(['manual', 'subscription_cycle'])('reviews an overage invoice with billing reason %s without writes', async billingReason => {
+            const f = v2Fixture();
+            await seedOverage(f);
+            f.stripe.invoice.subscriptionId = 'sub_local';
+            f.stripe.invoice.billingReason = billingReason;
+            f.stripe.charge.invoiceId = 'in_local';
+            const before = structuredClone({
+                overages: f.store.overageInvoices, consents: f.store.consents, issues: f.store.issues,
+            });
+            expect(await processStripeEvent(makeEvent(), f.deps)).toBe(
+                kind === 'refund' ? 'review:refund_on_overage_invoice' : 'review:dispute_on_overage_invoice',
+            );
+            expect(f.stripe.reads).toEqual(['charge:ch_local', 'invoice:in_local']);
+            expect(f.store.writes).toEqual([]);
+            expect(f.store.grants.size).toBe(0);
+            expect(f.store.outbox.size).toBe(0);
+            expect({ overages: f.store.overageInvoices, consents: f.store.consents, issues: f.store.issues }).toEqual(before);
+        });
+
+        it.each([
+            { billingReason: 'manual' }, { billingReason: null }, { billingReason: 'subscription_threshold' },
+            { billingReason: 'subscription_update' }, { status: 'open' }, { status: 'void' },
+            { status: 'uncollectible' }, { subscriptionId: null },
+        ])('ignores an invoice that cannot grant: %j', async fields => {
+            const { store, stripe, deps } = v2Fixture();
+            Object.assign(stripe.invoice, fields);
+            stripe.charge.invoiceId = 'in_local';
+            expect(await processStripeEvent(makeEvent(), deps)).toBe('ignored');
+            expect(stripe.reads).toEqual(['charge:ch_local', 'invoice:in_local']);
+            expect(store.writes).toEqual([]);
+        });
+
+        it.each(['missing credit', 'nonpositive compute', 'foreign compute', 'foreign credit', 'invalid compute period', 'downgrade'])(
+            'ignores a non-upgrade subscription_update: %s', async scenario => {
+                const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+                stripe.charge.invoiceId = 'in_local';
+                stripe.invoice.billingReason = 'subscription_update';
+                const compute = { ...baseLine('compute_monthly_v2'), periodStart: now };
+                const credit = { ...baseLine('standard_monthly_v2'), amount: -1000 };
+                stripe.invoice.lines = [compute, credit];
+                if (scenario === 'missing credit') stripe.invoice.lines = [compute];
+                if (scenario === 'nonpositive compute') compute.amount = 0;
+                if (scenario === 'foreign compute') compute.subscriptionId = 'sub_foreign';
+                if (scenario === 'foreign credit') credit.subscriptionId = 'sub_foreign';
+                if (scenario === 'invalid compute period') compute.periodEnd = now;
+                if (scenario === 'downgrade') { compute.amount = -5000; credit.amount = 1000; }
+                expect(await processStripeEvent(makeEvent(), deps)).toBe('ignored');
+                expect(store.writes).toEqual([]);
+            },
+        );
+
+        it('ignores a charge with neither invoice nor payment intent', async () => {
+            const { store, stripe, deps } = fixture();
+            stripe.charge.paymentIntentId = null;
+            expect(await processStripeEvent(makeEvent(), deps)).toBe('ignored');
+            expect(stripe.reads).toEqual(['charge:ch_local']);
+            expect(store.sourceReads).toEqual([]);
+            expect(store.writes).toEqual([]);
+        });
+
+        it.each(['subscription_create', 'subscription_cycle', 'upgrade', 'top-up'] as const)(
+            'retries before a %s grant, then applies once', async scenario => {
+                const { store, stripe, deps } = v2Fixture(scenario === 'upgrade' ? 'compute_monthly_v2' : 'standard_monthly_v2');
+                if (scenario !== 'top-up') {
+                    stripe.charge.invoiceId = 'in_local';
+                    stripe.invoice.billingReason = scenario === 'upgrade' ? 'subscription_update' : scenario;
+                }
+                if (scenario === 'upgrade') {
+                    stripe.invoice.lines = [
+                        { ...baseLine('compute_monthly_v2'), subscriptionId: null, periodStart: now },
+                        { ...baseLine('standard_monthly_v2'), subscriptionId: null, amount: 0, periodStart: now },
+                    ];
+                }
+                expect(await processStripeEvent(makeEvent(), deps)).toBe(
+                    kind === 'refund' ? 'failed:no_grant_for_refund' : 'failed:no_grant_for_dispute',
+                );
+                expect(store.writes).toEqual([]);
+                expect(await processStripeEvent(scenario === 'top-up' ? checkout(false) : paidV2(), deps)).toBe('applied');
+                const original = [...store.grants.values()][0];
+                expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
+                const writes = [...store.writes];
+                expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
+                expect(store.writes).toEqual(writes);
+                expect([...store.grants.values()]).toEqual([original, expect.objectContaining({
+                    kind: kind === 'refund' ? 'revoke' : kind === 'dispute' ? 'suspend' : 'restore',
+                    meter: original.meter, subscriptionId: original.subscriptionId,
+                    amount: kind === 'dispute restore' ? original.amount : -original.amount,
+                    periodStart: original.periodStart, periodEnd: original.periodEnd,
+                })]);
+            },
+        );
+    });
+
+    it('resolves paid manual invoice issues even without a subscription', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        stripe.invoice.subscriptionId = null;
+        stripe.invoice.billingReason = 'manual';
+        stripe.invoice.status = 'open';
+        await processStripeEvent(issueEvent('invoice.payment_action_required'), deps);
+        stripe.invoice.status = 'paid';
+        expect(await processStripeEvent(issueEvent('invoice.paid'), deps)).toBe('ignored');
+        expect(await store.openPaymentIssues('user_local')).toEqual([]);
+        expect(store.grants.size).toBe(0);
+    });
+
+    it('retries a refund before its grant, then revokes v2 compute once with the subscription id', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        stripe.charge.invoiceId = 'in_local';
+        expect(await processStripeEvent(refund(), deps)).toBe('failed:no_grant_for_refund');
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect(await processStripeEvent(refund(), deps)).toBe('applied');
+        expect(await processStripeEvent(refund(), deps)).toBe('applied');
+        expect([...store.grants.values()]).toHaveLength(2);
+        expect([...store.grants.values()][1]).toMatchObject({ kind: 'revoke', meter: 'compute_std_seconds',
+            subscriptionId: 'sub_local', amount: -BigInt(216000), periodStart, periodEnd });
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it.each([false, true])('retries a dispute before its grant (restore=%s)', async restore => {
+        const f = v2Fixture();
+        f.stripe.charge.invoiceId = 'in_local';
+        expect(await processStripeEvent(dispute(restore), f.deps)).toBe('failed:no_grant_for_dispute');
+        await processStripeEvent(paidV2(), f.deps);
+        expect(await processStripeEvent(dispute(restore), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()][1]).toMatchObject({ kind: restore ? 'restore' : 'suspend',
+            meter: 'compute_std_seconds', subscriptionId: 'sub_local', amount: BigInt(restore ? 216000 : -216000) });
+    });
+
+    it.each([false, true])('lets a failed outcome win over a review in either order (failed first=%s)', async failedFirst => {
+        const { store, stripe, deps } = fixture();
+        vi.spyOn(stripe, 'retrieveCharge')
+            .mockResolvedValueOnce({ ...stripe.charge, refunded: !failedFirst ? false : true })
+            .mockResolvedValueOnce({ ...stripe.charge, refunded: failedFirst ? false : true });
+        const input = refund();
+        input.data.object.refunds = { data: [{ id: 're_first' }, { id: 're_second' }] };
+        expect(await processStripeEvent(input, deps)).toBe('failed:no_grant_for_refund');
+        expect(store.grants.size).toBe(0);
+    });
+});
+
+describe('v2 payment issues and plan changes', () => {
+    it.each(['invoice.payment_failed', 'invoice.payment_action_required', 'invoice.voided', 'invoice.marked_uncollectible'])('ignores unrelated standalone %s without recording a payment issue', async type => {
+        const { store, stripe, deps } = v2Fixture();
+        stripe.invoice.subscriptionId = null;
+        stripe.invoice.billingReason = 'manual';
+        stripe.invoice.status = 'open';
+        const recordPaymentIssue = vi.spyOn(store, 'recordPaymentIssue');
+        expect(await processStripeEvent(issueEvent(type), deps)).toBe('ignored');
+        expect(recordPaymentIssue).not.toHaveBeenCalled();
+        expect(store.issues.size).toBe(0);
+        expect(store.consents).toEqual([]);
+        expect(store.planChanges).toEqual([]);
+        expect(store.writes).toEqual([]);
+    });
+
+    it.each(['invoice.payment_failed', 'invoice.payment_action_required', 'invoice.voided', 'invoice.marked_uncollectible'])('reviews %s for unknown overage without writes, with a known-row control', async type => {
+        const f = v2Fixture('compute_monthly_v2');
+        await seedOverage(f);
+        f.stripe.invoice.status = 'open';
+        const [overage] = f.store.overageInvoices.splice(0);
+        const recordPaymentIssue = vi.spyOn(f.store, 'recordPaymentIssue');
+        const recordConsent = vi.spyOn(f.store, 'recordConsent');
+        const setOverageInvoiceStatus = vi.spyOn(f.store, 'setOverageInvoiceStatus');
+        expect(await processStripeEvent(issueEvent(type), f.deps)).toBe('review:unknown_overage_invoice');
+        expect(recordPaymentIssue).not.toHaveBeenCalled();
+        expect(recordConsent).not.toHaveBeenCalled();
+        expect(setOverageInvoiceStatus).not.toHaveBeenCalled();
+        expect(f.store.issues.size).toBe(0);
+        expect(f.store.writes).toEqual([]);
+        expect(await f.store.latestConsent('user_local', 'sub_local')).toMatchObject({ enabled: true });
+
+        f.store.overageInvoices.push(overage);
+        expect(await processStripeEvent(issueEvent(type), f.deps)).toBe('applied');
+        expect(await f.store.latestConsent('user_local', 'sub_local')).toMatchObject({
+            enabled: false, actor: 'system:overage_payment_issue',
+        });
+        expect(f.store.issues.get('in_local')).toMatchObject({ invoiceKind: 'overage', subscriptionId: 'sub_local' });
+    });
+
+    it.each([
+        ['invoice.payment_failed', 'payment_failed', 'payment_failed'],
+        ['invoice.payment_action_required', 'requires_action', 'requires_action'],
+        ['invoice.voided', 'voided', 'void'],
+        ['invoice.marked_uncollectible', 'uncollectible', 'uncollectible'],
+    ])('records %s on overage and disables consent once', async (type, issue, status) => {
+        const f = v2Fixture('compute_monthly_v2');
+        await seedOverage(f);
+        f.stripe.invoice.status = 'open';
+        const input = issueEvent(type);
+        expect(await processStripeEvent(input, f.deps)).toBe('applied');
+        expect(await processStripeEvent(input, f.deps)).toBe('applied');
+        expect(await f.store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({
+            stripeInvoiceId: 'in_local', userId: 'user_local', subscriptionId: 'sub_local', invoiceKind: 'overage', issue,
+            hostedInvoiceUrl: 'https://invoice.stripe.com/local', stripeEventCreated: now,
+        })]);
+        expect(f.store.overageInvoices[0].status).toBe(status);
+        expect(f.store.consents).toHaveLength(2);
+        expect(await f.store.latestConsent('user_local', 'sub_local')).toMatchObject({
+            enabled: false, capCents: 4200, actor: 'system:overage_payment_issue', acceptedAt: now,
+            termsVersion: OVERAGE_TERMS_VERSION, catalogVersion: 2, rateCentsPerStdHour: 25,
+        });
+        expect(f.store.grants.size).toBe(0);
+    });
+
+    it.each([
+        ['invoice.payment_failed', 'payment_failed'], ['invoice.payment_action_required', 'requires_action'],
+    ])('records %s on an upgrade without granting', async (type, state) => {
+        const { store, stripe, deps } = v2Fixture();
+        await seedChange(store);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.status = 'open';
+        expect(await processStripeEvent(issueEvent(type, true), deps)).toBe('applied');
+        expect(store.planChanges[0]).toMatchObject({ state, stripeInvoiceId: 'in_local' });
+        expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ invoiceKind: 'upgrade', issue: state })]);
+        expect(store.grants.size).toBe(0);
+        if (type === 'invoice.payment_failed') expect(store.subscriptions.get('sub_local')?.sku).toBe('standard_monthly_v2');
+    });
+
+    it('syncs failed subscription payments and records their issue', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        stripe.subscription.status = 'past_due';
+        stripe.invoice.status = 'open';
+        expect(await processStripeEvent(issueEvent('invoice.payment_failed', true), deps)).toBe('applied');
+        expect(store.subscriptions.get('sub_local')?.status).toBe('past_due');
+        expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ invoiceKind: 'subscription', issue: 'payment_failed' })]);
+        expect(store.grants.size).toBe(0);
+    });
+
+    it('scopes upgrade invoice issue plan changes to the resolved user', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        await seedChange(store);
+        store.planChanges[0].userId = 'user_owner';
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.status = 'open';
+        const update = vi.spyOn(store, 'setPlanChangeState');
+        expect(await processStripeEvent(issueEvent('invoice.payment_action_required', true), deps)).toBe('applied');
+        expect(update).toHaveBeenCalledWith({ userId: 'user_local', subscriptionId: 'sub_local', kind: 'upgrade',
+            stripeInvoiceId: 'in_local', state: 'requires_action' });
+        expect(store.planChanges[0].state).toBe('pending');
+    });
+
+    it.each(['applied', 'expired'] as const)('syncs pending update %s and changes only the open upgrade state', async outcome => {
+        const { store, stripe, deps } = v2Fixture(outcome === 'applied' ? 'compute_monthly_v2' : 'standard_monthly_v2');
+        await seedChange(store);
+        expect(await processStripeEvent(event(`customer.subscription.pending_update_${outcome}`, {
+            id: 'sub_local', pending_update: null,
+        }), deps)).toBe('applied');
+        expect(store.planChanges[0].state).toBe(outcome);
+        expect(store.subscriptions.get('sub_local')?.sku).toBe(stripe.subscription.sku);
+        expect(store.grants.size).toBe(0);
+    });
+
+    it('does not use invoice metadata to attribute payment issues', async () => {
+        const f = v2Fixture();
+        await seedOverage(f);
+        f.store.customers.clear();
+        expect(await processStripeEvent(issueEvent('invoice.payment_failed'), f.deps)).toBe('unattributed:customer');
+        expect(f.store.issues.size).toBe(0);
+        expect(f.store.consents).toHaveLength(1);
+    });
+});
+
+describe('late usage heartbeat', () => {
+    it('accepts late heartbeats after stop without opening or touching, and allows an explicit restart', async () => {
+        vi.spyOn(Date, 'now').mockReturnValue(now.getTime());
+        const { store } = fixture();
+        const usage = (type: 'start' | 'stop' | 'heartbeat', seconds: number): UsageEvent => ({
+            type, computerId: 'computer_local', at: new Date(now.getTime() + seconds * 1000).toISOString(),
+        });
+        expect(await ingestUsageEvents([usage('start', 0), usage('stop', 60)], { store })).toEqual({ accepted: 2, rejected: 0 });
+        const calls = [...store.usageCalls];
+        expect(await ingestUsageEvents([usage('heartbeat', 30), usage('heartbeat', 120)], { store })).toEqual({ accepted: 2, rejected: 0 });
+        expect(store.usageCalls).toEqual(calls);
+        expect(store.intervals).toHaveLength(1);
+        expect(store.intervals[0].endedAt).toEqual(new Date(now.getTime() + 60000));
+        await ingestUsageEvents([usage('start', 150), usage('heartbeat', 180)], { store });
+        expect(store.intervals).toHaveLength(2);
+        expect(store.intervals[1]).toMatchObject({ endedAt: null, lastSeenAt: new Date(now.getTime() + 180000) });
     });
 });

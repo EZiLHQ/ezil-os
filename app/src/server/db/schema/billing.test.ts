@@ -1,12 +1,16 @@
 import { readFileSync } from 'node:fs';
-import { getTableConfig } from 'drizzle-orm/pg-core';
+import { getTableConfig, PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 
 import * as billing from './billing';
 
 const migration = readFileSync(new URL('../../../../drizzle/0003_billing.sql', import.meta.url), 'utf8');
 const journal = JSON.parse(readFileSync(new URL('../../../../drizzle/meta/_journal.json', import.meta.url), 'utf8'));
-const tables = Object.values(billing).map(getTableConfig);
+const v1Tables = [
+    billing.billingCustomers, billing.billingEvents, billing.billingGrants, billing.billingOutbox,
+    billing.billingStorageSamples, billing.billingSubscriptions, billing.billingUsageIntervals,
+];
+const tables = v1Tables.map(getTableConfig);
 const tableNames = tables.map((table) => table.name).sort();
 const appendOnlyNames = [billing.billingGrants, billing.billingStorageSamples]
     .map((table) => getTableConfig(table).name);
@@ -79,7 +83,7 @@ function assertBillingMigration(sql: string): void {
 }
 
 describe('billing schema and migration 0003', () => {
-    it('exports exactly the seven contract tables and applies the migration guards to those names', () => {
+    it('keeps the seven v1 contract tables and applies the migration guards to those names', () => {
         expect(tableNames).toEqual([
             'ezil_billing_customers',
             'ezil_billing_events',
@@ -171,5 +175,179 @@ describe('billing schema and migration 0003', () => {
     ])('rejects unrelated or destructive SQL: %s', (extra) => {
         assertBillingMigration(migration);
         expect(() => assertBillingMigration(`${migration}\n${extra}`)).toThrow();
+    });
+});
+
+const migrationV2 = readFileSync(new URL('../../../../drizzle/0004_billing_v2.sql', import.meta.url), 'utf8');
+const v2Tables = [
+    billing.billingComputeEpochs, billing.billingOverageConsents, billing.billingOverageInvoices,
+    billing.billingPaymentIssues, billing.billingPlanChanges, billing.billingSizePreferences,
+].map(getTableConfig);
+const v2Names = v2Tables.map(table => table.name).sort();
+const grantChecks = {
+    meter: `"ezil_billing_grants"."meter" in ('workspace_seconds', 'ai_usd_micro', 'compute_std_seconds')`,
+    kind: `"ezil_billing_grants"."kind" in ('pro_period', 'topup', 'revoke', 'suspend', 'restore', 'plan_period', 'upgrade_prorated')`,
+};
+const v2Indexes = [
+    `CREATE UNIQUE INDEX "ezil_billing_grants_plan_period_uidx" ON "ezil_billing_grants" USING btree ("subscription_id","period_start","meter") WHERE "ezil_billing_grants"."kind" = 'plan_period'`,
+    `CREATE UNIQUE INDEX "ezil_billing_compute_epochs_open_computer_uidx" ON "ezil_billing_compute_epochs" USING btree ("computer_id") WHERE "ezil_billing_compute_epochs"."ended_at" is null`,
+    `CREATE UNIQUE INDEX "ezil_billing_plan_changes_open_kind_uidx" ON "ezil_billing_plan_changes" USING btree ("subscription_id","kind") WHERE "ezil_billing_plan_changes"."state" in ('pending', 'requires_action', 'payment_failed', 'scheduled')`,
+];
+
+function assertBillingV2Migration(sql: string): void {
+    const parsed = statements(sql);
+    const namesFor = (pattern: RegExp) => parsed.flatMap(statement => {
+        const match = statement.match(pattern);
+        return match ? [match[1]] : [];
+    }).sort();
+    expect(namesFor(/^CREATE TABLE "([^"]+)"\s*\(/i)).toEqual(v2Names);
+    expect(namesFor(/^ALTER TABLE "([^"]+)" ENABLE ROW LEVEL SECURITY$/i)).toEqual(v2Names);
+    expect(namesFor(/^CREATE POLICY "Service role full access [^"]+"\s+ON "([^"]+)" FOR ALL USING \(auth\.role\(\) = 'service_role'\)$/i))
+        .toEqual(v2Names);
+    expect(parsed.filter(statement => /^CREATE (?:OR REPLACE )?FUNCTION/i.test(statement))).toEqual([]);
+
+    for (const name of v2Names) {
+        expect(parsed).toContain(`ALTER TABLE "${name}" ADD CONSTRAINT "${name}_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE cascade ON UPDATE cascade`);
+        const create = parsed.find(statement => statement.startsWith(`CREATE TABLE "${name}"`))!;
+        expect(create).toMatch(/"user_id" uuid (?:PRIMARY KEY )?NOT NULL/);
+    }
+    expect(parsed).toContain('ALTER TABLE "ezil_billing_compute_epochs" ADD CONSTRAINT "ezil_billing_compute_epochs_computer_id_fkey" FOREIGN KEY ("computer_id") REFERENCES "public"."ezil_computers"("id") ON DELETE cascade ON UPDATE cascade');
+
+    expect(parsed.find(statement => statement.startsWith('CREATE TABLE "ezil_billing_overage_consents"')))
+        .toContain('CONSTRAINT "ezil_billing_overage_consents_decision_unique" UNIQUE("user_id","subscription_id","accepted_at","enabled","cap_cents","terms_version","catalog_version","rate_cents_per_std_hour","actor")');
+    for (const [events, scope] of [['UPDATE OR DELETE', 'ROW'], ['TRUNCATE', 'STATEMENT']]) {
+        const pattern = new RegExp(`^CREATE TRIGGER "[^"]+"\\s+BEFORE ${events} ON "ezil_billing_overage_consents"\\s+FOR EACH ${scope} EXECUTE FUNCTION "public"\\."ezil_billing_refuse_mutation"\\(\\)$`, 'i');
+        expect(parsed.filter(statement => pattern.test(statement))).toHaveLength(1);
+    }
+    const drops = ['meter', 'kind'].map(name => `ALTER TABLE "ezil_billing_grants" DROP CONSTRAINT "ezil_billing_grants_${name}_chk"`);
+    const grantAlters = [
+        ...drops,
+        'ALTER TABLE "ezil_billing_grants" ADD COLUMN "subscription_id" text',
+        ...Object.entries(grantChecks).map(([name, value]) => `ALTER TABLE "ezil_billing_grants" ADD CONSTRAINT "ezil_billing_grants_${name}_chk" CHECK (${value})`),
+    ];
+    expect(parsed.filter(statement => /\bDROP\b/i.test(statement)).sort()).toEqual(drops.sort());
+    expect(parsed.filter(statement => statement.startsWith('ALTER TABLE "ezil_billing_grants"')).sort()).toEqual(grantAlters.sort());
+    expect(parsed.filter(statement => /^CREATE UNIQUE INDEX/i.test(statement)).sort()).toEqual([...v2Indexes].sort());
+    const dialect = new PgDialect();
+    for (const table of v2Tables) {
+        for (const check of table.checks) {
+            expect(sql).toContain(`CONSTRAINT "${check.name}" CHECK (${dialect.sqlToQuery(check.value).sql})`);
+        }
+    }
+    for (const statement of parsed) {
+        const target = statement.match(/^(?:CREATE TABLE|ALTER TABLE) "([^"]+)"/i)
+            ?? statement.match(/^CREATE (?:UNIQUE INDEX|POLICY|TRIGGER) "[^"]+"\s+(?:BEFORE (?:UPDATE OR DELETE|TRUNCATE)\s+)?ON "([^"]+)"/i);
+        if (!target || ![...v2Names, 'ezil_billing_grants'].includes(target[1])) {
+            throw new Error('Statement targets something outside the v2 billing tables');
+        }
+        if (/^ALTER TABLE/i.test(statement) && target[1] !== 'ezil_billing_grants') {
+            expect(statement).toMatch(/^ALTER TABLE "[^"]+" (?:ENABLE ROW LEVEL SECURITY|ADD CONSTRAINT "[^"]+" FOREIGN KEY \("[^"]+"\) REFERENCES "(?:auth|public)"\."(?:users|ezil_computers)"\("id"\) ON DELETE cascade ON UPDATE cascade)$/i);
+        }
+    }
+}
+
+describe('billing schema and migration 0004', () => {
+    it('adds exactly six tables with service-only RLS, cascading ownership and all SQL guards', () => {
+        expect(v2Names).toEqual([
+            'ezil_billing_compute_epochs', 'ezil_billing_overage_consents', 'ezil_billing_overage_invoices',
+            'ezil_billing_payment_issues', 'ezil_billing_plan_changes', 'ezil_billing_size_preferences',
+        ]);
+        expect(Object.values(billing).map(table => getTableConfig(table).name).sort()).toEqual([...tableNames, ...v2Names].sort());
+        assertBillingV2Migration(migrationV2);
+        for (const table of v2Tables) {
+            expect(table.enableRLS).toBe(true);
+            const fk = table.foreignKeys.find(key => key.getName() === `${table.name}_user_id_fkey`)!;
+            expect(fk).toBeDefined();
+            expect(fk.onDelete).toBe('cascade');
+            expect(fk.onUpdate).toBe('cascade');
+            const ref = fk.reference();
+            expect(ref.columns.map(column => column.name)).toEqual(['user_id']);
+            expect(ref.columns[0].notNull).toBe(true);
+            expect(getTableConfig(ref.foreignTable)).toMatchObject({ name: 'users', schema: 'auth' });
+            expect(ref.foreignColumns.map(column => column.name)).toEqual(['id']);
+        }
+    });
+
+    it('uses integer quantities, timezone-aware instants, identity order and partial uniqueness', () => {
+        for (const table of v2Tables) {
+            for (const column of table.columns) {
+                expect(column.getSQLType()).not.toMatch(/numeric|real|double/i);
+                if (column.dataType === 'date') expect(column.getSQLType()).toBe('timestamp with time zone');
+            }
+        }
+        expect(billing.billingOverageConsents.id.generatedIdentity?.type).toBe('always');
+        expect(billing.billingOverageConsents.id.primary).toBe(true);
+        expect(billing.billingOverageInvoices.stdSecondsOver.mapFromDriverValue('9007199254740993')).toBe(BigInt('9007199254740993'));
+        expect(billing.billingComputeEpochs.overheadSeconds.default).toBe(0);
+        const computerFk = getTableConfig(billing.billingComputeEpochs).foreignKeys
+            .find(key => key.getName() === 'ezil_billing_compute_epochs_computer_id_fkey')!;
+        expect(computerFk.onDelete).toBe('cascade');
+        expect(computerFk.onUpdate).toBe('cascade');
+        for (const table of [billing.billingComputeEpochs, billing.billingPlanChanges, billing.billingGrants]) {
+            const [index] = getTableConfig(table).indexes;
+            expect(index.config.unique).toBe(true);
+            expect(index.config.where).toBeDefined();
+        }
+    });
+
+    it('registers 0004 and carries every previous table unchanged except the three specified grant additions', () => {
+        expect(journal.entries.filter((entry: { idx: number }) => entry.idx === 4)).toEqual([
+            expect.objectContaining({ idx: 4, tag: '0004_billing_v2', version: '7', when: expect.any(Number), breakpoints: true }),
+        ]);
+        const previous = JSON.parse(readFileSync(new URL('../../../../drizzle/meta/0003_snapshot.json', import.meta.url), 'utf8'));
+        const current = JSON.parse(readFileSync(new URL('../../../../drizzle/meta/0004_snapshot.json', import.meta.url), 'utf8'));
+        expect(current.prevId).toBe(previous.id);
+        const grants = structuredClone(previous.tables['public.ezil_billing_grants']);
+        grants.columns.subscription_id = { name: 'subscription_id', type: 'text', primaryKey: false, notNull: false };
+        for (const [name, value] of Object.entries(grantChecks)) {
+            grants.checkConstraints[`ezil_billing_grants_${name}_chk`].value = value;
+        }
+        grants.indexes.ezil_billing_grants_plan_period_uidx = {
+            name: 'ezil_billing_grants_plan_period_uidx',
+            columns: ['subscription_id', 'period_start', 'meter'].map(expression => ({ expression, isExpression: false, asc: true, nulls: 'last' })),
+            isUnique: true, where: `"ezil_billing_grants"."kind" = 'plan_period'`, concurrently: false, method: 'btree', with: {},
+        };
+        for (const [name, table] of Object.entries(previous.tables)) {
+            expect(current.tables[name]).toEqual(name === 'public.ezil_billing_grants' ? grants : table);
+        }
+        expect(Object.keys(current.tables).filter(name => !(name in previous.tables)).sort()).toEqual(v2Names.map(name => `public.${name}`));
+        for (const table of v2Tables) {
+            const snapshot = current.tables[`public.${table.name}`];
+            expect(snapshot.isRLSEnabled).toBe(true);
+            expect(Object.keys(snapshot.columns).sort()).toEqual(table.columns.map(column => column.name).sort());
+            expect(Object.keys(snapshot.checkConstraints).sort()).toEqual(table.checks.map(check => check.name).sort());
+        }
+    });
+
+    it.each([
+        ['missing table', (sql: string) => sql.replace('CREATE TABLE "ezil_billing_compute_epochs"', 'CREATE TABLE "unexpected"')],
+        ['missing RLS', (sql: string) => sql.replace('ENABLE ROW LEVEL SECURITY', 'DISABLE ROW LEVEL SECURITY')],
+        ['client policy', (sql: string) => sql.replace("auth.role() = 'service_role'", "auth.role() = 'authenticated'")],
+        ['missing user cascade', (sql: string) => sql.replace('ON DELETE cascade', 'ON DELETE restrict')],
+        ['missing row trigger', (sql: string) => sql.replace('BEFORE UPDATE OR DELETE', 'BEFORE UPDATE')],
+        ['missing truncate trigger', (sql: string) => sql.replace('BEFORE TRUNCATE', 'AFTER TRUNCATE')],
+        ['wrong guard function', (sql: string) => sql.replace('EXECUTE FUNCTION "public"."ezil_billing_refuse_mutation"', 'EXECUTE FUNCTION "public"."other"')],
+        ['missing grant meter', (sql: string) => sql.replace(", 'compute_std_seconds'", '')],
+        ['missing grant kind', (sql: string) => sql.replace(", 'upgrade_prorated'", '')],
+        ['missing grant predicate', (sql: string) => sql.replace(` WHERE "ezil_billing_grants"."kind" = 'plan_period'`, '')],
+        ['missing epoch predicate', (sql: string) => sql.replace(' WHERE "ezil_billing_compute_epochs"."ended_at" is null', '')],
+        ['missing plan predicate', (sql: string) => sql.replace(` WHERE "ezil_billing_plan_changes"."state" in ('pending', 'requires_action', 'payment_failed', 'scheduled')`, '')],
+        ['wrong size check', (sql: string) => sql.replace("'free-cf', 'std-2', 'cmp-4', 'cmp-8'", "'std-2'")],
+    ])('rejects %s with the original as a positive control', (_name, mutate) => {
+        assertBillingV2Migration(migrationV2);
+        expect(() => assertBillingV2Migration(mutate(migrationV2))).toThrow();
+    });
+
+    it.each([
+        'DROP TABLE "ezil_billing_compute_epochs";',
+        'ALTER TABLE "ezil_billing_grants" DROP CONSTRAINT "ezil_billing_grants_source_type_chk";',
+        'ALTER TABLE "ezil_billing_compute_epochs" DROP COLUMN "size";',
+        'ALTER TABLE "ezil_computers" ENABLE ROW LEVEL SECURITY;',
+        'CREATE TABLE "unrelated" ("id" integer);',
+        'DELETE FROM "unrelated";',
+        'CREATE FUNCTION "public"."unexpected"() RETURNS integer LANGUAGE sql AS $$ SELECT 1; $$;',
+    ])('rejects extra destructive or unrelated SQL: %s', extra => {
+        assertBillingV2Migration(migrationV2);
+        expect(() => assertBillingV2Migration(`${migrationV2}\n${extra}`)).toThrow();
     });
 });

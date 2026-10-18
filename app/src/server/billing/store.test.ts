@@ -150,7 +150,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
         expect((await store.subscriptionsFor(userId))[0]).toMatchObject({ status: 'trialing', cancelAtPeriodEnd: true });
 
         const newer = {
-            ...row, userId: otherUserId, status: 'canceled', sku: 'free_v1',
+            ...row, status: 'canceled', sku: 'free_v1',
             currentPeriodStart: null, currentPeriodEnd: null, stripeEventCreated: instant(11),
         };
         expect(await store.upsertSubscription(newer)).toBe('applied');
@@ -163,6 +163,25 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
         expect(await store.upsertSubscription(other)).toBe('applied');
         expect((await store.subscriptionsFor(otherUserId)).map(sub => sub.stripeSubscriptionId)).toEqual([other.stripeSubscriptionId]);
         expect((await store.subscriptionsFor(userId)).map(sub => sub.stripeSubscriptionId)).toEqual([row.stripeSubscriptionId]);
+    });
+
+    it('rejects another owner of an existing subscription for older, equal and newer events without changing the row', async () => {
+        const row: SubscriptionUpsert = {
+            stripeSubscriptionId: `sub_${randomUUID()}`, userId, status: 'active', sku: 'compute_monthly_v2',
+            currentPeriodStart: instant(0), currentPeriodEnd: instant(1000), cancelAtPeriodEnd: false,
+            stripeEventCreated: instant(10),
+        };
+        expect(await store.upsertSubscription(row)).toBe('applied');
+        const before = await db.select().from(billingSubscriptions)
+            .where(eq(billingSubscriptions.stripeSubscriptionId, row.stripeSubscriptionId));
+        for (const created of [9, 10, 11]) {
+            expect(await store.upsertSubscription({ ...row, userId: otherUserId, status: 'past_due',
+                sku: 'standard_monthly_v2', currentPeriodStart: instant(1000), currentPeriodEnd: instant(2000),
+                cancelAtPeriodEnd: true, stripeEventCreated: instant(created) })).toBe('conflict');
+            expect(await db.select().from(billingSubscriptions)
+                .where(eq(billingSubscriptions.stripeSubscriptionId, row.stripeSubscriptionId))).toEqual(before);
+        }
+        expect(await store.subscriptionsFor(otherUserId)).toEqual([]);
     });
 
     it('deduplicates grants by the full source/meter/kind key and preserves bigint amounts', async () => {

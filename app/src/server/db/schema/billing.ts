@@ -14,6 +14,8 @@ import {
     uuid,
 } from 'drizzle-orm/pg-core';
 
+import type { EpochEndReason, SizeCode, SizeWeight } from '@/server/billing/v2/contract';
+
 import { authUsers } from './auth-users';
 import { computers } from './computers';
 
@@ -112,12 +114,16 @@ export const billingGrants = pgTable(
         periodEnd: timestamp('period_end', { withTimezone: true }),
         sourceType: text('source_type').notNull(),
         sourceId: text('source_id').notNull(),
+        subscriptionId: text('subscription_id'),
         createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     },
     (table) => [
-        check('ezil_billing_grants_meter_chk', sql`${table.meter} in ('workspace_seconds', 'ai_usd_micro')`),
-        check('ezil_billing_grants_kind_chk', sql`${table.kind} in ('pro_period', 'topup', 'revoke', 'suspend', 'restore')`),
+        check('ezil_billing_grants_meter_chk', sql`${table.meter} in ('workspace_seconds', 'ai_usd_micro', 'compute_std_seconds')`),
+        check('ezil_billing_grants_kind_chk', sql`${table.kind} in ('pro_period', 'topup', 'revoke', 'suspend', 'restore', 'plan_period', 'upgrade_prorated')`),
         check('ezil_billing_grants_source_type_chk', sql`${table.sourceType} in ('invoice', 'payment_intent', 'refund', 'dispute')`),
+        uniqueIndex('ezil_billing_grants_plan_period_uidx')
+            .on(table.subscriptionId, table.periodStart, table.meter)
+            .where(sql`${table.kind} = 'plan_period'`),
         unique('ezil_billing_grants_source_meter_kind_unique')
             .on(table.sourceType, table.sourceId, table.meter, table.kind),
         foreignKey({
@@ -229,3 +235,181 @@ export type BillingGrantRow = typeof billingGrants.$inferSelect;
 export type BillingUsageIntervalRow = typeof billingUsageIntervals.$inferSelect;
 export type BillingStorageSampleRow = typeof billingStorageSamples.$inferSelect;
 export type BillingOutboxRow = typeof billingOutbox.$inferSelect;
+
+/** A size-stable, whole-second interval from resource readiness to verified stop. */
+export const billingComputeEpochs = pgTable(
+    'ezil_billing_compute_epochs',
+    {
+        id: uuid('id').primaryKey().defaultRandom(),
+        userId: uuid('user_id').notNull(),
+        computerId: uuid('computer_id').notNull(),
+        subscriptionId: text('subscription_id'),
+        size: text('size').$type<SizeCode>().notNull(),
+        weight: integer('weight').$type<SizeWeight>().notNull(),
+        readyAt: timestamp('ready_at', { withTimezone: true }).notNull(),
+        endedAt: timestamp('ended_at', { withTimezone: true }),
+        endReason: text('end_reason').$type<EpochEndReason>(),
+        overheadSeconds: integer('overhead_seconds').notNull().default(0),
+        createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        check('ezil_billing_compute_epochs_size_chk', sql`${table.size} in ('free-cf', 'std-2', 'cmp-4', 'cmp-8')`),
+        check('ezil_billing_compute_epochs_weight_chk', sql`(${table.size} in ('free-cf', 'std-2') and ${table.weight} = 1) or (${table.size} = 'cmp-4' and ${table.weight} = 2) or (${table.size} = 'cmp-8' and ${table.weight} = 4)`),
+        check('ezil_billing_compute_epochs_end_reason_chk', sql`${table.endReason} is null or ${table.endReason} in ('user_stop', 'idle_sleep', 'session_max', 'allowance_exhausted', 'overage_cap', 'payment_issue', 'resize', 'provider_stop', 'platform_failure')`),
+        check('ezil_billing_compute_epochs_end_pair_chk', sql`(${table.endedAt} is null) = (${table.endReason} is null)`),
+        check('ezil_billing_compute_epochs_ended_at_chk', sql`${table.endedAt} is null or ${table.endedAt} >= ${table.readyAt}`),
+        check('ezil_billing_compute_epochs_overhead_seconds_chk', sql`${table.overheadSeconds} >= 0`),
+        uniqueIndex('ezil_billing_compute_epochs_open_computer_uidx')
+            .on(table.computerId)
+            .where(sql`${table.endedAt} is null`),
+        foreignKey({
+            name: 'ezil_billing_compute_epochs_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+        foreignKey({
+            name: 'ezil_billing_compute_epochs_computer_id_fkey',
+            columns: [table.computerId],
+            foreignColumns: [computers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+/** Append-only decisions; identity order, not client timestamps, selects the latest. */
+export const billingOverageConsents = pgTable(
+    'ezil_billing_overage_consents',
+    {
+        id: bigint('id', { mode: 'bigint' }).primaryKey().generatedAlwaysAsIdentity(),
+        userId: uuid('user_id').notNull(),
+        subscriptionId: text('subscription_id').notNull(),
+        enabled: boolean('enabled').notNull(),
+        capCents: integer('cap_cents').notNull(),
+        termsVersion: text('terms_version').notNull(),
+        catalogVersion: integer('catalog_version').notNull(),
+        rateCentsPerStdHour: integer('rate_cents_per_std_hour').notNull(),
+        actor: text('actor').notNull(),
+        acceptedAt: timestamp('accepted_at', { withTimezone: true }).notNull(),
+    },
+    (table) => [
+        unique('ezil_billing_overage_consents_decision_unique')
+            .on(table.userId, table.subscriptionId, table.acceptedAt, table.enabled, table.capCents,
+                table.termsVersion, table.catalogVersion, table.rateCentsPerStdHour, table.actor),
+        check('ezil_billing_overage_consents_cap_cents_chk', sql`${table.capCents} between 0 and 10000`),
+        check('ezil_billing_overage_consents_rate_chk', sql`${table.rateCentsPerStdHour} > 0`),
+        foreignKey({
+            name: 'ezil_billing_overage_consents_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+export const billingOverageInvoices = pgTable(
+    'ezil_billing_overage_invoices',
+    {
+        id: uuid('id').primaryKey().defaultRandom(),
+        userId: uuid('user_id').notNull(),
+        subscriptionId: text('subscription_id').notNull(),
+        periodStart: timestamp('period_start', { withTimezone: true }).notNull(),
+        periodEnd: timestamp('period_end', { withTimezone: true }).notNull(),
+        ratingVersion: integer('rating_version').notNull(),
+        stdSecondsOver: bigint('std_seconds_over', { mode: 'bigint' }).notNull(),
+        cents: integer('cents').notNull(),
+        stripeInvoiceId: text('stripe_invoice_id').unique(),
+        status: text('status', { enum: ['pending', 'open', 'paid', 'payment_failed', 'requires_action', 'void', 'uncollectible'] }).notNull(),
+        createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        check('ezil_billing_overage_invoices_std_seconds_over_chk', sql`${table.stdSecondsOver} >= 0`),
+        check('ezil_billing_overage_invoices_cents_chk', sql`${table.cents} >= 0`),
+        check('ezil_billing_overage_invoices_status_chk', sql`${table.status} in ('pending', 'open', 'paid', 'payment_failed', 'requires_action', 'void', 'uncollectible')`),
+        unique('ezil_billing_overage_invoices_period_rating_unique')
+            .on(table.subscriptionId, table.periodStart, table.ratingVersion),
+        foreignKey({
+            name: 'ezil_billing_overage_invoices_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+export const billingPlanChanges = pgTable(
+    'ezil_billing_plan_changes',
+    {
+        id: uuid('id').primaryKey().defaultRandom(),
+        userId: uuid('user_id').notNull(),
+        subscriptionId: text('subscription_id').notNull(),
+        kind: text('kind', { enum: ['upgrade', 'downgrade', 'cancel'] }).notNull(),
+        fromSku: text('from_sku').notNull(),
+        toSku: text('to_sku'),
+        stripeInvoiceId: text('stripe_invoice_id'),
+        stripeScheduleId: text('stripe_schedule_id'),
+        hostedInvoiceUrl: text('hosted_invoice_url'),
+        state: text('state', { enum: ['pending', 'requires_action', 'payment_failed', 'scheduled', 'applied', 'expired', 'canceled'] }).notNull(),
+        effectiveAt: timestamp('effective_at', { withTimezone: true }),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+        createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        check('ezil_billing_plan_changes_kind_chk', sql`${table.kind} in ('upgrade', 'downgrade', 'cancel')`),
+        check('ezil_billing_plan_changes_state_chk', sql`${table.state} in ('pending', 'requires_action', 'payment_failed', 'scheduled', 'applied', 'expired', 'canceled')`),
+        uniqueIndex('ezil_billing_plan_changes_open_kind_uidx')
+            .on(table.subscriptionId, table.kind)
+            .where(sql`${table.state} in ('pending', 'requires_action', 'payment_failed', 'scheduled')`),
+        foreignKey({
+            name: 'ezil_billing_plan_changes_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+export const billingSizePreferences = pgTable(
+    'ezil_billing_size_preferences',
+    {
+        userId: uuid('user_id').primaryKey(),
+        size: text('size').$type<SizeCode>().notNull(),
+        updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        check('ezil_billing_size_preferences_size_chk', sql`${table.size} in ('free-cf', 'std-2', 'cmp-4', 'cmp-8')`),
+        foreignKey({
+            name: 'ezil_billing_size_preferences_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+export const billingPaymentIssues = pgTable(
+    'ezil_billing_payment_issues',
+    {
+        stripeInvoiceId: text('stripe_invoice_id').primaryKey(),
+        userId: uuid('user_id').notNull(),
+        subscriptionId: text('subscription_id'),
+        invoiceKind: text('invoice_kind', { enum: ['subscription', 'upgrade', 'overage'] }).notNull(),
+        issue: text('issue', { enum: ['payment_failed', 'requires_action', 'voided', 'uncollectible'] }).notNull(),
+        hostedInvoiceUrl: text('hosted_invoice_url'),
+        stripeEventCreated: timestamp('stripe_event_created', { withTimezone: true }).notNull(),
+        resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+        updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        check('ezil_billing_payment_issues_invoice_kind_chk', sql`${table.invoiceKind} in ('subscription', 'upgrade', 'overage')`),
+        check('ezil_billing_payment_issues_issue_chk', sql`${table.issue} in ('payment_failed', 'requires_action', 'voided', 'uncollectible')`),
+        foreignKey({
+            name: 'ezil_billing_payment_issues_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+export type BillingComputeEpochRow = typeof billingComputeEpochs.$inferSelect;
+export type BillingOverageConsentRow = typeof billingOverageConsents.$inferSelect;
+export type BillingOverageInvoiceRow = typeof billingOverageInvoices.$inferSelect;
+export type BillingPlanChangeRow = typeof billingPlanChanges.$inferSelect;
+export type BillingSizePreferenceRow = typeof billingSizePreferences.$inferSelect;
+export type BillingPaymentIssueRow = typeof billingPaymentIssues.$inferSelect;

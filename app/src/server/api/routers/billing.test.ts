@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '@/server/billing/config';
 import type { SubscriptionRow } from '@/server/billing/meters';
-import type { BillingDeps, BillingStore, StripeApi, StripeCheckoutSession, StripeInvoiceSummary } from '@/server/billing/ports';
+import type { BillingDeps, BillingStore, GrantRow, StripeApi, StripeCheckoutSession, StripeInvoiceSummary } from '@/server/billing/ports';
+import { OVERAGE_TERMS_VERSION } from '@/server/billing/v2/contract';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
@@ -40,9 +41,40 @@ function subscription(overrides: Partial<SubscriptionRow> = {}): SubscriptionRow
     };
 }
 
+function grant(amount: number, meter: GrantRow['meter'] = 'compute_std_seconds'): GrantRow {
+    return {
+        id: 'grant_fixture', userId, subscriptionId: 'sub_fixture', meter, kind: meter === 'workspace_seconds' ? 'pro_period' : 'plan_period',
+        amount: BigInt(amount), periodStart: subscription().currentPeriodStart, periodEnd: subscription().currentPeriodEnd,
+        sourceType: 'invoice', sourceId: 'in_fixture', createdAt: now,
+    };
+}
+
 function fixture() {
     let customer: string | null = null;
     const store = {
+        grantsForPeriod: vi.fn<BillingStore['grantsForPeriod']>().mockResolvedValue([]),
+        openEpoch: vi.fn<BillingStore['openEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
+        closeEpoch: vi.fn<BillingStore['closeEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
+        epochsFor: vi.fn<BillingStore['epochsFor']>().mockResolvedValue([{
+            id: 'epoch_fixture', userId, computerId: 'computer', size: 'free-cf', weight: 1,
+            readyAt: '2026-10-01T00:00:00Z', endedAt: '2026-10-01T00:01:00Z', endReason: 'user_stop', overheadSeconds: 0,
+        }]),
+        recordConsent: vi.fn<BillingStore['recordConsent']>(async () => { throw new Error('Unused v2 store stub'); }),
+        latestConsent: vi.fn<BillingStore['latestConsent']>().mockResolvedValue(null),
+        upsertOverageInvoice: vi.fn<BillingStore['upsertOverageInvoice']>(async () => { throw new Error('Unused v2 store stub'); }),
+        attachOverageStripeInvoice: vi.fn<BillingStore['attachOverageStripeInvoice']>(async () => { throw new Error('Unused v2 store stub'); }),
+        setOverageInvoiceStatus: vi.fn<BillingStore['setOverageInvoiceStatus']>(async () => { throw new Error('Unused v2 store stub'); }),
+        overageInvoiceByStripeId: vi.fn<BillingStore['overageInvoiceByStripeId']>(async () => { throw new Error('Unused v2 store stub'); }),
+        overageInvoicesFor: vi.fn<BillingStore['overageInvoicesFor']>(async () => { throw new Error('Unused v2 store stub'); }),
+        recordPlanChange: vi.fn<BillingStore['recordPlanChange']>(async () => { throw new Error('Unused v2 store stub'); }),
+        setPlanChangeState: vi.fn<BillingStore['setPlanChangeState']>(async () => { throw new Error('Unused v2 store stub'); }),
+        openPlanChanges: vi.fn<BillingStore['openPlanChanges']>().mockResolvedValue([]),
+        recordPaymentIssue: vi.fn<BillingStore['recordPaymentIssue']>(async () => { throw new Error('Unused v2 store stub'); }),
+        resolvePaymentIssue: vi.fn<BillingStore['resolvePaymentIssue']>(async () => { throw new Error('Unused v2 store stub'); }),
+        openPaymentIssues: vi.fn<BillingStore['openPaymentIssues']>().mockResolvedValue([]),
+        setSizePreference: vi.fn<BillingStore['setSizePreference']>(async () => { throw new Error('Unused v2 store stub'); }),
+        sizePreference: vi.fn<BillingStore['sizePreference']>().mockResolvedValue(null),
+        userCreatedAt: vi.fn<BillingStore['userCreatedAt']>().mockResolvedValue(now),
         stripeCustomerFor: vi.fn(async () => customer),
         userForStripeCustomer: vi.fn(async () => userId),
         subscriptionsFor: vi.fn(async (): Promise<SubscriptionRow[]> => []),
@@ -59,6 +91,7 @@ function fixture() {
         upsertSubscription: vi.fn(async () => 'applied' as const),
         insertGrant: vi.fn(async () => 'inserted' as const),
         enqueueOutbox: vi.fn(async () => 'queued' as const),
+        latestIntervalFor: vi.fn<BillingStore['latestIntervalFor']>().mockResolvedValue(null),
         openInterval: vi.fn(async () => {}),
         touchInterval: vi.fn(async () => {}),
         closeInterval: vi.fn(async () => {}),
@@ -98,28 +131,84 @@ async function checkoutControl(f = fixture()) {
 }
 
 describe('billing router', () => {
-    it('does no billing reads with the tab off, and loads the same user when enabled', async () => {
+    it('does no store reads with the tab off and returns v2 legacy Free with epochs when enabled', async () => {
         const f = fixture();
         f.deps.config.tabEnabled = false;
         await expect(f.caller.summary()).resolves.toEqual({ enabled: false });
-        expect(f.store.subscriptionsFor).toHaveBeenCalledTimes(0);
-        expect(f.store.intervalsFor).toHaveBeenCalledTimes(0);
-        expect(f.store.latestStorageFor).toHaveBeenCalledTimes(0);
+        for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
         f.deps.config.tabEnabled = true;
-        await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true, meters: { workspace: { usedSeconds: 60 }, storage: { usedBytes: '123' } } });
+        await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true, version: 2,
+            plan: { sku: 'free_v1_legacy', family: 'free' },
+            compute: { allowanceStdSeconds: 28800, usedStdSeconds: 60, remainingStdSeconds: 28740 },
+            storage: { usedBytes: '123' }, overage: null });
         expect(f.store.subscriptionsFor).toHaveBeenCalledWith(userId);
-        expect(f.store.intervalsFor).toHaveBeenCalledWith(userId, new Date('2026-10-01T00:00:00Z'));
+        expect(f.store.epochsFor).toHaveBeenCalledWith(userId, new Date('2026-10-01T00:00:00Z'));
+        expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
+            { start: new Date('2026-10-01T00:00:00Z'), end: new Date('2026-11-01T00:00:00Z') }, []);
         expect(f.store.latestStorageFor).toHaveBeenCalledWith(userId);
+        expect(f.store.latestConsent).not.toHaveBeenCalled();
+        expect(f.store.intervalsFor).not.toHaveBeenCalled();
     });
 
-    it('loads intervals back to the earliest subscription period or Free window', async () => {
+    it('loads the selected Standard period and reads its allowance from grants', async () => {
         const f = fixture();
-        f.store.subscriptionsFor.mockResolvedValue([subscription(), subscription({ currentPeriodStart: null })]);
-        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { id: 'pro' } });
-        expect(f.store.intervalsFor).toHaveBeenCalledWith(userId, new Date('2026-09-20T00:00:00Z'));
-        f.store.subscriptionsFor.mockResolvedValue([subscription({ currentPeriodStart: new Date('2026-10-05T00:00:00Z') })]);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' }),
+            subscription({ stripeSubscriptionId: 'sub_old', status: 'canceled', currentPeriodStart: new Date('2026-01-01T00:00:00Z') })]);
+        f.store.grantsForPeriod.mockResolvedValue([grant(120000)]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { family: 'standard' },
+            compute: { allowanceStdSeconds: 120000, usedStdSeconds: 60, remainingStdSeconds: 119940 } });
+        expect(f.store.epochsFor).toHaveBeenCalledWith(userId, new Date('2026-09-20T00:00:00Z'));
+        expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
+            { start: new Date('2026-09-20T00:00:00Z'), end: new Date('2026-10-20T00:00:00Z') }, ['compute_std_seconds']);
+        expect(f.store.latestConsent).toHaveBeenCalledWith(userId, 'sub_fixture');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2', currentPeriodStart: new Date('2026-10-05T00:00:00Z') })]);
         await f.caller.summary();
-        expect(f.store.intervalsFor).toHaveBeenLastCalledWith(userId, new Date('2026-10-01T00:00:00Z'));
+        expect(f.store.epochsFor).toHaveBeenLastCalledWith(userId, new Date('2026-10-05T00:00:00Z'));
+    });
+
+    it('returns Compute consent, weighted usage, overage and size preference', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'compute_monthly_v2' })]);
+        f.store.grantsForPeriod.mockResolvedValue([grant(144)]);
+        f.store.epochsFor.mockResolvedValue([{
+            id: 'epoch_compute', userId, computerId: 'computer', size: 'cmp-8', weight: 4,
+            readyAt: '2026-10-01T00:00:00Z', endedAt: '2026-10-01T00:01:12Z', endReason: 'user_stop', overheadSeconds: 0,
+        }]);
+        f.store.latestConsent.mockResolvedValue({
+            id: BigInt(1), userId, subscriptionId: 'sub_fixture', enabled: true, capCents: 100,
+            termsVersion: OVERAGE_TERMS_VERSION, catalogVersion: 2, rateCentsPerStdHour: 25, actor: 'user', acceptedAt: now,
+        });
+        f.store.sizePreference.mockResolvedValue('cmp-8');
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { family: 'compute' },
+            compute: { allowanceStdSeconds: 144, usedStdSeconds: 288, remainingStdSeconds: 0, selectedSize: 'cmp-8' },
+            overage: { enabled: true, capCents: 100, accruedCents: 1 },
+            estimate: { subscriptionCents: 10000, accruedOverageCents: 1, worstCaseOverageCents: 100 } });
+    });
+
+    it('loads both compute and legacy workspace grants for Pro', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        f.store.grantsForPeriod.mockResolvedValue([grant(72000, 'workspace_seconds')]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { family: 'pro_legacy' },
+            compute: { allowanceStdSeconds: 72000, remainingStdSeconds: 71940 }, overage: null });
+        expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
+            { start: subscription().currentPeriodStart, end: subscription().currentPeriodEnd }, ['compute_std_seconds', 'workspace_seconds']);
+    });
+
+    it('scopes every summary store read to the authenticated user', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' })]);
+        const otherUser = '22222222-2222-4222-8222-222222222222';
+        const caller = f.router.createCaller({ ...f.ctx, user: { ...f.ctx.user!, id: otherUser } });
+        await caller.summary();
+        const reads = ['subscriptionsFor', 'userCreatedAt', 'openPlanChanges', 'epochsFor', 'grantsForPeriod',
+            'latestConsent', 'openPaymentIssues', 'latestStorageFor', 'sizePreference', 'stripeCustomerFor'] as const;
+        for (const [name, method] of Object.entries(f.store)) {
+            if (reads.includes(name as typeof reads[number])) {
+                expect(method, name).toHaveBeenCalledTimes(1);
+                expect(method.mock.calls[0]?.[0], name).toBe(otherUser);
+            } else expect(method, name).not.toHaveBeenCalled();
+        }
     });
 
     it.each(['flag', 'key', 'client'] as const)('gates every Stripe procedure without %s', async missing => {
@@ -171,6 +260,14 @@ describe('billing router', () => {
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(0);
         f.store.subscriptionsFor.mockResolvedValue([subscription({ status: 'canceled' })]);
         await checkoutControl(f);
+    });
+
+    it('refuses another checkout for a v2 Standard subscription', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' })]);
+        await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
     });
 
     it('creates and links the customer once, using session identity and distinct checkout keys', async () => {
