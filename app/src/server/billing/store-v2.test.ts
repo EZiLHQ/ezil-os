@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as schema from '@/server/db/schema';
 import { billingComputeEpochs, billingOverageConsents, billingPaymentIssues, billingPlanChanges, computers } from '@/server/db/schema';
@@ -12,6 +12,22 @@ import { CATALOG_V2_VERSION, GRANT_METER_COMPUTE, OVERAGE_CENTS_PER_STD_HOUR, OV
 
 type Database = typeof import('@/server/db').db;
 const instant = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000);
+
+it('bounds openEpoch retries when each conflicting epoch closes before the read', async () => {
+    const where = vi.fn().mockResolvedValueOnce([{ id: 'computer_local' }]).mockResolvedValue([]);
+    // The fourth call stops the old unbounded loop, making this regression fail
+    // deterministically instead of hanging the test process.
+    const returning = vi.fn().mockRejectedValue(new Error('Unexpected fourth epoch insert'))
+        .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const db = {
+        select: () => ({ from: () => ({ where }) }),
+        insert: () => ({ values: () => ({ onConflictDoNothing: () => ({ returning }) }) }),
+    } as unknown as Database;
+    await expect(createBillingStore(db).openEpoch({ userId: 'user_local', computerId: 'computer_local',
+        subscriptionId: 'sub_local', size: 'cmp-4', readyAt: instant(0) }))
+        .rejects.toThrow('Could not open compute epoch after 3 attempts');
+    expect(returning).toHaveBeenCalledTimes(3);
+});
 
 /** A disposable, migrated Postgres; one connection and a rollback per test. */
 describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2', () => {

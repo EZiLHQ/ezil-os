@@ -70,7 +70,8 @@ export function createBillingStore(db: Database): BillingStore {
             const readyAt = new Date(epochSeconds(input.readyAt, 'ceil') * 1000);
             // A concurrent close can remove the conflicting open row between the
             // insert and select. Retry then, without changing any existing epoch.
-            for (;;) {
+            // Bound contention so the caller can retry instead of spinning forever.
+            for (let attempt = 0; attempt < 3; attempt++) {
                 const [inserted] = await db.insert(billingComputeEpochs).values({
                     ...input, readyAt, weight: SIZES[input.size].weight,
                 }).onConflictDoNothing().returning();
@@ -84,6 +85,7 @@ export function createBillingStore(db: Database): BillingStore {
                     return { status: 'exists', epoch: computeEpoch(existing) };
                 }
             }
+            throw new Error('Could not open compute epoch after 3 attempts');
         },
 
         async closeEpoch({ computerId, endedAt, reason, overheadSeconds }) {

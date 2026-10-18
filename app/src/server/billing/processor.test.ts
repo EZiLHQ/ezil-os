@@ -7,6 +7,7 @@ import type {
     StripeSubscription, SubscriptionUpsert, UsageEvent, OverageConsentRow, OverageInvoiceRow, PlanChangeRow, PaymentIssueRow,
 } from './ports';
 import { ingestUsageEvents, processStripeEvent } from './processor';
+import { createStripeClient } from './stripe/client';
 import type { StripeEventLike } from './stripe/events';
 import { CATALOG_V2, OVERAGE_PRICE_LOOKUP_KEY, OVERAGE_TERMS_VERSION } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
@@ -696,6 +697,25 @@ async function seedOverage(f: ReturnType<typeof fixture>) {
 }
 
 describe('v2 webhook grants', () => {
+    it('grants a Compute cycle and saves the Compute SKU despite stale Standard metadata', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        const client = createStripeClient({ secretKey: 'sk_test_fixture', fetch: vi.fn<typeof fetch>().mockResolvedValue(
+            Response.json({
+                id: 'sub_local', customer: 'cus_local', status: 'active', cancel_at_period_end: false,
+                metadata: { sku: 'standard_monthly_v2' },
+                items: { data: [{ price: { id: 'price_compute', lookup_key: 'ezil_compute_monthly_v2' },
+                    current_period_start: periodStart.getTime() / 1000, current_period_end: periodEnd.getTime() / 1000 }] },
+            }),
+        ) });
+        vi.spyOn(stripe, 'retrieveSubscription').mockImplementation(client.retrieveSubscription);
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expect.objectContaining({
+            kind: 'plan_period', meter: 'compute_std_seconds', amount: BigInt(1_800_000),
+            subscriptionId: 'sub_local', periodStart, periodEnd,
+        })]);
+        expect(store.subscriptions.get('sub_local')?.sku).toBe('compute_monthly_v2');
+    });
+
     it.each(['standard_monthly_v2', 'compute_monthly_v2'] as const)('grants %s once per invoice and subscription period on create/cycle', async sku => {
         for (const billingReason of ['subscription_create', 'subscription_cycle']) {
             const { store, stripe, deps } = v2Fixture(sku);
@@ -778,6 +798,43 @@ describe('v2 webhook grants', () => {
         expect(expected).toBeLessThan(CATALOG_V2.compute_monthly_v2.allowanceStdSeconds - CATALOG_V2.standard_monthly_v2.allowanceStdSeconds);
         expect(store.planChanges[0]).toMatchObject({ state: 'applied', effectiveAt: now });
         expect(store.outbox.size).toBe(0);
+    });
+
+    it.each(['renewed subscription period', 'different proration end', 'effective date before current period'])('reviews an upgrade with %s without granting or applying the plan change', async scenario => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        await seedChange(store);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+        ];
+        if (scenario === 'renewed subscription period') {
+            stripe.subscription.currentPeriodStart = periodEnd;
+            stripe.subscription.currentPeriodEnd = new Date('2026-12-01T00:00:00Z');
+        } else if (scenario === 'different proration end') {
+            stripe.invoice.lines[1].periodEnd = new Date(periodEnd.getTime() - 1000);
+        } else {
+            stripe.subscription.currentPeriodStart = new Date(now.getTime() + 1000);
+        }
+        const setPlanChangeState = vi.spyOn(store, 'setPlanChangeState');
+        expect(await processStripeEvent(paidV2(), deps)).toBe('review:upgrade_period_mismatch');
+        expect(store.grants.size).toBe(0);
+        expect(store.subscriptions.size).toBe(0);
+        expect(store.planChanges[0]).toMatchObject({ state: 'pending', effectiveAt: null });
+        expect(setPlanChangeState).not.toHaveBeenCalled();
+        expect(store.writes).toEqual([]);
+    });
+
+    it('uses the proration line end when subscription ends agree to whole seconds', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.subscription.currentPeriodEnd = new Date(periodEnd.getTime() + 500);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+        ];
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()][0].periodEnd).toEqual(periodEnd);
     });
 
     it.each(['missing credit', 'nonpositive compute', 'foreign credit', 'downgrade'])('ignores subscription_update: %s', async scenario => {
@@ -873,6 +930,44 @@ describe('v2 webhook grants', () => {
 });
 
 describe('v2 payment issues and plan changes', () => {
+    it.each(['invoice.payment_failed', 'invoice.payment_action_required', 'invoice.voided', 'invoice.marked_uncollectible'])('ignores unrelated standalone %s without recording a payment issue', async type => {
+        const { store, stripe, deps } = v2Fixture();
+        stripe.invoice.subscriptionId = null;
+        stripe.invoice.billingReason = 'manual';
+        stripe.invoice.status = 'open';
+        const recordPaymentIssue = vi.spyOn(store, 'recordPaymentIssue');
+        expect(await processStripeEvent(issueEvent(type), deps)).toBe('ignored');
+        expect(recordPaymentIssue).not.toHaveBeenCalled();
+        expect(store.issues.size).toBe(0);
+        expect(store.consents).toEqual([]);
+        expect(store.planChanges).toEqual([]);
+        expect(store.writes).toEqual([]);
+    });
+
+    it.each(['invoice.payment_failed', 'invoice.payment_action_required', 'invoice.voided', 'invoice.marked_uncollectible'])('reviews %s for unknown overage without writes, with a known-row control', async type => {
+        const f = v2Fixture('compute_monthly_v2');
+        await seedOverage(f);
+        f.stripe.invoice.status = 'open';
+        const [overage] = f.store.overageInvoices.splice(0);
+        const recordPaymentIssue = vi.spyOn(f.store, 'recordPaymentIssue');
+        const recordConsent = vi.spyOn(f.store, 'recordConsent');
+        const setOverageInvoiceStatus = vi.spyOn(f.store, 'setOverageInvoiceStatus');
+        expect(await processStripeEvent(issueEvent(type), f.deps)).toBe('review:unknown_overage_invoice');
+        expect(recordPaymentIssue).not.toHaveBeenCalled();
+        expect(recordConsent).not.toHaveBeenCalled();
+        expect(setOverageInvoiceStatus).not.toHaveBeenCalled();
+        expect(f.store.issues.size).toBe(0);
+        expect(f.store.writes).toEqual([]);
+        expect(await f.store.latestConsent('user_local', 'sub_local')).toMatchObject({ enabled: true });
+
+        f.store.overageInvoices.push(overage);
+        expect(await processStripeEvent(issueEvent(type), f.deps)).toBe('applied');
+        expect(await f.store.latestConsent('user_local', 'sub_local')).toMatchObject({
+            enabled: false, actor: 'system:overage_payment_issue',
+        });
+        expect(f.store.issues.get('in_local')).toMatchObject({ invoiceKind: 'overage', subscriptionId: 'sub_local' });
+    });
+
     it.each([
         ['invoice.payment_failed', 'payment_failed', 'payment_failed'],
         ['invoice.payment_action_required', 'requires_action', 'requires_action'],

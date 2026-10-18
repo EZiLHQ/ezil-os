@@ -608,7 +608,7 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(fetcher).toHaveBeenCalledTimes(2);
     });
 
-    it.each([undefined, { sku: 'unknown_sku' }])('infers SKU from the first recognized subscription item with metadata %j', async metadata => {
+    it.each([undefined, { sku: 'unknown_sku' }, { sku: 'standard_monthly_v2' }])('infers SKU from the first recognized subscription item with metadata %j', async metadata => {
         const { client, fetcher } = fixture({ ...subscription, metadata, pending_update: { expires_at: end }, items: { data: [
             { price: { id: 'price_unrelated', lookup_key: 'unrelated' }, current_period_start: 10, current_period_end: 20 },
             { price: { id: 'price_compute', lookup_key: computeKey }, current_period_start: start, current_period_end: end },
@@ -622,11 +622,15 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(fetcher).toHaveBeenCalledTimes(1);
     });
 
-    it('honors known metadata SKU and maps null pending updates and unknown items', async () => {
+    it('prefers the item SKU over known metadata and falls back to metadata for inline prices', async () => {
         const { client, fetcher } = fixture({ ...subscription, current_period_start: start, current_period_end: end,
             pending_update: null, items: { data: [{ price: { id: 'price_compute', lookup_key: computeKey } }] } });
-        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription,
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription, sku: 'compute_monthly_v2',
             items: [{ priceId: 'price_compute', lookupKey: computeKey }] });
+        fetcher.mockResolvedValueOnce(Response.json({ ...subscription, current_period_start: start, current_period_end: end,
+            items: { data: [{ price: { id: 'price_inline', lookup_key: null } }] } }));
+        expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription,
+            items: [{ priceId: 'price_inline', lookupKey: null }] });
         fetcher.mockResolvedValueOnce(Response.json({ ...subscription, metadata: { sku: 'toString' }, pending_update: null,
             items: { data: [{ price: { id: 'price_unknown', lookup_key: 'unknown' } }, {}] } }));
         expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({ sku: null, pendingUpdateExpiresAt: null,

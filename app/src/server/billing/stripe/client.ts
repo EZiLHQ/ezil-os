@@ -315,7 +315,8 @@ export function createStripeClient(opts: {
             const items = data.map(item => ({ priceId: referenceId(item.price), lookupKey: item.price?.lookup_key ?? null }));
             const metadataSku = subscription.metadata?.sku;
             const itemOffer = items.map(item => item.lookupKey ? offerByLookupKey(item.lookupKey) : undefined).find(Boolean);
-            const sku = metadataSku && offerBySku(metadataSku) ? metadataSku : itemOffer?.sku ?? null;
+            // Pending upgrades change the item Price without changing checkout metadata.
+            const sku = itemOffer?.sku ?? (metadataSku && offerBySku(metadataSku) ? metadataSku : null);
             const offer = sku ? offerBySku(sku) : undefined;
             const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
             return {

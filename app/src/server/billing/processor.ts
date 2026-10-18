@@ -109,12 +109,16 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     && line.amount > 0 && validPeriod(line.periodStart, line.periodEnd));
                 const credit = ownedLines.find(line => line.lookupKey === CATALOG_V2.standard_monthly_v2.stripeLookupKey);
                 if (!compute || !credit) return 'ignored';
-                const { currentPeriodStart: periodStart, currentPeriodEnd: periodEnd } = subscription;
-                if (!validPeriod(periodStart, periodEnd)) return 'review:invalid_period';
+                const { currentPeriodStart: periodStart, currentPeriodEnd } = subscription;
+                if (!validPeriod(periodStart, currentPeriodEnd)) return 'review:invalid_period';
                 const effectiveAt = compute.periodStart!;
+                const periodEnd = compute.periodEnd!;
+                // A late upgrade invoice must not grant against a later renewal.
+                if (Math.floor(periodEnd.getTime() / 1000) !== Math.floor(currentPeriodEnd!.getTime() / 1000)
+                    || effectiveAt < periodStart! || effectiveAt >= periodEnd) return 'review:upgrade_period_mismatch';
                 const amount = upgradeGrantStdSeconds({
                     fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
-                    periodStart: periodStart!.toISOString(), periodEnd: periodEnd!.toISOString(), effectiveAt: effectiveAt.toISOString(),
+                    periodStart: periodStart!.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: effectiveAt.toISOString(),
                 });
                 await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                 await store.insertGrant({
@@ -142,11 +146,13 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
         }
         case 'invoice_issue': {
             const invoice = await stripe.retrieveInvoice(action.invoiceId);
+            if (invoice.metadataKind !== 'overage' && invoice.subscriptionId === null) return 'ignored';
             const userId = await store.userForStripeCustomer(invoice.customer);
             if (userId === null) return 'unattributed:customer';
             const invoiceKind = invoice.metadataKind === 'overage' ? 'overage'
                 : invoice.billingReason === UPGRADE_GRANT_BILLING_REASON ? 'upgrade' : 'subscription';
             const overage = invoiceKind === 'overage' ? await store.overageInvoiceByStripeId(invoice.id) : null;
+            if (invoiceKind === 'overage' && overage === null) return 'review:unknown_overage_invoice';
             if (overage && overage.userId !== userId) return 'review:customer_mismatch';
             const subscriptionId = overage?.subscriptionId ?? invoice.subscriptionId;
             await store.recordPaymentIssue({
