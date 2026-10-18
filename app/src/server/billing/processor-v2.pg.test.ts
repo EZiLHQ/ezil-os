@@ -32,7 +32,8 @@ function subscription(owner: Tenant, sku: SellableSku = 'standard_monthly_v2'): 
     return {
         id: owner.subscriptionId, customer: owner.customerId, status: 'active', sku, cancelAtPeriodEnd: false,
         currentPeriodStart: START, currentPeriodEnd: END, pendingUpdateExpiresAt: null,
-        items: [{ priceId: `price_${sku}`, lookupKey: CATALOG_V2[sku].stripeLookupKey }],
+        defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null,
+        items: [{ id: null, priceId: `price_${sku}`, lookupKey: CATALOG_V2[sku].stripeLookupKey }],
     };
 }
 
@@ -89,6 +90,7 @@ function fakeStripe() {
     }
     const unused = async (): Promise<never> => { throw new Error('Unexpected Stripe API operation'); };
     const api: StripeApi = {
+        resolvePrice: unused, previewUpgrade: unused, confirmUpgrade: unused, scheduleDowngrade: unused, cancelScheduledChange: unused, setCancelAtPeriodEnd: unused,
         retrieveSubscription: async id => read(subscriptions, id), retrieveInvoice: async id => read(invoices, id),
         retrieveCharge: async id => read(charges, id), retrieveCheckoutSession: unused, createCustomer: unused,
         createCheckoutSession: unused, createPortalSession: unused, listInvoices: unused,

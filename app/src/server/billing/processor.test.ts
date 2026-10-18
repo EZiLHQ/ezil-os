@@ -203,10 +203,18 @@ class MemoryStore implements BillingStore {
 }
 
 class MemoryStripe implements StripeApi {
+    async resolvePrice(): Promise<never> { throw new Error('Unexpected resolvePrice'); }
+    async previewUpgrade(): Promise<never> { throw new Error('Unexpected previewUpgrade'); }
+    async confirmUpgrade(): Promise<never> { throw new Error('Unexpected confirmUpgrade'); }
+    async scheduleDowngrade(): Promise<never> { throw new Error('Unexpected scheduleDowngrade'); }
+    async cancelScheduledChange(): Promise<never> { throw new Error('Unexpected cancelScheduledChange'); }
+    async setCancelAtPeriodEnd(): Promise<never> { throw new Error('Unexpected setCancelAtPeriodEnd'); }
+
     reads: string[] = [];
     subscription: StripeSubscription = {
         id: 'sub_local', customer: 'cus_local', sku: PRO_PLAN.sku, status: 'active',
         cancelAtPeriodEnd: false, currentPeriodStart: periodStart, currentPeriodEnd: periodEnd, items: [], pendingUpdateExpiresAt: null,
+        defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null,
     };
     invoice: StripeInvoice = {
         id: 'in_local', customer: 'cus_local', status: 'paid', subscriptionId: 'sub_local', periodStart, periodEnd,
@@ -665,7 +673,7 @@ describe('ingestUsageEvents', () => {
 function v2Fixture(sku: 'standard_monthly_v2' | 'compute_monthly_v2' = 'standard_monthly_v2') {
     const f = fixture();
     f.stripe.subscription.sku = sku;
-    f.stripe.subscription.items = [{ priceId: 'price_base', lookupKey: CATALOG_V2[sku].stripeLookupKey }];
+    f.stripe.subscription.items = [{ id: null, priceId: 'price_base', lookupKey: CATALOG_V2[sku].stripeLookupKey }];
     f.stripe.invoice.lines = [baseLine(sku)];
     return f;
 }

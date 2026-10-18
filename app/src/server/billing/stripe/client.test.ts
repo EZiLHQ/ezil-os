@@ -1,8 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
 import type { CheckoutRequest } from '../ports';
-import { createStripeClient, StripeRequestError } from './client';
+import { BillingProviderError, createStripeClient, resetStripeCachesForTests, StripeRequestError, UPGRADE_PREVIEW_MAX_AGE_SECONDS } from './client';
+
+beforeEach(resetStripeCachesForTests);
+afterEach(() => vi.useRealTimers());
 
 const secretKey = 'sk_test_client_fixture';
 const start = 1_799_000_000;
@@ -21,8 +24,8 @@ const checkoutRequest: CheckoutRequest = {
 };
 const customerRequest = { userId: 'user_fixture', email: 'billing+test@example.com', idempotencyKey: 'customer_fixture' };
 
-function fixture(payload: unknown, opts: { priceProMonthly?: string; apiVersion?: string } = {}) {
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json(payload));
+function fixture(payload: unknown, opts: { priceProMonthly?: string } = {}) {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async url => Response.json(String(url).includes('/invoice_payments?') ? { data: [{ invoice: 'in_fixture' }] } : payload));
     const client = createStripeClient({ secretKey, fetch: fetcher, ...opts });
     return { client, fetcher };
 }
@@ -42,8 +45,6 @@ function commonCheckout(sku = checkoutRequest.sku) {
         'customer_update[address]': 'auto',
         'customer_update[name]': 'auto',
         billing_address_collection: 'auto',
-        'payment_method_types[0]': 'card',
-        'payment_method_types[1]': 'link',
         'adaptive_pricing[enabled]': 'false',
         'saved_payment_method_options[payment_method_save]': 'enabled',
         success_url: checkoutRequest.successUrl,
@@ -72,7 +73,7 @@ const subscription = {
 const expectedSubscription = {
     id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancelAtPeriodEnd: true,
     currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000), sku: 'pro_monthly_v1',
-    pendingUpdateExpiresAt: null,
+    pendingUpdateExpiresAt: null, defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null,
 };
 const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20 };
 const expectedInvoice = {
@@ -106,7 +107,7 @@ describe('createStripeClient requests', () => {
         expect(sent.url).toBe('https://api.stripe.com/v1/customers');
         expect(sent.init?.method).toBe('POST');
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
         expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
         expect(sent.headers.get('Idempotency-Key')).toBe(customerRequest.idempotencyKey);
         expect(sent.body).toEqual({ 'metadata[user_id]': 'user_fixture', email: customerRequest.email });
@@ -122,7 +123,7 @@ describe('createStripeClient requests', () => {
         expect(sent.url).toBe('https://api.stripe.com/v1/checkout/sessions');
         expect(sent.init?.method).toBe('POST');
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
         expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
         expect(sent.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
         expect(sent.body).toEqual(inlinePro());
@@ -166,14 +167,14 @@ describe('createStripeClient requests', () => {
     });
 
     it('lists invoices for one encoded customer and maps descriptions and nullable fields', async () => {
-        const base = { ...invoice, amount_paid: 2000, currency: 'usd', created: start };
+        const base = { ...invoice, amount_paid: 2000, amount_due: 2200, currency: 'usd', created: start };
         const { client, fetcher } = fixture({ data: [
             { ...base, number: 'INV-1', hosted_invoice_url: 'https://invoice.stripe.com/fixture', description: 'Invoice description', lines: { data: [{ description: 'Line description' }] } },
             { ...base, id: 'in_line', number: null, hosted_invoice_url: null, description: null, lines: { data: [{ description: 'EZiL Pro' }] } },
             { ...base, id: 'in_empty', status: 'draft', amount_paid: 0, lines: { data: [] } },
             { ...base, id: 'in_no_lines' },
         ] });
-        const mapped = { id: base.id, number: null, status: 'paid', amountPaidCents: 2000, currency: 'usd', created: new Date(start * 1000), hostedInvoiceUrl: null, description: null };
+        const mapped = { id: base.id, number: null, status: 'paid', amountPaidCents: 2000, amountDueCents: 2200, metadataKind: null, billingReason: null, currency: 'usd', created: new Date(start * 1000), hostedInvoiceUrl: null, description: null };
         expect(await client.listInvoices('cus_fixture&limit=99', 12)).toEqual([
             { ...mapped, number: 'INV-1', hostedInvoiceUrl: 'https://invoice.stripe.com/fixture', description: 'Invoice description' },
             { ...mapped, id: 'in_line', description: 'EZiL Pro' },
@@ -241,16 +242,17 @@ describe('createStripeClient requests', () => {
         expect(fetcher).not.toHaveBeenCalled();
     });
 
-    it('creates a portal session with its return URL and an explicit version override', async () => {
-        const { client, fetcher } = fixture({ id: 'bps_fixture', url: 'https://billing.stripe.com/fixture' }, { apiVersion: '2024-06-20' });
+    it('creates a portal session with its return URL and the pinned version', async () => {
+        const { client, fetcher } = fixture({ id: 'bps_fixture', url: 'https://billing.stripe.com/fixture' });
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ id: 'bpc_v2', metadata: { ezil_portal: 'v2' }, features: { subscription_update: { enabled: false } } }] }));
         expect(await client.createPortalSession({ customerId: 'cus_fixture', returnUrl: checkoutRequest.cancelUrl }))
             .toEqual({ url: 'https://billing.stripe.com/fixture' });
-        const sent = inspect(fetcher);
+        const sent = inspect(fetcher, 1);
         expect(sent.url).toBe('https://api.stripe.com/v1/billing_portal/sessions');
         expect(sent.init?.method).toBe('POST');
-        expect(sent.body).toEqual({ customer: 'cus_fixture', return_url: checkoutRequest.cancelUrl });
+        expect(sent.body).toEqual({ customer: 'cus_fixture', return_url: checkoutRequest.cancelUrl, configuration: 'bpc_v2' });
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2024-06-20');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
     });
 });
 
@@ -259,7 +261,7 @@ describe('Stripe response mapping', () => {
         { name: 'legacy', current_period_start: start, current_period_end: end },
         { name: 'modern', items: { data: [{ current_period_start: start, current_period_end: end }] } },
         { name: 'null legacy', current_period_start: null, current_period_end: null, items: { data: [{ current_period_start: start, current_period_end: end }] } },
-        { name: 'legacy precedence', current_period_start: start, current_period_end: end, items: { data: [{ current_period_start: 10, current_period_end: 20 }] } },
+        { name: 'item precedence', current_period_start: 10, current_period_end: 20, items: { data: [{ current_period_start: start, current_period_end: end }] } },
     ])('maps $name subscription periods', async shape => {
         const { client, fetcher } = fixture({ ...subscription, ...shape, customer: { id: 'cus_fixture' } });
         expect(await client.retrieveSubscription('sub_fixture')).toMatchObject(expectedSubscription);
@@ -267,7 +269,7 @@ describe('Stripe response mapping', () => {
         expect(sent.url).toBe('https://api.stripe.com/v1/subscriptions/sub_fixture');
         expect(sent.init?.method).toBe('GET');
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
         expect(sent.init?.body).toBeUndefined();
     });
 
@@ -367,9 +369,9 @@ describe('Stripe response mapping', () => {
         expect(await client.retrieveCharge('ch_fixture')).toEqual({ ...expectedCharge, invoiceId: 'in_from_payments' });
         const second = fetcher.mock.calls[1][0] as string;
         expect(second).toBe('https://api.stripe.com/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=pi_fixture&limit=1');
-        // Positive control: a charge that still names its invoice makes no second request.
+        // A charge without a PaymentIntent cannot have an Invoice Payment lookup.
         fetcher.mockReset();
-        fetcher.mockResolvedValueOnce(Response.json(charge));
+        fetcher.mockResolvedValueOnce(Response.json({ ...charge, payment_intent: null }));
         await client.retrieveCharge('ch_fixture');
         expect(fetcher).toHaveBeenCalledTimes(1);
     });
@@ -401,7 +403,7 @@ describe('Stripe request failures', () => {
         const error: unknown = await client.createCustomer(customerRequest).catch((error: unknown) => error);
         expect(error).toBeInstanceOf(StripeRequestError);
         expect(error).toMatchObject({ name: 'StripeRequestError', status, code, type });
-        // Stripe's own message is kept for diagnosis, scrubbed of any credential.
+        // Error messages contain only the HTTP status.
         expect((error as Error).message).toMatch(new RegExp(`^Stripe request failed \\(HTTP ${status}\\)`));
         expect(inspect(fetcher, 1).headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
         expect(String(error)).not.toContain(secretKey);
@@ -416,7 +418,8 @@ describe('Stripe request failures', () => {
         } }, { status: 400 }));
         const error = await client.createCustomer(customerRequest).catch((e: unknown) => e) as StripeRequestError;
         expect(error.param).toBe('ui_mode');
-        expect(error.message).toBe('Stripe request failed (HTTP 400) on ui_mode: Invalid ui_mode: embedded_page.');
+        expect(error.message).toBe('Stripe request failed (HTTP 400)');
+        expect(error.detail).toBe('Invalid ui_mode: embedded_page.');
     });
 
     it.each(['not json', '{}', '{"error":{"code":42,"type":false}}', 'null'])('maps malformed HTTP errors to null codes: %s', async body => {
@@ -454,8 +457,6 @@ describe.each(['hosted', 'embedded'] as const)('Managed Payments in %s checkout'
             'adaptive_pricing[enabled]': 'true',
             'customer_update[name]': 'auto',
             'customer_update[address]': 'auto',
-            'payment_method_types[0]': 'card',
-            'payment_method_types[1]': 'link',
         });
         expect(sent.body).toMatchObject({
             'managed_payments[enabled]': 'true', mode,
@@ -467,7 +468,7 @@ describe.each(['hosted', 'embedded'] as const)('Managed Payments in %s checkout'
                 ui_mode: 'embedded_page', return_url: input.returnUrl, redirect_on_completion: 'if_required',
             } : { success_url: input.successUrl, cancel_url: input.cancelUrl }),
         });
-        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
         expect(sent.headers.get('Idempotency-Key')).toBe(input.idempotencyKey);
         expect(ordinary).not.toHaveProperty('managed_payments[enabled]');
         expect(MANAGED_PAYMENTS_TAX_CODE).toBe('txcd_10103000');
@@ -559,7 +560,7 @@ describe('v2 Stripe response mapping and checkout', () => {
         parent: { type: 'subscription_item_details', subscription_item_details: { subscription: 'sub_fixture', proration: true } },
         period: { start, end } });
 
-    it('resolves each distinct endive Price id once per invoice read and maps every line', async () => {
+    it('caches each distinct endive Price id across invoice reads and maps every line', async () => {
         const data = [line('il_first', 'price_fee'), line('il_base', 'price_standard'), line('il_credit', 'price_standard')];
         const { client, fetcher } = fixture(null);
         fetcher.mockImplementation(async url => {
@@ -579,7 +580,7 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(fetcher).toHaveBeenCalledTimes(3);
         expect(fetcher.mock.calls.filter(([url]) => String(url).endsWith('/prices/price_standard'))).toHaveLength(1);
         await client.retrieveInvoice('in_fixture');
-        expect(fetcher).toHaveBeenCalledTimes(6); // Cache lasts one retrieval only.
+        expect(fetcher).toHaveBeenCalledTimes(4); // Price ids persist across retrievals.
     });
 
     it('uses expanded modern and legacy Price lookup keys without extra fetches', async () => {
@@ -616,8 +617,8 @@ describe('v2 Stripe response mapping and checkout', () => {
         ] } });
         expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription, sku: 'compute_monthly_v2',
             pendingUpdateExpiresAt: new Date(end * 1000), items: [
-                { priceId: 'price_unrelated', lookupKey: 'unrelated' },
-                { priceId: 'price_compute', lookupKey: computeKey }, { priceId: 'price_standard', lookupKey: standardKey },
+                { id: null, priceId: 'price_unrelated', lookupKey: 'unrelated' },
+                { id: null, priceId: 'price_compute', lookupKey: computeKey }, { id: null, priceId: 'price_standard', lookupKey: standardKey },
             ] });
         expect(fetcher).toHaveBeenCalledTimes(1);
     });
@@ -626,15 +627,15 @@ describe('v2 Stripe response mapping and checkout', () => {
         const { client, fetcher } = fixture({ ...subscription, current_period_start: start, current_period_end: end,
             pending_update: null, items: { data: [{ price: { id: 'price_compute', lookup_key: computeKey } }] } });
         expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription, sku: 'compute_monthly_v2',
-            items: [{ priceId: 'price_compute', lookupKey: computeKey }] });
+            items: [{ id: null, priceId: 'price_compute', lookupKey: computeKey }] });
         fetcher.mockResolvedValueOnce(Response.json({ ...subscription, current_period_start: start, current_period_end: end,
             items: { data: [{ price: { id: 'price_inline', lookup_key: null } }] } }));
         expect(await client.retrieveSubscription('sub_fixture')).toEqual({ ...expectedSubscription,
-            items: [{ priceId: 'price_inline', lookupKey: null }] });
+            items: [{ id: null, priceId: 'price_inline', lookupKey: null }] });
         fetcher.mockResolvedValueOnce(Response.json({ ...subscription, metadata: { sku: 'toString' }, pending_update: null,
             items: { data: [{ price: { id: 'price_unknown', lookup_key: 'unknown' } }, {}] } }));
         expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({ sku: null, pendingUpdateExpiresAt: null,
-            items: [{ priceId: 'price_unknown', lookupKey: 'unknown' }, { priceId: null, lookupKey: null }] });
+            items: [{ id: null, priceId: 'price_unknown', lookupKey: 'unknown' }, { id: null, priceId: null, lookupKey: null }] });
     });
 
     it.each(['standard_monthly_v2', 'compute_monthly_v2'])('resolves the active Price by lookup key for %s checkout', async sku => {
@@ -649,8 +650,8 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(Object.fromEntries(url.searchParams)).toEqual({ 'lookup_keys[]': lookupKey, active: 'true', limit: '1' });
         expect(lookup.init?.method).toBe('GET');
         expect(inspect(fetcher, 1).body).toMatchObject({ mode: 'subscription', 'line_items[0][price]': 'price_v2',
-            'line_items[0][quantity]': '1', 'subscription_data[metadata][sku]': sku });
-        expect(inspect(fetcher, 1).headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+            'line_items[0][quantity]': '1', 'subscription_data[metadata][sku]': sku, 'subscription_data[metadata][ezil_catalog]': 'v2' });
+        expect(inspect(fetcher, 1).headers.get('Stripe-Version')).toBe('2026-09-30.endive');
         expect(inspect(fetcher, 1).body).not.toHaveProperty('line_items[0][price_data][unit_amount]');
     });
 
@@ -658,7 +659,7 @@ describe('v2 Stripe response mapping and checkout', () => {
         [{ id: 'price_wrong', active: true, lookup_key: computeKey }]])('rejects missing or inactive matching Prices %#', async (...data) => {
         const { client, fetcher } = fixture({ data });
         await expect(client.createCheckoutSession({ ...checkoutRequest, sku: 'standard_monthly_v2' }))
-            .rejects.toThrow(`No active Stripe Price for lookup key ${standardKey}`);
+            .rejects.toMatchObject({ code: 'price_not_found' });
         expect(fetcher).toHaveBeenCalledTimes(1);
     });
 
@@ -666,5 +667,337 @@ describe('v2 Stripe response mapping and checkout', () => {
         const { client, fetcher } = fixture(null);
         await expect(client.createCheckoutSession({ ...checkoutRequest, sku })).rejects.toThrow('Unknown billing SKU');
         expect(fetcher).not.toHaveBeenCalled();
+    });
+});
+
+const standardPrice = { id: 'price_standard', lookup_key: 'ezil_standard_monthly_v2', active: true, unit_amount: 2000, currency: 'usd', recurring: { interval: 'month' } };
+const computePrice = { ...standardPrice, id: 'price_compute', lookup_key: 'ezil_compute_monthly_v2', unit_amount: 10000 };
+const planSubscription = {
+    ...subscription, schedule: null, billing_cycle_anchor: { day_of_month: 1 },
+    items: { data: [{ id: 'si_standard', price: standardPrice, current_period_start: start, current_period_end: end }] },
+};
+const portalConfig = { id: 'bpc_v2', active: true, metadata: { ezil_portal: 'v2' }, features: { subscription_update: { enabled: false } } };
+
+/** Every request in these fixtures must use endive, and Checkout must use dynamic payment methods. */
+function sequence(...responses: unknown[]) {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+        expect(new Headers(init?.headers).get('Stripe-Version')).toBe('2026-09-30.endive');
+        expect(new Headers(init?.headers).get('Authorization')).toBe(`Bearer ${secretKey}`);
+        if (String(url).includes('/checkout/sessions')) expect(String(init?.body)).not.toContain('payment_method_types');
+        if (responses.length === 0) throw new Error(`Unexpected request: ${String(url)}`);
+        const result = responses.shift();
+        return result instanceof Response ? result : Response.json(result);
+    });
+    return { fetcher, client: createStripeClient({ secretKey, fetch: fetcher }) };
+}
+
+function expectRequest(fetcher: ReturnType<typeof fixture>['fetcher'], index: number, path: string, body?: Record<string, string>, key?: string) {
+    const sent = inspect(fetcher, index);
+    expect(sent.url).toBe(`https://api.stripe.com/v1${path}`);
+    expect(sent.init?.method).toBe(body === undefined ? 'GET' : 'POST');
+    expect(sent.body).toEqual(body ?? {});
+    expect(sent.headers.get('Idempotency-Key')).toBe(key ?? null);
+    if (body !== undefined) expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
+}
+
+describe('shared Stripe caches', () => {
+    it('reuses lookup Prices across clients, scopes by secret, expires at ten minutes and resets', async () => {
+        vi.useFakeTimers();
+        const { client, fetcher } = fixture({ data: [standardPrice] });
+        const second = createStripeClient({ secretKey, fetch: fetcher });
+        const expected = { id: 'price_standard', lookupKey: standardPrice.lookup_key, unitAmount: 2000, currency: 'usd', recurring: true };
+        expect(await client.resolvePrice(standardPrice.lookup_key)).toEqual(expected);
+        expectRequest(fetcher, 0, '/prices?lookup_keys%5B%5D=ezil_standard_monthly_v2&active=true&limit=1');
+        expect(await second.resolvePrice(standardPrice.lookup_key)).toEqual(expected);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        await createStripeClient({ secretKey: 'sk_test_another_fixture', fetch: fetcher }).resolvePrice(standardPrice.lookup_key);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        vi.advanceTimersByTime(599_999);
+        await second.resolvePrice(standardPrice.lookup_key);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        vi.advanceTimersByTime(1);
+        await second.resolvePrice(standardPrice.lookup_key);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+        resetStripeCachesForTests();
+        await second.resolvePrice(standardPrice.lookup_key);
+        expect(fetcher).toHaveBeenCalledTimes(4);
+    });
+
+    it.each([[], [{ ...standardPrice, active: false }], [computePrice]])('does not cache missing or mismatched prices %#', async (...data) => {
+        const { client, fetcher } = sequence({ data }, { data: [standardPrice] });
+        await expect(client.resolvePrice(standardPrice.lookup_key)).rejects.toBeInstanceOf(BillingProviderError);
+        expect(await createStripeClient({ secretKey, fetch: fetcher }).resolvePrice(standardPrice.lookup_key)).toMatchObject({ id: standardPrice.id });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not cache HTTP failures and maps nullable nonrecurring prices', async () => {
+        const { client, fetcher } = sequence(new Response('{}', { status: 503 }), { data: [{ ...standardPrice, unit_amount: null, recurring: null, currency: 'eur' }] });
+        await expect(client.resolvePrice(standardPrice.lookup_key)).rejects.toMatchObject({ status: 503 });
+        expect(await client.resolvePrice(standardPrice.lookup_key)).toMatchObject({ unitAmount: null, recurring: false, currency: 'eur' });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('seeds the invoice Price map from resolvePrice, caches fallback reads across clients and expires both', async () => {
+        vi.useFakeTimers();
+        const invoiceWithPrice = { ...invoice, lines: { data: [{ id: 'il_1', pricing: { price_details: { price: standardPrice.id } } }] } };
+        const { client, fetcher } = sequence({ data: [standardPrice] }, invoiceWithPrice, invoiceWithPrice, standardPrice, invoiceWithPrice);
+        await client.resolvePrice(standardPrice.lookup_key);
+        expect((await createStripeClient({ secretKey, fetch: fetcher }).retrieveInvoice(invoice.id)).lines[0].lookupKey).toBe(standardPrice.lookup_key);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        vi.advanceTimersByTime(600_000);
+        await client.retrieveInvoice(invoice.id);
+        expectRequest(fetcher, 3, '/prices/price_standard');
+        await createStripeClient({ secretKey, fetch: fetcher }).retrieveInvoice(invoice.id);
+        expect(fetcher).toHaveBeenCalledTimes(5);
+        expectRequest(fetcher, 4, '/invoices/in_fixture'); // No unverified line expansion.
+    });
+
+    it('retries failed invoice Price lookups without caching them', async () => {
+        const data = { ...invoice, lines: { data: [{ id: 'il_1', pricing: { price_details: { price: standardPrice.id } } }] } };
+        const { client, fetcher } = sequence(data, new Response('{}', { status: 500 }), data, standardPrice);
+        await expect(client.retrieveInvoice(invoice.id)).rejects.toMatchObject({ status: 500 });
+        expect((await client.retrieveInvoice(invoice.id)).lines[0].lookupKey).toBe(standardPrice.lookup_key);
+        expect(fetcher).toHaveBeenCalledTimes(4);
+    });
+
+    it('reuses the safe v2 portal configuration across client instances and resets it', async () => {
+        const session = { url: 'https://billing.stripe.com/session' };
+        const { client, fetcher } = sequence({ data: [{ ...portalConfig, id: 'inactive', active: false }, { ...portalConfig, metadata: {} }, portalConfig] }, session, session,
+            { data: [portalConfig] }, session);
+        const input = { customerId: 'cus_fixture', returnUrl: checkoutRequest.cancelUrl };
+        await client.createPortalSession(input);
+        await createStripeClient({ secretKey, fetch: fetcher }).createPortalSession(input);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+        expectRequest(fetcher, 0, '/billing_portal/configurations?limit=100');
+        for (const index of [1, 2]) expectRequest(fetcher, index, '/billing_portal/sessions', {
+            customer: input.customerId, return_url: input.returnUrl, configuration: 'bpc_v2',
+        });
+        resetStripeCachesForTests();
+        await client.createPortalSession(input);
+        expect(fetcher).toHaveBeenCalledTimes(5);
+    });
+
+    it.each([[], [{ ...portalConfig, active: false }], [{ ...portalConfig, features: { subscription_update: { enabled: true } } }]])('fails closed without caching unsafe portal configuration %#', async (...data) => {
+        const { client, fetcher } = sequence({ data }, { data: [portalConfig] }, { url: 'portal' });
+        const input = { customerId: 'cus_fixture', returnUrl: 'https://example.com' };
+        await expect(client.createPortalSession(input)).rejects.toMatchObject({ code: 'portal_configuration_missing' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        await createStripeClient({ secretKey, fetch: fetcher }).createPortalSession(input);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+    });
+
+    it('expires portal configurations after ten minutes and isolates accounts', async () => {
+        vi.useFakeTimers();
+        const { client, fetcher } = fixture(null);
+        fetcher.mockImplementation(async url => Response.json(String(url).includes('/configurations?') ? { data: [portalConfig] } : { url: 'portal' }));
+        const input = { customerId: 'cus_fixture', returnUrl: 'https://example.com' };
+        await client.createPortalSession(input);
+        await createStripeClient({ secretKey: 'sk_test_other_fixture', fetch: fetcher }).createPortalSession(input);
+        expect(fetcher).toHaveBeenCalledTimes(4);
+        vi.advanceTimersByTime(600_000);
+        await client.createPortalSession(input);
+        expect(fetcher).toHaveBeenCalledTimes(6);
+    });
+});
+
+describe('endive plan changes', () => {
+    const previewInput = { subscriptionId: subscription.id, toSku: 'compute_monthly_v2' as const, prorationDate: start + 500 };
+    const confirmInput = { ...previewInput, now: new Date((start + 600) * 1000), idempotencyKey: 'upgrade_fixture' };
+    const openInvoice = { ...invoice, status: 'open', hosted_invoice_url: 'https://invoice.stripe.com/upgrade' };
+    const updated = { ...planSubscription, pending_update: { expires_at: end }, latest_invoice: openInvoice };
+    const updateBody = {
+        'items[0][id]': 'si_standard', 'items[0][price]': computePrice.id,
+        payment_behavior: 'pending_if_incomplete', proration_behavior: 'always_invoice',
+        proration_date: String(previewInput.prorationDate), 'expand[]': 'latest_invoice',
+    };
+
+    it('previews only net proration lines using the subscription item period', async () => {
+        const { client, fetcher } = sequence(planSubscription, { data: [computePrice] }, {
+            amount_due: 14000, currency: 'usd', lines: { data: [
+                { description: 'Unused Standard', amount: -1000, parent: { subscription_item_details: { proration: true } } },
+                { description: 'Remaining Compute', amount: 5000, proration: true },
+                { description: 'Next month', amount: 10000 },
+            ] },
+        });
+        expect(await client.previewUpgrade(previewInput)).toEqual({
+            prorationDate: previewInput.prorationDate, amountDueCents: 4000, currency: 'usd',
+            lines: [{ description: 'Unused Standard', amountCents: -1000 }, { description: 'Remaining Compute', amountCents: 5000 }],
+            periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
+        });
+        expectRequest(fetcher, 0, '/subscriptions/sub_fixture');
+        expectRequest(fetcher, 2, '/invoices/create_preview', {
+            subscription: subscription.id, 'subscription_details[items][0][id]': 'si_standard',
+            'subscription_details[items][0][price]': computePrice.id,
+            'subscription_details[proration_date]': String(previewInput.prorationDate),
+            'subscription_details[proration_behavior]': 'always_invoice',
+        });
+    });
+
+    it.each([false, true])('clamps negative preview totals with proration=%s', async proration => {
+        const { client } = sequence(planSubscription, { data: [computePrice] }, { amount_due: -80, lines: { data: [{ amount: -100, proration }] } });
+        expect((await client.previewUpgrade(previewInput)).amountDueCents).toBe(0);
+    });
+
+    it('uses amount_due and all lines when no line has a proration flag', async () => {
+        const { client } = sequence(planSubscription, { data: [computePrice] }, { amount_due: 1234, currency: 'usd', lines: { data: [{ amount: 1000, description: 'Compute' }] } });
+        expect(await client.previewUpgrade(previewInput)).toMatchObject({ amountDueCents: 1234, lines: [{ description: 'Compute', amountCents: 1000 }] });
+    });
+
+    it.each([[], [{ id: 'si_compute', price: computePrice }], [planSubscription.items.data[0], planSubscription.items.data[0]], [{ price: standardPrice }]])('refuses invalid source items for preview and confirmation %#', async (...data) => {
+        const { client, fetcher } = fixture({ ...planSubscription, items: { data } });
+        await expect(client.previewUpgrade(previewInput)).rejects.toMatchObject({ code: 'invalid_subscription_state' });
+        await expect(client.confirmUpgrade(confirmInput)).rejects.toMatchObject({ code: 'invalid_subscription_state' });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        expect(fetcher.mock.calls.every(([, init]) => init?.method === 'GET')).toBe(true);
+    });
+
+    it.each([901, -61])('rejects a preview age of %s seconds before requesting Stripe', async age => {
+        expect(UPGRADE_PREVIEW_MAX_AGE_SECONDS).toBe(900);
+        const { client, fetcher } = sequence();
+        await expect(client.confirmUpgrade({ ...confirmInput, now: new Date((previewInput.prorationDate + age) * 1000) })).rejects.toMatchObject({ code: 'preview_expired' });
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it.each([900, -60])('accepts the preview time boundary at age %s', async age => {
+        const { client } = sequence(planSubscription, { data: [computePrice] }, { ...planSubscription, latest_invoice: invoice });
+        expect((await client.confirmUpgrade({ ...confirmInput, now: new Date((previewInput.prorationDate + age) * 1000) })).status).toBe('applied');
+    });
+
+    it('applies only a paid invoice without a pending update and sends the exact mutation', async () => {
+        const { client, fetcher } = sequence(planSubscription, { data: [computePrice] }, { ...planSubscription, latest_invoice: invoice });
+        expect(await client.confirmUpgrade(confirmInput)).toEqual({ status: 'applied', invoiceId: invoice.id, hostedInvoiceUrl: null, expiresAt: null });
+        expectRequest(fetcher, 2, '/subscriptions/sub_fixture', updateBody, confirmInput.idempotencyKey);
+        expect(String(fetcher.mock.calls[2][1]?.body)).not.toContain('metadata');
+        expect(fetcher).toHaveBeenCalledTimes(3);
+    });
+
+    it.each([
+        ['requires_action', false, 'requires_action'], ['requires_confirmation', true, 'requires_action'],
+        ['requires_payment_method', true, 'payment_failed'], ['processing', false, 'payment_failed'], ['succeeded', false, 'payment_failed'],
+    ] as const)('maps payment intent %s with string reference=%s', async (piStatus, stringReference, status) => {
+        const intent = { id: 'pi_upgrade', status: piStatus };
+        const responses: unknown[] = [planSubscription, { data: [computePrice] }, updated,
+            { data: [{ payment: { payment_intent: stringReference ? intent.id : intent } }] }];
+        if (stringReference) responses.push(intent);
+        const { client, fetcher } = sequence(...responses);
+        expect(await client.confirmUpgrade(confirmInput)).toEqual({ status, invoiceId: invoice.id, hostedInvoiceUrl: openInvoice.hosted_invoice_url, expiresAt: new Date(end * 1000) });
+        expectRequest(fetcher, 2, '/subscriptions/sub_fixture', updateBody, confirmInput.idempotencyKey);
+        expectRequest(fetcher, 3, '/invoice_payments?invoice=in_fixture&expand%5B%5D=data.payment.payment_intent');
+        if (stringReference) expectRequest(fetcher, 4, '/payment_intents/pi_upgrade');
+    });
+
+    it.each(['applied', 'requires_action', 'payment_failed'] as const)('recovers HTTP 402 into %s by re-reading the expanded subscription', async status => {
+        const result = status === 'applied' ? { ...planSubscription, latest_invoice: invoice } : updated;
+        const responses: unknown[] = [planSubscription, { data: [computePrice] }, new Response('{}', { status: 402 }), result];
+        if (status !== 'applied') responses.push({ data: [{ payment: { payment_intent: { id: 'pi_upgrade', status: status === 'requires_action' ? 'requires_action' : 'requires_payment_method' } } }] });
+        const { client, fetcher } = sequence(...responses);
+        expect((await client.confirmUpgrade(confirmInput)).status).toBe(status);
+        expectRequest(fetcher, 3, '/subscriptions/sub_fixture?expand[]=latest_invoice');
+    });
+
+    it('accepts HTTP 402 with an open invoice even without a pending update', async () => {
+        const { client } = sequence(planSubscription, { data: [computePrice] }, new Response('{}', { status: 402 }),
+            { ...planSubscription, latest_invoice: openInvoice }, { data: [] });
+        expect((await client.confirmUpgrade(confirmInput)).status).toBe('payment_failed');
+    });
+
+    it('does not treat paid invoices with pending updates as applied', async () => {
+        const { client } = sequence(planSubscription, { data: [computePrice] }, { ...updated, latest_invoice: invoice }, { data: [] });
+        expect((await client.confirmUpgrade(confirmInput)).status).toBe('payment_failed');
+    });
+
+    it('retrieves a string latest_invoice before classifying the result', async () => {
+        const { client, fetcher } = sequence(planSubscription, { data: [computePrice] }, { ...planSubscription, latest_invoice: invoice.id }, invoice);
+        expect((await client.confirmUpgrade(confirmInput)).status).toBe('applied');
+        expectRequest(fetcher, 3, '/invoices/in_fixture');
+    });
+
+    it.each([402, 500])('rethrows HTTP %s when there is no recoverable update', async status => {
+        const responses: unknown[] = [planSubscription, { data: [computePrice] }, new Response('{}', { status })];
+        if (status === 402) responses.push({ ...planSubscription, latest_invoice: { ...invoice, status: 'void' } });
+        const { client } = sequence(...responses);
+        await expect(client.confirmUpgrade(confirmInput)).rejects.toMatchObject({ name: 'StripeRequestError', status });
+    });
+
+    const computeSubscription = { ...planSubscription, items: { data: [{ ...planSubscription.items.data[0], id: 'si_compute', price: computePrice }] } };
+    const downgradeInput = { subscriptionId: subscription.id, toSku: 'standard_monthly_v2' as const, idempotencyKey: 'downgrade_fixture' };
+
+    it('creates and configures a downgrade schedule with separate idempotency keys', async () => {
+        const { client, fetcher } = sequence(computeSubscription, { data: [standardPrice] },
+            { id: 'sub_sched', current_phase: { start_date: start + 10, end_date: end + 10 } }, { id: 'sub_sched' });
+        expect(await client.scheduleDowngrade(downgradeInput)).toEqual({ scheduleId: 'sub_sched', effectiveAt: new Date((end + 10) * 1000) });
+        expectRequest(fetcher, 2, '/subscription_schedules', { from_subscription: subscription.id }, 'downgrade_fixture:create');
+        expectRequest(fetcher, 3, '/subscription_schedules/sub_sched', {
+            end_behavior: 'release', 'metadata[ezil_change]': 'downgrade', 'metadata[to_sku]': 'standard_monthly_v2',
+            'phases[0][start_date]': String(start + 10), 'phases[0][end_date]': String(end + 10),
+            'phases[0][items][0][price]': computePrice.id, 'phases[0][items][0][quantity]': '1',
+            'phases[1][items][0][price]': standardPrice.id, 'phases[1][items][0][quantity]': '1',
+            'phases[1][proration_behavior]': 'none', 'phases[1][duration][interval]': 'month', 'phases[1][duration][interval_count]': '1',
+        }, 'downgrade_fixture:phases');
+    });
+
+    it.each(['sub_sched', { id: 'sub_sched' }])('refuses an existing schedule %j', async schedule => {
+        const { client, fetcher } = sequence({ ...computeSubscription, schedule });
+        await expect(client.scheduleDowngrade(downgradeInput)).rejects.toMatchObject({ code: 'invalid_subscription_state' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses a downgrade from a Standard subscription', async () => {
+        const { client, fetcher } = sequence(planSubscription);
+        await expect(client.scheduleDowngrade(downgradeInput)).rejects.toMatchObject({ code: 'invalid_subscription_state' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases the encoded schedule id', async () => {
+        const { client, fetcher } = sequence({ id: 'sub_sched' });
+        await client.cancelScheduledChange({ scheduleId: 'sub_sched/other' });
+        expectRequest(fetcher, 0, '/subscription_schedules/sub_sched%2Fother/release', {});
+    });
+
+    it.each([
+        { cancel: true, cancelAt: end + 10, expected: end + 10 },
+        { cancel: true, cancelAt: null, expected: end },
+        { cancel: false, cancelAt: end + 10, expected: null },
+    ])('sets cancellation=$cancel with cancel_at=$cancelAt', async ({ cancel, cancelAt, expected }) => {
+        const { client, fetcher } = sequence({ ...planSubscription, cancel_at: cancelAt });
+        expect(await client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel, idempotencyKey: 'cancel_fixture' }))
+            .toEqual({ cancelsAt: expected === null ? null : new Date(expected * 1000) });
+        expectRequest(fetcher, 0, '/subscriptions/sub_fixture', { cancel_at_period_end: String(cancel) }, 'cancel_fixture');
+    });
+});
+
+describe('additional endive mappings', () => {
+    it.each([false, true])('maps item ids, payment method, schedule and latest invoice with expanded=%s', async expanded => {
+        const reference = (id: string) => expanded ? { id } : id;
+        const { client } = sequence({ ...planSubscription, default_payment_method: reference('pm_default'), schedule: reference('sub_sched'), latest_invoice: reference('in_latest') });
+        expect(await client.retrieveSubscription(subscription.id)).toMatchObject({
+            items: [{ id: 'si_standard', priceId: 'price_standard', lookupKey: standardPrice.lookup_key }],
+            defaultPaymentMethod: 'pm_default', scheduleId: 'sub_sched', latestInvoiceId: 'in_latest',
+            currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000),
+        });
+    });
+
+    it('maps overage kind, amount due and billing reason in invoice history', async () => {
+        const { client } = sequence({ data: [{ ...invoice, amount_due: 2500, amount_paid: 0, created: start, currency: 'usd', metadata: { kind: 'overage' }, billing_reason: 'manual' }] });
+        expect((await client.listInvoices('cus_fixture', 10))[0]).toMatchObject({ amountDueCents: 2500, amountPaidCents: 0, metadataKind: 'overage', billingReason: 'manual' });
+    });
+
+    it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1', 'ai_pack_10_v1', 'ai_pack_25_v1'])('never sends payment_method_types for %s with either merchant mode', async sku => {
+        const isV2 = sku.endsWith('_v2');
+        const price = sku === 'standard_monthly_v2' ? standardPrice : computePrice;
+        const { client, fetcher } = sequence(...(isV2 ? [{ data: [price] }] : []), checkoutResult, checkoutResult);
+        for (const managedPayments of [false, true]) await client.createCheckoutSession({ ...checkoutRequest, sku, managedPayments, uiMode: 'embedded' });
+        for (const [url, init] of fetcher.mock.calls) {
+            if (!String(url).endsWith('/checkout/sessions')) continue;
+            const body = new URLSearchParams(String(init?.body));
+            expect(body.get('ui_mode')).toBe('embedded_page');
+            expect([...body.keys()].some(key => key.startsWith('payment_method_types'))).toBe(false);
+            if (isV2) expect(body.get('subscription_data[metadata][ezil_catalog]')).toBe('v2');
+        }
+    });
+
+    it('does not echo request values or credentials in HTTP error messages', async () => {
+        const { client } = sequence(Response.json({ error: { param: secretKey, message: `email=${customerRequest.email} ${secretKey}` } }, { status: 400 }));
+        await expect(client.createCustomer(customerRequest)).rejects.toThrow('Stripe request failed (HTTP 400)');
     });
 });

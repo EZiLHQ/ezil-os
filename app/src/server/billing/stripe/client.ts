@@ -1,16 +1,57 @@
+import { createHash } from 'node:crypto';
+
 import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
-import type { StripeApi, StripeCheckoutSession } from '../ports';
+import type { StripeApi, StripeCheckoutSession, StripePrice, StripeUpgradeResult } from '../ports';
 import { offerByLookupKey, offerBySku } from '../v2/catalog';
+import { CATALOG_V2 } from '../v2/contract';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
-const STRIPE_API_VERSION = '2026-03-25.dahlia';
+export const STRIPE_API_VERSION = '2026-09-30.endive';
+export const UPGRADE_PREVIEW_MAX_AGE_SECONDS = 900;
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+type CacheEntry<T> = { value: T; expiresAt: number };
+const pricesByLookupKey = new Map<string, CacheEntry<StripePrice>>();
+const lookupKeysByPriceId = new Map<string, CacheEntry<string | null>>();
+const portalConfigurations = new Map<string, CacheEntry<string>>();
+
+export function resetStripeCachesForTests(): void {
+    pricesByLookupKey.clear();
+    lookupKeysByPriceId.clear();
+    portalConfigurations.clear();
+}
+
+function cached<T>(cache: Map<string, CacheEntry<T>>, key: string): CacheEntry<T> | undefined {
+    const entry = cache.get(key);
+    if (entry && entry.expiresAt > Date.now()) return entry;
+    cache.delete(key);
+    return undefined;
+}
+
+function cacheValue<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T): void {
+    cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+export class BillingProviderError extends Error {
+    constructor(public readonly code: 'price_not_found' | 'portal_configuration_missing' | 'preview_expired' | 'invalid_subscription_state') {
+        super(code);
+        this.name = 'BillingProviderError';
+    }
+}
 
 type FormValue = string | number | boolean | undefined | FormValue[] | { [key: string]: FormValue };
 type FormFields = { [key: string]: FormValue };
 type StripeReference = string | { id: string } | null;
 type Metadata = { sku?: string; kind?: string };
-type Price = { id: string; lookup_key?: string | null; active?: boolean };
+type Price = { id: string; lookup_key?: string | null; active?: boolean; unit_amount?: number | null; currency?: string; recurring?: object | null };
+
+interface SubscriptionItem {
+    id?: string | null;
+    price?: Price | null;
+    current_period_start?: number | null;
+    current_period_end?: number | null;
+}
 
 interface SubscriptionResponse {
     id: string;
@@ -19,7 +60,11 @@ interface SubscriptionResponse {
     cancel_at_period_end: boolean;
     current_period_start?: number | null;
     current_period_end?: number | null;
-    items?: { data: { price?: Price | null; current_period_start?: number | null; current_period_end?: number | null }[] };
+    items?: { data: SubscriptionItem[] };
+    default_payment_method?: StripeReference;
+    schedule?: StripeReference;
+    latest_invoice?: string | InvoiceResponse | null;
+    cancel_at?: number | null;
     pending_update?: { expires_at?: number | null } | null;
     metadata?: Metadata | null;
 }
@@ -40,10 +85,12 @@ interface InvoiceLine {
     period?: { start?: number | null; end?: number | null } | null;
 }
 
-interface InvoiceResponse {
+export interface InvoiceResponse {
     id: string;
     customer: StripeReference;
     status: string;
+    amount_due?: number;
+    currency?: string;
     billing_reason?: string | null;
     metadata?: Metadata | null;
     hosted_invoice_url?: string | null;
@@ -75,15 +122,13 @@ interface CheckoutResponse {
 interface ChargeResponse {
     id: string;
     customer?: StripeReference;
-    invoice?: StripeReference;
     payment_intent?: StripeReference;
     amount: number;
     amount_refunded: number;
     refunded: boolean;
 }
 
-/** Stripe messages can echo request data; expose status and machine codes instead. */
-/** Stripe's own error text names the bad parameter; keys are scrubbed defensively. */
+/** Keep diagnostic fields separate from the status-only public error message. */
 function scrub(text: string | null): string | null {
     if (text === null) return null;
     return text
@@ -99,9 +144,9 @@ export class StripeRequestError extends Error {
 
     constructor(public status: number, public code: string | null, public type: string | null, param: string | null = null, detail: string | null = null) {
         const safeDetail = scrub(detail);
-        super(`Stripe request failed (HTTP ${status})${param ? ` on ${param}` : ''}${safeDetail ? `: ${safeDetail}` : ''}`);
+        super(`Stripe request failed (HTTP ${status})`);
         this.name = 'StripeRequestError';
-        this.param = param;
+        this.param = scrub(param);
         this.detail = safeDetail;
     }
 }
@@ -149,18 +194,20 @@ function lineSubscription(line: InvoiceLine): string | null {
     return referenceId(line.subscription ?? line.parent?.subscription_item_details?.subscription);
 }
 
-export function createStripeClient(opts: {
+export interface StripeClientOptions {
     secretKey: string;
     fetch?: typeof fetch;
     priceProMonthly?: string;
-    apiVersion?: string;
-}): StripeApi {
+}
+
+/** Shared transport: undefined fields mean GET, even an empty object means POST. */
+export function createStripeRequest(opts: Pick<StripeClientOptions, 'secretKey' | 'fetch'>) {
     const fetcher = opts.fetch ?? globalThis.fetch;
 
     async function request<T>(path: string, fields?: FormFields, idempotencyKey?: string): Promise<T> {
         const headers = new Headers({
             Authorization: `Bearer ${opts.secretKey}`,
-            'Stripe-Version': opts.apiVersion ?? STRIPE_API_VERSION,
+            'Stripe-Version': STRIPE_API_VERSION,
         });
         if (fields !== undefined) headers.set('Content-Type', 'application/x-www-form-urlencoded');
         if (idempotencyKey !== undefined) headers.set('Idempotency-Key', idempotencyKey);
@@ -185,7 +232,183 @@ export function createStripeClient(opts: {
         return response.json() as Promise<T>;
     }
 
+    return request;
+}
+
+export function createStripeClient(opts: StripeClientOptions): StripeApi {
+    const request = createStripeRequest(opts);
+    // A fingerprint scopes shared caches without retaining the secret in cache keys.
+    const scope = createHash('sha256').update(opts.secretKey).digest('hex').slice(0, 32);
+
+    async function resolvePrice(lookupKey: string): Promise<StripePrice> {
+        const key = `${scope}:${lookupKey}`;
+        const hit = cached(pricesByLookupKey, key);
+        if (hit) return { ...hit.value };
+        const query = new URLSearchParams({ 'lookup_keys[]': lookupKey, active: 'true', limit: '1' });
+        const prices = await request<{ data?: Price[] }>(`/prices?${query}`);
+        const price = prices.data?.find(item => item.lookup_key === lookupKey && item.active === true && item.id);
+        if (!price) throw new BillingProviderError('price_not_found');
+        const value = {
+            id: price.id, lookupKey, unitAmount: price.unit_amount ?? null,
+            currency: price.currency ?? 'usd', recurring: price.recurring != null,
+        };
+        cacheValue(pricesByLookupKey, key, value);
+        cacheValue(lookupKeysByPriceId, `${scope}:${price.id}`, lookupKey);
+        return { ...value };
+    }
+
+    async function resolvePortalConfiguration(): Promise<string> {
+        const key = `${scope}:ezil_portal:v2`;
+        const hit = cached(portalConfigurations, key);
+        if (hit) return hit.value;
+        const configurations = await request<{ data?: {
+            id: string; active?: boolean; metadata?: { ezil_portal?: string };
+            features?: { subscription_update?: { enabled?: boolean } };
+        }[] }>('/billing_portal/configurations?limit=100');
+        const config = configurations.data?.find(item => item.metadata?.ezil_portal === 'v2' && item.active !== false);
+        if (!config?.id || config.features?.subscription_update?.enabled === true) {
+            throw new BillingProviderError('portal_configuration_missing');
+        }
+        cacheValue(portalConfigurations, key, config.id);
+        return config.id;
+    }
+
+    function planItem(subscription: SubscriptionResponse, lookupKey: string) {
+        const items = subscription.items?.data ?? [];
+        const item = items[0];
+        if (items.length !== 1 || !item?.id || !item.price?.id || item.price.lookup_key !== lookupKey) {
+            throw new BillingProviderError('invalid_subscription_state');
+        }
+        return { ...item, id: item.id, price: item.price };
+    }
+
+    async function latestInvoice(subscription: SubscriptionResponse): Promise<InvoiceResponse | null> {
+        const invoice = subscription.latest_invoice;
+        return typeof invoice === 'string'
+            ? request<InvoiceResponse>(`/invoices/${encodeURIComponent(invoice)}`)
+            : invoice ?? null;
+    }
+
+    async function upgradeResult(subscription: SubscriptionResponse, invoice: InvoiceResponse | null): Promise<StripeUpgradeResult> {
+        if (!invoice?.id) throw new BillingProviderError('invalid_subscription_state');
+        let status: StripeUpgradeResult['status'] = 'payment_failed';
+        if (invoice.status === 'paid' && !subscription.pending_update) {
+            status = 'applied';
+        } else {
+            const query = new URLSearchParams({ invoice: invoice.id, 'expand[]': 'data.payment.payment_intent' });
+            const payments = await request<{ data?: { payment?: { payment_intent?: string | { id: string; status: string } | null } }[] }>(`/invoice_payments?${query}`);
+            for (const payment of payments.data ?? []) {
+                const reference = payment.payment?.payment_intent;
+                const intent = typeof reference === 'string'
+                    ? await request<{ status: string }>(`/payment_intents/${encodeURIComponent(reference)}`)
+                    : reference;
+                if (intent?.status === 'requires_action' || intent?.status === 'requires_confirmation') {
+                    status = 'requires_action';
+                    break;
+                }
+            }
+        }
+        return {
+            status, invoiceId: invoice.id, hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
+            expiresAt: date(subscription.pending_update?.expires_at),
+        };
+    }
+
     return {
+        resolvePrice,
+
+        async previewUpgrade(input) {
+            const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`);
+            const item = planItem(subscription, CATALOG_V2.standard_monthly_v2.stripeLookupKey!);
+            const periodStart = date(item.current_period_start);
+            const periodEnd = date(item.current_period_end);
+            if (!periodStart || !periodEnd || periodEnd <= periodStart) throw new BillingProviderError('invalid_subscription_state');
+            const price = await resolvePrice(CATALOG_V2[input.toSku].stripeLookupKey!);
+            const invoice = await request<InvoiceResponse>('/invoices/create_preview', {
+                subscription: input.subscriptionId,
+                subscription_details: {
+                    items: [{ id: item.id, price: price.id }],
+                    proration_date: input.prorationDate,
+                    proration_behavior: 'always_invoice',
+                },
+            });
+            const allLines = invoice.lines?.data ?? [];
+            const prorations = allLines.filter(line => line.parent?.subscription_item_details?.proration === true || line.proration === true);
+            const lines = (prorations.length ? prorations : allLines).map(line => ({
+                description: line.description ?? '',
+                amountCents: Number.isSafeInteger(line.amount) ? line.amount! : 0,
+            }));
+            return {
+                prorationDate: input.prorationDate,
+                amountDueCents: Math.max(0, prorations.length ? lines.reduce((sum, line) => sum + line.amountCents, 0) : invoice.amount_due ?? 0),
+                currency: invoice.currency ?? price.currency, lines, periodStart, periodEnd,
+            };
+        },
+
+        async confirmUpgrade(input) {
+            const nowSeconds = input.now.getTime() / 1000;
+            if (!Number.isSafeInteger(input.prorationDate) || !Number.isFinite(nowSeconds)
+                || nowSeconds - input.prorationDate > UPGRADE_PREVIEW_MAX_AGE_SECONDS || input.prorationDate > nowSeconds + 60) {
+                throw new BillingProviderError('preview_expired');
+            }
+            const path = `/subscriptions/${encodeURIComponent(input.subscriptionId)}`;
+            const subscription = await request<SubscriptionResponse>(path);
+            const item = planItem(subscription, CATALOG_V2.standard_monthly_v2.stripeLookupKey!);
+            const price = await resolvePrice(CATALOG_V2[input.toSku].stripeLookupKey!);
+            let updated: SubscriptionResponse;
+            try {
+                updated = await request<SubscriptionResponse>(path, {
+                    items: [{ id: item.id, price: price.id }],
+                    payment_behavior: 'pending_if_incomplete',
+                    proration_behavior: 'always_invoice',
+                    proration_date: input.prorationDate,
+                    'expand[]': 'latest_invoice',
+                }, input.idempotencyKey);
+            } catch (error) {
+                if (!(error instanceof StripeRequestError) || error.status !== 402) throw error;
+                updated = await request<SubscriptionResponse>(`${path}?expand[]=latest_invoice`);
+                const invoice = await latestInvoice(updated);
+                if (!updated.pending_update && invoice?.status !== 'open' && invoice?.status !== 'paid') throw error;
+                return upgradeResult(updated, invoice);
+            }
+            return upgradeResult(updated, await latestInvoice(updated));
+        },
+
+        async scheduleDowngrade(input) {
+            const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`);
+            const item = planItem(subscription, CATALOG_V2.compute_monthly_v2.stripeLookupKey!);
+            if (subscription.schedule !== null) throw new BillingProviderError('invalid_subscription_state');
+            const price = await resolvePrice(CATALOG_V2[input.toSku].stripeLookupKey!);
+            const schedule = await request<{ id: string; current_phase?: { start_date: number; end_date: number } | null }>(
+                '/subscription_schedules', { from_subscription: input.subscriptionId }, `${input.idempotencyKey}:create`,
+            );
+            const phase = schedule.current_phase;
+            const effectiveAt = date(phase?.end_date);
+            if (!phase || !date(phase.start_date) || !effectiveAt || phase.end_date <= phase.start_date) {
+                throw new BillingProviderError('invalid_subscription_state');
+            }
+            await request(`/subscription_schedules/${encodeURIComponent(schedule.id)}`, {
+                end_behavior: 'release',
+                metadata: { ezil_change: 'downgrade', to_sku: input.toSku },
+                phases: [
+                    { start_date: phase.start_date, end_date: phase.end_date, items: [{ price: item.price.id, quantity: 1 }] },
+                    { items: [{ price: price.id, quantity: 1 }], proration_behavior: 'none', duration: { interval: 'month', interval_count: 1 } },
+                ],
+            }, `${input.idempotencyKey}:phases`);
+            return { scheduleId: schedule.id, effectiveAt };
+        },
+
+        async cancelScheduledChange(input) {
+            await request(`/subscription_schedules/${encodeURIComponent(input.scheduleId)}/release`, {});
+        },
+
+        async setCancelAtPeriodEnd(input) {
+            const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, {
+                cancel_at_period_end: input.cancel,
+            }, input.idempotencyKey);
+            return { cancelsAt: input.cancel ? date(subscription.cancel_at) ?? date(subscription.items?.data[0]?.current_period_end) : null };
+        },
+
         async createCustomer(input) {
             const customer = await request<{ id: string }>('/customers', {
                 // Informational only: ownership is resolved through the local customer table.
@@ -216,8 +439,6 @@ export function createStripeClient(opts: {
                         automatic_tax: { enabled: true },
                         customer_update: { address: 'auto', name: 'auto' },
                     } : {}),
-                    // Card wallets and Link avoid an extra payment-method decision.
-                    payment_method_types: ['card', 'link'],
                     // Keep the USD summary and checkout aligned unless opted in.
                     adaptive_pricing: { enabled: input.adaptivePricing ? 'true' : 'false' },
                 }),
@@ -235,13 +456,10 @@ export function createStripeClient(opts: {
                 }),
             };
             if (lookupKey) {
-                const query = new URLSearchParams({ 'lookup_keys[]': lookupKey, active: 'true', limit: '1' });
-                const prices = await request<{ data?: Price[] }>(`/prices?${query}`);
-                const price = prices.data?.find(item => item.lookup_key === lookupKey && item.active === true && item.id);
-                if (!price) throw new Error(`No active Stripe Price for lookup key ${lookupKey}`);
+                const price = await resolvePrice(lookupKey);
                 fields.mode = 'subscription';
                 fields.line_items = [{ quantity: 1, price: price.id }];
-                fields.subscription_data = { metadata: { sku: input.sku } };
+                fields.subscription_data = { metadata: { sku: input.sku, ezil_catalog: 'v2' } };
             } else if (input.sku === PRO_PLAN.sku) {
                 fields.mode = 'subscription';
                 fields.line_items = [{
@@ -293,6 +511,9 @@ export function createStripeClient(opts: {
                 number: invoice.number ?? null,
                 status: invoice.status,
                 amountPaidCents: invoice.amount_paid,
+                amountDueCents: invoice.amount_due ?? 0,
+                metadataKind: invoice.metadata?.kind ?? null,
+                billingReason: invoice.billing_reason ?? null,
                 currency: invoice.currency,
                 created: new Date(invoice.created * 1000),
                 hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
@@ -305,6 +526,7 @@ export function createStripeClient(opts: {
             const session = await request<{ url: string }>('/billing_portal/sessions', {
                 customer: input.customerId,
                 return_url: input.returnUrl,
+                configuration: await resolvePortalConfiguration(),
             });
             return { url: session.url };
         },
@@ -312,7 +534,7 @@ export function createStripeClient(opts: {
         async retrieveSubscription(id) {
             const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(id)}`);
             const data = subscription.items?.data ?? [];
-            const items = data.map(item => ({ priceId: referenceId(item.price), lookupKey: item.price?.lookup_key ?? null }));
+            const items = data.map(item => ({ id: item.id ?? null, priceId: referenceId(item.price), lookupKey: item.price?.lookup_key ?? null }));
             const metadataSku = subscription.metadata?.sku;
             const itemOffer = items.map(item => item.lookupKey ? offerByLookupKey(item.lookupKey) : undefined).find(Boolean);
             // Pending upgrades change the item Price without changing checkout metadata.
@@ -324,11 +546,14 @@ export function createStripeClient(opts: {
                 customer: requiredCustomer(subscription.customer),
                 status: subscription.status,
                 cancelAtPeriodEnd: subscription.cancel_at_period_end,
-                currentPeriodStart: date(subscription.current_period_start ?? item?.current_period_start),
-                currentPeriodEnd: date(subscription.current_period_end ?? item?.current_period_end),
+                currentPeriodStart: date(item?.current_period_start ?? subscription.current_period_start),
+                currentPeriodEnd: date(item?.current_period_end ?? subscription.current_period_end),
                 sku,
                 items,
                 pendingUpdateExpiresAt: date(subscription.pending_update?.expires_at),
+                defaultPaymentMethod: referenceId(subscription.default_payment_method),
+                scheduleId: referenceId(subscription.schedule),
+                latestInvoiceId: referenceId(subscription.latest_invoice),
             };
         },
 
@@ -337,7 +562,7 @@ export function createStripeClient(opts: {
             const subscriptionId = referenceId(invoice.subscription ?? invoice.parent?.subscription_details?.subscription);
             const lines = invoice.lines?.data ?? [];
             const priceFor = (line: InvoiceLine) => line.pricing?.price_details?.price ?? line.price;
-            // Expanded keys need no request; each remaining Price id is fetched once per invoice read.
+            // Expanded keys need no request; reuse the account-scoped Price cache across requests.
             const lookupKeys = new Map<string, string | null>();
             for (const line of lines) {
                 const price = priceFor(line);
@@ -347,8 +572,15 @@ export function createStripeClient(opts: {
             }
             const priceIds = new Set(lines.map(line => referenceId(priceFor(line))).filter((id): id is string => id !== null));
             await Promise.all([...priceIds].filter(id => !lookupKeys.has(id)).map(async id => {
+                const key = `${scope}:${id}`;
+                const hit = cached(lookupKeysByPriceId, key);
+                if (hit) {
+                    lookupKeys.set(id, hit.value);
+                    return;
+                }
                 const price = await request<Price>(`/prices/${encodeURIComponent(id)}`);
                 lookupKeys.set(id, price.lookup_key ?? null);
+                cacheValue(lookupKeysByPriceId, key, price.lookup_key ?? null);
             }));
             // An invoice can start with a fee or adjustment. Only its subscription
             // line describes the entitlement window, never invoice.period_start/end.
@@ -401,8 +633,8 @@ export function createStripeClient(opts: {
             // the Invoice Payments API maps the payment back to it. Without
             // this a refund of a subscription charge could not find the
             // period grant it has to revoke.
-            let invoiceId = referenceId(charge.invoice);
-            if (invoiceId === null && paymentIntentId !== null) {
+            let invoiceId: string | null = null;
+            if (paymentIntentId !== null) {
                 const query = `payment[type]=payment_intent&payment[payment_intent]=${encodeURIComponent(paymentIntentId)}&limit=1`;
                 const payments = await request<{ data?: Array<{ invoice?: unknown }> }>(`/invoice_payments?${query}`);
                 invoiceId = referenceId(payments.data?.[0]?.invoice as StripeReference | undefined);

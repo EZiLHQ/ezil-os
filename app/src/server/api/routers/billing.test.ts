@@ -22,7 +22,7 @@ const session: StripeCheckoutSession = {
     mode: 'subscription', status: 'open', paymentStatus: 'unpaid', paymentIntentId: null, sku,
 };
 const invoice: StripeInvoiceSummary = {
-    id: 'in_fixture', number: 'INV-1', status: 'paid', amountPaidCents: 2000,
+    id: 'in_fixture', number: 'INV-1', status: 'paid', amountPaidCents: 2000, amountDueCents: 2000, metadataKind: null, billingReason: null,
     currency: 'usd', created: now, hostedInvoiceUrl: 'https://invoice.stripe.com/fixture', description: 'EZiL Pro',
 };
 const history = [{
@@ -99,6 +99,13 @@ function fixture() {
         closeStaleIntervals: vi.fn(async () => 0),
     } satisfies BillingStore;
     const stripe = {
+        resolvePrice: vi.fn<StripeApi['resolvePrice']>(),
+        previewUpgrade: vi.fn<StripeApi['previewUpgrade']>(),
+        confirmUpgrade: vi.fn<StripeApi['confirmUpgrade']>(),
+        scheduleDowngrade: vi.fn<StripeApi['scheduleDowngrade']>(),
+        cancelScheduledChange: vi.fn<StripeApi['cancelScheduledChange']>(),
+        setCancelAtPeriodEnd: vi.fn<StripeApi['setCancelAtPeriodEnd']>(),
+
         createCustomer: vi.fn(async () => ({ id: 'cus_fixture' })),
         createCheckoutSession: vi.fn<StripeApi['createCheckoutSession']>(async input => ({
             id: session.id, url: input.uiMode === 'hosted' ? 'https://checkout.example/session' : null,
@@ -113,7 +120,7 @@ function fixture() {
     } satisfies StripeApi;
     const deps: BillingDeps = {
         config: readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'fixture-only' }),
-        store, stripe, now: () => now,
+        store, stripe, usage: null, now: () => now,
     };
     const ctx: Awaited<ReturnType<typeof createTRPCContext>> = {
         db: {} as Awaited<ReturnType<typeof createTRPCContext>>['db'],

@@ -229,7 +229,10 @@ export interface StripeSubscription {
     cancelAtPeriodEnd: boolean;
     currentPeriodStart: Date | null;
     currentPeriodEnd: Date | null;
-    items: { priceId: string | null; lookupKey: string | null }[];
+    items: { id: string | null; priceId: string | null; lookupKey: string | null }[];
+    defaultPaymentMethod: string | null;
+    scheduleId: string | null;
+    latestInvoiceId: string | null;
     pendingUpdateExpiresAt: Date | null;
     /** Known catalog SKU from metadata or the first recognized item lookup key. */
     sku: string | null;
@@ -284,7 +287,7 @@ export interface CheckoutRequest {
     sku: string;
     /**
      * `embedded` (default for the OS): Stripe Embedded Checkout mounted in an
-     * OS window — `ui_mode=embedded`, `return_url` = `returnUrl`,
+     * OS window — `ui_mode=embedded_page`, `return_url` = `returnUrl`,
      * `redirect_on_completion=if_required`, so card / Link / wallet payments
      * finish in place with no redirect. `hosted`: the redirect page, kept for
      * clients that cannot load Stripe.js (`successUrl` / `cancelUrl`).
@@ -315,6 +318,9 @@ export interface StripeInvoiceSummary {
     number: string | null;
     status: string;
     amountPaidCents: number;
+    amountDueCents: number;
+    metadataKind: string | null;
+    billingReason: string | null;
     currency: string;
     created: Date;
     hostedInvoiceUrl: string | null;
@@ -322,6 +328,12 @@ export interface StripeInvoiceSummary {
 }
 
 export interface StripeApi {
+    resolvePrice(lookupKey: string): Promise<StripePrice>;
+    previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number }): Promise<StripeUpgradePreview>;
+    confirmUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number; now: Date; idempotencyKey: string }): Promise<StripeUpgradeResult>;
+    scheduleDowngrade(input: { subscriptionId: string; toSku: 'standard_monthly_v2'; idempotencyKey: string }): Promise<{ scheduleId: string; effectiveAt: Date }>;
+    cancelScheduledChange(input: { scheduleId: string }): Promise<void>;
+    setCancelAtPeriodEnd(input: { subscriptionId: string; cancel: boolean; idempotencyKey: string }): Promise<{ cancelsAt: Date | null }>;
     createCustomer(input: { userId: string; email: string | null; idempotencyKey: string }): Promise<{ id: string }>;
     createCheckoutSession(input: CheckoutRequest): Promise<CheckoutSessionCreated>;
     /** Newest first. */
@@ -331,6 +343,50 @@ export interface StripeApi {
     retrieveInvoice(id: string): Promise<StripeInvoice>;
     retrieveCheckoutSession(id: string): Promise<StripeCheckoutSession>;
     retrieveCharge(id: string): Promise<StripeCharge>;
+}
+
+export interface StripePrice {
+    id: string;
+    lookupKey: string;
+    unitAmount: number | null;
+    currency: string;
+    recurring: boolean;
+}
+
+export interface StripeUpgradePreview {
+    prorationDate: number;
+    amountDueCents: number;
+    currency: string;
+    lines: { description: string; amountCents: number }[];
+    periodStart: Date;
+    periodEnd: Date;
+}
+
+export interface StripeUpgradeResult {
+    status: 'applied' | 'requires_action' | 'payment_failed';
+    invoiceId: string;
+    hostedInvoiceUrl: string | null;
+    expiresAt: Date | null;
+}
+
+export interface OverageInvoiceRequest {
+    customerId: string;
+    subscriptionId: string;
+    periodStart: Date;
+    periodEnd: Date;
+    ratingVersion: number;
+    cents: number;
+    overageEnabled: boolean;
+    now: Date;
+    existingInvoiceId?: string | null;
+}
+
+export type OverageInvoiceResult =
+    | { status: 'invoiced'; invoiceId: string; invoiceStatus: string; hostedInvoiceUrl: string | null }
+    | { status: 'skipped'; reason: 'overage_disabled' | 'nothing_to_bill' | 'period_not_closed' };
+
+export interface UsageBillingPort {
+    invoiceOverage(input: OverageInvoiceRequest, hooks?: { onDraftCreated?: (invoiceId: string) => Promise<void> }): Promise<OverageInvoiceResult>;
 }
 
 // ── Processor / handlers ──────────────────────────────────────────────────────
@@ -352,5 +408,6 @@ export interface BillingDeps {
     store: BillingStore;
     /** Null unless `STRIPE_SECRET` is set. */
     stripe: StripeApi | null;
+    usage: UsageBillingPort | null;
     now: () => Date;
 }
