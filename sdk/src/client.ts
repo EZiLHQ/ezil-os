@@ -9,7 +9,7 @@
  */
 import { call, type CallOptions } from './transport';
 import { EzilError } from './errors';
-import type { Computer, DesktopStatus, DesktopUrl, EzilClientOptions } from './types';
+import type { Computer, ComputePlacement, DesktopStatus, DesktopUrl, EzilClientOptions } from './types';
 
 /** Per-call escape hatches. */
 export interface RequestOptions {
@@ -22,6 +22,8 @@ export interface EzilClient {
         list(opts?: RequestOptions): Promise<Computer[]>;
         /** One computer by id. Throws `NOT_FOUND` if it is deleted, missing, or someone else's. */
         get(id: string, opts?: RequestOptions): Promise<Computer>;
+        /** Observe recorded compute placement without admitting or starting a provider. Throws `NOT_FOUND` for a computer the user does not own. */
+        computePlacement(id: string, opts?: RequestOptions): Promise<ComputePlacement>;
         /**
          * Create a computer in the lowest free slot.
          * Throws when the user already holds two — the cap is a database
@@ -99,6 +101,7 @@ export const createEzilClient = (options: EzilClientOptions): EzilClient => {
         computers: {
             list: (opts) => query<Computer[]>('computer.list', undefined, opts),
             get: (id, opts) => query<Computer>('computer.get', { id }, opts),
+            computePlacement: (id, opts) => query<ComputePlacement>('computer.computePlacement', { id }, opts),
             create: (input, opts) => mutate<Computer>('computer.create', { ...(input?.name ? { name: input.name } : {}) }, opts),
             getOrCreateDefault: (opts) => mutate<Computer>('computer.getOrCreateDefault', undefined, opts),
             rename: (id, name, opts) => mutate<Computer>('computer.rename', { id, name }, opts),

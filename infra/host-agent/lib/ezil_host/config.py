@@ -17,6 +17,7 @@ DEFAULTS = {
     "apparmorProfile": "ezil-desktop",
     "deviceByIdDir": "/dev/disk/by-id",
     "dataDeviceName": "/dev/sdf",              # EC2 attachment name, not the Nitro guest path
+    "blankVerifySeconds": 500,                 # bounded full zero scan; only before first format
     "imdsUrl": "http://169.254.169.254",
     "enrollUrl": None,                         # https://<app>/api/internal/computers/enroll
     "caFile": None,                            # None = system trust store
@@ -41,6 +42,7 @@ DEFAULTS = {
     "shutdownRetryMaxSeconds": 60,
     "stopWarnSeconds": 60,
     "canaryConsole": False,                   # opt-in, bounded public diagnostics on ttyS0
+    "canaryTools": [],                        # npm bin names the canary reports (presence, size, version)
     # Host edge (gateway contract GW-2/GW-3): cloudflared's only ingress target. It forwards
     # verified requests to the desktop at edgeUpstreamHost on the edgePorts the CF route exposes.
     "edgeBind": "127.0.0.1",

@@ -29,5 +29,5 @@
 		"resolveJsonModule": true,
 		"noEmit": true
 	},
-	"include": ["*.ts"]
+	"include": ["*.ts", "lifecycle/*.ts"]
 }
