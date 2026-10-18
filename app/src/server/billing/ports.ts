@@ -137,6 +137,7 @@ export interface PlanChangeRow extends PlanChangeInsert {
 }
 
 export interface PlanChangeStateUpdate {
+    userId: string;
     subscriptionId: string;
     kind: PlanChangeKind;
     state: PlanChangeState;
@@ -205,7 +206,7 @@ export interface BillingStore {
      */
     recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed'>;
     markEventProcessed(eventId: string, outcome: string): Promise<void>;
-    upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale'>;
+    upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale' | 'conflict'>;
     insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'>;
     enqueueOutbox(item: OutboxInsert): Promise<'queued' | 'duplicate'>;
 

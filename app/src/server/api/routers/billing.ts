@@ -4,9 +4,11 @@ import { z } from 'zod';
 import { findPack, PRO_PLAN } from '@/server/billing/catalog';
 import { checkoutAvailable } from '@/server/billing/config';
 import { getBillingDeps } from '@/server/billing/deps';
-import { buildSummary, freeWindow, resolvePlan } from '@/server/billing/meters';
 import type { BillingDeps } from '@/server/billing/ports';
-import type { BillingInvoice, BillingSummary, CheckoutStart, CheckoutStatus } from '@/server/billing/types';
+import type { BillingInvoice, CheckoutStart, CheckoutStatus } from '@/server/billing/types';
+import { planFromSubscriptions } from '@/server/billing/v2/catalog';
+import type { BillingSummaryV2Result } from '@/server/billing/v2/contract';
+import { buildSummaryV2, summaryMeters } from '@/server/billing/v2/summary';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -27,19 +29,30 @@ function requestOrigin(headers?: Headers): string {
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 export function createBillingRouter(getDeps: () => BillingDeps) {
     return createTRPCRouter({
-        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummary> => {
+        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV2Result> => {
             const deps = getDeps();
             if (!deps.config.tabEnabled) return { enabled: false };
             const now = deps.now();
-            const subs = await deps.store.subscriptionsFor(ctx.user.id);
-            const since = new Date(Math.min(freeWindow(now).start.getTime(), ...subs.flatMap(sub => (
-                sub.currentPeriodStart ? [sub.currentPeriodStart.getTime()] : []
-            ))));
-            const [intervals, storage] = await Promise.all([
-                deps.store.intervalsFor(ctx.user.id, since),
-                deps.store.latestStorageFor(ctx.user.id),
+            const [subs, userCreatedAt, planChanges] = await Promise.all([
+                deps.store.subscriptionsFor(ctx.user.id),
+                deps.store.userCreatedAt(ctx.user.id),
+                deps.store.openPlanChanges(ctx.user.id),
             ]);
-            return buildSummary({ config: deps.config, now, subs, intervals, storage });
+            const plan = planFromSubscriptions({ subs, now, userCreatedAt });
+            const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer] = await Promise.all([
+                deps.store.epochsFor(ctx.user.id, window.start),
+                deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
+                plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
+                deps.store.openPaymentIssues(ctx.user.id),
+                deps.store.latestStorageFor(ctx.user.id),
+                deps.store.sizePreference(ctx.user.id),
+                deps.store.stripeCustomerFor(ctx.user.id),
+            ]);
+            return buildSummaryV2({
+                config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
+                storage, sizePreference, hasCustomer: customer !== null,
+            });
         }),
 
         createCheckout: protectedProcedure.input(z.object({ sku: z.string() })).mutation(async ({ ctx, input }): Promise<CheckoutStart> => {
@@ -52,8 +65,8 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             }
             if (input.sku !== PRO_PLAN.sku) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_sku' });
             const subs = await deps.store.subscriptionsFor(ctx.user.id);
-            const plan = resolvePlan(subs.filter(sub => sub.sku === PRO_PLAN.sku), deps.now());
-            if (plan.status !== 'free') throw new TRPCError({ code: 'CONFLICT', message: 'already_subscribed' });
+            const plan = planFromSubscriptions({ subs, now: deps.now(), userCreatedAt: null });
+            if (plan.family !== 'free') throw new TRPCError({ code: 'CONFLICT', message: 'already_subscribed' });
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) {

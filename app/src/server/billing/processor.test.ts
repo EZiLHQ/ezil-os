@@ -67,7 +67,8 @@ class MemoryStore implements BillingStore {
         return 'inserted';
     };
     setPlanChangeState: BillingStore['setPlanChangeState'] = async input => {
-        for (const row of this.planChanges.filter(row => row.subscriptionId === input.subscriptionId && row.kind === input.kind && this.isOpenChange(row))) {
+        for (const row of this.planChanges.filter(row => row.userId === input.userId
+            && row.subscriptionId === input.subscriptionId && row.kind === input.kind && this.isOpenChange(row))) {
             row.state = input.state;
             if (input.stripeInvoiceId !== undefined) row.stripeInvoiceId = input.stripeInvoiceId;
             if (input.effectiveAt !== undefined) row.effectiveAt = input.effectiveAt;
@@ -145,8 +146,9 @@ class MemoryStore implements BillingStore {
     }
     async recordEvent() { return 'new' as const; }
     async markEventProcessed() {}
-    async upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale'> {
+    async upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale' | 'conflict'> {
         const previous = this.subscriptions.get(row.stripeSubscriptionId);
+        if (previous && previous.userId !== row.userId) return 'conflict';
         if (previous && previous.stripeEventCreated > row.stripeEventCreated) return 'stale';
         if (JSON.stringify(previous) !== JSON.stringify(row)) {
             this.subscriptions.set(row.stripeSubscriptionId, { ...row });
@@ -697,6 +699,47 @@ async function seedOverage(f: ReturnType<typeof fixture>) {
 }
 
 describe('v2 webhook grants', () => {
+    it.each(['legacy period', 'v2 period', 'upgrade', 'sync', 'failed invoice', 'plan applied', 'plan expired'] as const)(
+        'reviews subscription ownership conflicts before any further write: %s', async scenario => {
+            const { store, stripe, deps } = scenario === 'legacy period' ? fixture() : v2Fixture('compute_monthly_v2');
+            const ownerRow: SubscriptionUpsert = {
+                stripeSubscriptionId: 'sub_local', userId: 'user_owner', status: 'active', sku: 'standard_monthly_v2',
+                currentPeriodStart: periodStart, currentPeriodEnd: periodEnd, cancelAtPeriodEnd: false,
+                stripeEventCreated: periodStart,
+            };
+            store.subscriptions.set('sub_local', ownerRow);
+            await seedChange(store);
+            store.planChanges[0].userId = 'user_owner';
+            await store.recordPaymentIssue({ stripeInvoiceId: 'in_local', userId: 'user_owner', subscriptionId: 'sub_local',
+                invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, eventCreated: periodStart });
+            let delivery = scenario === 'legacy period' ? invoice() : paidV2();
+            if (scenario === 'upgrade') {
+                stripe.invoice.billingReason = 'subscription_update';
+                stripe.invoice.lines = [
+                    { ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+                    { ...baseLine('compute_monthly_v2'), amount: 5000, proration: true, periodStart: now },
+                ];
+            } else if (scenario === 'sync') {
+                delivery = sync();
+            } else if (scenario === 'failed invoice') {
+                stripe.invoice.status = 'open';
+                delivery = issueEvent('invoice.payment_failed', true);
+            } else if (scenario === 'plan applied' || scenario === 'plan expired') {
+                delivery = event(`customer.subscription.pending_update_${scenario === 'plan applied' ? 'applied' : 'expired'}`, { id: 'sub_local' });
+            }
+            const writes = [
+                vi.spyOn(store, 'insertGrant'), vi.spyOn(store, 'enqueueOutbox'), vi.spyOn(store, 'setPlanChangeState'),
+                vi.spyOn(store, 'recordPaymentIssue'), vi.spyOn(store, 'resolvePaymentIssue'),
+            ];
+            expect(await processStripeEvent(delivery, deps)).toBe('review:customer_mismatch');
+            for (const write of writes) expect(write).not.toHaveBeenCalled();
+            expect(store.subscriptions.get('sub_local')).toEqual(ownerRow);
+            expect(store.planChanges[0].state).toBe('pending');
+            expect(store.issues.get('in_local')?.resolvedAt).toBeNull();
+            expect(store.writes).toEqual([]);
+        },
+    );
+
     it('grants a Compute cycle and saves the Compute SKU despite stale Standard metadata', async () => {
         const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
         const client = createStripeClient({ secretKey: 'sk_test_fixture', fetch: vi.fn<typeof fetch>().mockResolvedValue(
@@ -1015,6 +1058,19 @@ describe('v2 payment issues and plan changes', () => {
         expect(store.subscriptions.get('sub_local')?.status).toBe('past_due');
         expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ invoiceKind: 'subscription', issue: 'payment_failed' })]);
         expect(store.grants.size).toBe(0);
+    });
+
+    it('scopes upgrade invoice issue plan changes to the resolved user', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        await seedChange(store);
+        store.planChanges[0].userId = 'user_owner';
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.status = 'open';
+        const update = vi.spyOn(store, 'setPlanChangeState');
+        expect(await processStripeEvent(issueEvent('invoice.payment_action_required', true), deps)).toBe('applied');
+        expect(update).toHaveBeenCalledWith({ userId: 'user_local', subscriptionId: 'sub_local', kind: 'upgrade',
+            stripeInvoiceId: 'in_local', state: 'requires_action' });
+        expect(store.planChanges[0].state).toBe('pending');
     });
 
     it.each(['applied', 'expired'] as const)('syncs pending update %s and changes only the open upgrade state', async outcome => {

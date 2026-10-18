@@ -313,17 +313,28 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
             expect(await store.recordPlanChange({ ...input, state })).toBe('exists');
         }
         const stripeInvoiceId = `in_${randomUUID()}`;
-        await store.setPlanChangeState({ subscriptionId, kind: 'upgrade', state: 'requires_action', stripeInvoiceId });
-        await store.setPlanChangeState({ subscriptionId, kind: 'upgrade', state: 'scheduled' });
+        await store.setPlanChangeState({ userId, subscriptionId, kind: 'upgrade', state: 'requires_action', stripeInvoiceId });
+        await store.setPlanChangeState({ userId, subscriptionId, kind: 'upgrade', state: 'scheduled' });
         expect(await store.openPlanChanges(userId)).toEqual([expect.objectContaining({ id: initial.id, state: 'scheduled', stripeInvoiceId })]);
         expect(await store.recordPlanChange(change({ kind: 'cancel', toSku: null }))).toBe('inserted');
         expect(await store.openPlanChanges(userId)).toHaveLength(2);
-        await store.setPlanChangeState({ subscriptionId, kind: 'upgrade', state: 'applied', effectiveAt: instant(50) });
-        await store.setPlanChangeState({ subscriptionId, kind: 'upgrade', state: 'canceled', effectiveAt: instant(60) });
+        await store.setPlanChangeState({ userId, subscriptionId, kind: 'upgrade', state: 'applied', effectiveAt: instant(50) });
+        await store.setPlanChangeState({ userId, subscriptionId, kind: 'upgrade', state: 'canceled', effectiveAt: instant(60) });
         const [closed] = await db.select().from(billingPlanChanges).where(eq(billingPlanChanges.id, initial.id));
         expect(closed).toMatchObject({ state: 'applied', stripeInvoiceId, effectiveAt: instant(50) });
         expect(await store.recordPlanChange(input)).toBe('inserted');
         expect(await store.openPlanChanges(userId)).toHaveLength(2);
+    });
+
+    it('does not let B update A\'s open plan change through A\'s subscription id', async () => {
+        await store.recordPlanChange(change());
+        const before = await store.openPlanChanges(userId);
+        await store.setPlanChangeState({ userId: otherUserId, subscriptionId, kind: 'upgrade', state: 'applied',
+            stripeInvoiceId: 'in_foreign', effectiveAt: instant(50) });
+        expect(await store.openPlanChanges(userId)).toEqual(before);
+        expect(await store.openPlanChanges(otherUserId)).toEqual([]);
+        await store.setPlanChangeState({ userId, subscriptionId, kind: 'upgrade', state: 'requires_action' });
+        expect(await store.openPlanChanges(userId)).toEqual([expect.objectContaining({ id: before[0].id, state: 'requires_action' })]);
     });
 
     it('guards issue updates and resolutions against stale events, including replays after resolution', async () => {

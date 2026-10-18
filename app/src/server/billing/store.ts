@@ -184,9 +184,10 @@ export function createBillingStore(db: Database): BillingStore {
             return rows.length > 0 ? 'inserted' : 'exists';
         },
 
-        async setPlanChangeState({ subscriptionId, kind, state, stripeInvoiceId, effectiveAt }) {
+        async setPlanChangeState({ userId, subscriptionId, kind, state, stripeInvoiceId, effectiveAt }) {
             await db.update(billingPlanChanges).set({ state, stripeInvoiceId, effectiveAt, updatedAt: sql`now()` })
                 .where(and(
+                    eq(billingPlanChanges.userId, userId),
                     eq(billingPlanChanges.subscriptionId, subscriptionId),
                     eq(billingPlanChanges.kind, kind),
                     inArray(billingPlanChanges.state, openChangeStates),
@@ -360,9 +361,13 @@ export function createBillingStore(db: Database): BillingStore {
                     stripeEventCreated: sql`excluded.stripe_event_created`,
                     updatedAt: sql`now()`,
                 },
-                setWhere: sql`excluded.stripe_event_created >= ${billingSubscriptions.stripeEventCreated}`,
+                setWhere: sql`${billingSubscriptions.userId} = excluded.user_id
+                    and excluded.stripe_event_created >= ${billingSubscriptions.stripeEventCreated}`,
             }).returning({ id: billingSubscriptions.stripeSubscriptionId });
-            return written.length > 0 ? 'applied' : 'stale';
+            if (written.length > 0) return 'applied';
+            const [existing] = await db.select({ userId: billingSubscriptions.userId }).from(billingSubscriptions)
+                .where(eq(billingSubscriptions.stripeSubscriptionId, row.stripeSubscriptionId));
+            return existing && existing.userId !== row.userId ? 'conflict' : 'stale';
         },
 
         async insertGrant(grant) {

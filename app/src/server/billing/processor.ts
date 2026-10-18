@@ -60,8 +60,10 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 await store.resolvePaymentIssue(invoice.id, eventCreated);
                 return result === 'updated' ? 'applied' : 'ignored';
             }
-            await store.resolvePaymentIssue(invoice.id, eventCreated);
-            if (invoice.billingReason === null || invoice.billingReason === 'manual' || invoice.subscriptionId === null) return 'ignored';
+            if (invoice.billingReason === null || invoice.billingReason === 'manual' || invoice.subscriptionId === null) {
+                await store.resolvePaymentIssue(invoice.id, eventCreated);
+                return 'ignored';
+            }
             const subscription = await stripe.retrieveSubscription(invoice.subscriptionId);
             if (subscription.customer !== invoice.customer) return 'review:customer_mismatch';
             const userId = await store.userForStripeCustomer(invoice.customer);
@@ -73,7 +75,9 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 if (offer.sku === PRO_PLAN.sku) {
                     const { periodStart, periodEnd } = invoice;
                     if (!validPeriod(periodStart, periodEnd)) return 'review:invalid_period';
-                    await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                    const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                    if (result === 'conflict') return 'review:customer_mismatch';
+                    await store.resolvePaymentIssue(invoice.id, eventCreated);
                     await store.insertGrant({
                         userId, meter: 'workspace_seconds', kind: 'pro_period',
                         amount: BigInt(PRO_PLAN.workspaceSeconds), periodStart, periodEnd,
@@ -94,7 +98,9 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                         && (line.subscriptionId === subscription.id || line.subscriptionId === null)
                         && validPeriod(line.periodStart, line.periodEnd));
                     if (!base) return 'review:no_base_line';
-                    await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                    const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                    if (result === 'conflict') return 'review:customer_mismatch';
+                    await store.resolvePaymentIssue(invoice.id, eventCreated);
                     await store.insertGrant({
                         userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'plan_period',
                         amount: BigInt(offer.allowanceStdSeconds), periodStart: base.periodStart, periodEnd: base.periodEnd,
@@ -108,7 +114,10 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 const compute = ownedLines.find(line => line.lookupKey === CATALOG_V2.compute_monthly_v2.stripeLookupKey
                     && line.amount > 0 && validPeriod(line.periodStart, line.periodEnd));
                 const credit = ownedLines.find(line => line.lookupKey === CATALOG_V2.standard_monthly_v2.stripeLookupKey);
-                if (!compute || !credit) return 'ignored';
+                if (!compute || !credit) {
+                    await store.resolvePaymentIssue(invoice.id, eventCreated);
+                    return 'ignored';
+                }
                 const { currentPeriodStart: periodStart, currentPeriodEnd } = subscription;
                 if (!validPeriod(periodStart, currentPeriodEnd)) return 'review:invalid_period';
                 const effectiveAt = compute.periodStart!;
@@ -120,14 +129,17 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
                     periodStart: periodStart!.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: effectiveAt.toISOString(),
                 });
-                await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                if (result === 'conflict') return 'review:customer_mismatch';
+                await store.resolvePaymentIssue(invoice.id, eventCreated);
                 await store.insertGrant({
                     userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'upgrade_prorated',
                     amount: BigInt(amount), periodStart, periodEnd, sourceType: 'invoice', sourceId: invoice.id,
                 });
-                await store.setPlanChangeState({ subscriptionId: subscription.id, kind: 'upgrade', state: 'applied', effectiveAt });
+                await store.setPlanChangeState({ userId, subscriptionId: subscription.id, kind: 'upgrade', state: 'applied', effectiveAt });
                 return 'applied';
             }
+            await store.resolvePaymentIssue(invoice.id, eventCreated);
             return 'ignored';
         }
         case 'sync_subscription':
@@ -136,9 +148,10 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             if (subscription.sku === null || !offerBySku(subscription.sku)) return 'review:unknown_sku';
             const userId = await store.userForStripeCustomer(subscription.customer);
             if (userId === null) return 'unattributed:customer';
-            await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+            const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+            if (result === 'conflict') return 'review:customer_mismatch';
             if (action.type === 'plan_change') {
-                await store.setPlanChangeState({ subscriptionId: subscription.id, kind: 'upgrade', state: action.outcome });
+                await store.setPlanChangeState({ userId, subscriptionId: subscription.id, kind: 'upgrade', state: action.outcome });
             } else if (action.invoiceIssue) {
                 return applyAction({ type: 'invoice_issue', ...action.invoiceIssue, eventCreated: action.eventCreated }, event, deps);
             }
@@ -172,7 +185,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 }
             } else if (invoiceKind === 'upgrade' && subscriptionId !== null) {
                 await store.setPlanChangeState({
-                    subscriptionId, kind: 'upgrade', stripeInvoiceId: invoice.id,
+                    userId, subscriptionId, kind: 'upgrade', stripeInvoiceId: invoice.id,
                     state: action.issue === 'requires_action' ? 'requires_action' : 'payment_failed',
                 });
             }
