@@ -362,9 +362,9 @@ export const APPS = [
             ...ctx,
             apps: resolve(ctx.payload),
             // The store window outlives a Settings Switch (it is not a sandbox
-            // window), so resolve the computer at click time, not open time —
-            // same rule as `boot.js`'s `launch_ctx`.
-            launchApp: id => launch(id, isNative(ctx) ? ctx : { ...ctx, computer: session.currentComputer() ?? ctx.computer }),
+            // window), so resolve the computer at click time, not open time
+            // (`launchContext`, below).
+            launchApp: id => launch(id, launchContext(ctx)),
         }),
     },
     {
@@ -457,6 +457,18 @@ export function settingsDrawerAction (ctx = {}) {
 }
 
 /** @param {string} id @returns {AppDescriptor|undefined} */
+/**
+ * `ctx` with the computer resolved NOW, at click time. A launcher's `ctx` is
+ * built once (the dock and Start menu at boot, the App Store at open); a
+ * Settings Switch changes `session.currentComputer()` afterwards, and every
+ * launch must follow it rather than the computer that was current when the
+ * launcher was made. Native keeps its ctx untouched (its switch replaces the
+ * whole shell).
+ */
+export function launchContext (ctx) {
+    return isNative(ctx) ? ctx : { ...ctx, computer: session.currentComputer() ?? ctx.computer };
+}
+
 export function getApp (id) {
     return APPS.find(a => a.id === id);
 }
@@ -796,4 +808,4 @@ export async function launch (id, ctx = {}) {
     }
 }
 
-export default { APPS, getApp, resolve, launch, settingsDrawerAction };
+export default { APPS, getApp, resolve, launch, launchContext, settingsDrawerAction };

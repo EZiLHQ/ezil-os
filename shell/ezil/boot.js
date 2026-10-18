@@ -662,17 +662,6 @@ function maybe_warm_desktop (ctx, apps) {
 }
 
 /**
- * `ctx` with the computer resolved NOW, at click time. `build()` makes `ctx`
- * once, with the boot payload's computer; a Settings Switch changes
- * `session.currentComputer()` afterwards, and the dock, Start menu and warm
- * intent must follow it rather than the computer the page booted with. Native
- * keeps its ctx untouched (its switch replaces the whole shell).
- */
-function launch_ctx (ctx) {
-    return isNative(ctx) ? ctx : { ...ctx, computer: session.currentComputer() ?? ctx.computer };
-}
-
-/**
  * 🔴 WARM ON INTENT, NOT ON LOGIN (container-billing fix). `warm()` used to
  * fire unconditionally the instant the desktop painted — see "LOGIN NO LONGER
  * WARMS" in `build()`, below, for the full account of why that booted a
@@ -699,7 +688,7 @@ function launch_ctx (ctx) {
  */
 function bind_warm_intent (el, ctx, apps) {
     if ( ! el ) return;
-    const on_intent = () => { maybe_warm_desktop(launch_ctx(ctx), apps); };
+    const on_intent = () => { maybe_warm_desktop(registry.launchContext(ctx), apps); };
     el.addEventListener('pointerdown', on_intent);
     el.addEventListener('pointerenter', on_intent);
 }
@@ -737,7 +726,7 @@ function open_start_menu (apps, ctx, el_anchor) {
         // Chromium: handing it the descriptor's data URI printed the entire
         // URI as visible text next to the app name. It has to be markup.
         icon: `<img src="${html_encode(app.icon)}" alt="" style="width:16px;height:16px;border-radius:3px;vertical-align:middle">`,
-        onClick: () => { void registry.launch(app.id, launch_ctx(ctx)); },
+        onClick: () => { void registry.launch(app.id, registry.launchContext(ctx)); },
     }));
     if ( items.length === 0 ) items.push({ html: 'Nothing to open', disabled: true });
 
@@ -868,7 +857,7 @@ async function build (payload) {
             // Returning anything other than `false` suppresses UITaskbarItem's
             // built-in `showWindow()` — `launch` already restores an existing
             // window and opens one otherwise.
-            onClick: () => { void registry.launch(app.id, launch_ctx(ctx)); },
+            onClick: () => { void registry.launch(app.id, registry.launchContext(ctx)); },
         });
         // 🔴 WARM ON INTENT — see `bind_warm_intent`'s doc comment and "LOGIN
         // NO LONGER WARMS" below. The dock icon is the far more common path to

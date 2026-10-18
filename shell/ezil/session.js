@@ -136,8 +136,8 @@ export function payload () {
 
 /**
  * 🔴 THE current computer — the one Settings marks Current AND the one every
- * new Desktop/Code/Preview window opens on (`boot.js`'s `launch_ctx`, the App
- * Store's `launchApp`). The boot payload's computer until the user switches in
+ * new Desktop/Code/Preview window opens on (`registry.js`'s `launchContext`,
+ * used by the dock, the Start menu and the App Store's `launchApp`). The boot payload's computer until the user switches in
  * Settings, then the computer switched to, for the rest of this page.
  * `setCurrentComputer(null)` clears the choice (back to the payload's).
  * Module state, never written into `window.__EZIL_BOOT__`. Founder-reported

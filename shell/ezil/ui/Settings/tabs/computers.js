@@ -308,8 +308,8 @@ function rowHtml (slot, computer) {
     }
 
     // 🔴 "Current" is `session.currentComputer()` — the SAME value the dock,
-    // Start menu and App Store launch with (`boot.js`'s `launch_ctx`). Founder-
-    // reported 2026-10-18: this used to be "the desktop on screen, else this
+    // Start menu and App Store launch with (`registry.js`'s `launchContext`).
+    // Founder-reported 2026-10-18: this used to be "the desktop on screen, else this
     // module's own last-switched id" while the dock kept the boot payload's
     // computer, so Settings said Computer 1 while Code opened on Computer 2.
     // The open desktop's stamp is only a fallback for a payload-less host.
