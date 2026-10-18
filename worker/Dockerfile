@@ -208,7 +208,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxshmfence1 \
       libsecret-1-0 \
       wmctrl \
+      tmux \
   && rm -rf /var/lib/apt/lists/*
+# `tmux` (above): users keep long-running terminal jobs in tmux sessions, and
+# the Worker holds an idle stop while any session exists (src/tmux-keepalive.ts).
+# Without it in the image every user had to `apt-get install tmux` first.
 # `wmctrl` (above) gives start-neko.sh a deterministic, machine-checkable way to
 # list/activate windows by class (`wmctrl -l`, `wmctrl -x -a`) for focus/app
 # switching between VS Code and the isolated Chromium instance, on top of the
