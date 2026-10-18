@@ -64,6 +64,7 @@ import { openCodeWindow } from './code.js';
 import { openAppStoreWindow } from './app-store.js';
 import { openSecureBrowser } from './native.js';
 import { isNative } from '../native-runtime.js';
+import session from '../session.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
 import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
 import telemetry from '../telemetry.js';
@@ -360,7 +361,10 @@ export const APPS = [
         open: ctx => openAppStoreWindow({
             ...ctx,
             apps: resolve(ctx.payload),
-            launchApp: id => launch(id, ctx),
+            // The store window outlives a Settings Switch (it is not a sandbox
+            // window), so resolve the computer at click time, not open time —
+            // same rule as `boot.js`'s `launch_ctx`.
+            launchApp: id => launch(id, isNative(ctx) ? ctx : { ...ctx, computer: session.currentComputer() ?? ctx.computer }),
         }),
     },
     {

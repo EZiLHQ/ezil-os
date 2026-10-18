@@ -101,7 +101,8 @@ function sandboxWindowEls () {
 /**
  * The computer id the single 'desktop' app window currently streams, as far
  * as module state knows. Only ever a HINT — `desktopStreams()` below is the
- * authority.
+ * authority. It is the delete guard's hint, NOT "the current computer": that
+ * is `session.currentComputer()`, and only that (see `rowHtml`).
  *
  * 🔴 This used to be seeded at MODULE-EVAL time from `session.payload()` and
  * treated as the truth, and the end-to-end harness
@@ -118,21 +119,11 @@ function sandboxWindowEls () {
  * (there too, and again inside `UIWindow` itself). It also doubles as the
  * fallback hint for ANY sandbox window (not just the desktop) whose own
  * stamp is missing — see `windowStreams()` below — because every sandbox
- * window open at once shares one computer: `ctx.computer` is fixed for the
- * whole boot/switch cycle (`boot.js`'s `build()`), so a desktop streaming
- * `c-1` never coexists with a Preview or Code streaming anything else.
+ * window open at once shares one computer: every launch (dock, Start menu,
+ * App Store, Switch) opens on `session.currentComputer()`, and a Switch
+ * closes every sandbox window before it changes that value.
  */
 let activeComputerId;
-
-/**
- * The computer this session is ON: the one it booted with, or the last one
- * the user switched to. Separate from `activeComputerId` (the delete guard's
- * "what is the desktop streaming" hint, which goes null when the desktop
- * window closes). Closing the desktop window does not change which computer
- * you are on, so the list keeps marking it Current instead of offering it a
- * Switch button as if it were someone else's.
- */
-let sessionComputerId;
 
 /**
  * The computer the open desktop window is streaming.
@@ -273,11 +264,14 @@ function reportError (message) {
  *
  * @param {string} [id] Close only windows streaming this computer (fails
  *   safe: 'unknown' ownership closes too — see `windowStreams()`). Omitted
- *   entirely closes every open sandbox window unconditionally.
+ *   entirely closes every open sandbox window unless `keepId` matches.
+ * @param {string} [keepId] Keep windows positively streaming this computer
+ *   when reopening its desktop; unknown ownership still closes.
  */
-async function closeSandboxWindows (id) {
+async function closeSandboxWindows (id, keepId) {
     const targets = () => sandboxWindowEls()
-        .filter(el => id === undefined || windowStreams(el, id) !== false);
+        .filter(el => (id === undefined || windowStreams(el, id) !== false)
+            && (keepId === undefined || windowStreams(el, keepId) !== true));
 
     const $wins = $(targets());
     if ( $wins.length === 0 ) {
@@ -313,13 +307,19 @@ function rowHtml (slot, computer) {
             </div>`;
     }
 
-    // "Current" is the computer this session is on: the desktop on screen
-    // right now (read from the DOM), or — when no desktop window is open —
-    // the computer the session booted with / last switched to. Closing the
-    // desktop window must not make your own computer look like another one.
+    // 🔴 "Current" is `session.currentComputer()` — the SAME value the dock,
+    // Start menu and App Store launch with (`boot.js`'s `launch_ctx`). Founder-
+    // reported 2026-10-18: this used to be "the desktop on screen, else this
+    // module's own last-switched id" while the dock kept the boot payload's
+    // computer, so Settings said Computer 1 while Code opened on Computer 2.
+    // The open desktop's stamp is only a fallback for a payload-less host.
+    // Closing the desktop window does not change which computer you are on:
+    // the row stays Current and offers Open instead of Switch.
     const onScreen = isNative() ? window.__EZIL_BOOT__?.computer?.id : openDesktopComputerId();
-    const isActive = (onScreen ?? sessionComputerId) === computer.id;
-    const desktopClosed = !isNative() && onScreen === null;
+    const currentId = isNative() ? (onScreen ?? session.currentComputer()?.id)
+        : (session.currentComputer()?.id ?? onScreen);
+    const isActive = currentId === computer.id;
+    const needsOpen = !isNative() && onScreen !== currentId;
     const isBusy = busyId === computer.id;
     const isEditing = editingId === computer.id;
     const when = timeAgo(computer.lastOpenedAt ?? computer.createdAt);
@@ -344,11 +344,11 @@ function rowHtml (slot, computer) {
             <span class="ezil-settings-row-slot">${slot}</span>
             <div class="ezil-settings-row-meta">
                 <div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
-                <div class="ezil-settings-row-sub">${isNative() ? (computer.available === false ? 'Folder unavailable — locate it to continue' : computer.kind === 'attached' ? 'Original folder · edits stay in place' : 'EZiL-managed project') : (isActive ? (desktopClosed ? 'Your current computer' : 'Active now') : (when ? `Active ${when}` : 'Never opened'))}</div>
+                <div class="ezil-settings-row-sub">${isNative() ? (computer.available === false ? 'Folder unavailable — locate it to continue' : computer.kind === 'attached' ? 'Original folder · edits stay in place' : 'EZiL-managed project') : (isActive ? (needsOpen ? 'Your current computer' : 'Active now') : (onScreen === computer.id ? 'Desktop still open' : (when ? `Active ${when}` : 'Never opened')))}</div>
             </div>
             <div class="ezil-settings-row-actions">
                 ${isActive
-                    ? `<span class="ezil-settings-pill">Current</span>${desktopClosed ? `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy ? 'disabled' : ''}>${isBusy ? 'Opening…' : 'Open'}</button>` : ''}`
+                    ? `<span class="ezil-settings-pill">Current</span>${needsOpen ? `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy ? 'disabled' : ''}>${isBusy ? 'Opening…' : 'Open'}</button>` : ''}`
                     : `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy || computer.available === false ? 'disabled' : ''}>${isBusy ? 'Switching…' : 'Switch'}</button>`}
                 ${isNative() ? (computer.available === false ? '<button type="button" class="ezil-settings-btn" data-action="relink">Locate folder…</button>' : '<button type="button" class="ezil-settings-btn" data-action="reveal">Finder</button><button type="button" class="ezil-settings-btn" data-action="openVSCode">VS Code</button><button type="button" class="ezil-settings-btn" data-action="openXcode">Xcode</button>') : ''}
                 <button type="button" class="ezil-settings-btn" data-action="rename" ${isBusy ? 'disabled' : ''}>Rename</button>
@@ -448,7 +448,12 @@ async function switchTo (computer, ctx, $win) {
         // yanked out from under a window that `registry.launch` would
         // otherwise just re-focus. No `id` argument: we are leaving whatever
         // is open behind regardless of which computer it belonged to.
-        await closeSandboxWindows();
+        //
+        // Except on Open (the target already IS the current computer): a Code
+        // or Preview window positively streaming it is not being left behind,
+        // so it stays. Unknown or other-computer windows still close.
+        const keepId = session.currentComputer()?.id === computer.id ? computer.id : undefined;
+        await closeSandboxWindows(undefined, keepId);
         if (isNative(ctx)) {
             const selected = await trpc.mutate('computer.select', { id: computer.id });
             if (!selected.ok) { reportError('Could not switch local workspaces.'); return; }
@@ -457,7 +462,7 @@ async function switchTo (computer, ctx, $win) {
             if (ctx.payload) ctx.payload.computer = computer;
         }
         activeComputerId = computer.id;
-        sessionComputerId = computer.id;
+        session.setCurrentComputer(computer);
         const desktopState = ctx?.payload?.desktopState ?? {};
         await registry.launch('desktop', { ...ctx, computer, desktopState });
     } finally {
@@ -532,7 +537,7 @@ async function handleDelete (computer, $win) {
             reportError(res.message || 'Failed to delete computer. Please try again.');
             return;
         }
-        if ( sessionComputerId === computer.id ) sessionComputerId = undefined;
+        if ( session.currentComputer()?.id === computer.id ) session.setCurrentComputer(null);
         await load($win);
     } finally {
         busyId = null;
@@ -630,12 +635,11 @@ export default {
         // stamp on the window itself. Read HERE rather than at module-eval
         // time, so the rehydrate path (payload arrives from
         // `/api/shell/session` after this module was imported) is not seeded
-        // empty. See the note on `activeComputerId`.
+        // empty. See the note on `activeComputerId`. Which computer is
+        // Current is NOT seeded from this window's ctx: that is
+        // `session.currentComputer()`, shared with every launch.
         if ( activeComputerId === undefined ) {
             activeComputerId = ctx?.computer?.id ?? session.payload()?.computer?.id ?? undefined;
-        }
-        if ( sessionComputerId === undefined ) {
-            sessionComputerId = ctx?.computer?.id ?? session.payload()?.computer?.id ?? undefined;
         }
         bind($win, ctx);
         void load($win);

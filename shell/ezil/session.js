@@ -134,6 +134,20 @@ export function payload () {
     return raw;
 }
 
+/**
+ * 🔴 THE current computer — the one Settings marks Current AND the one every
+ * new Desktop/Code/Preview window opens on (`boot.js`'s `launch_ctx`, the App
+ * Store's `launchApp`). The boot payload's computer until the user switches in
+ * Settings, then the computer switched to, for the rest of this page.
+ * `setCurrentComputer(null)` clears the choice (back to the payload's).
+ * Module state, never written into `window.__EZIL_BOOT__`. Founder-reported
+ * 2026-10-18: with two copies of this (the dock's build-time ctx and Settings'
+ * own last-switched id), Settings said Computer 1 while Code opened on 2.
+ */
+let chosenComputer = null;
+export function currentComputer () { return chosenComputer ?? payload()?.computer ?? null; }
+export function setCurrentComputer (computer) { chosenComputer = computer?.id ? computer : null; }
+
 /** Where the Route Handlers live. Mirrors `SHELL_API_ROUTES` in boot-payload.ts. */
 export const ENDPOINTS = {
     session: '/api/shell/session',
@@ -1052,7 +1066,7 @@ export { withWakeAndOneRetry };
 
 export default {
     get, set, del,
-    payload,
+    payload, currentComputer, setCurrentComputer,
     readSession, openSession,
     openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
