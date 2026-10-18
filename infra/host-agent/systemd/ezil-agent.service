@@ -1,0 +1,15 @@
+[Unit]
+Description=EZiL: control channel, idle predicate and quiesce/shutdown (R9)
+Requires=ezil-enroll.service
+After=ezil-enroll.service
+# A crashed agent is restarted (bounded). One that crashed mid-shutdown resumes it on start
+# (runDir/shutdown-pending): the poweroff is retried until the OS accepts it.
+StartLimitIntervalSec=600
+StartLimitBurst=20
+[Service]
+Type=simple
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent agent
+Restart=on-failure
+RestartSec=5

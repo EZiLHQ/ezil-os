@@ -1,0 +1,8 @@
+{
+  "stage": "pilot",
+  "region": "ap-south-1",
+  "zoneIds": ["aps1-az1"],
+  "instanceType": "m6i.large",
+  "rootDeviceName": "/dev/sda1",
+  "rootVolumeGiB": 30
+}

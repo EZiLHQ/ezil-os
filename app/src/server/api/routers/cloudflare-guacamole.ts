@@ -49,7 +49,6 @@ import {
     describeAppliedScreen,
     enableImplicitHosting,
     FOCUSABLE_APPS,
-    getGuacamoleSandboxStatus,
     isOwnDesktopOrigin,
     mintAppPreviewBootstrapToken,
     newCorrelationId,
@@ -58,12 +57,8 @@ import {
     probeDesktopFrame,
     readDesktopScreen,
     readWorkerBridgeUrl,
-    requestGuacamoleActivity,
-    requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
     requestRelayRefresh,
-    requestGuacamolePreview,
-    requestGuacamoleSandboxTerminate,
     readGuacamoleScreen,
     requestGuacamoleScreen,
     resolveCloudflareGuacamoleConfig,
@@ -71,6 +66,10 @@ import {
     fitScreenRequest,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
+import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
+import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, routeComputer } from './compute-dispatch';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -89,6 +88,21 @@ async function assertOwnedComputer(
     }
 }
 
+/**
+ * The control target (sandbox name + Worker auth) for an owned computer's screen, focus or
+ * relay call: v2 `aws-ec2` claims for an AWS placement, so the Worker refuses rather than
+ * waking a Cloudflare sandbox when its tunnel is gone; the legacy v1 path otherwise. A
+ * placement owned by someone else looks absent (NOT_FOUND), as in `routeComputer`.
+ */
+async function controlTarget(db: typeof import('@/server/db').db, userId: string, computerId: string): Promise<ControlTarget> {
+    try {
+        return await controlTargetFor(db as unknown as PlacementExecutor, { userId, computerId });
+    } catch (err) {
+        if (err instanceof PlacementOwnerError) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+        throw err;
+    }
+}
+
 export const cloudflareGuacamoleRouter = createTRPCRouter({
     relayState: protectedProcedure.input(z.object({ computerId: z.string().uuid() }))
         .query(async ({ ctx, input }) => {
@@ -96,7 +110,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const config = resolveCloudflareGuacamoleConfig();
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             if (!config.isConfigured || !hmacSecret) return { ok:false as const,error:'relay_not_configured' };
-            return requestRelayRefresh(config,hmacSecret,deriveGuacamoleSandboxId(ctx.user.id,input.computerId),newCorrelationId());
+            const target = await controlTarget(ctx.db,ctx.user.id,input.computerId);
+            return requestRelayRefresh(config,hmacSecret,target.sandboxName,newCorrelationId(),undefined,target.auth);
         }),
     refreshRelay: protectedProcedure.input(z.object({ computerId: z.string().uuid(), runtimeId: z.string().regex(/^[a-f0-9]{32}$/) }))
         .mutation(async ({ ctx, input }) => {
@@ -104,7 +119,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const config = resolveCloudflareGuacamoleConfig();
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             if (!config.isConfigured || !hmacSecret) return { ok:false as const,error:'relay_not_configured' };
-            return requestRelayRefresh(config,hmacSecret,deriveGuacamoleSandboxId(ctx.user.id,input.computerId),newCorrelationId(),input.runtimeId);
+            const target = await controlTarget(ctx.db,ctx.user.id,input.computerId);
+            return requestRelayRefresh(config,hmacSecret,target.sandboxName,newCorrelationId(),input.runtimeId,target.auth);
         }),
     /**
      * Check whether the desktop provider is configured. Safe to call from
@@ -170,25 +186,28 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const correlationId = newCorrelationId();
 
-            const result = await requestGuacamolePreview(
-                config,
-                hmacSecret,
-                {
-                    sessionId: input.sessionId,
-                    userId: ctx.user.id,
-                    projectId: input.computerId,
-                    desktopMode: 'neko',
-                    // 🔴 OMITTED, not defaulted, when nothing usable was asked
-                    // for. The Worker only injects `NEKO_SCREEN` when this
-                    // field is present, so a `default` resolution produces a
-                    // byte-for-byte identical container to the one this
-                    // codebase booted before the field existed.
-                    ...(screen.source === 'default'
-                        ? {}
-                        : { screen: { width: screen.width, height: screen.height } }),
-                },
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const ensureOptions = {
+                sessionId: input.sessionId,
+                desktopMode: 'neko' as const,
+                // 🔴 OMITTED, not defaulted, when nothing usable was asked
+                // for. The Worker only injects `NEKO_SCREEN` when this
+                // field is present, so a `default` resolution produces a
+                // byte-for-byte identical container to the one this
+                // codebase booted before the field existed.
+                ...(screen.source === 'default'
+                    ? {}
+                    : { screen: { width: screen.width, height: screen.height } }),
+            };
+            // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            if (routed.kind === 'aws-ec2') {
+                return awsPreviewAnswer(
+                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                );
+            }
+            const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -425,20 +444,19 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const correlationId = newCorrelationId();
 
-            const result = await requestGuacamolePreview(
-                config,
-                hmacSecret,
-                {
-                    // Same correlation convention as `../desktop/route.ts`'s
-                    // POST handler: defaulting sessionId to the computer id
-                    // when the shell has no separate session concept for it.
-                    sessionId: input.computerId,
-                    userId: ctx.user.id,
-                    projectId: input.computerId,
-                    desktopMode: 'neko',
-                },
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            // Same correlation convention as `../desktop/route.ts`'s
+            // POST handler: defaulting sessionId to the computer id
+            // when the shell has no separate session concept for it.
+            const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            if (routed.kind === 'aws-ec2') {
+                return awsPreviewAnswer(
+                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                );
+            }
+            const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -602,17 +620,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const correlationId = newCorrelationId();
 
-            const result = await requestGuacamolePreview(
-                config,
-                hmacSecret,
-                {
-                    sessionId: input.computerId,
-                    userId: ctx.user.id,
-                    projectId: input.computerId,
-                    desktopMode: 'neko',
-                },
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            if (routed.kind === 'aws-ec2') {
+                return awsPreviewAnswer(
+                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                );
+            }
+            const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -871,14 +888,26 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const status = await getGuacamoleSandboxStatus(config, sandboxName, correlationId);
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind === 'aws-ec2') {
+                // `guacamoleRunning` is the Cloudflare container's flag; an AWS computer
+                // reports its lifecycle state instead (`starting`/`running`/`stopped`/...).
+                const aws = awsStatusAnswer(await routed.provider.status({ correlationId }, computer));
+                return { ...aws, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
+            }
+            const status = await routed.provider.status({ correlationId }, computer);
 
             return { ...status, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
         }),
 
-    /** Request teardown of a computer's sandbox. Fire-and-forget. */
+    /**
+     * Request teardown of a computer's sandbox. Fire-and-forget, except with `confirm`
+     * (the shell's `POST /api/shell/stop`): an AWS stop is then waited for and reported
+     * only once confirmed (`confirmAwsStop`).
+     */
     terminate: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({ computerId: z.string().uuid(), confirm: z.boolean().optional() }))
         .mutation(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
@@ -887,10 +916,17 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ok: false as const, error: 'provider_not_configured', provider: 'cloudflare-guacamole' as const };
             }
 
-            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleSandboxTerminate(config, hmacSecret, sandboxName, correlationId);
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const routed = await routeComputer(ctx.db, computer);
+            // A user stop of an AWS computer STOPS the instance (data and root disks kept;
+            // reopen is a cold boot). It never retires: retire is the computer delete.
+            const result = routed.kind === 'aws-ec2'
+                ? input.confirm
+                    ? await confirmAwsStop(routed.provider, { correlationId }, computer)
+                    : await routed.provider.stop({ correlationId }, computer, 'user')
+                : await routed.provider.terminate({ correlationId }, computer);
             // Report what the Worker actually confirmed, not a hardcoded
             // success — `result.ok` is false for still_running/destroy_failed,
             // a rejected signature, or an unreachable Worker.
@@ -936,9 +972,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
 
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const target = await controlTarget(ctx.db, ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleFocusApp(config, hmacSecret, sandboxName, input.app, correlationId);
+            const result = await requestGuacamoleFocusApp(config, hmacSecret, target.sandboxName, input.app, correlationId, target.auth);
 
             return {
                 ok: result.ok,
@@ -1001,8 +1037,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
 
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
-            const result = await readGuacamoleScreen(config, hmacSecret, sandboxName, correlationId);
+            const target = await controlTarget(ctx.db, ctx.user.id, input.computerId);
+            const result = await readGuacamoleScreen(config, hmacSecret, target.sandboxName, correlationId, target.auth);
 
             if (!result.ok) {
                 return {
@@ -1068,14 +1104,15 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
 
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const control = await controlTarget(ctx.db, ctx.user.id, input.computerId);
             const result = await requestGuacamoleScreen(
                 config,
                 hmacSecret,
-                sandboxName,
+                control.sandboxName,
                 target.width,
                 target.height,
                 correlationId,
+                control.auth,
             );
 
             if (!result.ok) {
@@ -1161,16 +1198,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleActivity(
-                config,
-                hmacSecret,
-                sandboxName,
-                input.lastInputAgoMs,
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const routed = await routeComputer(ctx.db, computer);
+            const result = await routed.provider.activity({ correlationId }, computer, {
+                lastInputAgoMs: input.lastInputAgoMs,
+            });
 
             return {
                 ok: result.ok,
@@ -1209,10 +1242,15 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleDesktopRestart(config, hmacSecret, sandboxName, correlationId);
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            if (routed.kind === 'aws-ec2') {
+                // No in-place desktop restart on AWS yet; a refusal the UI renders, never Cloudflare.
+                const aws = await routed.provider.restart({ correlationId }, computer);
+                return { ok: false as const, errorCode: aws.outcome ?? 'aws_not_supported', correlationId, provider: 'cloudflare-guacamole' as const };
+            }
+            const result = await routed.provider.restart({ correlationId }, computer);
 
             if (!result.ok) {
                 return {

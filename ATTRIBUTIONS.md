@@ -250,3 +250,22 @@ The licenses and versions were checked in the installed packages' own
 `package.json` files. Both are pinned development dependencies in
 `app/package.json` and `app/bun.lock`; no upstream source was copied into
 the application.
+
+## AWS persistent-computer infrastructure
+
+The independently authored CDK stacks and lifecycle workflow in
+`infra/app-computers` use [AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3)
+clients `@aws-sdk/client-ec2`, `client-sfn` and `client-secrets-manager` at
+3.1140.0 (Apache-2.0), [AWS CDK](https://github.com/aws/aws-cdk) `aws-cdk-lib`
+2.270.0 and the `aws-cdk` CLI 2.1143.0 (Apache-2.0), `constructs` 10.8.1
+(Apache-2.0), Zod 3.25.76 (MIT) for strict wire validation, esbuild 0.25.10 (MIT)
+to bundle its Lambda handlers, and tsx 4.23.15 (MIT) to run TypeScript.
+Versions and licenses were checked in the installed packages' `package.json`
+files. No third-party application source is included in these artifacts.
+
+The application (`app/`) calls AWS for the same computers through
+[AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3) clients
+`@aws-sdk/client-sfn`, `@aws-sdk/client-ec2` and `@aws-sdk/client-sts` at
+3.1140.0 (Apache-2.0), pinned exactly in `app/package.json` and `app/bun.lock`
+(`app/src/server/lib/compute/aws-clients.ts`). Versions and licenses were
+checked in the installed packages' `package.json` files; no SDK source is copied.
