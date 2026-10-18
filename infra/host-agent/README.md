@@ -112,11 +112,14 @@ stops the desktop, unmounts the overlay, syncs, unmounts the data volume and run
 
 **Terminal work (SIGNAL C).** Before checking load or marking a stop, the agent probes the
 running desktop through `runc exec` with the Worker's `terminal-keepalive.ts` script. Any
-tmux session or terminal foreground job holds an idle stop for up to 8 hours after last
-presence; idle prompts and background jobs do not count. A held cycle sets no mark and
+tmux session or terminal foreground job holds the agent's idle stop for up to 8 hours after
+last presence; idle prompts and background jobs do not count. A held cycle sets no mark and
 flushes nothing; it logs `idle stop held: tmuxSessions/terminalJobs=<t>/<j>` and the check
-repeats. The probe times out after 30 s;
-a stopped desktop, probe failure, malformed output or expired cap leaves the ordinary
+repeats. The hold does not extend the control plane's lease: only owner presence renews it
+(`leaseSeconds`, 3600 by default), so a lapsed lease still stops a held computer about an
+hour after the owner left. The probe times out after 30 s; a user who returns during the
+probe cancels the stop, and a stopped desktop, probe failure, malformed output or expired
+cap leaves the ordinary
 idle path in charge. Control-plane stops and fences still proceed.
 
 **Stop outcome is recorded, never assumed.** `desktop.stop()` first hangs up the terminal

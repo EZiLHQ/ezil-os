@@ -229,6 +229,16 @@ class AgentTick(unittest.TestCase):
         self.load.side_effect = OSError("unreadable")
         self.assert_held("1/0", "live_tmux_sessions")
 
+    def test_presence_during_the_probe_cancels_the_stop(self):
+        def returning_user(*_args, **_kwargs):
+            self.a.last_presence = self.now     # a presence report lands while the probe runs
+            return subprocess.CompletedProcess(["/bin/sh"], 0, "0 0", "")
+        self.execute.side_effect = returning_user
+        self.assertEqual(self.a.tick(), "active")
+        self.flush.assert_not_called()
+        self.shutdown.assert_not_called()
+        self.assertFalse(os.path.exists(self.stopping))
+
     def test_presence_does_not_probe(self):
         self.a.last_presence = self.now - 599
         self.assertEqual(self.a.tick(), "active")

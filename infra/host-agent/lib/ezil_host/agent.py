@@ -12,7 +12,8 @@ plane regardless of what this agent reports; this agent only:
       A. no presence for idle.inactivitySeconds  (worker isIdleStopDue)
          then, before B: a tmux session or a terminal running a foreground job in the
          desktop HOLDS the due stop (held_terminal: no marker, no flush) for at most 8 h
-         of idle; unknown = no hold (worker SIGNAL C, terminal-keepalive.ts; terminal_work)
+         of idle (a lapsed control-plane lease still stops it, about 1 h after the owner
+         left); unknown = no hold (worker SIGNAL C, terminal-keepalive.ts; terminal_work)
       B. host 1-min load below idle.load1Busy, strictly parsed; unknown = busy
          (worker CONTAINER_BUSY_LOAD1 / parseLoadAvg1)
       C. a SUCCESSFUL final flush; busy (dpkg/apt lock held in the guest) or stale
@@ -469,6 +470,9 @@ class Agent:
             return "active"
         if self._terminal_hold(now - self.last_presence):
             return "held_terminal"
+        # The probe can take up to 30 s; a user who came back meanwhile is present again.
+        if not idle_due(self.last_presence, self.clock(), self.cfg.idle["inactivitySeconds"]):
+            return "active"
         try:
             with open("/proc/loadavg") as f:
                 load1 = parse_load1(f.read())
