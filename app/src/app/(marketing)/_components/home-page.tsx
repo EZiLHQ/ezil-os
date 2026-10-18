@@ -1,3 +1,4 @@
+import { FREE_V2_EFFECTIVE_AT } from '@/server/billing/v2/contract';
 import { getPricingContent, marketingContent as chrome } from '../pricing/pricing-content';
 import styles from '../marketing.module.css';
 
@@ -30,14 +31,15 @@ function ProductFrame() {
 }
 
 /**
- * Both routes render one document. Native autofocus brings /pricing to its
- * plans without shipping a scrolling script; ordinary home visits keep the hero.
+ * Both routes share a server-rendered document; /pricing starts at the plans,
+ * while ordinary home visits keep the hero.
  */
-export default function MarketingHome({ largeStorageEnabled, focusPlans = false }: {
+export default function MarketingHome({ largeStorageEnabled, focusPlans = false, freeV2EffectiveAt = FREE_V2_EFFECTIVE_AT }: {
     largeStorageEnabled: boolean;
     focusPlans?: boolean;
+    freeV2EffectiveAt?: string | null;
 }) {
-    const copy = getPricingContent(largeStorageEnabled);
+    const copy = getPricingContent(largeStorageEnabled, freeV2EffectiveAt);
 
     return (
         <div className={styles.shell}>
@@ -89,30 +91,32 @@ export default function MarketingHome({ largeStorageEnabled, focusPlans = false 
                         : <h2 id="plans-title">{copy.plansLabel}</h2>}
                     <div className={styles.plans}>
                         {copy.plans.map(plan => (
-                            <article key={plan.id} data-testid={`plan-${plan.id}`} className={`${styles.card} ${plan.id === 'pro' ? styles.pro : ''}`} aria-labelledby={`plan-${plan.id}-title`}>
+                            <article key={plan.id} data-testid={`plan-${plan.id}`} className={`${styles.card} ${plan.id === 'compute' ? styles.compute : ''}`} aria-labelledby={`plan-${plan.id}-title`}>
                                 <div className={styles.cardHeading}>
                                     <h3 id={`plan-${plan.id}-title`}>{plan.name}</h3>
                                     {plan.badge && <span className={styles.pill}>{plan.badge}</span>}
                                 </div>
                                 <p className={styles.price}>{plan.price}<span>{plan.interval}</span></p>
                                 <p className={styles.caption}>{plan.billingNote}</p>
-                                <a data-testid={plan.id === 'pro' ? 'cta-get-pro' : undefined} className={plan.id === 'pro' ? styles.primary : styles.outline} href={plan.cta.href}>{plan.cta.label}</a>
+                                <a data-testid={plan.id === 'free' ? undefined : `cta-get-${plan.id}`} className={plan.id === 'compute' ? styles.primary : styles.outline} href={plan.cta.href}>{plan.cta.label}</a>
                                 <dl className={styles.allowances}>
                                     {plan.allowances.map(allowance => (
                                         <div key={allowance.id} className={styles.allowance} data-testid={`allowance-${plan.id}-${allowance.id}`}>
                                             <dt>{allowance.label}</dt>
-                                            <dd><strong>{allowance.value}</strong> <span>{allowance.unit}</span><small>{allowance.caption}</small></dd>
+                                            <dd><strong>{allowance.value}</strong> <span>{allowance.unit}</span>{allowance.caption && <small>{allowance.caption}</small>}</dd>
                                         </div>
                                     ))}
                                 </dl>
+                                {plan.disclosure && <p className={styles.planNote}>{plan.disclosure}</p>}
+                                {plan.note && <p className={styles.planNote}>{plan.note}</p>}
                             </article>
                         ))}
                     </div>
                     <p className={styles.sharedNote}>{copy.sharedNote}</p>
                 </section>
-                <section className={styles.topUps} aria-labelledby="top-ups-title">
-                    <h2 id="top-ups-title">{copy.topUps.title}</h2>
-                    <p className={styles.pill}>{copy.topUps.note}</p>
+                <section className={styles.overage} aria-labelledby="overage-title">
+                    <h2 id="overage-title">{copy.overage.title}</h2>
+                    <p>{copy.overage.body}</p>
                 </section>
                 <section className={styles.section} aria-labelledby="limits-title">
                     <h2 id="limits-title">{copy.limits.title}</h2>
@@ -128,9 +132,7 @@ export default function MarketingHome({ largeStorageEnabled, focusPlans = false 
                 <section className={styles.section} aria-labelledby="faq-title">
                     <h2 id="faq-title">{copy.faq.title}</h2>
                     {copy.faq.items.map(item => (
-                        // Open questions rather than <details>: six short answers read
-                        // faster on one screen, and Chromium exposes <summary> only as
-                        // text to assistive technology (found by e2e/billing-home.mjs).
+                        // Keep questions as visible headings for assistive technology.
                         <div key={item.question} className={styles.faq}>
                             <h3>{item.question}</h3><p>{item.answer}</p>
                         </div>

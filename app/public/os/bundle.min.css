@@ -1030,14 +1030,17 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-billing-header .ezil-settings-lead{margin:0}
 .ezil-billing-header>button{margin-left:auto}
 .ezil-billing-card{min-width:0;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
-.ezil-billing-plan.is-pro{border-color:var(--accent)}
+.ezil-billing-plan[data-family=compute]{border-color:var(--accent)}
 .ezil-billing-plan p{margin:8px 0 0}
-.ezil-billing-plan-heading h4{margin:0;font-size:16px;color:var(--text);text-transform:none;letter-spacing:normal}
+.ezil-billing-card h4,.ezil-billing-meter h4,.ezil-billing-sizes legend{margin:0;font-size:16px;line-height:24px;font-weight:600;color:var(--text);text-transform:none;letter-spacing:normal}
 .ezil-billing-price{margin-left:auto;font-size:20px;font-weight:600;line-height:28px}
 .ezil-billing-status{color:var(--muted)}
+.ezil-settings-billing [data-role=plan-status][data-status=active]{background:color-mix(in srgb,var(--accent) 18%,var(--surface));color:#4fd8de}
+.ezil-settings-billing [data-role=plan-status][data-status=free]{background:var(--surface-2);color:var(--muted)}
+.ezil-settings-billing [data-role=plan-status][data-status=cancels],.ezil-settings-billing [data-role=plan-status][data-status=incomplete],.ezil-settings-billing [data-role=plan-status][data-status=upgrade_pending]{background:color-mix(in srgb,var(--warn) 12%,var(--surface));color:var(--warn)}
+.ezil-settings-billing [data-role=plan-status][data-status=past_due]{background:color-mix(in srgb,var(--danger) 12%,var(--surface));color:var(--danger)}
 .ezil-billing-meters{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;margin-top:16px}
-.ezil-billing-meter{min-width:0;padding:16px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
-.ezil-billing-meter h4{color:var(--text);text-transform:none;letter-spacing:normal;font-size:14px}
+.ezil-billing-meter{min-width:0;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}
 .ezil-billing-meter p{margin:8px 0 0}
 .ezil-billing-usage{font-size:28px;font-weight:600;line-height:34px}
 .ezil-billing-meter.is-unavailable .ezil-billing-usage{font-size:18px;line-height:34px;color:var(--muted,#9aa3ad)}
@@ -1049,25 +1052,71 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-billing-nudge{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:16px;padding:12px 16px;border-left:2px solid var(--warn);background:var(--surface)}
 .ezil-billing-nudge p{flex:1 1 180px;margin:0}
 .ezil-billing-actions,.ezil-billing-footer{display:flex;flex-wrap:wrap;gap:12px;margin-top:20px}
-.ezil-billing-pack{display:flex;flex-direction:column;gap:6px;width:100%;min-width:0}
-.ezil-billing-pack select{width:100%;min-width:0;padding:8px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;font:inherit}
+.ezil-settings-billing [data-role=plan-actions]:empty{display:none}
+.ezil-billing-payment{margin-bottom:16px}
+.ezil-billing-payment p{margin:0 0 12px}
+.ezil-billing-payment.is-warn{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--surface))}
+.ezil-billing-payment.is-danger{border-color:var(--danger);background:color-mix(in srgb,var(--danger) 8%,var(--surface))}
+.ezil-billing-warning{color:var(--warn)}
+.ezil-billing-estimate,.ezil-billing-meter[data-meter=compute],.ezil-billing-overage,.ezil-billing-picker,.ezil-billing-session,.ezil-billing-sizes{margin:16px 0 0}
+.ezil-billing-offers,.ezil-billing-size-options{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}
+.ezil-billing-offers .ezil-billing-card{display:flex;flex-direction:column;align-items:flex-start;gap:12px}
+.ezil-billing-offers p{margin:0}
+.ezil-billing-offers button{margin-top:auto}
+.ezil-billing-offer-price{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 4px}
+.ezil-billing-offer-price strong{font-size:24px;line-height:32px;font-weight:600;color:var(--text)}
+.ezil-billing-offer-price span{color:var(--muted)}
+.ezil-billing-offer-allowances{display:grid;gap:4px;list-style:none;margin:0;padding:0}
+.ezil-billing-offer-note{color:var(--muted);font-size:13px}
+.ezil-billing-sizes legend{padding:0 6px}
+.ezil-billing-sizes h4{margin-bottom:12px}
+.ezil-billing-size{display:flex;align-items:flex-start;gap:8px;min-width:0;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
+.ezil-billing-size:has(input:checked){border-color:var(--accent)}
+.ezil-billing-size input{accent-color:var(--accent);flex-shrink:0;margin:3px 0}
+.ezil-billing-size>span{display:flex;flex-direction:column;gap:6px;min-width:0}
+.ezil-billing-size>span>span{color:var(--muted);font-size:12px}
+.ezil-settings-billing button{max-width:100%;white-space:normal;border-radius:8px}
+.ezil-settings-billing :is(button,input):disabled{cursor:default;opacity:.6}
+.ezil-settings-billing [data-role=size-hours]{font-size:13px;color:var(--muted)}
+.ezil-settings-billing [data-role=size-hours] [data-size]{display:inline;white-space:nowrap}
+.ezil-settings-billing [data-role=size-status]:empty{margin:0}
+.ezil-billing-session{color:var(--muted);font-size:13px}
+.ezil-billing-session p{margin:0}
+.ezil-billing-session [data-role=session-countdown]{margin-top:8px;color:var(--text)}
+.ezil-billing-session [data-role=session-countdown].ezil-billing-warning{color:var(--warn)}
+.ezil-billing-estimate,.ezil-billing-invoice,.ezil-billing-offer-price,.ezil-billing-overage,.ezil-billing-price,.ezil-billing-size,.ezil-billing-usage,.ezil-settings-billing [data-role=session-countdown],.ezil-settings-billing [data-role=size-hours]{font-variant-numeric:tabular-nums}
 .ezil-settings-billing .ezil-settings-error{flex-wrap:wrap}
 .ezil-billing-action-error{color:var(--danger)}
 .ezil-billing-action-error:empty{display:none}
 .ezil-billing-footer a,.ezil-billing-invoice a{color:var(--accent);text-underline-offset:3px}
 .ezil-billing-invoices{margin-top:24px}
 .ezil-billing-invoice-list{list-style:none;padding:0;margin:0}
-.ezil-billing-invoice{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;padding:12px 0;border-bottom:1px solid var(--border)}
-.ezil-billing-invoice>*{min-width:0}
-.ezil-billing-invoice time{color:var(--muted);font-size:12px}
+.ezil-billing-invoice{display:grid;grid-template-columns:minmax(0,1fr);gap:6px 12px;padding:12px 0;border-bottom:1px solid var(--border)}
+.ezil-billing-invoice :is(div,span,time){min-width:0}
+.ezil-billing-invoice-details,.ezil-billing-invoice-heading{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px}
+.ezil-billing-invoice time{color:var(--muted);font-size:12px;white-space:nowrap}
+.ezil-billing-invoice [data-role=invoice-kind]{justify-self:start;width:max-content;flex-shrink:0;white-space:nowrap}
+.ezil-billing-invoice-details{gap:6px}
+.ezil-billing-invoice-status{color:var(--muted)}
+.ezil-billing-invoice-link::before,.ezil-billing-invoice-status::before{content:'·';margin-right:6px;color:var(--muted)}
 .ezil-billing-skeleton{min-height:140px}
 .ezil-billing-skeleton span{display:block;height:16px;margin:12px 0;width:70%;border-radius:8px;background:var(--border)}
 .ezil-billing-skeleton span:nth-child(2){height:32px;width:90%}
 @container ezil-settings-window (min-width:640px){
-.ezil-billing-meters{grid-template-columns:repeat(3,minmax(0,1fr))}
+.ezil-billing-meters{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @container (min-width:640px){
-.ezil-billing-invoice{grid-template-columns:96px minmax(0,1fr) auto auto auto;align-items:baseline}
+.ezil-billing-offers{grid-template-columns:repeat(2,minmax(0,1fr))}
+.ezil-billing-size-options{grid-template-columns:repeat(3,minmax(0,1fr))}
+.ezil-billing-invoice{grid-template-columns:max-content minmax(0,1fr) max-content minmax(0,max-content) minmax(0,max-content) max-content;align-items:baseline}
+.ezil-billing-invoice-details,.ezil-billing-invoice-heading{display:contents}
+.ezil-billing-invoice time{grid-area:1/1}
+.ezil-billing-invoice-description{grid-area:1/2}
+.ezil-billing-invoice [data-role=invoice-kind]{grid-area:1/3}
+.ezil-billing-invoice-amount{grid-area:1/4}
+.ezil-billing-invoice-status{grid-area:1/5}
+.ezil-billing-invoice-link{grid-area:1/6}
+.ezil-billing-invoice-link::before,.ezil-billing-invoice-status::before{content:none}
 }
 @container (max-width:600px){
 .ezil-settings{flex-direction:column}
@@ -1130,6 +1179,29 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-settings-window *,.ezil-settings-window ::after,.ezil-settings-window ::before{animation:none!important;transition:none!important}
 .ezil-upgrade-sheet,.ezil-upgrade-sheet *{animation:none;transition:none}
 }
+.ezil-upgrade-price [data-role=price]{color:inherit;font:inherit}
+.ezil-billing-sheet{width:min(560px,calc(100vw - 32px));padding:28px}
+.ezil-billing-sheet h2{margin:8px 36px 24px 0;font-size:22px;line-height:1.3}
+.ezil-billing-sheet p{margin:16px 0}
+.ezil-billing-sheet .ezil-upgrade-caption,.ezil-billing-sheet :is(#ezil-cap-range,#ezil-cap-hours){color:var(--muted);font-size:13px}
+.ezil-billing-sheet-lines{width:100%;border-collapse:collapse;table-layout:fixed}
+.ezil-billing-sheet-lines td,.ezil-billing-sheet-lines th{padding:12px 0;border-bottom:1px solid var(--border);vertical-align:top}
+.ezil-billing-sheet-lines th{text-align:left;font-weight:400;padding-right:16px}
+.ezil-billing-sheet-lines td{width:35%;text-align:right;font-variant-numeric:tabular-nums}
+.ezil-billing-sheet-total{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+.ezil-billing-sheet-actions{display:flex;flex-wrap:wrap;gap:12px}
+.ezil-billing-sheet .ezil-billing-sheet-danger{background:var(--danger);color:var(--accent-ink)}
+.ezil-billing-sheet .ezil-billing-sheet-secondary{background:var(--surface-2);color:var(--text)}
+.ezil-upgrade-sheet button:disabled{opacity:.55;cursor:default}
+.ezil-billing-sheet a{display:inline-block;max-width:100%;color:var(--accent);margin:0 16px 16px 0}
+.ezil-billing-cap{display:grid;gap:8px;font-weight:600}
+.ezil-billing-cap input{width:100%;min-width:0;max-width:240px;min-height:40px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font:inherit;font-variant-numeric:tabular-nums}
+.ezil-billing-consent{display:flex;align-items:flex-start;gap:12px;margin:24px 0}
+.ezil-billing-consent input{flex:0 0 20px;width:20px;height:20px;margin:0;accent-color:var(--accent)}
+.ezil-billing-consent span{min-width:0}
+.ezil-billing-sheet input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ezil-billing-sheet [data-role=sheet-error]{color:var(--danger)}
+.ezil-upgrade-backdrop.is-compact .ezil-billing-sheet{padding:56px 16px 24px}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#04060c;background-image:radial-gradient(24% 6% at 50% 91.2%,rgba(255,200,150,.6) 0,rgba(255,150,100,.18) 55%,rgba(255,150,100,0) 100%),radial-gradient(150% 72% at 50% 138%,#04060c 0,#04060c 62%,rgba(0,200,208,.72) 63.1%,rgba(96,110,255,.38) 65.4%,rgba(112,86,255,.1) 70%,rgba(112,86,255,0) 78%),radial-gradient(55% 45% at 82% 6%,rgba(0,190,200,.4) 0,rgba(0,190,200,0) 62%),radial-gradient(50% 55% at 8% 22%,rgba(112,86,255,.34) 0,rgba(112,86,255,0) 64%),linear-gradient(180deg,#0a0e1d 0,#070a14 50%,#04060c 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
