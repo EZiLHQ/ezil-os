@@ -1,6 +1,6 @@
 import type { Instance, Volume, Tag, RunInstancesRequest } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
-import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFor, tagList, initialVolumeTags,
+import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFor, tagList, initialVolumeTags, poolTagsFor, claimTagsFor, poolLease,
     type Phase, type Action, type Settings } from './contract.js';
 import { MAX_THROTTLE_RETRIES, NO_ERROR, RecordedErrorSchema, classifyProviderError, throttleDelaySeconds, toLambdaError } from './errors.js';
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
@@ -55,6 +55,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             return {decision:'backoff',phase:'initial',delaySeconds:throttleDelaySeconds(event.throttles)};
         }
         if(previous.kind==='failed')return {decision:'rejected',code:previous.code};
+        if(['pool-provision','adopt','release'].includes(i.operation))return observePool(i,envelope.digest,event.phase,deps,action);
         const tags=tagsFor(i),phase=event.phase,newInstance=['provision','replace'].includes(i.operation);
         const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(envelope.digest,'volume')});
         if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
@@ -187,9 +188,131 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         return action('startInstances',{InstanceIds:[targetId]});
     };
 }
-function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string,state:LifecycleReceipt['state']){
+function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string|null,state:LifecycleReceipt['state']){
     return {decision:'success',receipt:{schemaVersion:1,jobId:i.jobId,digest,computerId:i.computerId,
         generation:i.targetGeneration,leaseEpoch:i.leaseEpoch,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
+}
+type Dispatch = (name:Action,parameters:object)=>Promise<Record<string,unknown>>;
+/** Pool steps share the execution/authority/error gates above. Only the graph
+ * mutates EC2; a lost non-idempotent reply is observed until the deadline. */
+async function observePool(i:LifecycleIntent,digest:string,phase:Phase,deps:Dependencies,action:Dispatch):Promise<Record<string,unknown>>{
+    const d=i.deployment,claim=claimTagsFor(i);
+    const rows=await deps.instances(i.operation==='pool-provision'?{token:token(digest,'instance')}:[i.providerInstanceId!]);
+    if(rows.length>1)return fail('lifecycle_instance_ambiguous');
+    const host=rows[0]?.instance;
+    if(host){
+        if(rows[0]?.owner!==d.accountId || (i.providerInstanceId!==null&&host.InstanceId!==i.providerInstanceId))return fail('lifecycle_instance_invalid');
+        assertEffectiveInstance(host,i);
+        if(!instanceId(host.InstanceId)||host.Placement?.AvailabilityZoneId!==d.zoneId)return fail('lifecycle_instance_invalid');
+    }
+    if(i.operation==='pool-provision'){
+        if(!host)return action('runInstances',await launchParameters(i,digest,deps));
+        if(host.ClientToken!==token(digest,'instance')||!tagged(host.Tags,poolTagsFor(i))
+            ||host.Tags?.some(t=>['ezil:computer','ezil:computer-id','ezil:fence'].includes(t.Key??'')))return fail('lifecycle_instance_invalid');
+        if(host.State?.Name==='pending')return wait(phase);
+        if(host.State?.Name!=='running')return fail('lifecycle_instance_invalid');
+        assertPoolDisks(host,d);
+        const done=success(i,digest,host.InstanceId!,null,'running');
+        return {...done,receipt:{...done.receipt,poolHostId:i.poolHostId!,poolGeneration:i.poolGeneration!}};
+    }
+    if(i.operation==='adopt'){
+        if(!host||host.State?.Name!=='running')return fail('lifecycle_instance_invalid');
+        const base=poolTagsFor(i),{['ezil:pool']:ignored,...identity}=base;
+        if(!tagged(host.Tags,identity))return fail('lifecycle_instance_invalid');
+        // A completed claim is the only acceptable replay of a non-pool host.
+        const claimed=tagged(host.Tags,claim),hasClaim=host.Tags?.some(t=>['ezil:computer','ezil:generation','ezil:fence','ezil:computer-id'].includes(t.Key??''));
+        if((hasClaim&&!claimed)||(!claimed&&!tagged(host.Tags,{'ezil:pool':'1'})))return fail('lifecycle_instance_invalid');
+        if(host.Tags?.some(t=>t.Key==='ezil:pool')&&!tagged(host.Tags,{'ezil:pool':'1'}))return fail('lifecycle_instance_invalid');
+    }else if(host){
+        if(!tagged(host.Tags,{'ezil:managed-by':'app-computer-platform','ezil:stage':d.namespace,'ezil:namespace':d.namespace,...claim})
+            ||host.Tags?.some(t=>t.Key==='ezil:pool'))return fail('lifecycle_instance_invalid');
+    }
+    const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(digest,'volume')});
+    if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
+    const v=volumes[0];
+    if(!v){
+        if(i.operation!=='adopt'||i.dataVolumeId!==null||!['initial','volume'].includes(phase))return fail('lifecycle_volume_invalid');
+        assertPoolDisks(host!,d);
+        return action('createVolume',{AvailabilityZoneId:d.zoneId,Size:i.dataVolumeGiB,VolumeType:'gp3',Iops:3000,Throughput:125,
+            Encrypted:true,KmsKeyId:d.dataKeyArn,ClientToken:token(digest,'volume'),
+            TagSpecifications:[{ResourceType:'volume',Tags:tagList({...initialVolumeTags(i,digest),...claim})}]});
+    }
+    if(!volumeId(v.VolumeId)||(i.dataVolumeId!==null&&v.VolumeId!==i.dataVolumeId)||v.VolumeType!=='gp3'||!dataSizeValid(v.Size,d)
+        ||v.Encrypted!==true||v.KmsKeyId!==d.dataKeyArn||v.AvailabilityZoneId!==d.zoneId||v.MultiAttachEnabled!==false||!Array.isArray(v.Attachments))return fail('lifecycle_volume_invalid');
+    const ownership={'ezil:managed-by':'app-computer-platform','ezil:stage':d.namespace,'ezil:computer-id':i.computerId};
+    if(!tagged(v.Tags,ownership))return fail('lifecycle_volume_invalid');
+    if(i.operation==='adopt'){
+        if(v.Tags?.some(t=>t.Key==='ezil:computer')&&!tagged(v.Tags,{'ezil:computer':i.computerId}))return fail('lifecycle_volume_invalid');
+        if(i.dataVolumeId===null&&!tagged(v.Tags,{...initialVolumeTags(i,digest),...claim}))return fail('lifecycle_volume_invalid');
+        // An old generation may move forward only on a free, owned volume.
+        // Equal generations must already have this fence; newer ones never move back.
+        const generation=v.Tags?.filter(t=>t.Key==='ezil:generation'),fence=v.Tags?.filter(t=>t.Key==='ezil:fence-token');
+        const g=generation?.[0]?.Value;
+        if(generation?.length!==1||!g||!/^\d+$/.test(g)||Number(g)<1||Number(g)>i.targetGeneration||fence?.length!==1
+            ||!fence[0]?.Value||!/^[a-f0-9-]{36}$/.test(fence[0].Value)
+            ||(Number(g)===i.targetGeneration&&fence[0].Value!==i.fenceToken))return fail('lifecycle_volume_invalid');
+        assertPoolDisks(host!,d,v.VolumeId);
+        if(v.State==='creating')return wait(phase);
+        if(!tagged(v.Tags,{...tagsFor(i),...claim})){
+            if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
+            if(phase==='tagged')return wait(phase);
+            return action('createTags',{Resources:[v.VolumeId],Tags:tagList({...retagsFor(i),...claim})});
+        }
+        if(v.State==='available'&&v.Attachments.length===0){
+            // A claimed host must not reacquire a disk after it was released.
+            if(tagged(host!.Tags,claim))return fail('lifecycle_attachment_invalid');
+            if(phase==='attached')return wait(phase);
+            return action('attachVolume',{Device:DATA_DEVICE,InstanceId:host!.InstanceId,VolumeId:v.VolumeId});
+        }
+        if(v.Attachments.length!==1||v.Attachments[0]?.InstanceId!==host!.InstanceId||v.Attachments[0]?.VolumeId!==v.VolumeId)return fail('lifecycle_attachment_invalid');
+        if(v.Attachments[0]?.State==='attaching'||!host!.BlockDeviceMappings?.some(m=>m.Ebs?.VolumeId===v.VolumeId))return wait(phase);
+        assertAttached(host!,v,host!.InstanceId!);
+        if(!tagged(host!.Tags,claim)){
+            if(phase==='claimed')return wait(phase);
+            return action('claimInstance',{Resources:[host!.InstanceId],Tags:tagList(claim)});
+        }
+        if(host!.Tags?.some(t=>t.Key==='ezil:pool')){
+            if(phase==='unpooled')return wait(phase);
+            return action('deleteTags',{Resources:[host!.InstanceId],Tags:[{Key:'ezil:pool',Value:'1'}]});
+        }
+        return success(i,digest,host!.InstanceId!,v.VolumeId,'running');
+    }
+    if(!tagged(v.Tags,{...tagsFor(i),...claim}))return fail('lifecycle_volume_invalid');
+    const free=v.State==='available'&&v.Attachments.length===0;
+    if(!host||host.State?.Name==='terminated'){
+        if(!free)return fail('lifecycle_attachment_invalid');
+        return success(i,digest,i.providerInstanceId!,v.VolumeId,'retired');
+    }
+    assertPoolDisks(host,d,v.VolumeId);
+    const status=host.State?.Name;
+    if(status==='shutting-down'){
+        if(!free)return fail('lifecycle_attachment_invalid');
+        return wait(phase);
+    }
+    if(status==='stopping')return wait(phase);
+    if(status==='running'){
+        assertAttached(host,v,host.InstanceId!);
+        if(phase!=='initial')return wait(phase);
+        return action('stopInstances',{InstanceIds:[host.InstanceId],Force:false,Hibernate:false,SkipOsShutdown:false});
+    }
+    if(status!=='stopped')return fail('lifecycle_instance_invalid');
+    if(free){
+        if(host.BlockDeviceMappings?.some(m=>m.DeviceName===DATA_DEVICE))return wait(phase);
+        if(!['initial','stopped','detached'].includes(phase))return wait(phase);
+        return action('terminateInstances',{InstanceIds:[host.InstanceId]});
+    }
+    if(v.Attachments.length!==1||v.Attachments[0]?.InstanceId!==host.InstanceId||v.Attachments[0]?.VolumeId!==v.VolumeId)return fail('lifecycle_attachment_invalid');
+    if(v.Attachments[0]?.State==='detaching')return wait(phase);
+    assertAttached(host,v,host.InstanceId!);
+    if(!['initial','stopped'].includes(phase))return wait(phase);
+    return action('detachVolume',{Device:DATA_DEVICE,InstanceId:host.InstanceId,VolumeId:v.VolumeId,Force:false});
+}
+/** Pool hosts are root-only until adoption; never terminate unexpected disks. */
+function assertPoolDisks(host:Instance,d:Settings['deployment'],dataVolumeId?:string){
+    const maps=host.BlockDeviceMappings,root=maps?.filter(m=>m.DeviceName===d.storage.rootDeviceName);
+    if(!Array.isArray(maps)||root?.length!==1||!volumeId(root[0]?.Ebs?.VolumeId)||root[0]?.Ebs?.DeleteOnTermination!==true
+        ||root[0]?.Ebs?.Status!=='attached'||maps.some(m=>m.DeviceName!==d.storage.rootDeviceName
+            &&!(dataVolumeId&&m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===dataVolumeId)))return fail('lifecycle_unexpected_disk');
 }
 /** A stop whose instance is gone: a `stopped` receipt marked `instanceLost`. */
 function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string){
@@ -246,14 +369,15 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
         ||!equal(t.SecurityGroupIds,[d.securityGroupId])
         ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!==d.storage.rootDeviceName)return fail('lifecycle_launch_invalid');
     return {LaunchTemplate:{LaunchTemplateId:d.launchTemplateId,Version:d.launchTemplateVersion},ImageId:d.amiId,
-        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),UserData:i.userData!,
+        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),UserData:i.operation==='pool-provision'?poolLease(i):i.userData!,
         SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],
         MetadataOptions:{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'},
         HibernationOptions:{Configured:false},
         EbsOptimized:true,Monitoring:{Enabled:false},
         // R3: the root disk is disposable (OS + pre-pulled image); the data disk is retained.
         BlockDeviceMappings:[{DeviceName:d.storage.rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:d.storage.rootGiB,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
-        TagSpecifications:[{ResourceType:'instance',Tags:tagList(tagsFor(i))},{ResourceType:'volume',Tags:tagList({...tagsFor(i),'ezil:disk-kind':'root'})}]};
+        TagSpecifications:[{ResourceType:'instance',Tags:tagList(i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i))},
+            {ResourceType:'volume',Tags:tagList({...i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i),'ezil:disk-kind':'root'})}]};
 }
 let helper:ReturnType<typeof createLifecycleHelper>|undefined;
 export async function handler(input:unknown){

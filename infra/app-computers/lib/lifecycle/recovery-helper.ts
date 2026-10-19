@@ -37,6 +37,9 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || now - source.startDate.getTime() > 86400000) return fail();
         const envelope = EnvelopeSchema.parse(JSON.parse(source.input));
         const i = parseLifecycleWork({ ...envelope, createdAt: source.startDate });
+        // The historical cleanup graph cannot prove a pool claim or perform
+        // release's detach sequence. Leave its reservation unconfirmed.
+        if (['pool-provision', 'adopt', 'release'].includes(i.operation)) return fail();
         if (!equal(i.deployment, d)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
             || execution.name !== `cleanup-computer-${i.jobId}`

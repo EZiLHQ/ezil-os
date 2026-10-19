@@ -26,6 +26,18 @@ function billingV2Ceiling(statements: Statement[]): Statement[] {
     });
 }
 
+/** Pool lifecycle v1 opens only two formerly denied workload actions. The
+ * deploy/exec identities retain the historical blanket denies above. */
+function poolCeiling(statements: Statement[], c: { region: string; accountId: string; namespace: string }): Statement[] {
+    const managed = { 'aws:ResourceTag/ezil:managed-by': 'app-computer-platform', 'aws:ResourceTag/ezil:stage': c.namespace };
+    return [...statements.map(s => s.Effect === 'Deny' && s.Action ? {
+        ...s, Action: list(s.Action).filter(a => !['ec2:DetachVolume', 'ec2:DeleteTags'].includes(a)),
+    } : s),
+    { Effect: 'Allow', Action: ['ec2:DetachVolume', 'ec2:DeleteTags'],
+        Resource: [`arn:aws:ec2:${c.region}:${c.accountId}:instance/*`, `arn:aws:ec2:${c.region}:${c.accountId}:volume/*`],
+        Condition: { StringEquals: managed } }];
+}
+
 /** Conservative language containment, not matching a wildcard as a literal.
  * Exact equality and a single trailing wildcard cover our ARN/action shapes.
  * Unknown wildcard relationships fail closed. */
@@ -143,8 +155,9 @@ for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified 
             assertDeniesRetained(legacy, fences);
         }
         const workload = boundaryStatements(config).map(s => s.toStatementJson());
-        assertAllowsWithin(workload, legacy);
-        assertDeniesRetained(legacy, workload);
+        const pool = poolCeiling(legacy, config);
+        assertAllowsWithin(workload, pool);
+        assertDeniesRetained(pool, workload);
     });
 }
 

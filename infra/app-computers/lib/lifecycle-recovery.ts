@@ -44,7 +44,7 @@ export class ComputerLifecycleRecovery extends Construct {
             resources: [`arn:aws:ec2:${r}:${d.accountId}:instance/*`], conditions: { StringEquals: {
                 'aws:RequestedRegion': r, 'ec2:ResourceTag/ezil:managed-by': 'app-computer-platform',
                 'ec2:ResourceTag/ezil:stage': d.namespace } } }));
-        role.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...DENIED_ACTIONS], resources: ['*'] }));
+        role.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...DENIED_ACTIONS,'ec2:DetachVolume','ec2:DeleteTags'], resources: ['*'] }));
         role.addToPolicy(new iam.PolicyStatement({ actions: ['logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
             'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies', 'logs:DescribeLogGroups'], resources: ['*'] }));
         const workflowLogs = log('WorkflowLogs');

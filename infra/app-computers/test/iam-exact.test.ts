@@ -20,14 +20,22 @@ const LT = { ArnEquals: { 'ec2:LaunchTemplate': ec2('launch-template/lt-11111111
 const MANAGED = { 'ec2:ResourceTag/ezil:managed-by': 'app-computer-platform', 'ec2:ResourceTag/ezil:stage': 'pilot' };
 const REQUEST = { 'aws:RequestTag/ezil:managed-by': 'app-computer-platform', 'aws:RequestTag/ezil:stage': 'pilot' };
 const REGION_EQ = { 'aws:RequestedRegion': R };
-const DENIED = ['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume', 'ec2:ModifyInstanceAttribute',
-    'ec2:ModifyInstanceMetadataOptions', 'ec2:DeleteTags', 'iam:PassRole'];
+const DENIED = ['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:ModifyInstanceAttribute',
+    'ec2:ModifyInstanceMetadataOptions', 'iam:PassRole'];
 function expectedController(userDataOpen: boolean) {
     return [
         { Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances'], Resource: ec2('instance/*'),
-            Condition: { StringEquals: { ...REGION_EQ, ...MANAGED } } },
+            Condition: { StringEquals: { ...REGION_EQ, ...MANAGED }, Null: { 'aws:ResourceTag/ezil:computer-id': 'false', 'aws:ResourceTag/ezil:pool': 'true' } } },
         { Effect: 'Allow', Action: 'ec2:AttachVolume', Resource: [ec2('instance/*'), ec2('volume/*')],
-            Condition: { StringEquals: { ...REGION_EQ, ...MANAGED, 'ec2:AvailabilityZoneId': Z } } },
+            Condition: { StringEquals: { ...REGION_EQ, ...MANAGED, 'ec2:AvailabilityZoneId': Z }, Null: { 'aws:ResourceTag/ezil:computer-id': 'false', 'aws:ResourceTag/ezil:pool': 'true' } } },
+        { Effect: 'Allow', Action: 'ec2:AttachVolume', Resource: ec2('instance/*'), Condition: {
+            StringEquals: { ...REGION_EQ, ...MANAGED, 'aws:ResourceTag/ezil:pool': '1', 'ec2:AvailabilityZoneId': Z,
+                'ec2:InstanceType': ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] } } },
+        { Effect: 'Allow', Action: ['ec2:StopInstances', 'ec2:TerminateInstances'], Resource: ec2('instance/*'), Condition: {
+            StringEquals: { ...REGION_EQ, ...MANAGED, 'ec2:InstanceType': ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] },
+            Null: { 'aws:ResourceTag/ezil:computer': 'false' } } },
+        { Effect: 'Allow', Action: 'ec2:DetachVolume', Resource: ec2('volume/*'), Condition: {
+            StringEquals: { ...REGION_EQ, ...MANAGED, 'ec2:AvailabilityZoneId': Z }, Null: { 'aws:ResourceTag/ezil:computer': 'false' } } },
         { Effect: 'Allow', Action: 'ec2:CreateVolume', Resource: ec2('volume/*'), Condition: {
             StringEquals: { ...REGION_EQ, ...REQUEST, 'ec2:VolumeType': 'gp3', 'ec2:AvailabilityZoneId': Z },
             ArnEquals: { 'ec2:KmsKeyId': KEY }, Bool: { 'ec2:Encrypted': 'true' },
@@ -46,6 +54,16 @@ function expectedController(userDataOpen: boolean) {
             Condition: { StringEquals: { ...REGION_EQ, 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } } },
         { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: ec2('volume/*'), Condition: { StringEquals: { ...REGION_EQ, ...MANAGED },
             'ForAllValues:StringEquals': { 'aws:TagKeys': ['ezil:generation', 'ezil:fence-token'] }, Null: { 'aws:TagKeys': 'false' } } },
+        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: ec2('volume/*'), Condition: {
+            StringEquals: { ...REGION_EQ, ...MANAGED, 'aws:RequestTag/ezil:computer': '${aws:ResourceTag/ezil:computer-id}' },
+            'ForAllValues:StringEquals': { 'aws:TagKeys': ['ezil:computer', 'ezil:generation', 'ezil:fence', 'ezil:fence-token'] },
+            Null: { 'aws:TagKeys': 'false', 'aws:ResourceTag/ezil:computer-id': 'false' } } },
+        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: ec2('instance/*'), Condition: {
+            StringEquals: { ...REGION_EQ, ...MANAGED, 'aws:ResourceTag/ezil:pool': '1', 'ec2:InstanceType': ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] },
+            'ForAllValues:StringEquals': { 'aws:TagKeys': ['ezil:computer', 'ezil:generation', 'ezil:fence'] }, Null: { 'aws:TagKeys': 'false' } } },
+        { Effect: 'Allow', Action: 'ec2:DeleteTags', Resource: ec2('instance/*'), Condition: {
+            StringEquals: { ...REGION_EQ, ...MANAGED, 'aws:ResourceTag/ezil:pool': '1', 'ec2:InstanceType': ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] },
+            'ForAllValues:StringEquals': { 'aws:TagKeys': ['ezil:pool'] }, Null: { 'aws:TagKeys': 'false', 'aws:ResourceTag/ezil:computer': 'false' } } },
         { Effect: 'Deny', Action: 'ec2:CreateTags', Resource: '*', Condition: {
             'ForAnyValue:StringEquals': { 'aws:TagKeys': ['ezil:computer-id', 'ezil:managed-by', 'ezil:stage', 'ezil:backup'] }, Null: { 'ec2:CreateAction': 'true' } } },
         { Effect: 'Deny', Action: DENIED.filter(a => !(userDataOpen && a === 'ec2:ModifyInstanceAttribute')), Resource: '*' },

@@ -161,7 +161,9 @@
               "ec2:StopInstances",
               "ec2:TerminateInstances",
               "ec2:AttachVolume",
-              "ec2:CreateTags"
+              "ec2:CreateTags",
+              "ec2:DetachVolume",
+              "ec2:DeleteTags"
             ],
             "Condition": {
               "StringEquals": {
@@ -210,8 +212,6 @@
               "aws-marketplace:*",
               "ec2:DeleteVolume",
               "ec2:DeleteSnapshot",
-              "ec2:DetachVolume",
-              "ec2:DeleteTags",
               "ec2:ModifyInstanceAttribute",
               "iam:*",
               "sts:*",

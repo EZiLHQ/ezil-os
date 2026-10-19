@@ -151,13 +151,13 @@ function compactStatements(statements: iam.PolicyStatement[]): iam.PolicyStateme
 }
 
 /** These fences apply to workload roles AND the founder-created identities. */
-function commonDenies(c: IdentityConfig): iam.PolicyStatement[] {
+function commonDenies(c: IdentityConfig, poolLifecycle = false): iam.PolicyStatement[] {
     const r = c.region, a = c.accountId;
     return [
         deny(PURCHASES),
         deny([], { actions: undefined, notActions: [...GLOBAL_SERVICES],
             conditions: { StringNotEquals: { 'aws:RequestedRegion': c.region } } }),
-        deny(['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume', 'ec2:DeleteTags']),
+        deny(['ec2:DeleteVolume', 'ec2:DeleteSnapshot', ...(poolLifecycle ? [] : ['ec2:DetachVolume', 'ec2:DeleteTags'])]),
         deny(['ec2:CreateTags'], { conditions: {
             'ForAnyValue:StringEquals': { 'aws:TagKeys': ['ezil:backup'] }, Null: { 'ec2:CreateAction': 'true' } } }),
         deny(['ec2:DescribeInstanceAttribute'], { resources: [`arn:aws:ec2:${r}:${a}:instance/*`],
@@ -230,13 +230,16 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
         allow(['ec2:RunInstances'], [ec2('subnet'), ec2('security-group'), ec2('launch-template')],
             { StringEquals: nsTag('Resource') }),
         allow(['ec2:RunInstances'], [`arn:aws:ec2:${r}::image/*`]),
-        allow(['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags'],
+        // The boundary caps compute permissions by managed namespace. The
+        // lifecycle controller further restricts detach/untag to release and
+        // pool claims; keep this shared ceiling compact enough for IAM's 6 KiB.
+        allow(['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags', 'ec2:DetachVolume', 'ec2:DeleteTags'],
             [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
         ...(c.userDataAttributeKeyVerified ? [allow(['ec2:ModifyInstanceAttribute'], [ec2('instance')],
             { StringEquals: { ...compute('Resource'), 'ec2:Attribute': 'userData' } })] : []),
         allow(['ec2:CreateTags'], [ec2('instance'), ec2('volume')],
             { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } }),
-        ...commonDenies(c),
+        ...commonDenies(c, true),
         deny(['iam:*', 'sts:*', 'organizations:*', 'account:*', 'aws-portal:*', 'billing:*', 'payments:*', 'tax:*', 'ce:*',
             'route53:*', 'route53domains:*', 'cloudfront:*', 'budgets:*', 'cloudwatch:*']),
     ]);

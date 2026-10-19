@@ -3,7 +3,7 @@ import { CfnOutput, Duration, RemovalPolicy, Stack, aws_cloudwatch as cloudwatch
     aws_events as events, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_sqs as sqs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { RETAG_KEYS, SettingsSchema, type Settings } from './lifecycle/contract.js';
+import { RETAG_KEYS, POOL_CLAIM_KEYS, POOL_IAM_TYPES, SettingsSchema, type Settings } from './lifecycle/contract.js';
 import { lifecycleDefinition } from './lifecycle/definition.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
 
@@ -85,6 +85,8 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
     const existing={StringEquals:{...region,...managed}};
     const requestTags={...region,'aws:RequestTag/ezil:managed-by':'app-computer-platform','aws:RequestTag/ezil:stage':d.namespace};
     const template={ArnEquals:{'ec2:LaunchTemplate':arn('launch-template',d.launchTemplateId)}};
+    const poolTypes=POOL_IAM_TYPES.filter(t=>d.instanceTypes.includes(t));
+    const pool=(s:iam.PolicyStatement)=>poolTypes.length?[s]:[];
     // C-6 nonce delivery to a stopped instance. The Deny on every other
     // attribute is narrowed only once staging has proven how ec2:Attribute
     // evaluates; until then ModifyInstanceAttribute stays denied outright.
@@ -94,9 +96,19 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
         // ModifyInstanceAttribute is never allowed for type, disk flags or
         // anything but userData (R10, C-6).
         new iam.PolicyStatement({actions:['ec2:StartInstances','ec2:StopInstances','ec2:TerminateInstances'],
-            resources:[arn('instance')],conditions:existing}),
+            resources:[arn('instance')],conditions:{...existing,Null:{'aws:ResourceTag/ezil:computer-id':'false','aws:ResourceTag/ezil:pool':'true'}}}),
         new iam.PolicyStatement({actions:['ec2:AttachVolume'],resources:[arn('instance'),arn('volume')],
-            conditions:{StringEquals:{...region,...managed,'ec2:AvailabilityZoneId':d.zoneId}}}),
+            conditions:{StringEquals:{...region,...managed,'ec2:AvailabilityZoneId':d.zoneId},Null:{'aws:ResourceTag/ezil:computer-id':'false','aws:ResourceTag/ezil:pool':'true'}}}),
+        // AttachVolume authorizes the instance AND volume separately. A pool
+        // host has no tenant identity; its volume must already have one.
+        ...pool(new iam.PolicyStatement({actions:['ec2:AttachVolume'],resources:[arn('instance')],conditions:{
+            StringEquals:{...region,...managed,'aws:ResourceTag/ezil:pool':'1','ec2:AvailabilityZoneId':d.zoneId,
+                'ec2:InstanceType':poolTypes}}})),
+        ...pool(new iam.PolicyStatement({actions:['ec2:StopInstances','ec2:TerminateInstances'],resources:[arn('instance')],conditions:{
+            StringEquals:{...region,...managed,'ec2:InstanceType':poolTypes},
+            Null:{'aws:ResourceTag/ezil:computer':'false'}}})),
+        new iam.PolicyStatement({actions:['ec2:DetachVolume'],resources:[arn('volume')],conditions:{
+            StringEquals:{...region,...managed,'ec2:AvailabilityZoneId':d.zoneId},Null:{'aws:ResourceTag/ezil:computer':'false'}}}),
         // R1/R11: data volumes only in the configured ZoneId, encrypted with the
         // configured key, gp3, inside the configured size range.
         new iam.PolicyStatement({actions:['ec2:CreateVolume'],resources:[arn('volume')],conditions:{
@@ -124,6 +136,16 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
         // A managed volume's generation and fence may move; nothing else.
         new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('volume')],conditions:{...existing,
             'ForAllValues:StringEquals':{'aws:TagKeys':[...RETAG_KEYS]},Null:{'aws:TagKeys':'false'}}}),
+        new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('volume')],conditions:{
+            StringEquals:{...region,...managed,'aws:RequestTag/ezil:computer':'${aws:ResourceTag/ezil:computer-id}'},
+            'ForAllValues:StringEquals':{'aws:TagKeys':[...POOL_CLAIM_KEYS,'ezil:fence-token']},
+            Null:{'aws:TagKeys':'false','aws:ResourceTag/ezil:computer-id':'false'}}}),
+        ...pool(new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('instance')],conditions:{
+            StringEquals:{...region,...managed,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
+            'ForAllValues:StringEquals':{'aws:TagKeys':[...POOL_CLAIM_KEYS]},Null:{'aws:TagKeys':'false'}}})),
+        ...pool(new iam.PolicyStatement({actions:['ec2:DeleteTags'],resources:[arn('instance')],conditions:{
+            StringEquals:{...region,...managed,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
+            'ForAllValues:StringEquals':{'aws:TagKeys':['ezil:pool']},Null:{'aws:TagKeys':'false','aws:ResourceTag/ezil:computer':'false'}}})),
         new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:CreateTags'],resources:['*'],conditions:{
             'ForAnyValue:StringEquals':{'aws:TagKeys':[...IDENTITY_TAG_KEYS]},Null:{'ec2:CreateAction':'true'}}}),
         new iam.PolicyStatement({effect:iam.Effect.DENY,actions:denied,resources:['*']}),
@@ -141,8 +163,8 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
             StringEquals:{'kms:ViaService':`ec2.${r}.amazonaws.com`}}}),
     ];
 }
-/** R11 and R5: automation never deletes storage, never detaches (and so never
- * force-detaches), never edits instances in place and never passes a role. */
-export const DENIED_ACTIONS=['ec2:DeleteVolume','ec2:DeleteSnapshot','ec2:DetachVolume','ec2:ModifyInstanceAttribute',
-    'ec2:ModifyInstanceMetadataOptions','ec2:DeleteTags','iam:PassRole'] as const;
+/** R11 and R5: no storage deletion, attribute mutation or host role. The fixed
+ * release graph is the only detach path, and always passes Force=false. */
+export const DENIED_ACTIONS=['ec2:DeleteVolume','ec2:DeleteSnapshot','ec2:ModifyInstanceAttribute',
+    'ec2:ModifyInstanceMetadataOptions','iam:PassRole'] as const;
 export const IDENTITY_TAG_KEYS=['ezil:computer-id','ezil:managed-by','ezil:stage','ezil:backup'] as const;
