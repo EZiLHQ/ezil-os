@@ -17,13 +17,16 @@ import { authCookieOptions, isHttpsRequest, isLegacyAuthCookie } from './cookie-
  * Also stamps an `x-pathname` request header with the current path, so a
  * protected layout can build an accurate `returnUrl` back to wherever the
  * unauthenticated visitor was trying to go (see `utils/constants.ts`'s
- * `getReturnUrlQueryParam`).
+ * `getReturnUrlQueryParam`), and `x-return-url` with the path AND query, for
+ * the `/app/<name>` deep link whose query must survive sign-in (`os/page.tsx`).
+ * Both are set from this request's own URL, overwriting anything a client sent.
  */
 export async function updateSession(request: NextRequest) {
     // Clone (never mutate) the incoming headers — `request.headers` may be
     // an immutable Headers instance depending on runtime.
     const requestHeaders = new Headers(request.headers);
     requestHeaders.set('x-pathname', request.nextUrl.pathname);
+    requestHeaders.set('x-return-url', request.nextUrl.pathname + request.nextUrl.search);
 
     let response = NextResponse.next({ request: { headers: requestHeaders } });
     const secure = isHttpsRequest(request.headers);
