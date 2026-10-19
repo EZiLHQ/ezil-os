@@ -25,6 +25,7 @@ function request(body = rawBody, time: number | string = timestamp, key = secret
 
 function fixture() {
     const deps: BillingDeps = {
+        usage: null,
         config: readBillingConfig({ BILLING_USAGE_HMAC_SECRET: secret }),
         store: {} as BillingStore, stripe: null, now: () => new Date(timestamp * 1000),
     };

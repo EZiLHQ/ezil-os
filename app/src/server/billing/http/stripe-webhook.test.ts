@@ -29,6 +29,7 @@ function fixture() {
         markEventProcessed: vi.fn<BillingStore['markEventProcessed']>().mockResolvedValue(undefined),
     };
     const deps: BillingDeps = {
+        usage: null,
         config: readBillingConfig({ STRIPE_WEBHOOK_SECRET: secret }),
         store: store as unknown as BillingStore, stripe: {} as StripeApi,
         now: () => new Date(timestamp * 1000),

@@ -6,6 +6,7 @@ import { readBillingConfig } from './config';
 import type { BillingDeps } from './ports';
 import { createBillingStore } from './store';
 import { createStripeClient } from './stripe/client';
+import { createStripeUsageBilling } from './stripe/usage-billing';
 
 /**
  * The billing composition root: the one place the real database, the real
@@ -26,6 +27,7 @@ export function getBillingDeps(): BillingDeps {
         stripe: config.stripeSecret
             ? createStripeClient({ secretKey: config.stripeSecret, priceProMonthly: config.stripePriceProMonthly })
             : null,
+        usage: config.stripeSecret ? createStripeUsageBilling({ secretKey: config.stripeSecret }) : null,
         now: () => new Date(),
     };
 }
