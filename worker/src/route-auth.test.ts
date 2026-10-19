@@ -47,6 +47,7 @@ async function mintToken(secret = SECRET, now = Date.now()): Promise<string> {
 
 interface CallLog {
   terminateSandbox: number;
+  resetRuntimeForAcceptance: number;
   restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
   destroy: number;
   flushWorkspaceNow: number;
@@ -132,6 +133,10 @@ function fakeSandboxNamespace(options: {
    * only proves the ROUTE TABLE (auth, kill switch, response mapping).
    */
   restartResult?: Record<string, unknown>;
+  /** Canned `resetRuntimeForAcceptance` answer (default: the reset is scheduled). */
+  resetResult?: Record<string, unknown>;
+  /** Make `resetRuntimeForAcceptance` throw, as an object on an older revision does. */
+  resetThrows?: Error;
   /**
    * When set, any `exec()` command touching the container's boot-telemetry
    * NDJSON path (`ezil-telemetry.ndjson` — see `drainContainerBootTelemetry`,
@@ -163,6 +168,7 @@ function fakeSandboxNamespace(options: {
   let openedWith = SANDBOX_NAME;
   const calls: CallLog = {
     terminateSandbox: 0,
+    resetRuntimeForAcceptance: 0,
     restartDesktopStack: [],
     destroy: 0,
     flushWorkspaceNow: 0,
@@ -338,6 +344,7 @@ function fakeSandboxNamespace(options: {
   };
   impl.runningContainerFetch = impl.containerFetch!;
   impl.stopRuntimeForAcceptance = impl.terminateSandbox!;
+  impl.resetRuntimeForAcceptance = async () => { calls.resetRuntimeForAcceptance++; if (options.resetThrows) throw options.resetThrows; return options.resetResult ?? { ok: true }; };
 
   const stub = new Proxy(
     {},
@@ -390,6 +397,50 @@ describe('isolated runtime stop for stale recovery acceptance', () => {
     expect(calls.terminateSandbox).toBe(0);
     expect((await worker.fetch(request(SANDBOX_NAME), env)).status).toBe(200);
     expect(calls.terminateSandbox).toBe(1);
+  });
+});
+
+describe('isolated object reset onto the deployed code for acceptance', () => {
+  it('requires staging scope and signed authorization before resetting anything', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = await mintToken();
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET,
+      EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME };
+    const request = (name: string, signed = true) => new Request(`https://api-desktop.ezil.org/sandbox/${name}/acceptance-reset`, {
+      method: 'POST', headers: signed ? { authorization: `Bearer ${token}` } : {},
+    });
+    expect((await worker.fetch(request(SANDBOX_NAME), {...env,EZIL_ACCEPTANCE_ENV:'production'})).status).toBe(404);
+    expect((await worker.fetch(request(SANDBOX_NAME), {...env,EZIL_ACCEPTANCE_ENV:undefined})).status).toBe(404);
+    expect((await worker.fetch(request('guac-other-computer'), env)).status).toBe(404);
+    expect((await worker.fetch(request(SANDBOX_NAME, false), env)).status).toBe(401);
+    expect(calls.resetRuntimeForAcceptance).toBe(0);
+    const response = await worker.fetch(request(SANDBOX_NAME), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(calls.resetRuntimeForAcceptance).toBe(1);
+    expect(calls.terminateSandbox).toBe(0);
+  });
+
+  it('reports a running test computer as a conflict instead of resetting it', async () => {
+    const { binding } = fakeSandboxNamespace({ resetResult: { ok: false, error: 'runtime_running' } });
+    const response = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/acceptance-reset`, {
+      method: 'POST', headers: { authorization: `Bearer ${await mintToken()}` },
+    }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'runtime_running' });
+  });
+  it('reports an object still on the previous revision as unsupported, any other failure as failed', async () => {
+    const env = (resetThrows: Error) => ({ Sandbox: fakeSandboxNamespace({ resetThrows }).binding, SANDBOX_HMAC_SECRET: SECRET,
+      EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME });
+    const call = async (resetThrows: Error) => worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/acceptance-reset`, {
+      method: 'POST', headers: { authorization: `Bearer ${await mintToken()}` },
+    }), env(resetThrows));
+    const old = await call(new TypeError('The RPC receiver does not implement the method "resetRuntimeForAcceptance".'));
+    expect(old.status).toBe(501);
+    expect(await old.json()).toEqual({ ok: false, error: 'acceptance_reset_unsupported' });
+    const broken = await call(new Error('storage unavailable'));
+    expect(broken.status).toBe(502);
+    expect(await broken.json()).toEqual({ ok: false, error: 'acceptance_reset_failed' });
   });
 });
 

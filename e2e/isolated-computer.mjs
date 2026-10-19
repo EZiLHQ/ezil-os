@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { appRequest, cookieHeader } from './deployed-target.mjs';
 
 /** Cloud CI must verify its explicit computer before opening or restarting apps. */
 export async function verifySelectedComputer(page, {
@@ -18,15 +19,31 @@ export async function verifySelectedComputer(page, {
 }
 
 /** Cleanup works after page failure and treats already-stopped compute as success. */
-export async function stopIsolatedComputer(context, computerId, app, headers, timeout) {
+export async function stopIsolatedComputer(context, computerId, app, headers, timeout, send = appRequest) {
   assert.match(computerId, /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i);
-  const response = await context.request.post(`${app}/api/shell/stop`, {
-    data: { computerId }, headers, maxRedirects: 0, timeout,
+  // The final checkpoint can hold this response silent for minutes; see appRequest.
+  const cookies = await context.cookies(app);
+  const response = await send(`${app}/api/shell/stop`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json', ...(cookies.length ? { cookie: cookieHeader(cookies) } : {}) },
+    body: JSON.stringify({ computerId }),
+    timeout,
   });
+  let stopped;
+  try { stopped = JSON.parse(response.body.toString('utf8')); } catch { stopped = null; }
   try {
-    assert.ok(response.ok(), 'Cleanup stop failed');
-    const stopped = await response.json();
-    assert.ok(stopped.ok === true && (stopped.outcome === 'destroyed' && stopped.terminated === true
+    assert.ok(response.status >= 200 && response.status < 300, 'Cleanup stop failed');
+    assert.ok(stopped?.ok === true && (stopped.outcome === 'destroyed' && stopped.terminated === true
       || stopped.outcome === 'not_running' && stopped.terminated === false), 'Cleanup stop unconfirmed');
-  } finally { await response.dispose(); }
+  } catch (error) {
+    // Public CI evidence: the status and the server's own codes only, never the body.
+    error.stop = stopSummary(response.status, stopped);
+    throw error;
+  }
+}
+
+const CODE = /^[A-Za-z_]{1,40}$/;
+function stopSummary(status, body) {
+  const code = value => (typeof value === 'string' && CODE.test(value) ? value : undefined);
+  return { status, ok: body?.ok === true, outcome: code(body?.outcome), error: code(body?.error) ?? code(body?.error?.code) };
 }

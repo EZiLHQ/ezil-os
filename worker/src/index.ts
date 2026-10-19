@@ -681,6 +681,8 @@ import {
 const DESKTOP_PORT = 8080;
 /** Preview validity window reported to the client. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
+// Lets the reset reply leave the object before `ctx.abort()` discards it.
+export const ACCEPTANCE_RESET_DELAY_MS = 100;
 /**
  * Sandbox auto-sleep when idle. BACKSTOP ONLY, not the real mechanism:
  * `EzilSandboxDO.flushWorkspaceScheduled`'s explicit idle-stop path
@@ -815,6 +817,7 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
+  resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }>;
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
@@ -2487,6 +2490,33 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     this.runtimeMutationTail = next.then(() => undefined, () => undefined);
     return next;
   }
+  /**
+   * Relay credential operations change only the running neko process's in-memory
+   * ICE configuration. They used to queue behind `withRuntimeMutation` and
+   * `withWorkspacePersistence`, so any checkpoint longer than the relay budget
+   * (a 36 s system-layer flush was observed) refused renewals with `relay_busy`
+   * while the desktop was healthy, and the viewer then dropped to its error state.
+   * They now serialize only with each other, and with the operations that actually
+   * stop, restart or replace the runtime (`withRuntimeTransition`): a transition
+   * fences new relay operations off and waits for an in-flight one to finish,
+   * exactly the exclusion the runtime lock used to give.
+   */
+  private relayTail: Promise<unknown> = Promise.resolve();
+  private runtimeTransitionsInFlight = 0;
+  private withRelayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.relayTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.relayTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  private async withRuntimeTransition<T>(operation: () => Promise<T>): Promise<T> {
+    this.runtimeTransitionsInFlight++;
+    try {
+      await (this.relayTail ?? Promise.resolve()).catch(() => undefined);
+      return await operation();
+    } finally {
+      this.runtimeTransitionsInFlight--;
+    }
+  }
   async desktopReachable(): Promise<boolean> {
     try {
       const response = await this.runningContainerFetch('http://127.0.0.1:8181/', {}, 8181, 1000);
@@ -2532,11 +2562,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
     const requestedAt = Date.now();
     try {
-      const state = await this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      const state = await this.withRelayOperation(async () => {
         // A queued request that outlived the caller's forwarding budget must
         // never apply a late configuration change to a resumed runtime.
         remainingRelayBudget(requestedAt);
-        if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
+        if (this.runtimeTransitionsInFlight > 0 || !this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
         const credentials = await deriveNekoCredentials(this.env, sandboxId);
         // Local TCP transport cannot start a stopped container, and its signal
         // is cancellable here without crossing the Sandbox RPC boundary.
@@ -2548,7 +2578,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           if (!servers) throw new RelayFailure('turn_unavailable');
           return { servers, expiresAt: relayExpiryFor(issuedAt, resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS)) };
         } } : {}) });
-      }));
+      });
       return { ok: true, ...state };
     } catch (error) { return relayFailureResult(error); }
   }
@@ -3157,7 +3187,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // does because the absence of a reschedule (below) is the only thing
         // marking this loop retired.
         try {
-          await this.stop();
+          await this.withRuntimeTransition(() => this.stop());
         } catch (err) {
           console.error(
             `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=workspace_operation_failed`,
@@ -3540,12 +3570,34 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * label) rather than `<sandboxId>`.
    */
   async terminateSandbox(): Promise<TerminateReport> {
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint()));
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint())));
   }
 
   async stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport> {
     assertAcceptanceScope(this.env, sandboxId);
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true)));
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true))));
+  }
+
+  /**
+   * Staging acceptance only: discard this object instance so the next request
+   * constructs it from the currently deployed code. After a deploy, Cloudflare
+   * keeps a live object on its old code and resets it later ("Durable Object
+   * reset because its code was updated"); on staging that reset landed inside
+   * timed acceptance, failing a desktop open with 500 and pushing the cold first
+   * paint past its budget. The prepare step stops the test computer and then
+   * calls this, so the reset happens before any timing starts.
+   *
+   * Refuses while a container runs: only an already stopped test computer, with
+   * its final checkpoint committed, is ever reset. The abort runs after the reply
+   * and after any queued runtime or persistence work, so it cannot cut a write.
+   */
+  async resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }> {
+    assertAcceptanceScope(this.env, sandboxId);
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      if (this.containerIsRunning()) return { ok: false as const, error: 'runtime_running' as const };
+      setTimeout(() => this.ctx.abort('acceptance_reset'), ACCEPTANCE_RESET_DELAY_MS);
+      return { ok: true as const };
+    }));
   }
 
   private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {
@@ -3722,7 +3774,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       };
     }
     this.restartInProgress = true;
-    return this.withRuntimeMutation(async () => {
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(async () => {
     try {
       const exposedBefore = await this.getExposedPorts(hostname);
       const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
@@ -3920,7 +3972,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     } finally {
       this.restartInProgress = false;
     }
-    });
+    }));
   }
 }
 
@@ -7114,6 +7166,23 @@ export default {
       if (unauthorized) return unauthorized;
       try { return json(await openSandbox(env, name).stopRuntimeForAcceptance(name)); }
       catch { return json({ok:false,error:'acceptance_stop_failed'},502); }
+    }
+    const acceptanceReset = path.match(/^\/sandbox\/([^/]+)\/acceptance-reset$/);
+    if (method === 'POST' && acceptanceReset) {
+      const name = decodeURIComponent(acceptanceReset[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try {
+        const result = await openSandbox(env, name).resetRuntimeForAcceptance(name);
+        return json(result, result.ok ? 200 : 409);
+      } catch (error) {
+        // An object still on the previous revision (the state this route exists
+        // for) has no such method yet; say so, so the prepare step can skip it.
+        if (/does not implement|not a function|no such method/i.test(String(error))) return json({ok:false,error:'acceptance_reset_unsupported'},501);
+        return json({ok:false,error:'acceptance_reset_failed'},502);
+      }
     }
     const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
     if (method === 'POST' && acceptanceMatch) {

@@ -55,12 +55,12 @@ export interface FlushR2BucketLike {
   }): Promise<{ etag?: string } | null>;
 }
 export interface HydrateContainerLike {
-  mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
-  writeFile(path: string, content: string, options?: { encoding?: string }): Promise<unknown>;
+  mkdir(path: string, options?: { recursive?: boolean; sessionId?: string }): Promise<unknown>;
+  writeFile(path: string, content: string, options?: { encoding?: string; sessionId?: string }): Promise<unknown>;
   exec(command: string, options?: { timeout?: number }): Promise<{ exitCode: number; stdout: string; stderr?: string }>;
 }
 export interface FlushContainerLike extends HydrateContainerLike {
-  readFile(path: string, options?: { encoding?: string }): Promise<{ content: string; encoding?: string }>;
+  readFile(path: string, options?: { encoding?: string; sessionId?: string }): Promise<{ content: string; encoding?: string }>;
   exists(path: string): Promise<{ exists: boolean }>;
 }
 // Retained for DO cache compatibility; never trusted to skip byte verification.

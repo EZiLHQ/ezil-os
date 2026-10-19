@@ -672,6 +672,72 @@ mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
     for (let i = 0; i < 3; i++) expect((await sysFlush(a, store, prefix)).ok).toBe(true);
   }, T);
 
+  // Found on staging 2026-10-19: a 186 MB layer (one unchanged 185 MB tool binary) was
+  // re-uploaded in full at every checkpoint. Between generations only platform churn
+  // differed: a new Copilot CLI process log per boot (248 of the layer's 294 entries) and
+  // VS Code's shared state.vscdb rewritten with the same single row (SQLite page churn).
+  const CHURN_DB = '/root/.vscode-oss-shared/sharedStorage/state.vscdb';
+  // Base64 keeps the shell away from the program (VS Code's marker key contains `$`).
+  const writeDb = (rows: Record<string, string>) => `printf %s ${Buffer.from(
+    `import sqlite3, json\nc = sqlite3.connect('${CHURN_DB}')\n`
+    + `c.execute('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)')\n`
+    + `for kv in json.loads(${JSON.stringify(JSON.stringify(rows))}).items(): c.execute('INSERT OR REPLACE INTO ItemTable VALUES (?,?)', kv)\n`
+    + `c.commit(); c.close()\n`).toString('base64')} | base64 -d | python3`;
+  it('platform churn after a restore (tool logs, rewritten VS Code state) does not re-upload the layer; real changes do', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-churn-restore');
+    const a = await startComputer('sysre-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, [
+      'mkdir -p /root/.opencode/bin /root/.copilot/logs /root/.local/share/opencode/log /root/.vscode-oss-shared/sharedStorage /opt/eztool',
+      'head -c 3000000 /dev/urandom > /root/.opencode/bin/tool && chmod 755 /root/.opencode/bin/tool',
+      'echo boot-1 > /root/.copilot/logs/process-1.log && echo boot-1 > /root/.local/share/opencode/log/1.log',
+      'echo v1 > /opt/eztool/config && ln -s config /opt/eztool/current',
+      writeDb({ '__$__isNewStorageMarker': 'true' }),
+    ].join(' && '));
+    expect(await sysFlush(a, store, prefix)).toMatchObject({ ok: true });
+    await destroyComputer(a);
+
+    const b = await startComputer('sysre-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true, sameImage: true, conflicts: 0 });
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    // The churn every boot produces, with no user action: new process logs, and the state DB
+    // rewritten with the same row (its bytes change: SQLite bumps the file change counter).
+    const before = await must(b, `sha256sum ${CHURN_DB}`);
+    await must(b, ['mkdir -p /root/.copilot/logs /root/.local/share/opencode/log',
+      'echo boot-2 > /root/.copilot/logs/process-2.log', 'echo boot-2 > /root/.local/share/opencode/log/2.log',
+      writeDb({ '__$__isNewStorageMarker': 'true' })].join(' && '));
+    expect(await must(b, `sha256sum ${CHURN_DB}`)).not.toBe(before);
+    expect(await sysFlush(b, store, prefix)).toMatchObject({ ok: true, unchanged: true, uploaded: 0 });
+
+    // Every kind of real change is still a change, and still uploaded.
+    const changes = [
+      writeDb({ 'workbench.panel.width': '420' }),                      // a real VS Code state value
+      'echo v2 > /opt/eztool/config',                                    // an edit
+      'echo new > /opt/eztool/added',                                    // a new file
+      'rm /root/.opencode/bin/tool',                                     // a deletion
+      'chmod 600 /opt/eztool/config',                                    // a mode change
+      'echo alt > /opt/eztool/alt && ln -sfn alt /opt/eztool/current',   // a symlink retarget (+ its target)
+    ];
+    for (const change of changes) {
+      await must(b, change);
+      const out = await sysFlush(b, store, prefix);
+      expect({ change, ok: out.ok, unchanged: out.unchanged ?? false, uploaded: out.uploaded > 0 })
+        .toEqual({ change, ok: true, unchanged: false, uploaded: true });
+    }
+    await destroyComputer(b);
+
+    // The last committed layer carries every change onto a new container.
+    const c = await startComputer('sysre-c');
+    expect(await sysHydrate(c, store, prefix)).toMatchObject({ ok: true });
+    expect((await must(c, 'cat /opt/eztool/config /opt/eztool/added; readlink /opt/eztool/current; stat -c %a /opt/eztool/config')).split('\n'))
+      .toEqual(['v2', 'new', 'alt', '600', '']);
+    expect((await sh(c, 'test -e /root/.opencode/bin/tool')).exitCode).not.toBe(0);
+    expect(JSON.parse(await must(c, `python3 -c 'import sqlite3, json; print(json.dumps(dict(sqlite3.connect("${CHURN_DB}").execute("select key, value from ItemTable"))))'`)))
+      .toEqual({ '__$__isNewStorageMarker': 'true', 'workbench.panel.width': '420' });
+    // Tool logs are not part of the layer.
+    expect((await sh(c, 'test -e /root/.copilot/logs/process-1.log')).exitCode).not.toBe(0);
+  }, T);
+
   it('a system delta over the snapshot limit is reported as too_large and never half-written', async () => {
     const store = await makeStore(); const prefix = prefixFor('system-big');
     const a = await startComputer('sysbig-a'); await sysHydrate(a, store, prefix);
