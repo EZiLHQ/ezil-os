@@ -182,7 +182,7 @@ export function openOverageSheet (options) {
     const offer = summary.catalog.offers.find(offer => offer.sku === COMPUTE);
     const largest = summary.catalog.sizes.filter(size => offer.sizes.includes(size.code)).sort((a, b) => b.vcpu - a.vcpu)[0];
     const { node, button } = sheet;
-    node('p', `When your ${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours are used up, keep working at ${money(overage.centsPerStdHour)} per standard-hour, up to a monthly cap you set. Usage is billed separately after each billing period, on its own invoice.`);
+    node('p', `When your ${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours are used up, keep working at ${money(overage.centsPerStdHour)} per standard-hour, before tax, up to a monthly cap you set. Usage is billed separately after each billing period, on its own invoice.`);
     const label = node('label', 'Monthly cap (USD)');
     label.className = 'ezil-billing-cap';
     const input = node('input', null, label);

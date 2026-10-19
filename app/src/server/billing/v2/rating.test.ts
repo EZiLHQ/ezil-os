@@ -45,6 +45,13 @@ function goldenAdmitInput(input: typeof golden.admitStart[number]['input']): Par
 }
 
 describe('rating against the independent golden oracle', () => {
+    it.each([-100, 0])('never subtracts included allowance for an overage cap of %i', capCents => {
+        expect(admitStart({ planSku: 'compute_monthly_v2', planActive: true, paymentIssue: false, upgradePending: false,
+            size: 'std-2', allowanceStdSeconds: 1800000, usedStdSeconds: 1799940, overage: { enabled: true, capCents },
+            runningComputers: 0, now: '2026-11-01T00:00:00Z' }))
+            .toMatchObject({ admit: true, maxRunSeconds: 60, deadline: '2026-11-01T00:01:00Z' });
+    });
+
     it('retains every pinned row in all four groups', () => {
         expect(golden.rateWindow).toHaveLength(15);
         expect(golden.ratePeriod).toHaveLength(12);

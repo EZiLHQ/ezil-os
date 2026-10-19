@@ -1,10 +1,12 @@
 import type { BillingStore, OverageInvoiceResult, UsageBillingPort } from '../ports';
-import { CATALOG_V2, GRANT_METER_COMPUTE, STD_SECONDS_PER_OVERAGE_CENT } from './contract';
+import { CATALOG_V2, GRANT_METER_COMPUTE, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_TERMS_VERSION, STD_SECONDS_PER_OVERAGE_CENT } from './contract';
 import { rateWindow } from './rating';
+import { hasOveragePaymentFailure } from './summary';
 import { epochSeconds, isoSeconds } from './time';
 import { OVERAGE_GRACE_SECONDS, OVERAGE_RATING_VERSION } from './usage-billing';
 
 type ClosePeriodStore = Pick<BillingStore, 'subscriptionsFor' | 'grantsForPeriod' | 'epochsFor' | 'consentDecisionsForPeriod'
+    | 'openPaymentIssues' | 'overageInvoicesFor'
     | 'upsertOverageInvoice' | 'stripeCustomerFor' | 'attachOverageStripeInvoice' | 'markOverageInvoiceOpen'>;
 
 export type ClosePeriodResult = OverageInvoiceResult
@@ -24,6 +26,9 @@ export async function closePeriodAndInvoiceOverage(
         : [...subscriptions].sort((a, b) => (b.currentPeriodStart?.getTime() ?? 0) - (a.currentPeriodStart?.getTime() ?? 0))[0];
     if (!subscription) return { status: 'skipped', reason: 'not_found' };
     const subscriptionId = subscription.stripeSubscriptionId;
+    const [paymentIssues, overageInvoices] = await Promise.all([
+        store.openPaymentIssues(userId), store.overageInvoicesFor(userId),
+    ]);
     const recent = await store.grantsForPeriod(userId, {
         start: new Date(now.getTime() - 70 * 24 * 3600 * 1000), end: now,
     }, [GRANT_METER_COMPUTE]);
@@ -34,6 +39,14 @@ export async function closePeriodAndInvoiceOverage(
     if (!period) return { status: 'skipped', reason: 'no_closed_period' };
     const periodStart = period.periodStart!;
     const periodEnd = period.periodEnd!;
+    const existing = overageInvoices.find(invoice => invoice.subscriptionId === subscriptionId
+        && invoice.periodStart.getTime() === periodStart.getTime() && invoice.ratingVersion === OVERAGE_RATING_VERSION
+        && invoice.stripeInvoiceId !== null && invoice.status !== 'pending');
+    if (existing?.stripeInvoiceId) return { status: 'exists', invoiceId: existing.stripeInvoiceId };
+    // Conservatively bill nothing while a failure is unresolved, regardless of later consent.
+    if (hasOveragePaymentFailure(subscriptionId, paymentIssues, overageInvoices)) {
+        return { status: 'skipped', reason: 'overage_disabled' };
+    }
     const grants = (await store.grantsForPeriod(userId, { start: periodStart, end: periodEnd }, [GRANT_METER_COMPUTE]))
         .filter(grant => grant.subscriptionId === subscriptionId && grant.meter === GRANT_METER_COMPUTE
             && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < periodEnd && grant.periodEnd > periodStart);
@@ -51,7 +64,8 @@ export async function closePeriodAndInvoiceOverage(
     let capCents = 0;
     for (let i = 0; i < decisions.length; i++) {
         const decision = decisions[i];
-        if (!decision.enabled) continue;
+        if (!decision.enabled || decision.termsVersion !== OVERAGE_TERMS_VERSION
+            || decision.rateCentsPerStdHour !== OVERAGE_CENTS_PER_STD_HOUR) continue;
         const start = Math.max(startSeconds, epochSeconds(decision.acceptedAt));
         const end = Math.min(endSeconds, epochSeconds(decisions[i + 1]?.acceptedAt ?? periodEnd));
         // Only decisions in force for a positive interval can supply the cap.

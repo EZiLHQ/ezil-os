@@ -72,6 +72,14 @@ export function createBillingStore(db: Database): BillingStore {
             // insert and select. Retry then, without changing any existing epoch.
             // Bound contention so the caller can retry instead of spinning forever.
             for (let attempt = 0; attempt < 3; attempt++) {
+                // Ready-event replays keep their original epoch, even after it has closed.
+                const [replayed] = await db.select().from(billingComputeEpochs).where(and(
+                    eq(billingComputeEpochs.computerId, input.computerId), eq(billingComputeEpochs.readyAt, readyAt),
+                ));
+                if (replayed) {
+                    if (replayed.userId !== input.userId) throw new Error('Epoch ownership conflict');
+                    return { status: 'exists', epoch: computeEpoch(replayed) };
+                }
                 const [inserted] = await db.insert(billingComputeEpochs).values({
                     ...input, readyAt, weight: SIZES[input.size].weight,
                 }).onConflictDoNothing().returning();
@@ -159,7 +167,7 @@ export function createBillingStore(db: Database): BillingStore {
             const [row] = await db.select().from(billingOverageConsents).where(and(
                 eq(billingOverageConsents.userId, userId),
                 eq(billingOverageConsents.subscriptionId, subscriptionId),
-            )).orderBy(desc(billingOverageConsents.id)).limit(1);
+            )).orderBy(desc(billingOverageConsents.acceptedAt), desc(billingOverageConsents.id)).limit(1);
             return row ?? null;
         },
 

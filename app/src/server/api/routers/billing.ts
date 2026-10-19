@@ -7,13 +7,13 @@ import type { BillingDeps, StripeApi } from '@/server/billing/ports';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions } from '@/server/billing/v2/catalog';
 import {
-    OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
+    CATALOG_V2, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
     type BillingErrorCode, type BillingInvoiceDTO, type BillingSummaryV2Result, type CheckoutStartDTO,
     type CheckoutStatusDTO, type ConfirmUpgradeOutput, type PreviewUpgradeOutput, type ScheduleDowngradeOutput,
     type CancelAtPeriodEndOutput, type SetOverageOutput, type SelectSizeOutput,
 } from '@/server/billing/v2/contract';
 import { upgradeGrantStdSeconds } from '@/server/billing/v2/rating';
-import { buildSummaryV2, summaryMeters } from '@/server/billing/v2/summary';
+import { buildSummaryV2, hasOveragePaymentFailure, summaryMeters } from '@/server/billing/v2/summary';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
@@ -106,7 +106,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer] = await Promise.all([
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -114,10 +114,11 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 deps.store.latestStorageFor(ctx.user.id),
                 deps.store.sizePreference(ctx.user.id),
                 deps.store.stripeCustomerFor(ctx.user.id),
+                deps.store.overageInvoicesFor(ctx.user.id),
             ]);
             return buildSummaryV2({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
-                storage, sizePreference, hasCustomer: customer !== null,
+                storage, sizePreference, hasCustomer: customer !== null, overageInvoices,
             });
         }),
 
@@ -266,18 +267,38 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 if (!Number.isInteger(input.capCents) || input.capCents < 0 || input.capCents > OVERAGE_MAX_CAP_CENTS
                     || input.capCents % 100 !== 0) throw billingError('cap_out_of_range', 'BAD_REQUEST');
                 const { plan, subs, userCreatedAt, changes } = await currentPlan(deps, ctx.user.id);
-                const subscriptionId = paidSubscription(plan);
-                if (plan.sku !== 'compute_monthly_v2' || plan.status !== 'active') throw billingError('not_subscribed', 'PRECONDITION_FAILED');
-                const paymentIssues = await deps.store.openPaymentIssues(ctx.user.id);
+                // Opt-out depends on ownership, even when the subscription no longer supplies a current plan.
+                const ownedCompute = subs.filter(sub => sub.sku === 'compute_monthly_v2')
+                    .sort((a, b) => (b.currentPeriodEnd?.getTime() ?? 0) - (a.currentPeriodEnd?.getTime() ?? 0));
+                const subscriptionId = input.enabled ? paidSubscription(plan)
+                    : (ownedCompute.find(sub => sub.stripeSubscriptionId === plan.subscriptionId) ?? ownedCompute[0])?.stripeSubscriptionId;
+                if (!subscriptionId || (input.enabled && (plan.sku !== 'compute_monthly_v2' || plan.status !== 'active'))) {
+                    throw billingError('not_subscribed', 'PRECONDITION_FAILED');
+                }
+                const [paymentIssues, overageInvoices] = await Promise.all([
+                    deps.store.openPaymentIssues(ctx.user.id), deps.store.overageInvoicesFor(ctx.user.id),
+                ]);
                 // The pinned vocabulary has no overage-payment refusal: not_subscribed
                 // means overage cannot be enabled until this subscription's issue is repaired.
-                if (input.enabled && paymentIssues.some(issue => issue.subscriptionId === subscriptionId
-                    && issue.invoiceKind === 'overage' && issue.resolvedAt === null)) {
+                if (input.enabled && (hasOveragePaymentFailure(subscriptionId, paymentIssues, overageInvoices)
+                    || paymentIssues.some(issue => issue.subscriptionId === subscriptionId
+                        && issue.invoiceKind === 'overage' && issue.resolvedAt === null))) {
                     throw billingError('not_subscribed', 'PRECONDITION_FAILED');
                 }
                 const now = deps.now();
-                await deps.store.recordConsent({ userId: ctx.user.id, subscriptionId, ...input,
-                    catalogVersion: 2, rateCentsPerStdHour: 25, actor: ctx.user.id, acceptedAt: now });
+                const recorded = await deps.store.recordConsent({ userId: ctx.user.id, subscriptionId, ...input,
+                    catalogVersion: 2, rateCentsPerStdHour: OVERAGE_CENTS_PER_STD_HOUR, actor: ctx.user.id, acceptedAt: now });
+                if (!input.enabled) {
+                    const policy = CATALOG_V2.compute_monthly_v2.overage!;
+                    const paymentFailed = hasOveragePaymentFailure(subscriptionId, paymentIssues, overageInvoices);
+                    return {
+                        available: plan.subscriptionId === subscriptionId && plan.planActive && !paymentFailed,
+                        enabled: false, capCents: recorded.capCents, defaultCapCents: policy.defaultCapCents,
+                        maxCapCents: policy.maxCapCents, centsPerStdHour: policy.centsPerStdHour, accruedCents: 0,
+                        termsVersion: OVERAGE_TERMS_VERSION, acceptedVersion: recorded.termsVersion,
+                        acceptedAt: isoSeconds(epochSeconds(recorded.acceptedAt)), pausedReason: paymentFailed ? 'payment_failed' : null,
+                    };
+                }
                 const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
                 const [epochs, grants, consent, storage, sizePreference, customer] = await Promise.all([
                     deps.store.epochsFor(ctx.user.id, window.start),
@@ -286,7 +307,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     deps.store.sizePreference(ctx.user.id), deps.store.stripeCustomerFor(ctx.user.id),
                 ]);
                 return buildSummaryV2({ config: deps.config, now, userCreatedAt, subs, epochs, grants, consent,
-                    planChanges: changes, paymentIssues, storage, sizePreference, hasCustomer: customer !== null }).overage!;
+                    planChanges: changes, paymentIssues, overageInvoices, storage, sizePreference, hasCustomer: customer !== null }).overage!;
             }),
 
         selectSize: protectedProcedure.input(z.object({ size: z.string() }))

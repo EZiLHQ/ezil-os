@@ -179,6 +179,27 @@ describe('buildSummaryV2', () => {
             worstCaseOverageCents: enabled ? 2500 : 0, currency: 'usd', taxNote: 'before_tax' });
     });
 
+    it.each([{ termsVersion: 'overage-v1' }, { rateCentsPerStdHour: 30 }])('disables stale consent but preserves its acceptance details: %o', stale => {
+        const accepted = consent(stale);
+        const result = buildSummaryV2(compute({ consent: accepted, epochs: [epoch(2000)] }));
+        expect(result.overage).toMatchObject({ enabled: false, accruedCents: 0, acceptedVersion: accepted.termsVersion,
+            acceptedAt: '2026-10-18T12:00:00Z' });
+        expect(result.estimate).toMatchObject({ accruedOverageCents: 0, worstCaseOverageCents: 0 });
+    });
+
+    it.each(['open', 'payment_failed', 'requires_action', 'uncollectible'] as const)('disables later consent for a %s invoice without an issue row', status => {
+        const invoice = { id: 'overage_previous', userId: 'user_a', subscriptionId: 'sub_a', periodStart: new Date('2026-09-01T00:00:00Z'),
+            periodEnd: new Date(START), ratingVersion: 1, stdSecondsOver: BigInt(14400), cents: 100, stripeInvoiceId: 'in_previous',
+            status, createdAt: new Date(START), updatedAt: new Date(START) };
+        const result = buildSummaryV2(compute({ consent: consent(), overageInvoices: [invoice], epochs: [epoch(2000)] }));
+        expect(result.overage).toMatchObject({ enabled: false, available: false, pausedReason: 'payment_failed', accruedCents: 0 });
+        expect(result.estimate.worstCaseOverageCents).toBe(0);
+        for (const resolved of [{ ...invoice, status: 'paid' as const }, { ...invoice, status: 'void' as const },
+            { ...invoice, subscriptionId: 'sub_other' }]) {
+            expect(buildSummaryV2(compute({ consent: consent(), overageInvoices: [resolved] })).overage?.enabled).toBe(true);
+        }
+    });
+
     it.each([0, 2])('reports cap reached at cap %i, with billed overage bounded by it', capCents => {
         const result = buildSummaryV2(compute({ consent: consent({ capCents }), epochs: [epoch(1432)] }));
         expect(result.compute.state).toBe('over_cap');
