@@ -125,6 +125,12 @@ for job_name, target in (('preview', 'staging'), ('production', 'production')):
     assert steps[prepare]['run'] == 'node e2e/prepare-hosted-computer.mjs'
     if job_name == 'preview':
         assert steps[prepare]['if'] == "needs.trust.outputs.manual_preview != 'true'"
+        # Staging resets its stopped test computer onto the deployed code.
+        assert steps[prepare]['env']['EZIL_ACCEPTANCE_SANDBOX'] == '${{ secrets.EZIL_ACCEPTANCE_SANDBOX }}'
+        assert steps[prepare]['env']['EZIL_ACCEPTANCE_HMAC_SECRET'] == '${{ secrets.EZIL_ACCEPTANCE_HMAC_SECRET }}'
+    else:
+        # Production has no acceptance scope: its preparation only stops.
+        assert not {'EZIL_ACCEPTANCE_SANDBOX', 'EZIL_ACCEPTANCE_HMAC_SECRET'} & set(steps[prepare].get('env', {}))
 # Hosted continuity is an explicit cloud gate; missing isolated IDs are failures.
 preview_steps = jobs['preview']['steps']
 continuity = next(step for step in preview_steps if step.get('name') == 'Hosted continuity release gate')

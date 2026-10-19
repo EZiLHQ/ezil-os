@@ -8,7 +8,13 @@ import { pathToFileURL } from 'node:url';
 import { deployedTarget, configureAppContext, APP_STOP_FETCH_TIMEOUT_MS } from './deployed-target.mjs';
 import { stopIsolatedComputer } from './isolated-computer.mjs';
 
-export async function cleanupHostedComputer(env = process.env, chromium, send) {
+/** The Worker's sandbox name for a session, exactly as the OS shell derives it. */
+export function sandboxIdFor(session) {
+  const compact = id => String(id ?? '').replace(/[^a-z0-9]/gi, '').slice(0, 16);
+  return `guac-${compact(session?.user?.id)}-${compact(session?.computer?.id)}`;
+}
+
+export async function cleanupHostedComputer(env = process.env, chromium, send, { expectSandbox } = {}) {
   const evidence = { ok: false, phase: 'prerequisites' };
   let browser;
   try {
@@ -38,7 +44,13 @@ export async function cleanupHostedComputer(env = process.env, chromium, send) {
     const session = await context.request.get(`${app}/api/shell/session`, { headers, maxRedirects: 0, timeout: 30000 });
     try {
       assert.ok(session.ok());
-      assert.ok((await session.json()).computer?.id === computerId, 'cleanup_computer_mismatch');
+      const signedIn = await session.json();
+      assert.ok(signedIn.computer?.id === computerId, 'cleanup_computer_mismatch');
+      // A runtime reset after the stop must target this signed-in test computer.
+      if (expectSandbox !== undefined) {
+        assert.ok(sandboxIdFor(signedIn) === expectSandbox, 'cleanup_sandbox_mismatch');
+        evidence.sandboxVerified = true;
+      }
     } finally { await session.dispose(); }
     evidence.phase = 'final_stop';
     await stopIsolatedComputer(context, computerId, app, headers, APP_STOP_FETCH_TIMEOUT_MS, send);

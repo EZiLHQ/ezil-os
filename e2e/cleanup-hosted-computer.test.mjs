@@ -6,7 +6,7 @@ const computerId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const env = { EZIL_E2E_APP: 'https://staging.example', EZIL_E2E_COMPUTER_ID: computerId,
   EZIL_E2E_EMAIL: 'test@example.invalid', EZIL_E2E_PASSWORD: 'private-test-password',
   VERCEL_AUTOMATION_BYPASS_SECRET: 'private-test-bypass' };
-function fixture({ selected = computerId, stop = { ok: true, terminated: true, outcome: 'destroyed' }, failure } = {}) {
+function fixture({ selected = computerId, user = 'abcdef01-2345-6789-aaaa-bbbbbbbbbbbb', stop = { ok: true, terminated: true, outcome: 'destroyed' }, failure } = {}) {
   const calls = [];
   const page = { goto: async url => { calls.push(['goto', url]); },
     waitForFunction: async () => {},
@@ -16,7 +16,7 @@ function fixture({ selected = computerId, stop = { ok: true, terminated: true, o
   };
   const response = json => ({ ok: () => true, json: async () => json, dispose: async () => {} });
   const context = { route: async () => {}, newPage: async () => page, cookies: async () => [], request: {
-    get: async (url, options) => { calls.push(['get', url, options]); return response({ computer: { id: selected } }); },
+    get: async (url, options) => { calls.push(['get', url, options]); return response({ user: { id: user }, computer: { id: selected } }); },
   } };
   const send = async (url, options) => {
     calls.push(['stop', url, options]);
@@ -65,4 +65,15 @@ test('cleanup failures remain explicit and redacted while browser resources clos
     { status: 200, ok: false, outcome: 'flush_failed', error: undefined });
   const f = fixture({ stop: { ok: true, terminated: false, outcome: 'not_running' } });
   assert.equal((await cleanupHostedComputer(env, f.chromium, f.send)).ok, true);
+});
+test('a reset target that is not the signed-in test computer is refused before any stop', async () => {
+  const expected = 'guac-abcdef0123456789-aaaaaaaaaaaaaaaa';
+  const f = fixture();
+  const ok = await cleanupHostedComputer(env, f.chromium, f.send, { expectSandbox: expected });
+  assert.equal(ok.ok, true); assert.equal(ok.sandboxVerified, true);
+  assert.equal(JSON.stringify(ok).includes(expected), false);
+  const other = fixture({ user: 'bbbbbbbb-2345-6789-aaaa-bbbbbbbbbbbb' });
+  const refused = await cleanupHostedComputer(env, other.chromium, other.send, { expectSandbox: expected });
+  assert.equal(refused.ok, false); assert.equal(refused.phase, 'computer_identity');
+  assert.equal(other.calls.some(c => c[0] === 'stop'), false);
 });

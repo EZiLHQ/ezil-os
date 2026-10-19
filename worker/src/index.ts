@@ -681,6 +681,8 @@ import {
 const DESKTOP_PORT = 8080;
 /** Preview validity window reported to the client. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
+// Lets the reset reply leave the object before `ctx.abort()` discards it.
+export const ACCEPTANCE_RESET_DELAY_MS = 100;
 /**
  * Sandbox auto-sleep when idle. BACKSTOP ONLY, not the real mechanism:
  * `EzilSandboxDO.flushWorkspaceScheduled`'s explicit idle-stop path
@@ -815,6 +817,7 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
+  resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }>;
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
@@ -3573,6 +3576,28 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport> {
     assertAcceptanceScope(this.env, sandboxId);
     return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true))));
+  }
+
+  /**
+   * Staging acceptance only: discard this object instance so the next request
+   * constructs it from the currently deployed code. After a deploy, Cloudflare
+   * keeps a live object on its old code and resets it later ("Durable Object
+   * reset because its code was updated"); on staging that reset landed inside
+   * timed acceptance, failing a desktop open with 500 and pushing the cold first
+   * paint past its budget. The prepare step stops the test computer and then
+   * calls this, so the reset happens before any timing starts.
+   *
+   * Refuses while a container runs: only an already stopped test computer, with
+   * its final checkpoint committed, is ever reset. The abort runs after the reply
+   * and after any queued runtime or persistence work, so it cannot cut a write.
+   */
+  async resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }> {
+    assertAcceptanceScope(this.env, sandboxId);
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      if (this.containerIsRunning()) return { ok: false as const, error: 'runtime_running' as const };
+      setTimeout(() => this.ctx.abort('acceptance_reset'), ACCEPTANCE_RESET_DELAY_MS);
+      return { ok: true as const };
+    }));
   }
 
   private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {
@@ -7141,6 +7166,18 @@ export default {
       if (unauthorized) return unauthorized;
       try { return json(await openSandbox(env, name).stopRuntimeForAcceptance(name)); }
       catch { return json({ok:false,error:'acceptance_stop_failed'},502); }
+    }
+    const acceptanceReset = path.match(/^\/sandbox\/([^/]+)\/acceptance-reset$/);
+    if (method === 'POST' && acceptanceReset) {
+      const name = decodeURIComponent(acceptanceReset[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try {
+        const result = await openSandbox(env, name).resetRuntimeForAcceptance(name);
+        return json(result, result.ok ? 200 : 409);
+      } catch { return json({ok:false,error:'acceptance_reset_failed'},502); }
     }
     const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
     if (method === 'POST' && acceptanceMatch) {

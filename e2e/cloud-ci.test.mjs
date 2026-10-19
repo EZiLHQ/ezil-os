@@ -9,6 +9,7 @@ import './viewer-progress.test.mjs';
 import './process-continuity.test.mjs';
 import './isolated-computer.test.mjs';
 import './cleanup-hosted-computer.test.mjs';
+import './prepare-hosted-computer.test.mjs';
 import './editor-shortcut.test.mjs';
 import './relay-lifetime.test.mjs';
 import './await-container-rollout.test.mjs';
