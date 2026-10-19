@@ -800,6 +800,44 @@ describe('shared Stripe caches', () => {
     });
 });
 
+describe('invoice payment state', () => {
+    it.each([
+        ['requires_action', 'requires_action'], ['requires_confirmation', 'requires_action'],
+        ['succeeded', 'paid'], ['processing', 'processing'],
+        ['requires_payment_method', 'failed'], ['canceled', 'failed'],
+    ] as const)('maps PaymentIntent %s to %s for expanded and string references', async (status, state) => {
+        for (const expanded of [true, false]) {
+            const intent = { id: 'pi_invoice/payment', status };
+            const responses: unknown[] = [{ data: [{ payment: { payment_intent: expanded ? intent : intent.id } }] }];
+            if (!expanded) responses.push(intent);
+            const { client, fetcher } = sequence(...responses);
+            expect(await client.retrieveInvoicePaymentState('in_fixture')).toBe(state);
+            expectRequest(fetcher, 0, '/invoice_payments?invoice=in_fixture&expand%5B%5D=data.payment.payment_intent');
+            if (!expanded) expectRequest(fetcher, 1, '/payment_intents/pi_invoice%2Fpayment');
+            expect(fetcher).toHaveBeenCalledTimes(expanded ? 1 : 2);
+        }
+    });
+
+    it.each([{}, { data: [] }, { data: [{ payment: null }, { payment: { payment_intent: null } }] }])(
+        'returns none without a PaymentIntent (%j)', async payload => {
+            const { client } = sequence(payload);
+            expect(await client.retrieveInvoicePaymentState('in_fixture')).toBe('none');
+        },
+    );
+
+    it('re-reads payment state on every call and propagates provider failures', async () => {
+        const { client, fetcher } = sequence(
+            { data: [{ payment: { payment_intent: { id: 'pi_fixture', status: 'requires_action' } } }] },
+            { data: [{ payment: { payment_intent: { id: 'pi_fixture', status: 'succeeded' } } }] },
+            new Response('{}', { status: 503 }),
+        );
+        expect(await client.retrieveInvoicePaymentState('in_fixture')).toBe('requires_action');
+        expect(await client.retrieveInvoicePaymentState('in_fixture')).toBe('paid');
+        await expect(client.retrieveInvoicePaymentState('in_fixture')).rejects.toMatchObject({ status: 503 });
+        expect(fetcher).toHaveBeenCalledTimes(3);
+    });
+});
+
 describe('endive plan changes', () => {
     const previewInput = { subscriptionId: subscription.id, toSku: 'compute_monthly_v2' as const, prorationDate: start + 500 };
     const confirmInput = { ...previewInput, now: new Date((start + 600) * 1000), idempotencyKey: 'upgrade_fixture' };

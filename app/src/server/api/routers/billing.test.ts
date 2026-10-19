@@ -141,6 +141,7 @@ function fixture() {
             items: [], defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null, pendingUpdateExpiresAt: null,
         }),
         retrieveInvoice: vi.fn<StripeApi['retrieveInvoice']>(),
+        retrieveInvoicePaymentState: vi.fn<StripeApi['retrieveInvoicePaymentState']>(),
         retrieveCharge: vi.fn<StripeApi['retrieveCharge']>(),
     } satisfies StripeApi;
     const deps: BillingDeps = {

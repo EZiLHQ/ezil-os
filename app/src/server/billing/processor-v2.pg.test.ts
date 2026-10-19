@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import * as schema from '@/server/db/schema';
 import { computers } from '@/server/db/schema';
 import { readBillingConfig } from './config';
-import type { BillingStore, StripeApi, StripeCharge, StripeInvoice, StripeSubscription } from './ports';
+import type { BillingStore, StripeApi, StripeCharge, StripeInvoice, StripeInvoicePaymentState, StripeSubscription } from './ports';
 import { processStripeEvent } from './processor';
 import { createBillingStore } from './store';
 import type { StripeEventLike } from './stripe/events';
@@ -83,6 +83,7 @@ function fakeStripe() {
     const subscriptions = new Map<string, StripeSubscription>();
     const invoices = new Map<string, StripeInvoice>();
     const charges = new Map<string, StripeCharge>();
+    const paymentStates = new Map<string, StripeInvoicePaymentState>();
     function read<T>(rows: Map<string, T>, id: string): T {
         const row = rows.get(id);
         if (!row) throw new Error(`Unexpected Stripe read: ${id}`);
@@ -92,10 +93,11 @@ function fakeStripe() {
     const api: StripeApi = {
         resolvePrice: unused, previewUpgrade: unused, confirmUpgrade: unused, scheduleDowngrade: unused, cancelScheduledChange: unused, setCancelAtPeriodEnd: unused,
         retrieveSubscription: async id => read(subscriptions, id), retrieveInvoice: async id => read(invoices, id),
+        retrieveInvoicePaymentState: async id => paymentStates.get(id) ?? 'failed',
         retrieveCharge: async id => read(charges, id), retrieveCheckoutSession: unused, createCustomer: unused,
         createCheckoutSession: unused, createPortalSession: unused, listInvoices: unused,
     };
-    return { api, subscriptions, invoices, charges };
+    return { api, subscriptions, invoices, charges, paymentStates };
 }
 
 /** A disposable migrated Postgres, with one connection and a rollback for every scenario. */
@@ -217,6 +219,67 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
         expect(await store.grantsBySource('invoice', duplicatePeriod.id)).toEqual([]);
     });
 
+    it('grants a delayed Standard create invoice after upgrade, replays once, then grants a Compute renewal', async () => {
+        const sub = subscription(a, 'compute_monthly_v2');
+        stripe.subscriptions.set(sub.id, sub);
+        const value = invoice(sub, { billingReason: 'subscription_create', lines: [line(sub, 'standard_monthly_v2')] });
+        stripe.invoices.set(value.id, value);
+        const delivery = invoiceEvent(value);
+        expect((await deliver(delivery)).outcome).toBe('applied');
+        const expected = expect.objectContaining({
+            userId: a.userId, subscriptionId: sub.id, kind: 'plan_period', meter: 'compute_std_seconds',
+            amount: BigInt(216_000), periodStart: START, periodEnd: END, sourceId: value.id,
+        });
+        expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toEqual([expected]);
+        expect((await store.subscriptionsFor(a.userId))[0].sku).toBe('compute_monthly_v2');
+        expect((await deliver({ ...delivery, id: `evt_${randomUUID()}` })).outcome).toBe('applied');
+        expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toEqual([expected]);
+
+        const nextEnd = new Date('2026-12-01T00:00:00Z');
+        const renewed = { ...sub, currentPeriodStart: END, currentPeriodEnd: nextEnd };
+        stripe.subscriptions.set(sub.id, renewed);
+        const renewal = invoice(renewed, { lines: [line(renewed, 'compute_monthly_v2')] });
+        stripe.invoices.set(renewal.id, renewal);
+        expect((await deliver(invoiceEvent(renewal, 'invoice.paid', END))).outcome).toBe('applied');
+        expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toEqual([expected]);
+        expect(await store.grantsForPeriod(a.userId, { start: END, end: nextEnd }, ['compute_std_seconds'])).toEqual([
+            expect.objectContaining({ userId: a.userId, subscriptionId: sub.id, kind: 'plan_period', meter: 'compute_std_seconds',
+                amount: BigInt(1_800_000), periodStart: END, periodEnd: nextEnd, sourceId: renewal.id }),
+        ]);
+    });
+
+    it.each(['subscription_cycle', 'subscription_update'])('keeps same-second 3DS issues requires_action in both delivery orders for %s', async billingReason => {
+        const sub = subscription(a);
+        for (const firstType of ['invoice.payment_action_required', 'invoice.payment_failed']) {
+            const value = invoice(sub, { status: 'open', billingReason });
+            stripe.invoices.set(value.id, value);
+            stripe.paymentStates.set(value.id, 'requires_action');
+            if (billingReason === 'subscription_update') {
+                await store.recordPlanChange({ userId: a.userId, subscriptionId: sub.id, kind: 'upgrade',
+                    fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2', state: 'pending',
+                    stripeInvoiceId: value.id, stripeScheduleId: null, hostedInvoiceUrl: value.hostedInvoiceUrl,
+                    effectiveAt: null, expiresAt: END });
+            }
+            const secondType = firstType === 'invoice.payment_failed' ? 'invoice.payment_action_required' : 'invoice.payment_failed';
+            for (const type of [firstType, secondType]) {
+                expect((await deliver(invoiceEvent(value, type, NOW))).outcome).toBe('applied');
+                const issues = await store.openPaymentIssues(a.userId);
+                expect(issues.find(issue => issue.stripeInvoiceId === value.id)).toMatchObject({
+                    issue: 'requires_action', stripeEventCreated: NOW,
+                });
+                if (billingReason === 'subscription_update') {
+                    expect(await store.openPlanChanges(a.userId)).toEqual([expect.objectContaining({
+                        stripeInvoiceId: value.id, state: 'requires_action',
+                    })]);
+                }
+            }
+            if (billingReason === 'subscription_update') {
+                await store.setPlanChangeState({ userId: a.userId, subscriptionId: sub.id, kind: 'upgrade', state: 'expired' });
+            }
+        }
+        expect(await store.grantsForPeriod(a.userId, window, ['compute_std_seconds'])).toEqual([]);
+    });
+
     it.each(['refund', 'dispute'] as const)('retries a %s delivered before its grant, then applies one negative row', async kind => {
         const value = invoice(subscription(a));
         stripe.invoices.set(value.id, value);
@@ -329,6 +392,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
         // A separate invoice in the next period fails; paid invoices do not turn back into open invoices.
         const failed = { ...value, id: `in_${randomUUID()}`, status: 'open' };
         stripe.invoices.set(failed.id, failed);
+        stripe.paymentStates.set(failed.id, failureType === 'invoice.payment_action_required' ? 'requires_action' : 'failed');
         const next = await store.upsertOverageInvoice({ userId: a.userId, subscriptionId: a.subscriptionId,
             periodStart: END, periodEnd: new Date('2026-12-01T00:00:00Z'), ratingVersion: 2, stdSecondsOver: BigInt(3600), cents: 25 });
         await store.attachOverageStripeInvoice(next.row.id, failed.id);
@@ -396,8 +460,14 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
         for (const type of ['refund.created', 'charge.dispute.created']) {
             expect((await deliver(event(type, { id: `reversal_${randomUUID()}`, charge: charge.id }))).outcome).toBe('review:customer_mismatch');
         }
-        // Invoice-only issues resolve to B's mapped customer, even with A's subscription reference.
-        expect((await deliver(invoiceEvent(foreign, 'invoice.payment_action_required'))).outcome).toBe('applied');
+        // A paid invoice cannot gain an issue from a stale payment event.
+        expect((await deliver(invoiceEvent(foreign, 'invoice.payment_action_required'))).outcome).toBe('ignored');
+        expect(await store.openPaymentIssues(b.userId)).toEqual([]);
+        // Open invoice-only issues still resolve to B's mapped customer, even with A's subscription reference.
+        const openForeign = { ...foreign, id: `in_${randomUUID()}`, status: 'open' };
+        stripe.invoices.set(openForeign.id, openForeign);
+        stripe.paymentStates.set(openForeign.id, 'requires_action');
+        expect((await deliver(invoiceEvent(openForeign, 'invoice.payment_action_required'))).outcome).toBe('applied');
         expect(await store.openPaymentIssues(b.userId)).toEqual([expect.objectContaining({ userId: b.userId })]);
         expect(await store.openPaymentIssues(a.userId)).toEqual([]);
         expect(await store.epochsFor(a.userId, START)).toEqual(aEpochs);

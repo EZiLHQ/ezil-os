@@ -333,6 +333,8 @@ export interface StripeInvoiceSummary {
     description: string | null;
 }
 
+export type StripeInvoicePaymentState = 'paid' | 'requires_action' | 'processing' | 'failed' | 'none';
+
 export interface StripeApi {
     resolvePrice(lookupKey: string): Promise<StripePrice>;
     previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number }): Promise<StripeUpgradePreview>;
@@ -347,6 +349,7 @@ export interface StripeApi {
     createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
     retrieveSubscription(id: string): Promise<StripeSubscription>;
     retrieveInvoice(id: string): Promise<StripeInvoice>;
+    retrieveInvoicePaymentState(invoiceId: string): Promise<StripeInvoicePaymentState>;
     retrieveCheckoutSession(id: string): Promise<StripeCheckoutSession>;
     retrieveCharge(id: string): Promise<StripeCharge>;
 }

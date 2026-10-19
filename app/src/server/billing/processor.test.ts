@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PRO_PLAN } from './catalog';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
-    StorageSample, StripeApi, StripeCharge, StripeCheckoutSession, StripeInvoice,
+    StorageSample, StripeApi, StripeCharge, StripeCheckoutSession, StripeInvoice, StripeInvoicePaymentState,
     StripeSubscription, SubscriptionUpsert, UsageEvent, OverageConsentRow, OverageInvoiceRow, PlanChangeRow, PaymentIssueRow,
 } from './ports';
 import { ingestUsageEvents, processStripeEvent } from './processor';
@@ -236,6 +236,8 @@ class MemoryStripe implements StripeApi {
     async createPortalSession(): Promise<never> { throw new Error('Unexpected createPortalSession'); }
     async retrieveSubscription(id: string) { this.reads.push(`subscription:${id}`); return this.subscription; }
     async retrieveInvoice(id: string) { this.reads.push(`invoice:${id}`); return this.invoice; }
+    paymentState: StripeInvoicePaymentState = 'failed';
+    async retrieveInvoicePaymentState(id: string) { this.reads.push(`invoice_payment:${id}`); return this.paymentState; }
     async retrieveCheckoutSession(id: string) { this.reads.push(`session:${id}`); return this.session; }
     async retrieveCharge(id: string) { this.reads.push(`charge:${id}`); return this.charge; }
 }
@@ -424,6 +426,7 @@ describe('processStripeEvent', () => {
     it.each(['customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'invoice.payment_failed'])(
         'syncs re-read state for %s and accepts stale delivery', async type => {
             const { store, stripe, deps } = fixture();
+            stripe.invoice.status = 'open';
             stripe.subscription.status = 'past_due';
             stripe.subscription.cancelAtPeriodEnd = true;
             const input = event(type, { id: 'sub_local', subscription: 'sub_local', status: 'active' });
@@ -709,6 +712,59 @@ async function seedOverage(f: ReturnType<typeof fixture>) {
 }
 
 describe('v2 webhook grants', () => {
+    it('grants a delayed Standard create invoice after upgrade, replays once, then grants a Compute renewal', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.invoice.billingReason = 'subscription_create';
+        stripe.invoice.lines = [baseLine('standard_monthly_v2')];
+        const delivery = paidV2();
+        expect(await processStripeEvent(delivery, deps)).toBe('applied');
+        const expected = expect.objectContaining({
+            subscriptionId: 'sub_local', kind: 'plan_period', meter: 'compute_std_seconds',
+            amount: BigInt(216_000), periodStart, periodEnd, sourceId: 'in_local',
+        });
+        expect([...store.grants.values()]).toEqual([expected]);
+        expect(store.subscriptions.get('sub_local')?.sku).toBe('compute_monthly_v2');
+        expect(await processStripeEvent({ ...delivery, id: 'evt_replay' }, deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expected]);
+
+        const nextEnd = new Date('2026-12-01T00:00:00Z');
+        stripe.subscription.currentPeriodStart = periodEnd;
+        stripe.subscription.currentPeriodEnd = nextEnd;
+        stripe.invoice = { ...stripe.invoice, id: 'in_renewal', billingReason: 'subscription_cycle',
+            periodStart: periodEnd, periodEnd: nextEnd,
+            lines: [{ ...baseLine('compute_monthly_v2'), periodStart: periodEnd, periodEnd: nextEnd }] };
+        const renewal = { ...paidV2(), id: 'evt_renewal', created: periodEnd.getTime() / 1000 };
+        renewal.data.object.id = 'in_renewal';
+        expect(await processStripeEvent(renewal, deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expected, expect.objectContaining({
+            subscriptionId: 'sub_local', kind: 'plan_period', meter: 'compute_std_seconds',
+            amount: BigInt(1_800_000), periodStart: periodEnd, periodEnd: nextEnd, sourceId: 'in_renewal',
+        })]);
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it.each([false, true])('reviews two distinct sellable base offers regardless of line order (reverse=%s)', async reverse => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.invoice.lines = [baseLine('standard_monthly_v2'), baseLine('compute_monthly_v2')];
+        if (reverse) stripe.invoice.lines.reverse();
+        expect(await processStripeEvent(paidV2(), deps)).toBe('review:ambiguous_base_line');
+        expect(store.writes).toEqual([]);
+    });
+
+    it('accepts repeated lines for one offer and excludes foreign or invalid lines for the other offer', async () => {
+        const { store, stripe, deps } = v2Fixture('compute_monthly_v2');
+        stripe.invoice.lines = [
+            { ...baseLine('compute_monthly_v2'), subscriptionId: 'sub_foreign' },
+            { ...baseLine('compute_monthly_v2'), periodEnd: periodStart },
+            { ...baseLine('standard_monthly_v2'), subscriptionId: null },
+            { ...baseLine('standard_monthly_v2'), id: 'il_duplicate' },
+        ];
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expect.objectContaining({
+            kind: 'plan_period', amount: BigInt(216_000), periodStart, periodEnd,
+        })]);
+    });
+
     it.each(['legacy period', 'v2 period', 'upgrade', 'sync', 'failed invoice', 'plan applied', 'plan expired'] as const)(
         'reviews subscription ownership conflicts before any further write: %s', async scenario => {
             const { store, stripe, deps } = scenario === 'legacy period' ? fixture() : v2Fixture('compute_monthly_v2');
@@ -930,7 +986,7 @@ describe('v2 webhook grants', () => {
         expect(await f.store.openPaymentIssues('user_local')).toEqual([]);
         expect(f.store.grants.size).toBe(0);
         expect(f.store.outbox.size).toBe(0);
-        expect(f.stripe.reads.every(read => read.startsWith('invoice:'))).toBe(true);
+        expect(f.stripe.reads).toEqual(['invoice:in_local', 'invoice_payment:in_local', 'invoice:in_local']);
         f.store.overageInvoices = [];
         expect(await processStripeEvent(paid, f.deps)).toBe('ignored');
     });
@@ -1092,6 +1148,88 @@ describe('v2 webhook grants', () => {
 });
 
 describe('v2 payment issues and plan changes', () => {
+    describe.each(['subscription_cycle', 'subscription_update'])('provider payment state for %s', billingReason => {
+        it.each(['invoice.payment_action_required', 'invoice.payment_failed'])(
+            'records requires_action for both same-second 3DS deliveries, starting with %s', async firstType => {
+                const { store, stripe, deps } = v2Fixture();
+                stripe.invoice.billingReason = billingReason;
+                stripe.invoice.status = 'open';
+                stripe.paymentState = 'requires_action';
+                if (billingReason === 'subscription_update') await seedChange(store);
+                const recordIssue = vi.spyOn(store, 'recordPaymentIssue');
+                const secondType = firstType === 'invoice.payment_failed' ? 'invoice.payment_action_required' : 'invoice.payment_failed';
+                for (const type of [firstType, secondType]) {
+                    const delivery = { ...issueEvent(type, true), id: `evt_${type}` };
+                    expect(await processStripeEvent(delivery, deps)).toBe('applied');
+                    expect(recordIssue).toHaveBeenLastCalledWith(expect.objectContaining({ issue: 'requires_action', eventCreated: now }));
+                    expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ issue: 'requires_action' })]);
+                    if (billingReason === 'subscription_update') expect(store.planChanges[0].state).toBe('requires_action');
+                }
+                expect(recordIssue).toHaveBeenCalledTimes(2);
+                expect(stripe.reads.filter(read => read === 'invoice_payment:in_local')).toHaveLength(2);
+                expect(store.grants.size).toBe(0);
+            },
+        );
+
+        it.each(['failed', 'none'] as const)('records payment_failed from provider state %s for either issue event', async state => {
+            for (const type of ['invoice.payment_failed', 'invoice.payment_action_required']) {
+                const { store, stripe, deps } = v2Fixture();
+                stripe.invoice.billingReason = billingReason;
+                stripe.invoice.status = 'open';
+                stripe.paymentState = state;
+                if (billingReason === 'subscription_update') await seedChange(store);
+                expect(await processStripeEvent(issueEvent(type, true), deps)).toBe('applied');
+                expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ issue: 'payment_failed' })]);
+                if (billingReason === 'subscription_update') expect(store.planChanges[0].state).toBe('payment_failed');
+            }
+        });
+    });
+
+    it('keeps a concurrent 3DS upgrade requires_action when the failed delivery finishes subscription sync last', async () => {
+        const { store, stripe, deps } = v2Fixture();
+        await seedChange(store);
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.status = 'open';
+        stripe.paymentState = 'requires_action';
+        let release!: () => void;
+        const syncPending = new Promise<void>(resolve => { release = resolve; });
+        vi.spyOn(stripe, 'retrieveSubscription').mockImplementation(async () => {
+            await syncPending;
+            return stripe.subscription;
+        });
+        const failed = processStripeEvent({ ...issueEvent('invoice.payment_failed', true), id: 'evt_failed' }, deps);
+        try {
+            expect(await processStripeEvent({ ...issueEvent('invoice.payment_action_required', true), id: 'evt_action' }, deps)).toBe('applied');
+        } finally {
+            release();
+        }
+        expect(await failed).toBe('applied');
+        expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ issue: 'requires_action' })]);
+        expect(store.planChanges[0].state).toBe('requires_action');
+    });
+
+    it.each([
+        ['paid', 'failed'], ['open', 'paid'], ['open', 'processing'],
+    ] as const)('ignores stale payment events when invoice=%s and payment=%s without issue effects', async (status, state) => {
+        for (const kind of ['subscription', 'upgrade', 'overage']) {
+            for (const type of ['invoice.payment_failed', 'invoice.payment_action_required']) {
+                const f = v2Fixture();
+                if (kind === 'upgrade') {
+                    await seedChange(f.store);
+                    f.stripe.invoice.billingReason = 'subscription_update';
+                }
+                if (kind === 'overage') await seedOverage(f);
+                f.stripe.invoice.status = status;
+                f.stripe.paymentState = state;
+                const writes = [vi.spyOn(f.store, 'recordPaymentIssue'), vi.spyOn(f.store, 'setPlanChangeState'),
+                    vi.spyOn(f.store, 'setOverageInvoiceStatus'), vi.spyOn(f.store, 'recordConsent')];
+                expect(await processStripeEvent(issueEvent(type, kind !== 'overage'), f.deps)).toBe('ignored');
+                for (const write of writes) expect(write).not.toHaveBeenCalled();
+                expect(f.store.issues.size).toBe(0);
+            }
+        }
+    });
+
     it.each(['invoice.payment_failed', 'invoice.payment_action_required', 'invoice.voided', 'invoice.marked_uncollectible'])('ignores unrelated standalone %s without recording a payment issue', async type => {
         const { store, stripe, deps } = v2Fixture();
         stripe.invoice.subscriptionId = null;
@@ -1139,6 +1277,8 @@ describe('v2 payment issues and plan changes', () => {
         const f = v2Fixture('compute_monthly_v2');
         await seedOverage(f);
         f.stripe.invoice.status = 'open';
+        f.stripe.paymentState = issue === 'requires_action' ? 'requires_action' : issue === 'payment_failed' ? 'failed' : 'paid';
+        const paymentState = vi.spyOn(f.stripe, 'retrieveInvoicePaymentState');
         const input = issueEvent(type);
         expect(await processStripeEvent(input, f.deps)).toBe('applied');
         expect(await processStripeEvent(input, f.deps)).toBe('applied');
@@ -1153,6 +1293,7 @@ describe('v2 payment issues and plan changes', () => {
             termsVersion: OVERAGE_TERMS_VERSION, catalogVersion: 2, rateCentsPerStdHour: 25,
         });
         expect(f.store.grants.size).toBe(0);
+        if (issue === 'voided' || issue === 'uncollectible') expect(paymentState).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -1162,6 +1303,7 @@ describe('v2 payment issues and plan changes', () => {
         await seedChange(store);
         stripe.invoice.billingReason = 'subscription_update';
         stripe.invoice.status = 'open';
+        stripe.paymentState = state === 'requires_action' ? 'requires_action' : 'failed';
         expect(await processStripeEvent(issueEvent(type, true), deps)).toBe('applied');
         expect(store.planChanges[0]).toMatchObject({ state, stripeInvoiceId: 'in_local' });
         expect(await store.openPaymentIssues('user_local')).toEqual([expect.objectContaining({ invoiceKind: 'upgrade', issue: state })]);
@@ -1185,6 +1327,7 @@ describe('v2 payment issues and plan changes', () => {
         store.planChanges[0].userId = 'user_owner';
         stripe.invoice.billingReason = 'subscription_update';
         stripe.invoice.status = 'open';
+        stripe.paymentState = 'requires_action';
         const update = vi.spyOn(store, 'setPlanChangeState');
         expect(await processStripeEvent(issueEvent('invoice.payment_action_required', true), deps)).toBe('applied');
         expect(update).toHaveBeenCalledWith({ userId: 'user_local', subscriptionId: 'sub_local', kind: 'upgrade',
@@ -1206,6 +1349,7 @@ describe('v2 payment issues and plan changes', () => {
     it('does not use invoice metadata to attribute payment issues', async () => {
         const f = v2Fixture();
         await seedOverage(f);
+        f.stripe.invoice.status = 'open';
         f.store.customers.clear();
         expect(await processStripeEvent(issueEvent('invoice.payment_failed'), f.deps)).toBe('unattributed:customer');
         expect(f.store.issues.size).toBe(0);

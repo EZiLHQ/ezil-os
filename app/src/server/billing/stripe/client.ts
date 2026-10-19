@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
-import type { StripeApi, StripeCheckoutSession, StripePrice, StripeUpgradeResult } from '../ports';
+import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult } from '../ports';
 import { offerByLookupKey, offerBySku } from '../v2/catalog';
 import { CATALOG_V2 } from '../v2/contract';
 
@@ -289,24 +289,35 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             : invoice ?? null;
     }
 
+    async function retrieveInvoicePaymentState(invoiceId: string): Promise<StripeInvoicePaymentState> {
+        const query = new URLSearchParams({ invoice: invoiceId, 'expand[]': 'data.payment.payment_intent' });
+        const payments = await request<{ data?: { payment?: { payment_intent?: string | { id: string; status: string } | null } | null }[] }>(`/invoice_payments?${query}`);
+        const states = new Set<StripeInvoicePaymentState>();
+        for (const payment of payments.data ?? []) {
+            const reference = payment.payment?.payment_intent;
+            const intent = typeof reference === 'string'
+                ? await request<{ status: string }>(`/payment_intents/${encodeURIComponent(reference)}`)
+                : reference;
+            switch (intent?.status) {
+                case 'succeeded': return 'paid';
+                case 'requires_action':
+                case 'requires_confirmation': states.add('requires_action'); break;
+                case 'processing': states.add('processing'); break;
+                case 'requires_payment_method':
+                case 'canceled': states.add('failed'); break;
+            }
+        }
+        // A failed attempt must not hide another payment that needs authentication.
+        return (['requires_action', 'processing', 'failed'] as const).find(state => states.has(state)) ?? 'none';
+    }
+
     async function upgradeResult(subscription: SubscriptionResponse, invoice: InvoiceResponse | null): Promise<StripeUpgradeResult> {
         if (!invoice?.id) throw new BillingProviderError('invalid_subscription_state');
         let status: StripeUpgradeResult['status'] = 'payment_failed';
         if (invoice.status === 'paid' && !subscription.pending_update) {
             status = 'applied';
-        } else {
-            const query = new URLSearchParams({ invoice: invoice.id, 'expand[]': 'data.payment.payment_intent' });
-            const payments = await request<{ data?: { payment?: { payment_intent?: string | { id: string; status: string } | null } }[] }>(`/invoice_payments?${query}`);
-            for (const payment of payments.data ?? []) {
-                const reference = payment.payment?.payment_intent;
-                const intent = typeof reference === 'string'
-                    ? await request<{ status: string }>(`/payment_intents/${encodeURIComponent(reference)}`)
-                    : reference;
-                if (intent?.status === 'requires_action' || intent?.status === 'requires_confirmation') {
-                    status = 'requires_action';
-                    break;
-                }
-            }
+        } else if (await retrieveInvoicePaymentState(invoice.id) === 'requires_action') {
+            status = 'requires_action';
         }
         return {
             status, invoiceId: invoice.id, hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
@@ -316,6 +327,7 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
 
     return {
         resolvePrice,
+        retrieveInvoicePaymentState,
 
         async previewUpgrade(input) {
             const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`);

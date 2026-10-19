@@ -111,17 +111,24 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                         },
                     });
                 } else {
-                    const base = invoice.lines.find(line => offer.stripeLookupKey !== null
-                        && line.lookupKey === offer.stripeLookupKey
-                        && (line.subscriptionId === subscription.id || line.subscriptionId === null)
-                        && validPeriod(line.periodStart, line.periodEnd));
-                    if (!base) return 'review:no_base_line';
+                    // Delayed invoices retain the offer sold for their own period,
+                    // even when the subscription has since changed its price.
+                    const bases = Object.values(CATALOG_V2).filter(candidate => candidate.sellable).flatMap(candidate => {
+                        const base = invoice.lines.find(line => candidate.stripeLookupKey !== null
+                            && line.lookupKey === candidate.stripeLookupKey
+                            && (line.subscriptionId === subscription.id || line.subscriptionId === null)
+                            && validPeriod(line.periodStart, line.periodEnd));
+                        return base ? [{ base, offer: candidate }] : [];
+                    });
+                    if (bases.length === 0) return 'review:no_base_line';
+                    if (bases.length > 1) return 'review:ambiguous_base_line';
+                    const { base, offer: invoicedOffer } = bases[0];
                     const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                     if (result === 'conflict') return 'review:customer_mismatch';
                     await store.resolvePaymentIssue(invoice.id, eventCreated);
                     await store.insertGrant({
                         userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'plan_period',
-                        amount: BigInt(offer.allowanceStdSeconds), periodStart: base.periodStart, periodEnd: base.periodEnd,
+                        amount: BigInt(invoicedOffer.allowanceStdSeconds), periodStart: base.periodStart, periodEnd: base.periodEnd,
                         sourceType: 'invoice', sourceId: invoice.id,
                     });
                 }
@@ -180,6 +187,15 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
         case 'invoice_issue': {
             const invoice = await stripe.retrieveInvoice(action.invoiceId);
             if (invoice.metadataKind !== 'overage' && invoice.subscriptionId === null) return 'ignored';
+            let issue = action.issue;
+            if (issue === 'payment_failed' || issue === 'requires_action') {
+                if (invoice.status === 'paid') return 'ignored';
+                const state = await stripe.retrieveInvoicePaymentState(invoice.id);
+                if (state === 'paid' || state === 'processing') return 'ignored';
+                // Same-second failed/action-required deliveries must converge on
+                // the provider's current state, regardless of their write order.
+                issue = state === 'requires_action' ? 'requires_action' : 'payment_failed';
+            }
             const userId = await store.userForStripeCustomer(invoice.customer);
             if (userId === null) return 'unattributed:customer';
             const invoiceKind = invoice.metadataKind === 'overage' ? 'overage'
@@ -189,11 +205,11 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             if (overage && overage.userId !== userId) return 'review:customer_mismatch';
             const subscriptionId = overage?.subscriptionId ?? invoice.subscriptionId;
             await store.recordPaymentIssue({
-                stripeInvoiceId: invoice.id, userId, subscriptionId, invoiceKind, issue: action.issue,
+                stripeInvoiceId: invoice.id, userId, subscriptionId, invoiceKind, issue,
                 hostedInvoiceUrl: invoice.hostedInvoiceUrl, eventCreated: action.eventCreated,
             });
             if (invoiceKind === 'overage') {
-                await store.setOverageInvoiceStatus(invoice.id, action.issue === 'voided' ? 'void' : action.issue);
+                await store.setOverageInvoiceStatus(invoice.id, issue === 'voided' ? 'void' : issue);
                 const consent = subscriptionId === null ? null : await store.latestConsent(userId, subscriptionId);
                 if (consent?.enabled) {
                     await store.recordConsent({
@@ -206,7 +222,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             } else if (invoiceKind === 'upgrade' && subscriptionId !== null) {
                 await store.setPlanChangeState({
                     userId, subscriptionId, kind: 'upgrade', stripeInvoiceId: invoice.id,
-                    state: action.issue === 'requires_action' ? 'requires_action' : 'payment_failed',
+                    state: issue === 'requires_action' ? 'requires_action' : 'payment_failed',
                 });
             }
             return 'applied';
