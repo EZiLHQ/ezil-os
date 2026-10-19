@@ -15,7 +15,8 @@ const instant = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1
 
 it.each([false, true])('returns the closed epoch for a ready replay (concurrent close: %s)', async concurrentClose => {
     const closed = { id: 'epoch_original', userId: 'user_local', computerId: 'computer_local', subscriptionId: 'sub_local',
-        size: 'cmp-4', weight: 2, readyAt: instant(1), endedAt: instant(3601), endReason: 'user_stop', overheadSeconds: 0 };
+        size: 'cmp-4', weight: 2, readyAt: instant(1), endedAt: instant(3601), endReason: 'user_stop', overheadSeconds: 0,
+        deadlineAt: null, lastHeartbeatAt: null };
     const where = vi.fn().mockResolvedValueOnce([{ id: 'computer_local' }]);
     if (concurrentClose) where.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
     where.mockResolvedValue([closed]);
@@ -28,6 +29,7 @@ it.each([false, true])('returns the closed epoch for a ready replay (concurrent 
         subscriptionId: 'sub_local', size: 'cmp-4', readyAt: instant(0.001) })).resolves.toEqual({ status: 'exists', epoch: {
         id: closed.id, userId: closed.userId, computerId: closed.computerId, size: closed.size, weight: closed.weight,
         readyAt: '2026-01-01T00:00:01Z', endedAt: '2026-01-01T01:00:01Z', endReason: 'user_stop', overheadSeconds: 0,
+        deadlineAt: null, lastHeartbeatAt: null,
     } });
     expect(returning).toHaveBeenCalledTimes(concurrentClose ? 1 : 0);
 });
@@ -323,15 +325,20 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
     it('sweeps all open epochs by effective deadline, including legacy rows, across users with a limit', async () => {
         const closed = await store.openEpoch({ ...epoch(), deadlineAt: instant(1) });
         await store.closeEpoch({ computerId, endedAt: instant(1), reason: 'user_stop' });
-        const latest = await store.openEpoch({ ...epoch(), deadlineAt: instant(100) });
+        const latest = await store.openEpoch({ ...epoch(instant(2)), deadlineAt: instant(100) }); // a new session, not a replay of the closed one
         const legacyUser = randomUUID();
         const legacyComputer = randomUUID();
         await client`insert into auth.users (id) values (${legacyUser}::uuid)`;
         await db.insert(computers).values({ id: legacyComputer, userId: legacyUser, slot: 1 });
         const legacy = await store.openEpoch({ ...epoch(instant(-21550)), userId: legacyUser, computerId: legacyComputer });
         const earliest = await store.openEpoch({ ...epoch(), userId: otherUserId, computerId: otherComputerId, deadlineAt: instant(10) });
-        expect(await store.openEpochsForSweep({ limit: 200 })).toEqual([earliest.epoch, legacy.epoch, latest.epoch]);
-        expect(await store.openEpochsForSweep({ limit: 2 })).toEqual([earliest.epoch, legacy.epoch]);
+        // Other PG test files share this database, so judge only this test's epochs.
+        const mine = new Set([earliest.epoch.id, legacy.epoch.id, latest.epoch.id]);
+        const swept = await store.openEpochsForSweep({ limit: 200 });
+        expect(swept.filter(row => mine.has(row.id))).toEqual([earliest.epoch, legacy.epoch, latest.epoch]);
+        const firstTwo = await store.openEpochsForSweep({ limit: 2 });
+        expect(firstTwo).toHaveLength(2);
+        expect(firstTwo).toEqual(swept.slice(0, 2));
         expect(await store.openEpochsForSweep({ limit: 0 })).toEqual([]);
         expect((await store.openEpochsForSweep({ limit: 200 })).map(epoch => epoch.id)).not.toContain(closed.epoch.id);
     });
