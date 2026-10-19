@@ -53,6 +53,10 @@ test('failed, incomplete and contradictory stop responses fail cleanup instead o
     async () => ({ status: 200, headers: {}, body: Buffer.from('<html>') })), /unconfirmed/);
   await assert.rejects(stopIsolatedComputer(jar, computerId, 'https://staging.example', {}, 290000,
     async () => reply({ ok: true, outcome: 'destroyed', terminated: true }, 502)), /Cleanup stop failed/);
+  const refused = await stopIsolatedComputer(jar, computerId, 'https://staging.example', {}, 290000,
+    async () => reply({ error: { code: 'NOT_FOUND', message: `Computer ${computerId} not found` } }, 404)).then(() => null, e => e);
+  assert.deepEqual(refused.stop, { status: 404, ok: false, outcome: undefined, error: 'NOT_FOUND' });
+  assert.equal(JSON.stringify(refused.stop).includes(computerId), false);
   await assert.rejects(stopIsolatedComputer(jar, computerId, 'https://staging.example', {}, 290000,
     async () => { throw new Error('timed out'); }), /timed out/);
 });

@@ -60,6 +60,9 @@ test('cleanup failures remain explicit and redacted while browser resources clos
       assert.equal(JSON.stringify(evidence).includes(privateValue), false);
     }
   }
+  const failed = fixture({ stop: { ok: false, terminated: false, outcome: 'flush_failed', detail: computerId } });
+  assert.deepEqual((await cleanupHostedComputer(env, failed.chromium, failed.send)).stop,
+    { status: 200, ok: false, outcome: 'flush_failed', error: undefined });
   const f = fixture({ stop: { ok: true, terminated: false, outcome: 'not_running' } });
   assert.equal((await cleanupHostedComputer(env, f.chromium, f.send)).ok, true);
 });

@@ -29,9 +29,21 @@ export async function stopIsolatedComputer(context, computerId, app, headers, ti
     body: JSON.stringify({ computerId }),
     timeout,
   });
-  assert.ok(response.status >= 200 && response.status < 300, 'Cleanup stop failed');
   let stopped;
   try { stopped = JSON.parse(response.body.toString('utf8')); } catch { stopped = null; }
-  assert.ok(stopped?.ok === true && (stopped.outcome === 'destroyed' && stopped.terminated === true
-    || stopped.outcome === 'not_running' && stopped.terminated === false), 'Cleanup stop unconfirmed');
+  try {
+    assert.ok(response.status >= 200 && response.status < 300, 'Cleanup stop failed');
+    assert.ok(stopped?.ok === true && (stopped.outcome === 'destroyed' && stopped.terminated === true
+      || stopped.outcome === 'not_running' && stopped.terminated === false), 'Cleanup stop unconfirmed');
+  } catch (error) {
+    // Public CI evidence: the status and the server's own codes only, never the body.
+    error.stop = stopSummary(response.status, stopped);
+    throw error;
+  }
+}
+
+const CODE = /^[A-Za-z_]{1,40}$/;
+function stopSummary(status, body) {
+  const code = value => (typeof value === 'string' && CODE.test(value) ? value : undefined);
+  return { status, ok: body?.ok === true, outcome: code(body?.outcome), error: code(body?.error) ?? code(body?.error?.code) };
 }

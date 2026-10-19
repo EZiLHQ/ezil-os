@@ -45,9 +45,10 @@ export async function cleanupHostedComputer(env = process.env, chromium, send) {
     evidence.cleanupStopped = true;
     evidence.ok = true;
     evidence.phase = 'complete';
-  } catch {
+  } catch (error) {
     // Browser errors may contain session headers, credentials or computer IDs.
     evidence.failure = 'hosted_computer_cleanup_failed';
+    if (error?.stop) evidence.stop = error.stop;
   } finally {
     try { await browser?.close(); } catch { evidence.ok = false; evidence.failure = 'cleanup_browser_close_failed'; }
   }
