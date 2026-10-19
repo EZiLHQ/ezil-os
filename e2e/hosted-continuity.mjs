@@ -570,9 +570,21 @@ try {
     'Disk reload probe did not reach Code': 'reload_probe_missing',
     'Disk reload did not discard the unsaved probe': 'reload_probe_not_discarded',
     'Restored keybinding did not save the workspace edit': 'shortcut_not_saved',
+    'Current viewer frame progression timed out': 'viewer_progress_timeout',
+    'Runtime changed before session hold': 'hold_runtime_changed_before',
+    'Session hold relay baseline unavailable or expired': 'hold_relay_baseline_unavailable',
+    'Session hold relay unavailable or expired': 'hold_relay_unavailable',
+    'Session hold replaced runtime': 'hold_runtime_replaced',
+    'Session hold relay expiry moved backwards': 'hold_relay_expiry_backwards',
+    'Automatic credential renewal did not occur during session hold': 'hold_no_renewal',
   };
   const assertionCode = assertionCodes[error?.message];
   if (assertionCode) evidence.assertionCode = assertionCode;
+  // bounded() and api() failures name a literal operation or a query-free path.
+  const deadline = String(error?.message).match(/^([A-Za-z][A-Za-z ]{0,60}): deadline exceeded$/);
+  if (deadline) evidence.deadlineExceeded = deadline[1];
+  const http = String(error?.message).match(/^HTTP failure (\/api\/[a-z/-]{1,60})$/);
+  if (http) evidence.httpFailure = http[1];
   const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z0-9_]+)$/);
   if (missing) evidence.missingPrerequisite = missing[1];
   evidence.failedPhase = evidence.phases.at(-1)?.name || 'setup';
