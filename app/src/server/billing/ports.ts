@@ -174,6 +174,8 @@ export interface BillingStore {
     recordConsent(input: OverageConsentInsert): Promise<OverageConsentRow>;
     /** Latest acceptance strictly before the exclusive period end; ties use audit identity. */
     consentAsOf(userId: string, subscriptionId: string, at: Date): Promise<OverageConsentRow | null>;
+    /** Latest decision at or before start, then decisions strictly inside the period, ordered by (acceptedAt, id). */
+    consentDecisionsForPeriod(userId: string, subscriptionId: string, start: Date, end: Date): Promise<OverageConsentRow[]>;
     latestConsent(userId: string, subscriptionId: string): Promise<OverageConsentRow | null>;
     upsertOverageInvoice(input: OverageInvoiceInsert): Promise<{ status: 'inserted' | 'exists'; row: OverageInvoiceRow }>;
     attachOverageStripeInvoice(id: string, stripeInvoiceId: string): Promise<void>;

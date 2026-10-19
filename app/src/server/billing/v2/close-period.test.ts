@@ -11,6 +11,8 @@ const start = new Date('2026-09-01T00:00:00Z');
 const end = new Date('2026-10-01T00:00:00Z');
 const now = new Date(end.getTime() + OVERAGE_GRACE_SECONDS * 1000);
 const input = { userId, now };
+// The fixture consumes four standard-seconds per wall-clock second.
+const atStdHours = (hours: number) => new Date(start.getTime() + hours * 3600_000 / 4);
 
 function fixture() {
     const grants: GrantRow[] = [{
@@ -36,9 +38,12 @@ function fixture() {
             grant.userId === user && meters.includes(grant.meter) && grant.periodStart !== null && grant.periodEnd !== null
             && grant.periodStart < window.end && grant.periodEnd > window.start)),
         epochsFor: vi.fn<BillingStore['epochsFor']>().mockResolvedValue(epochs),
-        consentAsOf: vi.fn<BillingStore['consentAsOf']>(async (user, subscription, at) => consents.filter(row => row.userId === user
-            && row.subscriptionId === subscription && row.acceptedAt < at).sort((a, b) => b.acceptedAt.getTime() - a.acceptedAt.getTime()
-                || Number(b.id - a.id))[0] ?? null),
+        consentDecisionsForPeriod: vi.fn<BillingStore['consentDecisionsForPeriod']>(async (user, subscription, from, to) => {
+            const ordered = consents.filter(row => row.userId === user && row.subscriptionId === subscription && row.acceptedAt < to)
+                .sort((a, b) => a.acceptedAt.getTime() - b.acceptedAt.getTime() || Number(a.id - b.id));
+            const initial = ordered.filter(row => row.acceptedAt <= from).at(-1);
+            return [...(initial ? [initial] : []), ...ordered.filter(row => row.acceptedAt > from)];
+        }),
         upsertOverageInvoice: vi.fn<BillingStore['upsertOverageInvoice']>(async value => {
             const row = rows.find(row => row.subscriptionId === value.subscriptionId && row.periodStart.getTime() === value.periodStart.getTime()
                 && row.ratingVersion === value.ratingVersion);
@@ -78,8 +83,96 @@ describe('closePeriodAndInvoiceOverage', () => {
         await expect(closePeriodAndInvoiceOverage(f.deps, { ...input, now: new Date(now.getTime() + 2 * 86400_000) }))
             .resolves.toEqual({ status: 'exists', invoiceId: 'in_overage' });
         expect(f.invoiceOverage).toHaveBeenCalledTimes(1);
-        expect(f.store.consentAsOf).toHaveBeenCalledWith(userId, subscriptionId, end);
+        expect(f.store.consentDecisionsForPeriod).toHaveBeenCalledWith(userId, subscriptionId, start, end);
         expect(f.store.epochsFor).toHaveBeenCalledWith(userId, start);
+    });
+
+    it.each([userId, 'system:overage_payment_issue'])('bills 50 standard-hours accrued before a pause by %s', async actor => {
+        const f = fixture();
+        f.consents.push({ ...f.consents[0], id: BigInt(2), enabled: false, capCents: 0, actor, acceptedAt: atStdHours(550) });
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toMatchObject({ status: 'invoiced' });
+        expect(f.invoiceOverage.mock.calls[0][0].cents).toBe(1250);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(50 * 3600), cents: 1250 });
+    });
+
+    it.each(['disabled', 'no consent'] as const)('bills only the overage increase after enabling with %s at start', async initial => {
+        const f = fixture();
+        const enabled = { ...f.consents[0], id: BigInt(2), acceptedAt: atStdHours(550) };
+        if (initial === 'disabled') f.consents[0].enabled = false;
+        else f.consents.length = 0;
+        f.consents.push(enabled);
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(50 * 3600), cents: 1250 });
+    });
+
+    it('shares the allowance with usage before consent was enabled', async () => {
+        const f = fixture();
+        f.consents[0].acceptedAt = atStdHours(400);
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(100 * 3600), cents: 2500 });
+    });
+
+    it.each([[2500, 1875], [1000, 1000]])('sums active intervals after re-enabling and applies the latest cap %i once', async (capCents, cents) => {
+        const f = fixture();
+        f.consents.push({ ...f.consents[0], id: BigInt(2), enabled: false, capCents: 0, acceptedAt: atStdHours(525) },
+            { ...f.consents[0], id: BigInt(3), capCents, acceptedAt: atStdHours(550) });
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(75 * 3600), cents });
+        expect(f.invoiceOverage.mock.calls[0][0].cents).toBe(cents);
+    });
+
+    it.each([[1000, 1000], [5000, 2500]])('keeps continuous consent active when the cap changes to %i', async (capCents, cents) => {
+        const f = fixture();
+        f.consents.push({ ...f.consents[0], id: BigInt(2), capCents, acceptedAt: atStdHours(550) });
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(100 * 3600), cents });
+    });
+
+    it('uses only the last decision at a tied acceptance time, without taking a cap that was never in force', async () => {
+        const f = fixture();
+        // Deliberately append out of identity order; the store orders the audit trail.
+        f.consents.push({ ...f.consents[0], id: BigInt(3), enabled: false, acceptedAt: atStdHours(550) },
+            { ...f.consents[0], id: BigInt(2), capCents: 0, acceptedAt: atStdHours(550) });
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(50 * 3600), cents: 1250 });
+    });
+
+    it('skips when an enable is superseded by a pause at the same instant', async () => {
+        const f = fixture();
+        f.consents[0].acceptedAt = atStdHours(550);
+        f.consents.push({ ...f.consents[0], id: BigInt(2), enabled: false });
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toEqual({ status: 'skipped', reason: 'overage_disabled' });
+        expect(f.store.upsertOverageInvoice).not.toHaveBeenCalled();
+        expect(f.invoiceOverage).not.toHaveBeenCalled();
+    });
+
+    it('sums integer standard-seconds across intervals before flooring to cents', async () => {
+        const f = fixture();
+        const decision = { ...f.consents[0] };
+        const exhaustedAt = atStdHours(500).getTime();
+        f.consents[0].enabled = false;
+        for (const [i, seconds] of [0, 18, 36, 54].entries()) {
+            f.consents.push({ ...decision, id: BigInt(i + 2), enabled: i % 2 === 0,
+                acceptedAt: new Date(exhaustedAt + seconds * 1000) });
+        }
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(144), cents: 1 });
+    });
+
+    it('normalizes consent times to whole seconds when rating a partial epoch', async () => {
+        const f = fixture();
+        f.consents.push({ ...f.consents[0], id: BigInt(2), enabled: false,
+            acceptedAt: new Date(atStdHours(550).getTime() + 999) });
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(50 * 3600), cents: 1250 });
+    });
+
+    it('preserves the six-hour epoch bound in each cumulative rating window', async () => {
+        const f = fixture();
+        f.consents.push({ ...f.consents[0], id: BigInt(2), enabled: false, acceptedAt: atStdHours(550) });
+        f.epochs[0].endedAt = end.toISOString();
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(50 * 3600), cents: 1250 });
     });
 
     it.each(['no subscription', 'foreign subscription', 'grace', 'disabled', 'no consent', 'zero usage', 'zero cap', 'standard'] as const)

@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, gte, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from 'drizzle-orm';
 
 import {
     billingComputeEpochs,
@@ -137,6 +137,22 @@ export function createBillingStore(db: Database): BillingStore {
                 lt(billingOverageConsents.acceptedAt, at),
             )).orderBy(desc(billingOverageConsents.acceptedAt), desc(billingOverageConsents.id)).limit(1);
             return row ?? null;
+        },
+
+        async consentDecisionsForPeriod(userId, subscriptionId, start, end) {
+            const initial = db.select({ id: billingOverageConsents.id }).from(billingOverageConsents).where(and(
+                eq(billingOverageConsents.userId, userId),
+                eq(billingOverageConsents.subscriptionId, subscriptionId),
+                lte(billingOverageConsents.acceptedAt, start),
+            )).orderBy(desc(billingOverageConsents.acceptedAt), desc(billingOverageConsents.id)).limit(1);
+            return db.select().from(billingOverageConsents).where(and(
+                eq(billingOverageConsents.userId, userId),
+                eq(billingOverageConsents.subscriptionId, subscriptionId),
+                or(inArray(billingOverageConsents.id, initial), and(
+                    gt(billingOverageConsents.acceptedAt, start),
+                    lt(billingOverageConsents.acceptedAt, end),
+                )),
+            )).orderBy(billingOverageConsents.acceptedAt, billingOverageConsents.id);
         },
 
         async latestConsent(userId, subscriptionId) {

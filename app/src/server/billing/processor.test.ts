@@ -40,6 +40,7 @@ class MemoryStore implements BillingStore {
         return row;
     };
     consentAsOf: BillingStore['consentAsOf'] = async () => { throw new Error('Unused v2 store stub'); };
+    consentDecisionsForPeriod: BillingStore['consentDecisionsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
     markOverageInvoiceOpen: BillingStore['markOverageInvoiceOpen'] = async () => { throw new Error('Unused v2 store stub'); };
     latestConsent: BillingStore['latestConsent'] = async (userId, subscriptionId) => [...this.consents].reverse()
         .find(row => row.userId === userId && row.subscriptionId === subscriptionId) ?? null;

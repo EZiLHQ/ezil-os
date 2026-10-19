@@ -1,10 +1,10 @@
 import type { BillingStore, OverageInvoiceResult, UsageBillingPort } from '../ports';
-import { CATALOG_V2, GRANT_METER_COMPUTE } from './contract';
-import { ratePeriod, rateWindow } from './rating';
+import { CATALOG_V2, GRANT_METER_COMPUTE, STD_SECONDS_PER_OVERAGE_CENT } from './contract';
+import { rateWindow } from './rating';
 import { epochSeconds, isoSeconds } from './time';
 import { OVERAGE_GRACE_SECONDS, OVERAGE_RATING_VERSION } from './usage-billing';
 
-type ClosePeriodStore = Pick<BillingStore, 'subscriptionsFor' | 'grantsForPeriod' | 'epochsFor' | 'consentAsOf'
+type ClosePeriodStore = Pick<BillingStore, 'subscriptionsFor' | 'grantsForPeriod' | 'epochsFor' | 'consentDecisionsForPeriod'
     | 'upsertOverageInvoice' | 'stripeCustomerFor' | 'attachOverageStripeInvoice' | 'markOverageInvoiceOpen'>;
 
 export type ClosePeriodResult = OverageInvoiceResult
@@ -42,18 +42,37 @@ export async function closePeriodAndInvoiceOverage(
     const allowance = grants.reduce((sum, grant) => sum + grant.amount, BigInt(0));
     const allowanceStdSeconds = Number(allowance < BigInt(0) ? BigInt(0) : allowance);
     if (!Number.isSafeInteger(allowanceStdSeconds)) throw new RangeError('Compute allowance exceeds safe integer range');
-    const [epochs, consent] = await Promise.all([
-        store.epochsFor(userId, periodStart), store.consentAsOf(userId, subscriptionId, periodEnd),
+    const [epochs, decisions] = await Promise.all([
+        store.epochsFor(userId, periodStart), store.consentDecisionsForPeriod(userId, subscriptionId, periodStart, periodEnd),
     ]);
-    const used = rateWindow({ epochs, window: {
-        start: isoSeconds(epochSeconds(periodStart)), end: isoSeconds(epochSeconds(periodEnd)),
-    }, now: isoSeconds(epochSeconds(now)) });
-    const rating = ratePeriod({ usedStdSeconds: used.stdSeconds, allowanceStdSeconds,
-        overage: consent ? { enabled: consent.enabled, capCents: consent.capCents } : null });
-    if (!consent?.enabled) return { status: 'skipped', reason: 'overage_disabled' };
-    if (rating.billableOverageCents === 0) return { status: 'skipped', reason: 'nothing_to_bill' };
+    const startSeconds = epochSeconds(periodStart);
+    const endSeconds = epochSeconds(periodEnd);
+    const activeIntervals: { start: number; end: number }[] = [];
+    let capCents = 0;
+    for (let i = 0; i < decisions.length; i++) {
+        const decision = decisions[i];
+        if (!decision.enabled) continue;
+        const start = Math.max(startSeconds, epochSeconds(decision.acceptedAt));
+        const end = Math.min(endSeconds, epochSeconds(decisions[i + 1]?.acceptedAt ?? periodEnd));
+        // Only decisions in force for a positive interval can supply the cap.
+        if (end <= start) continue;
+        capCents = decision.capCents;
+        const previous = activeIntervals[activeIntervals.length - 1];
+        if (previous?.end === start) previous.end = end;
+        else activeIntervals.push({ start, end });
+    }
+    if (activeIntervals.length === 0) return { status: 'skipped', reason: 'overage_disabled' };
+    const windowStart = isoSeconds(startSeconds);
+    const ratedAt = isoSeconds(epochSeconds(now));
+    // Cumulative overage keeps the allowance shared across enabled and paused usage.
+    const over = (end: number) => Math.max(0, rateWindow({ epochs,
+        window: { start: windowStart, end: isoSeconds(end) }, now: ratedAt,
+    }).stdSeconds - allowanceStdSeconds);
+    const billableStd = activeIntervals.reduce((sum, interval) => sum + over(interval.end) - over(interval.start), 0);
+    const cents = Math.min(Math.floor(billableStd / STD_SECONDS_PER_OVERAGE_CENT), capCents);
+    if (cents === 0) return { status: 'skipped', reason: 'nothing_to_bill' };
     const { row } = await store.upsertOverageInvoice({ userId, subscriptionId, periodStart, periodEnd,
-        ratingVersion: OVERAGE_RATING_VERSION, stdSecondsOver: BigInt(rating.overStdSeconds), cents: rating.billableOverageCents });
+        ratingVersion: OVERAGE_RATING_VERSION, stdSecondsOver: BigInt(billableStd), cents });
     // Durable guard: Stripe's idempotency keys alone do not protect retries after 24 hours.
     if (row.stripeInvoiceId !== null && row.status !== 'pending') return { status: 'exists', invoiceId: row.stripeInvoiceId };
     const customerId = await store.stripeCustomerFor(userId);

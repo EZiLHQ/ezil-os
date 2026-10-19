@@ -68,6 +68,7 @@ function fixture() {
         }]),
         recordConsent: vi.fn<BillingStore['recordConsent']>(async input => consent = { ...input, id: BigInt(1) }),
         consentAsOf: vi.fn<BillingStore['consentAsOf']>().mockResolvedValue(null),
+        consentDecisionsForPeriod: vi.fn<BillingStore['consentDecisionsForPeriod']>().mockResolvedValue([]),
         latestConsent: vi.fn<BillingStore['latestConsent']>(async () => consent),
         upsertOverageInvoice: vi.fn<BillingStore['upsertOverageInvoice']>(async () => { throw new Error('Unused v2 store stub'); }),
         attachOverageStripeInvoice: vi.fn<BillingStore['attachOverageStripeInvoice']>(async () => { throw new Error('Unused v2 store stub'); }),

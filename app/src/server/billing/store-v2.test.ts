@@ -120,6 +120,44 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         expect(await store.consentAsOf(userId, subscriptionId, instant(10))).toBeNull();
     });
 
+    it('returns the start decision and all interior decisions in time/identity order, scoped to the tenant and subscription', async () => {
+        await store.recordConsent(consent({ acceptedAt: instant(0) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(10) }));
+        const initial = await store.recordConsent(consent({ capCents: 5000, acceptedAt: instant(10) }));
+        // An older decision delivered later must not replace the initial decision.
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(5) }));
+        const paused = await store.recordConsent(consent({ enabled: false, acceptedAt: instant(20) }));
+        const enabled = await store.recordConsent(consent({ acceptedAt: instant(20) }));
+        const earlier = await store.recordConsent(consent({ capCents: 1000, acceptedAt: instant(15) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(100) }));
+        await store.recordConsent(consent({ capCents: 100, acceptedAt: instant(101) }));
+        for (const acceptedAt of [instant(10), instant(30)]) {
+            await store.recordConsent(consent({ userId: otherUserId, acceptedAt }));
+            await store.recordConsent(consent({ subscriptionId: 'another_subscription', acceptedAt }));
+        }
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(10), instant(100)))
+            .toEqual([initial, earlier, paused, enabled]);
+        expect(await store.consentDecisionsForPeriod(otherUserId, 'another_subscription', instant(10), instant(100))).toEqual([]);
+    });
+
+    it('carries only the latest decision before start into a period without a decision at start', async () => {
+        await store.recordConsent(consent({ acceptedAt: instant(-20) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(-10) }));
+        const initial = await store.recordConsent(consent({ capCents: 1000, acceptedAt: instant(-10) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(-15) }));
+        const paused = await store.recordConsent(consent({ enabled: false, actor: 'system:overage_payment_issue', acceptedAt: instant(50) }));
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(100))).toEqual([initial, paused]);
+    });
+
+    it('returns interior decisions without initial consent and excludes decisions at or after the end', async () => {
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(100))).toEqual([]);
+        const enabled = await store.recordConsent(consent({ acceptedAt: instant(20) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(100) }));
+        await store.recordConsent(consent({ acceptedAt: instant(101) }));
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(100))).toEqual([enabled]);
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(20))).toEqual([]);
+    });
+
     it.each(['paid', 'payment_failed', 'requires_action', 'void', 'uncollectible'] as const)
         ('opens only pending overage invoices and preserves webhook %s', async status => {
             const { row } = await store.upsertOverageInvoice(overage());
