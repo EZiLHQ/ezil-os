@@ -5,7 +5,14 @@
  * RUNNING → stop → STOPPED (tunnel fenced) → wake by replace → enroll → RUNNING.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { billingComputeMeter, type ComputeMeter } from '@/server/billing/v2/compute-meter';
+import { readBillingConfig } from '@/server/billing/config';
+import type { BillingStore } from '@/server/billing/ports';
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
+afterEach(() => vi.restoreAllMocks());
 
 import { createAwsEc2Provider, type LifecycleStarter } from './aws-ec2';
 import { handleAwsEnrollment, nonceHashOf, type Ec2EnrollmentView, type TunnelClient } from './aws-enroll';
@@ -15,11 +22,11 @@ import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
     applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, reconcileGuestStop, startRetireAsReconciler, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
-    runAwsBackgroundReconcile, sessionLimitFor, type GuestStopDeps, type LifecycleExecutionReader,
+    runAwsBackgroundReconcile, sessionLimitFor, enforceSessionLimits, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
-    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
+    consumeEnrollmentNonce, finishEnrollment, ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
 } from './placement';
 import { monthUsageFromRows } from './usage';
 
@@ -57,7 +64,7 @@ const env = (over: Record<string, string> = {}) => ({
     ...over,
 });
 
-type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null };
+type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null };
 
 function receiptOf(o: { jobId?: string; digest?: string; generation?: number; leaseEpoch?: number; fenceToken?: string; instanceId?: string; volumeId?: string; state?: string; instanceLost?: true } = {}) {
     return JSON.stringify({
@@ -75,7 +82,7 @@ const row = (over: Record<string, unknown> = {}) =>
         lease_until: new Date(NOW.getTime() + 3_600_000), ...over,
     });
 
-function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[] } = {}) {
+function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[]; meter?: ComputeMeter } = {}) {
     // The database clock is the scenario clock: usage rows are dated by it.
     const fake = createFakePlacementDb({ placements: rows, computers: [{ id: C1, user_id: U1 }], usage: opts.usage }, { clock: () => NOW });
     const read: string[] = [];
@@ -101,7 +108,7 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     };
     const provider = createAwsEc2Provider({
         db: fake.db, env: () => env(), now: () => NOW, newId: () => crypto.randomUUID(), starter, tierFor: async () => 'free',
-        randomBytes: () => Buffer.from(NONCE_BYTES), executions, ...(opts.noTunnels ? {} : { tunnels }),
+        randomBytes: () => Buffer.from(NONCE_BYTES), executions, meter: opts.meter, ...(opts.noTunnels ? {} : { tunnels }),
     });
     const status = () => provider.status(ctx, { userId: U1, computerId: C1 });
     const enroll = () => {
@@ -126,6 +133,148 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     };
     return { ...fake, provider, status, enroll, read, deleted, created, starts, tunnels, executions };
 }
+
+describe('billing v2 observations', () => {
+    const meter = () => ({ ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) });
+    const enrolled = { enroll_nonce_hash: null, last_error: ENROLLMENT_SUCCEEDED, instance_id: I_NEW };
+    const stoppedAt = new Date(NOW.getTime() - 42_321);
+    const readyInput = { userId: U1, computerId: C1, size: 'cmp-8', readyAt: NOW, overheadSeconds: 12 };
+
+    it('provision waits for enrollment, then meters the actual cmp-8 instance once, after commit', async () => {
+        const m = meter();
+        const s = setup([row({ state: 'PROVISIONING', instance_type: 'm6i.2xlarge', volume_id: null })],
+            { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 12_999) }, { meter: m });
+        let inTransaction = false;
+        const transaction = s.db.transaction.bind(s.db);
+        s.db.transaction = async fn => {
+            inTransaction = true;
+            try { return await transaction(fn); } finally { inTransaction = false; }
+        };
+        const observations: { inTransaction: boolean; state: unknown }[] = [];
+        m.ready.mockImplementation(async () => {
+            observations.push({ inTransaction, state: s.placements[0]!.state });
+        });
+        await s.status();
+        expect(m.ready).not.toHaveBeenCalled();
+        const beforeEnroll = (await readPlacement(s.db, C1)).record!;
+        const consumed = await consumeEnrollmentNonce(s.db, { computerId: C1, expected: beforeEnroll,
+            nonceHash: nonceHashOf(NONCE), fields: { instanceId: I_NEW, volumeId: VOL } });
+        expect(consumed.ok).toBe(true);
+        if (!consumed.ok) throw new Error('consume failed');
+        expect((await finishEnrollment(s.db, { computerId: C1, expected: consumed.placement, success: true })).ok).toBe(true);
+        const stale = (await readPlacement(s.db, C1)).record!;
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        await s.status();
+        await applyLifecycleReceipt({ db: s.db, executions: s.executions, meter: m, now: () => NOW }, stale, D);
+        expect(m.ready).toHaveBeenCalledExactlyOnceWith(readyInput);
+        expect(observations).toEqual([{ inTransaction: false, state: 'RUNNING' }]);
+    });
+
+    it.each(['STARTING', 'MOUNTING'])('%s with receipt and enrollment meters first RUNNING', async state => {
+        const m = meter();
+        const s = setup([row({ state, ...enrolled, instance_type: 'm6i.2xlarge' })],
+            { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 12_999) }, { meter: m });
+        await s.status();
+        await s.status();
+        expect(m.ready).toHaveBeenCalledExactlyOnceWith(readyInput);
+    });
+
+    it('enrollment replay preserves MOUNTING; the next receipt check meters once with unknown overhead zero', async () => {
+        const m = meter();
+        const s = setup([row()], { status: 'SUCCEEDED', output: receiptOf() }, { meter: m });
+        await s.status();
+        expect((await s.enroll()).status).toBe(200);
+        expect((await s.enroll()).status).toBe(200);
+        expect(s.placements[0]!.state).toBe('MOUNTING');
+        expect(m.ready).not.toHaveBeenCalled();
+        await s.status();
+        expect((await s.enroll()).status).toBe(200);
+        await s.status();
+        expect(m.ready).toHaveBeenCalledExactlyOnceWith({ ...readyInput, size: 'std-2', overheadSeconds: 0 });
+    });
+
+    it.each(['FAILED', 'TIMED_OUT', 'ABORTED'])('failed provision (%s) never opens an epoch or bills overhead', async status => {
+        const m = meter();
+        const s = setup([row({ state: 'PROVISIONING', ...enrolled })],
+            { status, startDate: new Date(NOW.getTime() - 300_000) }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'UNCONFIRMED' });
+        expect(m.ready).not.toHaveBeenCalled();
+        expect(m.stopped).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['STOPPING', 'stopped', undefined, 'user_stop'],
+        ['DRAINING', 'stopped', true, 'platform_failure'],
+        ['RETIRING', 'retired', undefined, 'provider_stop'],
+    ] as const)('%s closes at execution stopDate with %s receipt', async (state, receiptState, instanceLost, reason) => {
+        const m = meter();
+        const s = setup([row({ state, instance_id: I_NEW })],
+            { status: 'SUCCEEDED', output: receiptOf({ state: receiptState, instanceLost }), stopDate: stoppedAt }, { meter: m });
+        await s.status();
+        await s.status();
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: stoppedAt, reason });
+    });
+
+    it('missing execution stopDate falls back to transition time', async () => {
+        const m = meter();
+        const s = setup([row({ state: 'STOPPING', instance_id: I_NEW })],
+            { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) }, { meter: m });
+        await s.status();
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: NOW, reason: 'user_stop' });
+    });
+
+    it.each([true, false])('guest idle stop uses the EC2 observation time when available (%s)', async hasTime => {
+        const m = meter();
+        const s = setup([row({ state: 'RUNNING', ...enrolled, lifecycle_job_id: null, lifecycle_digest: null })]);
+        const p = (await readPlacement(s.db, C1)).record!;
+        const started = await reconcileGuestStop({ db: s.db, meter: m, now: () => NOW,
+            starter: { start: async () => {} }, newId: () => JOB,
+            describer: { describeForEnrollment: async () => ({ state: 'stopped', stateTransitionAt: hasTime ? stoppedAt : null } as Ec2EnrollmentView) },
+        }, p, D);
+        expect(started).toBe(true);
+        expect(s.placements[0]!.state).toBe('STOPPING');
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: hasTime ? stoppedAt : NOW, reason: 'idle_sleep' });
+    });
+
+    it.each(['lease_expired', 'user_hours_cap', 'global_hours_cap'] as const)('%s leaves closure to the receipt, using provider_stop', async limit => {
+        const m = meter();
+        const s = setup([row({ state: 'RUNNING', ...enrolled, lifecycle_job_id: null, lifecycle_digest: null,
+            ...(limit === 'lease_expired' ? { lease_until: NOW } : {}) })]);
+        const p = (await readPlacement(s.db, C1)).record!;
+        const deps = { db: s.db, meter: m, now: () => NOW, newId: () => JOB, starter: { start: async () => {} } };
+        expect(await enforceSessionLimits(deps, p, D, { now: NOW,
+            caps: { userMonthlyHours: limit === 'user_hours_cap' ? 0 : 100, globalMonthlyHours: limit === 'global_hours_cap' ? 0 : 600 },
+        })).toBe(limit);
+        expect(m.stopped).not.toHaveBeenCalled();
+        const stopping = (await readPlacement(s.db, C1)).record!;
+        await applyLifecycleReceipt({ ...deps, executions: { describe: async () => ({ status: 'SUCCEEDED', stopDate: stoppedAt,
+            output: receiptOf({ state: 'stopped', digest: stopping.lifecycleDigest! }) }) } }, stopping, D);
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: stoppedAt, reason: 'provider_stop' });
+    });
+
+    it.each(['PROVISIONING', 'STOPPING'] as const)('throwing meters cannot fail or roll back %s transitions', async state => {
+        const m = meter();
+        m.ready.mockRejectedValue(new Error('meter failed'));
+        m.stopped.mockRejectedValue(new Error('meter failed'));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const s = setup([row({ state, ...enrolled })],
+            { status: 'SUCCEEDED', output: receiptOf({ state: state === 'STOPPING' ? 'stopped' : 'running' }) }, { meter: m });
+        await expect(s.status()).resolves.toMatchObject({ placementState: state === 'STOPPING' ? 'STOPPED' : 'RUNNING' });
+        expect(warn).toHaveBeenCalledWith('[billing.meter] observation failed', expect.any(Object));
+    });
+
+    it('real meter with flags off never accesses the store for AWS readiness or stops', async () => {
+        const access = vi.fn(() => { throw new Error('billing tables absent'); });
+        const m = billingComputeMeter(() => ({ config: readBillingConfig({}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => NOW }));
+        for (const state of ['PROVISIONING', 'STOPPING'] as const) {
+            const s = setup([row({ state, ...enrolled })],
+                { status: 'SUCCEEDED', output: receiptOf({ state: state === 'STOPPING' ? 'stopped' : 'running' }) }, { meter: m });
+            expect(await s.status()).toMatchObject({ placementState: state === 'STOPPING' ? 'STOPPED' : 'RUNNING' });
+        }
+        expect(access).not.toHaveBeenCalled();
+    });
+});
 
 describe('the execution read', () => {
     it('reads exactly the placement job in its region (version ARN → execution under the machine)', async () => {

@@ -176,6 +176,13 @@ describe('Step Functions starter', () => {
 });
 
 describe('Step Functions execution reader', () => {
+    it('passes valid execution stopDate through and drops invalid or absent times', async () => {
+        for (const [stopDate, expected] of [[NOW, NOW], [new Date('nope'), null], ['2026-10-14', null], [undefined, null]] as const) {
+            const sfn = fakeSender(() => ({ status: 'SUCCEEDED', stopDate }));
+            expect((await createSfnExecutionReader(regional(sfn)).describe(R, EXECUTION)).stopDate).toEqual(expected);
+        }
+    });
+
     it('passes the execution start through (it dates the usage row) and drops an invalid one', async () => {
         const started = new Date('2026-10-14T05:00:00Z');
         for (const [startDate, expected] of [[started, started], [new Date('nope'), null], ['2026-10-14', null]] as const) {
@@ -186,7 +193,7 @@ describe('Step Functions execution reader', () => {
 
     it('describes exactly the named execution and normalizes absent fields to null', async () => {
         const sfn = fakeSender(() => ({ status: 'SUCCEEDED', output: '{"ok":1}' }));
-        await expect(createSfnExecutionReader(regional(sfn)).describe(R, EXECUTION)).resolves.toEqual({ status: 'SUCCEEDED', output: '{"ok":1}', error: null, cause: null, startDate: null });
+        await expect(createSfnExecutionReader(regional(sfn)).describe(R, EXECUTION)).resolves.toEqual({ status: 'SUCCEEDED', output: '{"ok":1}', error: null, cause: null, startDate: null, stopDate: null });
         expect(cmdName(sfn.calls[0])).toBe('DescribeExecutionCommand');
         expect(input(sfn.calls[0])).toEqual({ executionArn: EXECUTION });
     });
@@ -207,7 +214,7 @@ describe('Step Functions execution reader', () => {
 const INSTANCE = 'i-0123456789abcdef0';
 const DATA = 'vol-0123456789abcdef0';
 const ROOT = 'vol-0fedcba9876543210';
-function ec2Fake(o: { placement?: Record<string, string>; volumes?: { VolumeId: string; Tags?: { Key: string; Value: string }[] }[]; dot?: boolean; zones?: unknown } = {}) {
+function ec2Fake(o: { transitionReason?: string; placement?: Record<string, string>; volumes?: { VolumeId: string; Tags?: { Key: string; Value: string }[] }[]; dot?: boolean; zones?: unknown } = {}) {
     return fakeSender((c) => {
         switch (cmdName(c)) {
             case 'DescribeInstancesCommand':
@@ -216,6 +223,7 @@ function ec2Fake(o: { placement?: Record<string, string>; volumes?: { VolumeId: 
                         Instances: [{
                             InstanceId: INSTANCE,
                             State: { Name: 'running' },
+                            StateTransitionReason: o.transitionReason,
                             Placement: o.placement ?? { AvailabilityZone: 'us-east-1a', AvailabilityZoneId: 'use1-az1' },
                             PublicIpAddress: '203.0.113.7',
                             Tags: [{ Key: 'ezil:generation', Value: '2' }],
@@ -237,6 +245,17 @@ function ec2Fake(o: { placement?: Record<string, string>; volumes?: { VolumeId: 
 }
 
 describe('EC2 enrollment describer', () => {
+    it.each([
+        ['User initiated (2026-10-19 12:34:56 GMT)', new Date('2026-10-19T12:34:56Z')],
+        ['User initiated', undefined],
+        ['User initiated (2026-99-99 12:34:56 GMT)', undefined],
+        [undefined, undefined],
+    ] as const)('maps provider state-transition time from %s', async (transitionReason, expected) => {
+        const ec2 = ec2Fake({ transitionReason });
+        const view = await createEc2EnrollmentDescriber(regional(ec2)).describeForEnrollment(R, INSTANCE);
+        expect(view?.stateTransitionAt).toEqual(expected);
+    });
+
     it('maps the instance, its zone id, public IP, tags and every attached volume', async () => {
         const ec2 = ec2Fake();
         const view = await createEc2EnrollmentDescriber(regional(ec2)).describeForEnrollment(R, INSTANCE);

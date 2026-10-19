@@ -104,6 +104,8 @@ export interface Ec2EnrollmentView {
     instanceId: string;
     /** EC2 state name: only `running` enrolls. */
     state: string;
+    /** Timestamp in EC2's StateTransitionReason, when the provider supplies one. */
+    stateTransitionAt?: Date | null;
     availabilityZone: string;
     /** The ZoneId (e.g. `aps1-az1`): compared with the placement's. */
     availabilityZoneId: string;
@@ -438,6 +440,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     if (replay) {
         // Read-only: the Worker returns this epoch's existing tunnel token only for the exact record
         // (same instance, address and key) inside its window. No consume, no new tunnel, no write.
+        // Enrollment preserves placement state; the receipt path meters the first RUNNING transition.
         let replayed: TunnelResult;
         try {
             replayed = await deps.tunnels.createTunnel({ userId: p.ownerUserId }, { ...tunnelRequest(doc.instanceId, view.publicIp), replay: true });

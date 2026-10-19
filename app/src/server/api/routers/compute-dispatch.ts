@@ -22,6 +22,7 @@
 import { TRPCError } from '@trpc/server';
 
 import { billingV2EntitlementReader } from '@/server/billing/v2/compute-access';
+import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
@@ -46,11 +47,13 @@ export type RoutedComputer =
  * `ensure`/`stop` refuse BEFORE any write (`aws_lifecycle_unconfigured`) —
  * never Cloudflare. This is the ONE place the routers get them from.
  */
-export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer'> {
+export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter'> {
     if (!isAwsComputersEnabled(env)) return {};
     const { starter, executions, describer } = sharedAwsSdkCollaborators(env);
     const tunnels = workerTunnelClientFromEnv(env) ?? undefined;
     return {
+        // Shared by router dispatch and sandbox-reap's background reconcile.
+        meter: billingComputeMeter(),
         ...(starter ? { starter } : {}), ...(executions ? { executions } : {}), ...(tunnels ? { tunnels } : {}),
         // The read-only EC2 describe that catches a guest-initiated idle stop (R9).
         ...(describer ? { describer } : {}),
@@ -62,7 +65,7 @@ export interface RouteOptions {
     /** Defaults to billing v2, whose reader touches no store while billing is off. */
     entitlements?: EntitlementReader;
     /** Overrides `defaultAwsCollaborators(env)` (tests). */
-    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
+    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
     /** The caller starts a sandbox: pin a no-row Cloudflare computer first (select.ts `ResolveOptions`). */
     pinCloudflare?: boolean;
 }

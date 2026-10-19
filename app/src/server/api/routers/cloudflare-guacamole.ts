@@ -38,6 +38,8 @@ import { z } from 'zod';
 import { computers } from '@/server/db/schema';
 import { getBillingDeps } from '@/server/billing/deps';
 import { gateComputerStart } from '@/server/billing/v2/compute-access';
+import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
+import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { stampOpened } from './computer-store';
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
@@ -104,6 +106,9 @@ async function controlTarget(db: typeof import('@/server/db').db, userId: string
         throw err;
     }
 }
+
+// One lazy factory for router metering; tests can mock billingComputeMeter.
+const getComputeMeter = () => billingComputeMeter();
 
 export const cloudflareGuacamoleRouter = createTRPCRouter({
     relayState: protectedProcedure.input(z.object({ computerId: z.string().uuid() }))
@@ -217,6 +222,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            // This branch is Cloudflare-only, after admission and a provider readiness signal.
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) await recordComputeMeter(() => getComputeMeter().ready({
+                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+            }));
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -473,6 +482,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            // This branch is Cloudflare-only, after admission and a provider readiness signal.
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) await recordComputeMeter(() => getComputeMeter().ready({
+                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+            }));
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -653,6 +666,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            // This branch is Cloudflare-only, after admission and a provider readiness signal.
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) await recordComputeMeter(() => getComputeMeter().ready({
+                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+            }));
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -950,6 +967,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     ? await confirmAwsStop(routed.provider, { correlationId }, computer)
                     : await routed.provider.stop({ correlationId }, computer, 'user')
                 : await routed.provider.terminate({ correlationId }, computer);
+            if (routed.kind === 'cloudflare' && result.ok && result.terminated) await recordComputeMeter(() => getComputeMeter().stopped({
+                ...computer, endedAt: new Date(), reason: 'user_stop',
+            }));
             // Report what the Worker actually confirmed, not a hardcoded
             // success — `result.ok` is false for still_running/destroy_failed,
             // a rejected signature, or an unreachable Worker.
@@ -1227,6 +1247,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,
             });
+            if (routed.kind === 'cloudflare' && result.ok) await recordComputeMeter(() => getComputeMeter().heartbeat({
+                ...computer, at: new Date(),
+            }));
 
             return {
                 ok: result.ok,
@@ -1281,6 +1304,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ok: false as const, errorCode: aws.outcome ?? 'aws_not_supported', correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const result = await routed.provider.restart({ correlationId }, computer);
+            if (result.ok) await recordComputeMeter(() => getComputeMeter().ready({
+                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+            }));
 
             if (!result.ok) {
                 return {

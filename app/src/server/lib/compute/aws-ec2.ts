@@ -51,6 +51,7 @@ import {
 } from './aws-intent';
 import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
+import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
@@ -115,6 +116,7 @@ export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RET
 
 export interface AwsProviderDeps {
     db: PlacementDb;
+    meter?: ComputeMeter;
     env?: () => Env;
     now?: () => Date;
     /** Lower-case uuid v4. */
@@ -274,7 +276,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
-    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, sleep: deps.sleep });
+    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter });
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
