@@ -178,6 +178,8 @@ export interface BillingStore {
     touchEpoch(computerId: string, at: Date): Promise<'touched' | 'not_open'>;
     /** Across users; oldest effective deadline first, capped at 200 rows. */
     openEpochsForSweep(input: { limit: number }): Promise<StoredComputeEpoch[]>;
+    /** Recent policy closes, newest first, for computers with no open epoch; capped at 200. */
+    policyClosedEpochsSince(since: Date, limit: number): Promise<StoredComputeEpoch[]>;
     /** Computer ownership is checked by the caller, as for closeInterval. */
     closeEpoch(input: CloseEpochInput): Promise<'closed' | 'not_open'>;
     epochsFor(userId: string, since: Date): Promise<StoredComputeEpoch[]>;

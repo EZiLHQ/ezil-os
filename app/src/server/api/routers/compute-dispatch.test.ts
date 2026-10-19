@@ -234,16 +234,42 @@ describe('billing v2 dispatch wiring', () => {
         expect(access).not.toHaveBeenCalled();
     });
 
-    it.each(['status', 'reportActivity', 'terminate'] as const)('%s on a row-backed computer makes zero billing-store calls with metering on', async method => {
+    it.each(['status', 'terminate'] as const)('%s on a row-backed computer makes zero billing-store calls with metering on', async method => {
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
         const access = vi.fn(() => { throw new Error('Unexpected billing store call'); });
         captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }),
             store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => new Date() } satisfies BillingDeps);
         const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
         const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
-        await caller[method]({ computerId: C1, lastInputAgoMs: 5 });
+        await caller[method]({ computerId: C1 });
         expect(access).not.toHaveBeenCalled();
         expect(captured.billingDeps).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('reportActivity on a row-backed Cloudflare computer only touches its heartbeat when metering is %s', async metering => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const at = new Date('2026-10-18T12:00:00Z');
+        vi.useFakeTimers();
+        vi.setSystemTime(at);
+        try {
+            const touchEpoch = vi.fn<BillingStore['touchEpoch']>().mockResolvedValue('touched');
+            // Any routing/state read (including loadComputeBillingState) fails this assertion,
+            // even if the meter catches the error. With metering off, even touch is forbidden.
+            const access = vi.fn((_target: BillingStore, key: string | symbol) => {
+                if (metering && key === 'touchEpoch') return touchEpoch;
+                throw new Error(`Unexpected billing store access: ${String(key)}`);
+            });
+            captured.billingDeps.mockReturnValue({ config: readBillingConfig(metering ? { BILLING_TAB_ENABLED: '1' } : {}),
+                store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => at } satisfies BillingDeps);
+            const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+            const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
+            await caller.reportActivity({ computerId: C1, lastInputAgoMs: 5 });
+            expect(access.mock.calls.map(([, key]) => key)).toEqual(metering ? ['touchEpoch'] : []);
+            if (metering) expect(touchEpoch).toHaveBeenCalledExactlyOnceWith(C1, at);
+            else expect(touchEpoch).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('a paid computer at capacity stays unplaced and returns the existing refusal', async () => {

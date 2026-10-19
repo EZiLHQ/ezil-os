@@ -57,6 +57,7 @@ function fixture() {
         openEpochFor: vi.fn<BillingStore['openEpochFor']>(async () => { throw new Error('Unused v2 store stub'); }),
         touchEpoch: vi.fn<BillingStore['touchEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
         openEpochsForSweep: vi.fn<BillingStore['openEpochsForSweep']>(async () => { throw new Error('Unused v2 store stub'); }),
+        policyClosedEpochsSince: vi.fn<BillingStore['policyClosedEpochsSince']>(async () => { throw new Error('Unused v2 store stub'); }),
         closeEpoch: vi.fn<BillingStore['closeEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
         epochsFor: vi.fn<BillingStore['epochsFor']>().mockResolvedValue([{
             id: 'epoch_fixture', userId, computerId: 'computer', size: 'free-cf', weight: 1,

@@ -1,4 +1,5 @@
-import { and, desc, eq, gt, gte, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, isNull, lt, notExists, or, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 
 import {
     billingComputeEpochs,
@@ -115,6 +116,21 @@ export function createBillingStore(db: Database): BillingStore {
             const rows = await db.select().from(billingComputeEpochs).where(isNull(billingComputeEpochs.endedAt))
                 .orderBy(sql`coalesce(${billingComputeEpochs.deadlineAt}, ${billingComputeEpochs.readyAt} + interval '21600 seconds')`, billingComputeEpochs.id)
                 .limit(boundedLimit);
+            return rows.map(computeEpoch);
+        },
+
+        async policyClosedEpochsSince(since, limit) {
+            if (!Number.isFinite(limit) || limit < 0) throw new RangeError('Invalid sweep limit');
+            const boundedLimit = Math.min(200, Math.floor(limit));
+            if (boundedLimit === 0) return [];
+            const open = alias(billingComputeEpochs, 'open_epoch');
+            const rows = await db.select().from(billingComputeEpochs).where(and(
+                inArray(billingComputeEpochs.endReason, ['session_max', 'allowance_exhausted', 'overage_cap']),
+                gte(billingComputeEpochs.endedAt, since),
+                notExists(db.select({ id: open.id }).from(open).where(and(
+                    eq(open.computerId, billingComputeEpochs.computerId), isNull(open.endedAt),
+                ))),
+            )).orderBy(desc(billingComputeEpochs.endedAt), billingComputeEpochs.id).limit(boundedLimit);
             return rows.map(computeEpoch);
         },
 

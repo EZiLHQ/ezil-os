@@ -73,7 +73,8 @@ import {
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
-import { awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, routeComputer } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, routeComputer } from './compute-dispatch';
+import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -959,15 +960,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const routed = await routeComputer(ctx.db, computer);
-            // A user stop of an AWS computer STOPS the instance (data and root disks kept;
-            // reopen is a cold boot). It never retires: retire is the computer delete.
-            const result = routed.kind === 'aws-ec2'
-                ? input.confirm
-                    ? await confirmAwsStop(routed.provider, { correlationId }, computer)
-                    : await routed.provider.stop({ correlationId }, computer, 'user')
-                : await routed.provider.terminate({ correlationId }, computer);
-            if (routed.kind === 'cloudflare' && result.ok && result.terminated) await recordComputeMeter(() => getComputeMeter().stopped({
+            const { kind, result } = await stopComputerForPolicy(ctx.db, computer, 'user_stop', {
+                confirm: input.confirm, correlationId,
+            });
+            if (kind === 'cloudflare' && result.ok && result.terminated) await recordComputeMeter(() => getComputeMeter().stopped({
                 ...computer, endedAt: new Date(), reason: 'user_stop',
             }));
             // Report what the Worker actually confirmed, not a hardcoded

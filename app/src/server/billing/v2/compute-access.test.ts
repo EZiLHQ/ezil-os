@@ -71,6 +71,7 @@ function fixture(over: Partial<Input> = {}) {
         },
         touchEpoch: async () => { throw new Error('Unused touchEpoch'); },
         openEpochsForSweep: async () => { throw new Error('Unused openEpochsForSweep'); },
+        policyClosedEpochsSince: async () => { throw new Error('Unused policyClosedEpochsSince'); },
         grantsForPeriod: async () => [...input.grants],
         latestConsent: async () => input.consent,
         openPaymentIssues: async () => [...input.paymentIssues],

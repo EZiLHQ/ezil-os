@@ -29,6 +29,7 @@ class MemoryStore implements BillingStore {
     openEpochFor: BillingStore['openEpochFor'] = async () => { throw new Error('Unused v2 store stub'); };
     touchEpoch: BillingStore['touchEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
     openEpochsForSweep: BillingStore['openEpochsForSweep'] = async () => { throw new Error('Unused v2 store stub'); };
+    policyClosedEpochsSince: BillingStore['policyClosedEpochsSince'] = async () => { throw new Error('Unused v2 store stub'); };
     closeEpoch: BillingStore['closeEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
     epochsFor: BillingStore['epochsFor'] = async () => { throw new Error('Unused v2 store stub'); };
     recordConsent: BillingStore['recordConsent'] = async input => {

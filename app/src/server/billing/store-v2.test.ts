@@ -217,6 +217,46 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         expect(swept.map(epoch => epoch.computerId)).toEqual(rows.slice(0, 200).map(row => row.id));
     });
 
+    it('finds only recent policy closes, across owners, excluding computers with any open epoch', async () => {
+        await store.openEpoch(epoch());
+        await store.closeEpoch({ computerId, endedAt: instant(10), reason: 'session_max' });
+        await store.openEpoch({ ...epoch(), computerId: secondComputerId });
+        await store.closeEpoch({ computerId: secondComputerId, endedAt: instant(20), reason: 'allowance_exhausted' });
+        await store.openEpoch({ ...epoch(), computerId: otherComputerId, userId: otherUserId });
+        await store.closeEpoch({ computerId: otherComputerId, endedAt: instant(30), reason: 'overage_cap' });
+
+        expect((await store.policyClosedEpochsSince(instant(10), 50)).map(row => row.endReason))
+            .toEqual(['overage_cap', 'allowance_exhausted', 'session_max']);
+        expect((await store.policyClosedEpochsSince(instant(20), 50)).map(row => row.computerId))
+            .toEqual([otherComputerId, secondComputerId]);
+        expect(await store.policyClosedEpochsSince(instant(31), 50)).toEqual([]);
+        expect(await store.policyClosedEpochsSince(instant(0), 0)).toEqual([]);
+        expect((await store.policyClosedEpochsSince(instant(0), 1)).map(row => row.computerId)).toEqual([otherComputerId]);
+
+        // A new session, even for the same owner, must not be stopped by an old close.
+        await store.openEpoch({ ...epoch(instant(40)), computerId: secondComputerId });
+        expect((await store.policyClosedEpochsSince(instant(0), 50)).map(row => row.computerId))
+            .toEqual([otherComputerId, computerId]);
+        await store.closeEpoch({ computerId: secondComputerId, endedAt: instant(50), reason: 'user_stop' });
+        await store.openEpoch({ ...epoch(instant(60)), computerId: secondComputerId });
+        await store.closeEpoch({ computerId: secondComputerId, endedAt: instant(70), reason: 'idle_sleep' });
+        expect((await store.policyClosedEpochsSince(instant(21), 50)).map(row => row.endReason)).toEqual(['overage_cap']);
+    });
+
+    it('caps recent policy closes at 200 rows', async () => {
+        const owners = await client<{ id: string }[]>`insert into auth.users (id)
+            select gen_random_uuid() from generate_series(1, 201) returning id`;
+        const rows = owners.map(owner => ({ id: randomUUID(), userId: owner.id, slot: 1 }));
+        await db.insert(computers).values(rows);
+        await db.insert(billingComputeEpochs).values(rows.map((row, index) => ({
+            userId: row.userId, computerId: row.id, size: 'std-2' as const, weight: 1 as const,
+            readyAt: instant(0), endedAt: instant(index + 1), endReason: 'session_max' as const,
+        })));
+        const recent = await store.policyClosedEpochsSince(instant(0), 999);
+        expect(recent).toHaveLength(200);
+        expect(recent.map(row => row.computerId)).toEqual(rows.slice(1).reverse().map(row => row.id));
+    });
+
     it('clamps a subsecond or skewed stop at readiness and handles missing computers', async () => {
         await store.openEpoch({ ...epoch(instant(1.1)), size: 'free-cf', subscriptionId: null });
         expect(await store.closeEpoch({ computerId, endedAt: instant(1.9), reason: 'platform_failure' })).toBe('closed');
