@@ -222,7 +222,7 @@ describe('closePeriodAndInvoiceOverage', () => {
     it.each(['no subscription', 'foreign subscription', 'grace', 'disabled', 'no consent', 'zero usage', 'zero cap', 'standard'] as const)
         ('skips %s without creating a row or calling the port', async scenario => {
             const f = fixture();
-            let value: typeof input & { subscriptionId?: string } = { ...input };
+            const value: typeof input & { subscriptionId?: string } = { ...input };
             let reason: string;
             switch (scenario) {
                 case 'no subscription': f.store.subscriptionsFor.mockResolvedValue([]); reason = 'not_found'; break;
