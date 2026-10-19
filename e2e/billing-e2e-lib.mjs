@@ -10,7 +10,7 @@ export function redact(value) {
 /** Substring matching follows CONTRACT §8, including claims inside longer words. */
 export function scanCopy(value) {
     const text = String(value).toLowerCase().replace(/\s+/g, ' ');
-    return ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'fair use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai']
+    return ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour']
         .filter(term => text.includes(term));
 }
 

@@ -1,10 +1,10 @@
-// Billing v2 — the server owns allowances, sizes and action availability.
+// Versioned billing views. The summary owns plan details and action availability.
 import TabAccount from './account.js';
 import { payload as bootPayload } from '../../../session.js';
 import { isNative } from '../../../native-runtime.js';
 import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
-import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet } from '../billing-sheets.js';
+import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl } from '../billing-format.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -14,7 +14,7 @@ const STATES = new Set(['ok', 'low', 'exhausted', 'over_cap', 'unavailable']);
 const ATTENTION = new Set(['low', 'exhausted', 'over_cap']);
 const windows = new WeakMap();
 let upgradeSheetOpener = openUpgradeSheet;
-let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet };
+let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet };
 
 export function setUpgradeSheetOpener (fn) { upgradeSheetOpener = fn; }
 export function setBillingSheetOpeners (openers) { sheetOpeners = { ...sheetOpeners, ...openers }; }
@@ -187,6 +187,38 @@ function nudgeHtml (summary) {
             ? actionHtml('overage', 'Turn on overage…') : ''}</aside>` : '';
 }
 
+function summaryV3Html (summary) {
+    const { plan, computer, fairUse, actions } = summary;
+    const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
+    const hours = computer.sessionMaxSeconds / 3600;
+    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)} — upgrade to keep working` }[fairUse.status];
+    const changeAction = actions.downgrade ? actionHtml('downgrade', 'Change plan')
+        : actions.upgrade ? actionHtml('upgrade', 'Change plan') : actions.checkout ? actionHtml('choose', 'Change plan', true) : '';
+    return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div>
+        ${actions.portal ? actionHtml('portal', 'Manage payment') : ''}</header>
+        ${paymentHtml(summary)}
+        <section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3" aria-label="Current plan">
+            <div class="ezil-billing-plan-heading"><h4>${encode(plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(plan.status)}">${encode(status)}</span></div>
+            ${plan.status !== 'cancels' && plan.status !== 'past_due' && plan.renewal ? paragraph(`Renews on ${dateLabel(plan.renewal.at)} for ${dollars(plan.renewal.amountCents, { compact: true })}`, 'ezil-billing-status') : ''}
+            ${plan.status === 'cancels' ? `<aside role="status" data-role="cancels-banner">${paragraph(`Your plan ends on ${dateLabel(plan.cancelsAt)}. You keep your plan until then.`)}</aside>` : ''}
+            ${plan.status === 'past_due' && ! plan.paymentIssue ? '<aside role="status" data-role="payment-banner">Your payment is past due. Manage payment to keep your plan.</aside>' : ''}
+            ${plan.scheduledChange ? paragraph(`Changes to ${offerFor(summary, plan.scheduledChange.toSku)?.name ?? 'Standard'} on ${dateLabel(plan.scheduledChange.effectiveAt)}.`) : ''}
+            ${plan.pendingUpgrade ? paragraph(`Premium starts once payment is confirmed. This upgrade expires ${dateLabel(plan.pendingUpgrade.expiresAt)}.`) : ''}
+            <div class="ezil-billing-actions" data-role="plan-actions">${actions.upgrade ? actionHtml('upgrade', 'Upgrade', true) : ''}${changeAction}${actions.cancel ? actionHtml(plan.status === 'cancels' ? 'resume' : 'cancel', plan.status === 'cancels' ? 'Resume plan' : 'Cancel') : ''}</div>
+        </section>
+        <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
+            ${paragraph(`${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
+            ${paragraph(`Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
+            ${paragraph(computer.opening === 'standard' ? 'Standard opening' : 'Opens from a ready computer')}
+            ${computer.opening === 'fastest' ? paragraph('First in line for a ready computer', 'ezil-billing-note') : ''}
+        </section>
+        <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
+        <p class="ezil-billing-note">Prices before tax.</p>
+        <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
+        <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3>Invoices</h3>
+            <div data-role="invoice-rows" aria-busy="true"><p class="ezil-billing-note">Loading invoices…</p></div></section>`;
+}
+
 function summaryHtml (summary) {
     const { storage, ai, actions, compute } = summary;
     const unavailable = ai.state === 'unavailable';
@@ -224,7 +256,7 @@ function invoicesHtml (rows) {
 }
 
 function loadingHtml () {
-    return `<header class="ezil-billing-header"><div><h3>Plan &amp; usage</h3><p class="ezil-settings-lead">Your plan, compute and what renews when.</p></div></header>
+    return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div></header>
         <p role="status">Loading billing…</p><div class="ezil-billing-meters" aria-hidden="true">${Array.from({ length: 3 }, () => '<div class="ezil-billing-meter ezil-billing-skeleton"><span></span><span></span><span></span></div>').join('')}</div>`;
 }
 
@@ -235,6 +267,7 @@ function stopCountdown (state) {
 
 function startCountdown ($win, state) {
     stopCountdown(state);
+    if ( state.summary.version !== 2 ) return;
     const session = state.summary.compute.session;
     if ( ! session.activeDeadline || ! state.active ) return;
     const update = () => {
@@ -262,10 +295,10 @@ async function load ($win, state) {
         const result = await trpc.query('billing.summary');
         if ( state.closed || ! $win.get(0).isConnected ) return;
         if ( ! result.ok ) throw new Error('summary failed');
-        if ( result.data?.enabled === false || result.data?.version !== 2 ) {
+        if ( result.data?.enabled === false || ! [2, 3].includes(result.data?.version) ) {
             $body.html('<p>Billing isn\'t available yet.</p>');
         } else {
-            $body.html(summaryHtml(result.data));
+            $body.html(result.data.version === 3 ? summaryV3Html(result.data) : summaryHtml(result.data));
             state.summary = result.data;
             startCountdown($win, state);
         }
@@ -279,8 +312,9 @@ async function load ($win, state) {
         state.autoOpened = true;
         const sku = state.openUpgrade;
         if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
-        else if ( sku === 'compute_monthly_v2' && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
+        else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
+            if ( state.summary.version === 3 ) openSheet($win, state, 'choose');
             const picker = $body.find('[data-role="plan-picker"]').get(0);
             picker?.scrollIntoView?.({ block: 'nearest' });
             picker?.querySelector('button')?.focus();
@@ -304,10 +338,10 @@ async function load ($win, state) {
 function actionError ($win, copy) { $win.find('[data-role="billing-action-error"]').text(copy); }
 
 function openSheet ($win, state, action, sku) {
-    if ( state.pending || state.sheet || state.closed || state.summary?.actions[action] !== true ) return;
+    if ( state.pending || state.sheet || state.closed || state.summary?.actions[action === 'choose' ? 'checkout' : action] !== true ) return;
     const summary = state.summary;
     const offer = action === 'checkout' ? offerFor(summary, sku) : null;
-    if ( action === 'checkout' && ! offer ) return;
+    if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return;
     const container = $win.find('.window-body').get(0);
     const token = {};
     state.sheet = token;
@@ -319,7 +353,7 @@ function openSheet ($win, state, action, sku) {
     const onDone = () => { onClose(); void load($win, state); };
     actionError($win, '');
     try {
-        const options = { container, trpc, onDone, onClose };
+        const options = { container, trpc, onDone, onClose, checkout: params => openSheet($win, state, 'checkout', params.sku) };
         token.handle = action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
@@ -354,7 +388,7 @@ async function act ($win, state, action, value) {
     if ( action !== 'open-invoice' && summary.actions[flag] !== true ) return;
     if ( action === 'size' && (value === summary.compute.selectedSize || ! summary.compute.allowedSizes.includes(value)) ) return;
     const $pane = $win.find('[data-pane="billing"]');
-    const previousSize = summary.compute.selectedSize;
+    const previousSize = summary.compute?.selectedSize;
     const controls = $pane.find('button, input[type="radio"]').get().map(element => [element, element.disabled]);
     state.pending = true;
     controls.forEach(([element]) => { element.disabled = true; });
@@ -416,7 +450,7 @@ export default {
             if ( this.disabled ) return;
             const action = this.dataset.action;
             if ( action === 'retry' ) void load($win, state);
-            else if ( ['checkout', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
+            else if ( ['checkout', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
             else void act($win, state, action, this.dataset.kind);
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {

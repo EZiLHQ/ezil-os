@@ -1202,6 +1202,13 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-billing-sheet input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .ezil-billing-sheet [data-role=sheet-error]{color:var(--danger)}
 .ezil-upgrade-backdrop.is-compact .ezil-billing-sheet{padding:56px 16px 24px}
+.ezil-billing-choice{border:1px solid var(--border);border-radius:12px;padding:20px;margin:16px 0}
+.ezil-billing-choice.is-highlighted{border-color:var(--accent)}
+.ezil-billing-sheet ul{padding-left:20px;line-height:1.6}
+.ezil-billing-sheet li+li{margin-top:8px}
+.ezil-billing-fair-use{padding:12px 0}
+.ezil-billing-fair-use[data-status=near]{color:var(--warn)}
+.ezil-billing-fair-use[data-status=paused]{color:var(--danger)}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#04060c;background-image:radial-gradient(24% 6% at 50% 91.2%,rgba(255,200,150,.6) 0,rgba(255,150,100,.18) 55%,rgba(255,150,100,0) 100%),radial-gradient(150% 72% at 50% 138%,#04060c 0,#04060c 62%,rgba(0,200,208,.72) 63.1%,rgba(96,110,255,.38) 65.4%,rgba(112,86,255,.1) 70%,rgba(112,86,255,0) 78%),radial-gradient(55% 45% at 82% 6%,rgba(0,190,200,.4) 0,rgba(0,190,200,0) 62%),radial-gradient(50% 55% at 8% 22%,rgba(112,86,255,.34) 0,rgba(112,86,255,0) 64%),linear-gradient(180deg,#0a0e1d 0,#070a14 50%,#04060c 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}

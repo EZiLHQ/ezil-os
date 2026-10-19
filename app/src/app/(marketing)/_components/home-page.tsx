@@ -1,4 +1,3 @@
-import { FREE_V2_EFFECTIVE_AT } from '@/server/billing/v2/contract';
 import { getPricingContent, marketingContent as chrome } from '../pricing/pricing-content';
 import styles from '../marketing.module.css';
 
@@ -34,12 +33,8 @@ function ProductFrame() {
  * Both routes share a server-rendered document; /pricing starts at the plans,
  * while ordinary home visits keep the hero.
  */
-export default function MarketingHome({ largeStorageEnabled, focusPlans = false, freeV2EffectiveAt = FREE_V2_EFFECTIVE_AT }: {
-    largeStorageEnabled: boolean;
-    focusPlans?: boolean;
-    freeV2EffectiveAt?: string | null;
-}) {
-    const copy = getPricingContent(largeStorageEnabled, freeV2EffectiveAt);
+export default function MarketingHome({ focusPlans = false }: { focusPlans?: boolean; largeStorageEnabled?: boolean }) {
+    const copy = getPricingContent();
 
     return (
         <div className={styles.shell}>
@@ -91,43 +86,23 @@ export default function MarketingHome({ largeStorageEnabled, focusPlans = false,
                         : <h2 id="plans-title">{copy.plansLabel}</h2>}
                     <div className={styles.plans}>
                         {copy.plans.map(plan => (
-                            <article key={plan.id} data-testid={`plan-${plan.id}`} className={`${styles.card} ${plan.id === 'compute' ? styles.compute : ''}`} aria-labelledby={`plan-${plan.id}-title`}>
+                            <article key={plan.id} data-testid={`plan-${plan.id}`} className={`${styles.card} ${plan.highlighted ? styles.premium : ''}`} aria-labelledby={`plan-${plan.id}-title`}>
                                 <div className={styles.cardHeading}>
                                     <h3 id={`plan-${plan.id}-title`}>{plan.name}</h3>
                                     {plan.badge && <span className={styles.pill}>{plan.badge}</span>}
                                 </div>
+                                <p className={styles.tagline}>{plan.tagline}</p>
                                 <p className={styles.price}>{plan.price}<span>{plan.interval}</span></p>
                                 <p className={styles.caption}>{plan.billingNote}</p>
-                                <a data-testid={plan.id === 'free' ? undefined : `cta-get-${plan.id}`} className={plan.id === 'compute' ? styles.primary : styles.outline} href={plan.cta.href}>{plan.cta.label}</a>
-                                <dl className={styles.allowances}>
-                                    {plan.allowances.map(allowance => (
-                                        <div key={allowance.id} className={styles.allowance} data-testid={`allowance-${plan.id}-${allowance.id}`}>
-                                            <dt>{allowance.label}</dt>
-                                            <dd><strong>{allowance.value}</strong> <span>{allowance.unit}</span>{allowance.caption && <small>{allowance.caption}</small>}</dd>
-                                        </div>
-                                    ))}
-                                </dl>
-                                {plan.disclosure && <p className={styles.planNote}>{plan.disclosure}</p>}
-                                {plan.note && <p className={styles.planNote}>{plan.note}</p>}
+                                <a data-testid={plan.id === 'free' ? undefined : `cta-get-${plan.id}`} className={plan.highlighted ? styles.primary : styles.outline} href={plan.cta.href}>{plan.cta.label}</a>
+                                <p className={styles.includes}>{plan.includes}</p>
+                                <ul className={styles.bullets}>
+                                    {plan.bullets.map(bullet => <li key={bullet}>{bullet}</li>)}
+                                </ul>
                             </article>
                         ))}
                     </div>
                     <p className={styles.sharedNote}>{copy.sharedNote}</p>
-                </section>
-                <section className={styles.overage} aria-labelledby="overage-title">
-                    <h2 id="overage-title">{copy.overage.title}</h2>
-                    <p>{copy.overage.body}</p>
-                </section>
-                <section className={styles.section} aria-labelledby="limits-title">
-                    <h2 id="limits-title">{copy.limits.title}</h2>
-                    <dl className={styles.limits}>
-                        {copy.limits.rows.map((row, index) => (
-                            <div key={row.label}>
-                                <span className={styles.icon} aria-hidden="true">{['◷', '▱', '✦'][index]}</span>
-                                <dt>{row.label}</dt><dd>{row.value}</dd>
-                            </div>
-                        ))}
-                    </dl>
                 </section>
                 <section className={styles.section} aria-labelledby="faq-title">
                     <h2 id="faq-title">{copy.faq.title}</h2>

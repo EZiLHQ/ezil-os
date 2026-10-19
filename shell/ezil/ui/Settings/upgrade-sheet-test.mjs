@@ -1,6 +1,7 @@
 // upgrade-sheet-test.mjs — EZiL-authored. Like the Settings harness, this
 // drives DOM controls in jsdom with no transport. Bundle the real modules
 // so fake Stripe and a deterministic clock exercise every race.
+import { summaryV3 } from './billing-v3-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,7 +26,7 @@ const sizes = [
 ];
 const offer = { sku: 'standard_monthly_v2', family: 'standard', priceCents: 2300, currency: 'usd', interval: 'month', allowanceStdSeconds: 63 * 3600, sizes: ['std-2'], overage: null };
 const computeOffer = { ...offer, sku: 'compute_monthly_v2', family: 'compute', priceCents: 12345, allowanceStdSeconds: 510 * 3600, sizes: sizes.map(size => size.code), overage: { centsPerStdHour: 30, defaultCapCents: 2500, maxCapCents: 10000 } };
-const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|fair\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai/i;
+const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai|compute\s+hours|standard-hour/i;
 const free = { enabled: true, version: 2, plan: { sku: 'free_v2' } };
 const settle = async () => { for ( let i = 0; i < 20; i++ ) await Promise.resolve(); };
 const deferred = () => {
@@ -80,7 +81,7 @@ function harness () {
     let done = 0;
     let closed = 0;
     const h = {
-        dom, window, document, timers, tick, calls, opens, rendered,
+        dom, window, document, timers, tick, calls, opens, rendered, v3: false,
         q: selector => document.querySelector(selector),
         text: () => document.querySelector('[data-role="upgrade-sheet"]')?.textContent ?? '',
         create: async () => embedded,
@@ -614,7 +615,7 @@ test('copy keeps gated allowances honest and every control has a name', async h 
     const success = h.q('[data-role="upgrade-success"]');
     assert.ok(success);
     assert.match(success.textContent, /63 standard-hours each billing period/);
-    assert.doesNotMatch(h.text(), banned, 'positive rendered price, allowances and success asserted above');
+    assert.doesNotMatch(h.text().replace(/standard-hours?/gi, ''), banned, 'positive rendered price, allowances and success asserted above');
     for ( const control of h.document.querySelectorAll('button, summary, iframe') ) {
         assert.ok(control.getAttribute('aria-label') || control.getAttribute('title') || control.textContent.trim());
     }
@@ -663,9 +664,9 @@ test('success requires the purchased SKU even when another paid plan is present'
     assert.match(h.q('[data-role="upgrade-success"]').textContent, /510 standard-hours each billing period/);
 });
 
-test('v2 deep links select Standard and Compute, and legacy pro remains supported', async h => {
+test('v3 deep links select Standard and Premium while legacy links remain supported', async h => {
     const parse = h.window.sheetApi.parseBillingDeepLink;
-    for ( const [value, expected] of [['standard', offer.sku], ['compute', computeOffer.sku], ['pro', true], ['other', false], ['__proto__', false], ['constructor', false]] ) {
+    for ( const [value, expected] of [['standard', 'standard_monthly_v3'], ['premium', 'premium_monthly_v3'], ['compute', computeOffer.sku], ['pro', true], ['other', false], ['__proto__', false], ['constructor', false]] ) {
         const result = parse(`?view=files&settings=billing&upgrade=${value}&view=recent`);
         assert.equal(result.openUpgrade, expected);
         assert.equal(result.search, '?view=files&view=recent');
@@ -727,10 +728,36 @@ test('a late summary after close leaves both the old and reopened sheet untouche
     assert.equal(h.done, 0);
 });
 
+for ( const tier of ['standard', 'premium'] ) test(`v3 ${tier} checkout requires exact purchased SKU before success`, async h => {
+    h.v3 = true;
+    const summary = summaryV3(tier), offer = summary.catalog.offers.find(offer => offer.sku === summary.plan.sku);
+    h.summary = async () => summaryV3('free');
+    h.open({ sku: offer.sku, offer, sizes: undefined }); await settle();
+    assert.equal(h.mounted, 1); assert.equal(h.calls[0].input.sku, offer.sku);
+    assert.equal(h.document.querySelectorAll('.ezil-upgrade-allowances li').length, 3);
+    assert.match(h.text(), /Usage included/); assert.doesNotMatch(h.text(), banned);
+    h.complete(); await settle(); assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    h.summary = async () => summary;
+    await h.tick(1500); assert.match(h.text(), new RegExp(`You're on ${offer.name}`));
+    h.click('[data-action="done"]'); assert.equal(h.done, 1); assert.equal(h.destroyed, 1);
+});
+test('v3 failed checkout creation retries the chosen SKU and unpaid timeout never grants a plan', async h => {
+    h.v3 = true;
+    const offer = summaryV3().catalog.offers[1];
+    h.create = async () => ({ ok: false, message: 'stripe_unavailable' });
+    h.open({ sku: offer.sku, offer, sizes: undefined }); await settle();
+    assert.match(h.text(), /Payments are unavailable/); assert.equal(h.mounted, 0);
+    h.create = async () => embedded; h.click('[data-action="retry"]'); await settle();
+    assert.equal(h.calls.at(-1).input.sku, offer.sku); assert.equal(h.mounted, 1);
+    h.status = async () => 'open'; h.summary = async () => summaryV3('free');
+    h.complete(); await h.tick(60000);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    assert.doesNotMatch(h.text(), /You're on Standard/); assert.equal(h.done, 0);
+});
 let failed = 0;
 for ( const { name, fn } of tests ) {
     const h = harness();
-    try { await fn(h); await settle(); for ( const state of h.rendered ) assert.doesNotMatch(state, banned); console.log(`PASS ${name}`); }
+    try { await fn(h); await settle(); for ( const state of h.rendered ) assert.doesNotMatch(h.v3 ? state : state.replace(/standard-hours?/gi, ''), banned); console.log(`PASS ${name}`); }
     catch (error) { failed++; console.error(`FAIL ${name}\n${error.stack}`); }
     finally { h.cleanup(); }
 }

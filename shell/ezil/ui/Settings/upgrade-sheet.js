@@ -10,7 +10,8 @@ export function parseBillingDeepLink (search) {
     const params = new URLSearchParams(search);
     if ( params.get('settings') !== 'billing' ) return null;
     const upgrade = params.get('upgrade');
-    const openUpgrade = upgrade === 'standard' ? 'standard_monthly_v2'
+    const openUpgrade = upgrade === 'standard' ? 'standard_monthly_v3'
+        : upgrade === 'premium' ? 'premium_monthly_v3'
         : upgrade === 'compute' ? 'compute_monthly_v2' : upgrade === 'pro';
     params.delete('settings');
     params.delete('upgrade');
@@ -85,9 +86,10 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     let finished = false;
     let deadline = 0;
     const timers = new Set();
-    const name = planName(offer.family);
+    const v3 = sku.endsWith('_v3');
+    const name = v3 ? offer.name : planName(offer.family);
     const price = dollars(offer.priceCents, { compact: true });
-    const allowance = `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
+    const allowance = v3 ? 'Usage included' : `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
     const frame = openSheetFrame({
         container, title: `Subscribe to ${name}`, role: 'upgrade-sheet', onClose,
         canDismissBackdrop: () => ! busy && ! (confirming && ! finished),
@@ -128,12 +130,20 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     dialog.querySelector('#ezil-upgrade-title').textContent = `Subscribe to ${name}`;
     dialog.querySelector('.ezil-upgrade-compact-title').textContent = `${name} · ${price}/month · before applicable tax`;
     dialog.querySelector('[data-role="price"]').textContent = price;
-    const offeredSizes = offer.sizes.map(code => sizes.find(size => size.code === code));
-    const cpus = offeredSizes.map(size => size.vcpu);
-    const sizeCopy = offeredSizes.length === 1 ? `${sizeLabel(offeredSizes[0])} computer`
-        : `${cpus.slice(0, -1).join(', ')} or ${cpus.at(-1)} vCPU computers, up to ${Math.max(...offeredSizes.map(size => size.memoryGiB))} GiB`;
-    const lines = [allowance, sizeCopy, 'Sessions run up to 6 hours; files and installed tools are kept'];
-    if ( offer.family === 'compute' && offer.overage ) lines.push(`Optional usage beyond ${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours at ${dollars(offer.overage.centsPerStdHour, { compact: true })} each — off unless you turn it on`);
+    let lines;
+    if ( v3 ) {
+        lines = offer.bullets;
+        const included = doc.createElement('p');
+        included.textContent = allowance;
+        dialog.querySelector('.ezil-upgrade-allowances').before(included);
+    } else {
+        const offeredSizes = offer.sizes.map(code => sizes.find(size => size.code === code));
+        const cpus = offeredSizes.map(size => size.vcpu);
+        const sizeCopy = offeredSizes.length === 1 ? `${sizeLabel(offeredSizes[0])} computer`
+            : `${cpus.slice(0, -1).join(', ')} or ${cpus.at(-1)} vCPU computers, up to ${Math.max(...offeredSizes.map(size => size.memoryGiB))} GiB`;
+        lines = [allowance, sizeCopy, 'Sessions run up to 6 hours; files and installed tools are kept'];
+        if ( offer.family === 'compute' && offer.overage ) lines.push(`Optional usage beyond ${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours at ${dollars(offer.overage.centsPerStdHour, { compact: true })} each — off unless you turn it on`);
+    }
     for ( const line of lines ) {
         const li = doc.createElement('li');
         li.textContent = line;

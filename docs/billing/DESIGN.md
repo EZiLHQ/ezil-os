@@ -1,4 +1,4 @@
-# Billing UI design v2 — home page, Settings → Billing, in-OS checkout
+# Billing UI design — home page, Settings → Billing, in-OS checkout
 
 Historical v1 design for wave 3 (2026-10-12), retained below. **Billing catalog v2 supersedes the marked portions in §7 (2026-10-18).** Contract: [`CONTRACT.md`](CONTRACT.md). Research: Mobbin, 2026-10-12. The references are cited inline, and each one says what we take from it.
 
@@ -384,7 +384,7 @@ Metadata: “Start free. Upgrade for more compute time and larger computers.” 
 
 ### Copy ban and accessibility
 
-All five specified copy-ban sites use these **16 terms in this order** (`vcpu` is removed); the additional `billing-sheets-test.mjs` regex is identical too:
+For the historical v2 view, the five copy-ban sites used these **16 terms in this order** (`vcpu` is removed); the additional `billing-sheets-test.mjs` regex is identical too:
 
 ```js
 ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'fair use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai']
@@ -439,3 +439,91 @@ The pipe-separated values above enumerate alternatives; they are not literal CSS
 `e2e/billing-home.mjs` still targets the Pro CTA/card and v1 allowance text; its assertions need to follow the three public cards. `e2e/billing-checkout.mjs` still supplies a v1 fake and asserts `pro_monthly_v1`, so it cannot validate the v2 checkout. `CONTRACT.md` §8 still bans `vcpu`; v2's list above is authoritative for these surfaces.
 
 A `requires_action` renewal has no hosted-invoice URL in `PlanSummaryV2`; only `pendingUpgrade.hostedInvoiceUrl` is supplied. The UI therefore falls back to the newest open subscription invoice with a valid URL in history, then the portal when `actions.portal` permits it. The checkout sheet's session line is fixed six-hour text because `OfferDTO` carries no session policy. No new DTO fields were invented.
+
+
+## 8. v3 (2026-10-19): Free, Standard, Premium
+
+This section supersedes §7 for new plans and public pricing. The pinned sources are
+[`CONTRACT-v3.md`](CONTRACT-v3.md) and [`contract.ts`](../../app/src/server/billing/v3/contract.ts).
+The v2 Settings view remains only behind `summary.version === 2`; its sold terms remain visible.
+The v3 view consumes `BillingSummaryV3` and `PublicOfferV3` without reading v2 meters or size tables.
+
+### References
+
+The v3 brief names these [Mobbin web references](https://mobbin.com/browse/web/apps).
+Individual screenshot permalinks were not supplied; these are named design references, not newly verified screenshots.
+
+| Mobbin reference | Applied pattern |
+| --- | --- |
+| Grammarly pricing and subscription | Three clear choices; current plan with status and “Renews on <date> for $X”. Cancellation and past-due notices replace renewal copy. |
+| Midjourney manage subscription | Plan management next to the current subscription; payment management and dated invoices remain easy to find. |
+| Cofounder upgrade modal | Price, “Usage included”, three benefits, one purchase button per offer. |
+| [Perplexity upgrade](https://mobbin.com/flows/91554608-8cb1-4f62-a30c-e2e2a4fd2c9b) | Compact upgrade decision before payment; EZiL then uses its existing embedded checkout. |
+| TravelPerk “Premium Most popular” | Premium alone has the accent border and “Most popular” badge. |
+| Railway | Short plan details and a clear price; separate the purchase decision from billing history. |
+| Replit | Plain audience taglines, inherited “Everything in …, plus:” benefits and one CTA per card. |
+
+### Settings → Billing
+
+The plan card contains name, status and renewal date/amount. Cancellation, failed payment,
+pending upgrade and scheduled plan changes are explicit. The next row is “Your computer”:
+vCPU · GB, “Sessions up to N hours”, and “Opens from a ready computer” for paid plans.
+Free says “Standard opening”; Premium also says “First in line for a ready computer”.
+
+Fair use is exactly one status line: “Within fair use”, “Nearly at fair use”, or
+“Paused until <date> — upgrade to keep working”. There are no meters, size selectors,
+overage controls or usage totals in this view. Manage payment opens the validated portal URL.
+Invoices retain the existing dated list, missing-link handling and retry behavior.
+
+The server's action flags gate controls and click handling. Free's Change plan opens the
+Standard/Premium chooser; Standard's Upgrade/Change plan opens the Premium proration preview;
+Premium's Change plan schedules Standard. Cancel takes effect at period end. A cancelling
+plan can resume through the existing `cancelAtPeriodEnd({cancel:false})` operation.
+
+### Sheets and checkout
+
+Chooser and session-end offers have the catalog price, “Usage included”, three bullets and
+one CTA per offer. Standard → Premium reuses the existing signed proration lines and Due now,
+confirming with the preview's `prorationDate`. Payment failure or bank confirmation keeps the
+upgrade pending. The v3 sheet never displays the historical `grantStdSeconds` amount.
+
+Paid selections send `standard_monthly_v3` or `premium_monthly_v3` to embedded checkout.
+The existing exact-SKU confirmation, 60-second bound, loader retry, close cleanup, focus trap,
+responsive summary and hosted fallback are preserved. Public login return links select v3.
+
+`openSessionEndSheet({summary, reason: 'session_max', ...})` displays:
+“Your 1-hour session ended. Standard gives you 2-hour sessions and opens from a ready computer — $20/month.”
+For Standard it offers Premium and routes through proration. Other stop reasons, Premium,
+disabled billing and disallowed actions do not open an offer.
+
+The shell listens for `ezil:session-ended` with `detail.reason === 'session_max'`, fetches the
+v3 summary, and opens this sheet once while it is visible. Teardown removes the listener.
+**Integration still required:** no current host transport emits a confirmed end reason, and
+`BillingSummaryV3` exposes only `activeDeadline`, which can also be shortened by fair use.
+The runtime/server lane must emit the event after a confirmed limit stop. The UI intentionally
+does not infer a session-limit stop from a timer, idle sleep or a disconnect. No server DTO was extended.
+
+### Pricing and home
+
+Both use `CATALOG_V3`: Free $0, Standard $20/month, Premium $40/month. Each card contains its
+name, audience tagline, big price, one CTA and three inherited benefits. Only Premium is highlighted.
+“Prices before tax.” appears beneath the cards. Four visible FAQs explain sessions, fair use
+(about 5 / 40 / 80 hours a month, and 8 for older Free accounts), files/tools persisting while
+processes stop, and payment-confirmed upgrades versus period-end cancellations/downgrades.
+
+### Copy bans and validation
+
+The five sites named in §7, the shared format array and the sheet test regex use the same
+**17 terms in this order**. Fair use is now required copy and is removed from the old ban.
+
+```js
+['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour']
+/faster|instant|unlimited|priority|gpu|heavy\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai|compute\s+hours|standard-hour/i
+```
+
+The v3 rendered states use the full scan. Legacy v2 jsdom fixtures exempt only their sold
+“standard-hour(s)” terms. Marketing tests verify list equality and scan metadata, accessible
+names, content and rendered HTML. DTO-only shell fakes exercise summary/history/portal failures,
+action gating, proration failures, checkout verification/timeouts and confirmed-stop events.
+The lead owns browser suites and screenshots; historical v2 pricing/QA assertions need to
+follow v3 separately (the server QA files are outside this lane's editable scope).

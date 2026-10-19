@@ -164,3 +164,11 @@
 .ezil-billing-sheet input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .ezil-billing-sheet [data-role="sheet-error"] { color: var(--danger); }
 .ezil-upgrade-backdrop.is-compact .ezil-billing-sheet { padding: 56px 16px 24px; }
+
+.ezil-billing-choice { border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin: 16px 0; }
+.ezil-billing-choice.is-highlighted { border-color: var(--accent); }
+.ezil-billing-sheet ul { padding-left: 20px; line-height: 1.6; }
+.ezil-billing-sheet li + li { margin-top: 8px; }
+.ezil-billing-fair-use { padding: 12px 0; }
+.ezil-billing-fair-use[data-status="near"] { color: var(--warn); }
+.ezil-billing-fair-use[data-status="paused"] { color: var(--danger); }

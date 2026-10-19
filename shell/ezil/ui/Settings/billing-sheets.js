@@ -1,4 +1,5 @@
-// Billing v2 mutations share one modal lifetime with embedded checkout.
+// Versioned billing mutations share one modal lifetime with embedded checkout.
+import { openUpgradeSheet } from './upgrade-sheet.js';
 import { openSheetFrame } from './sheet-frame.js';
 import { dollars, dateLabel, dateTimeLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl } from './billing-format.js';
 
@@ -8,7 +9,7 @@ const money = cents => dollars(cents, { compact: true });
 
 function billingSheet (options, kind, title) {
     const { summary, trpc, onDone } = options;
-    if ( summary?.enabled !== true || summary.version !== 2 || summary.actions?.[kind] !== true ) throw new Error('unavailable');
+    if ( summary?.enabled !== true || ! [2, 3].includes(summary.version) || summary.actions?.[kind] !== true ) throw new Error('unavailable');
     let busy = false;
     let completed = false;
     let paymentPending = false;
@@ -88,15 +89,21 @@ function billingSheet (options, kind, title) {
 }
 
 export function openComputeUpgradeSheet (options) {
-    const sheet = billingSheet(options, 'upgrade', 'Upgrade to EZiL Compute');
+    const v3 = options.summary.version === 3;
+    const target = v3 ? 'premium_monthly_v3' : COMPUTE;
+    const name = v3 ? 'Premium' : 'EZiL Compute';
+    const offer = options.summary.catalog.offers.find(offer => offer.sku === target);
+    if ( ! offer ) throw new Error('unavailable');
+    const sheet = billingSheet(options, 'upgrade', `Upgrade to ${name}`);
     if ( sheet.existing ) return sheet.existing;
     const { body, node, button, request, result } = sheet;
     function preview () {
         if ( sheet.closed || sheet.isBusy() ) return;
         body.replaceChildren();
         node('p', 'Checking the price…');
-        void request('billing.previewUpgrade', { toSku: COMPUTE }, data => {
+        void request('billing.previewUpgrade', { toSku: target }, data => {
             body.replaceChildren();
+            if ( v3 ) offerDetails(sheet, offer);
             const table = node('table', null);
             table.className = 'ezil-billing-sheet-lines';
             table.setAttribute('aria-label', 'Upgrade price breakdown');
@@ -108,13 +115,13 @@ export function openComputeUpgradeSheet (options) {
             }
             node('p', `Due now ${money(data.amountDueCents)}`).className = 'ezil-billing-sheet-total';
             node('p', 'USD. Any applicable tax appears on the invoice.').className = 'ezil-upgrade-caption';
-            node('p', `Adds ${stdHoursLabel(data.grantStdSeconds, { round: 'down' })} standard-hours for the rest of this period (until ${dateLabel(data.periodEnd)}). Your usage so far carries over.`);
+            if ( ! v3 ) node('p', `Adds ${stdHoursLabel(data.grantStdSeconds, { round: 'down' })} standard-hours for the rest of this period (until ${dateLabel(data.periodEnd)}). Your usage so far carries over.`);
             node('p', 'Your plan changes once payment is confirmed.');
             const actions = node('div', null);
             actions.className = 'ezil-billing-sheet-actions';
             button(`Pay ${money(data.amountDueCents)} and upgrade`, 'confirm', () => {
-                void request('billing.confirmUpgrade', { toSku: COMPUTE, prorationDate: data.prorationDate }, confirmation => {
-                    if ( confirmation.status === 'applied' ) result(["You're on EZiL Compute"]);
+                void request('billing.confirmUpgrade', { toSku: target, prorationDate: data.prorationDate }, confirmation => {
+                    if ( confirmation.status === 'applied' ) result([`You're on ${name}`]);
                     else if ( confirmation.status === 'requires_action' ) result([
                         'Confirm the payment with your bank to finish.',
                         'Your plan changes once payment is confirmed.',
@@ -128,7 +135,7 @@ export function openComputeUpgradeSheet (options) {
                     else throw new Error('unavailable');
                 });
             }, actions);
-            button('Not now', 'not-now', sheet.close, actions).className = 'ezil-billing-sheet-secondary';
+            if ( ! v3 ) button('Not now', 'not-now', sheet.close, actions).className = 'ezil-billing-sheet-secondary';
         }, () => {
             body.replaceChildren();
             button('Retry', 'retry', preview);
@@ -139,6 +146,7 @@ export function openComputeUpgradeSheet (options) {
 }
 
 export function openDowngradeSheet (options) {
+    if ( options.summary.version === 3 ) return openV3DowngradeSheet(options);
     const sheet = billingSheet(options, 'downgrade', 'Switch to Standard at period end');
     if ( sheet.existing ) return sheet.existing;
     const { summary } = options;
@@ -160,9 +168,11 @@ export function openDowngradeSheet (options) {
 }
 
 export function openCancelSheet (options) {
-    const sheet = billingSheet(options, 'cancel', `Cancel ${planName(options.summary.plan.family)}`);
+    const sheet = billingSheet(options, 'cancel', `Cancel ${options.summary.version === 3 ? options.summary.plan.name : planName(options.summary.plan.family)}`);
     if ( sheet.existing ) return sheet.existing;
-    sheet.node('p', `Your plan stays active until ${dateLabel(options.summary.plan.periodEnd)}, then moves to Free. You can resume any time before then.`);
+    sheet.node('p', options.summary.version === 3
+        ? `Your plan stays active ${options.summary.plan.renewal ? `until ${dateLabel(options.summary.plan.renewal.at)}` : 'until the end of your billing period'}, then moves to Free. Your files and installed tools stay.`
+        : `Your plan stays active until ${dateLabel(options.summary.plan.periodEnd)}, then moves to Free. You can resume any time before then.`);
     const actions = sheet.node('div', null);
     actions.className = 'ezil-billing-sheet-actions';
     sheet.button('Cancel plan', 'confirm', () => {
@@ -226,5 +236,76 @@ export function openOverageSheet (options) {
     input.addEventListener('input', update);
     checkbox.addEventListener('change', update);
     update();
+    return sheet.handle;
+}
+
+/** PublicOfferV3 only: price, included usage and the catalog's three benefits. */
+function offerDetails (sheet, offer, parent = sheet.body) {
+    sheet.node('p', `${money(offer.priceCents)}/month`, parent).className = 'ezil-billing-sheet-total';
+    sheet.node('p', 'Usage included · Prices before tax.', parent);
+    const bullets = sheet.node('ul', null, parent);
+    for ( const bullet of offer.bullets ) sheet.node('li', bullet, bullets);
+}
+
+export function openPlanPickerSheet (options) {
+    if ( options.summary.version !== 3 ) throw new Error('unavailable');
+    const sheet = billingSheet(options, 'checkout', 'Choose your plan');
+    if ( sheet.existing ) return sheet.existing;
+    sheet.dialog.dataset.sheet = 'choose';
+    const offers = options.summary.catalog.offers.filter(offer => ['standard_monthly_v3', 'premium_monthly_v3'].includes(offer.sku));
+    for ( const offer of offers ) {
+        const card = sheet.node('section');
+        card.className = `ezil-billing-choice${offer.highlighted ? ' is-highlighted' : ''}`;
+        sheet.node('h3', offer.name, card);
+        if ( offer.badge ) sheet.node('p', offer.badge, card).className = 'ezil-settings-pill';
+        sheet.node('p', offer.tagline, card);
+        offerDetails(sheet, offer, card);
+        sheet.button(`Choose ${offer.name}`, 'checkout', () => {
+            if ( ! options.summary.actions.checkout ) return;
+            sheet.close();
+            (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer });
+        }, card).dataset.sku = offer.sku;
+    }
+    return sheet.handle;
+}
+
+function openV3DowngradeSheet (options) {
+    const standard = options.summary.catalog.offers.find(offer => offer.sku === 'standard_monthly_v3');
+    if ( ! standard ) throw new Error('unavailable');
+    const sheet = billingSheet(options, 'downgrade', 'Change to Standard');
+    if ( sheet.existing ) return sheet.existing;
+    offerDetails(sheet, standard);
+    const date = options.summary.plan.renewal?.at;
+    sheet.node('p', `You keep Premium ${date ? `until ${dateLabel(date)}` : 'until the end of your billing period'}. Standard starts then.`);
+    sheet.button('Change to Standard', 'confirm', () => {
+        void sheet.request('billing.scheduleDowngrade', { toSku: standard.sku }, data => {
+            sheet.result([`Scheduled. You switch to Standard on ${dateLabel(data.effectiveAt)}.`]);
+        });
+    });
+    return sheet.handle;
+}
+
+/** Called only with a confirmed limit stop; a deadline alone is not proof. */
+export function openSessionEndSheet (options) {
+    const { summary, reason } = options;
+    if ( reason !== 'session_max' || summary?.version !== 3 || ! summary.enabled ) return null;
+    const free = summary.plan.sku === 'free_v3';
+    const target = free ? 'standard_monthly_v3' : summary.plan.sku === 'standard_monthly_v3' ? 'premium_monthly_v3' : null;
+    const action = free ? 'checkout' : 'upgrade';
+    const offer = summary.catalog.offers.find(offer => offer.sku === target);
+    if ( ! offer || ! summary.actions[action] ) return null;
+    const sheet = billingSheet(options, action, 'Your session ended');
+    if ( sheet.existing ) return null;
+    sheet.dialog.dataset.sheet = 'session-end';
+    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name} gives you ${offer.sessionMaxSeconds / 3600}-hour sessions and opens from a ready computer — ${money(offer.priceCents)}/month.`);
+    offerDetails(sheet, offer);
+    sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');
+    sheet.button(free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {
+        if ( ! summary.actions[action] ) return;
+        sheet.close();
+        const next = free ? (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer })
+            : openComputeUpgradeSheet(options);
+        options.onContinue?.(next);
+    });
     return sheet.handle;
 }

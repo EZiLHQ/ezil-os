@@ -15,11 +15,11 @@ test('redaction removes every key mode and checkout secret while retaining usefu
 
 test('copy scan covers the entire frozen list with positive controls', () => {
     assert.deepEqual(scanCopy('$20 USD · before tax. 2 vCPU · 8 GiB. Sessions run up to 6 hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.'), []);
-    for (const term of ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'fair use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai']) {
+    for (const term of ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour']) {
         assert.deepEqual(scanCopy(`A ${term.toUpperCase()} claim`), [term]);
         assert.deepEqual(scanCopy(term.replaceAll(' ', '\n\t ')), [term]);
     }
-    assert.deepEqual(scanCopy('HEAVY\n USE and fair\tuse'), ['heavy use', 'fair use']);
+    assert.deepEqual(scanCopy('HEAVY\n USE and fair\tuse'), ['heavy use']);
     assert.deepEqual(scanCopy('instantly available'), ['instant']);
 });
 

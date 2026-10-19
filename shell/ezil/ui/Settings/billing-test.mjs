@@ -1,4 +1,5 @@
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
+import { summaryV3 } from './billing-v3-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -123,12 +124,7 @@ const bundled = await build({
         resolveDir: path.resolve(here, '../../../..'),
     },
     bundle: true, write: false, format: 'iife', target: 'es2022',
-    plugins: [{ name: 'payment-surface-port', setup (builder) {
-        builder.onResolve({ filter: /(?:upgrade-sheet|billing-sheets)\.js$/ }, args => ({ path: args.path, namespace: 'test' }));
-        builder.onLoad({ filter: /.*/, namespace: 'test' }, args => ({ contents: args.path.endsWith('billing-sheets.js')
-            ? ['openComputeUpgradeSheet', 'openDowngradeSheet', 'openCancelSheet', 'openOverageSheet'].map(name => `export function ${name} () { throw new Error('unavailable'); }`).join('\n')
-            : "export function openUpgradeSheet () { throw new Error('unavailable'); } export function parseBillingDeepLink () { return null; }" }));
-    } }],
+
 });
 window.eval(fs.readFileSync(path.join(out, 'icons.js'), 'utf8'));
 window.eval(bundled.outputFiles[0].text);
@@ -165,10 +161,10 @@ const changeSize = code => {
     input.checked = true;
     input.dispatchEvent(new window.Event('change', { bubbles: true }));
 };
-const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|fair\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai/i;
+const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai|compute\s+hours|standard-hour/i;
 let audited = 0, groups = 0;
 function audit () {
-    assert.equal(banned.test(text()), false, 'whole pane passes v2 copy scan');
+    assert.equal(banned.test(summary.version === 2 ? text().replace(/standard-hours?/gi, '') : text()), false, 'whole pane passes v2 copy scan');
     for ( const element of qa('[data-pane="billing"] button, [data-pane="billing"] a, [data-pane="billing"] input[type="radio"]') ) {
         assert.ok(element.getAttribute('aria-label') || (element.type === 'radio' ? [...element.labels].map(label => label.textContent).join('').trim() : element.textContent.trim()), 'control has an accessible name');
     }
@@ -228,7 +224,7 @@ try {
     assert.ok(banned.test('unlimited'), 'copy scan positive control');
     for ( const term of window.billingFormat.BANNED_COPY ) assert.ok(banned.test(term));
     const f = window.billingFormat;
-    assert.deepEqual(copy(f.BANNED_COPY), ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'fair use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai']);
+    assert.deepEqual(copy(f.BANNED_COPY), ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour']);
     assert.equal(f.dollars('900719925474099300'), '$9007199254740993.00');
     assert.equal(f.dollars(2000, { compact: true }), '$20');
     assert.equal(f.dollars(-2050, { compact: true }), '-$20.50');
@@ -262,7 +258,7 @@ try {
         bundle: true, write: false, format: 'iife', target: 'es2022',
     });
     window.eval(sheetBundle.outputFiles[0].text);
-    assert.deepEqual(Object.keys(window.realBillingSheets).sort(), ['openComputeUpgradeSheet', 'openDowngradeSheet', 'openCancelSheet', 'openOverageSheet'].sort());
+    assert.deepEqual(Object.keys(window.realBillingSheets).sort(), ['openComputeUpgradeSheet', 'openDowngradeSheet', 'openCancelSheet', 'openOverageSheet', 'openPlanPickerSheet', 'openSessionEndSheet'].sort());
     for ( const fn of Object.values(window.realBillingSheets) ) assert.equal(typeof fn, 'function');
     pass('shared formatting, 12 distinct error mappings, safe URLs and sheet exports');
 
@@ -835,6 +831,63 @@ try {
     summary = v2('standard'); summary.compute.allowanceStdSeconds = 30000; summary.catalog.offers[0].allowanceStdSeconds = 90 * 3600; summary.catalog.offers[0].priceCents = 3000;
     await refresh(); contains('[data-role="plan-card"]', '90 standard-hours each billing period'); contains('.ezil-billing-price', '$30/month');
     pass('disabled/v1 summaries, failed summary retry, loading state and prorated plan-card source');
+
+    for ( const tier of ['free', 'standard', 'premium'] ) {
+        summary = summaryV3(tier); await open();
+        contains('[data-role="plan-card"]', summary.plan.name);
+        contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
+        contains('[data-role="your-computer"]', `Sessions up to ${summary.computer.sessionMaxSeconds / 3600} hour`);
+        if ( tier !== 'free' ) {
+            contains('[data-role="plan-card"]', `Renews on Nov 1 for $${tier === 'standard' ? 20 : 40}`);
+            contains('[data-role="your-computer"]', 'Opens from a ready computer');
+            contains('[data-action="portal"]', 'Manage payment');
+            contains('[data-action="cancel"]', 'Cancel');
+        }
+        contains('[data-role="fair-use"]', 'Within fair use');
+        for ( const selector of ['[role="progressbar"]', '[data-meter]', '[data-role="size-selector"]', '[data-role="overage"]', '[data-role="estimate"]'] ) has(selector, false);
+        assert.doesNotMatch(text(), /\bcompute\b|standard-hour|instant|unlimited/i);
+        const action = tier === 'free' ? 'choose' : tier === 'standard' ? 'upgrade' : 'downgrade';
+        click(q(`[data-action="${action}"]`));
+        if ( tier === 'free' ) {
+            has('[data-sheet="choose"]');
+            assert.equal(qa('[data-sheet="choose"] li').length, 6);
+            click(q('[data-sheet="choose"] [data-sku="standard_monthly_v3"]'));
+            assert.equal(sheets.at(-1).kind, 'checkout');
+            assert.equal(sheets.at(-1).sku, 'standard_monthly_v3');
+            has('[data-sheet="choose"]', false);
+        } else assert.equal(sheets.at(-1).kind, action);
+        await closeSheet();
+    }
+    summary = summaryV3(); await refresh();
+    for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1 — upgrade to keep working']] ) {
+        summary.fairUse.status = status; await refresh(); contains('[data-role="fair-use"]', copy);
+    }
+    summary.plan.status = 'cancels'; summary.plan.cancelsAt = END; await refresh();
+    contains('[data-role="cancels-banner"]', 'Your plan ends on Nov 1'); assert.ok(!text().includes('Renews on'));
+    summary.plan.status = 'past_due'; summary.plan.paymentIssue = 'payment_failed'; await refresh();
+    contains('[data-role="payment-banner"]', "Your last payment didn't go through");
+    mutation = () => failure('stripe_unavailable'); click(q('[data-action="portal"]')); await settle();
+    contains('[data-role="billing-action-error"]', 'Payments are unavailable'); assert.equal(q('[data-action="portal"]').disabled, false);
+    mutation = () => reply({ url: 'javascript:alert(1)' }); const previousOpened = opened.length;
+    click(q('[data-action="portal"]')); await settle(); assert.equal(opened.length, previousOpened);
+    mutation = () => reply({ url: 'https://billing.example.test/v3' }); click(q('[data-action="portal"]')); await settle();
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/v3');
+    summary = summaryV3(); history = [invoice()]; getHistory = () => failure('private invoice failure'); await refresh();
+    contains('[data-role="invoice-rows"]', "Couldn't load invoices.");
+    getHistory = () => reply(history); click(q('[data-role="invoice-rows"] [data-action="retry"]')); await settle();
+    has('[data-role="invoice-rows"] a');
+    for ( const sku of ['standard_monthly_v3', 'premium_monthly_v3'] ) {
+        summary = summaryV3('free'); await open({ ...context, initialTab: 'billing', openUpgrade: sku });
+        assert.equal(sheets.at(-1).sku, sku); await closeSheet();
+    }
+    summary = summaryV3(); await open({ ...context, initialTab: 'billing', openUpgrade: 'premium_monthly_v3' });
+    assert.equal(sheets.at(-1).kind, 'upgrade'); await closeSheet();
+    summary = summaryV3(); summary.plan.name = '<img src=x onerror=alert(1)>'; await refresh();
+    has('[data-role="plan-card"] img', false); contains('[data-role="plan-card"]', '<img');
+    for ( const key of Object.keys(summary.actions) ) summary.actions[key] = false;
+    await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false);
+    pass('v3 DTO-only plans, fair-use states, cancellation/payment, invoices, actions, deep links, escaping and failure recovery');
+    summary = v2(); history = []; await refresh();
 
     const billingRequests = () => calls.filter(call => call.url.includes('/billing.')).length;
     for ( const ctx of [

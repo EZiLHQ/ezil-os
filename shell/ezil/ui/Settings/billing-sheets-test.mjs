@@ -1,4 +1,5 @@
 // Real sheet modules, deterministic tRPC DTO fakes, no network or browser.
+import { summaryV3 } from './billing-v3-fixtures.mjs';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -9,11 +10,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { build } = require(require.resolve('esbuild', { paths: [path.resolve(here, '../../../../app')] }));
 const bundle = (await build({
-    stdin: { contents: "import * as sheets from './billing-sheets.js'; import { openUpgradeSheet } from './upgrade-sheet.js'; import { BANNED_COPY } from './billing-format.js'; window.api = { ...sheets, openUpgradeSheet, BANNED_COPY };", resolveDir: here },
+    stdin: { contents: "import { watchBillingSessionEnd } from './session-end.js'; import * as sheets from './billing-sheets.js'; import { openUpgradeSheet } from './upgrade-sheet.js'; import { BANNED_COPY } from './billing-format.js'; window.api = { watchBillingSessionEnd, ...sheets, openUpgradeSheet, BANNED_COPY };", resolveDir: here },
     bundle: true, write: false, format: 'iife', target: 'es2022',
 })).outputFiles[0].text;
 const css = fs.readFileSync(new URL('./upgrade-sheet.css', import.meta.url), 'utf8');
-const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|fair\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai/i;
+const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai|compute\s+hours|standard-hour/i;
 const END = '2026-11-01T00:00:00Z';
 const TERMS = 'overage-v2-2026-10-18';
 const COMPUTE = 'compute_monthly_v2', STANDARD = 'standard_monthly_v2';
@@ -87,7 +88,7 @@ function harness () {
     };
     h.ready = async kind => { h.open(kind); await settle(); h.audit(); if ( kind === 'overage' ) h.click('input[type="checkbox"]'); };
     h.audit = () => {
-        assert.doesNotMatch(h.text(), banned);
+        assert.doesNotMatch(h.summary.version === 2 ? h.text().replace(/standard-hours?/gi, '') : h.text(), banned);
         for ( const element of doc.querySelectorAll('[role="dialog"] button, [role="dialog"] input, [role="dialog"] a, [role="dialog"] summary') ) {
             const name = element.getAttribute('aria-label') || (element.tagName === 'INPUT' ? [...element.labels].map(label => label.textContent).join('') : element.textContent);
             assert.ok(name?.trim(), `accessible name: ${element.outerHTML}`);
@@ -394,12 +395,98 @@ test('v2 copy scan positive controls and responsive/focus/motion styles', async 
     assert.match(css, /flex-wrap: wrap/); assert.match(css, /tabular-nums/);
     assert.match(css, /:focus-visible/); assert.match(css, /prefers-reduced-motion/);
 });
+test('v3 upgrade shows catalog benefits, prorated price, exact target and recoverable failure', async h => {
+    h.summary = summaryV3();
+    h.reply = method => method === 'billing.previewUpgrade' ? ok({ ...preview, toSku: 'premium_monthly_v3', lines: [{ description: 'Remaining Premium', amountCents: 1200 }], amountDueCents: 1200 }) : fail('stripe_unavailable');
+    await h.ready('upgrade');
+    assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$40\/month/);
+    assert.match(h.text(), /Usage included/); assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 3);
+    assert.match(h.text(), /Due now \$12/); assert.doesNotMatch(h.text(), /standard-hour|\bcompute\b/i);
+    assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
+    h.click('[data-action="confirm"]'); await settle();
+    assert.match(h.text(), /Payments are unavailable/); assert.equal(h.q('[data-action="confirm"]').disabled, false);
+    h.reply = () => ok(confirmation('applied')); h.click('[data-action="confirm"]'); await settle();
+    assert.deepEqual(h.calls.at(-1).input, { toSku: 'premium_monthly_v3', prorationDate: preview.prorationDate });
+    assert.match(h.text(), /You're on Premium/);
+});
+for ( const status of ['requires_action', 'payment_failed'] ) test(`v3 upgrade ${status} keeps the plan pending`, async h => {
+    h.summary = summaryV3();
+    h.reply = method => ok(method === 'billing.previewUpgrade' ? { ...preview, lines: [] } : confirmation(status));
+    await h.ready('upgrade'); h.click('[data-action="confirm"]'); await settle();
+    assert.doesNotMatch(h.text(), /You're on Premium/); assert.ok(h.q('[data-action="open-invoice"]'));
+    assert.match(h.text(), status === 'requires_action' ? /Confirm the payment with your bank/ : /payment didn't go through/);
+});
+test('v3 preview failure has Retry and never offers payment without a price', async h => {
+    h.summary = summaryV3(); h.reply = () => fail('stripe_unavailable');
+    await h.ready('upgrade'); assert.equal(h.q('[data-action="confirm"]'), null);
+    h.reply = () => ok({ ...preview, lines: [] }); h.click('[data-action="retry"]'); await settle();
+    assert.ok(h.q('[data-action="confirm"]'));
+});
+test('v3 plan picker has two choices, three benefits each, then embedded checkout', async h => {
+    h.summary = summaryV3('free'); const chosen = [];
+    h.window.api.openPlanPickerSheet({ ...h.options(), checkout: options => chosen.push(options) });
+    assert.equal(h.doc.querySelectorAll('[data-action="checkout"]').length, 2);
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 6);
+    assert.match(h.text(), /Most popular/); assert.match(h.text(), /\$20\/month/); assert.match(h.text(), /\$40\/month/);
+    h.click('[data-sku="premium_monthly_v3"]');
+    assert.equal(chosen.length, 1); assert.equal(chosen[0].sku, 'premium_monthly_v3');
+    assert.equal(h.q('[role="dialog"]'), null);
+});
+test('v3 change and cancel use only v3 summary dates and period-end mutations', async h => {
+    h.summary = summaryV3('premium'); await h.ready('downgrade');
+    assert.match(h.text(), /keep Premium until Nov 1/); assert.match(h.text(), /\$20\/month/);
+    h.click('[data-action="confirm"]'); await settle();
+    assert.deepEqual(h.calls.at(-1).input, { toSku: 'standard_monthly_v3' });
+    h.handle.close(); await h.ready('cancel'); assert.match(h.text(), /Cancel Premium/);
+    h.click('[data-action="confirm"]'); await settle(); assert.deepEqual(h.calls.at(-1).input, { cancel: true });
+});
+for ( const tier of ['free', 'standard'] ) test(`v3 ${tier} limit stop opens one session-end offer`, async h => {
+    h.summary = summaryV3(tier); const chosen = [];
+    const opts = { ...h.options(), reason: 'session_max', checkout: options => chosen.push(options) };
+    h.window.api.openSessionEndSheet(opts);
+    assert.ok(h.q('[data-sheet="session-end"]'));
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 3);
+    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard gives you 2-hour sessions and opens from a ready computer — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
+    h.click('[data-action="continue"]'); await settle();
+    if ( tier === 'free' ) assert.equal(chosen[0].sku, 'standard_monthly_v3');
+    else assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
+});
+test('v3 session-end ignores idle, disconnect, fair-use stop, disallowed actions and Premium', async h => {
+    h.summary = summaryV3('free');
+    for ( const reason of ['idle_sleep', 'provider_stop', 'fair_use_paused', undefined] ) assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason }), null);
+    h.summary.actions.checkout = false; assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason: 'session_max' }), null);
+    h.summary = summaryV3('premium'); assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason: 'session_max' }), null);
+    assert.equal(h.q('[role="dialog"]'), null); assert.equal(h.calls.length, 0);
+});
+test('v3 confirmed-stop event fetches summary once; failures retry and teardown removes the listener', async h => {
+    h.summary = summaryV3('free'); let reads = 0, available = false;
+    const stop = h.window.api.watchBillingSessionEnd({ win: h.window, client: { query: async () => { reads++; return available ? ok(h.summary) : fail('unavailable'); }, mutate: async () => fail('stripe_unavailable') } });
+    const emit = reason => h.window.dispatchEvent(new h.window.CustomEvent('ezil:session-ended', { detail: { reason } }));
+    emit('idle_sleep'); await settle(); assert.equal(reads, 0);
+    emit('session_max'); await settle(); assert.equal(reads, 1); assert.equal(h.q('[role="dialog"]'), null);
+    available = true; emit('session_max'); emit('session_max'); await settle();
+    assert.equal(reads, 2); assert.ok(h.q('[data-sheet="session-end"]'));
+    emit('session_max'); await settle(); assert.equal(reads, 2);
+    h.click('[data-action="continue"]'); await settle(); assert.ok(h.q('[data-role="upgrade-sheet"]'));
+    emit('session_max'); await settle(); assert.equal(reads, 2);
+    stop(); emit('session_max'); await settle(); assert.equal(reads, 2); assert.equal(h.q('[role="dialog"]'), null);
+});
+test('v3 session event does not take ownership of an existing billing sheet', async h => {
+    h.summary = summaryV3(); await h.ready('cancel');
+    const stop = h.window.api.watchBillingSessionEnd({ win: h.window, client: { query: async () => ok(h.summary) } });
+    const emit = () => h.window.dispatchEvent(new h.window.CustomEvent('ezil:session-ended', { detail: { reason: 'session_max' } }));
+    emit(); await settle(); assert.ok(h.q('[data-sheet="cancel"]'));
+    h.handle.close(); emit(); await settle(); assert.ok(h.q('[data-sheet="session-end"]'));
+    stop(); assert.equal(h.q('[role="dialog"]'), null);
+});
 let failed = 0, states = 0;
 for ( const { name, fn } of tests ) {
     const h = harness();
     try {
         await fn(h); await settle(); h.audit();
-        for ( const state of h.states ) assert.doesNotMatch(state, banned);
+        for ( const state of h.states ) assert.doesNotMatch(h.summary.version === 2 ? state.replace(/standard-hours?/gi, '') : state, banned);
         states += h.states.length;
         console.log(`PASS ${name}`);
     } catch (error) { failed++; console.error(`FAIL ${name}\n${error.stack}`); }

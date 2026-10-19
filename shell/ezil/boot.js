@@ -83,11 +83,13 @@ import { PuterBackendRemovedError, puter } from '../src/ezil-stubs.js';
 import session from './session.js';
 import { isNative } from './native-runtime.js';
 import registry from './apps/registry.js';
+import { watchBillingSessionEnd } from './ui/Settings/session-end.js';
 import { parseBillingDeepLink } from './ui/Settings/upgrade-sheet.js';
 import { warm } from './warm.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
 let nativePersistence = null;
 let billingDeepLinkHandled = false;
+let stopBillingSessionEnd = null;
 
 const PHASE = 'ezil-os:boot';
 
@@ -905,6 +907,9 @@ async function build (payload) {
     // nobody can see.
     console.info(`[${PHASE}] resolved ${apps.length} app(s); opening none automatically`,
         apps.map(a => a.id));
+
+    stopBillingSessionEnd?.();
+    stopBillingSessionEnd = payload.features?.billing === true && ! isNative(ctx) ? watchBillingSessionEnd() : null;
 
     // A return link is explicit launch intent. Reserve it before awaiting the
     // launcher so a shell rebuild cannot open the same checkout twice.
