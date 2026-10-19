@@ -7177,7 +7177,12 @@ export default {
       try {
         const result = await openSandbox(env, name).resetRuntimeForAcceptance(name);
         return json(result, result.ok ? 200 : 409);
-      } catch { return json({ok:false,error:'acceptance_reset_failed'},502); }
+      } catch (error) {
+        // An object still on the previous revision (the state this route exists
+        // for) has no such method yet; say so, so the prepare step can skip it.
+        if (/does not implement|not a function|no such method/i.test(String(error))) return json({ok:false,error:'acceptance_reset_unsupported'},501);
+        return json({ok:false,error:'acceptance_reset_failed'},502);
+      }
     }
     const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
     if (method === 'POST' && acceptanceMatch) {

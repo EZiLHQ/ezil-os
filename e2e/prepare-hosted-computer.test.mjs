@@ -43,6 +43,13 @@ test('a failed reset fails preparation with a fixed code and no private values',
   for (const secret of [sandbox, 'worker.staging.example', 'private-test-hmac']) assert.equal(JSON.stringify(evidence).includes(secret), false);
 });
 
+test('an object still on the previous revision skips the reset instead of failing preparation', async () => {
+  const evidence = await prepareHostedComputer(staging, { cleanup: async () => ({ ok: true }),
+    reset: async () => { throw Object.assign(new Error('acceptance_reset_unsupported'), { code: 'acceptance_reset_unsupported' }); } });
+  assert.equal(evidence.ok, true); assert.equal(evidence.runtimeReset, false); assert.equal(evidence.resetSkipped, 'unsupported');
+  assert.equal(evidence.phase, 'complete');
+});
+
 function fakeWorker(statuses, resetAnswer = { status: 200, body: { ok: true } }) {
   const requests = [];
   const fetchImpl = async (url, init = {}) => {

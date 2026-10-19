@@ -135,6 +135,8 @@ function fakeSandboxNamespace(options: {
   restartResult?: Record<string, unknown>;
   /** Canned `resetRuntimeForAcceptance` answer (default: the reset is scheduled). */
   resetResult?: Record<string, unknown>;
+  /** Make `resetRuntimeForAcceptance` throw, as an object on an older revision does. */
+  resetThrows?: Error;
   /**
    * When set, any `exec()` command touching the container's boot-telemetry
    * NDJSON path (`ezil-telemetry.ndjson` — see `drainContainerBootTelemetry`,
@@ -342,7 +344,7 @@ function fakeSandboxNamespace(options: {
   };
   impl.runningContainerFetch = impl.containerFetch!;
   impl.stopRuntimeForAcceptance = impl.terminateSandbox!;
-  impl.resetRuntimeForAcceptance = async () => { calls.resetRuntimeForAcceptance++; return options.resetResult ?? { ok: true }; };
+  impl.resetRuntimeForAcceptance = async () => { calls.resetRuntimeForAcceptance++; if (options.resetThrows) throw options.resetThrows; return options.resetResult ?? { ok: true }; };
 
   const stub = new Proxy(
     {},
@@ -426,6 +428,19 @@ describe('isolated object reset onto the deployed code for acceptance', () => {
     }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME });
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'runtime_running' });
+  });
+  it('reports an object still on the previous revision as unsupported, any other failure as failed', async () => {
+    const env = (resetThrows: Error) => ({ Sandbox: fakeSandboxNamespace({ resetThrows }).binding, SANDBOX_HMAC_SECRET: SECRET,
+      EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME });
+    const call = async (resetThrows: Error) => worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/acceptance-reset`, {
+      method: 'POST', headers: { authorization: `Bearer ${await mintToken()}` },
+    }), env(resetThrows));
+    const old = await call(new TypeError('The RPC receiver does not implement the method "resetRuntimeForAcceptance".'));
+    expect(old.status).toBe(501);
+    expect(await old.json()).toEqual({ ok: false, error: 'acceptance_reset_unsupported' });
+    const broken = await call(new Error('storage unavailable'));
+    expect(broken.status).toBe(502);
+    expect(await broken.json()).toEqual({ ok: false, error: 'acceptance_reset_failed' });
   });
 });
 

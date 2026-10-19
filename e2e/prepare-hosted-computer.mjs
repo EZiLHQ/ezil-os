@@ -20,6 +20,12 @@ export async function prepareHostedComputer(env = process.env, { cleanup = clean
     evidence.runtimeReset = true;
     evidence.phase = 'complete';
   } catch (error) {
+    // The first rollout of the reset reaches an object still on the previous
+    // revision, which cannot reset itself; the reset is a mitigation, not a gate.
+    if (error?.code === 'acceptance_reset_unsupported') {
+      evidence.runtimeReset = false; evidence.resetSkipped = 'unsupported'; evidence.phase = 'complete';
+      return evidence;
+    }
     // Fixed codes only: never a URL, a header or the sandbox name.
     evidence.ok = false;
     evidence.failure = 'test_runtime_reset_failed';
