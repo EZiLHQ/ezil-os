@@ -286,8 +286,16 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         expect((await store.epochsFor(userId, instant(-1))).filter(epoch => epoch.endedAt === null)).toEqual([winner.epoch]);
         const losingComputer = winner.epoch.computerId === computerId ? secondComputerId : computerId;
         expect(await store.openEpochFor(losingComputer)).toBeNull();
-        await rejectsSql(() => db.insert(billingComputeEpochs).values({ userId, computerId: losingComputer,
-            size: 'std-2', weight: 1, readyAt: instant(0) }), '23505');
+        await client`savepoint rejected_write`;
+        try {
+            await expect(db.insert(billingComputeEpochs).values({ userId, computerId: losingComputer,
+                size: 'std-2', weight: 1, readyAt: instant(0) })).rejects.toMatchObject({
+                cause: { code: '23505', constraint_name: 'ezil_billing_compute_epochs_one_open_per_user' },
+            });
+        } finally {
+            await client`rollback to savepoint rejected_write`;
+            await client`release savepoint rejected_write`;
+        }
         expect((await store.openEpoch({ ...epoch(), userId: otherUserId, computerId: otherComputerId })).status).toBe('opened');
         await store.closeEpoch({ computerId: winner.epoch.computerId, endedAt: instant(10), reason: 'user_stop' });
         expect((await store.openEpoch({ ...epoch(instant(11)), computerId: losingComputer })).status).toBe('opened');
