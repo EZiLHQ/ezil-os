@@ -1,6 +1,7 @@
 import {
     CATALOG_V2,
     MIN_START_ACTUAL_SECONDS,
+    OVERAGE_MAX_CAP_CENTS,
     SESSION_MAX_SECONDS,
     SIZES,
     STD_SECONDS_PER_OVERAGE_CENT,
@@ -71,11 +72,13 @@ export const admitStart: AdmitStart = ({
     if (runningComputers >= offer.maxConcurrentComputers) return { admit: false, reason: 'concurrent_limit' };
 
     const weight = SIZES[size].weight;
-    const overageSeconds = overage?.enabled ? overage.capCents * STD_SECONDS_PER_OVERAGE_CENT : 0;
+    const overageOn = offer.overage !== null && overage?.enabled === true;
+    const capCents = Math.max(0, Math.min(overage?.capCents ?? 0, OVERAGE_MAX_CAP_CENTS));
+    const overageSeconds = overageOn ? capCents * STD_SECONDS_PER_OVERAGE_CENT : 0;
     const headroom = Math.max(0, allowanceStdSeconds + overageSeconds - usedStdSeconds);
     const maxActual = Math.floor(headroom / weight);
     if (maxActual < MIN_START_ACTUAL_SECONDS) {
-        return { admit: false, reason: overage?.enabled ? 'overage_cap_reached' : 'allowance_exhausted' };
+        return { admit: false, reason: overageOn ? 'overage_cap_reached' : 'allowance_exhausted' };
     }
     const maxRunSeconds = Math.min(SESSION_MAX_SECONDS, maxActual);
     return { admit: true, size, weight, maxRunSeconds, deadline: isoSeconds(epochSeconds(now) + maxRunSeconds) };

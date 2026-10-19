@@ -75,7 +75,7 @@ function fixture() {
         markOverageInvoiceOpen: vi.fn<BillingStore['markOverageInvoiceOpen']>(),
         setOverageInvoiceStatus: vi.fn<BillingStore['setOverageInvoiceStatus']>(async () => { throw new Error('Unused v2 store stub'); }),
         overageInvoiceByStripeId: vi.fn<BillingStore['overageInvoiceByStripeId']>(async () => { throw new Error('Unused v2 store stub'); }),
-        overageInvoicesFor: vi.fn<BillingStore['overageInvoicesFor']>(async () => { throw new Error('Unused v2 store stub'); }),
+        overageInvoicesFor: vi.fn<BillingStore['overageInvoicesFor']>().mockResolvedValue([]),
         recordPlanChange: vi.fn<BillingStore['recordPlanChange']>(async input => {
             if (changes.some(row => row.subscriptionId === input.subscriptionId && row.kind === input.kind && isOpen(row))) return 'exists';
             changes.push({ ...input, id: `change_${changes.length}`, createdAt: now, updatedAt: now });
@@ -236,7 +236,7 @@ describe('billing router', () => {
         const caller = f.router.createCaller({ ...f.ctx, user: { ...f.ctx.user!, id: otherUser } });
         await caller.summary();
         const reads = ['subscriptionsFor', 'userCreatedAt', 'openPlanChanges', 'epochsFor', 'grantsForPeriod',
-            'latestConsent', 'openPaymentIssues', 'latestStorageFor', 'sizePreference', 'stripeCustomerFor'] as const;
+            'latestConsent', 'openPaymentIssues', 'latestStorageFor', 'sizePreference', 'stripeCustomerFor', 'overageInvoicesFor'] as const;
         for (const [name, method] of Object.entries(f.store)) {
             if (reads.includes(name as typeof reads[number])) {
                 expect(method, name).toHaveBeenCalledTimes(1);
@@ -702,6 +702,47 @@ describe('billing v2 mutations', () => {
             f.store.subscriptionsFor.mockResolvedValue([subscription(overrides)]);
             await domainFailure(() => f.caller.setOverage(overageInput), 'not_subscribed');
         }
+    });
+
+    it.each([
+        { status: 'active' }, { status: 'active', cancelAtPeriodEnd: true }, { status: 'past_due' },
+        { status: 'incomplete' }, { status: 'incomplete', currentPeriodStart: null, currentPeriodEnd: null },
+        { status: 'unpaid' }, { status: 'canceled' }, { status: 'incomplete_expired' }, { status: 'paused' },
+        { status: 'active', currentPeriodEnd: new Date('2026-10-01T00:00:00Z') },
+    ])('allows Compute opt-out for %o using only the session-owned subscription', async overrides => {
+        const f = await paidFixture('compute_monthly_v2');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'compute_monthly_v2', ...overrides })]);
+        const input = { ...overageInput, enabled: false, subscriptionId: 'sub_foreign', userId: 'foreign' };
+        await expect(f.caller.setOverage(input))
+            .resolves.toMatchObject({ enabled: false });
+        expect(f.store.subscriptionsFor).toHaveBeenCalledWith(userId);
+        expect(f.store.recordConsent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ userId,
+            subscriptionId: 'sub_fixture', actor: userId, enabled: false }));
+        if (overrides.status !== 'active' || overrides.cancelAtPeriodEnd) {
+            await domainFailure(() => f.caller.setOverage(overageInput), 'not_subscribed');
+        }
+    });
+
+    it('allows opting out of an owned Compute subscription while Standard supplies the current plan', async () => {
+        const f = await paidFixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription(), subscription({ stripeSubscriptionId: 'sub_compute',
+            sku: 'compute_monthly_v2', status: 'past_due' })]);
+        await expect(f.caller.setOverage({ ...overageInput, enabled: false })).resolves.toMatchObject({ enabled: false, available: false });
+        expect(f.store.recordConsent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+            userId, subscriptionId: 'sub_compute', enabled: false, actor: userId,
+        }));
+    });
+
+    it.each(['open', 'payment_failed', 'requires_action', 'uncollectible'] as const)('keeps overage paused for a %s invoice without an issue row', async status => {
+        const f = await paidFixture('compute_monthly_v2');
+        await f.caller.setOverage(overageInput);
+        f.store.overageInvoicesFor.mockResolvedValue([{ id: 'previous', userId, subscriptionId: 'sub_fixture',
+            periodStart: new Date('2026-08-20T00:00:00Z'), periodEnd: subscription().currentPeriodStart!,
+            ratingVersion: 1, stdSecondsOver: BigInt(14400), cents: 100, stripeInvoiceId: 'in_previous', status,
+            createdAt: now, updatedAt: now }]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ overage: { enabled: false, pausedReason: 'payment_failed' } });
+        await domainFailure(() => f.caller.setOverage(overageInput), 'not_subscribed');
+        await expect(f.caller.setOverage({ ...overageInput, enabled: false })).resolves.toMatchObject({ enabled: false });
     });
 
     it('blocks enabling unresolved overage issues, permits disabling, and isolates other subscriptions', async () => {

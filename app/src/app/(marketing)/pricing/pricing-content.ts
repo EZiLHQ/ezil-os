@@ -46,7 +46,7 @@ export const marketingContent = {
     desktop: { browser: 'Browser', editor: 'VS Code' },
     featuresLabel: 'Your workspace',
     features: [
-        { title: 'A real desktop', description: 'Windows, files and apps that stay where you left them.' },
+        { title: 'A real desktop', description: 'Your files and installed tools stay with your computer between sessions.' },
         { title: 'Browser and VS Code built in', description: 'Build and preview without installing anything.' },
         { title: 'AI assistant', badge: 'coming soon' },
     ],

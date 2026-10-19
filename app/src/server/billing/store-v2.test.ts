@@ -13,6 +13,25 @@ import { CATALOG_V2_VERSION, GRANT_METER_COMPUTE, OVERAGE_CENTS_PER_STD_HOUR, OV
 type Database = typeof import('@/server/db').db;
 const instant = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000);
 
+it.each([false, true])('returns the closed epoch for a ready replay (concurrent close: %s)', async concurrentClose => {
+    const closed = { id: 'epoch_original', userId: 'user_local', computerId: 'computer_local', subscriptionId: 'sub_local',
+        size: 'cmp-4', weight: 2, readyAt: instant(1), endedAt: instant(3601), endReason: 'user_stop', overheadSeconds: 0 };
+    const where = vi.fn().mockResolvedValueOnce([{ id: 'computer_local' }]);
+    if (concurrentClose) where.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    where.mockResolvedValue([closed]);
+    const returning = vi.fn().mockResolvedValue([]);
+    const db = {
+        select: () => ({ from: () => ({ where }) }),
+        insert: () => ({ values: () => ({ onConflictDoNothing: () => ({ returning }) }) }),
+    } as unknown as Database;
+    await expect(createBillingStore(db).openEpoch({ userId: 'user_local', computerId: 'computer_local',
+        subscriptionId: 'sub_local', size: 'cmp-4', readyAt: instant(0.001) })).resolves.toEqual({ status: 'exists', epoch: {
+        id: closed.id, userId: closed.userId, computerId: closed.computerId, size: closed.size, weight: closed.weight,
+        readyAt: '2026-01-01T00:00:01Z', endedAt: '2026-01-01T01:00:01Z', endReason: 'user_stop', overheadSeconds: 0,
+    } });
+    expect(returning).toHaveBeenCalledTimes(concurrentClose ? 1 : 0);
+});
+
 it('bounds openEpoch retries when each conflicting epoch closes before the read', async () => {
     const where = vi.fn().mockResolvedValueOnce([{ id: 'computer_local' }]).mockResolvedValue([]);
     // The fourth call stops the old unbounded loop, making this regression fail
@@ -290,14 +309,14 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         expect(await store.openPaymentIssues(otherUserId)).toEqual([]);
     });
 
-    it('orders consent by identity despite equal or backwards acceptance times', async () => {
+    it('orders consent by acceptance time then identity despite late delivery', async () => {
         expect(await store.latestConsent(userId, subscriptionId)).toBeNull();
         const first = await store.recordConsent(consent());
         const second = await store.recordConsent(consent({ enabled: false }));
         const third = await store.recordConsent(consent({ capCents: 0, acceptedAt: instant(1) }));
         expect(typeof first.id).toBe('bigint');
         expect(second.id > first.id && third.id > second.id).toBe(true);
-        expect(await store.latestConsent(userId, subscriptionId)).toEqual(third);
+        expect(await store.latestConsent(userId, subscriptionId)).toEqual(second);
         expect(await store.latestConsent(userId, 'another_subscription')).toBeNull();
         expect(await db.select().from(billingOverageConsents).where(eq(billingOverageConsents.userId, userId))).toHaveLength(3);
     });

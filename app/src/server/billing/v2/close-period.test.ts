@@ -38,6 +38,8 @@ function fixture() {
             grant.userId === user && meters.includes(grant.meter) && grant.periodStart !== null && grant.periodEnd !== null
             && grant.periodStart < window.end && grant.periodEnd > window.start)),
         epochsFor: vi.fn<BillingStore['epochsFor']>().mockResolvedValue(epochs),
+        openPaymentIssues: vi.fn<BillingStore['openPaymentIssues']>().mockResolvedValue([]),
+        overageInvoicesFor: vi.fn<BillingStore['overageInvoicesFor']>(async () => rows),
         consentDecisionsForPeriod: vi.fn<BillingStore['consentDecisionsForPeriod']>(async (user, subscription, from, to) => {
             const ordered = consents.filter(row => row.userId === user && row.subscriptionId === subscription && row.acceptedAt < to)
                 .sort((a, b) => a.acceptedAt.getTime() - b.acceptedAt.getTime() || Number(a.id - b.id));
@@ -70,6 +72,48 @@ function fixture() {
 }
 
 describe('closePeriodAndInvoiceOverage', () => {
+    it.each([{ termsVersion: 'overage-v1' }, { rateCentsPerStdHour: 30 }])('does not bill stale consent: %o', async stale => {
+        const f = fixture();
+        Object.assign(f.consents[0], stale);
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toEqual({ status: 'skipped', reason: 'overage_disabled' });
+        expect(f.store.upsertOverageInvoice).not.toHaveBeenCalled();
+        expect(f.invoiceOverage).not.toHaveBeenCalled();
+    });
+
+    it('bills only usage after the current terms and rate are accepted', async () => {
+        const f = fixture();
+        f.consents.push({ ...f.consents[0], id: BigInt(2), acceptedAt: atStdHours(550) });
+        f.consents[0].rateCentsPerStdHour = 30;
+        await closePeriodAndInvoiceOverage(f.deps, input);
+        expect(f.rows[0]).toMatchObject({ stdSecondsOver: BigInt(50 * 3600), cents: 1250 });
+    });
+
+    it('blocks billing for a late failure despite later enabled consent, until the issue is resolved', async () => {
+        const f = fixture();
+        const failedAt = atStdHours(100);
+        f.consents.push({ ...f.consents[0], id: BigInt(2), acceptedAt: atStdHours(200), capCents: 10000 });
+        const issue = { userId, subscriptionId, stripeInvoiceId: 'in_previous', invoiceKind: 'overage' as const,
+            issue: 'payment_failed' as const, hostedInvoiceUrl: null, stripeEventCreated: failedAt, resolvedAt: null, updatedAt: now };
+        f.store.openPaymentIssues.mockResolvedValue([issue]);
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toEqual({ status: 'skipped', reason: 'overage_disabled' });
+        expect(f.invoiceOverage).not.toHaveBeenCalled();
+        expect(f.store.upsertOverageInvoice).not.toHaveBeenCalled();
+        f.store.openPaymentIssues.mockResolvedValue([{ ...issue, resolvedAt: now }]);
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toMatchObject({ status: 'invoiced' });
+    });
+
+    it.each(['open', 'payment_failed', 'requires_action', 'uncollectible'] as const)('blocks billing for an unpaid %s invoice without an issue row', async status => {
+        const f = fixture();
+        const invoice: OverageInvoiceRow = { id: 'previous', userId, subscriptionId, periodStart: new Date('2026-08-01T00:00:00Z'),
+            periodEnd: start, ratingVersion: 1, stdSecondsOver: BigInt(14400), cents: 100, stripeInvoiceId: 'in_previous',
+            status, createdAt: start, updatedAt: now };
+        f.store.overageInvoicesFor.mockResolvedValue([invoice]);
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toEqual({ status: 'skipped', reason: 'overage_disabled' });
+        expect(f.invoiceOverage).not.toHaveBeenCalled();
+        f.store.overageInvoicesFor.mockResolvedValue([{ ...invoice, subscriptionId: 'sub_other' }]);
+        await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toMatchObject({ status: 'invoiced' });
+    });
+
     it('bills 25 six-hour cmp-8 epochs at exactly $25 once and persists the draft identity', async () => {
         const f = fixture();
         await expect(closePeriodAndInvoiceOverage(f.deps, input)).resolves.toMatchObject({ status: 'invoiced', invoiceId: 'in_overage' });

@@ -1,11 +1,11 @@
 import { storageCapBytes } from '../catalog';
 import { checkoutAvailable, type BillingConfig } from '../config';
 import { storageState, type SubscriptionRow } from '../meters';
-import type { GrantMeter, GrantRow, OverageConsentRow, PaymentIssueRow, PlanChangeRow } from '../ports';
+import type { GrantMeter, GrantRow, OverageConsentRow, OverageInvoiceRow, PaymentIssueRow, PlanChangeRow } from '../ports';
 import { offerBySku, planFromSubscriptions } from './catalog';
 import {
     CATALOG_V2, CATALOG_V2_VERSION, GRANT_METER_COMPUTE, IDLE_SLEEP_SECONDS,
-    OVERAGE_DEFAULT_CAP_CENTS, OVERAGE_TERMS_VERSION, SESSION_MAX_SECONDS, SESSION_WARN_SECONDS, SIZES,
+    OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_DEFAULT_CAP_CENTS, OVERAGE_TERMS_VERSION, SESSION_MAX_SECONDS, SESSION_WARN_SECONDS, SIZES,
     type BillingSummaryV2, type ComputeEpoch, type OfferDTO, type PlanFamily, type SellableSku, type SizeCode,
 } from './contract';
 import { ratePeriod, rateWindow } from './rating';
@@ -20,10 +20,20 @@ export function summaryMeters(family: PlanFamily): GrantMeter[] {
 const iso = (date: Date) => isoSeconds(epochSeconds(date));
 const sellable = (sku: string | null): sku is SellableSku => sku !== null && offerBySku(sku)?.sellable === true;
 
+/** Unresolved failures and finalized unpaid invoices override even later consent. */
+export function hasOveragePaymentFailure(subscriptionId: string | null, issues: readonly PaymentIssueRow[],
+    invoices: readonly OverageInvoiceRow[] = []): boolean {
+    return issues.some(issue => issue.subscriptionId === subscriptionId && issue.invoiceKind === 'overage'
+        && issue.resolvedAt === null && issue.issue !== 'voided')
+        || invoices.some(invoice => invoice.subscriptionId === subscriptionId
+            && ['open', 'payment_failed', 'requires_action', 'uncollectible'].includes(invoice.status));
+}
+
 export function buildSummaryV2(input: {
     config: BillingConfig; now: Date; userCreatedAt: Date | null;
     subs: SubscriptionRow[]; epochs: readonly ComputeEpoch[]; grants: readonly GrantRow[];
     consent: OverageConsentRow | null; planChanges: readonly PlanChangeRow[]; paymentIssues: readonly PaymentIssueRow[];
+    overageInvoices?: readonly OverageInvoiceRow[];
     storage: { computerId: string; bytes: bigint; measuredAt: Date }[]; sizePreference: SizeCode | null; hasCustomer: boolean;
 }): BillingSummaryV2 {
     const { config, now, subs, userCreatedAt, epochs, grants, consent, storage } = input;
@@ -48,7 +58,7 @@ export function buildSummaryV2(input: {
     const issues = input.paymentIssues.filter(issue => issue.resolvedAt === null && issue.issue !== 'voided'
         && issue.subscriptionId === plan.subscriptionId);
     const subscriptionIssues = issues.filter(issue => issue.invoiceKind !== 'overage');
-    const overageIssue = issues.some(issue => issue.invoiceKind === 'overage');
+    const overageIssue = hasOveragePaymentFailure(plan.subscriptionId, input.paymentIssues, input.overageInvoices);
     const delinquent = plan.status === 'past_due' || plan.status === 'incomplete';
     const paymentIssue = subscriptionIssues.some(issue => issue.issue === 'requires_action') ? 'requires_action'
         : subscriptionIssues.length > 0 || delinquent ? 'payment_failed'
@@ -68,7 +78,8 @@ export function buildSummaryV2(input: {
         allowanceStdSeconds = Number(allowance < BigInt(0) ? BigInt(0) : allowance);
         if (!Number.isSafeInteger(allowanceStdSeconds)) throw new RangeError('Compute allowance exceeds safe integer range');
     }
-    const overageOn = consent?.enabled === true && !overageIssue;
+    const overageOn = offer.overage !== null && consent?.enabled === true && !overageIssue
+        && consent.termsVersion === OVERAGE_TERMS_VERSION && consent.rateCentsPerStdHour === OVERAGE_CENTS_PER_STD_HOUR;
     const capCents = consent?.capCents ?? OVERAGE_DEFAULT_CAP_CENTS;
     const usage = rateWindow({ epochs, window, now: iso(now) });
     const rating = ratePeriod({
