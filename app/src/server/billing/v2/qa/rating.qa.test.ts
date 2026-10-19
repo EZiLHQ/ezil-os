@@ -24,19 +24,19 @@ function epoch(size: SizeCode, readyAt: string, endedAt: string | null, extra: P
 
 describe('qa golden oracle (independent python oracle)', () => {
     it.each(golden.rateWindow.map(c => [c.name, c] as const))('rateWindow %s', (_name, c) => {
-        expect(rateWindow(c.input as Parameters<typeof rateWindow>[0])).toEqual(c.expected);
+        expect(rateWindow(c.input as unknown as Parameters<typeof rateWindow>[0])).toEqual(c.expected);
     });
     it.each(golden.ratePeriod.map(c => [c.name, c] as const))('ratePeriod %s', (_name, c) => {
-        expect(ratePeriod(c.input as Parameters<typeof ratePeriod>[0])).toEqual(c.expected);
+        expect(ratePeriod(c.input as unknown as Parameters<typeof ratePeriod>[0])).toEqual(c.expected);
     });
     it.each(golden.upgradeGrant.map(c => [c.name, c] as const))('upgradeGrant %s', (_name, c) => {
-        const got = upgradeGrantStdSeconds(c.input as Parameters<typeof upgradeGrantStdSeconds>[0]);
+        const got = upgradeGrantStdSeconds(c.input as unknown as Parameters<typeof upgradeGrantStdSeconds>[0]);
         expect(got).toBe(c.expected);
         // Never the full Compute period allowance: at most the Standard→Compute delta.
         expect(got).toBeLessThanOrEqual(CATALOG_V2.compute_monthly_v2.allowanceStdSeconds - CATALOG_V2.standard_monthly_v2.allowanceStdSeconds);
     });
     it.each(golden.admitStart.map(c => [c.name, c] as const))('admitStart %s', (_name, c) => {
-        expect(admitStart(c.input as Parameters<typeof admitStart>[0])).toEqual(c.expected);
+        expect(admitStart(c.input as unknown as Parameters<typeof admitStart>[0])).toEqual(c.expected);
     });
 });
 
