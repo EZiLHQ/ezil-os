@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { deployedTarget, configureAppContext, APP_STOP_FETCH_TIMEOUT_MS } from './deployed-target.mjs';
 import { stopIsolatedComputer } from './isolated-computer.mjs';
 
-export async function cleanupHostedComputer(env = process.env, chromium) {
+export async function cleanupHostedComputer(env = process.env, chromium, send) {
   const evidence = { ok: false, phase: 'prerequisites' };
   let browser;
   try {
@@ -41,7 +41,7 @@ export async function cleanupHostedComputer(env = process.env, chromium) {
       assert.ok((await session.json()).computer?.id === computerId, 'cleanup_computer_mismatch');
     } finally { await session.dispose(); }
     evidence.phase = 'final_stop';
-    await stopIsolatedComputer(context, computerId, app, headers, APP_STOP_FETCH_TIMEOUT_MS);
+    await stopIsolatedComputer(context, computerId, app, headers, APP_STOP_FETCH_TIMEOUT_MS, send);
     evidence.cleanupStopped = true;
     evidence.ok = true;
     evidence.phase = 'complete';

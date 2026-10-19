@@ -12,7 +12,8 @@ import './cleanup-hosted-computer.test.mjs';
 import './editor-shortcut.test.mjs';
 import './relay-lifetime.test.mjs';
 import './await-container-rollout.test.mjs';
-import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout } from './deployed-target.mjs';
+import http from 'node:http';
+import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout, appRequest } from './deployed-target.mjs';
 import './sign-in.test.mjs';
 import './code-picker.test.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
@@ -155,13 +156,52 @@ test('checkpoint stop bypass leaves room for the provider budget and bounds hung
   for (const [method, path] of [['GET', '/api/shell/stop'], ['POST', '/api/shell/desktop'], ['POST', '/api/shell/stop-other']]) {
     assert.equal(appFetchTimeout(request(method, path)), APP_FETCH_TIMEOUT_MS);
   }
-  let handler, options;
-  await configureAppContext({ route: async (_pattern, callback) => { handler = callback; } },
-    { app: target.app, headers: { 'x-vercel-protection-bypass': 'test-bypass' } });
-  await handler({ request: () => request('POST', '/api/shell/stop'),
-    fetch: async value => { options = value; return 'response'; }, fulfill: async () => {} });
-  assert.equal(options.timeout, APP_STOP_FETCH_TIMEOUT_MS);
-  assert.equal(options.maxRedirects, 0);
+  let handler, sent, fulfilled;
+  await configureAppContext({ route: async (_pattern, callback) => { handler = callback; },
+    cookies: async (url) => { assert.equal(url, `${target.app}/api/shell/stop`); return [{ name: 'sb', value: 'session' }]; } },
+  { app: target.app, headers: { 'x-vercel-protection-bypass': 'test-bypass' },
+    send: async (url, options) => { sent = [url, options]; return { status: 200,
+      headers: { 'content-type': 'application/json', 'set-cookie': ['a=1', 'b=2'], connection: 'close', 'content-length': '2' }, body: Buffer.from('{}') }; } });
+  await handler({ request: () => ({ ...request('POST', '/api/shell/stop'), headers: () => ({ 'content-type': 'application/json' }),
+    postDataBuffer: () => Buffer.from('{"computerId":"x"}') }),
+  fetch: async () => { throw new Error('API calls must not use the keep-alive client'); }, fulfill: async value => { fulfilled = value; } });
+  assert.deepEqual(sent, [`${target.app}/api/shell/stop`, { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-vercel-protection-bypass': 'test-bypass', cookie: 'sb=session' },
+    body: Buffer.from('{"computerId":"x"}'), timeout: APP_STOP_FETCH_TIMEOUT_MS }]);
+  assert.deepEqual(fulfilled, { status: 200, headers: { 'content-type': 'application/json', 'set-cookie': 'a=1\nb=2' }, body: Buffer.from('{}') });
+});
+
+test('app API transport sends a fresh connection, never follows redirects and bounds silent responses', async (t) => {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      seen.push({ method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString() });
+      if (req.url === '/silent') return;
+      res.writeHead(302, { location: 'https://elsewhere.example/', 'set-cookie': ['a=1; Path=/', 'b=2; Path=/'] });
+      res.end('moved');
+    });
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const response = await appRequest(`${origin}/api/shell/stop`, { method: 'POST', body: '{"computerId":"x"}', timeout: 5000,
+    headers: { ':authority': 'x', host: 'spoofed', connection: 'keep-alive', 'content-length': '1', 'accept-encoding': 'gzip', cookie: 'sb=1', 'x-vercel-protection-bypass': 'b' } });
+  assert.equal(response.status, 302);
+  assert.deepEqual(response.headers['set-cookie'], ['a=1; Path=/', 'b=2; Path=/']);
+  assert.equal(response.body.toString(), 'moved');
+  assert.equal(seen.length, 1, 'redirect must not be followed');
+  assert.equal(seen[0].body, '{"computerId":"x"}');
+  assert.equal(seen[0].headers.host, `127.0.0.1:${server.address().port}`);
+  assert.equal(seen[0].headers.connection, 'close', 'no pooled keep-alive socket');
+  assert.equal(seen[0].headers['accept-encoding'], 'identity');
+  assert.equal(seen[0].headers.cookie, 'sb=1');
+  assert.equal(seen[0].headers['x-vercel-protection-bypass'], 'b');
+  const error = await appRequest(`${origin}/silent`, { headers: { cookie: 'sb=SECRET', 'x-vercel-protection-bypass': 'BYPASS' }, timeout: 300 })
+    .then(() => null, e => e);
+  assert.ok(error, 'a silent response must time out');
+  for (const secret of ['SECRET', 'BYPASS']) assert.equal(`${error.message}${error.stack}${error.cause ?? ''}`.includes(secret), false);
 });
 
 test('Vercel bypass route tolerates context disposal but surfaces live request errors', async () => {
@@ -188,18 +228,18 @@ test('🔴 a failed bypass fetch never prints request headers (public CI logs)',
   const playwright = Object.assign(new Error([
     'route.fetch: Timeout 30000ms exceeded.',
     'Call log:',
-    `  - → POST ${target.app}/api/shell/desktop`,
+    `  - → GET ${target.app}/os`,
     '    - cookie: __Host-ezil-os-auth=base64-SESSION-WITH-REFRESH-TOKEN',
     '    - x-vercel-protection-bypass: test-bypass',
   ].join('\n')), { name: 'TimeoutError' });
   const error = await handler({
-    request: () => ({ url: () => `${target.app}/api/shell/desktop`, method: () => 'POST', headers: () => ({}) }),
+    request: () => ({ url: () => `${target.app}/os`, method: () => 'GET', headers: () => ({}) }),
     fetch: async () => { throw playwright; },
     fulfill: async () => { throw new Error('fulfill should not run'); },
   }).then(() => null, (e) => e);
   assert.ok(error, 'the failure must still surface');
   assert.equal(error.name, 'TimeoutError');
-  assert.match(error.message, /POST \/api\/shell\/desktop: route\.fetch: Timeout 30000ms exceeded\.$/);
+  assert.match(error.message, /GET \/os: route\.fetch: Timeout 30000ms exceeded\.$/);
   for (const secret of ['SESSION-WITH-REFRESH-TOKEN', 'test-bypass', 'cookie', 'Call log']) {
     assert.equal(error.message.includes(secret), false, `leaked ${secret}`);
     assert.equal(String(error.stack ?? '').includes(secret), false, `leaked ${secret} via stack`);
