@@ -1,15 +1,18 @@
 import type { EntitlementReader } from '../../lib/compute/tier';
+import { sizeForInstanceType } from '../../lib/compute/aws-config';
 import type { BillingConfig } from '../config';
 import { getBillingDeps } from '../deps';
-import type { BillingDeps } from '../ports';
+import type { BillingDeps, StoredComputeEpoch } from '../ports';
 import { freeSkuFor, planFromSubscriptions } from './catalog';
-import { CATALOG_V2, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
-import { rateWindow } from './rating';
+import { CATALOG_V2, type AdmitDecision, type AdmitRefusal, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
+import { admitStart, rateWindow } from './rating';
 import { buildSummaryV2, summaryMeters } from './summary';
 import { epochSeconds, isoSeconds } from './time';
 
 export interface ComputeBillingState {
     planSku: PlanSku;
+    subscriptionId: string | null;
+    openEpochs: readonly StoredComputeEpoch[];
     /** Subscription facts; the effective allowance below may fall back to Free. */
     family: PlanFamily;
     planActive: boolean;
@@ -50,10 +53,13 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
         storage: [], sizePreference, hasCustomer: false,
     });
     const delinquent = plan.status === 'past_due' || plan.status === 'incomplete';
-    const paymentIssue = summary.plan.paymentIssue !== null;
+    // An unpaid overage invoice disables overage, not the paid subscription.
+    const paymentIssue = delinquent || summary.plan.paymentIssue === 'payment_failed'
+        || summary.plan.paymentIssue === 'requires_action';
     const paid = plan.family !== 'free' && plan.planActive && !paymentIssue;
     const state: ComputeBillingState = {
         planSku: summary.plan.sku, family: plan.family, planActive: plan.planActive,
+        subscriptionId: plan.subscriptionId, openEpochs: epochs.filter(epoch => epoch.endedAt === null),
         delinquent, paymentIssue, upgradePending: summary.plan.pendingUpgrade !== null,
         entitledSize: paid ? summary.compute.selectedSize : 'free-cf',
         provider: paid ? 'aws' : 'cloudflare', window: plan.window,
@@ -75,6 +81,67 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
         state.overage = null;
     }
     return state;
+}
+
+function decideStart(state: ComputeBillingState, computerId: string, size: SizeCode, now: Date): AdmitDecision {
+    return admitStart({
+        planSku: state.planSku,
+        // A delinquent subscription retains its status in state, but its Free
+        // fallback is an active allowance for Cloudflare use.
+        planActive: CATALOG_V2[state.planSku].family === 'free' || state.planActive,
+        paymentIssue: size !== 'free-cf' && state.paymentIssue,
+        upgradePending: state.upgradePending, size,
+        usedStdSeconds: state.usedStdSeconds, allowanceStdSeconds: state.allowanceStdSeconds, overage: state.overage,
+        runningComputers: state.openEpochs.filter(epoch => epoch.computerId !== computerId).length,
+        now: isoSeconds(epochSeconds(now)),
+    });
+}
+
+/** Billing can record an immediately due epoch, but must never fail readiness. */
+export async function openComputeEpochAtReady({ deps, userId, computerId, size, readyAt, overheadSeconds }: {
+    deps: BillingDeps; userId: string; computerId: string; size: SizeCode; readyAt: Date; overheadSeconds: number;
+}): Promise<'inactive' | 'error' | { status: 'opened' | 'exists'; deadlineAt: string | null; decision: AdmitDecision }> {
+    if (!billingMeteringActive(deps.config)) return 'inactive';
+    try {
+        const state = await loadComputeBillingState(deps, userId, readyAt);
+        const decision = decideStart(state, computerId, size, readyAt);
+        // Anchor to readiness, not a preview request or a copied admission deadline.
+        const deadlineAt = new Date(readyAt.getTime() + (decision.admit ? decision.maxRunSeconds : 0) * 1000);
+        const opened = await deps.store.openEpoch({
+            userId, computerId, subscriptionId: state.subscriptionId, size, readyAt, deadlineAt, overheadSeconds,
+        });
+        return { status: opened.status, deadlineAt: opened.epoch.deadlineAt, decision };
+    } catch (error) {
+        console.warn('[billing.epoch] open failed', { userId, computerId, error });
+        return 'error';
+    }
+}
+
+export async function gateComputerStart({ deps, userId, computerId, kind, instanceType, now }: {
+    deps: BillingDeps; userId: string; computerId: string; kind: 'cloudflare' | 'aws-ec2'; instanceType: string | null; now: Date;
+}): Promise<{ allowed: true; shadow?: AdmitDecision } | { allowed: false; reason: AdmitRefusal | 'billing_unavailable' }> {
+    if (!billingMeteringActive(deps.config)) return { allowed: true };
+    try {
+        // Preview URLs are polled. An existing running session is never re-gated.
+        if (await deps.store.openEpochFor(computerId)) return { allowed: true };
+        const state = await loadComputeBillingState(deps, userId, now);
+        // Paid plans omit free-cf. A paid user's pre-existing Cloudflare computer
+        // uses std-2 for admission, with the same weight (1) and paid allowance.
+        const size = kind === 'aws-ec2'
+            ? instanceType !== null ? sizeForInstanceType(instanceType) : state.entitledSize
+            : state.provider === 'aws' ? 'std-2' : 'free-cf';
+        const decision: AdmitDecision = kind === 'aws-ec2' && state.paymentIssue
+            ? { admit: false, reason: 'payment_issue' }
+            : decideStart(state, computerId, size, now);
+        if (!deps.config.enforcementEnabled) {
+            console.info('[billing.gate] shadow', { userId, computerId, decision });
+            return { allowed: true, shadow: decision };
+        }
+        return decision.admit ? { allowed: true } : { allowed: false, reason: decision.reason };
+    } catch (error) {
+        console.warn('[billing.gate] read failed', { userId, computerId, error });
+        return deps.config.enforcementEnabled ? { allowed: false, reason: 'billing_unavailable' } : { allowed: true };
+    }
 }
 
 export function billingV2EntitlementReader(getDeps: () => BillingDeps = getBillingDeps): EntitlementReader {

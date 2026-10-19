@@ -22,7 +22,7 @@ const sellable = (sku: string | null): sku is SellableSku => sku !== null && off
 
 export function buildSummaryV2(input: {
     config: BillingConfig; now: Date; userCreatedAt: Date | null;
-    subs: SubscriptionRow[]; epochs: readonly ComputeEpoch[]; grants: readonly GrantRow[];
+    subs: SubscriptionRow[]; epochs: readonly (ComputeEpoch & { deadlineAt?: string | null })[]; grants: readonly GrantRow[];
     consent: OverageConsentRow | null; planChanges: readonly PlanChangeRow[]; paymentIssues: readonly PaymentIssueRow[];
     storage: { computerId: string; bytes: bigint; measuredAt: Date }[]; sizePreference: SizeCode | null; hasCustomer: boolean;
 }): BillingSummaryV2 {
@@ -79,11 +79,16 @@ export function buildSummaryV2(input: {
     const allowedSizes = [...offer.sizes];
     const remainingActualSecondsBySize: Partial<Record<SizeCode, number>> = {};
     for (const size of allowedSizes) remainingActualSecondsBySize[size] = Math.floor(remainingStdSeconds / SIZES[size].weight);
-    let latestReady: number | null = null;
+    let latestReadyAt: number | null = null;
+    let activeDeadline: string | null = null;
     for (const epoch of epochs) {
         if (epoch.endedAt !== null) continue;
         const ready = epochSeconds(epoch.readyAt, 'ceil');
-        if (latestReady === null || ready > latestReady) latestReady = ready;
+        const readyAt = Date.parse(epoch.readyAt);
+        if (latestReadyAt === null || readyAt > latestReadyAt) {
+            latestReadyAt = readyAt;
+            activeDeadline = epoch.deadlineAt ?? isoSeconds(ready + SESSION_MAX_SECONDS);
+        }
     }
 
     // Storage is a level: retain only the newest sample for each computer.
@@ -132,7 +137,7 @@ export function buildSummaryV2(input: {
                 ? input.sizePreference : offer.defaultSize,
             session: {
                 maxSeconds: SESSION_MAX_SECONDS, warnSeconds: [...SESSION_WARN_SECONDS], idleSleepSeconds: IDLE_SLEEP_SECONDS,
-                activeDeadline: latestReady === null ? null : isoSeconds(latestReady + SESSION_MAX_SECONDS),
+                activeDeadline,
             },
         },
         overage: offer.overage ? {

@@ -26,6 +26,9 @@ class MemoryStore implements BillingStore {
     // Unused compute-epoch methods remain outside this webhook fake.
     grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
     openEpoch: BillingStore['openEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    openEpochFor: BillingStore['openEpochFor'] = async () => { throw new Error('Unused v2 store stub'); };
+    touchEpoch: BillingStore['touchEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    openEpochsForSweep: BillingStore['openEpochsForSweep'] = async () => { throw new Error('Unused v2 store stub'); };
     closeEpoch: BillingStore['closeEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
     epochsFor: BillingStore['epochsFor'] = async () => { throw new Error('Unused v2 store stub'); };
     recordConsent: BillingStore['recordConsent'] = async input => {

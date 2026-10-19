@@ -234,6 +234,18 @@ describe('billing v2 dispatch wiring', () => {
         expect(access).not.toHaveBeenCalled();
     });
 
+    it.each(['status', 'reportActivity', 'terminate'] as const)('%s on a row-backed computer makes zero billing-store calls with metering on', async method => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const access = vi.fn(() => { throw new Error('Unexpected billing store call'); });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => new Date() } satisfies BillingDeps);
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
+        await caller[method]({ computerId: C1, lastInputAgoMs: 5 });
+        expect(access).not.toHaveBeenCalled();
+        expect(captured.billingDeps).not.toHaveBeenCalled();
+    });
+
     it('a paid computer at capacity stays unplaced and returns the existing refusal', async () => {
         const { db, fake } = routerDb([]);
         const read = vi.fn(async () => paid);
@@ -323,6 +335,48 @@ describe('routers: AWS previews use their own Worker route', () => {
 
     beforeEach(() => {
         for (const [k, v] of Object.entries(AWS_ENV)) vi.stubEnv(k, v);
+    });
+
+    it.each(['previewUrl', 'appPreviewUrl', 'codePreviewUrl', 'restartDesktop'] as const)('%s returns a terminal billing refusal before any provider call', async surface => {
+        const now = new Date('2026-10-18T12:00:00Z');
+        const store = {
+            openEpochFor: vi.fn(async () => null),
+            subscriptionsFor: vi.fn(async () => [{ stripeSubscriptionId: 'sub_a', sku: 'standard_monthly_v2', status: 'active',
+                currentPeriodStart: new Date('2026-10-01T00:00:00Z'), currentPeriodEnd: new Date('2026-11-01T00:00:00Z'), cancelAtPeriodEnd: false }]),
+            userCreatedAt: vi.fn(async () => null), openPlanChanges: vi.fn(async () => []), epochsFor: vi.fn(async () => []),
+            grantsForPeriod: vi.fn(async () => []), latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
+            sizePreference: vi.fn(async () => null),
+        };
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
+            store: store as unknown as BillingStore, stripe: null, now: () => now } satisfies BillingDeps);
+        const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure');
+        const restart = vi.spyOn(cloudflareComputeProvider, 'restart');
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const result = surface === 'previewUrl'
+            ? await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })
+            : await caller(db)[surface]({ computerId: C1 });
+        expect(result).toMatchObject({ ok: false, error: 'billing_allowance_exhausted', errorCode: 'billing_allowance_exhausted',
+            billingRefusal: 'allowance_exhausted', provider: 'cloudflare-guacamole' });
+        expect(ensure).not.toHaveBeenCalled();
+        expect(restart).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('flags-off previewUrl preserves the provider result with zero billing-store calls (placement %s)', async hasPlacement => {
+        const access = vi.fn(() => { throw new Error('billing store accessed while flags off'); });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => new Date() } satisfies BillingDeps);
+        const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure').mockResolvedValue({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', retryable: true,
+        });
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const { db } = routerDb(hasPlacement
+            ? [placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })] : []);
+        expect(await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })).toEqual({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole',
+        });
+        expect(ensure).toHaveBeenCalledTimes(1);
+        expect(access).not.toHaveBeenCalled();
     });
 
     it('previewUrl / appPreviewUrl / codePreviewUrl answer a VALUE from the AWS provider, no Worker call', async () => {

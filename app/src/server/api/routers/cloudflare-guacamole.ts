@@ -36,6 +36,8 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
+import { getBillingDeps } from '@/server/billing/deps';
+import { gateComputerStart } from '@/server/billing/v2/compute-access';
 import { stampOpened } from './computer-store';
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
@@ -201,6 +203,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             };
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -450,6 +459,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // when the shell has no separate session concept for it.
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -623,6 +639,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -1245,6 +1268,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
             if (routed.kind === 'aws-ec2') {
                 // No in-place desktop restart on AWS yet; a refusal the UI renders, never Cloudflare.
                 const aws = await routed.provider.restart({ correlationId }, computer);

@@ -35,7 +35,7 @@ import { plusPlanIds, resolveEntitlement, tierForEntitlement, type EntitlementRe
 
 export type RoutedComputer =
     | { kind: 'cloudflare'; provider: CloudflareComputeProvider }
-    | { kind: 'aws-ec2'; provider: ComputeProvider };
+    | { kind: 'aws-ec2'; provider: ComputeProvider; instanceType: string | null };
 
 /**
  * The AWS provider's runtime collaborators: the Step Functions starter and
@@ -68,11 +68,11 @@ export interface RouteOptions {
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */
-export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | undefined, aws: RouteOptions['aws'] = {}) {
+export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | undefined | (() => Promise<EntitlementRecord | null>), aws: RouteOptions['aws'] = {}) {
     return {
         ...aws,
-        entitlement,
-        tierFor: async () => tierForEntitlement(entitlement, plusPlanIds(env)),
+        entitlement: typeof entitlement === 'function' ? undefined : entitlement,
+        tierFor: async () => tierForEntitlement(typeof entitlement === 'function' ? await entitlement() : entitlement, plusPlanIds(env)),
     };
 }
 
@@ -84,9 +84,14 @@ export async function routeComputer(
     // Flag off: no database read at all — the pre-P3 call, unchanged.
     if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
     let provider: ComputeProvider;
+    let instanceType: string | null = null;
+    let entitlement: Promise<EntitlementRecord | null> | undefined;
+    const getEntitlement = () => entitlement ??= resolveEntitlement(computer.userId, entitlements);
     try {
-        const entitlement = await resolveEntitlement(computer.userId, entitlements);
-        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlement, aws), { pinCloudflare, entitlement });
+        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, getEntitlement, aws), {
+            pinCloudflare, resolveEntitlement: getEntitlement,
+            onPlacement: placement => { instanceType = placement.record?.instanceType ?? null; },
+        });
     } catch (err) {
         if (err instanceof PlacementOwnerError) {
             // NOT_FOUND, never FORBIDDEN — a foreign computer must look absent.
@@ -96,7 +101,7 @@ export async function routeComputer(
     }
     // A cloudflare placement keeps the exact pre-P3 adapter (and its richer result type).
     if (provider.kind === 'cloudflare') return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
-    return { kind: 'aws-ec2', provider };
+    return { kind: 'aws-ec2', provider, instanceType };
 }
 
 /**

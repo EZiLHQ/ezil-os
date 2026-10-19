@@ -17,15 +17,15 @@ import {
     billingUsageIntervals,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
-import type { BillingStore, GrantKind, GrantMeter, GrantSource } from './ports';
-import { SIZES, type ComputeEpoch } from './v2/contract';
+import type { BillingStore, GrantKind, GrantMeter, GrantSource, StoredComputeEpoch } from './ports';
+import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
 
 type Database = typeof import('@/server/db').db;
 
 const openChangeStates = ['pending', 'requires_action', 'payment_failed', 'scheduled'] as const;
 
-function computeEpoch(row: BillingComputeEpochRow): ComputeEpoch {
+function computeEpoch(row: BillingComputeEpochRow): StoredComputeEpoch {
     return {
         id: row.id,
         userId: row.userId,
@@ -36,6 +36,8 @@ function computeEpoch(row: BillingComputeEpochRow): ComputeEpoch {
         endedAt: row.endedAt === null ? null : isoSeconds(epochSeconds(row.endedAt)),
         endReason: row.endReason,
         overheadSeconds: row.overheadSeconds,
+        deadlineAt: row.deadlineAt === null ? null : isoSeconds(epochSeconds(row.deadlineAt)),
+        lastHeartbeatAt: row.lastHeartbeatAt === null ? null : isoSeconds(epochSeconds(row.lastHeartbeatAt)),
     };
 }
 
@@ -68,12 +70,14 @@ export function createBillingStore(db: Database): BillingStore {
             ));
             if (!owner) throw new Error('Computer does not belong to billing user');
             const readyAt = new Date(epochSeconds(input.readyAt, 'ceil') * 1000);
+            const deadlineAt = input.deadlineAt == null ? null : new Date(Math.max(readyAt.getTime(),
+                Math.min(readyAt.getTime() + SESSION_MAX_SECONDS * 1000, epochSeconds(input.deadlineAt) * 1000)));
             // A concurrent close can remove the conflicting open row between the
             // insert and select. Retry then, without changing any existing epoch.
             // Bound contention so the caller can retry instead of spinning forever.
             for (let attempt = 0; attempt < 3; attempt++) {
                 const [inserted] = await db.insert(billingComputeEpochs).values({
-                    ...input, readyAt, weight: SIZES[input.size].weight,
+                    ...input, readyAt, deadlineAt, weight: SIZES[input.size].weight,
                 }).onConflictDoNothing().returning();
                 if (inserted) return { status: 'opened', epoch: computeEpoch(inserted) };
                 const [existing] = await db.select().from(billingComputeEpochs).where(and(
@@ -86,6 +90,32 @@ export function createBillingStore(db: Database): BillingStore {
                 }
             }
             throw new Error('Could not open compute epoch after 3 attempts');
+        },
+
+        async openEpochFor(computerId) {
+            const [row] = await db.select().from(billingComputeEpochs).where(and(
+                eq(billingComputeEpochs.computerId, computerId), isNull(billingComputeEpochs.endedAt),
+            )).limit(1);
+            return row ? computeEpoch(row) : null;
+        },
+
+        async touchEpoch(computerId, at) {
+            const rows = await db.update(billingComputeEpochs).set({
+                lastHeartbeatAt: sql`greatest(coalesce(${billingComputeEpochs.lastHeartbeatAt}, ${billingComputeEpochs.readyAt}), ${at.toISOString()}::timestamptz)`,
+            }).where(and(
+                eq(billingComputeEpochs.computerId, computerId), isNull(billingComputeEpochs.endedAt),
+            )).returning({ id: billingComputeEpochs.id });
+            return rows.length > 0 ? 'touched' : 'not_open';
+        },
+
+        async openEpochsForSweep({ limit }) {
+            if (!Number.isFinite(limit) || limit < 0) throw new RangeError('Invalid sweep limit');
+            const boundedLimit = Math.min(200, Math.floor(limit));
+            if (boundedLimit === 0) return [];
+            const rows = await db.select().from(billingComputeEpochs).where(isNull(billingComputeEpochs.endedAt))
+                .orderBy(sql`coalesce(${billingComputeEpochs.deadlineAt}, ${billingComputeEpochs.readyAt} + interval '21600 seconds')`, billingComputeEpochs.id)
+                .limit(boundedLimit);
+            return rows.map(computeEpoch);
         },
 
         async closeEpoch({ computerId, endedAt, reason, overheadSeconds }) {

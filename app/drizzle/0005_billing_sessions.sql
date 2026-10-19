@@ -1,0 +1,5 @@
+ALTER TABLE "ezil_billing_compute_epochs" ADD COLUMN "deadline_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "ezil_billing_compute_epochs" ADD COLUMN "last_heartbeat_at" timestamp with time zone;--> statement-breakpoint
+CREATE INDEX "ezil_billing_compute_epochs_open_deadline_idx" ON "ezil_billing_compute_epochs" USING btree ("deadline_at") WHERE "ezil_billing_compute_epochs"."ended_at" is null;--> statement-breakpoint
+ALTER TABLE "ezil_billing_compute_epochs" ADD CONSTRAINT "ezil_billing_compute_epochs_deadline_at_chk" CHECK ("ezil_billing_compute_epochs"."deadline_at" is null or ("ezil_billing_compute_epochs"."deadline_at" >= "ezil_billing_compute_epochs"."ready_at" and "ezil_billing_compute_epochs"."deadline_at" <= "ezil_billing_compute_epochs"."ready_at" + interval '21600 seconds'));--> statement-breakpoint
+ALTER TABLE "ezil_billing_compute_epochs" ADD CONSTRAINT "ezil_billing_compute_epochs_last_heartbeat_at_chk" CHECK ("ezil_billing_compute_epochs"."last_heartbeat_at" is null or "ezil_billing_compute_epochs"."last_heartbeat_at" >= "ezil_billing_compute_epochs"."ready_at");

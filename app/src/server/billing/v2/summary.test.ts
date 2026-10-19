@@ -283,6 +283,36 @@ describe('buildSummaryV2', () => {
         expect(result.compute.usedStdSeconds).toBe(21600 * 2 + 3600);
     });
 
+    it('the newest open epoch uses its stored deadline even when an older epoch has a later deadline', () => {
+        const result = buildSummaryV2(compute({ epochs: [
+            { ...epoch(0, { readyAt: '2026-10-03T00:00:00Z', endedAt: null }), deadlineAt: '2026-10-03T00:16:40Z' },
+            { ...epoch(0, { readyAt: '2026-10-02T23:00:00Z', endedAt: null }), deadlineAt: '2026-10-03T05:00:00Z' },
+            { ...epoch(1, { readyAt: '2026-10-04T00:00:00Z', endedAt: '2026-10-04T01:00:00Z' }), deadlineAt: '2026-10-04T06:00:00Z' },
+        ] }));
+        expect(result.compute.session.activeDeadline).toBe('2026-10-03T00:16:40Z');
+    });
+
+    it.each([null, undefined])('legacy newest open epoch with deadline %s falls back to its own ready time', deadlineAt => {
+        const result = buildSummaryV2(compute({ epochs: [
+            { ...epoch(0, { readyAt: '2026-10-03T00:00:00Z', endedAt: null }), deadlineAt },
+            { ...epoch(0, { readyAt: '2026-10-02T00:00:00Z', endedAt: null }), deadlineAt: '2026-10-02T00:01:00Z' },
+        ] }));
+        expect(result.compute.session.activeDeadline).toBe('2026-10-03T06:00:00Z');
+    });
+
+    it('closed epochs with stored deadlines do not supply an active deadline', () => {
+        expect(buildSummaryV2(compute({ epochs: [{ ...epoch(60), deadlineAt: '2026-10-01T06:00:00Z' }] }))
+            .compute.session.activeDeadline).toBeNull();
+    });
+
+    it('selects the newest legacy ready timestamp before rounding to whole seconds', () => {
+        const result = buildSummaryV2(compute({ epochs: [
+            { ...epoch(0, { readyAt: '2026-10-03T00:00:00.001Z', endedAt: null }), deadlineAt: '2026-10-03T00:01:00Z' },
+            { ...epoch(0, { readyAt: '2026-10-03T00:00:00.999Z', endedAt: null }), deadlineAt: '2026-10-03T00:02:00Z' },
+        ] }));
+        expect(result.compute.session.activeDeadline).toBe('2026-10-03T00:02:00Z');
+    });
+
     it('preserves v1 storage sampling, caps and unavailable AI', () => {
         const storage = [
             { computerId: 'a', bytes: BigInt(9000000000), measuredAt: new Date(START) },

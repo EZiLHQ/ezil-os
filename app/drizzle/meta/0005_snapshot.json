@@ -1,0 +1,2001 @@
+{
+  "id": "11c9061c-3a94-4341-8f88-74fe98c11ec5",
+  "prevId": "ff81ef1e-3fcd-4985-9acd-688b6ae6fbec",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "auth.users": {
+      "name": "users",
+      "schema": "auth",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.ezil_billing_compute_epochs": {
+      "name": "ezil_billing_compute_epochs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "size": {
+          "name": "size",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "weight": {
+          "name": "weight",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ready_at": {
+          "name": "ready_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ended_at": {
+          "name": "ended_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "end_reason": {
+          "name": "end_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "overhead_seconds": {
+          "name": "overhead_seconds",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "deadline_at": {
+          "name": "deadline_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_heartbeat_at": {
+          "name": "last_heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_billing_compute_epochs_open_computer_uidx": {
+          "name": "ezil_billing_compute_epochs_open_computer_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_billing_compute_epochs\".\"ended_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "ezil_billing_compute_epochs_open_deadline_idx": {
+          "name": "ezil_billing_compute_epochs_open_deadline_idx",
+          "columns": [
+            {
+              "expression": "deadline_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"ezil_billing_compute_epochs\".\"ended_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_billing_compute_epochs_user_id_fkey": {
+          "name": "ezil_billing_compute_epochs_user_id_fkey",
+          "tableFrom": "ezil_billing_compute_epochs",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "ezil_billing_compute_epochs_computer_id_fkey": {
+          "name": "ezil_billing_compute_epochs_computer_id_fkey",
+          "tableFrom": "ezil_billing_compute_epochs",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_compute_epochs_size_chk": {
+          "name": "ezil_billing_compute_epochs_size_chk",
+          "value": "\"ezil_billing_compute_epochs\".\"size\" in ('free-cf', 'std-2', 'cmp-4', 'cmp-8')"
+        },
+        "ezil_billing_compute_epochs_weight_chk": {
+          "name": "ezil_billing_compute_epochs_weight_chk",
+          "value": "(\"ezil_billing_compute_epochs\".\"size\" in ('free-cf', 'std-2') and \"ezil_billing_compute_epochs\".\"weight\" = 1) or (\"ezil_billing_compute_epochs\".\"size\" = 'cmp-4' and \"ezil_billing_compute_epochs\".\"weight\" = 2) or (\"ezil_billing_compute_epochs\".\"size\" = 'cmp-8' and \"ezil_billing_compute_epochs\".\"weight\" = 4)"
+        },
+        "ezil_billing_compute_epochs_end_reason_chk": {
+          "name": "ezil_billing_compute_epochs_end_reason_chk",
+          "value": "\"ezil_billing_compute_epochs\".\"end_reason\" is null or \"ezil_billing_compute_epochs\".\"end_reason\" in ('user_stop', 'idle_sleep', 'session_max', 'allowance_exhausted', 'overage_cap', 'payment_issue', 'resize', 'provider_stop', 'platform_failure')"
+        },
+        "ezil_billing_compute_epochs_end_pair_chk": {
+          "name": "ezil_billing_compute_epochs_end_pair_chk",
+          "value": "(\"ezil_billing_compute_epochs\".\"ended_at\" is null) = (\"ezil_billing_compute_epochs\".\"end_reason\" is null)"
+        },
+        "ezil_billing_compute_epochs_ended_at_chk": {
+          "name": "ezil_billing_compute_epochs_ended_at_chk",
+          "value": "\"ezil_billing_compute_epochs\".\"ended_at\" is null or \"ezil_billing_compute_epochs\".\"ended_at\" >= \"ezil_billing_compute_epochs\".\"ready_at\""
+        },
+        "ezil_billing_compute_epochs_overhead_seconds_chk": {
+          "name": "ezil_billing_compute_epochs_overhead_seconds_chk",
+          "value": "\"ezil_billing_compute_epochs\".\"overhead_seconds\" >= 0"
+        },
+        "ezil_billing_compute_epochs_deadline_at_chk": {
+          "name": "ezil_billing_compute_epochs_deadline_at_chk",
+          "value": "\"ezil_billing_compute_epochs\".\"deadline_at\" is null or (\"ezil_billing_compute_epochs\".\"deadline_at\" >= \"ezil_billing_compute_epochs\".\"ready_at\" and \"ezil_billing_compute_epochs\".\"deadline_at\" <= \"ezil_billing_compute_epochs\".\"ready_at\" + interval '21600 seconds')"
+        },
+        "ezil_billing_compute_epochs_last_heartbeat_at_chk": {
+          "name": "ezil_billing_compute_epochs_last_heartbeat_at_chk",
+          "value": "\"ezil_billing_compute_epochs\".\"last_heartbeat_at\" is null or \"ezil_billing_compute_epochs\".\"last_heartbeat_at\" >= \"ezil_billing_compute_epochs\".\"ready_at\""
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_customers": {
+      "name": "ezil_billing_customers",
+      "schema": "",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "stripe_customer_id": {
+          "name": "stripe_customer_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_customers_user_id_fkey": {
+          "name": "ezil_billing_customers_user_id_fkey",
+          "tableFrom": "ezil_billing_customers",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_billing_customers_stripe_customer_id_unique": {
+          "name": "ezil_billing_customers_stripe_customer_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "stripe_customer_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_events": {
+      "name": "ezil_billing_events",
+      "schema": "",
+      "columns": {
+        "event_id": {
+          "name": "event_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "livemode": {
+          "name": "livemode",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload_sha256": {
+          "name": "payload_sha256",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "received_at": {
+          "name": "received_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "processed_at": {
+          "name": "processed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_events_user_id_fkey": {
+          "name": "ezil_billing_events_user_id_fkey",
+          "tableFrom": "ezil_billing_events",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_grants": {
+      "name": "ezil_billing_grants",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "meter": {
+          "name": "meter",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "amount": {
+          "name": "amount",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "period_start": {
+          "name": "period_start",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "period_end": {
+          "name": "period_end",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_type": {
+          "name": "source_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_id": {
+          "name": "source_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ezil_billing_grants_plan_period_uidx": {
+          "name": "ezil_billing_grants_plan_period_uidx",
+          "columns": [
+            {
+              "expression": "subscription_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "period_start",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "meter",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_billing_grants\".\"kind\" = 'plan_period'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_billing_grants_user_id_fkey": {
+          "name": "ezil_billing_grants_user_id_fkey",
+          "tableFrom": "ezil_billing_grants",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_billing_grants_source_meter_kind_unique": {
+          "name": "ezil_billing_grants_source_meter_kind_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "source_type",
+            "source_id",
+            "meter",
+            "kind"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_grants_meter_chk": {
+          "name": "ezil_billing_grants_meter_chk",
+          "value": "\"ezil_billing_grants\".\"meter\" in ('workspace_seconds', 'ai_usd_micro', 'compute_std_seconds')"
+        },
+        "ezil_billing_grants_kind_chk": {
+          "name": "ezil_billing_grants_kind_chk",
+          "value": "\"ezil_billing_grants\".\"kind\" in ('pro_period', 'topup', 'revoke', 'suspend', 'restore', 'plan_period', 'upgrade_prorated')"
+        },
+        "ezil_billing_grants_source_type_chk": {
+          "name": "ezil_billing_grants_source_type_chk",
+          "value": "\"ezil_billing_grants\".\"source_type\" in ('invoice', 'payment_intent', 'refund', 'dispute')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_outbox": {
+      "name": "ezil_billing_outbox",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "event_key": {
+          "name": "event_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "delivered_at": {
+          "name": "delivered_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_error": {
+          "name": "last_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_outbox_user_id_fkey": {
+          "name": "ezil_billing_outbox_user_id_fkey",
+          "tableFrom": "ezil_billing_outbox",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_billing_outbox_event_key_unique": {
+          "name": "ezil_billing_outbox_event_key_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "event_key"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_overage_consents": {
+      "name": "ezil_billing_overage_consents",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "primaryKey": true,
+          "notNull": true,
+          "identity": {
+            "type": "always",
+            "name": "ezil_billing_overage_consents_id_seq",
+            "schema": "public",
+            "increment": "1",
+            "startWith": "1",
+            "minValue": "1",
+            "maxValue": "9223372036854775807",
+            "cache": "1",
+            "cycle": false
+          }
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "enabled": {
+          "name": "enabled",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "cap_cents": {
+          "name": "cap_cents",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "terms_version": {
+          "name": "terms_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "catalog_version": {
+          "name": "catalog_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "rate_cents_per_std_hour": {
+          "name": "rate_cents_per_std_hour",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor": {
+          "name": "actor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "accepted_at": {
+          "name": "accepted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_overage_consents_user_id_fkey": {
+          "name": "ezil_billing_overage_consents_user_id_fkey",
+          "tableFrom": "ezil_billing_overage_consents",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_billing_overage_consents_decision_unique": {
+          "name": "ezil_billing_overage_consents_decision_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "user_id",
+            "subscription_id",
+            "accepted_at",
+            "enabled",
+            "cap_cents",
+            "terms_version",
+            "catalog_version",
+            "rate_cents_per_std_hour",
+            "actor"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_overage_consents_cap_cents_chk": {
+          "name": "ezil_billing_overage_consents_cap_cents_chk",
+          "value": "\"ezil_billing_overage_consents\".\"cap_cents\" between 0 and 10000"
+        },
+        "ezil_billing_overage_consents_rate_chk": {
+          "name": "ezil_billing_overage_consents_rate_chk",
+          "value": "\"ezil_billing_overage_consents\".\"rate_cents_per_std_hour\" > 0"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_overage_invoices": {
+      "name": "ezil_billing_overage_invoices",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "period_start": {
+          "name": "period_start",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "period_end": {
+          "name": "period_end",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "rating_version": {
+          "name": "rating_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "std_seconds_over": {
+          "name": "std_seconds_over",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "cents": {
+          "name": "cents",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stripe_invoice_id": {
+          "name": "stripe_invoice_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_overage_invoices_user_id_fkey": {
+          "name": "ezil_billing_overage_invoices_user_id_fkey",
+          "tableFrom": "ezil_billing_overage_invoices",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_billing_overage_invoices_stripe_invoice_id_unique": {
+          "name": "ezil_billing_overage_invoices_stripe_invoice_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "stripe_invoice_id"
+          ]
+        },
+        "ezil_billing_overage_invoices_period_rating_unique": {
+          "name": "ezil_billing_overage_invoices_period_rating_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "subscription_id",
+            "period_start",
+            "rating_version"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_overage_invoices_std_seconds_over_chk": {
+          "name": "ezil_billing_overage_invoices_std_seconds_over_chk",
+          "value": "\"ezil_billing_overage_invoices\".\"std_seconds_over\" >= 0"
+        },
+        "ezil_billing_overage_invoices_cents_chk": {
+          "name": "ezil_billing_overage_invoices_cents_chk",
+          "value": "\"ezil_billing_overage_invoices\".\"cents\" >= 0"
+        },
+        "ezil_billing_overage_invoices_status_chk": {
+          "name": "ezil_billing_overage_invoices_status_chk",
+          "value": "\"ezil_billing_overage_invoices\".\"status\" in ('pending', 'open', 'paid', 'payment_failed', 'requires_action', 'void', 'uncollectible')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_payment_issues": {
+      "name": "ezil_billing_payment_issues",
+      "schema": "",
+      "columns": {
+        "stripe_invoice_id": {
+          "name": "stripe_invoice_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "invoice_kind": {
+          "name": "invoice_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issue": {
+          "name": "issue",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "hosted_invoice_url": {
+          "name": "hosted_invoice_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stripe_event_created": {
+          "name": "stripe_event_created",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "resolved_at": {
+          "name": "resolved_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_payment_issues_user_id_fkey": {
+          "name": "ezil_billing_payment_issues_user_id_fkey",
+          "tableFrom": "ezil_billing_payment_issues",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_payment_issues_invoice_kind_chk": {
+          "name": "ezil_billing_payment_issues_invoice_kind_chk",
+          "value": "\"ezil_billing_payment_issues\".\"invoice_kind\" in ('subscription', 'upgrade', 'overage')"
+        },
+        "ezil_billing_payment_issues_issue_chk": {
+          "name": "ezil_billing_payment_issues_issue_chk",
+          "value": "\"ezil_billing_payment_issues\".\"issue\" in ('payment_failed', 'requires_action', 'voided', 'uncollectible')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_plan_changes": {
+      "name": "ezil_billing_plan_changes",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "from_sku": {
+          "name": "from_sku",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "to_sku": {
+          "name": "to_sku",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stripe_invoice_id": {
+          "name": "stripe_invoice_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stripe_schedule_id": {
+          "name": "stripe_schedule_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "hosted_invoice_url": {
+          "name": "hosted_invoice_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "effective_at": {
+          "name": "effective_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ezil_billing_plan_changes_open_kind_uidx": {
+          "name": "ezil_billing_plan_changes_open_kind_uidx",
+          "columns": [
+            {
+              "expression": "subscription_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_billing_plan_changes\".\"state\" in ('pending', 'requires_action', 'payment_failed', 'scheduled')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_billing_plan_changes_user_id_fkey": {
+          "name": "ezil_billing_plan_changes_user_id_fkey",
+          "tableFrom": "ezil_billing_plan_changes",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_plan_changes_kind_chk": {
+          "name": "ezil_billing_plan_changes_kind_chk",
+          "value": "\"ezil_billing_plan_changes\".\"kind\" in ('upgrade', 'downgrade', 'cancel')"
+        },
+        "ezil_billing_plan_changes_state_chk": {
+          "name": "ezil_billing_plan_changes_state_chk",
+          "value": "\"ezil_billing_plan_changes\".\"state\" in ('pending', 'requires_action', 'payment_failed', 'scheduled', 'applied', 'expired', 'canceled')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_size_preferences": {
+      "name": "ezil_billing_size_preferences",
+      "schema": "",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "size": {
+          "name": "size",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_size_preferences_user_id_fkey": {
+          "name": "ezil_billing_size_preferences_user_id_fkey",
+          "tableFrom": "ezil_billing_size_preferences",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_size_preferences_size_chk": {
+          "name": "ezil_billing_size_preferences_size_chk",
+          "value": "\"ezil_billing_size_preferences\".\"size\" in ('free-cf', 'std-2', 'cmp-4', 'cmp-8')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_storage_samples": {
+      "name": "ezil_billing_storage_samples",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bytes": {
+          "name": "bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "measured_at": {
+          "name": "measured_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_storage_samples_user_id_fkey": {
+          "name": "ezil_billing_storage_samples_user_id_fkey",
+          "tableFrom": "ezil_billing_storage_samples",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_billing_storage_samples_bytes_chk": {
+          "name": "ezil_billing_storage_samples_bytes_chk",
+          "value": "\"ezil_billing_storage_samples\".\"bytes\" >= 0"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_subscriptions": {
+      "name": "ezil_billing_subscriptions",
+      "schema": "",
+      "columns": {
+        "stripe_subscription_id": {
+          "name": "stripe_subscription_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sku": {
+          "name": "sku",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "current_period_start": {
+          "name": "current_period_start",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "current_period_end": {
+          "name": "current_period_end",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cancel_at_period_end": {
+          "name": "cancel_at_period_end",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "stripe_event_created": {
+          "name": "stripe_event_created",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_billing_subscriptions_user_id_fkey": {
+          "name": "ezil_billing_subscriptions_user_id_fkey",
+          "tableFrom": "ezil_billing_subscriptions",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_billing_usage_intervals": {
+      "name": "ezil_billing_usage_intervals",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "last_seen_at": {
+          "name": "last_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ended_at": {
+          "name": "ended_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "close_reason": {
+          "name": "close_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "ezil_billing_usage_intervals_open_computer_uidx": {
+          "name": "ezil_billing_usage_intervals_open_computer_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_billing_usage_intervals\".\"ended_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_billing_usage_intervals_user_id_fkey": {
+          "name": "ezil_billing_usage_intervals_user_id_fkey",
+          "tableFrom": "ezil_billing_usage_intervals",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "ezil_billing_usage_intervals_computer_id_fkey": {
+          "name": "ezil_billing_usage_intervals_computer_id_fkey",
+          "tableFrom": "ezil_billing_usage_intervals",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_computers": {
+      "name": "ezil_computers",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'Computer'"
+        },
+        "slot": {
+          "name": "slot",
+          "type": "smallint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_opened_at": {
+          "name": "last_opened_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "metadata": {
+          "name": "metadata",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_computers_user_slot_uidx": {
+          "name": "ezil_computers_user_slot_uidx",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "slot",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_computers\".\"deleted_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_computers_user_id_fkey": {
+          "name": "ezil_computers_user_id_fkey",
+          "tableFrom": "ezil_computers",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computers_slot_chk": {
+          "name": "ezil_computers_slot_chk",
+          "value": "\"ezil_computers\".\"slot\" in (1, 2)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_os_access": {
+      "name": "ezil_os_access",
+      "schema": "",
+      "columns": {
+        "email": {
+          "name": "email",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "invited_by": {
+          "name": "invited_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_os_access_user_id_fkey": {
+          "name": "ezil_os_access_user_id_fkey",
+          "tableFrom": "ezil_os_access",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_os_access_email_lower_chk": {
+          "name": "ezil_os_access_email_lower_chk",
+          "value": "\"ezil_os_access\".\"email\" = lower(\"ezil_os_access\".\"email\")"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_error_events": {
+      "name": "ezil_error_events",
+      "schema": "",
+      "columns": {
+        "event_id": {
+          "name": "event_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "schema_version": {
+          "name": "schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "event_class": {
+          "name": "event_class",
+          "type": "varchar(32)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "varchar(16)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "char(19)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_hash": {
+          "name": "user_hash",
+          "type": "char(10)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "site": {
+          "name": "site",
+          "type": "varchar(96)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "code": {
+          "name": "code",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "varchar(16)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "detail": {
+          "name": "detail",
+          "type": "varchar(200)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "duration_ms": {
+          "name": "duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attrs": {
+          "name": "attrs",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "occurred_at": {
+          "name": "occurred_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "received_at": {
+          "name": "received_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "idx_ezil_error_events_fp_time_user": {
+          "name": "idx_ezil_error_events_fp_time_user",
+          "columns": [
+            {
+              "expression": "fingerprint",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "user_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_events_class_time": {
+          "name": "idx_ezil_error_events_class_time",
+          "columns": [
+            {
+              "expression": "event_class",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_events_time": {
+          "name": "idx_ezil_error_events_time",
+          "columns": [
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_events_user_time": {
+          "name": "idx_ezil_error_events_user_time",
+          "columns": [
+            {
+              "expression": "user_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_error_events_computer_id_fkey": {
+          "name": "ezil_error_events_computer_id_fkey",
+          "tableFrom": "ezil_error_events",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_error_events_fingerprint_chk": {
+          "name": "ezil_error_events_fingerprint_chk",
+          "value": "\"ezil_error_events\".\"fingerprint\" ~ '^fp_[0-9a-f]{16}$'"
+        },
+        "ezil_error_events_user_hash_chk": {
+          "name": "ezil_error_events_user_hash_chk",
+          "value": "\"ezil_error_events\".\"user_hash\" ~ '^u_[0-9a-f]{8}$'"
+        },
+        "ezil_error_events_outcome_chk": {
+          "name": "ezil_error_events_outcome_chk",
+          "value": "\"ezil_error_events\".\"outcome\" in ('ok','error','skipped')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_error_fingerprints": {
+      "name": "ezil_error_fingerprints",
+      "schema": "",
+      "columns": {
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "char(19)",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "event_class": {
+          "name": "event_class",
+          "type": "varchar(32)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "varchar(16)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "site": {
+          "name": "site",
+          "type": "varchar(96)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "code": {
+          "name": "code",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "normalized_detail": {
+          "name": "normalized_detail",
+          "type": "varchar(120)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "first_seen_at": {
+          "name": "first_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_seen_at": {
+          "name": "last_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "total_count": {
+          "name": "total_count",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "muted_at": {
+          "name": "muted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "notes": {
+          "name": "notes",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_ezil_error_fingerprints_last_seen": {
+          "name": "idx_ezil_error_fingerprints_last_seen",
+          "columns": [
+            {
+              "expression": "last_seen_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_fingerprints_class": {
+          "name": "idx_ezil_error_fingerprints_class",
+          "columns": [
+            {
+              "expression": "event_class",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "last_seen_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_error_user_hours": {
+      "name": "ezil_error_user_hours",
+      "schema": "",
+      "columns": {
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "char(19)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "hour_bucket": {
+          "name": "hour_bucket",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_hash": {
+          "name": "user_hash",
+          "type": "char(10)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_count": {
+          "name": "event_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "idx_ezil_error_user_hours_hour": {
+          "name": "idx_ezil_error_user_hours_hour",
+          "columns": [
+            {
+              "expression": "hour_bucket",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_error_user_hours_fingerprint_fkey": {
+          "name": "ezil_error_user_hours_fingerprint_fkey",
+          "tableFrom": "ezil_error_user_hours",
+          "tableTo": "ezil_error_fingerprints",
+          "columnsFrom": [
+            "fingerprint"
+          ],
+          "columnsTo": [
+            "fingerprint"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_error_user_hours_pkey": {
+          "name": "ezil_error_user_hours_pkey",
+          "columns": [
+            "fingerprint",
+            "hour_bucket",
+            "user_hash"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    }
+  },
+  "enums": {},
+  "schemas": {
+    "auth": "auth"
+  },
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

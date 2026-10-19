@@ -62,12 +62,20 @@ export interface OutboxInsert {
     payload: Record<string, unknown>;
 }
 
+export interface StoredComputeEpoch extends ComputeEpoch {
+    deadlineAt: string | null;
+    lastHeartbeatAt: string | null;
+}
+
 export interface OpenEpochInput {
     userId: string;
     computerId: string;
     subscriptionId: string | null;
     size: SizeCode;
     readyAt: Date;
+    /** Round down, then clamp to rounded readiness through readiness + 21,600 s. */
+    deadlineAt?: Date | string | null;
+    overheadSeconds?: number;
 }
 
 export interface CloseEpochInput {
@@ -164,10 +172,15 @@ export interface PaymentIssueRow extends Omit<PaymentIssueInsert, 'eventCreated'
 export interface BillingStore {
     // v2 ledger, compute and payment state
     grantsForPeriod(userId: string, window: { start: Date; end: Date }, meters: GrantMeter[]): Promise<GrantRow[]>;
-    openEpoch(input: OpenEpochInput): Promise<{ status: 'opened' | 'exists'; epoch: ComputeEpoch }>;
+    openEpoch(input: OpenEpochInput): Promise<{ status: 'opened' | 'exists'; epoch: StoredComputeEpoch }>;
+    /** These computer-scoped operations require ownership checks by the caller. */
+    openEpochFor(computerId: string): Promise<StoredComputeEpoch | null>;
+    touchEpoch(computerId: string, at: Date): Promise<'touched' | 'not_open'>;
+    /** Across users; oldest effective deadline first, capped at 200 rows. */
+    openEpochsForSweep(input: { limit: number }): Promise<StoredComputeEpoch[]>;
     /** Computer ownership is checked by the caller, as for closeInterval. */
     closeEpoch(input: CloseEpochInput): Promise<'closed' | 'not_open'>;
-    epochsFor(userId: string, since: Date): Promise<ComputeEpoch[]>;
+    epochsFor(userId: string, since: Date): Promise<StoredComputeEpoch[]>;
     /** Appends each distinct decision once; exact replays retain the original identity. */
     recordConsent(input: OverageConsentInsert): Promise<OverageConsentRow>;
     latestConsent(userId: string, subscriptionId: string): Promise<OverageConsentRow | null>;

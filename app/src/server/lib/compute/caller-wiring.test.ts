@@ -14,8 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const captured = vi.hoisted(() => ({ reapDeps: undefined as unknown, softDelete: undefined as unknown }));
 
 // Billing effects are exercised in compute-dispatch.test.ts.
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => ({ now: () => new Date() }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({
     billingV2EntitlementReader: () => ({ read: async () => null }),
+    gateComputerStart: async () => ({ allowed: true }),
 }));
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string } | null; db: unknown }>().create();

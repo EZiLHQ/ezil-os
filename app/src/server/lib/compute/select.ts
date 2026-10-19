@@ -68,6 +68,10 @@ function isPlacementDb(db: PlacementExecutor): db is PlacementDb {
 export interface ResolveOptions {
     /** Resolved once by the caller and shared with the AWS provision path. */
     entitlement?: EntitlementRecord | null;
+    /** Read only for a computer without placement; the caller may memoize it. */
+    resolveEntitlement?: () => Promise<EntitlementRecord | null>;
+    /** Share the ownership-checked placement with routing without another read. */
+    onPlacement?: (placement: ResolvedPlacement) => void;
     /**
      * The caller is about to START a sandbox (open, app/code preview, desktop restart).
      * A no-row computer neither billing nor the canary claims is PINNED to Cloudflare first
@@ -89,7 +93,10 @@ export async function resolveComputeProvider(
     // Every provider operation is the recorded owner's only (C-2): `computer.userId` is the
     // authenticated session user; a re-keyed or re-inserted ezil_computers row changes nothing.
     assertPlacementOwner(placement, computer);
-    const entitlement = options.entitlement !== undefined ? options.entitlement : aws.entitlement;
+    options.onPlacement?.(placement);
+    const entitlement = !placement.record && options.resolveEntitlement
+        ? await options.resolveEntitlement()
+        : options.entitlement !== undefined ? options.entitlement : aws.entitlement;
     const deps = isPlacementDb(db) ? { ...aws, entitlement, db, env: () => env } : undefined;
     if (!placement.record) {
         // Paid placement bypasses the canary's graceful capacity fallback. ensure()
@@ -103,6 +110,7 @@ export async function resolveComputeProvider(
         if (options.pinCloudflare && isPlacementDb(db)) {
             placement = await pinCloudflare(db, computer);
             assertPlacementOwner(placement, computer);
+            options.onPlacement?.(placement);
         }
     }
     return providerForPlacement(placement, env, deps);

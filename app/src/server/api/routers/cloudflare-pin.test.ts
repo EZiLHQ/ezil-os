@@ -10,8 +10,10 @@ import { initTRPC, TRPCError } from '@trpc/server';
 
 const spies = vi.hoisted(() => ({ preview: vi.fn(), restart: vi.fn(), status: vi.fn() }));
 // Billing effects are exercised in compute-dispatch.test.ts.
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => ({ now: () => new Date() }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({
     billingV2EntitlementReader: () => ({ read: async () => null }),
+    gateComputerStart: async () => ({ allowed: true }),
 }));
 vi.mock('../trpc', () => {
     const t = initTRPC.context<{ user: { id: string } | null; db: unknown }>().create();
