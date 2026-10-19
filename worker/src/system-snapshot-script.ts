@@ -239,6 +239,14 @@ def sqlite_fingerprint(data):
         con = sqlite3.connect('file:' + copy + '?immutable=1', uri=True)
         try:
             h = hashlib.sha256()
+            # Every persistent header setting (journal mode, auto_vacuum, encoding, page size,
+            # user_version, application_id, ...) except the fields a rewrite of the same rows
+            # changes: change counter and page count, freelist, schema cookie (the dump carries
+            # the schema), the vacuum root page (kept as on/off) and the version stamps.
+            header = bytearray(data[:100])
+            vacuum_on = header[52:56] != b'\x00\x00\x00\x00'
+            for start, end in ((24, 40), (40, 44), (52, 56), (92, 100)): header[start:end] = bytes(end - start)
+            h.update(b'header:' + bytes(header) + (b'1' if vacuum_on else b'0') + b'\n')
             for pragma in ('page_size', 'user_version', 'application_id', 'encoding'):
                 h.update(repr((pragma, con.execute('PRAGMA ' + pragma).fetchone())).encode() + b'\n')
             for line in con.iterdump(): h.update(line.encode('utf-8', 'surrogateescape') + b'\n')

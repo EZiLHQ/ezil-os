@@ -63,7 +63,7 @@ const OWN_HEADERS = new Set(['host', 'connection', 'keep-alive', 'content-length
  * App API calls therefore use a fresh connection without probes. Redirects
  * are returned, never followed; errors carry no request headers.
  */
-export function appRequest(url, { method = 'GET', headers = {}, body, timeout = APP_FETCH_TIMEOUT_MS } = {}) {
+export function appRequest(url, { method = 'GET', headers = {}, body, timeout = APP_FETCH_TIMEOUT_MS, signal } = {}) {
   const target = new URL(url);
   const client = target.protocol === 'https:' ? https : http;
   const sent = Object.fromEntries(Object.entries(headers)
@@ -71,7 +71,8 @@ export function appRequest(url, { method = 'GET', headers = {}, body, timeout = 
   if (headers.cookie) sent.cookie = headers.cookie;
   sent['accept-encoding'] = 'identity';
   return new Promise((resolve, reject) => {
-    const request = client.request(target, { method, headers: sent, agent: false, signal: AbortSignal.timeout(timeout) }, (response) => {
+    const request = client.request(target, { method, headers: sent, agent: false,
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(timeout), signal]) : AbortSignal.timeout(timeout) }, (response) => {
       const chunks = [];
       response.on('data', chunk => chunks.push(chunk));
       response.on('error', reject);
@@ -96,9 +97,14 @@ function fulfillHeaders(headers) {
 }
 
 export async function configureAppContext(context, { app = APP, headers = appHeaders, send = appRequest } = {}) {
-  if (!Object.keys(headers).length) return;
+  const bypass = Object.keys(headers).length > 0;
+  // A closed context cannot cancel the standalone API requests below; abort them.
+  const closed = new AbortController();
+  context.on?.('close', () => closed.abort());
   // Scope the bypass to this deployment. Global context headers would also
   // send it to the Worker, container frames and arbitrary external resources.
+  // The route is installed without a bypass too: API calls still need the
+  // probe-free transport on a public target.
   await context.route('**/*', async (route) => {
     const request = route.request();
     try {
@@ -113,9 +119,11 @@ export async function configureAppContext(context, { app = APP, headers = appHea
           headers: { ...request.headers(), ...headers, ...(cookies.length ? { cookie: cookieHeader(cookies) } : {}) },
           body: request.postDataBuffer() ?? undefined,
           timeout: appFetchTimeout(request),
+          signal: closed.signal,
         });
         return await route.fulfill({ status: response.status, headers: fulfillHeaders(response.headers), body: response.body });
       }
+      if (!bypass) return await route.continue();
       // fetch(maxRedirects: 0) prevents custom headers following cross-origin
       // redirects; the browser makes the next request through this route again.
       const response = await route.fetch({
@@ -123,9 +131,10 @@ export async function configureAppContext(context, { app = APP, headers = appHea
       });
       await route.fulfill({ response });
     } catch (error) {
-      // A media request can still be in flight when a completed test closes its
-      // browser context. Playwright then rejects route.fetch after disposal.
-      if (String(error).includes('Request context disposed')) return;
+      // A request can still be in flight when a completed test closes its
+      // browser context. Playwright then rejects route.fetch after disposal,
+      // and the API transport is aborted with the context.
+      if (closed.signal.aborted || String(error).includes('Request context disposed')) return;
       throw redactedFetchError(error, request);
     }
   });

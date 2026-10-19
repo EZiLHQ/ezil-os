@@ -166,10 +166,37 @@ test('checkpoint stop bypass leaves room for the provider budget and bounds hung
   await handler({ request: () => ({ ...request('POST', '/api/shell/stop'), headers: () => ({ 'content-type': 'application/json' }),
     postDataBuffer: () => Buffer.from('{"computerId":"x"}') }),
   fetch: async () => { throw new Error('API calls must not use the keep-alive client'); }, fulfill: async value => { fulfilled = value; } });
-  assert.deepEqual(sent, [`${target.app}/api/shell/stop`, { method: 'POST',
+  const { signal, ...options } = sent[1];
+  assert.ok(signal instanceof AbortSignal && !signal.aborted);
+  assert.deepEqual([sent[0], options], [`${target.app}/api/shell/stop`, { method: 'POST',
     headers: { 'content-type': 'application/json', 'x-vercel-protection-bypass': 'test-bypass', cookie: 'sb=session' },
     body: Buffer.from('{"computerId":"x"}'), timeout: APP_STOP_FETCH_TIMEOUT_MS }]);
   assert.deepEqual(fulfilled, { status: 200, headers: { 'content-type': 'application/json', 'set-cookie': 'a=1\nb=2' }, body: Buffer.from('{}') });
+});
+
+test('a public target without a bypass still sends API calls over the probe-free transport', async () => {
+  let handler, close, sent;
+  const context = { route: async (_pattern, callback) => { handler = callback; }, on: (event, callback) => { if (event === 'close') close = callback; },
+    cookies: async () => [] };
+  await configureAppContext(context, { app: target.app, headers: {},
+    send: async (url, options) => { sent = options; return { status: 200, headers: {}, body: Buffer.from('{}') }; } });
+  assert.ok(handler, 'route must be installed without a bypass');
+  const calls = [];
+  const route = path => ({ request: () => ({ url: () => `${target.app}${path}`, method: () => 'GET', headers: () => ({}), postDataBuffer: () => null }),
+    continue: async () => calls.push(['continue', path]), fetch: async () => { throw new Error('no route.fetch without a bypass'); },
+    fulfill: async () => calls.push(['fulfill', path]) });
+  await handler(route('/os'));
+  await handler(route('/api/shell/desktop'));
+  assert.deepEqual(calls, [['continue', '/os'], ['fulfill', '/api/shell/desktop']]);
+  assert.equal(sent.headers['x-vercel-protection-bypass'], undefined);
+  // Closing the context aborts an API call still in flight, and its failure stays quiet.
+  close();
+  assert.equal(sent.signal.aborted, true);
+  const aborted = { ...route('/api/shell/stop'), fulfill: async () => { throw new Error('fulfill should not run'); } };
+  await configureAppContext({ ...context, route: async (_p, cb) => { handler = cb; } }, { app: target.app, headers: {},
+    send: async () => { throw new Error('This operation was aborted'); } });
+  close();
+  await assert.doesNotReject(handler(aborted));
 });
 
 test('app API transport sends a fresh connection, never follows redirects and bounds silent responses', async (t) => {
@@ -202,6 +229,10 @@ test('app API transport sends a fresh connection, never follows redirects and bo
   const error = await appRequest(`${origin}/silent`, { headers: { cookie: 'sb=SECRET', 'x-vercel-protection-bypass': 'BYPASS' }, timeout: 300 })
     .then(() => null, e => e);
   assert.ok(error, 'a silent response must time out');
+  const controller = new AbortController();
+  const pending = appRequest(`${origin}/silent`, { timeout: 60_000, signal: controller.signal }).then(() => null, e => e);
+  controller.abort();
+  assert.ok(await pending, 'an aborted request must reject promptly');
   for (const secret of ['SECRET', 'BYPASS']) assert.equal(`${error.message}${error.stack}${error.cause ?? ''}`.includes(secret), false);
 });
 
