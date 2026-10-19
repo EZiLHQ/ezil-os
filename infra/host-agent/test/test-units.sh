@@ -100,6 +100,7 @@ check "relay env: Cloudflare's neko ICE env + derived credentials replace local 
 check "relay store: runDir tmpfs 0600 only (refused on the data volume), expiry-aware, bounded wait" pyunit test_ice.RelayStore
 check "agent ice/desktop_status: accepted, refused before seq, kept while running, ice_missing desktop restarted once; no credential echoed or logged" pyunit test_ice.AgentIce
 check "poweroff: a failed shutdown is retried (backoff, capped, forced fallback) until accepted; a restarted agent resumes it" pyunit test_host_resilience.PowerOff
+check "idle terminal hold: Worker SIGNAL C parity, bounded to eight hours; unknown means no hold" pyunit test_terminal_work
 check "desktop crash: unit exited/failed -> reset + restart on the next push, bounded per window, then reported; refused while stopping" pyunit test_host_resilience.DesktopRestart
 check "guard: same instance + same epoch = reboot; another instance replaying the epoch is refused" pyunit test_host_resilience.GuardReboot
 check "enroll: a same-instance reboot reuses its own epoch's credentials; any other case enrolls" pyunit test_host_resilience.EnrollReuse
