@@ -64,6 +64,17 @@ class SystemTooLargeError extends Error {}
 
 /** Chunk transfers in flight per flush / restore: each is a DO <-> container round trip plus an R2 call. */
 export const SYSTEM_TRANSFER_CONCURRENCY = 4;
+/**
+ * The Sandbox SDK's (0.12.1) `DISABLE_SESSION_TOKEN`, which it does not export. The
+ * container server runs every file operation of a session under that session's
+ * exclusive lock, so chunk transfers in the default session queued one at a time
+ * behind each other AND behind every command the desktop boot runs there: a
+ * 186 MB layer took 27-42 s to restore on a cold start (staging, 2026-10-19).
+ * Sessionless transfers use absolute paths only and run in parallel, unblocked.
+ * `system-persist.test.ts` pins this value against the installed SDK.
+ */
+export const SESSIONLESS_TRANSFER = '__DISABLE_SESSION__';
+const transfer = { encoding: 'base64', sessionId: SESSIONLESS_TRANSFER } as const;
 /** `readHead` refuses heads over this size; a head that could not be read back would lock the computer out. */
 const SYSTEM_HEAD_MAX_BYTES = 120 * 1024;
 
@@ -123,7 +134,7 @@ export async function flushSystemLayer(deps: {
     outcome.entries = snapshot.entries;
     if (previous?.snapshot.sha256 === snapshot.sha256) return { ...outcome, ok: true, unchanged: true };
     await forEachLimit(snapshot.chunks, SYSTEM_TRANSFER_CONCURRENCY, async (c, i) => {
-      const file = await container.readFile(`${work}/${i}`, { encoding: 'base64' });
+      const file = await container.readFile(`${work}/${i}`, transfer);
       if (file.encoding !== 'base64') throw new Error('system chunk encoding missing');
       const bytes = base64ToBytes(file.content);
       if (bytes.length !== c.size || await sha256(bytes) !== c.sha256) throw new Error('corrupt system chunk');
@@ -193,13 +204,13 @@ export async function hydrateSystemLayer(deps: {
       await run(container, { op: 'sys-hydrated', work, generation: snapshot.generation }, 60_000);
       return { ...outcome, ok: true, skippedReason: 'legacy_discarded' };
     }
-    await container.mkdir(work, { recursive: false });
+    await container.mkdir(work, { recursive: false, sessionId: SESSIONLESS_TRANSFER });
     await forEachLimit(snapshot.chunks, SYSTEM_TRANSFER_CONCURRENCY, async (c, i) => {
       const body = await bucket.get(chunkKey(prefix, snapshot.chunkGeneration ?? snapshot.generation, i));
       if (!body) throw new Error('system chunk missing');
       const bytes = await readBounded(body, SNAPSHOT_CHUNK_BYTES);
       if (bytes.length !== c.size || await sha256(bytes) !== c.sha256) throw new Error('system chunk corrupt');
-      requireSdkSuccess(await container.writeFile(`${work}/${i}`, bytesToBase64(bytes), { encoding: 'base64' }));
+      requireSdkSuccess(await container.writeFile(`${work}/${i}`, bytesToBase64(bytes), transfer));
     });
     // On success the codec also marks the container hydrated, which unlocks capture.
     const result = JSON.parse(await run(container, { op: 'sys-restore', work, snapshot }, 900_000)) as Record<string, unknown>;
