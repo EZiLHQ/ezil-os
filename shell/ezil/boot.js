@@ -84,6 +84,7 @@ import session from './session.js';
 import registry from './apps/registry.js';
 import { warm } from './warm.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
+import { feedback_enabled, mount_feedback_chip } from './ui/feedback/feedback.js';
 let nativePersistence = null;
 
 const PHASE = 'ezil-os:boot';
@@ -838,6 +839,7 @@ async function build (payload) {
     // unconditionally, so it has to go or the dock is drawn twice.
     $('.taskbar').remove();
     await UITaskbar({});
+    if ( feedback_enabled() ) mount_feedback_chip();
 
     // Pinned items, created up front rather than left to `UIWindow` — an app
     // pinned here survives its window being closed (UIWindow's own item is

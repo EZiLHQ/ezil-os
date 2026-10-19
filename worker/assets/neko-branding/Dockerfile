@@ -121,13 +121,14 @@ RUN set -eux; \
     sed -i 's|name="theme-color" content="#19bd9c"|name="theme-color" content="#161616"|' "$f"; \
     sed -i 's|<strong>We.re sorry but n\.eko[^<]*</strong>|<strong>This app requires JavaScript to be enabled.</strong>|' "$f"; \
     sed -i 's|<p>A self hosted virtual browser[^<]*<a[^>]*>[^<]*</a>[^<]*</p>||' "$f"; \
-    sed -i 's|</head>|<script defer="defer" src="ezil-mobile.js"></script></head>|' "$f"; \
+    sed -i 's|</head>|<script defer="defer" src="ezil-shell-origins.js"></script><script defer="defer" src="ezil-mobile.js"></script></head>|' "$f"; \
     # Every edit asserted, so a silent no-op from an upstream wording change is
     # a failed build rather than an unbranded image nobody notices.
     grep -q '<title>EZiL OS</title>' "$f"; \
     grep -q 'content="#161616"' "$f"; \
     grep -q 'color="#00adb5"' "$f"; \
     grep -q 'src="ezil-mobile.js"' "$f"; \
+    grep -q 'src="ezil-shell-origins.js"' "$f"; \
     ! grep -q 'n\.eko' "$f"; \
     ! grep -q 'm1k1o/neko' "$f"; \
     # 🔴 THE GUARD THAT WOULD HAVE CAUGHT THE PIN. Every hashed asset the page
@@ -139,16 +140,17 @@ RUN set -eux; \
     done; \
     echo "index.html branded in place; all referenced assets present"
 
-# The mobile on-screen-keyboard affordance, referenced by exactly one added
-# <script> tag in the index.html above (every pre-existing <script>/<link> tag
-# and hashed filename in that file is still byte-identical to upstream). It is
-# a separate file, not an inline blob, so it stays readable and diffable and so
-# index.html's own diff against upstream remains one line. It runs in the
-# desktop's origin — the only place with DOM access to the compiled client —
-# and it is a hard no-op unless the device reports real touch capability. See
-# the file's header comment for what the upstream bundle already provides and
-# what this repairs.
+# The frame bridge runs in the desktop origin, where it can reach the video
+# and intercept input (www/ezil-mobile.js:5). Its keyboard affordance alone is
+# touch-gated. Keep the code external and readable; the added configuration
+# script precedes it without changing the upstream bundle's asset references.
 COPY www/ezil-mobile.js             /var/www/ezil-mobile.js
+
+# The Worker writes only public origin configuration via sandbox.writeFile
+# before returning a preview (worker/src/index.ts:1096). A standalone image
+# leaves the global unset so ezil-mobile.js uses its production/loopback defaults.
+# Deferred scripts execute in document order: configuration precedes the bridge.
+RUN printf '%s\n' '// Configured by the Worker before serving the shell preview.' > /var/www/ezil-shell-origins.js
 
 # Build-time verification: fail the image build (not just a later manual
 # check) if any of the strings this overlay is supposed to remove are still
@@ -167,6 +169,7 @@ RUN if grep -qi "n\.eko" /var/www/index.html; then \
     fi \
   && test -s /var/www/chat.mp3 \
   && test -s /var/www/ezil-mobile.js \
+  && test -s /var/www/ezil-shell-origins.js \
   && if ! grep -q 'src="ezil-mobile.js"' /var/www/index.html; then \
       echo "ERROR: index.html does not load ezil-mobile.js" >&2; \
       exit 1; \

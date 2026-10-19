@@ -1,0 +1,74 @@
+/* Included by build-shell.sh with the other shell/ezil styles. */
+.ezil-redact-editor {
+    box-sizing: border-box;
+    width: min(1100px, calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+    max-height: calc(100dvh - 24px);
+    margin: auto;
+    padding: 20px;
+    overflow: auto;
+    border: 1px solid #5f6879;
+    border-radius: 12px;
+    background: #17202e;
+    color: #f5f7fb;
+    font: 14px/1.45 system-ui, sans-serif;
+    color-scheme: dark;
+}
+.ezil-redact-editor::backdrop { background: rgb(0 0 0 / 70%); }
+.ezil-redact-editor h2 { margin: 0 0 8px; color: inherit; font-size: 20px; }
+.ezil-redact-editor p { margin: 8px 0 12px; }
+.ezil-redact-tools, .ezil-redact-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ezil-redact-actions { justify-content: flex-end; }
+.ezil-redact-editor button {
+    box-sizing: border-box;
+    min-height: 44px;
+    padding: 8px 14px;
+    border: 1px solid #8593a8;
+    border-radius: 6px;
+    background: #27354a;
+    color: #fff;
+    font: inherit;
+    cursor: pointer;
+}
+.ezil-redact-editor button[aria-pressed="true"],
+.ezil-redact-editor button[data-action="confirm"] { background: #185cb0; }
+.ezil-redact-editor button:disabled { opacity: 0.5; cursor: default; }
+.ezil-redact-editor button:focus-visible { outline: 3px solid #80d8ff; outline-offset: 3px; }
+.ezil-redact-help { color: #d5dfef; font-size: 12px; }
+.ezil-redact-viewport { display: flex; justify-content: center; max-width: 100%; overflow: hidden; }
+.ezil-redact-stage { position: relative; flex: none; overflow: hidden; touch-action: none; user-select: none; cursor: crosshair; background: #fff; }
+.ezil-redact-stage canvas { display: block; width: 100%; height: 100%; pointer-events: none; }
+.ezil-redact-overlays { position: absolute; inset: 0; pointer-events: none; }
+.ezil-redact-editor .ezil-redact-box,
+.ezil-redact-editor .ezil-redact-crop {
+    position: absolute;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    pointer-events: auto;
+    touch-action: none;
+    cursor: move;
+}
+.ezil-redact-editor .ezil-redact-box,
+.ezil-redact-editor .ezil-redact-box[aria-pressed="true"] { background: #000; opacity: 1; }
+.ezil-redact-editor .ezil-redact-box[aria-pressed="true"] { outline: 2px solid #80d8ff; outline-offset: 0; }
+.ezil-redact-editor .ezil-redact-crop,
+.ezil-redact-editor .ezil-redact-crop[aria-pressed="true"] {
+    border: 2px dashed #ffe080;
+    background: transparent;
+    box-shadow: 0 0 0 3000px rgb(0 0 0 / 55%);
+    /* The interior stays available for drawing and selecting redactions. */
+    pointer-events: none;
+}
+.ezil-redact-crop::after { content: ''; position: absolute; top: -2px; right: -2px; width: 18px; height: 18px; background: #ffe080; pointer-events: auto; }
+.ezil-redact-status { min-height: 1.45em; }
+@media (max-width: 540px) {
+    .ezil-redact-editor { padding: 12px; }
+    .ezil-redact-editor button { padding: 8px 10px; }
+}
+@media (forced-colors: active) {
+    .ezil-redact-editor .ezil-redact-box { forced-color-adjust: none; background: #000; }
+}

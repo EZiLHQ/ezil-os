@@ -4,7 +4,9 @@ import { redirect } from 'next/navigation';
 
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
+import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
+import { shellFeaturesFor } from '@/server/shell/features';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
@@ -142,6 +144,7 @@ export default async function Page() {
         computer: computerResult.computer,
         isNew: computerResult.created,
         provider: providerResult,
+        features: shellFeaturesFor(user.email, env),
     });
 
     return (

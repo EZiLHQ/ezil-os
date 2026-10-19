@@ -38,7 +38,9 @@ import {
 import { startLocalServer, type LocalServer } from './server.ts';
 
 // Direct loopback media does not have Cloudflare TURN credentials to renew.
-const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_SHELL_API_ROUTES } = APP_SHELL_API_ROUTES;
+// Feedback is hosted-only (per-user flag, hosted database); the local host
+// neither publishes nor serves it.
+const { relayRefresh: HOSTED_RELAY_ROUTE, feedback: HOSTED_FEEDBACK_ROUTE, ...COMMON_SHELL_API_ROUTES } = APP_SHELL_API_ROUTES;
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 
@@ -133,6 +135,7 @@ describe('the published endpoint map and the served paths are the same nine', ()
         const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
         expect(body.desktopState.endpoints.relayRefresh).toBeUndefined();
         expect((await get(HOSTED_RELAY_ROUTE)).status).toBe(404);
+        expect((await get(HOSTED_FEEDBACK_ROUTE)).status).toBe(404);
     });
 });
 

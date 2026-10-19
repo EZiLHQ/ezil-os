@@ -46,7 +46,9 @@ import {
 
 // Relay renewal belongs to Cloudflare's hosted transport. The local host
 // serves direct loopback media and must not advertise a refresh URL it lacks.
-const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_ROUTES } = APP_ROUTES;
+// Feedback is hosted-only too: the app publishes it per user, behind a flag,
+// and stores reports in the hosted database (docs/FEEDBACK-CONTROLS-CONTRACT.md).
+const { relayRefresh: HOSTED_RELAY_ROUTE, feedback: HOSTED_FEEDBACK_ROUTE, ...COMMON_ROUTES } = APP_ROUTES;
 
 const encoder = new TextEncoder();
 
@@ -60,8 +62,9 @@ describe('the route table has not drifted from the app', () => {
         // Without this, a module that somehow resolved to `{}` would make every
         // "same keys" assertion below vacuously true.
         expect(typeof APP_ROUTES).toBe('object');
-        expect(Object.keys(APP_ROUTES).length).toBe(10);
+        expect(Object.keys(APP_ROUTES).length).toBe(11);
         expect(HOSTED_RELAY_ROUTE).toBe('/api/shell/relay-refresh');
+        expect(HOSTED_FEEDBACK_ROUTE).toBe('/api/shell/feedback');
         expect(typeof appSerialize).toBe('function');
     });
 
@@ -86,6 +89,10 @@ describe('the route table has not drifted from the app', () => {
 
     it('does not advertise the unsupported hosted relay operation', () => {
         expect('relayRefresh' in LOCAL_ROUTES).toBe(false);
+    });
+
+    it('does not advertise the hosted-only feedback endpoint', () => {
+        expect('feedback' in LOCAL_ROUTES).toBe(false);
     });
 
     it('every path is same-origin and relative — never an absolute URL', () => {

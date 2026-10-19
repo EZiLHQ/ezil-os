@@ -14,9 +14,9 @@
  *      right secret; 404 makes "misconfigured" and "not yours to call"
  *      indistinguishable from the outside.
  *
- * ── TWO JOBS, ONE CRON ──────────────────────────────────────────────────────
- * This handler runs the retention job AND, when `deps.drain` is supplied, the
- * R2 telemetry spool drain.
+ * ── THREE JOBS, ONE CRON ────────────────────────────────────────────────────
+ * This handler runs telemetry retention, feedback retention, and, when
+ * `deps.drain` is supplied, the R2 telemetry spool drain.
  *
  * 🔴 That is not tidiness, it is the fix for a 16-day outage. `app/vercel.json`
  * declared THREE crons; the plan permits two, and the one that stopped being
@@ -28,20 +28,22 @@
  * daily, both already authenticate with the same `CRON_SECRET`, and neither
  * needs the other's output.
  *
- * 🔴 THE TWO HALVES ARE ISOLATED FROM EACH OTHER, and that is the whole point
+ * 🔴 THE JOBS ARE ISOLATED FROM EACH OTHER, and that is the whole point
  * of running them here rather than chaining one route's handler into another's.
  * Each is awaited inside its own `try`, so:
- *   - retention throwing does not stop the drain from running or reporting;
- *   - the drain throwing does not undo or hide the retention that already ran;
- *   - the response body reports BOTH outcomes, and `failed` names whichever
- *     half broke, so "the drain is down" can never again look like "the cron
+ *   - either retention job throwing does not stop the other or the drain;
+ *   - the drain throwing does not undo or hide retention that already ran;
+ *   - the response body reports every outcome, and `failed` names whichever
+ *     job broke, so "the drain is down" can never again look like "the cron
  *     did nothing".
- * They run in sequence, not concurrently: both write to the same Postgres and
+ * They run in sequence, not concurrently: all write to the same Postgres and
  * the retention prunes are already chunked against a wall-clock budget —
  * interleaving them would double the connection pressure for no gain, and the
  * drain's own budget (`DEFAULT_DRAIN_BUDGET_MS`) assumes it starts after
- * retention has finished.
+ * retention has finished. Feedback shares one 20-second budget across all
+ * three stores, within the existing route's 300-second execution allowance.
  */
+import { feedbackTablesPresent, runFeedbackRetention, type FeedbackRetentionResult } from '../feedback/retention';
 import { runTelemetryMaintenance, type MaintenanceResult, type RetentionDb } from './retention';
 import { runTelemetrySpoolDrain, type SpoolDrainEngineDeps, type SpoolDrainResult } from './spool-drain';
 
@@ -52,19 +54,19 @@ export interface MaintenanceHandlerDeps {
     db: RetentionDb;
     /**
      * When present, the R2 spool drain runs after retention, in the same
-     * invocation. Optional so `/api/cron/telemetry-drain` and every existing
-     * test keep the retention-only behaviour byte for byte.
+     * invocation. Feedback retention always runs, including without a drain.
      */
     drain?: SpoolDrainEngineDeps;
 }
 
-/** Which half of the job threw. Absent when nothing did. */
-export type MaintenanceFailure = 'maintenance' | 'drain';
+/** Which jobs threw. Absent when nothing did. */
+export type MaintenanceFailure = 'maintenance' | 'feedback' | 'drain';
 
 export interface MaintenanceResponseBody {
-    /** `true` only when every half that was asked to run finished without throwing. */
+    /** `true` only when every job that was asked to run finished without throwing. */
     ok: boolean;
     result?: MaintenanceResult;
+    feedback?: FeedbackRetentionResult;
     drain?: SpoolDrainResult;
     failed?: MaintenanceFailure[];
 }
@@ -82,6 +84,16 @@ export async function handleTelemetryMaintenance(req: Request, deps: Maintenance
     } catch (err) {
         console.error('[telemetry] maintenance run failed', { m: String((err as Error)?.message ?? err) });
         failed.push('maintenance');
+    }
+
+    // The existing cron carries feedback too: no third Vercel schedule.
+    // Each job reports independently, even when an earlier job threw.
+    try {
+        // Absent tables (SQL not yet registered) are skipped, not a failure.
+        body.feedback = await runFeedbackRetention(deps.db, { tables: await feedbackTablesPresent(deps.db) });
+    } catch (err) {
+        console.error('[feedback] retention run failed', { m: String((err as Error)?.message ?? err) });
+        failed.push('feedback');
     }
 
     if (deps.drain) {

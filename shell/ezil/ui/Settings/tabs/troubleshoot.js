@@ -73,6 +73,7 @@ import log from '../../../log.js';
 import session from '../../../session.js';
 import telemetry from '../../../telemetry.js';
 import { ambientCorrelationId } from '../../../trace.js';
+import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -303,7 +304,14 @@ function render ($win) {
         </p>
         <button type="button" class="ezil-settings-btn" data-action="copy-diagnostics"
             ${nothingRecorded ? 'disabled' : ''}>Copy diagnostic log</button>
+        ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="report-problem">Report a problem</button>' : ''}
         ${copyHtml}
+        ${feedback_enabled() ? `<section aria-label="Your reports">
+            <h3>Your reports</h3>
+            <button type="button" class="ezil-settings-btn" data-action="load-reports">Load your reports</button>
+            <div data-role="feedback-reports" aria-live="polite"></div>
+            <p class="ezil-settings-muted">Deleted reports are removed immediately; database backups expire on their own schedule.</p>
+        </section>` : ''}
     `);
 }
 
@@ -370,10 +378,65 @@ async function handleCopyDiagnostics ($win) {
     }
 }
 
+// Loading is explicit: opening the feedback form must not cause a request.
+// Refresh only this list, so a response cannot replace a newly opened form.
+async function loadReports ($win) {
+    if ( ! feedback_enabled() ) return;
+    const host = $win.find('[data-role="feedback-reports"]')[0];
+    if ( ! host ) return;
+    host.textContent = 'Loading your reports…';
+    try {
+        const reports = await list_my_reports();
+        if ( ! host.isConnected || ! feedback_enabled() ) return;
+        host.textContent = '';
+        if ( reports.length === 0 ) { host.textContent = 'You have no reports yet.'; return; }
+        const list = document.createElement('ul');
+        list.className = 'ezil-feedback-reports';
+        for ( const report of reports ) {
+            const row = document.createElement('li');
+            const heading = document.createElement('strong');
+            const date = new Date(report.createdAt);
+            const category = { bug: 'Bug', idea: 'Idea', other: 'Other' }[report.category] || 'Report';
+            heading.textContent = `${category} · ${Number.isNaN(date.getTime()) ? 'Date unavailable' : date.toLocaleDateString()}`;
+            const preview = document.createElement('p');
+            preview.textContent = String(report.descriptionPreview ?? '').slice(0, 140);
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'ezil-settings-btn';
+            remove.textContent = 'Delete';
+            remove.addEventListener('click', async () => {
+                if ( ! feedback_enabled() || ! window.confirm('Delete this report and its screenshot?') ) return;
+                remove.disabled = true;
+                const message = document.createElement('p');
+                message.className = 'ezil-settings-error';
+                try {
+                    if ( ! await delete_my_report(report.id) ) throw new Error('delete_failed');
+                    row.remove();
+                    if ( ! list.children.length ) host.textContent = 'You have no reports yet.';
+                } catch {
+                    message.textContent = 'Could not delete this report. Try again.';
+                    row.append(message);
+                    remove.disabled = false;
+                }
+            });
+            row.append(heading, preview, remove);
+            list.append(row);
+        }
+        host.append(list);
+    } catch {
+        if ( host.isConnected ) host.textContent = 'Could not load your reports. Try again.';
+    }
+}
+
 function bind ($win) {
     $win.find('[data-role="troubleshoot-body"]')
         .on('click', '[data-action="restart"]', () => { void handleRestart($win); })
-        .on('click', '[data-action="copy-diagnostics"]', () => { void handleCopyDiagnostics($win); });
+        .on('click', '[data-action="copy-diagnostics"]', () => { void handleCopyDiagnostics($win); })
+        .on('click', '[data-action="report-problem"]', function () {
+            this.focus();
+            if ( feedback_enabled() ) open_feedback_dialog({ source: 'troubleshoot' });
+        })
+        .on('click', '[data-action="load-reports"]', () => { void loadReports($win); });
 }
 
 export default {

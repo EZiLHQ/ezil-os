@@ -100,6 +100,9 @@ import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
+import { confirm_close } from '../ui/close-confirm.js';
+import { feedback_enabled, open_feedback_dialog } from '../ui/feedback/feedback.js';
+import { classify_frame_controls_message, register_capture_target } from '../ui/frame-controls-bridge.js';
 import {
     computeFitBox,
     createScreenController,
@@ -238,6 +241,87 @@ function is_minimized (el) {
  * `minimise_to_taskbar` are the only two places that write it.
  */
 const FULLBLEED_CLASS = 'ezil-fullbleed';
+
+// A capture-pipeline resize is expensive (desktop-screen.js:238). Share one
+// trailing timer across viewport, fullscreen and body-resize notifications.
+export function debounce_measure (measure, { setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+    let timer = null;
+    const cancel = () => { clearTimer(timer); timer = null; };
+    const schedule = () => {
+        cancel();
+        timer = setTimer(() => { timer = null; measure(); }, 500);
+    };
+    schedule.cancel = cancel;
+    return schedule;
+}
+
+// Full-bleed has no other chrome (UIDesktopFullpage.js:126); a failed optional
+// drawer must still leave the original exit available.
+export function attach_with_floating_fallback (attach, el, legacy, floating) {
+    if ( floating ) {
+        try {
+            const drawer = attach(el, floating);
+            if ( drawer ) return drawer;
+        } catch { /* The legacy drawer still provides an exit. */ }
+    }
+    return attach(el, legacy);
+}
+
+export function bind_floating_fullscreen (drawer, schedule, doc = document, view = window) {
+    const changed = () => {
+        drawer.ezil_controls.set_fullscreen(!!doc.fullscreenElement);
+        schedule();
+    };
+    doc.addEventListener('fullscreenchange', changed);
+    view.addEventListener('resize', schedule);
+    drawer.ezil_controls.set_fullscreen(!!doc.fullscreenElement);
+    return {
+        async toggle () {
+            try {
+                if ( doc.fullscreenElement ) await doc.exitFullscreen();
+                else await doc.documentElement.requestFullscreen();
+            } catch {
+                drawer.ezil_controls.set_status("Couldn't change full screen. You can still minimise or close Browser.");
+            }
+        },
+        dispose () {
+            doc.removeEventListener('fullscreenchange', changed);
+            view.removeEventListener('resize', schedule);
+            schedule.cancel();
+        },
+    };
+}
+
+// Fullpage hides chrome visually, but does not remove desktop icons from Tab
+// (UIDesktopFullpage.js:126). Inert their containers, including later children.
+// A temporary first tab stop avoids moving a live iframe, which reloads it.
+export function floating_focus_order (el, drawer) {
+    const doc = el.ownerDocument;
+    const saved = [];
+    const set = (node, name, value) => {
+        saved.push([node, name, node.getAttribute(name)]);
+        node.setAttribute(name, value);
+    };
+    const inert_background = node => {
+        if ( node === el ) return;
+        if ( node.contains(el) ) {
+            for ( const child of node.children ) inert_background(child);
+        } else set(node, 'inert', '');
+    };
+    for ( const node of doc.querySelectorAll('.taskbar, .desktop') ) inert_background(node);
+    for ( const node of el.querySelectorAll('.window-head') ) set(node, 'inert', '');
+    for ( const node of doc.querySelectorAll('[tabindex]') ) {
+        if ( node.tabIndex > 0 ) set(node, 'tabindex', '0');
+    }
+    const grabber = drawer.querySelector('button[aria-expanded]');
+    set(grabber, 'tabindex', '1');
+    return () => {
+        for ( const [node, name, value] of saved.splice(0).reverse() ) {
+            if ( value === null ) node.removeAttribute(name);
+            else node.setAttribute(name, value);
+        }
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE STREAM'S SHAPE, AND WHAT THIS FILE CAN AND CANNOT DO ABOUT IT
@@ -595,6 +679,9 @@ export async function openDesktopWindow (ctx = {}) {
     document.addEventListener('visibilitychange',on_relay_return);
     window.addEventListener('online',on_relay_online);
     const el_iframe = el_window.querySelector('.window-app-iframe');
+    let floating_mode = false;
+    let restore_floating_focus = () => {};
+    let floating_fullscreen = null;
 
     // ── the desktop's ACTUAL size, and the live-resize path ────────────────
     // ADDED BY EZIL 2026-08-19. See `./desktop-screen.js` and the header block
@@ -704,6 +791,14 @@ export async function openDesktopWindow (ctx = {}) {
         return measureDesktopBox({ body: el_body, view });
     };
 
+    const schedule_floating_measure = debounce_measure(() => {
+        // Preserve the existing minimise/keyboard exclusions below: a hidden
+        // animation or keyboard inset must never resize the remote desktop.
+        if ( disposed || is_minimized(el_window) || keyboardInsetPx(document) > 0 ) return;
+        const want = measure_screen();
+        if ( want && neko_reachable ) screen_ctl.request(want.width, want.height);
+    });
+
     /**
      * Ask the server what the desktop's screen ACTUALLY is, and fold the answer
      * back into both the fit and the controller's dedup.
@@ -749,6 +844,7 @@ export async function openDesktopWindow (ctx = {}) {
                 // same debounced, deduplicated path every other caller uses,
                 // and `reconcile` has just cleared the entry that would have
                 // suppressed it.
+                if ( floating_mode ) { schedule_floating_measure(); return; }
                 const want = measure_screen();
                 if ( want ) screen_ctl.request(want.width, want.height);
             })
@@ -827,8 +923,10 @@ export async function openDesktopWindow (ctx = {}) {
             // keyboard-shrunk size.
             if ( keyboardInsetPx(typeof document !== 'undefined' ? document : null) > 0 ) {
                 screen_ctl.cancel();
+                schedule_floating_measure.cancel();
                 return;
             }
+            if ( floating_mode ) { schedule_floating_measure(); return; }
             const want = measure_screen();
             if ( want && neko_reachable ) screen_ctl.request(want.width, want.height);
         });
@@ -1000,6 +1098,17 @@ export async function openDesktopWindow (ctx = {}) {
     const STALE_RECOVERY_MIN_GAP_MS = 20_000;
     let last_stale_recovery = 0;
     const on_frame_message = (event) => {
+        // Controls intentionally have no attempt token (the pinned contract,
+        // docs/FEEDBACK-CONTROLS-CONTRACT.md:85). Their source/origin classifier
+        // cannot admit vitals or recovery messages past the existing gate.
+        if ( ! disposed && floating_mode ) {
+            const controls = classify_frame_controls_message(event, { origin: viewer_origin, source: el_iframe.contentWindow });
+            if ( controls ) {
+                drawer.ezil_controls.reveal();
+                if ( controls.type === 'controls_hotkey' ) drawer.ezil_controls.focus_grabber();
+                return;
+            }
+        }
         if ( disposed || ! isCurrentViewerMessage(event, el_iframe.contentWindow, viewer_origin, viewer_attempt) ) return;
         if (event.data?.source === 'ezil-mobile' && event.data?.type === 'peer_state' && ['failed','disconnected'].includes(event.data.state)) relay_renewal?.reconnect();
         if ( event.data?.source === 'ezil-mobile' && event.data?.type === 'stream_vitals' ) {
@@ -1122,6 +1231,7 @@ export async function openDesktopWindow (ctx = {}) {
         // clicked the wallpaper during the boot would otherwise get a desktop
         // that renders perfectly and ignores every click.
         $(el_window).focusWindow();
+        if ( floating_mode ) restore_floating_focus = floating_focus_order(el_window, drawer);
         // The drawer is now the only chrome on screen; let it introduce itself.
         el_window._ezil_drawer_flash?.();
         console.info(`[${PHASE}] full-bleed (${why})`);
@@ -1392,6 +1502,7 @@ export async function openDesktopWindow (ctx = {}) {
         viewer_origin = viewer_url.origin;
         viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
         el_iframe.src = viewer_url.href;
+        register_capture_target(el_iframe, viewer_origin);
         // 🔴 THE GATE STARTS HERE, NOT AFTER THE FRAME CHECK. Asking Neko
         // whether a peer is connected is independent of everything
         // `settle_frame` does — it goes to Neko's own API, not to the iframe —
@@ -1876,6 +1987,8 @@ export async function openDesktopWindow (ctx = {}) {
      * still restores the pre-full-bleed geometry correctly.
      */
     function minimise_to_taskbar (el) {
+        restore_floating_focus();
+        schedule_floating_measure.cancel();
         // Guarded, because this handler is now reachable from a window that
         // never went full-bleed (the drawer exists from the moment the window
         // does). The fullpage exit on a windowed window would re-show a head
@@ -1994,7 +2107,11 @@ export async function openDesktopWindow (ctx = {}) {
     async function switchApp (app, label, el) {
         if ( switch_in_flight || disposed || ! focus_endpoint ) return;
         switch_in_flight = true;
-        const el_title = el.querySelector('.dashboard-app-drawer-title');
+        // The floating title disappears on phones; its live status remains
+        // available (docs/FEEDBACK-CONTROLS-CONTRACT.md:73).
+        const el_title = floating_mode ? {
+            set textContent (text) { drawer.ezil_controls.set_status(text === title ? '' : text); },
+        } : el.querySelector('.dashboard-app-drawer-title');
         const restore_title = () => { if ( el_title ) el_title.textContent = title; };
         if ( el_title ) el_title.textContent = `${label}…`;
 
@@ -2059,12 +2176,48 @@ export async function openDesktopWindow (ctx = {}) {
             });
         }
     }
-    const drawer = attach_app_drawer(el_window, {
+    let close_pending = false;
+    const close_from_pill = async () => {
+        if ( close_pending || disposed ) return;
+        close_pending = true;
+        try {
+            const shared = [...document.querySelectorAll('.window[data-ezil-computer-id]')]
+                .some(w => w !== el_window && w.getAttribute('data-ezil-computer-id') === String(computer.id));
+            const choice = shared ? 'close' : await confirm_close({ shared: false });
+            if ( disposed ) return;
+            if ( choice === 'close' ) { void $(el_window).close(); return; }
+            if ( choice === 'minimize' ) { minimise_to_taskbar(el_window); return; }
+            drawer.ezil_controls.reveal();
+            drawer.querySelector('.dashboard-app-drawer-close').focus();
+        } finally { close_pending = false; }
+    };
+    const floating_options = desktop_state.ui?.floatingControls === true ? {
+        variant: 'floating',
+        title,
+        icon: ctx.icon,
+        flash_on_attach: false,
+        traffic: {
+            on_close: () => { void close_from_pill(); },
+            on_minimize: () => minimise_to_taskbar(el_window),
+            on_expand: () => { void floating_fullscreen.toggle(); },
+            expand_supported: document.fullscreenEnabled === true,
+        },
+        overflow: drawer_actions.filter(action => action.id.startsWith('focus-')).map(action => ({
+            id: action.id,
+            label: action.label,
+            className: `dashboard-app-drawer-${action.id}`,
+            onClick: () => action.onClick(el_window),
+        })),
+        ...(feedback_enabled() ? { on_feedback: () => open_feedback_dialog({ source: 'pill' }) } : {}),
+    } : null;
+    const drawer = attach_with_floating_fallback(attach_app_drawer, el_window, {
         title,
         icon: ctx.icon,
         flash_on_attach: false,
         actions: drawer_actions,
-    });
+    }, floating_options);
+    floating_mode = !!drawer?.classList.contains('ezil-floating-drawer');
+    if ( floating_mode ) floating_fullscreen = bind_floating_fullscreen(drawer, schedule_floating_measure);
     if ( ! drawer ) {
         // The drawer failing to attach means a full-bleed window with no exit.
         // Staying windowed is worse-looking and strictly better than trapping
@@ -2176,6 +2329,9 @@ export async function openDesktopWindow (ctx = {}) {
     /** Everything that must stop, whichever way this window ends. */
     const dispose = () => {
         disposed = true;
+        floating_fullscreen?.dispose();
+        schedule_floating_measure.cancel();
+        restore_floating_focus();
         relay_renewal?.stop();
         document.removeEventListener('visibilitychange',on_relay_return);
         window.removeEventListener('online',on_relay_online);
