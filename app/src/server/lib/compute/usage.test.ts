@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { rowHoursInMonth, rowOverlapsMonth, summarizeUsage, utcMonthStart, utcNextMonthStart } from './usage';
+import { monthUsageFromRows, rowHoursInMonth, rowOverlapsMonth, summarizeUsage, utcMonthStart, utcNextMonthStart } from './usage';
 
 const U1 = 'u1';
 const U2 = 'u2';
 const row = (userId: string, startedAt: string, stoppedAt: string | null, egressBytes: number | null = null) => ({
     computerId: 'c',
     userId,
+    instanceType: 'm6i.large',
     startedAt: new Date(startedAt),
     stoppedAt: stoppedAt === null ? null : new Date(stoppedAt),
     egressBytes,
@@ -57,12 +58,37 @@ describe('summaries', () => {
     ];
 
     it('splits per user and global', () => {
-        expect(summarizeUsage(rows, U1, now)).toEqual({ user: { hours: 3, egressBytes: 105 }, global: { hours: 13, egressBytes: 105 } });
+        expect(summarizeUsage(rows, U1, now)).toEqual({ user: { hours: 3, weightedSeconds: 10_800, egressBytes: 105 }, global: { hours: 13, weightedSeconds: 46_800, egressBytes: 105 } });
     });
 
     it('egress of a boundary-spanning row counts in both months (over-count, safe direction)', () => {
         const sept = new Date('2026-09-30T23:59:00Z');
         expect(summarizeUsage([rows[1]!], U1, sept).user.egressBytes).toBe(100);
         expect(summarizeUsage([rows[1]!], U1, now).user.egressBytes).toBe(100);
+    });
+});
+
+describe('integer weighted usage', () => {
+    const now = new Date('2026-10-13T12:00:00Z');
+    it('one cmp-8 hour is 14,400 weighted seconds, retaining one wall-clock hour', () => {
+        const rows = [{ ...row(U1, '2026-10-13T11:00:00Z', null), instanceType: 'm6i.2xlarge' }];
+        const totals = { hours: 1, weightedSeconds: 14_400, egressBytes: 0 };
+        expect(summarizeUsage(rows, U1, now)).toEqual({ user: totals, global: totals });
+        expect(monthUsageFromRows(rows, now).byUser.get(U1)).toEqual(totals);
+    });
+
+    it('clips to the UTC month and now, then floors each row before weighting', () => {
+        const instant = new Date('2026-10-01T00:00:01.999Z');
+        const rows = [
+            { ...row(U1, '2026-09-30T23:59:59.100Z', null), instanceType: 'm6i.2xlarge' },
+            { ...row(U1, '2026-10-01T00:00:01.100Z', '2026-10-01T00:00:02.999Z'), instanceType: 'm6i.xlarge' },
+        ];
+        expect(summarizeUsage(rows, U1, instant).user.weightedSeconds).toBe(4);
+        expect(monthUsageFromRows(rows, instant).global.weightedSeconds).toBe(4);
+    });
+
+    it.each(['c6i.xlarge', 'm6i.xlarge', 'unknown', null])('%j is weighted without under-metering', instanceType => {
+        const rows = [{ ...row(U1, '2026-10-13T11:00:00Z', null), instanceType }];
+        expect(monthUsageFromRows(rows, now).global.weightedSeconds).toBe(instanceType?.endsWith('.xlarge') ? 7_200 : 14_400);
     });
 });

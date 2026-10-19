@@ -218,7 +218,7 @@ test('premium type and size from the allowlist provision end to end',async()=>{
     assert.equal(r.calls.find(c=>c.action==='createVolume')!.parameters.Size,50);
 });
 // ── Tiers (founder 2026-10-14): free = t3a/t3.medium with standard credits; plus = m6i.large ──
-const TIERED=['t3a.medium','t3.medium','m6i.large'] as const;
+const TIERED=['t3a.medium','t3.medium','m6i.large','m6i.xlarge','m6i.2xlarge'] as const;
 for(const [instanceType,operation] of [['t3a.medium','provision'],['t3.medium','provision'],['t3a.medium','replace']] as const)
     test(`free tier ${instanceType} ${operation}: RunInstances carries exactly CpuCredits=standard through the burstable state`,async()=>{
         const r=await run(operation,{fixture:lifecycleFixture(operation,{instanceType,instanceTypes:[...TIERED]})});
@@ -227,10 +227,11 @@ for(const [instanceType,operation] of [['t3a.medium','provision'],['t3.medium','
         assert.deepEqual(launches[0]!.parameters.CreditSpecification,{CpuCredits:'standard'});
         assert.ok(r.visited.includes('runBurstableInstances'));assert.ok(!r.visited.includes('runInstances'));
     });
-test('upgraded tier m6i.large: RunInstances carries no CreditSpecification',async()=>{
-    const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType:'m6i.large',instanceTypes:[...TIERED]})});
+for(const instanceType of ['m6i.large','m6i.xlarge','m6i.2xlarge'] as const)
+test(`paid tier ${instanceType}: RunInstances carries no CreditSpecification`,async()=>{
+    const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType,instanceTypes:[...TIERED]})});
     assert.equal(r.error,undefined);const launch=r.calls.find(c=>c.action==='runInstances')!;
-    assert.equal(launch.parameters.InstanceType,'m6i.large');assert.ok(!('CreditSpecification' in launch.parameters));
+    assert.equal(launch.parameters.InstanceType,instanceType);assert.ok(!('CreditSpecification' in launch.parameters));
     assert.ok(r.visited.includes('runInstances'));assert.ok(!r.visited.includes('runBurstableInstances'));
 });
 test('graph: only the burstable state forwards CreditSpecification, and both states call EC2 RunInstances',()=>{
@@ -241,13 +242,14 @@ test('graph: only the burstable state forwards CreditSpecification, and both sta
     assert.ok(!Object.keys(plain.Parameters).includes('CreditSpecification.$'));
     assert.equal(burst.Next,'After-runBurstableInstances');assert.equal(g.States['After-runBurstableInstances'].Next,'Observe-instance');
 });
-test('tier map: free = t3a.medium then t3.medium (burstable), plus = m6i.large; all allowlisted; schema refuses bad maps',()=>{
-    assert.deepEqual(TIER_INSTANCE_TYPES,{free:['t3a.medium','t3.medium'],plus:['m6i.large']});
+test('tier map: free = t3a.medium then t3.medium (burstable), plus / compute4 / compute8 are non-burstable; all allowlisted; schema refuses bad maps',()=>{
+    assert.deepEqual(TIER_INSTANCE_TYPES,{free:['t3a.medium','t3.medium'],plus:['m6i.large'],compute4:['m6i.xlarge'],compute8:['m6i.2xlarge']});
     for(const tier of COMPUTER_TIERS)for(const t of TIER_INSTANCE_TYPES[tier])assert.ok((INSTANCE_TYPES as readonly string[]).includes(t),t);
     assert.deepEqual(INSTANCE_TYPES.filter(isBurstable),['t3a.medium','t3.medium']);
-    assert.ok(TIER_INSTANCE_TYPES.free.every(isBurstable));assert.ok(!TIER_INSTANCE_TYPES.plus.some(isBurstable));
-    for(const bad of [{free:['t3a.large'],plus:['m6i.large']},{free:['t3a.medium','t3a.medium'],plus:['m6i.large']},{free:[],plus:['m6i.large']},
-        {free:['t3a.medium']},{free:['t3a.medium'],plus:['m6i.large'],pro:['c6i.xlarge']}])
+    assert.ok(TIER_INSTANCE_TYPES.free.every(isBurstable));for(const tier of ['plus','compute4','compute8'] as const)assert.ok(!TIER_INSTANCE_TYPES[tier].some(isBurstable));
+    for(const bad of [{...TIER_INSTANCE_TYPES,free:['t3a.large']},{...TIER_INSTANCE_TYPES,free:['t3a.medium','t3a.medium']},
+        {...TIER_INSTANCE_TYPES,free:[]},{...TIER_INSTANCE_TYPES,compute4:[]},{...TIER_INSTANCE_TYPES,compute8:undefined},
+        {...TIER_INSTANCE_TYPES,pro:['c6i.xlarge']}])
         assert.equal(TierMapSchema.safeParse(bad).success,false,JSON.stringify(bad));
     assert.deepEqual(BURSTABLE_CREDITS,{CpuCredits:'standard'});
 });

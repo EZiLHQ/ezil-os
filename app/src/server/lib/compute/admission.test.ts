@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { decideAdmission, runAdmission, type RegionalCounters, type RegionPlan } from './admission';
 import { AWS_CAP_ENV, AWS_TIERS, instanceTypeForTier, isAwsTier, readAwsAdmissionConfig, regionCapEnv, type AwsAdmissionConfig } from './aws-config';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { leasePlacement, mintAdmissionTicket, readAdmissionCounters, withAdmission, type AdmissionCounters } from './placement';
+import { leasePlacement, mintAdmissionTicket, readAdmissionCounters, withAdmission, ENROLLMENT_FAILED, type AdmissionCounters } from './placement';
 import { monthUsageFromRows } from './usage';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
@@ -20,7 +20,7 @@ const C2 = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
 const C3 = 'c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3';
 const NOW = new Date('2026-10-13T12:00:00Z');
 /** Every AWS row lives in a region; seeded rows default to the configured one. */
-const awsRow = (over: Parameters<typeof placementRow>[0]) => placementRow({ region: 'ap-south-1', ...over });
+const awsRow = (over: Parameters<typeof placementRow>[0]) => placementRow({ region: 'ap-south-1', instance_type: 'm6i.large', ...over });
 const GB = 1_000_000_000;
 
 const ENV = {
@@ -38,6 +38,7 @@ const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'targetPlacementOwnerId' 
 const hoursRow = (userId: string, hours: number, egressBytes: number | null = 0) => ({
     computerId: C3,
     userId,
+    instanceType: 'm6i.large',
     startedAt: new Date(NOW.getTime() - hours * 3_600_000),
     stoppedAt: NOW,
     egressBytes,
@@ -75,12 +76,12 @@ describe('config: absent or invalid means disabled', () => {
 describe('decideAdmission (pure)', () => {
     // Fixtures are usage ROWS; admission takes the database's totals (`readMonthUsage`), which
     // `monthUsageFromRows` reproduces exactly (pinned against real Postgres in placement-usage-sql).
-    type DecideCounters = Partial<Omit<typeof empty, 'usage'>> & { usage?: Parameters<typeof monthUsageFromRows>[0] };
+    type DecideCounters = Partial<Omit<typeof empty, 'usage'>> & RegionalCounters & { usage?: Parameters<typeof monthUsageFromRows>[0] };
     const decide = (counters: DecideCounters = {}, cfg: AwsAdmissionConfig = config) =>
-        decideAdmission({ config: cfg, counters: { ...empty, ...counters, usage: monthUsageFromRows(counters.usage ?? [], NOW) }, userId: U1, now: NOW });
+        decideAdmission({ config: cfg, counters: { ...empty, ...counters, usage: monthUsageFromRows(counters.usage ?? [], NOW) }, userId: U1, now: NOW, instanceType: 'm6i.large' });
 
     it('admits under every cap', () => {
-        expect(decide({ runningCount: 1, usage: [hoursRow(U1, 99, 49 * GB), hoursRow(U2, 400, 100 * GB)] })).toEqual({ admit: true });
+        expect(decide({ runningCount: 1, runningVcpu: 2, usage: [hoursRow(U1, 99, 49 * GB), hoursRow(U2, 400, 100 * GB)] })).toEqual({ admit: true });
     });
 
     it.each([
@@ -112,6 +113,85 @@ describe('decideAdmission (pure)', () => {
     it('lists every failing reason', () => {
         const d = decide({ runningCount: 5, userOtherAwsComputers: 1 });
         expect(!d.admit && d.reasons).toEqual(['max_running', 'user_has_aws_computer']);
+    });
+});
+
+describe('vCPU-weighted admission', () => {
+    const env = (global: number, regional = global) => ({ ...ENV, AWS_MAX_RUNNING: String(global), EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: String(regional) });
+    const computers = [{ id: C1, user_id: U1 }];
+    const create = (tier: 'plus' | 'compute4' | 'compute8') => ({ kind: 'create' as const, userId: U1, computerId: C1, tier });
+    const lease = { kind: 'lease' as const, userId: U1, computerId: C1, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date(NOW.getTime() + 3_600_000) };
+    const running = (computer_id = C2, instance_type: string | null = 'm6i.large', region: string | null = 'ap-south-1') =>
+        awsRow({ computer_id, owner_user_id: U2, state: 'RUNNING', instance_type, region });
+
+    it('two m6i.large rows exhaust cap 2 and refuse a third', async () => {
+        const { db } = createFakePlacementDb({ computers, placements: [running(), running(C3)] });
+        expect(await runAdmission(db, create('plus'), { env: env(2), now: () => NOW })).toMatchObject({
+            admitted: false, reasons: ['max_running', 'region_capacity'],
+        });
+    });
+
+    it('one m6i.large with cap 3 refuses cmp-8 but admits std-2 and cmp-4', async () => {
+        for (const tier of ['plus', 'compute4', 'compute8'] as const) {
+            const { db } = createFakePlacementDb({ computers, placements: [running()] });
+            const result = await runAdmission(db, create(tier), { env: env(3), now: () => NOW });
+            expect(result.admitted).toBe(tier !== 'compute8');
+            if (tier === 'compute8') expect(result).toMatchObject({ reason: 'max_running', reasons: ['max_running', 'region_capacity'] });
+        }
+    });
+
+    it.each([[3, 10, 'max_running'], [10, 3, 'region_capacity']] as const)('global cap %i and regional cap %i independently enforce %s on create and lease', async (global, regional, reason) => {
+        for (const request of [create('compute8'), lease]) {
+            const placements = [running(), ...(request.kind === 'lease' ? [awsRow({ computer_id: C1, instance_type: 'm6i.2xlarge' })] : [])];
+            const { db } = createFakePlacementDb({ computers, placements });
+            expect(await runAdmission(db, request, { env: env(global, regional), now: () => NOW })).toMatchObject({ admitted: false, reason, reasons: [reason] });
+        }
+    });
+
+    it.each(['unknown', null])('unknown recorded type %j costs 8 vCPU for running rows and wakes', async instance_type => {
+        const runningDb = createFakePlacementDb({ computers, placements: [running(C2, instance_type)] }).db;
+        expect(await runAdmission(runningDb, create('plus'), { env: env(4), now: () => NOW })).toMatchObject({ admitted: false, reason: 'max_running' });
+        const wakeDb = createFakePlacementDb({ computers, placements: [awsRow({ computer_id: C1, instance_type })] }).db;
+        expect(await runAdmission(wakeDb, lease, { env: env(3), now: () => NOW })).toMatchObject({ admitted: false, reason: 'max_running' });
+    });
+
+    it('missing pure vCPU data uses count times 8, including regional and unplaced counts', () => {
+        const check = (counters: Partial<AdmissionCounters>, instanceType: string | null = 'm6i.large') => decideAdmission({
+            config: readAwsAdmissionConfig(env(4)), counters: { ...empty, ...counters }, userId: U1, now: NOW,
+            region: { kind: 'create' }, instanceType,
+        });
+        expect(check({ runningCount: 1 })).toMatchObject({ reasons: ['max_running', 'region_capacity'] });
+        expect(check({ runningCount: 1, runningVcpu: 2, runningByRegion: { 'ap-south-1': 1 } })).toMatchObject({ reasons: ['region_capacity'] });
+        expect(check({ runningCount: 1, runningVcpu: 2, runningByRegion: {}, runningUnplaced: 1 })).toMatchObject({ reasons: ['region_capacity'] });
+        expect(check({ runningCount: 1, runningVcpu: 2, runningByRegion: { 'ap-south-1': 1 }, runningVcpuByRegion: { 'ap-south-1': 2 } })).toMatchObject({ admit: true });
+        expect(check({ runningVcpu: 2 }, null)).toMatchObject({ reasons: ['max_running', 'region_capacity'] });
+    });
+
+    it('counters retain counts and sum mixed running types globally, per region and unplaced', async () => {
+        const { db } = createFakePlacementDb({ computers, placements: [
+            running(), running(C3, 'm6i.xlarge', 'us-east-1'), running(C1, null, null),
+            awsRow({ computer_id: C2, state: 'STOPPED', instance_type: 'm6i.2xlarge' }),
+            awsRow({ computer_id: C3, provider: 'cloudflare', workspace_store: 'r2', state: 'RUNNING' }),
+        ] });
+        const counters = await withAdmission(db, (tx, lock) => readAdmissionCounters(tx, lock, { userId: U1, computerId: C1, monthStart: new Date('2026-10-01T00:00:00Z'), now: NOW }));
+        expect(counters).toMatchObject({
+            runningCount: 3, runningVcpu: 14, runningByRegion: { 'ap-south-1': 1, 'us-east-1': 1 },
+            runningVcpuByRegion: { 'ap-south-1': 2, 'us-east-1': 4 }, runningUnplaced: 1, runningVcpuUnplaced: 8,
+        });
+    });
+
+    it('failed enrollment replacement reuses its recorded vCPU at an exactly full budget', async () => {
+        const { db } = createFakePlacementDb({ computers, placements: [awsRow({
+            computer_id: C1, state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED, instance_type: 'm6i.2xlarge',
+        })] });
+        expect(await runAdmission(db, { ...lease, replace: true }, { env: env(4), now: () => NOW })).toMatchObject({ admitted: true });
+    });
+
+    it.each([U1, U2])('one cmp-8 hour reaches a four-hour monthly cap for %s', userId => {
+        const usage = monthUsageFromRows([{ ...hoursRow(userId, 1), instanceType: 'm6i.2xlarge' }], NOW);
+        const decision = decideAdmission({ config: readAwsAdmissionConfig({ ...ENV, EZIL_AWS_USER_MONTHLY_HOURS: '4', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '4' }),
+            counters: { ...empty, usage }, userId: U1, now: NOW, instanceType: 'm6i.large' });
+        expect(decision).toMatchObject({ reasons: userId === U1 ? ['user_hours_cap', 'global_hours_cap'] : ['global_hours_cap'] });
     });
 });
 
@@ -152,7 +232,7 @@ describe('runAdmission (transactional)', () => {
         expect(running.params).toContain('UNCONFIRMED');
         expect(running.params).not.toContain('STOPPED');
         const perRegion = statements.find((s) => /count-running-region/.test(s.sql))!;
-        expect(perRegion.sql).toMatch(/SELECT region, count\(\*\)::int AS n\s+FROM public\.ezil_computer_placements\s+WHERE provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/);
+        expect(perRegion.sql).toMatch(/SELECT region, count\(\*\)::int AS n,\s+COALESCE\(SUM\(CASE instance_type[\s\S]*?AS vcpu\s+FROM public\.ezil_computer_placements\s+WHERE provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/);
         expect(perRegion.params).toEqual(running.params);
         const user = statements.find((s) => /count-user/.test(s.sql))!;
         expect(user.sql).toMatch(/p\.computer_id <> \$1::uuid AND p\.state <> 'PURGE_ELIGIBLE'/);
@@ -359,7 +439,7 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
         });
 
         it('tiers: free is 2 vCPU / 4 GiB burstable first, plus is 2 vCPU / 8 GiB; unknown tiers never get a default', () => {
-            expect(AWS_TIERS).toEqual({ free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'] });
+            expect(AWS_TIERS).toEqual({ free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'], compute4: ['m6i.xlarge'], compute8: ['m6i.2xlarge'] });
             expect(instanceTypeForTier('free')).toBe('t3a.medium');
             expect(instanceTypeForTier('plus')).toBe('m6i.large');
             for (const t of ['premium', '', 'toString', '__proto__', 'constructor', null, undefined]) {
@@ -372,7 +452,7 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
     describe('decideAdmission with a region plan (pure)', () => {
         const cfg = (ap: number, us: number) => readAwsAdmissionConfig({ ...TWO, AWS_MAX_RUNNING: '50', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: String(ap), EZIL_AWS_MAX_RUNNING_US_EAST_1: String(us) });
         const decide = (c: AwsAdmissionConfig, region: RegionPlan, counters: Partial<typeof empty> & RegionalCounters = {}) =>
-            decideAdmission({ config: c, counters: { ...empty, ...counters }, userId: U1, now: NOW, region });
+            decideAdmission({ config: c, counters: { ...empty, ...counters }, userId: U1, now: NOW, region, instanceType: 'm6i.large' });
 
         it('create picks the first region in order with room', () => {
             expect(decide(cfg(2, 2), { kind: 'create' })).toEqual({ admit: true, region: 'ap-south-1' });

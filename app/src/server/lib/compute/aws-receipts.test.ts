@@ -15,12 +15,13 @@ import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
     applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, reconcileGuestStop, startRetireAsReconciler, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
-    runAwsBackgroundReconcile, type GuestStopDeps, type LifecycleExecutionReader,
+    runAwsBackgroundReconcile, sessionLimitFor, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
     ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
 } from './placement';
+import { monthUsageFromRows } from './usage';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -426,6 +427,20 @@ describe('Codex #5: the usage ledger is written by confirmed receipts (hour caps
         expect(await s.status()).toMatchObject({ placementState: 'STOPPED' });
         expect(s.usage).toEqual([expect.objectContaining({ instance_id: I_NEW, stopped_at: NOW })]);
         expect(await s.provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, error: 'user_hours_cap' });
+    });
+});
+
+describe('weighted monthly session limits', () => {
+    it.each([U1, U2])('one cmp-8 hour reaches a four-hour cap for %s', async userId => {
+        const { db } = createFakePlacementDb({ placements: [row({ state: 'RUNNING' })] });
+        const placement = (await readPlacement(db, C1)).record!;
+        const usage = monthUsageFromRows([{
+            computerId: C1, userId, instanceType: 'm6i.2xlarge',
+            startedAt: new Date(NOW.getTime() - 3_600_000), stoppedAt: null, egressBytes: null,
+        }], NOW);
+        expect(sessionLimitFor(placement, { now: NOW, caps: { userMonthlyHours: 4, globalMonthlyHours: 4 } }, usage))
+            .toBe(userId === U1 ? 'user_hours_cap' : 'global_hours_cap');
+        expect(sessionLimitFor(placement, { now: NOW, caps: { userMonthlyHours: 5, globalMonthlyHours: 5 } }, usage)).toBeNull();
     });
 });
 

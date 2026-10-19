@@ -31,7 +31,7 @@ export const LIFECYCLE_DEPLOYMENTS_ENV = 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS';
  * type a tier may record, plus the benchmark type. A deployment may narrow it,
  * never extend it. aws-intent.test.ts checks that every tier type is listed.
  */
-export const KNOWN_INSTANCE_TYPES: readonly string[] = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'];
+export const KNOWN_INSTANCE_TYPES: readonly string[] = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'];
 
 const ZONE_ID_PATTERN = /^[a-z]{2,4}\d-az\d+$/;
 const DIRECTION: Record<string, string> = {

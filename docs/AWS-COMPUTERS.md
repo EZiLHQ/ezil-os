@@ -36,7 +36,7 @@ pre-booted hosts.
 | R7 | A Step Functions lifecycle workflow owns EC2/EBS mutations. The app may only start executions of exact workflow versions and describe resources. The Cloudflare Worker holds no EC2 or IAM rights; it keeps only its existing workspace-store S3 scope, and mints presigned URLs from it. EC2 state-change events are reconciled into the database. |
 | R8 | Single writer per computer, enforced by compare-and-swap on a generation number under a per-computer advisory lock. EBS single-attach is the physical fence. A reviewed migration-grammar extension adds UNIQUE indexes (required before Stage B). The engine copies in sibling repositories have diverged, so the extension is ported to each one separately with shared test vectors. |
 | R9 | Idle stop may be guest-initiated, but caps are not. Lease renewal comes only from gateway-observed, authenticated user presence. Hour, egress and lease limits are enforced by the control plane: warn, then flush, then stop, regardless of what the guest reports. |
-| R10 | Instance types come from a closed allowlist, chosen by the computer's **tier** (2026-10-14, superseding "no burstable types"): **free** = 2 vCPU / 4 GiB (`t3a.medium`, then `t3.medium`), launched with *standard* CPU credits so it throttles to its baseline instead of billing surplus CPU; **plus** = 2 vCPU / 8 GiB (`m6i.large`). One 4 vCPU / 8 GiB type stays for benchmarks only. The app records the tier's first type at creation (`AWS_TIERS`, app `aws-config.ts`); the region deployment's allowlist must contain it or the intent is refused. |
+| R10 | Instance types come from a closed allowlist, chosen by the computer's **tier** (2026-10-14, superseding "no burstable types"): **free** = 2 vCPU / 4 GiB (`t3a.medium`, then `t3.medium`), launched with *standard* CPU credits so it throttles to its baseline instead of billing surplus CPU; **plus** (std-2) = 2 vCPU / 8 GiB (`m6i.large`), **compute4** (cmp-4) = 4 vCPU / 16 GiB (`m6i.xlarge`), **compute8** (cmp-8) = 8 vCPU / 32 GiB (`m6i.2xlarge`), all x86_64. One 4 vCPU / 8 GiB type stays for benchmarks only. The app records the tier's first type at creation (`AWS_TIERS`, app `aws-config.ts`); the region deployment's allowlist must contain it or the intent is refused. |
 | R11 | Volume sizes come from an allowlist or range, with capped online growth. Automation never deletes volumes or snapshots and never force-detaches. Purge is a separate operator action. |
 | R12 | Hibernation is off. |
 | R13 | Provider and store are chosen **per computer**. No global store flip is used to migrate a subset of computers. An unknown value fails closed. |
@@ -223,7 +223,7 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   first wake, the C-4 guard would refuse it (the marker epoch is not below it), and the computer could never wake.
   Cloudflare rows never lease and start at 0.
 - Admission runs in the same transaction, under one global advisory lock. All of these must hold:
-  - running-class count < `AWS_MAX_RUNNING`
+  - running-class vCPU + requested vCPU <= `AWS_MAX_RUNNING` × 2
   - one AWS computer per user
   - per-user and global monthly instance-hours under their caps
   - per-user and global monthly egress under their caps
@@ -475,7 +475,7 @@ volume as hostile input.
 | Canary cohort | `EZIL_AWS_CANARY_USER_IDS` (comma-separated user UUIDs, or exactly `*` for every signed-in user) and `EZIL_AWS_CANARY_SINCE` (ISO-8601 instant with an explicit zone). With AWS enabled, a computer with **no placement row** goes to AWS only when its user is listed and its `ezil_computers.created_at` is at or after SINCE; older computers stay on Cloudflare because they may hold an R2 workspace. Even then it goes to AWS only if a read-only admission pre-check (same rules as admission: capacity, one AWS computer per user, monthly caps, kill switch) would admit it; otherwise it stays on Cloudflare. Any malformed value (including `*` beside ids) means no cohort. A rollout gate, not a security boundary: ownership stays `owner_user_id` |
 | Browser zone | `EZIL_AWS_BROWSER_ZONE`: the zone the Worker serves AWS browser hosts on (`aws-<port>-<sandboxId>-aws.<zone>`, e.g. `ezil.org`); lower-case DNS name, at least two labels, no trailing dot. Enrollment returns it with the routable sandbox id (`guac-<user>-<computer>`) and the host's edge trusts `x-forwarded-host` only for those hosts. Unset or malformed: enrollment answers 503 `enroll_unavailable` before the nonce is touched. It is also the ONLY zone the app's AWS preview handoff accepts (never derived from the Worker's host name: staging `api-desktop-staging.ezil.work` → `ezil.work`, production `api-desktop.ezil.org` → `ezil.org`), and the frame confirmation accepts AWS hosts on it; unset or malformed, every AWS preview answers `aws_preview_unavailable` |
 | Running computers | `AWS_MAX_RUNNING`; pilot value 2 (all regions together) |
-| Running per region | `EZIL_AWS_MAX_RUNNING_<REGION>` (e.g. `_AP_SOUTH_1`) for each region in `AWS_REGIONS`; required, no default. Set it from the region's **verified** Running On-Demand Standard vCPU quota minus every other workload in that quota, divided by 2 vCPU. Admission counts running-class rows per region under the admission lock. A region with no rows counts 0, and a running row without a region counts against every region |
+| Running per region | `EZIL_AWS_MAX_RUNNING_<REGION>` (e.g. `_AP_SOUTH_1`) for each region in `AWS_REGIONS`; required, no default. Set it from the region's **verified** Running On-Demand Standard vCPU quota minus every other workload in that quota, divided by 2 vCPU. Admission sums running-class vCPU per region under the admission lock. A region with no rows counts 0, and a running row without a region counts against every region |
 | Region deployments | `EZIL_AWS_LIFECYCLE_DEPLOYMENTS`: JSON keyed by region, each the lifecycle stack's deployment record (`stateMachineVersionArn` pinned to a version). A configured region without one disables AWS |
 | Computers per user | 1 |
 | Instance-hours | monthly aggregate cap, including idle running and pool hours; per-user cap |
@@ -483,6 +483,8 @@ volume as hostile input.
 | Storage | volume size allowlist; growth capped |
 | Cap configuration | `EZIL_AWS_{USER,GLOBAL}_MONTHLY_HOURS`, `EZIL_AWS_{USER,GLOBAL}_MONTHLY_EGRESS_GB`; strict integers, no defaults, malformed or absent disables admission. Pilot: global hours 600 |
 | Kill switch | `EZIL_AWS_KILL_SWITCH=1`: admission off → recovery workflow disabled → graceful stop of every instance → deny-start policy attached; no volume deleted |
+
+Global and regional running caps are budgets in 2-vCPU units: a create or wake fits only when running vCPU plus requested vCPU is at most the configured cap × 2. Unknown instance types count as 8 vCPU, and unplaced running rows count against every region. Monthly hour caps use whole seconds per usage row inside the UTC month, multiplied by vCPU / 2; one hour of cmp-8 consumes four cap hours.
 
 Budget alarms are alerts, not enforcement. Cost figures in public documents describe
 *method* only; operators compute their own from their region's price list.

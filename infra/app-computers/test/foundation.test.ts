@@ -60,7 +60,7 @@ test('item 4: no NAT, no load balancer, no inbound rules, all outbound', () => {
 });
 
 test('items 2/4/5: launch template is IMDSv2-only, hop 1, tags off, no hibernation, allowlisted type, encrypted configured root', () => {
-    for (const instanceType of ['m6i.large', 'c6i.xlarge'] as const) {
+    for (const instanceType of ['m6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'] as const) {
         const resource = Object.values(template({ instanceType }).findResources('AWS::EC2::LaunchTemplate'))[0] as {
             Properties: { LaunchTemplateData: Record<string, unknown> } };
         const data = resource.Properties.LaunchTemplateData;

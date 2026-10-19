@@ -465,8 +465,8 @@ export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage:
     if (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime()) return 'lease_expired';
     if (policy.caps && usage) {
         const totals = usageFor(usage, p.ownerUserId);
-        if (totals.user.hours >= policy.caps.userMonthlyHours) return 'user_hours_cap';
-        if (totals.global.hours >= policy.caps.globalMonthlyHours) return 'global_hours_cap';
+        if (totals.user.weightedSeconds >= policy.caps.userMonthlyHours * 3_600) return 'user_hours_cap';
+        if (totals.global.weightedSeconds >= policy.caps.globalMonthlyHours * 3_600) return 'global_hours_cap';
     }
     return null;
 }

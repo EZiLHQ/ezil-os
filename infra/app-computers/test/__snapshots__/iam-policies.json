@@ -211,7 +211,9 @@
               "aws:RequestTag/ezil:stage": "pilot",
               "ec2:InstanceType": [
                 "m6i.large",
-                "c6i.xlarge"
+                "c6i.xlarge",
+                "m6i.xlarge",
+                "m6i.2xlarge"
               ],
               "ec2:MetadataHttpTokens": "required",
               "ec2:InstanceMetadataTags": "disabled",

@@ -9,6 +9,7 @@ import { AppCaller, AppCallerConfigSchema, appCallerStatements } from '../lib/ap
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
 import { IdentityConfigSchema, boundaryStatements } from '../lib/identity.js';
+import { INSTANCE_TYPES, InstanceTypeSchema } from '../lib/lifecycle/deployment.js';
 
 /** Exact equality: every action, resource, condition and effect is spelled out
  * here as the reviewed specification. Any IAM drift, in either direction, fails. */
@@ -35,7 +36,7 @@ function expectedController(userDataOpen: boolean) {
             ec2('security-group/sg-11111111111111111'), ec2('launch-template/lt-11111111111111111'), ec2('network-interface/*')],
             Condition: { StringEquals: REGION_EQ, ...LT } },
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('instance/*'), Condition: {
-            StringEquals: { ...REGION_EQ, ...REQUEST, 'ec2:InstanceType': ['m6i.large', 'c6i.xlarge'], 'ec2:MetadataHttpTokens': 'required',
+            StringEquals: { ...REGION_EQ, ...REQUEST, 'ec2:InstanceType': ['m6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'], 'ec2:MetadataHttpTokens': 'required',
                 'ec2:InstanceMetadataTags': 'disabled', 'ec2:AvailabilityZoneId': Z },
             NumericLessThanEquals: { 'ec2:MetadataHttpPutResponseHopLimit': '1' }, Null: { 'ec2:InstanceProfile': 'true' }, ...LT } },
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('volume/*'), Condition: {
@@ -61,6 +62,17 @@ function expectedController(userDataOpen: boolean) {
     ];
 }
 const json = (statements: { toStatementJson(): unknown }[]) => statements.map(s => s.toStatementJson());
+
+test('RunInstances IAM allows exactly the configured types; ARM is rejected', () => {
+    for (const instanceTypes of [[...INSTANCE_TYPES], ['m6i.xlarge', 'm6i.2xlarge'] as const]) {
+        const settings = lifecycleFixture('provision', { instanceTypes: [...instanceTypes] }).settings;
+        const conditions = controllerStatements(settings).map(s => s.toStatementJson())
+            .filter(s => s.Action === 'ec2:RunInstances' && s.Condition?.StringEquals?.['ec2:InstanceType']);
+        assert.equal(conditions.length, 1);
+        assert.deepEqual(conditions[0]!.Condition.StringEquals['ec2:InstanceType'], instanceTypes);
+    }
+    assert.equal(InstanceTypeSchema.safeParse('m7g.xlarge').success, false);
+});
 
 test('controller policy equals the reviewed specification exactly (userData fence closed)', () => {
     const f = lifecycleFixture();
