@@ -279,11 +279,16 @@ await settle(8);
 //     under them and they showed 410 STALE_PREVIEW_URL. `registry.js` stamps
 //     `data-ezil-computer-id` on every window it opens for a computer.
 // ═══════════════════════════════════════════════════════════════════════════
-const fakeWindow = (computerId, app) => {
+const fakeWindow = (computerId, app, { frame = true } = {}) => {
     const el = doc.createElement('div');
     el.className = 'window';
     el.setAttribute('data-app', app);
     el.setAttribute('data-ezil-computer-id', computerId);
+    if ( frame ) {
+        const iframe = doc.createElement('iframe');
+        iframe.className = 'window-app-iframe';
+        el.appendChild(iframe);
+    }
     doc.body.appendChild(el);
     return el;
 };
@@ -305,6 +310,15 @@ await settle(8);
 push('a window on a DIFFERENT computer does not hold this one: the close still releases',
     activityCalls(before).length === 1, `${activityCalls(before).length} activity call(s)`);
 codeOtherComputer.remove();
+
+win = await openDesktop();
+const settingsSameComputer = fakeWindow(String(COMPUTER.id), 'settings', { frame: false });
+before = calls.length;
+await window.$(win).close();
+await settle(8);
+push('🔴 a Settings window stamped with the SAME computer (no frame) does not hold it: the close still releases',
+    activityCalls(before).length === 1, `${activityCalls(before).length} activity call(s)`);
+settingsSameComputer.remove();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2c. 🔴 A FRAME WHOSE RUNTIME IS GONE IS RE-MINTED, NOT LEFT ON RAW JSON.
