@@ -39,6 +39,16 @@ def parse(raw):
         d = json.loads(raw)
     except (ValueError, UnicodeDecodeError) as e:
         raise LeaseError("lease_userdata_not_json") from e
+    if isinstance(d, dict) and d.get("kind") == "pool":
+        if type(d.get("v", 1)) is not int or d.get("v", 1) != 1:
+            raise LeaseError("lease_userdata_version")
+        if not isinstance(d.get("poolHostId"), str) or not UUID_RE.fullmatch(d["poolHostId"]):
+            raise LeaseError("lease_field_invalid: poolHostId")
+        if not 1 <= _int(d.get("poolGeneration"), "poolGeneration") <= 2**53 - 1:
+            raise LeaseError("lease_field_invalid: poolGeneration")
+        if any(k in d for k in ("computerId", "volumeId", "fsUuid", "nonce", "provision", "rebase")):
+            raise LeaseError("pool_lease_contains_user_data")
+        return d
     if not isinstance(d, dict) or d.get("v") != 1:
         raise LeaseError("lease_userdata_version")
     for k in ("computerId", "fsUuid"):
@@ -93,3 +103,18 @@ class Imds:
         return (self.get("/latest/user-data", t),
                 self.get("/latest/dynamic/instance-identity/document", t).decode("utf-8"),
                 self.get("/latest/dynamic/instance-identity/pkcs7", t).decode("ascii").strip())
+
+    def fence_tag(self):
+        """404 on the tag *collection* means tags are disabled. A missing fence on
+        an enabled collection is a refusal, never permission to use the fallback."""
+        token = self._token()
+        path = "/latest/meta-data/tags/instance"
+        status, body = http.request("GET", self.base + path,
+                                    headers={"X-aws-ec2-metadata-token": token}, timeout=5)
+        if status == 404:
+            return None
+        if status != 200:
+            raise LeaseError(f"imds_tags_failed: {status}")
+        if b"ezil:fence" not in body.splitlines():
+            raise LeaseError("imds_fence_missing")
+        return self.get(path + "/ezil:fence", token).decode("ascii").strip()

@@ -10,6 +10,63 @@ C-4, C-6, and §3a. The S1 spike (`feat/aws-s1-runtime-spike`) holds the runtime
 The runtime agent uses Python 3 standard library only and makes no AWS API calls.
 The AMI build uses its temporary instance role to pull the desktop image from ECR.
 
+## Pool mode
+
+A lease `{kind:"pool", poolHostId, poolGeneration, appOrigin?}` (optional `v:1`)
+skips disk discovery at boot. `appOrigin` must be an HTTPS origin; when omitted,
+the origin of the existing baked `enrollUrl` is used. No new environment settings
+are required. The guard unit enrolls the pool host and starts a disposable desktop
+using `stateDir/pool-desktop` for its writable overlay, workspace and profiles.
+It has no user disk, tunnel or control key. Readiness requires both Neko on 8181
+and code-server's `/healthz` on 8443 to answer inside the running container.
+
+The pool client's wire format is:
+
+- `POST /api/compute/aws/pool/enroll`: `{poolHostId, poolGeneration,
+  identityDocument, signature}`; `signature` is the IMDS PKCS7, as in C-6.
+- `POST /api/compute/aws/pool/ready`: `{poolHostId,
+  health:{ok:true, desktop:true, editor:true}}`.
+- `GET /api/compute/aws/pool/claim`: no body. All three requests carry
+  `X-Ezil-Pool-Host-Id`, `X-Ezil-Pool-Generation`, `X-Ezil-Identity-Document`
+  (base64 of the exact document bytes), and `X-Ezil-Identity-Signature`
+  (PKCS7 base64 without whitespace). Identity material never goes into a URL.
+
+A 204 is an empty poll; polls are spaced by one second. Transport failures, 429,
+and the existing enrollment retryable responses use exponential backoff from 1
+to 30 seconds, bounded by `enrollRetrySeconds`. Other refusals and malformed
+claims stop adoption. Idle hosts refresh enrollment and readiness every five
+minutes to remain inside the contract's ten-minute enrollment window.
+
+On a claim, the host checks `ezil:fence` through IMDS tags when available. Only a
+404 on the tag collection enables the launch template's tags-disabled fallback:
+trust the fence in the identity-authenticated claim delivered over verified TLS.
+The contract specifies no independent claim-signature format. A host-only,
+fsynced `stateDir/pool-epoch.json` reserves the claim before disk access; replayed
+or lower epochs refuse, and even a later epoch cannot reuse this single-use host.
+A crash after reservation requires retirement/replacement, never pool re-entry.
+
+The volume is selected solely through its EBS serial under `/dev/disk/by-id`;
+root backing devices are excluded regardless of their NVMe names. Existing disks
+can supply their filesystem UUID via `blkid`; the regular read-only marker checks
+still verify computer, volume, UUID, generation, digest and a strictly increasing
+epoch. After enrollment, the disposable desktop stops and its scratch data is
+deleted. The existing clean/overlay/desktop chain starts the user's `/root`,
+workspace and profiles on the data disk. This switches the container/home by
+restarting the desktop; live in-process home migration is not implemented.
+
+**App-lane integration:** the minimal pinned claim omits two pieces the cold path
+uses. An optional `nonce` in the claim uses the existing C-6 enrollment unchanged.
+Without it, the host sends `{poolHostId, poolGeneration, fence}` instead of `nonce`
+to `/api/compute/aws/enroll`; the app must validate that proof against the adopted
+placement. The current cold-only endpoint needs that app-lane extension or a
+claim-provided nonce. For an unformatted new disk, the claim must additionally
+carry `provision:true` and the placement's `fsUuid`; the host refuses to invent
+either. L4c must implement the header and health shapes above. Live IMDS, runc,
+serial mounting and application interoperability still require the lead's EC2 test.
+
+Offline behavior tests:
+`python3 -m unittest discover -s infra/host-agent/test -p 'test_pool.py'`.
+
 ## Canary serial diagnostics (default off)
 
 Set `canaryConsole: true` in the baked `/etc/ezil-host/agent.json` for a canary.

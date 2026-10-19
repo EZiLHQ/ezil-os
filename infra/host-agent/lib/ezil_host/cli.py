@@ -6,7 +6,7 @@ import sys
 import threading
 import signal
 
-from . import agent as agentmod, canary, config, desktop, enroll as enrollmod, guard, rebase, tunnel
+from . import agent as agentmod, canary, config, desktop, enroll as enrollmod, guard, pool, rebase, tunnel
 from .fsops import Refused
 
 
@@ -84,9 +84,13 @@ def refuse_while_stopping(cfg, name):
 def step(cfg, name, detach=False):
     if name == "lease":
         l = enrollmod.fetch_lease(cfg)
+        if l.get("kind") == "pool":
+            return f"pool lease generation={l['poolGeneration']}"
         return f"lease generation={l['generation']} leaseEpoch={l['leaseEpoch']}"
     lease = _lease(cfg)
     if name == "guard":
+        if lease.get("kind") == "pool":
+            return pool.run(cfg, lease)
         return "guard " + guard.run_guard(cfg, lease, rebase_runner=rebase.run_job)
     guard.require_stamp(cfg, lease)
     if name == "clean":

@@ -255,10 +255,10 @@ def new_marker(lease, digest, instance_id=None):
     return m
 
 
-def run_guard(cfg, lease, rebase_runner=None):
+def run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
     """Steps 1-6, with optional public console diagnostics."""
     try:
-        verdict = _run_guard(cfg, lease, rebase_runner)
+        verdict = _run_guard(cfg, lease, rebase_runner, allow_reboot)
     except Refused:
         canary.guard_result(cfg, "refused")
         raise
@@ -269,7 +269,7 @@ def run_guard(cfg, lease, rebase_runner=None):
     return verdict
 
 
-def _run_guard(cfg, lease, rebase_runner=None):
+def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
     """Leaves the data volume mounted rw on success; unmounted on refusal."""
     digest = cfgmod.host_digest(cfg)
     instance_id = current_instance_id(cfg)
@@ -294,7 +294,7 @@ def _run_guard(cfg, lease, rebase_runner=None):
                     raise Refused("marker_missing", "init only on a provisioning lease and an empty volume")
                 verdict = "init"
             else:
-                verdict = check_marker(m, lease, digest, instance_id)
+                verdict = check_marker(m, lease, digest, instance_id if allow_reboot else None)
             if verdict == "rebase_needed":
                 if rebase_runner is None or not lease.get("rebase"):
                     raise Refused("lower_digest_mismatch", f"marker={m['lowerImageDigest']} host={digest}")

@@ -105,7 +105,7 @@ def _imds_lease_and_identity(cfg):
 def fetch_lease(cfg):
     raw, doc, sig = _imds_lease_and_identity(cfg)
     lease = leasemod.parse(raw)
-    if lease.get("volumeId") is None:  # parse permits this only for PROVISION
+    if lease.get("kind") != "pool" and lease.get("volumeId") is None:
         lease["volumeId"] = guard.wait_provision_volume(cfg)
     _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
     _write_private(os.path.join(cfg.runDir, "identity.json"), json.dumps({"document": doc, "signature": sig}).encode())
@@ -195,15 +195,21 @@ def persist(cfg, lease, answer, instance_id=None):
     return mark_nonce_consumed(cfg, dict(load_lease(cfg), sandboxId=sandbox_id, zone=zone))
 
 
-def enroll(cfg, lease, instance_id=None):
-    if lease.get("nonceConsumed") or not lease.get("nonce"):
+def enroll(cfg, lease, instance_id=None, pool_claim=None):
+    # Only the pool adopter supplies this alternative proof, after reserving its
+    # fence/epoch. Ordinary boots still require their one-time nonce.
+    if lease.get("nonceConsumed") or (not lease.get("nonce") and pool_claim is None):
         raise Refused("enroll_nonce_absent", "nonce already used for this epoch")
     if not cfg.enrollUrl:
         raise Refused("enroll_url_unset")
     with open(os.path.join(cfg.runDir, "identity.json"), encoding="utf-8") as f:
         ident = json.load(f)
+    proof = {"nonce": lease["nonce"]} if lease.get("nonce") else {
+        "poolHostId": pool_claim["poolHostId"], "poolGeneration": pool_claim["poolGeneration"],
+        "fence": pool_claim["fence"],
+    }
     body = json.dumps({"computerId": lease["computerId"], "generation": lease["generation"],
-                       "leaseEpoch": lease["leaseEpoch"], "nonce": lease["nonce"],
+                       "leaseEpoch": lease["leaseEpoch"], **proof,
                        "identityDocument": ident["document"], "signature": ident["signature"]}).encode()
     # Bounded retries in this one oneshot activation, so the units that require enrollment
     # simply wait for it (a systemd Restart= would fail their start jobs first).
