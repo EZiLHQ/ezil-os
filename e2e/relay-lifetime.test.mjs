@@ -55,3 +55,9 @@ test('an unavailable relay names its failure without publishing values', async (
   const stale = await verifyRelayLifetime(expired.options).then(() => null, e => e);
   assert.equal(stale.relay.expired, true); assert.equal(stale.relay.error, undefined);
 });
+test('an unavailable baseline also names its failure', async () => {
+  const f = fixture([{ ok: false, error: 'relay_busy' }]);
+  const error = await verifyRelayLifetime(f.options).then(() => null, e => e);
+  assert.match(error.message, /baseline unavailable/);
+  assert.equal(error.relay.error, 'relay_busy'); assert.equal(error.relay.ok, false);
+});
