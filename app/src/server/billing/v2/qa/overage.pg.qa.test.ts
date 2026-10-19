@@ -73,8 +73,8 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
         it('is never billed for Standard, even with a (forged) enabled consent and heavy usage', async () => {
             await subscribe(a, 'standard_monthly_v2');
             await consent(a, START);
-            await burn(a, new Date('2026-10-02T00:00:00Z'), 10, 'std-2');
-            expect(await close(a)).toMatchObject({ status: 'skipped' });
+            await burn(a, new Date('2026-10-02T00:00:00Z'), 12, 'std-2'); // 72 h = 12 h over the 60 h allowance
+            expect(await close(a)).toEqual({ status: 'skipped', reason: 'not_compute' });
             expect(usage.requests).toEqual([]);
             expect(await invoices(a)).toEqual([]);
         });
