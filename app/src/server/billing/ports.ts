@@ -151,6 +151,8 @@ export interface PlanChangeStateUpdate {
     state: PlanChangeState;
     stripeInvoiceId?: string | null;
     effectiveAt?: Date | null;
+    hostedInvoiceUrl?: string | null;
+    expiresAt?: Date | null;
 }
 
 export interface PaymentIssueInsert {
@@ -185,9 +187,15 @@ export interface BillingStore {
     epochsFor(userId: string, since: Date): Promise<StoredComputeEpoch[]>;
     /** Appends each distinct decision once; exact replays retain the original identity. */
     recordConsent(input: OverageConsentInsert): Promise<OverageConsentRow>;
+    /** Latest acceptance strictly before the exclusive period end; ties use audit identity. */
+    consentAsOf(userId: string, subscriptionId: string, at: Date): Promise<OverageConsentRow | null>;
+    /** Latest decision at or before start, then decisions strictly inside the period, ordered by (acceptedAt, id). */
+    consentDecisionsForPeriod(userId: string, subscriptionId: string, start: Date, end: Date): Promise<OverageConsentRow[]>;
     latestConsent(userId: string, subscriptionId: string): Promise<OverageConsentRow | null>;
     upsertOverageInvoice(input: OverageInvoiceInsert): Promise<{ status: 'inserted' | 'exists'; row: OverageInvoiceRow }>;
     attachOverageStripeInvoice(id: string, stripeInvoiceId: string): Promise<void>;
+    /** Only pending rows become open; webhook outcomes are preserved. */
+    markOverageInvoiceOpen(stripeInvoiceId: string): Promise<void>;
     setOverageInvoiceStatus(stripeInvoiceId: string, status: OverageInvoiceStatus): Promise<'updated' | 'not_found'>;
     overageInvoiceByStripeId(stripeInvoiceId: string): Promise<OverageInvoiceRow | null>;
     overageInvoicesFor(userId: string): Promise<OverageInvoiceRow[]>;
@@ -244,7 +252,10 @@ export interface StripeSubscription {
     cancelAtPeriodEnd: boolean;
     currentPeriodStart: Date | null;
     currentPeriodEnd: Date | null;
-    items: { priceId: string | null; lookupKey: string | null }[];
+    items: { id: string | null; priceId: string | null; lookupKey: string | null }[];
+    defaultPaymentMethod: string | null;
+    scheduleId: string | null;
+    latestInvoiceId: string | null;
     pendingUpdateExpiresAt: Date | null;
     /** Known catalog SKU from metadata or the first recognized item lookup key. */
     sku: string | null;
@@ -299,7 +310,7 @@ export interface CheckoutRequest {
     sku: string;
     /**
      * `embedded` (default for the OS): Stripe Embedded Checkout mounted in an
-     * OS window — `ui_mode=embedded`, `return_url` = `returnUrl`,
+     * OS window — `ui_mode=embedded_page`, `return_url` = `returnUrl`,
      * `redirect_on_completion=if_required`, so card / Link / wallet payments
      * finish in place with no redirect. `hosted`: the redirect page, kept for
      * clients that cannot load Stripe.js (`successUrl` / `cancelUrl`).
@@ -330,13 +341,24 @@ export interface StripeInvoiceSummary {
     number: string | null;
     status: string;
     amountPaidCents: number;
+    amountDueCents: number;
+    metadataKind: string | null;
+    billingReason: string | null;
     currency: string;
     created: Date;
     hostedInvoiceUrl: string | null;
     description: string | null;
 }
 
+export type StripeInvoicePaymentState = 'paid' | 'requires_action' | 'processing' | 'failed' | 'none';
+
 export interface StripeApi {
+    resolvePrice(lookupKey: string): Promise<StripePrice>;
+    previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number }): Promise<StripeUpgradePreview>;
+    confirmUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number; now: Date; idempotencyKey: string }): Promise<StripeUpgradeResult>;
+    scheduleDowngrade(input: { subscriptionId: string; toSku: 'standard_monthly_v2'; idempotencyKey: string }): Promise<{ scheduleId: string; effectiveAt: Date }>;
+    cancelScheduledChange(input: { scheduleId: string }): Promise<void>;
+    setCancelAtPeriodEnd(input: { subscriptionId: string; cancel: boolean; idempotencyKey: string }): Promise<{ cancelsAt: Date | null }>;
     createCustomer(input: { userId: string; email: string | null; idempotencyKey: string }): Promise<{ id: string }>;
     createCheckoutSession(input: CheckoutRequest): Promise<CheckoutSessionCreated>;
     /** Newest first. */
@@ -344,8 +366,53 @@ export interface StripeApi {
     createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
     retrieveSubscription(id: string): Promise<StripeSubscription>;
     retrieveInvoice(id: string): Promise<StripeInvoice>;
+    retrieveInvoicePaymentState(invoiceId: string): Promise<StripeInvoicePaymentState>;
     retrieveCheckoutSession(id: string): Promise<StripeCheckoutSession>;
     retrieveCharge(id: string): Promise<StripeCharge>;
+}
+
+export interface StripePrice {
+    id: string;
+    lookupKey: string;
+    unitAmount: number | null;
+    currency: string;
+    recurring: boolean;
+}
+
+export interface StripeUpgradePreview {
+    prorationDate: number;
+    amountDueCents: number;
+    currency: string;
+    lines: { description: string; amountCents: number }[];
+    periodStart: Date;
+    periodEnd: Date;
+}
+
+export interface StripeUpgradeResult {
+    status: 'applied' | 'requires_action' | 'payment_failed';
+    invoiceId: string;
+    hostedInvoiceUrl: string | null;
+    expiresAt: Date | null;
+}
+
+export interface OverageInvoiceRequest {
+    customerId: string;
+    subscriptionId: string;
+    periodStart: Date;
+    periodEnd: Date;
+    ratingVersion: number;
+    cents: number;
+    overageEnabled: boolean;
+    now: Date;
+    existingInvoiceId?: string | null;
+}
+
+export type OverageInvoiceResult =
+    | { status: 'invoiced'; invoiceId: string; invoiceStatus: string; hostedInvoiceUrl: string | null }
+    | { status: 'skipped'; reason: 'overage_disabled' | 'nothing_to_bill' | 'period_not_closed' };
+
+export interface UsageBillingPort {
+    invoiceOverage(input: OverageInvoiceRequest, hooks?: { onDraftCreated?: (invoiceId: string) => Promise<void> }): Promise<OverageInvoiceResult>;
 }
 
 // ── Processor / handlers ──────────────────────────────────────────────────────
@@ -367,5 +434,6 @@ export interface BillingDeps {
     store: BillingStore;
     /** Null unless `STRIPE_SECRET` is set. */
     stripe: StripeApi | null;
+    usage: UsageBillingPort | null;
     now: () => Date;
 }

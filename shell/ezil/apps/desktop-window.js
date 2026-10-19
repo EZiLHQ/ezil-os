@@ -2133,8 +2133,14 @@ export async function openDesktopWindow (ctx = {}) {
         // preview) means presence has NOT ended. Production 2026-10-04: a close
         // released the computer in the same second two windows were opened on
         // it, and the stop that followed left them on 410 STALE_PREVIEW_URL.
+        // Only a window that shows the computer in a frame counts. Settings and
+        // the App Store are stamped with the current computer too, but use
+        // nothing in it, and must not keep it running after a Switch (the same
+        // rule `ui/Settings/tabs/computers.js` uses for its sandbox windows).
+        // Code and Preview create their frame at open, before the mint.
         const others = [...document.querySelectorAll('.window[data-ezil-computer-id]')]
-            .filter(w => w !== el_window && w.getAttribute('data-ezil-computer-id') === String(computer.id));
+            .filter(w => w !== el_window && w.getAttribute('data-ezil-computer-id') === String(computer.id)
+                && w.querySelector('.window-app-iframe') !== null);
         if ( others.length > 0 ) {
             console.info(`[${PHASE}] close: ${others.length} other window(s) still use this computer — not releasing it`);
             return;

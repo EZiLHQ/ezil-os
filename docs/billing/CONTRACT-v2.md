@@ -81,6 +81,8 @@ Where this document and v1 disagree, v2 wins for new offers; v1 entitlements tha
   - It is a separate invoice from the subscription invoice; a combined bill is not promised.
   - Metronome would be the replacement adapter, but it needs a separate commercial account, so it is not used.
 - **Failure.** If an overage invoice fails or needs action (including off-session SCA), overage turns **off**. Usage stops at the allowance until the payment is repaired, and saved files are retained.
+- **Pause mid-period.** Overage accrued while consent was active and within the cap is billable; overage accrued after a pause (by the customer or after a failed overage invoice) is not.
+- **Known limitation.** Each run invoices only the latest closed period; an earlier period that was missed is not caught up.
 
 ## 5. Sessions and enforcement
 

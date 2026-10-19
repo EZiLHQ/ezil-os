@@ -105,6 +105,91 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         issue: 'payment_failed', hostedInvoiceUrl: 'https://invoice.example/test', eventCreated: instant(10), ...overrides,
     });
 
+    it('selects consent strictly before the boundary, by acceptance time then audit identity', async () => {
+        expect(await store.consentAsOf(userId, subscriptionId, instant(100))).toBeNull();
+        await store.recordConsent(consent({ acceptedAt: instant(10) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(20) }));
+        const latest = await store.recordConsent(consent({ capCents: 5000, acceptedAt: instant(20) }));
+        // Late delivery of an older decision does not change historical consent.
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(15) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(100) }));
+        await store.recordConsent(consent({ capCents: 100, acceptedAt: instant(101) }));
+        expect(await store.consentAsOf(userId, subscriptionId, instant(100))).toEqual(latest);
+        expect(await store.consentAsOf(otherUserId, subscriptionId, instant(100))).toBeNull();
+        expect(await store.consentAsOf(userId, 'foreign_subscription', instant(100))).toBeNull();
+        expect(await store.consentAsOf(userId, subscriptionId, instant(10))).toBeNull();
+    });
+
+    it('returns the start decision and all interior decisions in time/identity order, scoped to the tenant and subscription', async () => {
+        await store.recordConsent(consent({ acceptedAt: instant(0) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(10) }));
+        const initial = await store.recordConsent(consent({ capCents: 5000, acceptedAt: instant(10) }));
+        // An older decision delivered later must not replace the initial decision.
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(5) }));
+        const paused = await store.recordConsent(consent({ enabled: false, acceptedAt: instant(20) }));
+        const enabled = await store.recordConsent(consent({ acceptedAt: instant(20) }));
+        const earlier = await store.recordConsent(consent({ capCents: 1000, acceptedAt: instant(15) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(100) }));
+        await store.recordConsent(consent({ capCents: 100, acceptedAt: instant(101) }));
+        for (const acceptedAt of [instant(10), instant(30)]) {
+            await store.recordConsent(consent({ userId: otherUserId, acceptedAt }));
+            await store.recordConsent(consent({ subscriptionId: 'another_subscription', acceptedAt }));
+        }
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(10), instant(100)))
+            .toEqual([initial, earlier, paused, enabled]);
+        expect(await store.consentDecisionsForPeriod(otherUserId, 'another_subscription', instant(10), instant(100))).toEqual([]);
+    });
+
+    it('carries only the latest decision before start into a period without a decision at start', async () => {
+        await store.recordConsent(consent({ acceptedAt: instant(-20) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(-10) }));
+        const initial = await store.recordConsent(consent({ capCents: 1000, acceptedAt: instant(-10) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(-15) }));
+        const paused = await store.recordConsent(consent({ enabled: false, actor: 'system:overage_payment_issue', acceptedAt: instant(50) }));
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(100))).toEqual([initial, paused]);
+    });
+
+    it('returns interior decisions without initial consent and excludes decisions at or after the end', async () => {
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(100))).toEqual([]);
+        const enabled = await store.recordConsent(consent({ acceptedAt: instant(20) }));
+        await store.recordConsent(consent({ enabled: false, acceptedAt: instant(100) }));
+        await store.recordConsent(consent({ acceptedAt: instant(101) }));
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(100))).toEqual([enabled]);
+        expect(await store.consentDecisionsForPeriod(userId, subscriptionId, instant(0), instant(20))).toEqual([]);
+    });
+
+    it.each(['paid', 'payment_failed', 'requires_action', 'void', 'uncollectible'] as const)
+        ('opens only pending overage invoices and preserves webhook %s', async status => {
+            const { row } = await store.upsertOverageInvoice(overage());
+            const invoiceId = `in_${randomUUID()}`;
+            await store.attachOverageStripeInvoice(row.id, invoiceId);
+            await store.markOverageInvoiceOpen(invoiceId);
+            expect((await store.overageInvoiceByStripeId(invoiceId))?.status).toBe('open');
+            await store.setOverageInvoiceStatus(invoiceId, status);
+            await store.markOverageInvoiceOpen(invoiceId);
+            expect((await store.overageInvoiceByStripeId(invoiceId))?.status).toBe(status);
+            await store.markOverageInvoiceOpen('in_missing');
+            expect(await store.overageInvoiceByStripeId('in_missing')).toBeNull();
+        });
+
+    it('updates optional plan-change details only when provided and only on open owned rows', async () => {
+        await store.recordPlanChange(change());
+        const update = { userId, subscriptionId, kind: 'upgrade' as const };
+        await store.setPlanChangeState({ ...update, state: 'requires_action', stripeInvoiceId: 'in_upgrade',
+            hostedInvoiceUrl: 'https://invoice.example/action', expiresAt: instant(90) });
+        expect((await store.openPlanChanges(userId))[0]).toMatchObject({ state: 'requires_action', stripeInvoiceId: 'in_upgrade',
+            hostedInvoiceUrl: 'https://invoice.example/action', expiresAt: instant(90) });
+        await store.setPlanChangeState({ ...update, state: 'payment_failed' });
+        expect((await store.openPlanChanges(userId))[0]).toMatchObject({ hostedInvoiceUrl: 'https://invoice.example/action', expiresAt: instant(90) });
+        await store.setPlanChangeState({ ...update, userId: otherUserId, state: 'canceled', hostedInvoiceUrl: null, expiresAt: null });
+        expect((await store.openPlanChanges(userId))[0].state).toBe('payment_failed');
+        await store.setPlanChangeState({ ...update, state: 'applied', effectiveAt: instant(30), hostedInvoiceUrl: null, expiresAt: null });
+        const [closed] = await db.select().from(billingPlanChanges).where(eq(billingPlanChanges.userId, userId));
+        expect(closed).toMatchObject({ state: 'applied', effectiveAt: instant(30), hostedInvoiceUrl: null, expiresAt: null });
+        await store.setPlanChangeState({ ...update, state: 'requires_action', hostedInvoiceUrl: 'https://invoice.example/stale', expiresAt: instant(200) });
+        expect(await db.select().from(billingPlanChanges).where(eq(billingPlanChanges.userId, userId))).toEqual([closed]);
+    });
+
     it('reads the latest usage interval for just that computer, including closed intervals', async () => {
         expect(await store.latestIntervalFor(computerId)).toBeNull();
         await store.openInterval(userId, computerId, instant(0), 'start');

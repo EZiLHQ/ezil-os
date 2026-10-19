@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, gte, inArray, isNull, lt, notExists, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, notExists, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 
 import {
@@ -176,6 +176,31 @@ export function createBillingStore(db: Database): BillingStore {
             return row;
         },
 
+        async consentAsOf(userId, subscriptionId, at) {
+            const [row] = await db.select().from(billingOverageConsents).where(and(
+                eq(billingOverageConsents.userId, userId),
+                eq(billingOverageConsents.subscriptionId, subscriptionId),
+                lt(billingOverageConsents.acceptedAt, at),
+            )).orderBy(desc(billingOverageConsents.acceptedAt), desc(billingOverageConsents.id)).limit(1);
+            return row ?? null;
+        },
+
+        async consentDecisionsForPeriod(userId, subscriptionId, start, end) {
+            const initial = db.select({ id: billingOverageConsents.id }).from(billingOverageConsents).where(and(
+                eq(billingOverageConsents.userId, userId),
+                eq(billingOverageConsents.subscriptionId, subscriptionId),
+                lte(billingOverageConsents.acceptedAt, start),
+            )).orderBy(desc(billingOverageConsents.acceptedAt), desc(billingOverageConsents.id)).limit(1);
+            return db.select().from(billingOverageConsents).where(and(
+                eq(billingOverageConsents.userId, userId),
+                eq(billingOverageConsents.subscriptionId, subscriptionId),
+                or(inArray(billingOverageConsents.id, initial), and(
+                    gt(billingOverageConsents.acceptedAt, start),
+                    lt(billingOverageConsents.acceptedAt, end),
+                )),
+            )).orderBy(billingOverageConsents.acceptedAt, billingOverageConsents.id);
+        },
+
         async latestConsent(userId, subscriptionId) {
             const [row] = await db.select().from(billingOverageConsents).where(and(
                 eq(billingOverageConsents.userId, userId),
@@ -206,6 +231,12 @@ export function createBillingStore(db: Database): BillingStore {
             ));
         },
 
+        async markOverageInvoiceOpen(stripeInvoiceId) {
+            await db.update(billingOverageInvoices).set({ status: 'open', updatedAt: sql`now()` }).where(and(
+                eq(billingOverageInvoices.stripeInvoiceId, stripeInvoiceId), eq(billingOverageInvoices.status, 'pending'),
+            ));
+        },
+
         async setOverageInvoiceStatus(stripeInvoiceId, status) {
             const rows = await db.update(billingOverageInvoices).set({ status, updatedAt: sql`now()` })
                 .where(eq(billingOverageInvoices.stripeInvoiceId, stripeInvoiceId))
@@ -230,8 +261,8 @@ export function createBillingStore(db: Database): BillingStore {
             return rows.length > 0 ? 'inserted' : 'exists';
         },
 
-        async setPlanChangeState({ userId, subscriptionId, kind, state, stripeInvoiceId, effectiveAt }) {
-            await db.update(billingPlanChanges).set({ state, stripeInvoiceId, effectiveAt, updatedAt: sql`now()` })
+        async setPlanChangeState({ userId, subscriptionId, kind, state, stripeInvoiceId, effectiveAt, hostedInvoiceUrl, expiresAt }) {
+            await db.update(billingPlanChanges).set({ state, stripeInvoiceId, effectiveAt, hostedInvoiceUrl, expiresAt, updatedAt: sql`now()` })
                 .where(and(
                     eq(billingPlanChanges.userId, userId),
                     eq(billingPlanChanges.subscriptionId, subscriptionId),
