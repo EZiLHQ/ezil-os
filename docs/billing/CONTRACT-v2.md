@@ -97,6 +97,7 @@ Where this document and v1 disagree, v2 wins for new offers; v1 entitlements tha
   - `maxRunSeconds = min(21,600, floor(headroom / weight))`.
   - Refusal reasons: `no_plan`, `size_not_allowed`, `allowance_exhausted`, `overage_cap_reached`, `payment_issue`, `concurrent_limit`, `upgrade_pending`.
 - **Paid sizes** run on AWS only. The Cloudflare class is 2 vCPU / 6 GiB, so Free stays there.
+- **Delinquent paid plan** (lead decision 2026-10-18): a past_due/incomplete plan or an unresolved payment issue falls back to the Free allowance on `free-cf`; paid sizes are refused with `payment_issue`.
 
 ## 6. Router (tRPC `billing.*`)
 

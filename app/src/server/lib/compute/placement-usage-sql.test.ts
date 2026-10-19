@@ -33,9 +33,9 @@ const FIXTURE = [
     { computer_id: C(2), user_id: U1, instance_type: 'm6i.xlarge', started_at: at('2026-09-30T22:00:00.000Z'), stopped_at: at('2026-10-01T01:00:00.000Z'), egress_bytes: 1_000 },
     { computer_id: C(3), user_id: U2, instance_type: 'unknown', started_at: at('2026-09-29T00:00:00.000Z'), stopped_at: null, egress_bytes: 7 },
     { computer_id: C(4), user_id: U2, instance_type: 'm6i.large', started_at: at('2026-09-01T00:00:00.000Z'), stopped_at: at('2026-09-02T00:00:00.000Z'), egress_bytes: 99 },
-    { computer_id: C(5), user_id: U3, instance_type: null, started_at: at('2026-10-15T12:30:00.000Z'), stopped_at: null, egress_bytes: 3 },
+    { computer_id: C(5), user_id: U3, instance_type: 'm6i.large', started_at: at('2026-10-15T12:30:00.000Z'), stopped_at: null, egress_bytes: 3 },
     { computer_id: C(6), user_id: U3, instance_type: 'c6i.xlarge', started_at: at('2026-10-10T08:00:00.000Z'), stopped_at: at('2026-10-10T08:00:00.000Z'), egress_bytes: 0 },
-    { computer_id: C(7), user_id: U3, instance_type: null, started_at: at('2026-10-15T11:00:00.100Z'), stopped_at: null, egress_bytes: 0 },
+    { computer_id: C(7), user_id: U3, instance_type: 'm6i.large', started_at: at('2026-10-15T11:00:00.100Z'), stopped_at: null, egress_bytes: 0 },
     { computer_id: C(8), user_id: U3, instance_type: 'c6i.xlarge', started_at: at('2026-09-30T23:59:59.100Z'), stopped_at: at('2026-10-01T00:00:01.999Z'), egress_bytes: 0 },
     { computer_id: C(9), user_id: U3, instance_type: 'm6i.large', started_at: at('2026-10-15T11:00:00.000Z'), stopped_at: at('2026-10-15T11:00:00.999Z'), egress_bytes: 0 },
 ];

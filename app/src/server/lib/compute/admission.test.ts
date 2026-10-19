@@ -504,7 +504,7 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
             const seed = () =>
                 createFakePlacementDb({
                     // Mumbai (home) holds one running computer; the US has room. A full home must refuse, not hop.
-                    placements: [placementRow({ computer_id: C1, region: 'ap-south-1' }), placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'ap-south-1' })],
+                    placements: [placementRow({ instance_type: 'm6i.large', computer_id: C1, region: 'ap-south-1' }), placementRow({ instance_type: 'm6i.large', computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'ap-south-1' })],
                     computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
                 });
             const lease = { kind: 'lease', userId: U1, computerId: C1, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date(NOW.getTime() + 3_600_000) } as const;
@@ -529,7 +529,7 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
 
         it('exact per-region counts: Mumbai full while the US is empty admits into the US although the GLOBAL count is at Mumbai\'s cap', async () => {
             const { db, placements } = createFakePlacementDb({
-                placements: [placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'ap-south-1' })],
+                placements: [placementRow({ instance_type: 'm6i.large', computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'ap-south-1' })],
                 computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
             });
             const r = await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '1' }));
@@ -540,8 +540,8 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
         it('a running row in another region does not fill this one, and a STOPPED row fills none', async () => {
             const { db } = createFakePlacementDb({
                 placements: [
-                    placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'us-east-1' }),
-                    placementRow({ computer_id: C2, owner_user_id: U2, state: 'STOPPED', region: 'ap-south-1' }),
+                    placementRow({ instance_type: 'm6i.large', computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: 'us-east-1' }),
+                    placementRow({ instance_type: 'm6i.large', computer_id: C2, owner_user_id: U2, state: 'STOPPED', region: 'ap-south-1' }),
                 ],
                 computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }, { id: C3, user_id: U3 }],
             });
@@ -551,7 +551,7 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
 
         it('a running row WITHOUT a region counts against every region (safe direction)', async () => {
             const { db, placements } = createFakePlacementDb({
-                placements: [placementRow({ computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: null })],
+                placements: [placementRow({ instance_type: 'm6i.large', computer_id: C3, owner_user_id: U3, state: 'RUNNING', region: null })],
                 computers: [{ id: C1, user_id: U1 }, { id: C3, user_id: U3 }],
             });
             const r = await runAdmission(db, { kind: 'create', userId: U1, computerId: C1, tier: 'free' }, deps2({ ...TWO, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '1' }));
@@ -560,7 +560,7 @@ describe('regions and tiers (founder decisions 2026-10-14)', () => {
         });
 
         it('a legacy aws-ec2 row without a region is not leased', async () => {
-            const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
+            const { db, placements } = createFakePlacementDb({ placements: [placementRow({ instance_type: 'm6i.large', computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
             const lease = { kind: 'lease', userId: U1, computerId: C1, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date(NOW.getTime() + 3_600_000) } as const;
             expect(await runAdmission(db, lease, deps2(TWO))).toMatchObject({ admitted: false, reason: 'region_not_configured' });
             expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });

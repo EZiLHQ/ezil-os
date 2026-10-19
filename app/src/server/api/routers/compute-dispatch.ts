@@ -21,6 +21,7 @@
 
 import { TRPCError } from '@trpc/server';
 
+import { billingV2EntitlementReader } from '@/server/billing/v2/compute-access';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
@@ -30,7 +31,7 @@ import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/comput
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
-import { resolveTier, type EntitlementReader } from '@/server/lib/compute/tier';
+import { plusPlanIds, resolveEntitlement, tierForEntitlement, type EntitlementReader, type EntitlementRecord } from '@/server/lib/compute/tier';
 
 export type RoutedComputer =
     | { kind: 'cloudflare'; provider: CloudflareComputeProvider }
@@ -58,7 +59,7 @@ export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProvide
 
 export interface RouteOptions {
     env?: Env;
-    /** Where a user's paid entitlement is read from. None in this app today → every AWS computer is `free`. */
+    /** Defaults to billing v2, whose reader touches no store while billing is off. */
     entitlements?: EntitlementReader;
     /** Overrides `defaultAwsCollaborators(env)` (tests). */
     aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
@@ -67,24 +68,25 @@ export interface RouteOptions {
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */
-export function awsDepsFor(env: Env, entitlements: EntitlementReader | undefined, aws: RouteOptions['aws'] = {}) {
+export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | undefined, aws: RouteOptions['aws'] = {}) {
     return {
         ...aws,
-        // The size this user's computer gets: `free` unless a paid entitlement proves `plus`.
-        tierFor: (userId: string) => resolveTier(userId, entitlements, env),
+        entitlement,
+        tierFor: async () => tierForEntitlement(entitlement, plusPlanIds(env)),
     };
 }
 
 export async function routeComputer(
     db: unknown,
     computer: ComputerRef,
-    { env = process.env, entitlements, aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
+    { env = process.env, entitlements = billingV2EntitlementReader(), aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
 ): Promise<RoutedComputer> {
     // Flag off: no database read at all — the pre-P3 call, unchanged.
     if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
     let provider: ComputeProvider;
     try {
-        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlements, aws), { pinCloudflare });
+        const entitlement = await resolveEntitlement(computer.userId, entitlements);
+        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlement, aws), { pinCloudflare, entitlement });
     } catch (err) {
         if (err instanceof PlacementOwnerError) {
             // NOT_FOUND, never FORBIDDEN — a foreign computer must look absent.
