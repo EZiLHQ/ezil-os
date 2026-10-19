@@ -21,7 +21,8 @@
       "note": "standard-3 (2 vCPU / 8 GiB / 16 GB) at 20% CPU = 0.104832/h, excluding plan allowances and auxiliary services; memory and disk billed as provisioned, CPU as used; nothing while truly asleep"
     },
     "cloudflare_r2": { "source": "https://developers.cloudflare.com/r2/pricing/", "note": "Standard storage 0.015 per GB-month" },
-    "stripe_fees": { "note": "placeholder 5.1% + 0.30 per invoice (card + Billing); replace with the account's actual blended rate" }
+    "stripe_fees": { "note": "v2 placeholder 5.1% + 0.30 per invoice (card + Billing); retained for v2 reproducibility" },
+    "stripe_fees_v3": { "note": "Assigned v3 assumptions, 2026-10-19: card 2.9% + USD 0.30 per monthly invoice, Billing 0.7%, optional Managed Payments (merchant of record) 3.5% additional. Not fetched from a live account." }
   },
   "ec2_hourly": {
     "ap-south-1": { "t4g.large": "0.0448", "t4g.large@full_cpu": "0.1008", "m7g.large": "0.0583", "m7g.xlarge": "0.1166", "m7g.2xlarge": "0.2333", "m6i.large": "0.101", "m6i.xlarge": "0.202", "m6i.2xlarge": "0.404" },
@@ -31,5 +32,6 @@
   "public_ipv4_hour": "0.005",
   "cloudflare": { "standard3_hour_at_20pct_cpu": "0.104832", "workers_paid_base_month": "5", "r2_gb_month": "0.015" },
   "fees": { "rate": "0.051", "fixed": "0.30" },
+  "fees_v3": { "card_rate": "0.029", "card_fixed": "0.30", "billing_rate": "0.007", "managed_payments_rate": "0.035" },
   "hours_per_month": "730"
 }
