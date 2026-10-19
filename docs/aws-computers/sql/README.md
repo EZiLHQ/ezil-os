@@ -8,8 +8,11 @@ and nothing reads these tables while `EZIL_AWS_COMPUTERS_ENABLED` is unset.
 pool hosts and a global writer lease per computer. Nothing imports these models
 from a router, provider, cron or flag. Registration follows the same founder
 rehearsal, catalog-digest and manifest steps below, using a distinct migration name.
-Its primary keys, CHECKs, default and non-unique partial index require hosted
-`additiveSQL` grammar support before registration; the current parser rejects them.
+It parses with `additiveSQL`: NOT NULL plus unique indexes preserve primary-key
+and instance uniqueness; the candidate index is full. `ready-pool.ts` validates
+region/type/state/health, supplies generation 1 on insert, and guards lease
+consistency and generations in its atomic statements; `aws-migrate.ts` validates
+writer region/generation. Direct SQL writers must uphold these application invariants.
 
 ## Why `.sql.txt` and why here
 

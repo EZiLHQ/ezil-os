@@ -34,6 +34,27 @@ function checkClass(region: string, instanceType: PoolInstanceType): void {
     if (!AWS_REGION_PATTERN.test(region) || !POOL_INSTANCE_TYPES.includes(instanceType)) throw new Error('pool_class_invalid');
 }
 
+/** All clean-host writes must use this boundary: additiveSQL cannot express
+ * CHECKs or DEFAULTs. Only the atomic lease statement may enter leased state. */
+export async function insertPoolHost(db: PoolExecutor, input: {
+    id: string; region: string; zoneId: string; instanceId: string; instanceType: PoolInstanceType;
+    state: string; health: string; editorReadyAt: Date | null; now: Date; generation?: number;
+}): Promise<void> {
+    checkClass(input.region, input.instanceType);
+    if (!['booting', 'ready', 'draining', 'retired'].includes(input.state)) throw new Error('pool_state_invalid');
+    if (!['unknown', 'healthy', 'unhealthy'].includes(input.health)) throw new Error('pool_health_invalid');
+    const generation = generationOf(input.generation ?? 1);
+    const at = input.now.toISOString();
+    await db.execute(sql`
+        INSERT INTO public.ezil_compute_pool_hosts
+            (id, region, zone_id, instance_id, instance_type, state, health, editor_ready_at,
+             generation, leased_computer_id, leased_generation, lease_token, leased_at, created_at, updated_at)
+        VALUES (${input.id}::uuid, ${input.region}, ${input.zoneId}, ${input.instanceId}, ${input.instanceType},
+            ${input.state}, ${input.health}, ${input.editorReadyAt?.toISOString() ?? null}::timestamptz,
+            ${generation}, NULL, NULL, NULL, NULL, ${at}::timestamptz, ${at}::timestamptz)
+    `);
+}
+
 /** One atomic statement, including candidate selection. No candidate means cold boot. */
 export async function leasePoolHost(db: PoolExecutor, args: {
     region: string; instanceType: PoolInstanceType; computerId: string; now: Date;
@@ -49,6 +70,8 @@ export async function leasePoolHost(db: PoolExecutor, args: {
             SELECT id FROM public.ezil_compute_pool_hosts
             WHERE region = ${args.region} AND instance_type = ${args.instanceType}
                 AND state = 'ready' AND health = 'healthy' AND editor_ready_at IS NOT NULL
+                AND generation > 0 AND generation < ${Number.MAX_SAFE_INTEGER}
+                AND leased_computer_id IS NULL AND leased_generation IS NULL AND lease_token IS NULL AND leased_at IS NULL
             ORDER BY editor_ready_at, id FOR UPDATE SKIP LOCKED LIMIT 1
         )
         RETURNING id, region, zone_id, instance_id, instance_type, state, generation,
@@ -77,6 +100,7 @@ export async function releasePoolHost(db: PoolExecutor, args: {
             lease_token = NULL, leased_at = NULL, updated_at = now()
         WHERE id = ${args.id}::uuid AND state = 'leased' AND lease_token = ${args.leaseToken}::uuid
             AND generation = ${args.generation} AND leased_generation = ${args.generation - 1}
+            AND leased_computer_id IS NOT NULL AND leased_at IS NOT NULL
         RETURNING id
     `));
     return rows.length === 1 ? 'released' : 'fenced';

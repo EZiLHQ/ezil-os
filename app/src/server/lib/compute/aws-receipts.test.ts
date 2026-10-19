@@ -170,6 +170,17 @@ describe('billing v2 observations', () => {
         expect(observations).toEqual([{ inTransaction: false, state: 'RUNNING' }]);
     });
 
+    it('logs a concurrent AWS ready without rolling back the running receipt', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const m = { ...meter(), ready: vi.fn<ComputeMeter['ready']>().mockResolvedValue('concurrent') };
+        const s = setup([row({ state: 'STARTING', ...enrolled, instance_type: 'm6i.2xlarge' })],
+            { status: 'SUCCEEDED', output: receiptOf() }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        expect(info).toHaveBeenCalledWith('[billing.epoch] concurrent AWS ready', { userId: U1, computerId: C1 });
+        expect(m.ready).toHaveBeenCalledTimes(1);
+        expect(m.stopped).not.toHaveBeenCalled();
+    });
+
     it.each(['STARTING', 'MOUNTING'])('%s with receipt and enrollment meters first RUNNING', async state => {
         const m = meter();
         const s = setup([row({ state, ...enrolled, instance_type: 'm6i.2xlarge' })],
@@ -266,7 +277,7 @@ describe('billing v2 observations', () => {
     it('real meter with flags off never accesses the store for AWS readiness or stops', async () => {
         const access = vi.fn(() => { throw new Error('billing tables absent'); });
         const m = billingComputeMeter(() => ({ config: readBillingConfig({}),
-            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => NOW }));
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => NOW }));
         for (const state of ['PROVISIONING', 'STOPPING'] as const) {
             const s = setup([row({ state, ...enrolled })],
                 { status: 'SUCCEEDED', output: receiptOf({ state: state === 'STOPPING' ? 'stopped' : 'running' }) }, { meter: m });

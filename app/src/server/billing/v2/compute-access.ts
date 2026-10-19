@@ -2,9 +2,9 @@ import type { EntitlementReader } from '../../lib/compute/tier';
 import { sizeForInstanceType } from '../../lib/compute/aws-config';
 import type { BillingConfig } from '../config';
 import { getBillingDeps } from '../deps';
-import type { BillingDeps, StoredComputeEpoch } from '../ports';
+import type { BillingDeps } from '../ports';
 import { freeSkuFor, planFromSubscriptions } from './catalog';
-import { CATALOG_V2, type AdmitDecision, type AdmitRefusal, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
+import { CATALOG_V2, type ComputeEpoch, type AdmitDecision, type AdmitRefusal, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
 import { admitStart, rateWindow } from './rating';
 import { buildSummaryV2, summaryMeters } from './summary';
 import { epochSeconds, isoSeconds } from './time';
@@ -12,7 +12,7 @@ import { epochSeconds, isoSeconds } from './time';
 export interface ComputeBillingState {
     planSku: PlanSku;
     subscriptionId: string | null;
-    openEpochs: readonly StoredComputeEpoch[];
+    openEpochs: readonly ComputeEpoch[];
     /** Subscription facts; the effective allowance below may fall back to Free. */
     family: PlanFamily;
     planActive: boolean;
@@ -100,7 +100,7 @@ function decideStart(state: ComputeBillingState, computerId: string, size: SizeC
 /** Billing can record an immediately due epoch, but must never fail readiness. */
 export async function openComputeEpochAtReady({ deps, userId, computerId, size, readyAt, overheadSeconds }: {
     deps: BillingDeps; userId: string; computerId: string; size: SizeCode; readyAt: Date; overheadSeconds: number;
-}): Promise<'inactive' | 'error' | { status: 'opened' | 'exists'; deadlineAt: string | null; decision: AdmitDecision }> {
+}): Promise<'inactive' | 'error' | { status: 'opened' | 'exists' | 'concurrent'; deadlineAt: string | null; decision: AdmitDecision }> {
     if (!billingMeteringActive(deps.config)) return 'inactive';
     try {
         const state = await loadComputeBillingState(deps, userId, readyAt);
@@ -109,6 +109,9 @@ export async function openComputeEpochAtReady({ deps, userId, computerId, size, 
         const deadlineAt = new Date(readyAt.getTime() + (decision.admit ? decision.maxRunSeconds : 0) * 1000);
         const opened = await deps.store.openEpoch({
             userId, computerId, subscriptionId: state.subscriptionId, size, readyAt, deadlineAt, overheadSeconds,
+        });
+        if (opened.status === 'concurrent') console.info('[billing.epoch] concurrent', {
+            userId, computerId, runningComputerId: opened.epoch.computerId,
         });
         return { status: opened.status, deadlineAt: opened.epoch.deadlineAt, decision };
     } catch (error) {

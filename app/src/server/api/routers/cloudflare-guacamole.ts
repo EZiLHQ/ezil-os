@@ -224,9 +224,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
-            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) await recordComputeMeter(() => getComputeMeter().ready({
-                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
-            }));
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -484,9 +491,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
-            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) await recordComputeMeter(() => getComputeMeter().ready({
-                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
-            }));
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -668,9 +682,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
-            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) await recordComputeMeter(() => getComputeMeter().ready({
-                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
-            }));
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -1300,9 +1321,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ok: false as const, errorCode: aws.outcome ?? 'aws_not_supported', correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const result = await routed.provider.restart({ correlationId }, computer);
-            if (result.ok) await recordComputeMeter(() => getComputeMeter().ready({
-                ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
-            }));
+            if (result.ok) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 return {

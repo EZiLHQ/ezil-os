@@ -89,6 +89,13 @@ export function createBillingStore(db: Database): BillingStore {
                     if (existing.userId !== input.userId) throw new Error('Epoch ownership conflict');
                     return { status: 'exists', epoch: computeEpoch(existing) };
                 }
+                const [concurrent] = await db.select().from(billingComputeEpochs).where(and(
+                    eq(billingComputeEpochs.userId, input.userId),
+                    isNull(billingComputeEpochs.endedAt),
+                ));
+                if (concurrent && concurrent.computerId !== input.computerId) {
+                    return { status: 'concurrent', epoch: computeEpoch(concurrent) };
+                }
             }
             throw new Error('Could not open compute epoch after 3 attempts');
         },

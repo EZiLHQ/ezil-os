@@ -99,7 +99,7 @@ function routerDb(placements: Record<string, unknown>[], computerOwner = U1) {
 
 let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
-    captured.billingDeps.mockReset().mockReturnValue({ config: readBillingConfig({}), store: {}, stripe: null, now: () => new Date() });
+    captured.billingDeps.mockReset().mockReturnValue({ config: readBillingConfig({}), store: {}, stripe: null, usage: null, now: () => new Date() });
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_WORKER_URL', 'https://worker.example');
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'router-secret');
     fetchMock = vi.fn(async () => Response.json({ ok: true }));
@@ -212,7 +212,7 @@ describe('billing v2 dispatch wiring', () => {
             sizePreference: vi.fn(async () => 'cmp-8' as const),
         };
         captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }), store: store as unknown as BillingStore,
-            stripe: null, now: () => now } satisfies BillingDeps);
+            stripe: null, usage: null, now: () => now } satisfies BillingDeps);
         const { db, fake } = routerDb([]);
         const start = vi.fn(async () => {});
         const routed = await routeComputer(db, computer, { env: provisionEnv, aws: { starter: { start }, now: () => now }, pinCloudflare: true });
@@ -229,7 +229,7 @@ describe('billing v2 dispatch wiring', () => {
     it('billing flags off with placement reads on makes ZERO store accesses', async () => {
         const access = vi.fn(() => { throw new Error('billing store touched while off'); });
         const store = new Proxy({} as BillingStore, { get: access });
-        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}), store, stripe: null, now: () => new Date() } satisfies BillingDeps);
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}), store, stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
         const { db } = routerDb([]);
         expect((await routeComputer(db, computer, { env: AWS_ENV, aws: {} })).kind).toBe('cloudflare');
         expect(access).not.toHaveBeenCalled();
@@ -239,7 +239,7 @@ describe('billing v2 dispatch wiring', () => {
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
         const access = vi.fn(() => { throw new Error('Unexpected billing store call'); });
         captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }),
-            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => new Date() } satisfies BillingDeps);
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
         const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
         const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
         await caller[method]({ computerId: C1 });
@@ -258,7 +258,7 @@ describe('billing v2 dispatch wiring', () => {
             throw new Error(`Unexpected billing store access: ${String(key)}`);
         });
         captured.billingDeps.mockReturnValue({ config: readBillingConfig(metering ? { BILLING_TAB_ENABLED: '1' } : {}),
-            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => at } satisfies BillingDeps);
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => at } satisfies BillingDeps);
         const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
         const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
         await caller.reportActivity({ computerId: C1, lastInputAgoMs: 5 });
@@ -371,7 +371,7 @@ describe('routers: AWS previews use their own Worker route', () => {
             sizePreference: vi.fn(async () => null),
         };
         captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
-            store: store as unknown as BillingStore, stripe: null, now: () => now } satisfies BillingDeps);
+            store: store as unknown as BillingStore, stripe: null, usage: null, now: () => now } satisfies BillingDeps);
         const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure');
         const restart = vi.spyOn(cloudflareComputeProvider, 'restart');
         const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
@@ -388,7 +388,7 @@ describe('routers: AWS previews use their own Worker route', () => {
     it.each([true, false])('flags-off previewUrl preserves the provider result with zero billing-store calls (placement %s)', async hasPlacement => {
         const access = vi.fn(() => { throw new Error('billing store accessed while flags off'); });
         captured.billingDeps.mockReturnValue({ config: readBillingConfig({}),
-            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => new Date() } satisfies BillingDeps);
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
         const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure').mockResolvedValue({
             ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', retryable: true,
         });

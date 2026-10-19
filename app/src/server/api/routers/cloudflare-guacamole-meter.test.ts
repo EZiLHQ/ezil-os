@@ -51,7 +51,7 @@ beforeEach(() => {
     vi.setSystemTime(NOW);
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'test-secret');
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('unexpected network'); }));
-    mocks.deps.mockReset().mockReturnValue({ config: readBillingConfig({}), store: {}, stripe: null, now: () => NOW });
+    mocks.deps.mockReset().mockReturnValue({ config: readBillingConfig({}), store: {}, stripe: null, usage: null, now: () => NOW });
     mocks.ensure.mockReset().mockResolvedValue(ready);
     mocks.restart.mockReset().mockResolvedValue({ ok: true, outcome: 'restarted', wasRunning: true });
     mocks.activity.mockReset().mockResolvedValue({ ok: true });
@@ -75,6 +75,37 @@ describe('Cloudflare compute metering', () => {
         const provider = surface === 'restartDesktop' ? mocks.restart : mocks.ensure;
         expect(provider.mock.invocationCallOrder[0]).toBeLessThan(meter.ready.mock.invocationCallOrder[0]!);
     });
+
+    it.each(surfaces.slice(0, 4).flatMap(surface => [true, false].map(enforcement => ({ surface, enforcement }))))(
+        '$surface handles concurrent ready with enforcement=$enforcement', async ({ surface, enforcement }) => {
+            const actual = await vi.importActual<typeof import('@/server/billing/v2/compute-meter')>('@/server/billing/v2/compute-meter');
+            mocks.factory.mockImplementation(() => actual.billingComputeMeter());
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            // Both gates saw no running epoch; another computer wins the insert race at readiness.
+            const openEpoch = vi.fn<BillingStore['openEpoch']>(async () => ({ status: 'concurrent', epoch: {
+                id: 'epoch_other', userId, computerId: 'computer_other', size: 'free-cf', weight: 1,
+                readyAt: NOW.toISOString(), endedAt: null, endReason: null, overheadSeconds: 0,
+                deadlineAt: null, lastHeartbeatAt: null,
+            } }));
+            mocks.deps.mockReturnValue({ config: readBillingConfig(enforcement ? { BILLING_ENFORCEMENT: '1' } : { BILLING_TAB_ENABLED: '1' }),
+                stripe: null, usage: null, now: () => NOW, store: {
+                    openEpochFor: async () => null, subscriptionsFor: async () => [], userCreatedAt: async () => null,
+                    openPlanChanges: async () => [], epochsFor: async () => [], grantsForPeriod: async () => [],
+                    openPaymentIssues: async () => [], sizePreference: async () => null, openEpoch,
+                } });
+            const result = await call(surface);
+            expect(openEpoch).toHaveBeenCalledTimes(1);
+            expect(info).toHaveBeenCalledWith('[billing.epoch] concurrent', expect.objectContaining({ computerId, runningComputerId: 'computer_other' }));
+            if (enforcement) {
+                expect(result).toMatchObject({ ok: false, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                    billingRefusal: 'concurrent_limit', provider: 'cloudflare-guacamole' });
+                expect(mocks.terminate).toHaveBeenCalledExactlyOnceWith(expect.any(Object), { userId, computerId });
+                expect(openEpoch.mock.invocationCallOrder[0]).toBeLessThan(mocks.terminate.mock.invocationCallOrder[0]!);
+            } else {
+                expect(result).toMatchObject({ ok: true });
+                expect(mocks.terminate).not.toHaveBeenCalled();
+            }
+        });
 
     it('reportActivity preserves its answer and heartbeats after provider success', async () => {
         expect(await call('reportActivity')).toMatchObject({ ok: true, provider: 'cloudflare-guacamole' });
@@ -100,7 +131,7 @@ describe('Cloudflare compute metering', () => {
         mocks.factory.mockImplementation(() => actual.billingComputeMeter());
         const access = vi.fn(() => { throw new Error('billing tables absent'); });
         mocks.deps.mockReturnValue({ config: readBillingConfig({}), store: new Proxy({} as BillingStore, { get: access }),
-            stripe: null, now: () => NOW });
+            stripe: null, usage: null, now: () => NOW });
         expect(await call(surface)).toMatchObject({ ok: true });
         expect(mocks.factory).toHaveBeenCalledTimes(1);
         expect(mocks.deps).toHaveBeenCalled();

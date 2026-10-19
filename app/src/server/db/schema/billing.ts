@@ -267,6 +267,9 @@ export const billingComputeEpochs = pgTable(
         uniqueIndex('ezil_billing_compute_epochs_open_computer_uidx')
             .on(table.computerId)
             .where(sql`${table.endedAt} is null`),
+        uniqueIndex('ezil_billing_compute_epochs_one_open_per_user')
+            .on(table.userId)
+            .where(sql`${table.endedAt} is null`),
         index('ezil_billing_compute_epochs_open_deadline_idx')
             .on(table.deadlineAt)
             .where(sql`${table.endedAt} is null`),

@@ -4,7 +4,7 @@ import { PRO_PLAN } from './catalog';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
     StorageSample, StripeApi, StripeCharge, StripeCheckoutSession, StripeInvoice, StripeInvoicePaymentState,
-    StripeSubscription, SubscriptionUpsert, UsageEvent, OverageConsentRow, OverageInvoiceRow, PlanChangeRow, PaymentIssueRow,
+    StripeSubscription, SubscriptionUpsert, UsageEvent, OverageConsentRow, OverageInvoiceRow, PlanChangeRow, PaymentIssueRow, StoredComputeEpoch,
 } from './ports';
 import { ingestUsageEvents, processStripeEvent } from './processor';
 import { createStripeClient } from './stripe/client';
@@ -23,14 +23,36 @@ type Interval = {
 
 /** Match the database's unique keys so replay tests exercise persisted effects. */
 class MemoryStore implements BillingStore {
-    // Unused compute-epoch methods remain outside this webhook fake.
+    epochs: StoredComputeEpoch[] = [];
     grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
-    openEpoch: BillingStore['openEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    openEpoch: BillingStore['openEpoch'] = async input => {
+        const existing = this.epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
+        if (existing) return { status: 'exists', epoch: existing };
+        const concurrent = this.epochs.find(e => e.userId === input.userId && e.endedAt === null);
+        if (concurrent) return { status: 'concurrent', epoch: concurrent };
+        const epoch: StoredComputeEpoch = { id: `epoch_${this.epochs.length}`, userId: input.userId,
+            computerId: input.computerId, size: input.size, weight: 1, readyAt: input.readyAt.toISOString(),
+            endedAt: null, endReason: null, overheadSeconds: input.overheadSeconds ?? 0,
+            deadlineAt: null, lastHeartbeatAt: null };
+        this.epochs.push(epoch);
+        return { status: 'opened', epoch };
+    };
     openEpochFor: BillingStore['openEpochFor'] = async () => { throw new Error('Unused v2 store stub'); };
-    touchEpoch: BillingStore['touchEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    touchEpoch: BillingStore['touchEpoch'] = async (computerId, at) => {
+        const epoch = this.epochs.find(e => e.computerId === computerId && e.endedAt === null);
+        if (!epoch) return 'not_open';
+        epoch.lastHeartbeatAt = new Date(Math.max(Date.parse(epoch.lastHeartbeatAt ?? epoch.readyAt), at.getTime())).toISOString();
+        return 'touched';
+    };
     openEpochsForSweep: BillingStore['openEpochsForSweep'] = async () => { throw new Error('Unused v2 store stub'); };
     policyClosedEpochsSince: BillingStore['policyClosedEpochsSince'] = async () => { throw new Error('Unused v2 store stub'); };
-    closeEpoch: BillingStore['closeEpoch'] = async () => { throw new Error('Unused v2 store stub'); };
+    closeEpoch: BillingStore['closeEpoch'] = async input => {
+        const epoch = this.epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
+        if (!epoch) return 'not_open';
+        epoch.endedAt = input.endedAt.toISOString();
+        epoch.endReason = input.reason;
+        return 'closed';
+    };
     epochsFor: BillingStore['epochsFor'] = async () => { throw new Error('Unused v2 store stub'); };
     recordConsent: BillingStore['recordConsent'] = async input => {
         const key = JSON.stringify(input);
@@ -619,6 +641,46 @@ describe('ingestUsageEvents', () => {
     function usage(type: 'start' | 'heartbeat' | 'stop', offset = 0): Extract<UsageEvent, { reason?: string }> {
         return { type, computerId: 'computer_local', at: new Date(now.getTime() + offset).toISOString() };
     }
+
+    it.each([['idle', 'idle_sleep'], ['sleep', 'provider_stop'], [undefined, 'provider_stop']] as const)(
+        'drives v2 start/heartbeat/stop with reason %s while retaining v1 reason', async (reason, expected) => {
+            const { store } = fixture();
+            const open = vi.spyOn(store, 'openEpoch');
+            const touch = vi.spyOn(store, 'touchEpoch');
+            const close = vi.spyOn(store, 'closeEpoch');
+            expect(await ingestUsageEvents([usage('start'), usage('start'), usage('heartbeat', 60_000),
+                { ...usage('stop', 120_000), reason }], { store })).toEqual({ accepted: 4, rejected: 0 });
+            expect(open).toHaveBeenCalledWith({ userId: 'user_local', computerId: 'computer_local',
+                subscriptionId: null, size: 'free-cf', readyAt: now, overheadSeconds: 0 });
+            expect(touch).toHaveBeenCalledExactlyOnceWith('computer_local', new Date(now.getTime() + 60_000));
+            expect(close).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer_local',
+                endedAt: new Date(now.getTime() + 120_000), reason: expected });
+            expect(store.epochs).toHaveLength(1);
+            expect(store.epochs[0]).toMatchObject({ lastHeartbeatAt: new Date(now.getTime() + 60_000).toISOString(),
+                endedAt: new Date(now.getTime() + 120_000).toISOString(), endReason: expected });
+            expect(store.intervals[0]).toMatchObject({ reason: reason ?? 'stop', source: 'start' });
+        });
+
+    it('accepts a concurrent v2 start and preserves the existing v1 interval behavior', async () => {
+        const { store } = fixture();
+        await store.openEpoch({ userId: 'user_local', computerId: 'other_computer', subscriptionId: null,
+            size: 'free-cf', readyAt: now, overheadSeconds: 0 });
+        expect(await ingestUsageEvents([usage('start')], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(store.epochs).toHaveLength(1);
+        expect(store.epochs[0]?.computerId).toBe('other_computer');
+        expect(store.intervals[0]?.computerId).toBe('computer_local');
+    });
+
+    it('touches v2 even when v1 ignores a heartbeat after close, without reopening either', async () => {
+        const { store } = fixture();
+        await ingestUsageEvents([usage('start'), usage('stop', 60_000)], { store });
+        const touch = vi.spyOn(store, 'touchEpoch');
+        expect(await ingestUsageEvents([usage('heartbeat', 120_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(touch).toHaveBeenCalledExactlyOnceWith('computer_local', new Date(now.getTime() + 120_000));
+        expect(store.epochs).toHaveLength(1);
+        expect(store.epochs[0]?.endedAt).toBe(new Date(now.getTime() + 60_000).toISOString());
+        expect(store.intervals).toHaveLength(1);
+    });
 
     it('opens and touches starts/heartbeats, then closes with the supplied reason', async () => {
         vi.spyOn(Date, 'now').mockReturnValue(now.getTime());

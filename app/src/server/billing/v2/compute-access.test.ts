@@ -61,6 +61,8 @@ function fixture(over: Partial<Input> = {}) {
         openEpoch: async (data: Parameters<BillingStore['openEpoch']>[0]) => {
             const existing = input.epochs.find(e => e.computerId === data.computerId && e.endedAt === null);
             if (existing) return { status: 'exists' as const, epoch: stored(existing) };
+            const concurrent = input.epochs.find(e => e.userId === data.userId && e.endedAt === null);
+            if (concurrent) return { status: 'concurrent' as const, epoch: stored(concurrent) };
             const ready = epochSeconds(data.readyAt, 'ceil');
             const opened = stored({ id: 'new_epoch', userId: data.userId, computerId: data.computerId, size: data.size,
                 weight: SIZES[data.size].weight, readyAt: isoSeconds(ready), endedAt: null, endReason: null,
@@ -86,7 +88,7 @@ function fixture(over: Partial<Input> = {}) {
             };
         },
     }) as unknown as BillingStore;
-    const deps: BillingDeps = { config: input.config, store, stripe: null, now: () => NOW };
+    const deps: BillingDeps = { config: input.config, store, stripe: null, usage: null, now: () => NOW };
     return { input, deps, calls };
 }
 
@@ -371,9 +373,13 @@ describe('openComputeEpochAtReady', () => {
         expect(input.epochs).toEqual([existing]);
     });
 
-    it('another running computer makes the new epoch immediately due', async () => {
-        const { deps } = fixture({ subs: [subscription({ sku: 'compute_monthly_v2' })], grants: [grant()], epochs: [running('computer_b')] });
-        expect(await open(deps)).toMatchObject({ deadlineAt: '2026-10-18T13:00:00Z', decision: { admit: false, reason: 'concurrent_limit' } });
+    it('passes through and logs concurrency without opening another epoch', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const existing = running('computer_b');
+        const { deps, input } = fixture({ subs: [subscription({ sku: 'compute_monthly_v2' })], grants: [grant()], epochs: [existing] });
+        expect(await open(deps)).toMatchObject({ status: 'concurrent', decision: { admit: false, reason: 'concurrent_limit' } });
+        expect(input.epochs).toEqual([existing]);
+        expect(info).toHaveBeenCalledWith('[billing.epoch] concurrent', { userId: USER, computerId: COMPUTER, runningComputerId: 'computer_b' });
     });
 
     it('payment issues apply to AWS sizes, while delinquent Cloudflare can use Free', async () => {

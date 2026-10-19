@@ -300,6 +300,28 @@ describe('buildSummaryV2', () => {
         expect(result.compute.session.activeDeadline).toBe('2026-10-03T06:00:00Z');
     });
 
+    it.each([
+        ['stored deadline wins', '2026-10-18T12:01:00Z', 1000, '2026-10-18T12:01:00Z'],
+        ['headroom wins', '2026-10-18T13:00:00Z', 1000, '2026-10-18T12:03:10Z'],
+        ['no stored deadline', null, 1000, '2026-10-18T12:03:10Z'],
+        ['missing stored deadline', undefined, 1000, '2026-10-18T12:03:10Z'],
+        ['exhausted', null, 240, '2026-10-18T12:00:00Z'],
+        ['stored beyond session maximum', '2026-10-19T00:00:00Z', 1000000, '2026-10-18T17:59:00Z'],
+    ])('%s bounds the weighted running session', (_label, deadlineAt, allowance, expected) => {
+        const result = buildSummaryV2(compute({ grants: [grant(allowance)], epochs: [
+            { ...epoch(0, { readyAt: '2026-10-18T11:59:00Z', endedAt: null, size: 'cmp-8', weight: 4 }), deadlineAt },
+        ] }));
+        expect(result.compute.usedStdSeconds).toBe(240);
+        expect(result.compute.session.activeDeadline).toBe(expected);
+    });
+
+    it.each([true, false])('includes the cap in session headroom only with overage enabled=%s', enabled => {
+        const result = buildSummaryV2(compute({ grants: [grant(0)], consent: consent({ enabled, capCents: 25 }), epochs: [
+            epoch(0, { readyAt: '2026-10-18T11:59:00Z', endedAt: null, size: 'cmp-4', weight: 2 }),
+        ] }));
+        expect(result.compute.session.activeDeadline).toBe(enabled ? '2026-10-18T12:29:00Z' : '2026-10-18T12:00:00Z');
+    });
+
     it('closed epochs with stored deadlines do not supply an active deadline', () => {
         expect(buildSummaryV2(compute({ epochs: [{ ...epoch(60), deadlineAt: '2026-10-01T06:00:00Z' }] }))
             .compute.session.activeDeadline).toBeNull();

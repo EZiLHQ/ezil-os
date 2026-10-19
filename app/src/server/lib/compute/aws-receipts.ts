@@ -190,10 +190,16 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         const r = await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: p, to, fields, usage });
         // Billing tables are not installed in production: deliberately write epochs AFTER
         // the placement transaction commits, never in that transaction. Metering cannot roll it back.
-        if (r.ok && to === 'RUNNING') await recordComputeMeter(() => deps.meter?.ready({
-            userId: p.ownerUserId, computerId: p.computerId, size: sizeForInstanceType(p.instanceType), readyAt: at,
-            overheadSeconds: startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
-        }));
+        if (r.ok && to === 'RUNNING') {
+            const metered = await recordComputeMeter(() => deps.meter?.ready({
+                userId: p.ownerUserId, computerId: p.computerId, size: sizeForInstanceType(p.instanceType), readyAt: at,
+                overheadSeconds: startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
+            }));
+            // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
+            if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
+                userId: p.ownerUserId, computerId: p.computerId,
+            });
+        }
         if (r.ok && usage?.kind === 'close') await recordComputeMeter(() => deps.meter?.stopped({
             userId: p.ownerUserId, computerId: p.computerId, endedAt: stopDate ?? at, reason: endReason,
         }));

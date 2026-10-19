@@ -57,6 +57,8 @@ function fixture(epochs = [epoch()], { sku = 'standard_monthly_v2', allowance = 
         openEpoch: vi.fn<BillingStore['openEpoch']>(async input => {
             const existing = epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
             if (existing) return { status: 'exists', epoch: existing };
+            const concurrent = epochs.find(e => e.userId === input.userId && e.endedAt === null);
+            if (concurrent) return { status: 'concurrent', epoch: concurrent };
             const next = epoch({ id: `epoch-${epochs.length}`, userId: input.userId, computerId: input.computerId,
                 readyAt: isoSeconds(epochSeconds(input.readyAt, 'ceil')), size: input.size, weight: SIZES[input.size].weight });
             epochs.push(next);
@@ -69,7 +71,7 @@ function fixture(epochs = [epoch()], { sku = 'standard_monthly_v2', allowance = 
             .sort((a, b) => Date.parse(b.endedAt!) - Date.parse(a.endedAt!)).slice(0, limit)),
     };
     const deps: BillingDeps = { config: readBillingConfig(enforcement ? { BILLING_ENFORCEMENT: '1' } : { BILLING_TAB_ENABLED: '1' }),
-        store: store as unknown as BillingStore, stripe: null, now: () => { throw new Error('Use the injected sweep clock'); } };
+        store: store as unknown as BillingStore, stripe: null, usage: null, now: () => { throw new Error('Use the injected sweep clock'); } };
     const stop = vi.fn<SweepInput['stop']>().mockResolvedValue({ kind: 'aws-ec2', result: { ok: true, terminated: true } });
     const isStillRunning = vi.fn<SweepInput['isStillRunning']>().mockResolvedValue(false);
     const run = (seconds: number, limit?: number) => handleBillingSessionSweep({ deps, now: at(seconds), stop, isStillRunning, limit });

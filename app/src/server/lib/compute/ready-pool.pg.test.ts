@@ -6,7 +6,7 @@ import path from 'node:path';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { leasePoolHost, releasePoolHost, type PoolExecutor } from './ready-pool';
+import { insertPoolHost, leasePoolHost, releasePoolHost, type PoolExecutor, type PoolInstanceType } from './ready-pool';
 
 const PG = process.env.EZIL_PG_TEST_URL;
 const NOW = new Date('2026-10-19T12:00:00Z');
@@ -45,14 +45,15 @@ describe.skipIf(!PG)('ready pool on disposable Postgres', () => {
     });
 
     async function host(n: number, overrides: {
-        state?: string; health?: string; editorReadyAt?: Date | null; region?: string; instanceType?: string;
+        state?: string; health?: string; editorReadyAt?: Date | null; region?: string; instanceType?: string; generation?: number;
     } = {}) {
-        await client!.unsafe(`INSERT INTO ${schema}.ezil_compute_pool_hosts
-            (id, region, zone_id, instance_id, instance_type, state, health, editor_ready_at, created_at, updated_at)
-            VALUES ($1::uuid, $2, 'aps1-az1', $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $8::timestamptz)`,
-        [uuid(n), overrides.region ?? 'ap-south-1', `i-${n}`, overrides.instanceType ?? 'm6i.large',
-            overrides.state ?? 'ready', overrides.health ?? 'healthy',
-            overrides.editorReadyAt === null ? null : (overrides.editorReadyAt ?? NOW).toISOString(), NOW.toISOString()]);
+        await insertPoolHost(db, {
+            id: uuid(n), region: overrides.region ?? 'ap-south-1', zoneId: 'aps1-az1', instanceId: `i-${n}`,
+            instanceType: (overrides.instanceType ?? 'm6i.large') as PoolInstanceType,
+            state: overrides.state ?? 'ready', health: overrides.health ?? 'healthy',
+            editorReadyAt: overrides.editorReadyAt === null ? null : overrides.editorReadyAt ?? NOW,
+            generation: overrides.generation, now: NOW,
+        });
     }
     const lease = (n: number) => leasePoolHost(db, { region: 'ap-south-1', instanceType: 'm6i.large', computerId: uuid(100 + n), now: NOW });
     const rows = () => client!.unsafe(`SELECT * FROM ${schema}.ezil_compute_pool_hosts ORDER BY id`);
@@ -112,12 +113,36 @@ describe.skipIf(!PG)('ready pool on disposable Postgres', () => {
         expect(await lease(2)).toBeNull();
     });
 
-    it('enforces lease consistency, the closed type list and region grammar in SQL', async () => {
-        await expect(host(1, { state: 'leased' })).rejects.toMatchObject({ code: '23514' });
-        await expect(host(2, { instanceType: 't3.medium' })).rejects.toMatchObject({ code: '23514' });
-        await expect(host(3, { region: 'ap-south-1;invalid' })).rejects.toMatchObject({ code: '23514' });
-        await host(4);
-        await expect(client!.unsafe(`UPDATE ${schema}.ezil_compute_pool_hosts SET lease_token = $1::uuid`, [uuid(99)])).rejects.toMatchObject({ code: '23514' });
+    it('validates host writes before SQL and refuses corrupted lease candidates', async () => {
+        await expect(host(1, { state: 'leased' })).rejects.toThrow('pool_state_invalid');
+        await expect(host(2, { instanceType: 't3.medium' })).rejects.toThrow('pool_class_invalid');
+        await expect(host(3, { region: 'ap-south-1;invalid' })).rejects.toThrow('pool_class_invalid');
+        await expect(host(4, { health: 'invalid' })).rejects.toThrow('pool_health_invalid');
+        await expect(host(5, { generation: 0 })).rejects.toThrow('pool_generation_invalid');
+        expect(await rows()).toEqual([]);
+        await host(6);
+        await client!.unsafe(`UPDATE ${schema}.ezil_compute_pool_hosts SET lease_token = $1::uuid`, [uuid(99)]);
+        const before = await rows();
+        expect(await lease(1)).toBeNull();
+        expect(await rows()).toEqual(before);
+    });
+
+    it.each([0, -1, Number.MAX_SAFE_INTEGER])('never leases an invalid or overflowing generation %s', async generation => {
+        await host(1);
+        await client!.unsafe(`UPDATE ${schema}.ezil_compute_pool_hosts SET generation = $1`, [generation]);
+        const before = await rows();
+        expect(await lease(1)).toBeNull();
+        expect(await rows()).toEqual(before);
+    });
+
+    it('preserves non-null unique host keys and instance identities', async () => {
+        await host(1);
+        await expect(host(1)).rejects.toMatchObject({ code: '23505' });
+        await expect(client!.unsafe(`INSERT INTO ${schema}.ezil_compute_pool_hosts
+            SELECT $1::uuid, region, zone_id, instance_id, instance_type, state, health, editor_ready_at,
+                generation, leased_computer_id, leased_generation, lease_token, leased_at, created_at, updated_at
+            FROM ${schema}.ezil_compute_pool_hosts`, [uuid(2)])).rejects.toMatchObject({ code: '23505' });
+        await expect(client!.unsafe(`UPDATE ${schema}.ezil_compute_pool_hosts SET id = NULL`)).rejects.toMatchObject({ code: '23502' });
     });
 
     it('the writer lease is global per computer, even across different regions', async () => {

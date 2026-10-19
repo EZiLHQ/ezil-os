@@ -357,7 +357,7 @@ const sessionColumnNames = new Set(['deadline_at', 'last_heartbeat_at']);
 const sessionCheckNames = new Set(['ezil_billing_compute_epochs_deadline_at_chk', 'ezil_billing_compute_epochs_last_heartbeat_at_chk']);
 
 describe('billing schema and migration 0005', () => {
-    it('registers 0005 and preserves every 0004 table except two columns, two checks and one index', () => {
+    it('registers 0005 and preserves every 0004 table except two columns, two checks and two indexes', () => {
         expect(journal.entries.filter((entry: { idx: number }) => entry.idx === 5)).toEqual([
             expect.objectContaining({ idx: 5, tag: '0005_billing_sessions', version: '7', when: expect.any(Number), breakpoints: true }),
         ]);
@@ -386,6 +386,17 @@ describe('billing schema and migration 0005', () => {
             isUnique: false, where: '"ezil_billing_compute_epochs"."ended_at" is null', concurrently: false, method: 'btree', with: {},
         };
         expected.push(`CREATE INDEX "${name}" ON "${table.name}" USING btree ("deadline_at") WHERE "${table.name}"."ended_at" is null`);
+        const concurrentName = 'ezil_billing_compute_epochs_one_open_per_user';
+        epochs.indexes[concurrentName] = { name: concurrentName,
+            columns: [{ expression: 'user_id', isExpression: false, asc: true, nulls: 'last' }],
+            isUnique: true, where: '"ezil_billing_compute_epochs"."ended_at" is null', concurrently: false, method: 'btree', with: {},
+        };
+        expected.push(`CREATE UNIQUE INDEX "${concurrentName}" ON "${table.name}" USING btree ("user_id") WHERE "${table.name}"."ended_at" is null`);
+        const concurrentIndex = table.indexes.find(index => index.config.name === concurrentName)!;
+        expect(concurrentIndex.config.unique).toBe(true);
+        expect(dialect.sqlToQuery(concurrentIndex.config.where!).sql).toBe(epochs.indexes[concurrentName].where);
+        expect(concurrentIndex.config.columns.map(column => 'name' in column ? column.name : null)).toEqual(['user_id']);
+        expect(Object.keys(epochs.indexes).sort()).toEqual(table.indexes.map(index => index.config.name).sort());
         expect(statements(migration).sort()).toEqual(expected.sort());
         expect(Object.keys(current.tables).sort()).toEqual(Object.keys(previous.tables).sort());
         for (const [name, oldTable] of Object.entries(previous.tables)) {

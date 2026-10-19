@@ -33,7 +33,7 @@
     },
     {
       "path": "app/drizzle/0005_billing_sessions.sql",
-      "sha256": "aa044689cb1e9dd46c53e9f3c8751ef203bdfed00379c5d407162336cc15d489",
+      "sha256": "cf155c3d4f71f6414b6ce6097c929b8120da6c408b69c8f54e574c1cebec8413",
       "kind": "snapshot"
     }
   ],

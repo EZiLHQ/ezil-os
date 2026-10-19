@@ -1,7 +1,7 @@
 /** Also protect provider answers from a throwing injected meter or dependency factory. */
-export async function recordComputeMeter(observe: () => Promise<void> | undefined): Promise<void> {
+export async function recordComputeMeter<T>(observe: () => Promise<T> | undefined): Promise<T | undefined> {
     try {
-        await observe();
+        return await observe();
     } catch (error) {
         console.warn('[billing.meter] observation failed', { error });
     }

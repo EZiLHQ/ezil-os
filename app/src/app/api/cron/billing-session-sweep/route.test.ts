@@ -23,7 +23,7 @@ const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
 const counts = { examined: 2, stopped: 1, closed: 2, stopFailed: 0, heartbeatClosed: 1, retried: 0, shadow: 0 };
 const deps: BillingDeps = { config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
-    store: {} as BillingStore, stripe: null, now: () => now };
+    store: {} as BillingStore, stripe: null, usage: null, now: () => now };
 const request = (authorization?: string) => new Request('https://app.test/api/cron/billing-session-sweep', {
     headers: authorization === undefined ? {} : { authorization },
 });

@@ -5,7 +5,7 @@ import type { EpochEndReason, SizeCode } from './contract';
 import { epochSeconds } from './time';
 
 export interface ComputeMeter {
-    ready(input: { userId: string; computerId: string; size: SizeCode; readyAt: Date; overheadSeconds: number }): Promise<void>;
+    ready(input: { userId: string; computerId: string; size: SizeCode; readyAt: Date; overheadSeconds: number }): Promise<void | 'concurrent'>;
     stopped(input: { userId: string; computerId: string; endedAt: Date; reason: EpochEndReason; overheadSeconds?: number }): Promise<void>;
     heartbeat(input: { userId: string; computerId: string; at: Date }): Promise<void>;
 }
@@ -23,6 +23,7 @@ export function billingComputeMeter(getDeps: () => BillingDeps = getBillingDeps)
                 const deps = getDeps();
                 if (!billingMeteringActive(deps.config)) return;
                 const result = await openComputeEpochAtReady({ deps, ...input });
+                if (typeof result === 'object' && result.status === 'concurrent') return 'concurrent';
                 if (result === 'error') console.warn('[billing.meter] ready failed', { computerId: input.computerId });
             } catch (error) {
                 console.warn('[billing.meter] ready failed', { computerId: input.computerId, error });

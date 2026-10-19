@@ -5,7 +5,7 @@ import type { GrantMeter, GrantRow, OverageConsentRow, PaymentIssueRow, PlanChan
 import { offerBySku, planFromSubscriptions } from './catalog';
 import {
     CATALOG_V2, CATALOG_V2_VERSION, GRANT_METER_COMPUTE, IDLE_SLEEP_SECONDS,
-    OVERAGE_DEFAULT_CAP_CENTS, OVERAGE_TERMS_VERSION, SESSION_MAX_SECONDS, SESSION_WARN_SECONDS, SIZES,
+    OVERAGE_DEFAULT_CAP_CENTS, OVERAGE_TERMS_VERSION, SESSION_MAX_SECONDS, SESSION_WARN_SECONDS, SIZES, STD_SECONDS_PER_OVERAGE_CENT,
     type BillingSummaryV2, type ComputeEpoch, type OfferDTO, type PlanFamily, type SellableSku, type SizeCode,
 } from './contract';
 import { ratePeriod, rateWindow } from './rating';
@@ -87,7 +87,13 @@ export function buildSummaryV2(input: {
         const readyAt = Date.parse(epoch.readyAt);
         if (latestReadyAt === null || readyAt > latestReadyAt) {
             latestReadyAt = readyAt;
-            activeDeadline = epoch.deadlineAt ?? isoSeconds(ready + SESSION_MAX_SECONDS);
+            const headroomNow = Math.max(0, allowanceStdSeconds
+                + (offer.overage && overageOn ? capCents * STD_SECONDS_PER_OVERAGE_CENT : 0) - rating.usedStdSeconds);
+            const sessionMax = ready + SESSION_MAX_SECONDS;
+            activeDeadline = isoSeconds(Math.min(
+                epoch.deadlineAt == null ? sessionMax : epochSeconds(epoch.deadlineAt),
+                sessionMax, epochSeconds(now) + Math.floor(headroomNow / epoch.weight),
+            ));
         }
     }
 

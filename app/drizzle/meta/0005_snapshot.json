@@ -141,6 +141,22 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "ezil_billing_compute_epochs_one_open_per_user": {
+          "name": "ezil_billing_compute_epochs_one_open_per_user",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_billing_compute_epochs\".\"ended_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {

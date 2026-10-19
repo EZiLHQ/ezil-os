@@ -26,7 +26,7 @@ function fixture(flags: Record<string, string | undefined> = { BILLING_TAB_ENABL
             sourceType: 'invoice', sourceId: 'in_a', createdAt: READY }]),
         latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []), sizePreference: vi.fn(async () => 'std-2'),
         openEpoch: vi.fn(async (input: OpenEpochInput) => {
-            if (epoch) return { status: 'exists', epoch };
+            if (epoch) return { status: epoch.computerId === input.computerId ? 'exists' : 'concurrent', epoch };
             epoch = { id: 'epoch_a', ...ref, size: input.size, weight: 2, readyAt: input.readyAt.toISOString(),
                 endedAt: null, endReason: null, overheadSeconds: input.overheadSeconds ?? 0, lastHeartbeatAt: null,
                 deadlineAt: new Date(input.deadlineAt!).toISOString() };
@@ -34,7 +34,7 @@ function fixture(flags: Record<string, string | undefined> = { BILLING_TAB_ENABL
         }),
         closeEpoch: vi.fn(async () => 'closed'), touchEpoch: vi.fn(async () => 'touched'),
     };
-    const deps: BillingDeps = { config: readBillingConfig(flags), store: store as unknown as BillingStore, stripe: null, now: () => READY };
+    const deps: BillingDeps = { config: readBillingConfig(flags), store: store as unknown as BillingStore, stripe: null, usage: null, now: () => READY };
     return { store, deps, meter: billingComputeMeter(() => deps), epoch: () => epoch };
 }
 
@@ -44,7 +44,7 @@ describe('billingComputeMeter', () => {
     it('both flags off makes zero store accesses for ready, stopped and heartbeat', async () => {
         const access = vi.fn(() => { throw new Error('billing tables absent'); });
         const deps = { config: readBillingConfig({ CHECKOUT_ENABLED: '1', PRICING_PAGE_ENABLED: '1' }),
-            store: new Proxy({} as BillingStore, { get: access }), stripe: null, now: () => READY };
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => READY };
         const meter = billingComputeMeter(() => deps);
         await meter.ready(ready);
         await meter.stopped(stopped);
@@ -60,6 +60,17 @@ describe('billingComputeMeter', () => {
         expect(f.epoch()).toMatchObject({ size: 'cmp-4', overheadSeconds: 17, deadlineAt: '2026-10-19T12:16:40.000Z' });
         await f.meter.ready({ ...ready, readyAt: new Date('2026-10-19T12:05:00Z'), overheadSeconds: 999 });
         expect(f.epoch()).toMatchObject({ readyAt: READY.toISOString(), overheadSeconds: 17, deadlineAt: '2026-10-19T12:16:40.000Z' });
+    });
+
+    it('passes a concurrent readiness result to the lifecycle caller', async () => {
+        const f = fixture();
+        vi.spyOn(console, 'info').mockImplementation(() => {});
+        await f.meter.ready(ready);
+        expect(await f.meter.ready({ ...ready, computerId: 'computer_b' })).toBe('concurrent');
+        expect(f.epoch()?.computerId).toBe(ref.computerId);
+        expect(console.info).toHaveBeenCalledWith('[billing.epoch] concurrent', expect.objectContaining({
+            computerId: 'computer_b', runningComputerId: ref.computerId,
+        }));
     });
 
     it('floors stop time and passes optional overhead; heartbeat keeps its observation time', async () => {

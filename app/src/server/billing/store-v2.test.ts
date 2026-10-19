@@ -277,11 +277,31 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         ]);
     });
 
+    it('returns the other computer epoch when two starts contend for one user', async () => {
+        const results = await Promise.all([computerId, secondComputerId].map(id => store.openEpoch({ ...epoch(), computerId: id })));
+        expect(results.map(result => result.status).sort()).toEqual(['concurrent', 'opened']);
+        const winner = results.find(result => result.status === 'opened')!;
+        const loser = results.find(result => result.status === 'concurrent')!;
+        expect(loser.epoch).toEqual(winner.epoch);
+        expect((await store.epochsFor(userId, instant(-1))).filter(epoch => epoch.endedAt === null)).toEqual([winner.epoch]);
+        const losingComputer = winner.epoch.computerId === computerId ? secondComputerId : computerId;
+        expect(await store.openEpochFor(losingComputer)).toBeNull();
+        await rejectsSql(() => db.insert(billingComputeEpochs).values({ userId, computerId: losingComputer,
+            size: 'std-2', weight: 1, readyAt: instant(0) }), '23505');
+        expect((await store.openEpoch({ ...epoch(), userId: otherUserId, computerId: otherComputerId })).status).toBe('opened');
+        await store.closeEpoch({ computerId: winner.epoch.computerId, endedAt: instant(10), reason: 'user_stop' });
+        expect((await store.openEpoch({ ...epoch(instant(11)), computerId: losingComputer })).status).toBe('opened');
+    });
+
     it('sweeps all open epochs by effective deadline, including legacy rows, across users with a limit', async () => {
         const closed = await store.openEpoch({ ...epoch(), deadlineAt: instant(1) });
         await store.closeEpoch({ computerId, endedAt: instant(1), reason: 'user_stop' });
         const latest = await store.openEpoch({ ...epoch(), deadlineAt: instant(100) });
-        const legacy = await store.openEpoch({ ...epoch(instant(-21550)), computerId: secondComputerId });
+        const legacyUser = randomUUID();
+        const legacyComputer = randomUUID();
+        await client`insert into auth.users (id) values (${legacyUser}::uuid)`;
+        await db.insert(computers).values({ id: legacyComputer, userId: legacyUser, slot: 1 });
+        const legacy = await store.openEpoch({ ...epoch(instant(-21550)), userId: legacyUser, computerId: legacyComputer });
         const earliest = await store.openEpoch({ ...epoch(), userId: otherUserId, computerId: otherComputerId, deadlineAt: instant(10) });
         expect(await store.openEpochsForSweep({ limit: 200 })).toEqual([earliest.epoch, legacy.epoch, latest.epoch]);
         expect(await store.openEpochsForSweep({ limit: 2 })).toEqual([earliest.epoch, legacy.epoch]);
@@ -373,6 +393,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         const crossing = await store.openEpoch(epoch(instant(10)));
         await store.closeEpoch({ computerId, endedAt: instant(20), reason: 'user_stop' });
         const future = await store.openEpoch(epoch(instant(30)));
+        await store.closeEpoch({ computerId, endedAt: instant(40), reason: 'user_stop' });
         const oldOpen = await store.openEpoch({ ...epoch(instant(-100)), computerId: secondComputerId });
         expect((await store.epochsFor(userId, instant(10))).map(row => row.id).sort())
             .toEqual([crossing.epoch.id, future.epoch.id, oldOpen.epoch.id].sort());
