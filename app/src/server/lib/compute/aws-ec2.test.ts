@@ -16,6 +16,7 @@ import { nonceHashOf } from './aws-enroll';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { ENROLLMENT_FAILED, PLACEMENT_STATES, PlacementOwnerError, readPlacement, RELEASED_NO_RESOURCES, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
 import { AwsClientError } from './aws-errors';
+import type { EntitlementRecord } from './tier';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -81,6 +82,7 @@ function setup(
         newId: () => crypto.randomUUID(),
         starter: 'starter' in over ? over.starter : rec.starter,
         tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
+        entitlement: over.entitlement,
         randomBytes: over.randomBytes ?? (() => Buffer.from(NONCE_BYTES)),
         sleep: over.sleep ?? (async () => {}),
         ...(over.executions ? { executions: over.executions } : {}),
@@ -128,6 +130,26 @@ describe('configuration refusals happen before any statement', () => {
 });
 
 describe('ensure: a new computer', () => {
+    it('a cmp-8 billing record provisions m6i.2xlarge with a 50 GiB data volume', async () => {
+        const entitlement: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false };
+        const { provider, placements, calls } = setup({}, { entitlement, tierFor: undefined, e: env({
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+            [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']) }),
+        }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(placements[0]).toMatchObject({ instance_type: 'm6i.2xlarge', region: 'ap-south-1' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'provision', instanceType: 'm6i.2xlarge', dataVolumeGiB: 50 });
+    });
+
+    it.each(['start', 'replace'] as const)('waking by %s retains the recorded type despite a cmp-8 entitlement', async operation => {
+        const { provider, calls } = setup({ placements: [stopped()] }, {
+            entitlement: { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws' },
+            tierFor: async () => { throw new Error('Wake must not re-size'); }, e: operation === 'start' ? startMode() : env(),
+        });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(calls[0]!.intent).toMatchObject({ operation, instanceType: 't3a.medium' });
+    });
+
     it('Mumbai full → provisioned in the US region with the free tier (2 vCPU / 4 GiB) and its own deployment', async () => {
         const { provider, placements, calls } = setup({}, { e: env({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0' }) });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });

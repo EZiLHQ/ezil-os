@@ -17,7 +17,9 @@ import path from 'node:path';
 import { initTRPC, TRPCError } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const captured = vi.hoisted(() => ({ softDelete: vi.fn() }));
+const captured = vi.hoisted(() => ({ softDelete: vi.fn(), billingDeps: vi.fn() }));
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: captured.billingDeps }));
 
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string } | null; db: unknown }>().create();
@@ -51,6 +53,9 @@ import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-p
 
 import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
 import { appCallerRoleEnv } from '@/server/lib/compute/aws-clients';
+import { readBillingConfig } from '@/server/billing/config';
+import type { BillingDeps, BillingStore } from '@/server/billing/ports';
+import type { EntitlementRecord } from '@/server/lib/compute/tier';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -94,6 +99,7 @@ function routerDb(placements: Record<string, unknown>[], computerOwner = U1) {
 
 let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
+    captured.billingDeps.mockReset().mockReturnValue({ config: readBillingConfig({}), store: {}, stripe: null, usage: null, now: () => new Date() });
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_WORKER_URL', 'https://worker.example');
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'router-secret');
     fetchMock = vi.fn(async () => Response.json({ ok: true }));
@@ -105,6 +111,7 @@ beforeEach(() => {
     });
 });
 afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -117,6 +124,7 @@ describe('routeComputer', () => {
         expect(routed.provider).toBe(cloudflareComputeProvider);
         expect(untouchableDb.execute).not.toHaveBeenCalled();
         expect(untouchableDb.transaction).not.toHaveBeenCalled();
+        expect(captured.billingDeps).not.toHaveBeenCalled();
     });
 
     it('reads ON, no placement row → the same Cloudflare adapter', async () => {
@@ -156,13 +164,11 @@ describe('routeComputer', () => {
 
     it('the tier the AWS provider gets: free without an entitlement, plus only for an active listed plan', async () => {
         const env = { ...AWS_ENV, EZIL_AWS_PLUS_PLAN_IDS: 'os-plus' };
-        const seen: string[] = [];
-        const paid = { read: async (u: string) => { seen.push(u); return { status: 'active', planId: 'os-plus' }; } };
-        const cancelled = { read: async () => ({ status: 'cancelled', planId: 'os-plus' }) };
-        await expect(awsDepsFor(env, paid).tierFor(U1)).resolves.toBe('plus');
-        expect(seen).toEqual([U1]);
-        await expect(awsDepsFor(env, cancelled).tierFor(U1)).resolves.toBe('free');
-        await expect(awsDepsFor(env, undefined).tierFor(U1)).resolves.toBe('free');
+        const paid = { status: 'active', planId: 'os-plus' };
+        const cancelled = { status: 'cancelled', planId: 'os-plus' };
+        await expect(awsDepsFor(env, paid).tierFor()).resolves.toBe('plus');
+        await expect(awsDepsFor(env, cancelled).tierFor()).resolves.toBe('free');
+        await expect(awsDepsFor(env, undefined).tierFor()).resolves.toBe('free');
         // The collaborators pass through untouched.
         const starter: LifecycleStarter = { start: async () => {} };
         expect(awsDepsFor(env, undefined, { starter }).starter).toBe(starter);
@@ -176,6 +182,113 @@ describe('routeComputer', () => {
         expect(routed.kind).toBe('aws-ec2');
         await expect(routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).resolves.toEqual({ ok: true });
         expect(calls).toEqual([]);
+    });
+});
+
+describe('billing v2 dispatch wiring', () => {
+    const paid: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false };
+    const provisionEnv = {
+        ...AWS_ENV, EZIL_AWS_ENROLL_URL: 'https://app.example.test/api/compute/aws/enroll',
+        EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+        [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({
+            'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']),
+            'us-east-1': fixtureDeployment('us-east-1', [...TYPES, 'm6i.2xlarge']),
+        }),
+    };
+
+    it('placement reads off never calls even an explicitly supplied reader', async () => {
+        const read = vi.fn(async () => paid);
+        expect((await routeComputer(untouchableDb, computer, { env: {}, entitlements: { read } })).kind).toBe('cloudflare');
+        expect(read).not.toHaveBeenCalled();
+    });
+
+    it('the default reader provisions the paid size from billing exactly once', async () => {
+        const now = new Date('2026-10-18T12:00:00Z');
+        const store = {
+            subscriptionsFor: vi.fn(async () => [{ stripeSubscriptionId: 'sub_a', sku: 'compute_monthly_v2', status: 'active',
+                currentPeriodStart: new Date('2026-10-01T00:00:00Z'), currentPeriodEnd: new Date('2026-11-01T00:00:00Z'), cancelAtPeriodEnd: false }]),
+            userCreatedAt: vi.fn(async () => null), openPlanChanges: vi.fn(async () => []), epochsFor: vi.fn(async () => []),
+            grantsForPeriod: vi.fn(async () => []), latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
+            sizePreference: vi.fn(async () => 'cmp-8' as const),
+        };
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }), store: store as unknown as BillingStore,
+            stripe: null, usage: null, now: () => now } satisfies BillingDeps);
+        const { db, fake } = routerDb([]);
+        const start = vi.fn(async () => {});
+        const routed = await routeComputer(db, computer, { env: provisionEnv, aws: { starter: { start }, now: () => now }, pinCloudflare: true });
+        expect(routed.kind).toBe('aws-ec2');
+        expect(fake.placements).toEqual([]);
+        expect(await routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).toMatchObject({ errorCode: 'computer_starting' });
+        expect(fake.placements).toMatchObject([{ provider: 'aws-ec2', instance_type: 'm6i.2xlarge' }]);
+        expect(captured.billingDeps).toHaveBeenCalledTimes(1);
+        expect(store.subscriptionsFor).toHaveBeenCalledExactlyOnceWith(U1);
+        expect(store.sizePreference).toHaveBeenCalledExactlyOnceWith(U1);
+        expect(start).toHaveBeenCalledTimes(1);
+    });
+
+    it('billing flags off with placement reads on makes ZERO store accesses', async () => {
+        const access = vi.fn(() => { throw new Error('billing store touched while off'); });
+        const store = new Proxy({} as BillingStore, { get: access });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}), store, stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
+        const { db } = routerDb([]);
+        expect((await routeComputer(db, computer, { env: AWS_ENV, aws: {} })).kind).toBe('cloudflare');
+        expect(access).not.toHaveBeenCalled();
+    });
+
+    it.each(['status', 'terminate'] as const)('%s on a row-backed computer makes zero billing-store calls with metering on', async method => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const access = vi.fn(() => { throw new Error('Unexpected billing store call'); });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
+        await caller[method]({ computerId: C1 });
+        expect(access).not.toHaveBeenCalled();
+        expect(captured.billingDeps).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('reportActivity on a row-backed Cloudflare computer only touches its heartbeat when metering is %s', async metering => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const at = new Date('2026-10-18T12:00:00Z');
+        const touchEpoch = vi.fn<BillingStore['touchEpoch']>().mockResolvedValue('touched');
+        // Any routing/state read (including loadComputeBillingState) fails this assertion,
+        // even if the meter catches the error. With metering off, even touch is forbidden.
+        const access = vi.fn((_target: BillingStore, key: string | symbol) => {
+            if (metering && key === 'touchEpoch') return touchEpoch;
+            throw new Error(`Unexpected billing store access: ${String(key)}`);
+        });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig(metering ? { BILLING_TAB_ENABLED: '1' } : {}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => at } satisfies BillingDeps);
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
+        await caller.reportActivity({ computerId: C1, lastInputAgoMs: 5 });
+        expect(access.mock.calls.map(([, key]) => key)).toEqual(metering ? ['touchEpoch'] : []);
+        if (metering) expect(touchEpoch).toHaveBeenCalledExactlyOnceWith(C1, expect.any(Date));
+        else expect(touchEpoch).not.toHaveBeenCalled();
+    });
+
+    it('a paid computer at capacity stays unplaced and returns the existing refusal', async () => {
+        const { db, fake } = routerDb([]);
+        const read = vi.fn(async () => paid);
+        const start = vi.fn(async () => {});
+        const routed = await routeComputer(db, computer, { env: { ...provisionEnv,
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '0',
+        }, entitlements: { read }, aws: { starter: { start } }, pinCloudflare: true });
+        expect(routed.kind).toBe('aws-ec2');
+        expect(await routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).toMatchObject({ error: 'region_capacity', errorCode: 'capacity_unavailable' });
+        expect(fake.placements).toEqual([]);
+        expect(read).toHaveBeenCalledExactlyOnceWith(U1);
+        expect(start).not.toHaveBeenCalled();
+    });
+
+    it('billing failures log and keep the existing no-entitlement route', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const { db } = routerDb([]);
+        const routed = await routeComputer(db, computer, { env: AWS_ENV, aws: {}, entitlements: {
+            read: async () => { throw new Error('billing unavailable'); },
+        } });
+        expect(routed.kind).toBe('cloudflare');
+        expect(warn).toHaveBeenCalledTimes(1);
     });
 });
 
@@ -199,6 +312,8 @@ describe('defaultAwsCollaborators: the real AWS clients, gated', () => {
         expect(typeof all.executions?.describe).toBe('function');
         // Codex #6: the EC2 describe that catches a guest-initiated idle stop reaches the provider.
         expect(typeof all.describer?.describeForEnrollment).toBe('function');
+        expect(typeof all.meter?.ready).toBe('function');
+        expect(awsDepsFor(AWS_ENV, undefined, all).meter).toBe(all.meter);
     });
 });
 
@@ -243,6 +358,48 @@ describe('routers: AWS previews use their own Worker route', () => {
 
     beforeEach(() => {
         for (const [k, v] of Object.entries(AWS_ENV)) vi.stubEnv(k, v);
+    });
+
+    it.each(['previewUrl', 'appPreviewUrl', 'codePreviewUrl', 'restartDesktop'] as const)('%s returns a terminal billing refusal before any provider call', async surface => {
+        const now = new Date('2026-10-18T12:00:00Z');
+        const store = {
+            openEpochFor: vi.fn(async () => null),
+            subscriptionsFor: vi.fn(async () => [{ stripeSubscriptionId: 'sub_a', sku: 'standard_monthly_v2', status: 'active',
+                currentPeriodStart: new Date('2026-10-01T00:00:00Z'), currentPeriodEnd: new Date('2026-11-01T00:00:00Z'), cancelAtPeriodEnd: false }]),
+            userCreatedAt: vi.fn(async () => null), openPlanChanges: vi.fn(async () => []), epochsFor: vi.fn(async () => []),
+            grantsForPeriod: vi.fn(async () => []), latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
+            sizePreference: vi.fn(async () => null),
+        };
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
+            store: store as unknown as BillingStore, stripe: null, usage: null, now: () => now } satisfies BillingDeps);
+        const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure');
+        const restart = vi.spyOn(cloudflareComputeProvider, 'restart');
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const result = surface === 'previewUrl'
+            ? await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })
+            : await caller(db)[surface]({ computerId: C1 });
+        expect(result).toMatchObject({ ok: false, error: 'billing_allowance_exhausted', errorCode: 'billing_allowance_exhausted',
+            billingRefusal: 'allowance_exhausted', provider: 'cloudflare-guacamole' });
+        expect(ensure).not.toHaveBeenCalled();
+        expect(restart).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('flags-off previewUrl preserves the provider result with zero billing-store calls (placement %s)', async hasPlacement => {
+        const access = vi.fn(() => { throw new Error('billing store accessed while flags off'); });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
+        const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure').mockResolvedValue({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', retryable: true,
+        });
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const { db } = routerDb(hasPlacement
+            ? [placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })] : []);
+        expect(await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })).toEqual({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole',
+        });
+        expect(ensure).toHaveBeenCalledTimes(1);
+        expect(access).not.toHaveBeenCalled();
     });
 
     it('previewUrl / appPreviewUrl / codePreviewUrl answer a VALUE from the AWS provider, no Worker call', async () => {

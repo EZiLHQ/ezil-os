@@ -7,8 +7,9 @@ import { z } from 'zod';
  *   credits (`BURSTABLE_CREDITS`), so a free computer is throttled to its
  *   baseline instead of billing surplus credits.
  * - m6i.large (2 vCPU / 8 GiB): the upgraded tier.
- * - c6i.xlarge (4 vCPU / 8 GiB): benchmarks only. */
-export const INSTANCE_TYPES = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'] as const;
+ * - c6i.xlarge (4 vCPU / 8 GiB): benchmarks only.
+ * - m6i.xlarge / m6i.2xlarge (4 / 8 vCPU): paid Compute sizes cmp-4 / cmp-8, billing v2. */
+export const INSTANCE_TYPES = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'] as const;
 export const InstanceTypeSchema = z.enum(INSTANCE_TYPES);
 export type InstanceType = z.infer<typeof InstanceTypeSchema>;
 /** Burstable (T-family) types. T3/T3a launch with UNLIMITED credits by
@@ -17,19 +18,23 @@ export const isBurstable = (type: string): boolean => /^t\d[a-z]*\./.test(type);
 export const BURSTABLE_CREDITS = { CpuCredits: 'standard' } as const;
 /** Tier -> instance types in preference order (the first type with capacity
  * wins). Every type must be in INSTANCE_TYPES. */
-export const COMPUTER_TIERS = ['free', 'plus'] as const;
+export const COMPUTER_TIERS = ['free', 'plus', 'compute4', 'compute8'] as const;
 export const TierSchema = z.enum(COMPUTER_TIERS);
 export type ComputerTier = z.infer<typeof TierSchema>;
 export const TierMapSchema = z.object({
     free: z.array(InstanceTypeSchema).min(1),
     plus: z.array(InstanceTypeSchema).min(1),
+    compute4: z.array(InstanceTypeSchema).min(1),
+    compute8: z.array(InstanceTypeSchema).min(1),
 }).strict().superRefine((m, ctx) => {
     for (const tier of COMPUTER_TIERS) if (new Set(m[tier]).size !== m[tier].length)
         ctx.addIssue({ code: 'custom', path: [tier], message: 'duplicate_instance_type' });
 });
 export type TierMap = z.infer<typeof TierMapSchema>;
-/** free = 2 vCPU / 4 GiB (burstable, standard credits); plus = 2 vCPU / 8 GiB. */
-export const TIER_INSTANCE_TYPES: TierMap = TierMapSchema.parse({ free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'] });
+/** free = 2 vCPU / 4 GiB (burstable); plus = 2 / 8; compute4 = 4 / 16; compute8 = 8 / 32. */
+export const TIER_INSTANCE_TYPES: TierMap = TierMapSchema.parse({
+    free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'], compute4: ['m6i.xlarge'], compute8: ['m6i.2xlarge'],
+});
 
 /** R1: one commercial region per deployment, configured. */
 export const REGION_PATTERN = /^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$/;

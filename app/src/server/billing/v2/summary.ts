@@ -6,6 +6,7 @@ import { offerBySku, planFromSubscriptions } from './catalog';
 import {
     CATALOG_V2, CATALOG_V2_VERSION, GRANT_METER_COMPUTE, IDLE_SLEEP_SECONDS,
     OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_DEFAULT_CAP_CENTS, OVERAGE_TERMS_VERSION, SESSION_MAX_SECONDS, SESSION_WARN_SECONDS, SIZES,
+    STD_SECONDS_PER_OVERAGE_CENT,
     type BillingSummaryV2, type ComputeEpoch, type OfferDTO, type PlanFamily, type SellableSku, type SizeCode,
 } from './contract';
 import { ratePeriod, rateWindow } from './rating';
@@ -31,7 +32,7 @@ export function hasOveragePaymentFailure(subscriptionId: string | null, issues: 
 
 export function buildSummaryV2(input: {
     config: BillingConfig; now: Date; userCreatedAt: Date | null;
-    subs: SubscriptionRow[]; epochs: readonly ComputeEpoch[]; grants: readonly GrantRow[];
+    subs: SubscriptionRow[]; epochs: readonly (ComputeEpoch & { deadlineAt?: string | null })[]; grants: readonly GrantRow[];
     consent: OverageConsentRow | null; planChanges: readonly PlanChangeRow[]; paymentIssues: readonly PaymentIssueRow[];
     overageInvoices?: readonly OverageInvoiceRow[];
     storage: { computerId: string; bytes: bigint; measuredAt: Date }[]; sizePreference: SizeCode | null; hasCustomer: boolean;
@@ -90,11 +91,22 @@ export function buildSummaryV2(input: {
     const allowedSizes = [...offer.sizes];
     const remainingActualSecondsBySize: Partial<Record<SizeCode, number>> = {};
     for (const size of allowedSizes) remainingActualSecondsBySize[size] = Math.floor(remainingStdSeconds / SIZES[size].weight);
-    let latestReady: number | null = null;
+    let latestReadyAt: number | null = null;
+    let activeDeadline: string | null = null;
     for (const epoch of epochs) {
         if (epoch.endedAt !== null) continue;
         const ready = epochSeconds(epoch.readyAt, 'ceil');
-        if (latestReady === null || ready > latestReady) latestReady = ready;
+        const readyAt = Date.parse(epoch.readyAt);
+        if (latestReadyAt === null || readyAt > latestReadyAt) {
+            latestReadyAt = readyAt;
+            const headroomNow = Math.max(0, allowanceStdSeconds
+                + (offer.overage && overageOn ? capCents * STD_SECONDS_PER_OVERAGE_CENT : 0) - rating.usedStdSeconds);
+            const sessionMax = ready + SESSION_MAX_SECONDS;
+            activeDeadline = isoSeconds(Math.min(
+                epoch.deadlineAt == null ? sessionMax : epochSeconds(epoch.deadlineAt),
+                sessionMax, epochSeconds(now) + Math.floor(headroomNow / epoch.weight),
+            ));
+        }
     }
 
     // Storage is a level: retain only the newest sample for each computer.
@@ -143,7 +155,7 @@ export function buildSummaryV2(input: {
                 ? input.sizePreference : offer.defaultSize,
             session: {
                 maxSeconds: SESSION_MAX_SECONDS, warnSeconds: [...SESSION_WARN_SECONDS], idleSleepSeconds: IDLE_SLEEP_SECONDS,
-                activeDeadline: latestReady === null ? null : isoSeconds(latestReady + SESSION_MAX_SECONDS),
+                activeDeadline,
             },
         },
         overage: offer.overage ? {

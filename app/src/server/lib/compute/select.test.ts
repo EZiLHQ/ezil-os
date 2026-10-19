@@ -11,6 +11,7 @@ import { cloudflareComputeProvider } from './cloudflare';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { PlacementIntegrityError, PlacementOwnerError } from './placement';
 import { providerForPlacement, resolveComputeProvider, selectComputeProvider } from './select';
+import type { EntitlementRecord } from './tier';
 
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
@@ -21,6 +22,44 @@ const ADMIT = {
     EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
     AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
 };
+
+describe('billing v2 placement selection', () => {
+    const paid: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', provider: 'aws', size: 'cmp-8', paymentIssue: false };
+    const free: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'free_v1_legacy', provider: 'cloudflare', size: 'free-cf', paymentIssue: false };
+
+    it('no row plus a paid AWS entitlement selects AWS without canary checks or a Cloudflare pin', async () => {
+        const { db, placements, statements } = createFakePlacementDb();
+        expect((await resolveComputeProvider(db, computer, ON, {}, { entitlement: paid, pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(placements).toEqual([]);
+        expect(statements).toHaveLength(1); // only the placement read; admission happens at ensure
+    });
+
+    it('AWS disabled preserves the Cloudflare pin behavior even for a paid user', async () => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId }] });
+        expect(await resolveComputeProvider(db, computer, { EZIL_COMPUTE_PLACEMENT_READS: '1' }, {}, { entitlement: paid, pinCloudflare: true })).toBe(cloudflareComputeProvider);
+        expect(placements).toMatchObject([{ provider: 'cloudflare', workspace_store: 'r2' }]);
+    });
+
+    it.each([
+        ['cloudflare', 'r2', paid], ['aws-ec2', 'ebs', free],
+    ] as const)('an existing %s row keeps its provider despite entitlement', async (provider, workspace_store, entitlement) => {
+        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, provider, workspace_store })] });
+        expect((await resolveComputeProvider(db, computer, ON, {}, { entitlement, pinCloudflare: true })).kind).toBe(provider);
+        expect(placements).toHaveLength(1);
+        expect(placements[0]!.provider).toBe(provider);
+    });
+
+    it('a payment issue does not grant the paid route', async () => {
+        const { db } = createFakePlacementDb();
+        expect(await resolveComputeProvider(db, computer, ON, {}, { entitlement: { ...paid, paymentIssue: true } })).toBe(cloudflareComputeProvider);
+    });
+
+    it.each([free, { ...free, status: 'past_due', paymentIssue: true }])('Free/delinquent records still follow the existing canary rule (%j)', async entitlement => {
+        const { db } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date('2026-10-15T00:00:00Z') }] });
+        const env = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: '*', EZIL_AWS_CANARY_SINCE: '2026-10-14T00:00:00Z' };
+        expect((await resolveComputeProvider(db, computer, env, {}, { entitlement })).kind).toBe('aws-ec2');
+    });
+});
 
 describe('resolveComputeProvider', () => {
     it.each([{}, { EZIL_AWS_COMPUTERS_ENABLED: '0' }, { EZIL_AWS_COMPUTERS_ENABLED: 'true' }])('flag off (%j): Cloudflare with ZERO statements', async (env) => {

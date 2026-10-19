@@ -9,7 +9,7 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
     const computerId=randomUUID(),generation=operation==='replace'?2:1;
     const deployment={accountId:'123456789012',region:REGION,zoneId:ZONE_ID,
         subnetId:'subnet-11111111111111111',securityGroupId:'sg-11111111111111111',launchTemplateId:'lt-11111111111111111',launchTemplateVersion:'1',
-        amiId:'ami-11111111111111111',namespace:'pilot',instanceTypes:options.instanceTypes??['m6i.large','c6i.xlarge'] as InstanceType[],
+        amiId:'ami-11111111111111111',namespace:'pilot',instanceTypes:options.instanceTypes??['m6i.large','c6i.xlarge','m6i.xlarge','m6i.2xlarge'] as InstanceType[],
         storage:{...DEFAULT_STORAGE,rootDeviceName:options.rootDeviceName??DEFAULT_STORAGE.rootDeviceName},
         dataKeyArn:`arn:aws:kms:${REGION}:123456789012:key/11111111-1111-4111-8111-111111111111`,
         stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-pilot-lifecycle:1`};

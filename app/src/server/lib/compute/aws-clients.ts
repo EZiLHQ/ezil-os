@@ -209,7 +209,7 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             const { client, account } = sfnFor(region);
             if (m[1] !== region) throw new AwsClientError('aws_config', false, 'ExecutionRegionMismatch');
             if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
-            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date };
+            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date; stopDate?: Date };
             try {
                 out = (await client.send(new DescribeExecutionCommand({ executionArn }))) as typeof out;
             } catch (error) {
@@ -217,7 +217,8 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             }
             if (typeof out.status !== 'string') throw new AwsClientError('aws_error', false, 'DescribeExecutionNoStatus');
             const startDate = out.startDate instanceof Date && Number.isFinite(out.startDate.getTime()) ? out.startDate : null;
-            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate };
+            const stopDate = out.stopDate instanceof Date && Number.isFinite(out.stopDate.getTime()) ? out.stopDate : null;
+            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate, stopDate };
         },
     };
 }
@@ -280,6 +281,7 @@ export function createEc2EnrollmentDescriber(
             type Instance = {
                 InstanceId?: string;
                 State?: { Name?: string };
+                StateTransitionReason?: string;
                 Placement?: { AvailabilityZone?: string; AvailabilityZoneId?: string };
                 PublicIpAddress?: string;
                 Tags?: Ec2Tag[];
@@ -324,9 +326,14 @@ export function createEc2EnrollmentDescriber(
                 // Every attached volume must be described: a partial answer is not evidence.
                 if (volumeIds.some((id) => !volumeTags.has(id))) throw new AwsClientError('aws_error', false, 'DescribeVolumesIncomplete');
             }
+            // EC2 supplies shutdown time as e.g. "User initiated (2026-10-19 12:34:56 GMT)".
+            // Only accept that explicit UTC timestamp; other reasons have no usable time.
+            const stamp = /\((\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) GMT\)/.exec(inst.StateTransitionReason ?? '');
+            const transitionAt = stamp ? new Date(`${stamp[1]}T${stamp[2]}Z`) : null;
             const view: Ec2EnrollmentView = {
                 instanceId,
                 state: inst.State?.Name ?? 'unknown',
+                ...(transitionAt && Number.isFinite(transitionAt.getTime()) ? { stateTransitionAt: transitionAt } : {}),
                 availabilityZone: az,
                 availabilityZoneId: zoneId,
                 publicIp: inst.PublicIpAddress ?? null,

@@ -370,6 +370,15 @@ export async function ingestUsageEvents(events: UsageEvent[], deps: { store: Bil
                 rejected++;
                 continue;
         }
+        if (event.type === 'start') {
+            await store.openEpoch({ userId, computerId: event.computerId, subscriptionId: null,
+                size: 'free-cf', readyAt: at, overheadSeconds: 0 });
+        } else if (event.type === 'heartbeat') {
+            await store.touchEpoch(event.computerId, at);
+        } else if (event.type === 'stop') {
+            await store.closeEpoch({ computerId: event.computerId, endedAt: at,
+                reason: event.reason === 'idle' ? 'idle_sleep' : 'provider_stop' });
+        }
         accepted++;
     }
     return { accepted, rejected };

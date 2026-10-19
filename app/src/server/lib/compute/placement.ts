@@ -45,6 +45,7 @@ import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
+import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
 
 // ── Enums ────────────────────────────────────────────────────────────────
 
@@ -1016,6 +1017,7 @@ export async function finishEnrollment(
 export interface UsageRow {
     computerId: string;
     userId: string;
+    instanceType: string | null;
     startedAt: Date;
     stoppedAt: Date | null;
     egressBytes: number | null;
@@ -1032,6 +1034,7 @@ export interface AdmissionCounters {
     targetForeignUsage: number;
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
+    runningVcpu: number;
     /**
      * The same running-class rows, per region (only regions that have any). A
      * region absent here has none. Rows without a region are `runningUnplaced`
@@ -1039,6 +1042,8 @@ export interface AdmissionCounters {
      */
     runningByRegion: Readonly<Record<string, number>>;
     runningUnplaced: number;
+    runningVcpuByRegion: Readonly<Record<string, number>>;
+    runningVcpuUnplaced: number;
     /**
      * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE: counted by
      * `owner_user_id` (or usage metered to the user), never through
@@ -1074,12 +1079,18 @@ export async function readCanaryComputer(
     return { userId: canonicalId(row!.user_id), deleted: row!.deleted, createdAt };
 }
 
+/** Same closed, fail-closed vCPU mapping as the pure accounting helpers. */
+function instanceVcpuSql(column: SQL): SQL {
+    return sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU).map(([type, vcpu]) => sql`WHEN ${type} THEN ${vcpu}::int`), sql` `)} ELSE ${instanceVcpu(null)}::int END`;
+}
+
 /**
  * This month's usage, TOTALLED IN THE DATABASE: one row per user with usage overlapping
  * the UTC month that contains `now`, never the ledger's rows. The arithmetic is usage.ts's,
  * exactly (`monthUsageFromRows` is the reference): a run counts from max(started_at,
  * monthStart) to min(stopped_at ?? now, now, nextMonth), an open run until now, and its
- * whole egress counts in every month it overlaps (NULL = 0). Admission reads it under its
+ * whole egress counts in every month it overlaps (NULL = 0). Weighted seconds floor
+ * each clipped row duration before multiplying by vCPU / 2. Admission reads it under its
  * lock, so its size is bounded by users, not by how often computers stop and wake.
  * Session-limit enforcement (aws-receipts.ts `enforceSessionLimits`) reads it without one:
  * a cap is checked again by the next pass.
@@ -1092,6 +1103,8 @@ export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStar
             SELECT u.user_id::text AS user_id,
                 COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(u.stopped_at, w.now_at), w.now_at, w.next_month)
                     - GREATEST(u.started_at, w.month_start))), 0)), 0)::text AS seconds,
+                COALESCE(SUM(FLOOR(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(u.stopped_at, w.now_at), w.now_at, w.next_month)
+                    - GREATEST(u.started_at, w.month_start))), 0)) * (${instanceVcpuSql(sql`u.instance_type`)} / 2)), 0)::text AS weighted_seconds,
                 COALESCE(SUM(u.egress_bytes), 0)::text AS egress_bytes
             FROM public.ezil_compute_usage u CROSS JOIN w
             WHERE u.started_at < LEAST(w.now_at, w.next_month)
@@ -1103,10 +1116,12 @@ export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStar
         const userId = typeof r.user_id === 'string' ? canonicalId(r.user_id) : '';
         const seconds = typeof r.seconds === 'string' && /^\d+(\.\d+)?$/.test(r.seconds) ? Number(r.seconds) : NaN;
         const egress = counter(r.egress_bytes);
+        const weightedSeconds = counter(r.weighted_seconds);
         if (!UUID.test(userId) || byUser.has(userId)) throw new Error('usage aggregate has an invalid user_id');
         if (!Number.isFinite(seconds)) throw new Error('usage aggregate has invalid seconds');
+        if (weightedSeconds === null) throw new Error('usage aggregate has invalid weighted_seconds');
         if (egress === null) throw new Error('usage aggregate has an invalid egress_bytes');
-        byUser.set(userId, { hours: seconds / 3_600, egressBytes: egress });
+        byUser.set(userId, { hours: seconds / 3_600, weightedSeconds, egressBytes: egress });
     }
     return { global: totalsOf(byUser.values()), byUser };
 }
@@ -1156,12 +1171,14 @@ async function readCounters(
     );
     const running = sql.join(RUNNING_CLASS_STATES.map((s) => sql`${s}`), sql`, `);
     const runningRows = rowsOf(
-        await tx.execute(sql`/* placement:count-running */ SELECT count(*)::int AS n
+        await tx.execute(sql`/* placement:count-running */ SELECT count(*)::int AS n,
+                COALESCE(SUM(${instanceVcpuSql(sql`instance_type`)}), 0)::text AS vcpu
             FROM public.ezil_computer_placements
             WHERE provider = 'aws-ec2' AND state IN (${running})`),
     );
     const regionRows = rowsOf(
-        await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n
+        await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n,
+                COALESCE(SUM(${instanceVcpuSql(sql`instance_type`)}), 0)::text AS vcpu
             FROM public.ezil_computer_placements
             WHERE provider = 'aws-ec2' AND state IN (${running})
             GROUP BY region`),
@@ -1183,12 +1200,23 @@ async function readCounters(
         return n;
     };
     const runningByRegion: Record<string, number> = {};
+    const runningVcpuByRegion: Record<string, number> = {};
     let runningUnplaced = 0;
+    let runningVcpuUnplaced = 0;
+    const runningVcpu = counter(runningRows[0]?.vcpu);
+    if (runningVcpu === null) throw new Error('admission counter query returned no vcpu');
     for (const r of regionRows) {
         const n = counter(r.n);
         if (n === null) throw new Error('admission region counter returned no count');
-        if (r.region === null || r.region === undefined) runningUnplaced += n;
-        else if (typeof r.region === 'string' && !Object.prototype.hasOwnProperty.call(runningByRegion, r.region)) runningByRegion[r.region] = n;
+        const vcpu = counter(r.vcpu);
+        if (vcpu === null) throw new Error('admission region counter returned no vcpu');
+        if (r.region === null || r.region === undefined) {
+            runningUnplaced += n;
+            runningVcpuUnplaced += vcpu;
+        } else if (typeof r.region === 'string' && !Object.prototype.hasOwnProperty.call(runningByRegion, r.region)) {
+            runningByRegion[r.region] = n;
+            runningVcpuByRegion[r.region] = vcpu;
+        }
         else throw new Error('admission region counter returned a duplicate or invalid region');
     }
     const owner = ownerRows[0];
@@ -1198,8 +1226,11 @@ async function readCounters(
         targetDeleted: owner?.deleted === true,
         targetForeignUsage: count(foreignRows),
         runningCount: count(runningRows),
+        runningVcpu,
         runningByRegion,
         runningUnplaced,
+        runningVcpuByRegion,
+        runningVcpuUnplaced,
         userOtherAwsComputers: count(userRows),
         duplicates,
         usage,

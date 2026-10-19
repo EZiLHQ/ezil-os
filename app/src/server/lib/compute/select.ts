@@ -30,6 +30,7 @@ import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, typ
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
 import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
+import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
     void computer; // Placement-aware callers use `resolveComputeProvider`.
@@ -65,9 +66,15 @@ function isPlacementDb(db: PlacementExecutor): db is PlacementDb {
 }
 
 export interface ResolveOptions {
+    /** Resolved once by the caller and shared with the AWS provision path. */
+    entitlement?: EntitlementRecord | null;
+    /** Read only for a computer without placement; the caller may memoize it. */
+    resolveEntitlement?: () => Promise<EntitlementRecord | null>;
+    /** Share the ownership-checked placement with routing without another read. */
+    onPlacement?: (placement: ResolvedPlacement) => void;
     /**
      * The caller is about to START a sandbox (open, app/code preview, desktop restart).
-     * A no-row computer the canary does not claim is then PINNED to Cloudflare first
+     * A no-row computer neither billing nor the canary claims is PINNED to Cloudflare first
      * (`pinCloudflare`), so it can never later be reassigned to AWS. Reads and stops
      * never pin: a computer that never ran stays eligible.
      */
@@ -86,13 +93,24 @@ export async function resolveComputeProvider(
     // Every provider operation is the recorded owner's only (C-2): `computer.userId` is the
     // authenticated session user; a re-keyed or re-inserted ezil_computers row changes nothing.
     assertPlacementOwner(placement, computer);
-    const deps = isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined;
+    options.onPlacement?.(placement);
+    const entitlement = !placement.record && options.resolveEntitlement
+        ? await options.resolveEntitlement()
+        : options.entitlement !== undefined ? options.entitlement : aws.entitlement;
+    const deps = isPlacementDb(db) ? { ...aws, entitlement, db, env: () => env } : undefined;
     if (!placement.record) {
+        // Paid placement bypasses the canary's graceful capacity fallback. ensure()
+        // admits the entitled size or refuses; it never pins a paid computer to R2.
+        if (isAwsComputersEnabled(env) && entitlement?.source === 'billing_v2'
+            && tierForEntitlement(entitlement, plusPlanIds(env)) !== 'free') {
+            return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+        }
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
         if (await isAwsCanary(db, computer, env)) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
         if (options.pinCloudflare && isPlacementDb(db)) {
             placement = await pinCloudflare(db, computer);
             assertPlacementOwner(placement, computer);
+            options.onPlacement?.(placement);
         }
     }
     return providerForPlacement(placement, env, deps);

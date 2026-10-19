@@ -5,6 +5,7 @@ import {
     check,
     foreignKey,
     integer,
+    index,
     jsonb,
     pgTable,
     text,
@@ -247,6 +248,8 @@ export const billingComputeEpochs = pgTable(
         size: text('size').$type<SizeCode>().notNull(),
         weight: integer('weight').$type<SizeWeight>().notNull(),
         readyAt: timestamp('ready_at', { withTimezone: true }).notNull(),
+        deadlineAt: timestamp('deadline_at', { withTimezone: true }),
+        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
         endedAt: timestamp('ended_at', { withTimezone: true }),
         endReason: text('end_reason').$type<EpochEndReason>(),
         overheadSeconds: integer('overhead_seconds').notNull().default(0),
@@ -259,8 +262,16 @@ export const billingComputeEpochs = pgTable(
         check('ezil_billing_compute_epochs_end_pair_chk', sql`(${table.endedAt} is null) = (${table.endReason} is null)`),
         check('ezil_billing_compute_epochs_ended_at_chk', sql`${table.endedAt} is null or ${table.endedAt} >= ${table.readyAt}`),
         check('ezil_billing_compute_epochs_overhead_seconds_chk', sql`${table.overheadSeconds} >= 0`),
+        check('ezil_billing_compute_epochs_deadline_at_chk', sql`${table.deadlineAt} is null or (${table.deadlineAt} >= ${table.readyAt} and ${table.deadlineAt} <= ${table.readyAt} + interval '21600 seconds')`),
+        check('ezil_billing_compute_epochs_last_heartbeat_at_chk', sql`${table.lastHeartbeatAt} is null or ${table.lastHeartbeatAt} >= ${table.readyAt}`),
         uniqueIndex('ezil_billing_compute_epochs_open_computer_uidx')
             .on(table.computerId)
+            .where(sql`${table.endedAt} is null`),
+        uniqueIndex('ezil_billing_compute_epochs_one_open_per_user')
+            .on(table.userId)
+            .where(sql`${table.endedAt} is null`),
+        index('ezil_billing_compute_epochs_open_deadline_idx')
+            .on(table.deadlineAt)
             .where(sql`${table.endedAt} is null`),
         foreignKey({
             name: 'ezil_billing_compute_epochs_user_id_fkey',

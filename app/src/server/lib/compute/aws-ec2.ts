@@ -51,8 +51,10 @@ import {
 } from './aws-intent';
 import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
+import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
+import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -114,12 +116,15 @@ export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RET
 
 export interface AwsProviderDeps {
     db: PlacementDb;
+    meter?: ComputeMeter;
     env?: () => Env;
     now?: () => Date;
     /** Lower-case uuid v4. */
     newId?: () => string;
     starter?: LifecycleStarter;
-    /** The user's entitlement (free / plus). Never defaulted. */
+    /** The caller's resolved record; null means the read found no entitlement. */
+    entitlement?: EntitlementRecord | null;
+    /** Legacy tier source for callers that do not supply a resolved record. */
     tierFor?: (userId: string) => Promise<AwsTier>;
     /** Source of the enrollment nonce's 32 bytes (tests make it deterministic). */
     randomBytes?: (n: number) => Buffer;
@@ -271,7 +276,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
-    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, sleep: deps.sleep });
+    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter });
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
@@ -399,12 +404,14 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             }
 
             if (!placement) {
-                if (!deps.tierFor) return notReady('aws_tier_unavailable');
+                if (deps.entitlement === undefined && !deps.tierFor) return notReady('aws_tier_unavailable');
                 const enrollUrl = cfg.enrollUrl;
                 if (!enrollUrl) return notReady('aws_enrollment_unavailable');
                 let tier: AwsTier;
                 try {
-                    tier = await deps.tierFor(c.userId);
+                    tier = deps.entitlement !== undefined
+                        ? tierForEntitlement(deps.entitlement, plusPlanIds(cfg.e))
+                        : await deps.tierFor!(c.userId);
                 } catch {
                     return notReady('aws_tier_unavailable');
                 }

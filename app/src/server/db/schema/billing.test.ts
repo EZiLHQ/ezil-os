@@ -231,6 +231,7 @@ function assertBillingV2Migration(sql: string): void {
     const dialect = new PgDialect();
     for (const table of v2Tables) {
         for (const check of table.checks) {
+            if (sessionCheckNames.has(check.name)) continue; // Added in 0005, not 0004.
             expect(sql).toContain(`CONSTRAINT "${check.name}" CHECK (${dialect.sqlToQuery(check.value).sql})`);
         }
     }
@@ -314,8 +315,8 @@ describe('billing schema and migration 0004', () => {
         for (const table of v2Tables) {
             const snapshot = current.tables[`public.${table.name}`];
             expect(snapshot.isRLSEnabled).toBe(true);
-            expect(Object.keys(snapshot.columns).sort()).toEqual(table.columns.map(column => column.name).sort());
-            expect(Object.keys(snapshot.checkConstraints).sort()).toEqual(table.checks.map(check => check.name).sort());
+            expect(Object.keys(snapshot.columns).sort()).toEqual(table.columns.filter(column => !sessionColumnNames.has(column.name)).map(column => column.name).sort());
+            expect(Object.keys(snapshot.checkConstraints).sort()).toEqual(table.checks.filter(check => !sessionCheckNames.has(check.name)).map(check => check.name).sort());
         }
     });
 
@@ -349,5 +350,67 @@ describe('billing schema and migration 0004', () => {
     ])('rejects extra destructive or unrelated SQL: %s', extra => {
         assertBillingV2Migration(migrationV2);
         expect(() => assertBillingV2Migration(`${migrationV2}\n${extra}`)).toThrow();
+    });
+});
+
+const sessionColumnNames = new Set(['deadline_at', 'last_heartbeat_at']);
+const sessionCheckNames = new Set(['ezil_billing_compute_epochs_deadline_at_chk', 'ezil_billing_compute_epochs_last_heartbeat_at_chk']);
+
+describe('billing schema and migration 0005', () => {
+    it('registers 0005 and preserves every 0004 table except two columns, two checks and two indexes', () => {
+        expect(journal.entries.filter((entry: { idx: number }) => entry.idx === 5)).toEqual([
+            expect.objectContaining({ idx: 5, tag: '0005_billing_sessions', version: '7', when: expect.any(Number), breakpoints: true }),
+        ]);
+        const previous = JSON.parse(readFileSync(new URL('../../../../drizzle/meta/0004_snapshot.json', import.meta.url), 'utf8'));
+        const current = JSON.parse(readFileSync(new URL('../../../../drizzle/meta/0005_snapshot.json', import.meta.url), 'utf8'));
+        expect(current.prevId).toBe(previous.id);
+        expect(current.id).not.toBe(previous.id);
+        const epochs = structuredClone(previous.tables['public.ezil_billing_compute_epochs']);
+        for (const name of sessionColumnNames) {
+            epochs.columns[name] = { name, type: 'timestamp with time zone', primaryKey: false, notNull: false };
+        }
+        const table = getTableConfig(billing.billingComputeEpochs);
+        const dialect = new PgDialect();
+        const migration = readFileSync(new URL('../../../../drizzle/0005_billing_sessions.sql', import.meta.url), 'utf8');
+        const expected = [...sessionColumnNames].map(name => `ALTER TABLE "${table.name}" ADD COLUMN "${name}" timestamp with time zone`);
+        const checks = table.checks.filter(check => sessionCheckNames.has(check.name));
+        expect(checks).toHaveLength(2);
+        for (const check of checks) {
+            const value = dialect.sqlToQuery(check.value).sql;
+            epochs.checkConstraints[check.name] = { name: check.name, value };
+            expected.push(`ALTER TABLE "${table.name}" ADD CONSTRAINT "${check.name}" CHECK (${value})`);
+        }
+        const name = 'ezil_billing_compute_epochs_open_deadline_idx';
+        epochs.indexes[name] = { name,
+            columns: [{ expression: 'deadline_at', isExpression: false, asc: true, nulls: 'last' }],
+            isUnique: false, where: '"ezil_billing_compute_epochs"."ended_at" is null', concurrently: false, method: 'btree', with: {},
+        };
+        expected.push(`CREATE INDEX "${name}" ON "${table.name}" USING btree ("deadline_at") WHERE "${table.name}"."ended_at" is null`);
+        const concurrentName = 'ezil_billing_compute_epochs_one_open_per_user';
+        epochs.indexes[concurrentName] = { name: concurrentName,
+            columns: [{ expression: 'user_id', isExpression: false, asc: true, nulls: 'last' }],
+            isUnique: true, where: '"ezil_billing_compute_epochs"."ended_at" is null', concurrently: false, method: 'btree', with: {},
+        };
+        expected.push(`CREATE UNIQUE INDEX "${concurrentName}" ON "${table.name}" USING btree ("user_id") WHERE "${table.name}"."ended_at" is null`);
+        const concurrentIndex = table.indexes.find(index => index.config.name === concurrentName)!;
+        expect(concurrentIndex.config.unique).toBe(true);
+        expect(dialect.sqlToQuery(concurrentIndex.config.where!).sql).toBe(epochs.indexes[concurrentName].where);
+        expect(concurrentIndex.config.columns.map(column => 'name' in column ? column.name : null)).toEqual(['user_id']);
+        expect(Object.keys(epochs.indexes).sort()).toEqual(table.indexes.map(index => index.config.name).sort());
+        expect(statements(migration).sort()).toEqual(expected.sort());
+        expect(Object.keys(current.tables).sort()).toEqual(Object.keys(previous.tables).sort());
+        for (const [name, oldTable] of Object.entries(previous.tables)) {
+            expect(current.tables[name]).toEqual(name === 'public.ezil_billing_compute_epochs' ? epochs : oldTable);
+        }
+        expect(Object.keys(epochs.columns).sort()).toEqual(table.columns.map(column => column.name).sort());
+        expect(Object.keys(epochs.checkConstraints).sort()).toEqual(table.checks.map(check => check.name).sort());
+        const index = table.indexes.find(index => index.config.name === name)!;
+        expect(index.config.unique).toBe(false);
+        expect(dialect.sqlToQuery(index.config.where!).sql).toBe(epochs.indexes[name].where);
+        expect(index.config.columns.map(column => 'name' in column ? column.name : null)).toEqual(['deadline_at']);
+        for (const column of table.columns.filter(column => sessionColumnNames.has(column.name))) {
+            expect(column.notNull).toBe(false);
+            expect(column.getSQLType()).toBe('timestamp with time zone');
+        }
     });
 });

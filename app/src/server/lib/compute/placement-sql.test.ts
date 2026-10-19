@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 
 const REPO = path.resolve(__dirname, '../../../../..');
 const SQL_PATH = path.join(REPO, 'docs/aws-computers/sql/0001_compute_placement.sql.txt');
+const POOL_SQL_PATH = path.join(REPO, 'docs/aws-computers/sql/0002_ready_pool.sql.txt');
 const ENGINE = pathToFileURL(path.join(REPO, '.github/scripts/production-migrations.mjs')).href;
 
 type Engine = { additiveSQL: (sql: string, schemas: string[]) => string };
@@ -22,6 +23,25 @@ async function engine(): Promise<Engine> {
 }
 
 const sql = readFileSync(SQL_PATH, 'utf8');
+const poolSql = readFileSync(POOL_SQL_PATH, 'utf8');
+
+describe('offline ready-pool SQL registration contract', () => {
+    // Intentionally an acceptance assertion, not a stripped-down SQL copy or an
+    // expected failure. Currently blocked on hosted grammar support; see README.
+    it('parses 0002 with the engine additiveSQL before founder registration', async () => {
+        const { additiveSQL } = await engine();
+        expect(additiveSQL(poolSql, ['public'])).toBe(poolSql);
+    });
+
+    it('revokes client roles, enables RLS without policies, and stays unregistered', () => {
+        for (const table of ['ezil_compute_pool_hosts', 'ezil_compute_writer_leases']) {
+            expect(poolSql).toContain(`REVOKE ALL ON TABLE public.${table} FROM public, anon, authenticated;`);
+            expect(poolSql).toContain(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY;`);
+        }
+        expect(poolSql).not.toMatch(/CREATE\s+POLICY/i);
+        expect(POOL_SQL_PATH.endsWith('.sql')).toBe(false);
+    });
+});
 
 describe('placement SQL is inside the hosted additive grammar', () => {
     it('parses with the engine additiveSQL for the manifest schema', async () => {

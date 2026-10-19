@@ -14,8 +14,11 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
+import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
+import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
+import type { EpochEndReason } from '@/server/billing/v2/contract';
 import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
-import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
+import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, sizeForInstanceType, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
@@ -48,7 +51,7 @@ export interface LifecycleExecutionReader {
     describe(
         region: string,
         executionArn: string,
-    ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null }>;
+    ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null }>;
 }
 
 /** Who recorded a usage row (`observed_by`). */
@@ -109,6 +112,8 @@ export function nextInstanceTypeAfterCapacity(tier: AwsTier, failedType: string)
 
 export interface ReceiptDeps {
     db: PlacementDb;
+    meter?: ComputeMeter;
+    now?: () => Date;
     /** Without it nothing is read and nothing changes. */
     executions?: LifecycleExecutionReader;
     /** GW-1, to fence (delete) a stopped generation's tunnel. */
@@ -177,8 +182,27 @@ export async function startLifecycleJob(
  * provider receipt arrived AND GW-1 enrollment explicitly succeeded.
  */
 export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment): Promise<void> {
+    let startDate: Date | null = null;
+    let stopDate: Date | null = null;
+    let endReason: EpochEndReason = 'provider_stop';
     const step = async (p: Placement, to: PlacementState, fields: PlacementFields = {}, usage?: UsageEffect): Promise<Placement | null> => {
+        const at = (deps.now ?? deps.clock ?? (() => new Date()))();
         const r = await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: p, to, fields, usage });
+        // Billing tables are not installed in production: deliberately write epochs AFTER
+        // the placement transaction commits, never in that transaction. Metering cannot roll it back.
+        if (r.ok && to === 'RUNNING') {
+            const metered = await recordComputeMeter(() => deps.meter?.ready({
+                userId: p.ownerUserId, computerId: p.computerId, size: sizeForInstanceType(p.instanceType), readyAt: at,
+                overheadSeconds: startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
+            }));
+            // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
+            if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
+                userId: p.ownerUserId, computerId: p.computerId,
+            });
+        }
+        if (r.ok && usage?.kind === 'close') await recordComputeMeter(() => deps.meter?.stopped({
+            userId: p.ownerUserId, computerId: p.computerId, endedAt: stopDate ?? at, reason: endReason,
+        }));
         return r.ok ? r.placement : null;
     };
     const close: UsageEffect = { kind: 'close', observedBy: USAGE_OBSERVER };
@@ -229,6 +253,13 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         await step(p, 'UNCONFIRMED', { lastError: 'receipt_conflict' });
         return;
     }
+    startDate = e.startDate ?? null;
+    stopDate = e.stopDate ?? null;
+    // Session limits keep their reason in lastError. An unknown StartExecution
+    // overwrites it, so those ambiguous stops conservatively use provider_stop too.
+    const providerStop = ['lease_expired', 'user_hours_cap', 'global_hours_cap'].includes(p.lastError ?? '')
+        || lifecycleStartUnknownUndo(p) !== null;
+    endReason = r.instanceLost ? 'platform_failure' : stopping && !providerStop ? 'user_stop' : 'provider_stop';
     const done: PlacementFields = {
         instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null,
         // A stop that found its instance already gone (`instanceLost`): STOPPED with INSTANCE_LOST,
@@ -352,9 +383,16 @@ export async function reconcileGuestStop(deps: GuestStopDeps, p: Placement, depl
     } catch {
         return false; // Unknown: leave it, try again on the next look.
     }
-    if (!view || LOST_INSTANCE_STATES.has(view.state)) return recoverLostInstance(deps, p);
+    if (!view || LOST_INSTANCE_STATES.has(view.state)) return recoverLostInstance(deps, p, view?.stateTransitionAt);
     if (view.state !== 'stopping' && view.state !== 'stopped') return false;
-    return startStopAsReconciler(deps, p, deployment, null);
+    const endedAt = view.stateTransitionAt ?? (deps.now ?? deps.clock ?? (() => new Date()))();
+    const started = await startStopAsReconciler(deps, p, deployment, null);
+    // EC2 has already observed the guest shutdown. Close after the placement work
+    // commits; the later stop receipt is idempotent and cannot replace idle_sleep.
+    if (started) await recordComputeMeter(() => deps.meter?.stopped({
+        userId: p.ownerUserId, computerId: p.computerId, endedAt, reason: 'idle_sleep',
+    }));
+    return started;
 }
 
 /** EC2 states of an instance that is gone for good (terminate is not reversible). */
@@ -375,7 +413,7 @@ const LOST_INSTANCE_STATES: ReadonlySet<string> = new Set(['shutting-down', 'ter
  *     UNCONFIRMED with `INSTANCE_LOST_VOLUME_MISSING`: there is nothing to boot onto.
  * Returns true when the placement was moved.
  */
-async function recoverLostInstance(deps: GuestStopDeps, p: Placement): Promise<boolean> {
+async function recoverLostInstance(deps: GuestStopDeps, p: Placement, stateTransitionAt?: Date | null): Promise<boolean> {
     if (!deps.describer?.describeVolume || !p.region || !p.volumeId) return false;
     let volume;
     try {
@@ -398,6 +436,10 @@ async function recoverLostInstance(deps: GuestStopDeps, p: Placement): Promise<b
         fields: { ...cleared, lastError: usable ? INSTANCE_LOST : INSTANCE_LOST_VOLUME_MISSING },
         usage: { kind: 'close', observedBy: 'reconcile:instance_lost' },
     });
+    if (r.ok) await recordComputeMeter(() => deps.meter?.stopped({
+        userId: p.ownerUserId, computerId: p.computerId,
+        endedAt: stateTransitionAt ?? (deps.now ?? deps.clock ?? (() => new Date()))(), reason: 'platform_failure',
+    }));
     return r.ok;
 }
 
@@ -465,8 +507,8 @@ export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage:
     if (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime()) return 'lease_expired';
     if (policy.caps && usage) {
         const totals = usageFor(usage, p.ownerUserId);
-        if (totals.user.hours >= policy.caps.userMonthlyHours) return 'user_hours_cap';
-        if (totals.global.hours >= policy.caps.globalMonthlyHours) return 'global_hours_cap';
+        if (totals.user.weightedSeconds >= policy.caps.userMonthlyHours * 3_600) return 'user_hours_cap';
+        if (totals.global.weightedSeconds >= policy.caps.globalMonthlyHours * 3_600) return 'global_hours_cap';
     }
     return null;
 }
@@ -688,6 +730,10 @@ async function releaseWithoutResources(deps: GuestStopDeps, p: Placement): Promi
         usage: { kind: 'close', observedBy: 'reconcile:released' },
     });
     if (!retired.ok) return false;
+    await recordComputeMeter(() => deps.meter?.stopped({
+        userId: p.ownerUserId, computerId: p.computerId,
+        endedAt: (deps.now ?? deps.clock ?? (() => new Date()))(), reason: 'platform_failure',
+    }));
     await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: retired.placement, to: 'PURGE_ELIGIBLE' });
     return true;
 }

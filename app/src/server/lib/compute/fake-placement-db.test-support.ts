@@ -28,6 +28,7 @@ import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
 import { monthUsageFromRows } from './usage';
+import { instanceVcpu } from './aws-config';
 
 const dialect = new PgDialect();
 
@@ -178,19 +179,20 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             }
             case 'count-running': {
                 const states = new Set(params as string[]);
-                const n = placements.filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state))).length;
-                return { rows: [{ n }] };
+                const rows = placements.filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)));
+                return { rows: [{ n: rows.length, vcpu: rows.reduce((sum, r) => sum + instanceVcpu(r.instance_type as string | null), 0) }] };
             }
             case 'count-running-region': {
                 if (!/provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/.test(text)) throw new Error('fake db: unexpected per-region count SQL');
                 const states = new Set(params as string[]);
-                const byRegion = new Map<string | null, number>();
+                const byRegion = new Map<string | null, { n: number; vcpu: number }>();
                 for (const r of placements) {
                     if (r.provider !== 'aws-ec2' || !states.has(String(r.state))) continue;
                     const key = (r.region as string | null) ?? null;
-                    byRegion.set(key, (byRegion.get(key) ?? 0) + 1);
+                    const prev = byRegion.get(key) ?? { n: 0, vcpu: 0 };
+                    byRegion.set(key, { n: prev.n + 1, vcpu: prev.vcpu + instanceVcpu(r.instance_type as string | null) });
                 }
-                return { rows: [...byRegion].map(([region, n]) => ({ region, n })) };
+                return { rows: [...byRegion].map(([region, counts]) => ({ region, ...counts })) };
             }
             case 'count-user': {
                 const [computerId, userId] = params as string[];
@@ -210,13 +212,14 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 const now = new Date(String(params[0]));
                 const rows = usage.map((u) => ({
                     computerId: String(u.computer_id), userId: String(u.user_id),
+                    instanceType: (u.instance_type as string | null) ?? null,
                     startedAt: u.started_at as Date, stoppedAt: (u.stopped_at as Date | null) ?? null,
                     egressBytes: u.egress_bytes === null || u.egress_bytes === undefined ? null : Number(u.egress_bytes),
                 }));
                 const totals = monthUsageFromRows(rows, now);
                 return {
                     rows: [...totals.byUser].map(([user_id, t]) => ({
-                        user_id, seconds: (t.hours * 3_600).toFixed(6), egress_bytes: String(t.egressBytes),
+                        user_id, seconds: (t.hours * 3_600).toFixed(6), weighted_seconds: String(t.weightedSeconds), egress_bytes: String(t.egressBytes),
                     })),
                 };
             }

@@ -61,10 +61,14 @@ function fixture() {
     const store = {
         grantsForPeriod: vi.fn<BillingStore['grantsForPeriod']>().mockResolvedValue([]),
         openEpoch: vi.fn<BillingStore['openEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
+        openEpochFor: vi.fn<BillingStore['openEpochFor']>(async () => { throw new Error('Unused v2 store stub'); }),
+        touchEpoch: vi.fn<BillingStore['touchEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
+        openEpochsForSweep: vi.fn<BillingStore['openEpochsForSweep']>(async () => { throw new Error('Unused v2 store stub'); }),
+        policyClosedEpochsSince: vi.fn<BillingStore['policyClosedEpochsSince']>(async () => { throw new Error('Unused v2 store stub'); }),
         closeEpoch: vi.fn<BillingStore['closeEpoch']>(async () => { throw new Error('Unused v2 store stub'); }),
         epochsFor: vi.fn<BillingStore['epochsFor']>().mockResolvedValue([{
             id: 'epoch_fixture', userId, computerId: 'computer', size: 'free-cf', weight: 1,
-            readyAt: '2026-10-01T00:00:00Z', endedAt: '2026-10-01T00:01:00Z', endReason: 'user_stop', overheadSeconds: 0,
+            readyAt: '2026-10-01T00:00:00Z', endedAt: '2026-10-01T00:01:00Z', endReason: 'user_stop', overheadSeconds: 0, deadlineAt: null, lastHeartbeatAt: null,
         }]),
         recordConsent: vi.fn<BillingStore['recordConsent']>(async input => consent = { ...input, id: BigInt(1) }),
         consentAsOf: vi.fn<BillingStore['consentAsOf']>().mockResolvedValue(null),
@@ -206,7 +210,7 @@ describe('billing router', () => {
         f.store.grantsForPeriod.mockResolvedValue([grant(144)]);
         f.store.epochsFor.mockResolvedValue([{
             id: 'epoch_compute', userId, computerId: 'computer', size: 'cmp-8', weight: 4,
-            readyAt: '2026-10-01T00:00:00Z', endedAt: '2026-10-01T00:01:12Z', endReason: 'user_stop', overheadSeconds: 0,
+            readyAt: '2026-10-01T00:00:00Z', endedAt: '2026-10-01T00:01:12Z', endReason: 'user_stop', overheadSeconds: 0, deadlineAt: null, lastHeartbeatAt: null,
         }]);
         f.store.latestConsent.mockResolvedValue({
             id: BigInt(1), userId, subscriptionId: 'sub_fixture', enabled: true, capCents: 100,
