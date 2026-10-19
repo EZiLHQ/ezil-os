@@ -1,0 +1,39 @@
+-- OFFLINE ready-pool and global migration writer-lease model.
+-- NOT A REGISTERED MIGRATION. Registration follows README.md.
+-- Requires hosted grammar support for these constraints/defaults/partial index.
+
+CREATE TABLE public.ezil_compute_pool_hosts (
+  id uuid PRIMARY KEY,
+  region text NOT NULL CHECK (region ~ '^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$'),
+  zone_id text NOT NULL,
+  instance_id text NOT NULL UNIQUE,
+  instance_type text NOT NULL CHECK (instance_type IN ('m6i.large', 'm6i.xlarge', 'm6i.2xlarge')),
+  state text NOT NULL CHECK (state IN ('booting', 'ready', 'leased', 'draining', 'retired')),
+  health text NOT NULL CHECK (health IN ('unknown', 'healthy', 'unhealthy')),
+  editor_ready_at timestamptz NULL,
+  generation bigint NOT NULL DEFAULT 1 CHECK (generation > 0),
+  leased_computer_id uuid NULL,
+  leased_generation bigint NULL,
+  lease_token uuid NULL,
+  leased_at timestamptz NULL,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL,
+  CHECK ((state = 'leased' AND leased_computer_id IS NOT NULL AND leased_generation IS NOT NULL AND lease_token IS NOT NULL AND leased_at IS NOT NULL)
+    OR (state <> 'leased' AND leased_computer_id IS NULL AND leased_generation IS NULL AND lease_token IS NULL AND leased_at IS NULL)),
+  CHECK (leased_generation IS NULL OR (leased_generation > 0 AND leased_generation = generation - 1))
+);
+CREATE INDEX ezil_compute_pool_hosts_candidate_idx ON public.ezil_compute_pool_hosts (region, instance_type)
+  WHERE state = 'ready' AND health = 'healthy' AND editor_ready_at IS NOT NULL;
+REVOKE ALL ON TABLE public.ezil_compute_pool_hosts FROM public, anon, authenticated;
+ALTER TABLE public.ezil_compute_pool_hosts ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE public.ezil_compute_writer_leases (
+  computer_id uuid PRIMARY KEY,
+  region text NOT NULL CHECK (region ~ '^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$'),
+  generation bigint NOT NULL CHECK (generation > 0),
+  holder text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  fenced_at timestamptz NULL
+);
+REVOKE ALL ON TABLE public.ezil_compute_writer_leases FROM public, anon, authenticated;
+ALTER TABLE public.ezil_compute_writer_leases ENABLE ROW LEVEL SECURITY;

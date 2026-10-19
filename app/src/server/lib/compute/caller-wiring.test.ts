@@ -64,17 +64,28 @@ const sandbox = deriveGuacamoleSandboxId(userId, computerId);
 const base = 'https://worker.example';
 
 describe('every lifecycle router call inherits the billing reader', () => {
-    it.each([['cloudflare-guacamole.ts', 7], ['computer.ts', 1]] as const)('%s uses the dispatch default on every routeComputer call', (file, expectedCalls) => {
-        const source = ts.createSourceFile(file, readFileSync(path.resolve(__dirname, '../../api/routers', file), 'utf8'), ts.ScriptTarget.Latest, true);
+    it.each([
+        ['server/api/routers/cloudflare-guacamole.ts', 6, './compute-dispatch'],
+        ['server/api/routers/computer.ts', 1, './compute-dispatch'],
+        ['server/lib/compute/stop-policy.ts', 1, '@/server/api/routers/compute-dispatch'],
+        ['app/api/cron/billing-session-sweep/route.ts', 1, '@/server/api/routers/compute-dispatch'],
+    ] as const)('%s uses the dispatch default on every routeComputer call', (file, expectedCalls, dispatchImport) => {
+        const source = ts.createSourceFile(file, readFileSync(path.resolve(__dirname, '../../..', file), 'utf8'), ts.ScriptTarget.Latest, true);
         const calls: ts.CallExpression[] = [];
+        const isDispatch = (node: ts.Expression): boolean => {
+            if (ts.isIdentifier(node)) return node.text === 'routeComputer';
+            if (ts.isParenthesizedExpression(node)) return isDispatch(node.expression);
+            return ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+                && isDispatch(node.right);
+        };
         const visit = (node: ts.Node) => {
-            if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'routeComputer') calls.push(node);
+            if (ts.isCallExpression(node) && isDispatch(node.expression)) calls.push(node);
             ts.forEachChild(node, visit);
         };
         visit(source);
         expect(calls).toHaveLength(expectedCalls);
         expect(source.statements.some(node => ts.isImportDeclaration(node)
-            && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === './compute-dispatch'
+            && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === dispatchImport
             && node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)
             && node.importClause.namedBindings.elements.some(element => element.name.text === 'routeComputer'))).toBe(true);
         for (const call of calls) {

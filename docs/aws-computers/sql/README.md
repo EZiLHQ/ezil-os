@@ -4,6 +4,13 @@
 (`ezil_computer_placements`, `ezil_compute_usage`). It is **not applied anywhere**
 and nothing reads these tables while `EZIL_AWS_COMPUTERS_ENABLED` is unset.
 
+`0002_ready_pool.sql.txt` is the **offline ready-pool/migrate model**: single-use
+pool hosts and a global writer lease per computer. Nothing imports these models
+from a router, provider, cron or flag. Registration follows the same founder
+rehearsal, catalog-digest and manifest steps below, using a distinct migration name.
+Its primary keys, CHECKs, default and non-unique partial index require hosted
+`additiveSQL` grammar support before registration; the current parser rejects them.
+
 ## Why `.sql.txt` and why here
 
 `node .github/scripts/production-migrations.mjs validate` inventories every tracked
