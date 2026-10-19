@@ -17,7 +17,14 @@ export async function verifyRelayLifetime({ durationMs, expectedRuntimeId, readR
     await sleep(Math.min(intervalMs, deadline - now()));
     await verifyViewer();
     const current = await readRelay();
-    assert.ok(valid(current), 'Session hold relay unavailable or expired');
+    if (!valid(current)) {
+      const error = new assert.AssertionError({ message: 'Session hold relay unavailable or expired' });
+      // Public CI evidence: which of three failures this was, without values.
+      error.relay = { ok: current?.ok === true, error: typeof current?.error === 'string' && /^[a-z_]{1,40}$/.test(current.error) ? current.error : undefined,
+        expired: Number.isSafeInteger(current?.expiresAt) ? current.expiresAt <= now() : undefined,
+        renewals, holdSeconds: Math.round((now() - startedAt) / 1000) };
+      throw error;
+    }
     assert.ok(current.runtimeId === baseline.runtimeId, 'Session hold replaced runtime');
     assert.ok(current.expiresAt >= previousExpiry, 'Session hold relay expiry moved backwards');
     if (current.expiresAt > previousExpiry) renewals++;

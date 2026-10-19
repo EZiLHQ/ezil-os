@@ -583,6 +583,11 @@ try {
   // bounded() and api() failures name a literal operation or a query-free path.
   const deadline = String(error?.message).match(/^([A-Za-z][A-Za-z ]{0,60}): deadline exceeded$/);
   if (deadline) evidence.deadlineExceeded = deadline[1];
+  if (error?.relay) evidence.relayHold = error.relay;
+  try {
+    const state = await page?.evaluate(() => document.querySelector('.window[data-app="desktop"]')?.dataset.relayState ?? null);
+    if (typeof state === 'string' && /^[a-z]{1,20}$/.test(state)) evidence.desktopRelayState = state;
+  } catch { /* the page may be gone */ }
   const http = String(error?.message).match(/^HTTP failure (\/api\/[a-z/-]{1,60})$/);
   if (http) evidence.httpFailure = http[1];
   const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z0-9_]+)$/);
