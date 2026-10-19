@@ -253,6 +253,16 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
             await expect(caller(a).selectSize({ size })).rejects.toThrow(/size_not_allowed/);
         });
 
+        it('plan-changing procedures refuse a subscription whose provider customer is someone else, before any Stripe write', async () => {
+            await subscribe(a, 'compute_monthly_v2');
+            // Provider says A's subscription id belongs to B's customer.
+            stripe.subscriptions.set(a.subscriptionId, { ...stripeSubscription(b, 'compute_monthly_v2'), id: a.subscriptionId });
+            await expect(caller(a).cancelAtPeriodEnd({ cancel: true })).rejects.toThrow(/customer_conflict/);
+            await expect(caller(a).portal()).rejects.toThrow(/customer_conflict/);
+            await expect(caller(a).scheduleDowngrade({ toSku: 'standard_monthly_v2' })).rejects.toThrow(/customer_conflict/);
+            expect(stripe.calls).toEqual([]);
+        });
+
         it('checkoutStatus never reveals another user\'s session', async () => {
             stripe.sessions.set('cs_b', { id: 'cs_b', customer: b.customerId, clientReferenceId: b.userId, mode: 'subscription', status: 'complete', paymentStatus: 'paid', paymentIntentId: null, sku: 'compute_monthly_v2' });
             await expect(caller(a).checkoutStatus({ sessionId: 'cs_b' })).rejects.toThrow();
