@@ -5,7 +5,7 @@
  * same instance in the SAME region; a full home region refuses, never hops.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AWS_RETIREMENT_UNDERWAY, AWS_RETIRING, AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
 import { START_ATTEMPTS } from './aws-receipts';
@@ -17,6 +17,7 @@ import { createFakePlacementDb, placementRow } from './fake-placement-db.test-su
 import { ENROLLMENT_FAILED, PLACEMENT_STATES, PlacementOwnerError, readPlacement, RELEASED_NO_RESOURCES, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
 import { AwsClientError } from './aws-errors';
 import type { EntitlementRecord } from './tier';
+import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -84,6 +85,7 @@ function setup(
         tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
         entitlement: over.entitlement,
         randomBytes: over.randomBytes ?? (() => Buffer.from(NONCE_BYTES)),
+        meter: over.meter,
         sleep: over.sleep ?? (async () => {}),
         ...(over.executions ? { executions: over.executions } : {}),
         ...(over.describer ? { describer: over.describer } : {}),
@@ -141,13 +143,17 @@ describe('ensure: a new computer', () => {
         expect(calls[0]!.intent).toMatchObject({ operation: 'provision', instanceType: 'm6i.2xlarge', dataVolumeGiB: 50 });
     });
 
-    it.each(['start', 'replace'] as const)('waking by %s retains the recorded type despite a cmp-8 entitlement', async operation => {
+    it.each(['start', 'replace'] as const)('waking in %s mode replaces at the entitled cmp-8 size', async operation => {
         const { provider, calls } = setup({ placements: [stopped()] }, {
             entitlement: { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws' },
-            tierFor: async () => { throw new Error('Wake must not re-size'); }, e: operation === 'start' ? startMode() : env(),
+            tierFor: async () => { throw new Error('Use the resolved entitlement'); },
+            e: (operation === 'start' ? startMode : env)({
+                EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+                [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']) }),
+            }),
         });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
-        expect(calls[0]!.intent).toMatchObject({ operation, instanceType: 't3a.medium' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.2xlarge' });
     });
 
     it('Mumbai full → provisioned in the US region with the free tier (2 vCPU / 4 GiB) and its own deployment', async () => {
@@ -307,6 +313,119 @@ describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fen
             await receipt(db, 'STOPPING');
             await receipt(db, 'STOPPED');
         }
+    });
+});
+
+describe('ensure: resize to the current paid plan', () => {
+    const paid = (size: SizeCode): EntitlementRecord => ({
+        source: 'billing_v2', status: 'active', planId: size === 'std-2' ? 'standard_monthly_v2' : 'compute_monthly_v2',
+        size, provider: 'aws', paymentIssue: false,
+    });
+    const resizeEnv = (over: Record<string, string> = {}) => startMode({
+        AWS_MAX_RUNNING: '2', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
+        [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.xlarge']) }),
+        ...over,
+    });
+    const meter = () => ({ ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) });
+
+    it.each([
+        ['STOPPED', 'std-2', 'cmp-4'], ['RUNNING', 'std-2', 'cmp-4'],
+        ['STOPPED', 'cmp-4', 'std-2'], ['RUNNING', 'cmp-4', 'std-2'],
+    ] as const)('%s %s → %s replaces on the same volume and closes the epoch with resize', async (state, from, to) => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({
+            state, instance_type: SIZES[from].machine, generation: 3, lease_epoch: 7,
+            lease_until: new Date(NOW.getTime() + 3_600_000), enroll_consumed_hash: 'a'.repeat(64),
+        })] }, { entitlement: paid(to), meter: billing, e: resizeEnv({
+            AWS_MAX_RUNNING: to === 'std-2' ? '1' : '2', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: to === 'std-2' ? '1' : '2',
+        }) });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(s.calls).toHaveLength(1);
+        const intent = s.calls[0]!.intent;
+        expect(intent).toMatchObject({
+            operation: 'replace', instanceType: SIZES[to].machine, targetGeneration: 4, leaseEpoch: 8,
+            previousGeneration: 3, previousFenceToken: FENCE, previousInstanceId: 'i-11111111111111111',
+            dataVolumeId: 'vol-11111111111111111', dataVolumeGiB: null,
+        });
+        expect(intent.fenceToken).not.toBe(FENCE);
+        expect(leaseOf(intent.userData)).toMatchObject({ generation: 4, leaseEpoch: 8, nonce: NONCE, fsUuid: FS, provision: false });
+        expect(s.placements[0]).toMatchObject({
+            state: 'STARTING', instance_type: SIZES[to].machine, generation: 4, lease_epoch: 8,
+            region: 'ap-south-1', volume_id: 'vol-11111111111111111', instance_id: null,
+            fence_token: intent.fenceToken, enroll_nonce_hash: nonceHashOf(NONCE), enroll_consumed_hash: null,
+            lifecycle_job_id: intent.jobId, lifecycle_digest: s.calls[0]!.digest,
+        });
+        const lease = s.statements.find(st => st.sql.includes('placement:cas') && st.params.includes('LEASED'))!;
+        expect(lease.sql).toMatch(/instance_type =/);
+        expect(lease.sql).toMatch(/WHERE computer_id = .* AND generation = .* AND lease_epoch =/);
+        expect(lease.params).toContain(SIZES[to].machine);
+        expect(billing.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: NOW, reason: 'resize' });
+        expect(billing.ready).not.toHaveBeenCalled();
+        // Polling the in-flight replacement does not launch or close billing twice.
+        await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(s.calls).toHaveLength(1);
+        expect(billing.stopped).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['STOPPED', 'RUNNING'] as const)('%s upgrade without regional capacity keeps the old type and epoch', async state => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ state, instance_type: 'm6i.large', lease_until: new Date(NOW.getTime() + 3_600_000) })] }, {
+            entitlement: paid('cmp-4'), meter: billing, e: resizeEnv({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1' }),
+        });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable', error: 'region_capacity' });
+        expect(s.placements[0]).toMatchObject({ state, instance_type: 'm6i.large', generation: 1, lease_epoch: 0, fence_token: FENCE });
+        expect(s.calls).toEqual([]);
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('global capacity checks the new vCPU, even with room in the home region', async () => {
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), e: resizeEnv({ AWS_MAX_RUNNING: '1' }) });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable', error: 'max_running' });
+        expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', generation: 1, lease_epoch: 0 });
+        expect(s.calls).toEqual([]);
+    });
+
+    it.each(['generation', 'lease_epoch'] as const)('a competing %s update refuses the resize without launching or closing billing', async counter => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, {
+            entitlement: paid('cmp-4'), meter: billing, e: resizeEnv(),
+            randomBytes: () => { s.placements[0]![counter] = 9; return Buffer.from(NONCE_BYTES); },
+        });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'cas_conflict' });
+        expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', [counter]: 9, fence_token: FENCE });
+        expect(s.calls).toEqual([]);
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('resolves the legacy lazy tier source on open', async () => {
+        const tierFor = vi.fn(async () => 'compute4' as const);
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { tierFor, e: resizeEnv() });
+        await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(tierFor).toHaveBeenCalledWith(U1);
+        expect(s.calls[0]!.intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.xlarge' });
+    });
+
+    it('an unchanged paid size keeps start-in-place and does not close billing', async () => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('std-2'), meter: billing, e: resizeEnv() });
+        await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(s.calls[0]!.intent).toMatchObject({ operation: 'start', instanceType: 'm6i.large', targetGeneration: 1 });
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('a type outside the deployment allowlist refuses before the placement changes', async () => {
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), e: startMode() });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_intent_invalid' });
+        expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', generation: 1 });
+        expect(s.calls).toEqual([]);
+    });
+
+    it('a refused lifecycle start is never reported as a successful resize', async () => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), meter: billing, e: resizeEnv(), failStart: true });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_lifecycle_start_failed' });
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+        expect(billing.stopped).not.toHaveBeenCalled();
     });
 });
 

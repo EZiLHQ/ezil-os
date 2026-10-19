@@ -10,7 +10,7 @@
  * variable means.
  */
 
-import type { SizeCode } from '@/server/billing/v2/contract';
+import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
 
 export type Env = Record<string, string | undefined>;
 
@@ -131,9 +131,9 @@ export function regionCapEnv(region: string): string {
  */
 export const AWS_TIERS = {
     free: ['t3a.medium', 't3.medium'],
-    plus: ['m6i.large'],
-    compute4: ['m6i.xlarge'],
-    compute8: ['m6i.2xlarge'],
+    plus: [SIZES['std-2'].machine],
+    compute4: [SIZES['cmp-4'].machine],
+    compute8: [SIZES['cmp-8'].machine],
 } as const satisfies Record<string, readonly string[]>;
 export type AwsTier = keyof typeof AWS_TIERS;
 

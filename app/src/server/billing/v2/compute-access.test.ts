@@ -300,11 +300,16 @@ describe('gateComputerStart', () => {
         expect(admit).toHaveBeenCalledWith(expect.objectContaining({ size: 'std-2', planSku: 'compute_monthly_v2', paymentIssue: false }));
     });
 
-    it.each([['m6i.xlarge', 'cmp-4'], [null, 'cmp-8']] as const)('AWS type %s uses decision size %s', async (instanceType, size) => {
+    it.each(['m6i.large', 'm6i.xlarge', null])('AWS type %s gates the entitled size before resizing', async instanceType => {
         const admit = vi.spyOn(rating, 'admitStart');
         const { deps } = fixture({ config: enforced(), subs: [subscription({ sku: 'compute_monthly_v2' })], grants: [grant()], sizePreference: 'cmp-8' });
         expect(await gate(deps, { instanceType })).toEqual({ allowed: true });
-        expect(admit).toHaveBeenCalledWith(expect.objectContaining({ size }));
+        expect(admit).toHaveBeenCalledWith(expect.objectContaining({ size: 'cmp-8' }));
+    });
+
+    it('a downgraded Standard plan admits the next open at std-2 despite its old cmp-4 placement', async () => {
+        const { deps } = fixture({ config: enforced(), subs: [subscription()], grants: [grant()] });
+        expect(await gate(deps, { instanceType: 'm6i.xlarge' })).toEqual({ allowed: true });
     });
 
     it('a successful shadow decision is logged once and allowed', async () => {

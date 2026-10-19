@@ -915,7 +915,7 @@ export function noNonCloudflarePlacement(computerId: SQL): SQL {
 export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
 
 /**
- * `STOPPED → LEASED`, reserving `lease_epoch + 1` (and `generation + 1` for a
+ * `STOPPED → LEASED` (also RUNNING for a resize), reserving `lease_epoch + 1` (and `generation + 1` for a
  * replace or recovery, C-3). Only inside the admission transaction, with that
  * admission's ticket.
  */
@@ -929,6 +929,8 @@ export async function leasePlacement(
         expected: { generation: number; leaseEpoch: number };
         leaseUntil: Date;
         replace?: boolean;
+        /** Admission's selected type, written with the new generation and lease. */
+        resizeInstanceType?: string;
         /** Written in the SAME compare-and-swap as the lease: the job, fence and enrollment nonce hash of this boot. */
         fields?: PlacementFields;
     },
@@ -936,15 +938,22 @@ export async function leasePlacement(
     assertAdmissionLock(tx, lock);
     consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'lease' });
     const { record: current } = await readPlacement(tx, input.computerId);
+    if (input.resizeInstanceType !== undefined && (!input.replace || !input.resizeInstanceType || input.resizeInstanceType === current?.instanceType)) {
+        return { ok: false, reason: 'illegal_transition' };
+    }
     // A failed enrollment still owns a live instance. Only a fresh replace may lease it.
     const recover = input.replace && current?.state === 'UNCONFIRMED' && current.lastError === ENROLLMENT_FAILED;
     return casInTx(
         tx,
         input.computerId,
-        { ...input.expected, state: recover ? 'UNCONFIRMED' : 'STOPPED' },
+        { ...input.expected, state: recover ? 'UNCONFIRMED' : input.resizeInstanceType && current?.state === 'RUNNING' ? 'RUNNING' : 'STOPPED' },
         'LEASED',
         { generation: input.replace ? 1 : 0, leaseEpoch: 1 },
-        { ...input.fields, ...(input.replace ? { instanceId: null } : {}), leaseUntil: input.leaseUntil, lastError: null },
+        {
+            ...input.fields, ...(input.replace ? { instanceId: null } : {}), leaseUntil: input.leaseUntil, lastError: null,
+            // A caller's miscellaneous fields cannot bypass the type/region admission checked.
+            instanceType: input.resizeInstanceType ?? current?.instanceType, region: current?.region,
+        },
         // Only the recorded owner's aws-ec2 row matches: a Cloudflare row is never leased under
         // AWS caps, and a re-keyed or re-inserted ezil_computers row cannot claim a placement.
         { provider: 'aws-ec2', ownerUserId: input.ownerUserId, lastError: recover ? ENROLLMENT_FAILED : undefined },

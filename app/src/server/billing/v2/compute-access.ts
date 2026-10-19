@@ -128,10 +128,12 @@ export async function gateComputerStart({ deps, userId, computerId, kind, instan
         // Preview URLs are polled. An existing running session is never re-gated.
         if (await deps.store.openEpochFor(computerId)) return { allowed: true };
         const state = await loadComputeBillingState(deps, userId, now);
+        // AWS opens resize to the entitled size: gating the old type would reject
+        // a downgrade before the replacement can run, or under-rate an upgrade.
         // Paid plans omit free-cf. A paid user's pre-existing Cloudflare computer
         // uses std-2 for admission, with the same weight (1) and paid allowance.
         const size = kind === 'aws-ec2'
-            ? instanceType !== null ? sizeForInstanceType(instanceType) : state.entitledSize
+            ? state.provider === 'aws' ? state.entitledSize : instanceType !== null ? sizeForInstanceType(instanceType) : state.entitledSize
             : state.provider === 'aws' ? 'std-2' : 'free-cf';
         const decision: AdmitDecision = kind === 'aws-ec2' && state.paymentIssue
             ? { admit: false, reason: 'payment_issue' }

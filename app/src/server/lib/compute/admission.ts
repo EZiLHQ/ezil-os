@@ -150,6 +150,8 @@ export type AdmissionRequest =
           expected: { generation: number; leaseEpoch: number };
           leaseUntil: Date;
           replace?: boolean;
+          /** A paid plan change always replaces; admission reserves the new tier's vCPU. */
+          resizeTo?: Exclude<AwsTier, 'free'>;
           /** Recorded in the lease's own compare-and-swap (this boot's job, fence and enrollment nonce hash). */
           fields?: PlacementFields;
       }
@@ -205,7 +207,9 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
     const now = (deps.now ?? (() => new Date()))();
 
     // An unknown tier refuses before any statement: never a default size.
-    if (request.kind === 'create' && !isAwsTier(request.tier)) {
+    const requestedTier = request.kind === 'create' ? request.tier : request.resizeTo;
+    if ((request.kind === 'create' || requestedTier !== undefined) &&
+        (!isAwsTier(requestedTier) || (request.kind === 'lease' && requestedTier === 'free'))) {
         return { admitted: false, reason: 'aws_tier_invalid', reasons: ['aws_tier_invalid'] };
     }
 
@@ -219,12 +223,18 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
         // The lease's region is the placement's own, read inside this transaction
         // after the lock: never caller-supplied.
         const placement = request.kind === 'lease' ? (await readPlacement(tx, request.computerId)).record : null;
+        if (request.kind === 'lease' && placement &&
+            (placement.generation !== request.expected.generation || placement.leaseEpoch !== request.expected.leaseEpoch)) {
+            return { admitted: false, reason: 'cas_conflict' };
+        }
+        const replace = request.kind === 'lease' && (request.replace || request.resizeTo !== undefined);
         const region: RegionPlan =
             request.kind === 'create' ? { kind: 'create' } : { kind: 'lease', region: placement?.region ?? null };
-        // Replacing this failed boot reuses its running slot. Keep every other cap
-        // and ownership check; the lease CAS rechecks the failure and exact boot.
-        if (request.kind === 'lease' && request.replace && placement?.provider === 'aws-ec2' &&
-            placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED && placement.region &&
+        // A resize or enrollment recovery replaces its own running slot. Count the
+        // new type below, without charging both old and new vCPU against capacity.
+        if (request.kind === 'lease' && replace && placement?.provider === 'aws-ec2' &&
+            ((placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED) ||
+                (placement.state === 'RUNNING' && request.resizeTo !== undefined)) && placement.region &&
             placement.generation === request.expected.generation && placement.leaseEpoch === request.expected.leaseEpoch) {
             counters.runningCount = Math.max(0, counters.runningCount - 1);
             const reusedVcpu = instanceVcpu(placement.instanceType);
@@ -238,7 +248,8 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
                 [placement.region]: Math.max(0, (counters.runningByRegion[placement.region] ?? 0) - 1),
             };
         }
-        const instanceType = request.kind === 'create' ? instanceTypeForTier(request.tier) : placement?.instanceType;
+        const instanceType = request.kind === 'create' ? instanceTypeForTier(request.tier)
+            : request.resizeTo !== undefined ? instanceTypeForTier(request.resizeTo) : placement?.instanceType;
         const decision = decideAdmission({ config, counters, userId: request.userId, now, region, instanceType });
         if (!decision.admit) return { admitted: false, reason: decision.reason, reasons: decision.reasons };
 
@@ -251,7 +262,8 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
                       ownerUserId: request.userId,
                       expected: request.expected,
                       leaseUntil: request.leaseUntil,
-                      replace: request.replace,
+                      replace,
+                      resizeInstanceType: request.resizeTo !== undefined ? instanceType! : undefined,
                       fields: request.fields,
                   })
                 : await createAwsPlacement(tx, lock, ticket, {
