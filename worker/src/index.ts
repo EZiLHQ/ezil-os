@@ -2487,6 +2487,33 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     this.runtimeMutationTail = next.then(() => undefined, () => undefined);
     return next;
   }
+  /**
+   * Relay credential operations change only the running neko process's in-memory
+   * ICE configuration. They used to queue behind `withRuntimeMutation` and
+   * `withWorkspacePersistence`, so any checkpoint longer than the relay budget
+   * (a 36 s system-layer flush was observed) refused renewals with `relay_busy`
+   * while the desktop was healthy, and the viewer then dropped to its error state.
+   * They now serialize only with each other, and with the operations that actually
+   * stop, restart or replace the runtime (`withRuntimeTransition`): a transition
+   * fences new relay operations off and waits for an in-flight one to finish,
+   * exactly the exclusion the runtime lock used to give.
+   */
+  private relayTail: Promise<unknown> = Promise.resolve();
+  private runtimeTransitionsInFlight = 0;
+  private withRelayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.relayTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.relayTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  private async withRuntimeTransition<T>(operation: () => Promise<T>): Promise<T> {
+    this.runtimeTransitionsInFlight++;
+    try {
+      await (this.relayTail ?? Promise.resolve()).catch(() => undefined);
+      return await operation();
+    } finally {
+      this.runtimeTransitionsInFlight--;
+    }
+  }
   async desktopReachable(): Promise<boolean> {
     try {
       const response = await this.runningContainerFetch('http://127.0.0.1:8181/', {}, 8181, 1000);
@@ -2532,11 +2559,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
     const requestedAt = Date.now();
     try {
-      const state = await this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      const state = await this.withRelayOperation(async () => {
         // A queued request that outlived the caller's forwarding budget must
         // never apply a late configuration change to a resumed runtime.
         remainingRelayBudget(requestedAt);
-        if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
+        if (this.runtimeTransitionsInFlight > 0 || !this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
         const credentials = await deriveNekoCredentials(this.env, sandboxId);
         // Local TCP transport cannot start a stopped container, and its signal
         // is cancellable here without crossing the Sandbox RPC boundary.
@@ -2548,7 +2575,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           if (!servers) throw new RelayFailure('turn_unavailable');
           return { servers, expiresAt: relayExpiryFor(issuedAt, resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS)) };
         } } : {}) });
-      }));
+      });
       return { ok: true, ...state };
     } catch (error) { return relayFailureResult(error); }
   }
@@ -3157,7 +3184,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // does because the absence of a reschedule (below) is the only thing
         // marking this loop retired.
         try {
-          await this.stop();
+          await this.withRuntimeTransition(() => this.stop());
         } catch (err) {
           console.error(
             `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=workspace_operation_failed`,
@@ -3540,12 +3567,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * label) rather than `<sandboxId>`.
    */
   async terminateSandbox(): Promise<TerminateReport> {
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint()));
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint())));
   }
 
   async stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport> {
     assertAcceptanceScope(this.env, sandboxId);
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true)));
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true))));
   }
 
   private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {
@@ -3722,7 +3749,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       };
     }
     this.restartInProgress = true;
-    return this.withRuntimeMutation(async () => {
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(async () => {
     try {
       const exposedBefore = await this.getExposedPorts(hostname);
       const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
@@ -3920,7 +3947,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     } finally {
       this.restartInProgress = false;
     }
-    });
+    }));
   }
 }
 

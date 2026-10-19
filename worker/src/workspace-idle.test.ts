@@ -514,7 +514,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     );
     const probeIdx = idleBranch.indexOf('await this.probeContainerBusy()');
     const flushIdx = idleBranch.indexOf("await this.runWorkspaceFlush('alarm')");
-    const stopIdx = idleBranch.indexOf('await this.stop()');
+    const stopIdx = idleBranch.indexOf('await this.withRuntimeTransition(() => this.stop())');
     expect(probeIdx).toBeGreaterThan(-1);
     expect(flushIdx).toBeGreaterThan(-1);
     expect(stopIdx).toBeGreaterThan(-1);
@@ -589,7 +589,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
 
   it('the idle-stop path calls stop(), never destroy() — a NEW state, not explicit termination', () => {
     const idleBranch = between('if (isIdleStopDue({ lastActivityAt, now })) {', 'const outcome = await this.runWorkspaceFlush(\'alarm\', { allowDefer: true });\n    const nextIntervalSeconds');
-    expect(idleBranch).toContain('await this.stop()');
+    expect(idleBranch).toContain('await this.withRuntimeTransition(() => this.stop())');
     expect(idleBranch).not.toContain('this.destroy()');
     expect(idleBranch).not.toContain('super.destroy()');
     // Mutation-proven: temporarily changed `this.stop()` to `this.destroy()`
