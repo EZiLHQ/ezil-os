@@ -1,6 +1,7 @@
 """Offline contracts plus YAML and embedded-shell parsing for OS release workflows."""
 from pathlib import Path
 import json
+import ast
 import re
 import shlex
 import subprocess
@@ -30,6 +31,8 @@ for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app', 'macos-internal',
                 for script in re.findall(r"<<'JS'\n(.*?)\nJS(?:\n|$)", step['run'], re.S):
                     result = subprocess.run(['node', '--input-type=module', '--check'], input=script, text=True, capture_output=True)
                     assert result.returncode == 0, (name, step.get('name'), result.stderr)
+                for script in re.findall(r"<<'PY'\n(.*?)\nPY(?:\n|$)", step['run'], re.S):
+                    ast.parse(script)
             if 'script' in step.get('with', {}):
                 script = step['with']['script']
                 result = subprocess.run(['node', '--input-type=module', '--check'], input='async function githubScript() {\n' + script + '\n}', text=True, capture_output=True)
@@ -105,15 +108,31 @@ assert 'needs' not in changes and 'if' not in changes
 assert changes['outputs']['image_changed'] == '${{ steps.image_changes.outputs.changed }}'
 assert next(step for step in changes['steps'] if step.get('uses', '').startswith('actions/checkout@'))['with']['fetch-depth'] == 0
 changed = next(step['run'] for step in changes['steps'] if step.get('id') == 'image_changes')
-assert "before='${{ github.event.before }}'" in changed
-assert '[[ -z "$before" || "$before" =~ ^0+$ ]]' in changed
-assert 'git diff --name-only --no-renames "$before" "$GITHUB_SHA"' in changed
+assert 'github.event.before' not in changed
+assert 'deployed-evidence/live-evidence/image-source.json' in changed
+assert "assert.equal(receipt.deployment, process.env.DEPLOYED_SHA)" in changed
+assert "assert.equal(receipt.branch, process.env.GITHUB_REF_NAME)" in changed
+assert "assert.equal(receipt.tested, true)" in changed
+assert '[[ -z "$source" ]] || ! git cat-file -e "$source^{commit}"' in changed
+assert 'git diff --name-only --no-renames "$source" "$GITHUB_SHA"' in changed
+assert changes['permissions'] == {'contents': 'read', 'actions': 'read'}
+assert changes['outputs']['image_source'] == '${{ steps.image_changes.outputs.source }}'
+lookup = next(step for step in changes['steps'] if step.get('id') == 'deployed')
+assert "status: 'success'" in lookup['with']['script']
+assert "run.path === '.github/workflows/preview.yml'" in lookup['with']['script']
+assert 'run.head_branch === branch' in lookup['with']['script']
+assert "['push', 'workflow_dispatch'].includes(run.event)" in lookup['with']['script']
+assert 'Date.parse(b.updated_at) - Date.parse(a.updated_at)' in lookup['with']['script']
+evidence = next(step for step in changes['steps'] if step.get('id') == 'deployed_evidence')
+assert evidence['continue-on-error'] is True
+assert evidence['with']['run-id'] == '${{ steps.deployed.outputs.run }}'
+assert evidence['with']['name'] == '${{ steps.deployed.outputs.artifact }}'
 # One workflow path list drives both change detection and reused-image tag checks.
 image_inputs = preview['env']['IMAGE_INPUTS'].split()
 assert image_inputs and len(image_inputs) == len(set(image_inputs))
 assert all(path and not path.startswith('/') and '..' not in path.split('/') for path in image_inputs)
 assert 'mapfile -t image_inputs <<< "$IMAGE_INPUTS"' in changed
-assert 'git diff --quiet --no-renames "$before" "$GITHUB_SHA" -- "${image_inputs[@]}"' in changed
+assert 'git diff --quiet --no-renames "$source" "$GITHUB_SHA" -- "${image_inputs[@]}"' in changed
 assert '(( status == 1 )) || exit "$status"' in changed
 assert '[[ "$GITHUB_REF" == refs/tags/* ]]' in changed
 # COPY/ADD sources are relative to the worker build context; --from sources
@@ -217,13 +236,22 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert "if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]" in worker['run']
     assert './node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"' in worker['run']
     assert ('args=(--env staging)' if job_name == 'preview' else 'args=()') in worker['run']
-    assert ('16 * 60' if job_name == 'preview' else '15 * 60') in worker['run'] and 'timeout --kill-after=10s' in worker['run']
+    assert '16 * 60' in worker['run'] and 'timeout --kill-after=10s' in worker['run']
     deploy = by_name[deploy_name]
     check = by_id[check_id]
     rollout = by_id['rollout']
     identity = by_id['identity']
     assert rollout['if'] == image_condition and rollout['timeout-minutes'] == 11
     assert 'node e2e/await-container-rollout.mjs' in rollout['run']
+    capture_version = by_id['container_before']
+    assert capture_version['if'] == image_condition
+    assert capture_version['run'] == 'node .github/scripts/release-state.mjs container-version'
+    assert position(prepare) < position(capture_version) < position(worker)
+    assert rollout['env']['EZIL_PREVIOUS_CONTAINER_VERSION'] == '${{ steps.container_before.outputs.version }}'
+    assert rollout['env']['EZIL_CONTAINER_APPLICATION_ID'] == '${{ steps.container_before.outputs.id }}'
+    assert 'release-state.mjs rollout-target)' in rollout['run']
+    assert 'export EZIL_EXPECTED_CONTAINER_DIGEST' in rollout['run']
+    assert rollout['run'].index('release-state.mjs rollout-target') < rollout['run'].index('node e2e/await-container-rollout.mjs')
     assert 'node e2e/verify-cloud-deployment.mjs' in identity['run']
     assert identity['timeout-minutes'] == 3
     assert not rollout.get('continue-on-error', False) and not identity.get('continue-on-error', False)
@@ -251,7 +279,20 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert upload['if'] == 'always()' and upload['uses'].startswith('actions/upload-artifact@')
     assert 'live-evidence' in upload['with']['path'].splitlines() and steps[-1] == upload
     assert 'hosted-continuity-evidence/container-rollout.json' in upload['with']['path'].splitlines()
+    receipt = by_name['Record successfully deployed image source']
+    assert receipt['if'] == ('' if job_name == 'preview' else main + ' && ') + f"steps.{check_id}.outcome == 'success'"
+    assert position(check) < position(receipt) < position(upload)
+    assert "'live-evidence/image-source.json'" in receipt['run']
+    assert receipt['env']['REUSED_IMAGE_SOURCE'] == '${{ needs.changes.outputs.image_source }}'
+    assert "assert.equal(images.tested, true)" in receipt['run']
     if job_name == 'preview':
+        routes = by_name['Validate staging Worker hostname and routes']
+        assert 'if' not in routes and not routes.get('continue-on-error', False)
+        assert position(checks[0]) < position(routes) < position(worker)
+        for assertion in ('OS_WORKER_URL must be an HTTPS origin', 'Staging must use its named Worker',
+                          'Staging must use separate routes and zones', 'Staging requires a custom desktop domain',
+                          'Staging cannot use production ezil.org routing', 'Staging routes must cover OS_WORKER_URL'):
+            assert assertion in routes['run']
         assert '--prod' not in deploy['run']
         assert 'vercel alias set "$url" ezil-os-preview.vercel.app' in deploy['run']
         assert check['env'][bypass] == '${{ secrets.' + bypass + ' }}'
@@ -268,18 +309,27 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert '/deployments/os.ezil.work?teamId=' in by_id['previous_app']['run']
     assert by_id['previous_worker']['if'] == by_id['previous_app']['if'] == main
     assert position(by_id['previous_worker']) < position(by_id['previous_app']) < position(worker)
-    assert '15 * 60' in deploy['run'] and 'timeout --kill-after=10s' in deploy['run']
-    assert '15 * 60' in rollout['run'] and 'timeout --kill-after=10s' in rollout['run']
+    assert '16 * 60' in deploy['run'] and 'timeout --kill-after=10s' in deploy['run']
+    assert '16 * 60' in rollout['run'] and 'timeout --kill-after=10s' in rollout['run']
     for step in (identity, check):
-        assert '14 * 60' in step['run'] and 'timeout --kill-after=10s' in step['run']
-    # Attempt all three restorations independently and never mask a failed check.
+        assert '15 * 60' in step['run'] and 'timeout --kill-after=10s' in step['run']
+    # Admit recovery before any mutation; attempt each restoration after admission.
     rollback_condition = "always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure')"
     rollback_worker = by_name['Roll back production Worker']
     rollback_app = by_name['Restore previous Vercel production deployment']
     rollback_check = by_name['Verify production recovery identities']
     fail = by_name['Fail after production recovery']
-    for step in (rollback_worker, rollback_app, rollback_check, fail):
-        assert step['if'] == rollback_condition
+    guard = by_id['rollback_guard']
+    assert guard['if'] == rollback_condition + " && steps.previous_container.outcome == 'success'"
+    assert 'node .github/scripts/release-state.mjs rollback-guard' in guard['run']
+    assert 'no rollback mutations will run' in guard['run'] and 'exit 1' in guard['run']
+    assert guard['timeout-minutes'] == 1 and not guard.get('continue-on-error', False)
+    assert position(check) < position(guard) < position(rollback_worker)
+    guarded_condition = rollback_condition + " && steps.rollback_guard.outcome == 'success'"
+    assert fail['if'] == rollback_condition
+    assert 'rollback mutations were skipped' in fail['run']
+    for step in (rollback_worker, rollback_app, rollback_check):
+        assert step['if'] == guarded_condition
         assert position(step) > position(check)
     assert "wrangler rollback '${{ steps.previous_worker.outputs.version }}' -y" in rollback_worker['run']
     assert "vercel promote '${{ steps.previous_app.outputs.deployment }}'" in rollback_app['run']
@@ -297,11 +347,11 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert migrations['run'] == 'node .github/scripts/production-migrations.mjs apply'
     assert migrations['env'] == {'SUPABASE_ACCESS_TOKEN': '${{ secrets.SUPABASE_ACCESS_TOKEN }}',
                                  'GITHUB_TOKEN': '${{ github.token }}'}
-    assert container['if'] == rollback_condition + " && needs.changes.outputs.image_changed == 'true' && steps.previous_container.outcome == 'success'"
+    assert container['if'] == guarded_condition + " && needs.changes.outputs.image_changed == 'true' && steps.previous_container.outcome == 'success'"
     assert container['run'] == 'node .github/scripts/release-state.mjs container-rollback'
     assert container['timeout-minutes'] == 7 and not container.get('continue-on-error', False)
     for key in ('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID'):
-        assert capture['env'][key] == container['env'][key] == rollback_check['env'][key] == '${{ secrets.' + key + ' }}'
+        assert capture['env'][key] == guard['env'][key] == container['env'][key] == rollback_check['env'][key] == '${{ secrets.' + key + ' }}'
     assert position(rollback_worker) < position(container) < position(rollback_app) < position(rollback_check) < position(fail)
     assert rollback_check['timeout-minutes'] == 3 and not rollback_check.get('continue-on-error', False)
     assert rollback_check['run'] == ('for attempt in {1..12}; do\n'
@@ -346,7 +396,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert by_name['Fail unverified tag']['run'] == 'exit 1'
     # No deployment, rollback, or migration can execute on a tag.
     for step in steps:
-        if re.search(r'wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check)|production-migrations.mjs apply', step.get('run', '')):
+        if re.search(r'wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply', step.get('run', '')):
             assert main in step.get('if', ''), step.get('name')
     assert 'exit 1' in fail['run'] and not fail.get('continue-on-error', False)
 

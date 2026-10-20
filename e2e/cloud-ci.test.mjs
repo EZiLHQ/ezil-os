@@ -13,6 +13,7 @@ import './prepare-hosted-computer.test.mjs';
 import './editor-shortcut.test.mjs';
 import './relay-lifetime.test.mjs';
 import './await-container-rollout.test.mjs';
+import { awaitContainerRollout } from './await-container-rollout.mjs';
 import http from 'node:http';
 import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout, appRequest } from './deployed-target.mjs';
 import './sign-in.test.mjs';
@@ -330,7 +331,7 @@ test('production requires both production aliases to resolve the exact returned 
 });
 
 const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
-const { readState, pullCloudflareImage, restoreVercel } = await import('../.github/scripts/release-state.mjs');
+const { readState, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
 
 test('image keys rebuild changed base and branding independently without changing local pins', () => {
   const tree = p => `${p}-original`;
@@ -420,6 +421,203 @@ test('Vercel rollback refuses mismatched identities, untrusted hostnames and los
 const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
 const previewWorkflow = parseWorkflow(workflowText);
 
+test('image baseline lookup selects successful deployments on the target branch only', async () => {
+  const step = previewWorkflow.jobs.find(j => j.name === 'changes').steps.find(s => s.text.includes('id: deployed\n'));
+  const script = step.text.match(/script: \|\n([\s\S]*)$/)[1];
+  const outputs = {};
+  const valid = {id:10, updated_at:'2026-10-20T02:00:00Z', run_attempt:2, path:'.github/workflows/preview.yml',
+    head_branch:'main', head_sha:sha, conclusion:'success', event:'push'};
+  const github = {rest:{actions:{listWorkflowRuns:async args => {
+    assert.equal(args.branch, 'main');
+    assert.equal(args.status, 'success');
+    return {data:{workflow_runs:[
+      // A rerun of an older run can be the most recent successful deployment.
+      {...valid,id:20,updated_at:'2026-10-20T01:00:00Z'}, {...valid,id:11,conclusion:'failure'},
+      {...valid,id:12,run_number:12,head_branch:'preview'}, {...valid,id:13,run_number:13,event:'pull_request'},
+      {...valid,id:14,run_number:14,path:'.github/workflows/image.yml'}, valid,
+    ]}};
+  }}}};
+  const execute = new (Object.getPrototypeOf(async function(){}).constructor)('github', 'context', 'core', script);
+  await execute(github, {ref:'refs/heads/main', repo:{owner:'test',repo:'os'}, runId:15},
+    {setOutput:(key,value) => { outputs[key] = value; }, warning:assert.fail});
+  assert.deepEqual(outputs, {run:'10', sha, artifact:'live-evidence-main-10-2'});
+  let warnings = 0;
+  await execute({rest:{actions:{listWorkflowRuns:async () => { throw new Error('unavailable'); }}}},
+    {ref:'refs/heads/main'}, {setOutput:assert.fail, warning:() => warnings++});
+  assert.equal(warnings, 1);
+});
+
+test('failed image push remains drift on an app-only successor; untrusted or absent receipts rebuild', t => {
+  const step = previewWorkflow.jobs.find(j => j.name === 'changes').steps.find(s => s.text.includes('id: image_changes\n'));
+  const script = step.text.match(/run: \|\n([\s\S]*)$/)[1];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-deployed-source-'));
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  fs.mkdirSync(path.join(dir, 'deployed-evidence/live-evidence'), {recursive:true});
+  const receiptFile = path.join(dir, 'deployed-evidence/live-evidence/image-source.json');
+  // Push A changed the image but failed. B contains A's image plus an app change.
+  // Both differ from the deployed image source even though A -> B is app-only.
+  const deployed = 'b'.repeat(40), pushA = 'c'.repeat(40), pushB = 'd'.repeat(40);
+  const base = {source:sha, deployment:deployed, branch:'main', tested:true};
+  const shim = `
+    git() {
+      if [[ "$1" == cat-file ]]; then [[ "$3" == '${sha}^{commit}' ]]; return; fi
+      [[ "$1" == diff && "$3" == --no-renames && "$4" == '${sha}' && "$5" == '${pushB}' ]] || return 42
+      if [[ "$2" == --name-only ]]; then echo worker/Dockerfile; return; fi
+      [[ "$6" == -- && "$7" == worker/Dockerfile ]] || return 42
+      return "$TEST_IMAGE_DRIFT"
+    }
+  `;
+  for (const [receipt, downloaded, drift, ref, changed] of [
+    [base, 'true', '1', 'refs/heads/main', 'true'],
+    [base, 'true', '0', 'refs/heads/main', 'false'],
+    [base, 'true', '1', 'refs/tags/v1.2.3', 'false'],
+    [null, 'true', '0', 'refs/heads/main', 'true'],
+    [base, 'false', '0', 'refs/heads/main', 'true'],
+    [{...base,source:pushA}, 'true', '0', 'refs/heads/main', 'true'],
+    [{...base,deployment:pushA}, 'true', '0', 'refs/heads/main', 'true'],
+    [{...base,branch:'preview'}, 'true', '0', 'refs/heads/main', 'true'],
+    [{...base,tested:false}, 'true', '0', 'refs/heads/main', 'true'],
+    [{...base,source:'invalid'}, 'true', '0', 'refs/heads/main', 'true'],
+  ]) {
+    fs.writeFileSync(receiptFile, JSON.stringify(receipt));
+    const output = path.join(dir, 'github-output'); fs.writeFileSync(output, '');
+    const result = runWorkflowScript('bash', ['-e', '-c', shim + script], {cwd:dir, env:{PATH:process.env.PATH,
+      DEPLOYED_SHA:deployed, EVIDENCE_DOWNLOADED:downloaded, IMAGE_INPUTS:'worker/Dockerfile',
+      GITHUB_SHA:pushB, GITHUB_EVENT_BEFORE:pushA, GITHUB_REF:ref, GITHUB_REF_NAME:'main',
+      GITHUB_OUTPUT:output, TEST_IMAGE_DRIFT:drift}});
+    assert.equal(result.status, 0, result.output);
+    assert.match(fs.readFileSync(output, 'utf8'), new RegExp(`^changed=${changed}$`, 'm'));
+  }
+});
+
+test('successful deployment receipts preserve reused image source instead of the app-only commit', () => {
+  for (const name of ['preview', 'production']) {
+    const job = previewWorkflow.jobs.find(j => j.name === name);
+    const step = job.steps.find(s => s.line === '- name: Record successfully deployed image source');
+    assert.match(step.text, new RegExp(`steps.live_${name}.outcome == 'success'`));
+    const script = step.text.match(/<<'JS'\n([\s\S]*?)\nJS/)[1].replace(/^import .*;\n/gm, '');
+    for (const changed of ['true', 'false']) {
+      let saved;
+      const source = 'b'.repeat(40);
+      new Function('assert', 'fs', 'process', script)(assert, {
+        readFileSync:() => JSON.stringify({source:sha,tested:true}),
+        writeFileSync:(file, body) => { assert.equal(file, 'live-evidence/image-source.json'); saved = JSON.parse(body); },
+      }, {env:{IMAGE_CHANGED:changed, REUSED_IMAGE_SOURCE:source, EZIL_DEPLOY_SHA:sha, GITHUB_REF_NAME:name}});
+      assert.deepEqual(saved, {source:changed === 'true' ? sha : source, tested:true, deployment:sha, branch:name});
+    }
+  }
+});
+
+test('staging hostname validation rejects production and unrelated origins before deployment', () => {
+  const job = previewWorkflow.jobs.find(j => j.name === 'preview');
+  const step = job.steps.find(s => s.line === '- name: Validate staging Worker hostname and routes');
+  assert.ok(job.steps.indexOf(step) < job.steps.findIndex(s => /wrangler deploy\b/.test(s.text)));
+  // The lightweight contract parser flattens indentation; Python needs the raw block.
+  const script = workflowText.slice(workflowText.indexOf('      - name: Validate staging Worker hostname and routes'))
+    .match(/<<'PY'\n([\s\S]*?)\n          PY/)[1].replace(/^          /gm, '');
+  for (const [url, success] of [
+    ['https://api-desktop-staging.ezil.work', true], ['https://api-desktop-staging.ezil.work/', true],
+    ['https://api-desktop.ezil.org', false], ['https://os.ezil.work', false],
+    ['https://other.example', false], ['https://os-staging.test.workers.dev', false],
+    ['http://api-desktop-staging.ezil.work', false], ['https://api-desktop-staging.ezil.work/path', false],
+    ['https://user@api-desktop-staging.ezil.work', false], ['https://api-desktop-staging.ezil.work:444', false],
+    ['https://api-desktop-staging.ezil.work?foo=bar', false],
+  ]) {
+    const result = runWorkflowScript('python3', ['-c', script], {env:{PATH:process.env.PATH,
+      EZIL_WORKER_NAME:'ezil-os-worker-staging', EZIL_E2E_WORKER:url}});
+    assert.equal(result.status === 0, success, `${url}: ${result.output}`);
+  }
+});
+
+test('recovery mutations are skipped when ownership is lost, but release failure is preserved', () => {
+  const job = previewWorkflow.jobs.find(j => j.name === 'production');
+  const guard = job.steps.find(s => s.text.includes('id: rollback_guard\n'));
+  const mutations = job.steps.filter(s => /wrangler rollback|release-state.mjs container-rollback|vercel promote/.test(s.text));
+  assert.equal(mutations.length, 3);
+  for (const outcome of ['failure', 'skipped', 'cancelled', 'success']) {
+    const steps = Object.fromEntries(['previous_worker','previous_app','previous_container','worker','production_app',
+      'rollout','identity','live_production'].map(id => [id,{outcome:'success'}]));
+    steps.live_production.outcome = 'failure'; steps.rollback_guard = {outcome};
+    for (const step of [...mutations, job.steps.find(s => s.line === '- name: Fail after production recovery')]) {
+      assert.ok(job.steps.indexOf(guard) < job.steps.indexOf(step));
+      const condition = step.text.match(/^if: (.+)$/m)[1];
+      const admitted = new Function('github','steps','needs','always', `return (${condition})`)(
+        {ref:'refs/heads/main'}, steps, {changes:{outputs:{image_changed:'true'}}}, () => true);
+      assert.equal(admitted, step.line.includes('Fail after') || outcome === 'success');
+    }
+  }
+  const script = guard.text.match(/run: \|\n([\s\S]*)$/)[1];
+  const failure = runWorkflowScript('bash', ['-e', '-c', 'node() { return 1; };\n' + script]);
+  assert.equal(failure.status, 1);
+  assert.match(failure.output, /another release may own production; no rollback mutations will run/);
+});
+
+const rolloutEnv = {...env, EZIL_WORKER_NAME:'ezil-os-worker-staging', EZIL_CONTAINER_APPLICATION_ID:'container',
+  EZIL_PREVIOUS_CONTAINER_VERSION:'7', EZIL_EXPECTED_CONTAINER_DIGEST:`sha256:${'d'.repeat(64)}`};
+const rolloutImage = `registry.cloudflare.com/${env.CLOUDFLARE_ACCOUNT_ID}/desktop@${rolloutEnv.EZIL_EXPECTED_CONTAINER_DIGEST}`;
+const newRollout = {id:'new-rollout',created_at:'2026-10-20T00:00:00Z',target_version:8,current_version:7,
+  status:'completed',target_configuration:{image:rolloutImage},current_configuration:{image:rolloutImage},steps:[{status:'completed'}]};
+function fencedRolloutFixture(states) {
+  let time = 0, poll = 0;
+  return {now:() => time, sleep:async ms => { time += ms; }, pollMs:5, budgetMs:20,
+    fetchImpl:async input => {
+      const state = states[Math.min(poll, states.length - 1)];
+      const application = {id:'container', name:'ezil-os-worker-staging-sandbox', version:state.target_version,
+        configuration:state.target_configuration};
+      const pathname = new URL(input).pathname;
+      const result = pathname.endsWith('/applications') ? [application]
+        : pathname.endsWith('/rollouts') ? (poll++, [state]) : application;
+      return {ok:true,json:async () => ({result})};
+    }};
+}
+test('fenced rollout waits past old completed rollouts, even when the image digest is identical', async () => {
+  const old = {...newRollout,id:'old-rollout',target_version:7,current_version:6};
+  const result = await awaitContainerRollout(rolloutEnv, fencedRolloutFixture([old,newRollout]));
+  assert.equal(result.rollout, 'new-rollout');
+  assert.equal(result.version, 8); assert.equal(result.elapsedMs, 5);
+  await assert.rejects(awaitContainerRollout(rolloutEnv, fencedRolloutFixture([old])), /within its budget/);
+  await assert.rejects(awaitContainerRollout(rolloutEnv, fencedRolloutFixture([
+    {...newRollout,target_configuration:{image:rolloutImage.replace('d'.repeat(64),'e'.repeat(64))}},
+  ])), /candidate image digest/);
+  for (const patch of [{EZIL_EXPECTED_CONTAINER_DIGEST:''}, {EZIL_PREVIOUS_CONTAINER_VERSION:''},
+    {EZIL_PREVIOUS_CONTAINER_VERSION:'NaN'}, {EZIL_CONTAINER_APPLICATION_ID:'replacement'}]) {
+    await assert.rejects(awaitContainerRollout({...rolloutEnv,...patch}, fencedRolloutFixture([newRollout])));
+  }
+});
+
+test('candidate Cloudflare digest is bound to the tested GHCR layers, source and pre-deploy application', async () => {
+  const images = {source:sha,tested:true,desktop_digest:`sha256:${'f'.repeat(64)}`};
+  const local = {Config:{Labels:{'org.opencontainers.image.revision':sha}},RootFS:{Layers:['tested-layer']}};
+  function fixture({cloudflare = local, states = [newRollout], id = 'container'} = {}) {
+    let poll = 0;
+    const calls = [];
+    return {calls, fetchImpl:async (input, options) => {
+      const pathname = new URL(input).pathname;
+      assert.equal(options.redirect, 'error');
+      const result = pathname.endsWith('/applications') ? [{id,version:7,name:'ezil-os-worker-staging-sandbox'}]
+        : pathname.endsWith('/rollouts') ? [states[Math.min(poll++,states.length - 1)]]
+        : {username:'test',password:'test'};
+      return {ok:true,json:async () => ({result})};
+    }, sleep:async () => {}, exec:(cmd, args) => {
+      calls.push(args);
+      if (args[0] === 'image') return JSON.stringify([args.at(-1).startsWith('registry.cloudflare.com/') ? cloudflare : local]);
+      return '';
+    }};
+  }
+  const f = fixture({states:[{...newRollout,target_version:7},newRollout]});
+  assert.deepEqual(await captureContainerVersion(rolloutEnv, f.fetchImpl), {id:'container',version:7});
+  assert.equal(await candidateRolloutDigest(images, rolloutEnv, f), rolloutEnv.EZIL_EXPECTED_CONTAINER_DIGEST);
+  assert.ok(f.calls.some(args => args[0] === 'pull' && args[1] === `ghcr.io/ezilhq/ezil-os-desktop@${images.desktop_digest}`));
+  for (const config of [{cloudflare:{...local,RootFS:{Layers:['wrong-layer']}}},
+    {cloudflare:{...local,Config:{Labels:{'org.opencontainers.image.revision':'b'.repeat(40)}}}},
+    {cloudflare:{...local,RootFS:{}}}, {id:'other'}, {states:[{...newRollout,target_version:7}]}]) {
+    await assert.rejects(candidateRolloutDigest(images, rolloutEnv, fixture(config)));
+  }
+  for (const patch of [{source:'b'.repeat(40)}, {tested:false}, {desktop_digest:'tag'}]) {
+    await assert.rejects(candidateRolloutDigest({...images,...patch}, rolloutEnv, fixture()));
+  }
+});
+
 function runWorkflowScript(command, args, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-workflow-script-'));
   const log = path.join(dir, 'output');
@@ -454,6 +652,13 @@ test('both deploy jobs gate live-check on completed rollouts and deployment iden
     assert.ok(deploy >= 0 && deploy < rollout && rollout < identity && identity < job.steps.indexOf(checks[0]),
       `${name} must deploy, await rollout, and verify identity before live-check`);
     assert.match(job.steps[rollout].text, /if: .*needs.changes.outputs.image_changed == 'true'/);
+    const capture = job.steps.findIndex(step => /release-state.mjs container-version/.test(step.text));
+    const worker = job.steps.findIndex(step => /wrangler deploy\b/.test(step.text));
+    assert.ok(capture >= 0 && capture < worker && worker < rollout);
+    assert.match(job.steps[rollout].text, /EZIL_PREVIOUS_CONTAINER_VERSION: \$\{\{ steps.container_before.outputs.version \}\}/);
+    assert.match(job.steps[rollout].text, /EZIL_CONTAINER_APPLICATION_ID: \$\{\{ steps.container_before.outputs.id \}\}/);
+    assert.match(job.steps[rollout].text, /EZIL_EXPECTED_CONTAINER_DIGEST="\$\(.*release-state.mjs rollout-target\)"/);
+    assert.match(job.steps[rollout].text, /export EZIL_EXPECTED_CONTAINER_DIGEST/);
     for (const index of [rollout, identity]) assert.ok(!job.steps[index].keys.includes('continue-on-error'));
     assert.match(job.steps[identity].text, new RegExp(`EZIL_E2E_APP: \\$\\{\\{ steps\\.${name === 'preview' ? 'preview_app' : 'production_app'}\\.outputs\\.url \\}\\}`));
     assert.match(job.steps[deploy].text, /echo "url=\$url" >> "\$GITHUB_OUTPUT"/);
@@ -493,7 +698,7 @@ test('rollout and identity failures recover main with or without a new image, ne
   for (const imageChanged of ['true', 'false']) {
     for (const failure of ['worker', 'production_app', 'rollout', 'identity', 'live_production', null]) {
       const steps = Object.fromEntries(['previous_worker', 'previous_app', 'previous_container',
-        'worker', 'production_app', 'rollout', 'identity', 'live_production'].map(id => [id, { outcome: 'success' }]));
+        'rollback_guard', 'worker', 'production_app', 'rollout', 'identity', 'live_production'].map(id => [id, { outcome: 'success' }]));
       if (failure) {
         steps[failure].outcome = 'failure';
         // Earlier gate failures skip the default-success live check.
@@ -669,7 +874,7 @@ test('image change paths cover desktop inputs without rebuilding for app/Worker 
 test('tag verification never deploys or recovers production, and failed live checks cannot publish', () => {
   const job = previewWorkflow.jobs.find(job => job.name === 'production');
   for (const step of job.steps) {
-    if (/wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check)|production-migrations.mjs apply/.test(step.text)) {
+    if (/wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply/.test(step.text)) {
       assert.match(step.text, /if: .*github\.ref == 'refs\/heads\/main'/);
     }
     if (/gh release edit|imagetools create|release evidence and wait/.test(step.text)) {
