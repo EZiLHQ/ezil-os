@@ -83,6 +83,14 @@ export const SHELL_API_ROUTES = {
      */
     focus: '/api/shell/focus',
     /**
+     * GET = what Settings → System may say about the machine behind a computer
+     * (`?computerId=`): recorded provider, configured size, lifecycle state. Read
+     * only. Feature-detected: `shell/ezil/ui/Settings/tabs/system.js` shows the
+     * machine as unknown when this key is absent, rather than calling a URL it
+     * invented. Present only while `src/app/api/shell/system/route.ts` exists.
+     */
+    system: '/api/shell/system',
+    /**
      * POST = a batch of crash/error telemetry events (see
      * `docs/telemetry-design.md`). Same feature-detection contract as
      * `focus`: `shell/ezil/telemetry.js` reads `desktopState.endpoints.telemetry`

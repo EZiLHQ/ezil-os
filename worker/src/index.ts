@@ -18,6 +18,7 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *          (`mode` is DETECTED from the live exposed-port list when the caller
  *          omits `?desktopMode=`; `guacamoleRunning` means "the desktop port
  *          for the reported `mode` is exposed" — read the two together)
+ *   GET    /sandbox/:name/system   → { ok, imageId } (HMAC-gated, storage-only)
  *   POST   /sandbox/:name/workspace-diag → { ok, sandboxId, op, slot, exists, bytes, sha256, expectedSha256, matches, wrote }
  *          (HMAC-gated diagnostic: mounts the R2 workspace bucket and operates on
  *          named, allowlisted marker slots to prove deterministic R2 persistence
@@ -815,6 +816,7 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  getImageId(): Promise<string | null>;
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
   resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }>;
@@ -1945,6 +1947,8 @@ const SYSTEM_CHANGES_NOT_SAVED_KEY = 'ezil:systemChangesNotSaved';
 const SYSTEM_TOO_LARGE_KEY = 'ezil:systemTooLarge';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+/** Image observed by the system codec on the current container, never the restored snapshot's image. */
+const IMAGE_ID_KEY = 'ezil:imageId';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
@@ -2446,6 +2450,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
   }
   override async onStart(): Promise<void> {
+    // A replacement container may run a different image; wait for its own codec result.
+    try {
+      await this.ctx.storage.delete(IMAGE_ID_KEY);
+    } catch {
+      console.error('[image_id] could not clear previous image');
+    }
     this.observeRuntimeExit();
     bootLog('runtime_lifecycle', 'start');
     await super.onStart();
@@ -2680,6 +2690,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const systemStartedAt = Date.now();
           const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
             log: (message) => console.error(message) });
+          if (system.ok) await this.recordImageId(system.imageId);
           bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
             detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
         }
@@ -2869,6 +2880,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     try {
       const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
         log: (message) => console.error(`[system_flush] ${message}`) });
+      if (system.ok) await this.recordImageId(system.imageId);
       // `too_large` stays too large until the user deletes something, so it
       // waits out the interval too. Re-walking up to 512 MiB on every 10-60 s
       // cycle was already waste for a present user; SIGNAL C's hold
@@ -3283,6 +3295,23 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     await this.ctx.storage.put(SYSTEM_CHANGES_NOT_SAVED_KEY, { reason, at: now });
     bootLog('system_flush', 'end', { status: 'error', detail: `persistence_health=system_changes_not_saved,reason=${reason}` });
     return { proceed: true, unsaved: reason };
+  }
+
+  private async recordImageId(imageId: unknown): Promise<void> {
+    try {
+      if (typeof imageId === 'string' && imageId !== 'unknown' && imageId.length > 0 && imageId.length <= 128
+          && !/[^A-Za-z0-9._:-]/.test(imageId) && this.containerIsRunning()) {
+        await this.ctx.storage.put(IMAGE_ID_KEY, imageId);
+      }
+    } catch {
+      // Optional system metadata must never change a persistence outcome.
+      console.error('[image_id] could not record running image');
+    }
+  }
+
+  /** Storage-only system metadata: never probes or starts the container. */
+  async getImageId(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(IMAGE_ID_KEY)) ?? null;
   }
 
   /** Persistence-health signals for operators and the app (no file content). */
@@ -7055,6 +7084,18 @@ export default {
     const statusMatch = path.match(/^\/sandbox\/([^/]+)\/status$/);
     if (method === 'GET' && statusMatch) {
       return handleStatus(env, url, decodeURIComponent(statusMatch[1]), url.searchParams.get('desktopMode') ?? undefined);
+    }
+
+    const systemMatch = path.match(/^\/sandbox\/([^/]+)\/system$/);
+    if (method === 'GET' && systemMatch) {
+      if (resolvePreviewSecrets(env).length === 0) return json({ ok: false, error: 'system_auth_not_configured' }, 401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      let imageId: string | null = null;
+      try {
+        imageId = await openSandbox(env, decodeURIComponent(systemMatch[1])).getImageId();
+      } catch { /* Optional storage metadata; never probe or start a container. */ }
+      return json({ ok: true, imageId });
     }
 
     const workspaceDiagMatch = path.match(/^\/sandbox\/([^/]+)\/workspace-diag$/);

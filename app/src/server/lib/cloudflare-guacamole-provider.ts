@@ -1203,7 +1203,7 @@ export async function requestGuacamoleDesktopRestart(
     }
 }
 
-/** Health-check the named sandbox. */
+/** Read the named sandbox's status without starting its container. */
 export async function getGuacamoleSandboxStatus(
     config: CloudflareGuacamoleConfig,
     sandboxName: string,
@@ -1221,6 +1221,34 @@ export async function getGuacamoleSandboxStatus(
         return (await res.json()) as { ok: boolean; guacamoleRunning?: boolean; error?: string };
     } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+}
+
+/** Read HMAC-protected system metadata from storage without waking the container. */
+export async function getGuacamoleSandboxSystem(
+    config: CloudflareGuacamoleConfig,
+    sandboxName: string,
+    auth: WorkerAuth = { kind: 'v1' },
+): Promise<{ ok: boolean; imageId: string | null }> {
+    const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+    if (!config.isConfigured || !hmacSecret) return { ok: false, imageId: null };
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/system`;
+    try {
+        const res = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+                ...controlAuthHeaders(hmacSecret, auth, 'GET', endpoint, ''),
+                [CORRELATION_HEADER]: newCorrelationId(),
+            },
+            signal: AbortSignal.timeout(10_000),
+            cache: 'no-store',
+        });
+        if (!res.ok) return { ok: false, imageId: null };
+        const data = await res.json() as { ok?: unknown; imageId?: unknown; error?: unknown } | null;
+        if (data?.ok !== true || data.error) return { ok: false, imageId: null };
+        return { ok: true, imageId: typeof data.imageId === 'string' ? data.imageId : null };
+    } catch {
+        return { ok: false, imageId: null };
     }
 }
 
