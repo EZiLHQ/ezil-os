@@ -62,11 +62,10 @@ jobs:
           EZIL_VALIDATE_IMAGE: ${{ steps.build.outputs.desktop_ref }}
           EZIL_NEKO_IMAGE: ${{ steps.build.outputs.desktop_ref }}
         run: bash .github/scripts/test-desktop.sh
-      # EZiL Chat (bundled Copilot Chat on the gateway-subset mock): evidence-only until its first
-      # green run on a built image, then it joins test-desktop.sh as a blocking suite.
-      - name: EZiL Chat image e2e (non-blocking evidence)
+      # EZiL Chat (bundled Copilot Chat on the gateway-subset mock): blocking since its first green
+      # run (ezil-chat-e2e.yml run 39506604051, 87 checks, fresh and returning profiles).
+      - name: EZiL Chat image e2e
         id: ezil_chat_e2e
-        continue-on-error: true
         env:
           EZIL_COPILOT_E2E_OUT: ${{ runner.temp }}/ezil-chat-e2e
         run: bash e2e/copilot-ezil-image.sh "${{ steps.build.outputs.desktop_ref }}"
