@@ -1,0 +1,59 @@
+{
+  "model": "qwen.qwen3-coder-next",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Read the output."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_image",
+          "name": "read_file",
+          "input": {}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_image",
+          "content": [
+            {
+              "type": "text",
+              "text": "Attached image:\n[image omitted: not supported by this model]"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "max_tokens": 8192,
+  "stream": true,
+  "tools": [
+    {
+      "name": "read_file",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  }
+}
