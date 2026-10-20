@@ -14,7 +14,7 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *   GET    /health                 → { ok, service, mode }
  *   POST   /sandbox/preview        → { ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }
  *   GET    /sandbox/:name/status   → { ok, sandboxName, guacamoleRunning, mode,
- *                                     desktopRunning, runningModes, modeSource }
+ *                                     desktopRunning, runningModes, modeSource, imageId }
  *          (`mode` is DETECTED from the live exposed-port list when the caller
  *          omits `?desktopMode=`; `guacamoleRunning` means "the desktop port
  *          for the reported `mode` is exposed" — read the two together)
@@ -815,6 +815,7 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  getImageId(): Promise<string | null>;
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
   resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }>;
@@ -1945,6 +1946,8 @@ const SYSTEM_CHANGES_NOT_SAVED_KEY = 'ezil:systemChangesNotSaved';
 const SYSTEM_TOO_LARGE_KEY = 'ezil:systemTooLarge';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+/** Image observed by the system codec on the current container, never the restored snapshot's image. */
+const IMAGE_ID_KEY = 'ezil:imageId';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
@@ -2446,6 +2449,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
   }
   override async onStart(): Promise<void> {
+    // A replacement container may run a different image; wait for its own codec result.
+    await this.ctx.storage.delete(IMAGE_ID_KEY);
     this.observeRuntimeExit();
     bootLog('runtime_lifecycle', 'start');
     await super.onStart();
@@ -2680,6 +2685,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const systemStartedAt = Date.now();
           const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
             log: (message) => console.error(message) });
+          if (system.ok) await this.recordImageId(system.imageId);
           bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
             detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
         }
@@ -2869,6 +2875,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     try {
       const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
         log: (message) => console.error(`[system_flush] ${message}`) });
+      if (system.ok) await this.recordImageId(system.imageId);
       // `too_large` stays too large until the user deletes something, so it
       // waits out the interval too. Re-walking up to 512 MiB on every 10-60 s
       // cycle was already waste for a present user; SIGNAL C's hold
@@ -3283,6 +3290,18 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     await this.ctx.storage.put(SYSTEM_CHANGES_NOT_SAVED_KEY, { reason, at: now });
     bootLog('system_flush', 'end', { status: 'error', detail: `persistence_health=system_changes_not_saved,reason=${reason}` });
     return { proceed: true, unsaved: reason };
+  }
+
+  private async recordImageId(imageId: unknown): Promise<void> {
+    if (typeof imageId === 'string' && imageId.length > 0 && imageId.length <= 128
+        && !/[^A-Za-z0-9._:-]/.test(imageId) && this.containerIsRunning()) {
+      await this.ctx.storage.put(IMAGE_ID_KEY, imageId);
+    }
+  }
+
+  /** Storage-only status metadata: never probes or starts the container. */
+  async getImageId(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(IMAGE_ID_KEY)) ?? null;
   }
 
   /** Persistence-health signals for operators and the app (no file content). */
@@ -4745,6 +4764,7 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       desktopRunning: status.desktopRunning,
       runningModes: status.runningModes,
       modeSource: status.modeSource,
+      imageId: await sandbox.getImageId(),
     });
   } catch (err) {
     return json(

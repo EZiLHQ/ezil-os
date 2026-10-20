@@ -394,7 +394,7 @@ def merged_dpkg_status(snapshot_text):
 
 def restore():
     if os.path.exists(MANIFEST):
-        print(json.dumps({'skipped': 'already_restored'}))
+        print(json.dumps({'skipped': 'already_restored', 'imageId': image_id()}))
         return
     archive = os.path.join(work, 'archive.tar')
     digest = hashlib.sha256()
@@ -486,7 +486,7 @@ def restore():
         json.dump({'paths': restored, 'deleted': deleted, 'imageId': image_id(), 'snapshotImageId': p['snapshot'].get('imageId'), 'restoredAt': time.time()}, f)
     os.replace(MANIFEST + '.tmp', MANIFEST)
     mark_hydrated(p['snapshot'].get('generation'))
-    print(json.dumps({'restored': len(restored), 'skippedImageScoped': skipped, 'conflicts': conflicts, 'sameImage': same_image}))
+    print(json.dumps({'restored': len(restored), 'skippedImageScoped': skipped, 'conflicts': conflicts, 'sameImage': same_image, 'imageId': image_id()}))
 
 def baseline():
     os.makedirs(STATE, mode=0o700, exist_ok=True)
@@ -523,7 +523,7 @@ try:
     elif op == 'sys-baseline': baseline()
     elif op == 'sys-hydrated':
         mark_hydrated(p.get('generation'))
-        print(json.dumps({'hydrated': True}))
+        print(json.dumps({'hydrated': True, 'imageId': image_id()}))
     elif op == 'sys-cleanup': shutil.rmtree(work, ignore_errors=True)
     else: raise ValueError('unknown operation')
 except AssertionError as e:

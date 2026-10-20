@@ -42,6 +42,8 @@ export interface SystemSnapshot extends Snapshot {
 
 export interface SystemFlushOutcome {
   ok: boolean;
+  /** The capturing container's image, even when the checkpoint is unchanged. */
+  imageId?: string;
   uploaded: number;
   entries: number;
   unchanged?: boolean;
@@ -53,6 +55,8 @@ export interface SystemFlushOutcome {
 
 export interface SystemHydrateOutcome {
   ok: boolean;
+  /** The receiving container's image, not the snapshot's source image. */
+  imageId?: string;
   restored: number;
   skippedImageScoped: number;
   conflicts: number;
@@ -130,6 +134,7 @@ export async function flushSystemLayer(deps: {
       return { ...outcome, skippedReason: 'stale' };
     }
     const { imageId, replay, expectedGeneration: _expected, deletedCount: _deleted, ...shape } = captured;
+    if (typeof imageId === 'string') outcome.imageId = imageId;
     const snapshot = parseSnapshot(JSON.stringify({ ...shape, version: SYSTEM_SNAPSHOT_VERSION, generation })) as SystemSnapshot;
     outcome.entries = snapshot.entries;
     if (previous?.snapshot.sha256 === snapshot.sha256) return { ...outcome, ok: true, unchanged: true };
@@ -194,14 +199,16 @@ export async function hydrateSystemLayer(deps: {
     const head = await readHead(bucket, prefix);
     if (!head) {
       // Nothing committed yet: this container's state IS the computer's system layer.
-      await run(container, { op: 'sys-hydrated', work, generation: null }, 60_000);
+      const result = JSON.parse(await run(container, { op: 'sys-hydrated', work, generation: null }, 60_000)) as Record<string, unknown>;
+      if (typeof result.imageId === 'string') outcome.imageId = result.imageId;
       return { ...outcome, ok: true, skippedReason: 'no_snapshot' };
     }
     const snapshot = head.snapshot as SystemSnapshot;
     if (snapshot.format !== SYSTEM_LAYER_FORMAT) {
       // Never restored. Recording its generation lets this container's next capture replace it.
       log('[system-persist] discarding a system layer from an older format');
-      await run(container, { op: 'sys-hydrated', work, generation: snapshot.generation }, 60_000);
+      const result = JSON.parse(await run(container, { op: 'sys-hydrated', work, generation: snapshot.generation }, 60_000)) as Record<string, unknown>;
+      if (typeof result.imageId === 'string') outcome.imageId = result.imageId;
       return { ...outcome, ok: true, skippedReason: 'legacy_discarded' };
     }
     await container.mkdir(work, { recursive: false, sessionId: SESSIONLESS_TRANSFER });
@@ -214,6 +221,7 @@ export async function hydrateSystemLayer(deps: {
     });
     // On success the codec also marks the container hydrated, which unlocks capture.
     const result = JSON.parse(await run(container, { op: 'sys-restore', work, snapshot }, 900_000)) as Record<string, unknown>;
+    if (typeof result.imageId === 'string') outcome.imageId = result.imageId;
     if (result.skipped === 'already_restored') return { ...outcome, ok: true, skippedReason: 'already_restored' };
     Object.assign(outcome, {
       ok: true,

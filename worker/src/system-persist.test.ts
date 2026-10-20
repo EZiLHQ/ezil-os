@@ -20,6 +20,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 type Op = { kind: string; path?: string; sessionId: string; op?: string };
 
 class FakeContainerServer {
+  imageId: unknown = 'ezil-running:2026.10_20';
   files = new Map<string, Uint8Array>();
   log: Op[] = [];
   inFlightTransfers = 0;
@@ -74,9 +75,10 @@ class FakeContainerServer {
     return this.inSession('default', async () => {
       if (params.op === 'sys-restore') {
         this.restoreSaw = (params.snapshot.chunks as unknown[]).map((_c, i) => this.files.get(`${params.work}/${i}`)!);
-        return { exitCode: 0, stdout: JSON.stringify({ restored: params.snapshot.chunks.length }) };
+        return { exitCode: 0, stdout: JSON.stringify({ restored: params.snapshot.chunks.length, imageId: this.imageId }) };
       }
       if (params.op === 'sys-capture') return { exitCode: 0, stdout: JSON.stringify(this.capture(params.work)) };
+      if (params.op === 'sys-hydrated') return { exitCode: 0, stdout: JSON.stringify({ hydrated: true, imageId: this.imageId }) };
       return { exitCode: 0, stdout: '{}' };
     });
   }
@@ -91,7 +93,7 @@ async function storedLayer(count: number, { getLatency = () => 5 }: { getLatency
   const chunks = Array.from({ length: count }, (_, i) => crypto.getRandomValues(new Uint8Array(4096 + i)));
   const objects = new Map<string, Uint8Array>();
   chunks.forEach((c, i) => objects.set(chunkKey(PREFIX, generation, i), c));
-  const head = { version: 1, generation, format: 2, entries: count, sha256: await sha256(new Uint8Array([count])),
+  const head = { version: 1, generation, format: 2, imageId: 'ezil-old-image', entries: count, sha256: await sha256(new Uint8Array([count])),
     chunks: await Promise.all(chunks.map(async c => ({ sha256: await sha256(c), size: c.length }))) };
   objects.set(`${PREFIX}/${SNAPSHOT_HEAD}`, new TextEncoder().encode(JSON.stringify(head)));
   const bucket = {
@@ -186,16 +188,65 @@ describe('system layer checkpoint transfers', () => {
     const hashes = await Promise.all(chunks.map(c => sha256(c)));
     server.capture = work => {
       chunks.forEach((c, i) => server.files.set(`${work}/${i}`, c));
-      return { expectedGeneration: null, entries: 9, sha256: 'a'.repeat(64), chunks: chunks.map((c, i) => ({ size: c.length, sha256: hashes[i] })) };
+      return { imageId: server.imageId, expectedGeneration: null, entries: 9, sha256: 'a'.repeat(64), chunks: chunks.map((c, i) => ({ size: c.length, sha256: hashes[i] })) };
     };
     const outcome = await flushSystemLayer({ container: server, bucket, realPrefix: REAL_PREFIX, log: () => {} });
-    expect(outcome).toMatchObject({ ok: true, uploaded: 9 });
+    expect(outcome).toMatchObject({ ok: true, uploaded: 9, imageId: server.imageId });
     const reads = server.log.filter(o => o.kind === 'read');
     expect(reads).toHaveLength(9);
     expect(reads.every(o => o.sessionId === SESSIONLESS_TRANSFER)).toBe(true);
     expect(server.maxInFlightTransfers).toBe(SYSTEM_TRANSFER_CONCURRENCY);
     const generation = outcome.checkpoint!;
     chunks.forEach((c, i) => expect([...puts.get(chunkKey(PREFIX, generation, i))!]).toEqual([...c]));
+  });
+});
+
+describe('system layer running image ID', () => {
+  test('hydrate reports the receiving image, not the older snapshot image', async () => {
+    const { bucket } = await storedLayer(1);
+    const server = new FakeContainerServer();
+    const outcome = await hydrateSystemLayer({ container: server, bucket, realPrefix: REAL_PREFIX, log: () => {} });
+    expect(outcome).toMatchObject({ ok: true, imageId: server.imageId });
+    expect(server.log.filter(o => o.kind === 'exec').map(o => o.op)).toEqual(['sys-restore', 'sys-cleanup']);
+  });
+
+  for (const legacy of [false, true]) {
+    test(`hydrate reports the running image with ${legacy ? 'a discarded legacy snapshot' : 'no snapshot'}`, async () => {
+      const { bucket } = await storedLayer(1);
+      if (legacy) {
+        const head = JSON.parse(new TextDecoder().decode(bucket.objects.get(`${PREFIX}/${SNAPSHOT_HEAD}`)));
+        delete head.format;
+        bucket.objects.set(`${PREFIX}/${SNAPSHOT_HEAD}`, new TextEncoder().encode(JSON.stringify(head)));
+      } else {
+        bucket.objects.clear();
+      }
+      const server = new FakeContainerServer();
+      const outcome = await hydrateSystemLayer({ container: server, bucket, realPrefix: REAL_PREFIX, log: () => {} });
+      expect(outcome).toMatchObject({ ok: true, imageId: server.imageId, skippedReason: legacy ? 'legacy_discarded' : 'no_snapshot' });
+      expect(server.log.filter(o => o.kind === 'exec').map(o => o.op)).toEqual(['sys-hydrated', 'sys-cleanup']);
+    });
+  }
+
+  test('unchanged flush reports the capturing image without using the old head image', async () => {
+    const { bucket, generation } = await storedLayer(1);
+    const server = new FakeContainerServer();
+    const head = JSON.parse(new TextDecoder().decode(bucket.objects.get(`${PREFIX}/${SNAPSHOT_HEAD}`)));
+    server.capture = () => ({ ...head, expectedGeneration: generation, imageId: server.imageId });
+    const outcome = await flushSystemLayer({ container: server, bucket: {
+      ...bucket, put: async () => { throw new Error('unchanged flush must not upload'); },
+    }, realPrefix: REAL_PREFIX, log: () => {} });
+    expect(outcome).toMatchObject({ ok: true, unchanged: true, imageId: server.imageId, uploaded: 0 });
+    expect(server.log.filter(o => o.kind === 'exec').map(o => o.op)).toEqual(['sys-capture', 'sys-cleanup']);
+  });
+
+  test('already hydrated without a reported image remains unknown and adds no exec', async () => {
+    const { bucket } = await storedLayer(1);
+    const server = new FakeContainerServer();
+    server.exists = async () => ({ exists: true });
+    const outcome = await hydrateSystemLayer({ container: server, bucket, realPrefix: REAL_PREFIX, log: () => {} });
+    expect(outcome).toMatchObject({ ok: true, skippedReason: 'already_restored' });
+    expect(outcome.imageId).toBeUndefined();
+    expect(server.log.filter(o => o.kind === 'exec').map(o => o.op)).toEqual(['sys-cleanup']);
   });
 });
 

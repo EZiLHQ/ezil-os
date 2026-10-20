@@ -9,8 +9,9 @@
  * `index.ts`'s `Sandbox` (= `EzilSandboxDO`) methods run for real on a fake
  * `this`, with only the SDK's I/O surface shadowed.
  */
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { SNAPSHOT_HEAD } from './workspace-persist';
 
 // Must be registered before `./index.ts` is imported (see route-auth.test.ts).
 mock.module('cloudflare:workers', () => ({
@@ -80,6 +81,130 @@ const S3_VARS = {
   EZIL_WORKSPACE_S3_ACCESS_KEY_ID: 'AKID',
   EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY: 'sek',
 };
+
+describe('running container image ID storage', () => {
+  const imageKey = 'ezil:imageId';
+  const prefix = '11111111-2222-4333-8444-555555555555/branches/main';
+  const validId = 'EZiL-os:2026.10_20';
+  const invalidIds = [undefined, null, 42, {}, '', 'x'.repeat(129), 'image id', 'image/id', 'image\nid', 'image\n', 'imagé', 'image\0'];
+
+  async function imageFake(imageId: unknown, failed = false) {
+    const { fake, store } = await makeFake({});
+    const commands: string[] = [];
+    const hash = createHash('sha256').update('hello').digest('hex');
+    Object.assign(fake, {
+      // The workspace is ready; only the system layer needs hydration.
+      lastOkCheckpoint: { at: Date.now(), outcome: { ok: true } },
+      exists: async (path: string) => ({ exists: path.endsWith('.ezil-hydrated.json') }),
+      readFile: async (path: string) => path.endsWith('.ezil-hydrated.json')
+        ? { content: JSON.stringify({ version: 1, prefix, mountPath: MOUNT_PATH, hydratedAt: new Date().toISOString() }), encoding: 'utf-8' }
+        : { content: Buffer.from('hello').toString('base64'), encoding: 'base64' },
+      exec: async (command: string) => {
+        const params = JSON.parse(/ '(\{.*\})'$/s.exec(command)![1]!.replace(/'"'"'/g, "'"));
+        commands.push(params.op);
+        return { exitCode: failed && params.op !== 'sys-cleanup' ? 1 : 0,
+          stdout: JSON.stringify(params.op === 'sys-capture'
+            ? { imageId, expectedGeneration: null, sha256: hash, entries: 1, chunks: [{ size: 5, sha256: hash }] }
+            : { hydrated: true, restored: 1, imageId }), stderr: '' };
+      },
+      listSchedules: async () => [], deleteSchedules: () => undefined, schedule: async () => undefined,
+    });
+    return { fake, store, commands };
+  }
+
+  const operations = {
+    hydrate: async (fake: Awaited<ReturnType<typeof imageFake>>['fake']) => {
+      const result = await fake.hydrateWorkspace({ mountPath: MOUNT_PATH, prefix });
+      expect(result.mounted).toBe(true);
+    },
+    flush: async (fake: Awaited<ReturnType<typeof imageFake>>['fake']) => fake.runSystemFlush(fake.env.SANDBOX_WORKSPACE_R2_BUCKET, prefix, true),
+  };
+
+  for (const [name, operation] of Object.entries(operations)) {
+    it(`${name} stores valid image IDs, including the 1 and 128 character boundaries`, async () => {
+      for (const imageId of [validId, 'a', 'Z'.repeat(128)]) {
+        const { fake, store, commands } = await imageFake(imageId);
+        expect(await fake.getImageId()).toBeNull();
+        await operation(fake);
+        expect(store.get(imageKey)).toBe(imageId);
+        expect(await fake.getImageId()).toBe(imageId);
+        expect(commands).toEqual(name === 'hydrate'
+          ? ['sys-hydrated', 'sys-cleanup'] : ['sys-capture', 'sys-hydrated', 'sys-cleanup']);
+      }
+    });
+
+    it(`${name} ignores invalid or missing image IDs without replacing a known ID`, async () => {
+      for (const imageId of invalidIds) {
+        const { fake, store } = await imageFake(imageId);
+        store.set(imageKey, validId);
+        await operation(fake);
+        expect(store.get(imageKey)).toBe(validId);
+      }
+    });
+
+    it(`${name} leaves an unknown image null for invalid IDs or a failed codec`, async () => {
+      for (const [imageId, failed] of [...invalidIds.map(id => [id, false] as const), [validId, true] as const]) {
+        const { fake, store } = await imageFake(imageId, failed);
+        await operation(fake);
+        expect(store.has(imageKey)).toBe(false);
+        expect(await fake.getImageId()).toBeNull();
+      }
+    });
+  }
+
+  it('hydrate stores the running image when restoring a snapshot from another image', async () => {
+    const { fake, store, commands } = await imageFake(validId);
+    const bytes = Buffer.from('hello');
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    const snapshot = { version: 1, format: 2, generation: crypto.randomUUID(), entries: 1,
+      imageId: 'older-image', sha256: hash, chunks: [{ size: bytes.length, sha256: hash }] };
+    fake.env.SANDBOX_WORKSPACE_R2_BUCKET.get = async (key: string) => {
+      if (!key.includes('/system/')) return null;
+      const value = key.endsWith(`/${SNAPSHOT_HEAD}`) ? Buffer.from(JSON.stringify(snapshot)) : bytes;
+      return { etag: 'e', size: value.length, arrayBuffer: async () => Uint8Array.from(value).buffer };
+    };
+    fake.mkdir = async () => ({ success: true });
+    await operations.hydrate(fake);
+    expect(commands).toEqual(['sys-restore', 'sys-cleanup']);
+    expect(store.get(imageKey)).toBe(validId);
+  });
+
+  it('storage reads survive a new DO instance and never touch a stopped container', async () => {
+    const { fake, store } = await makeFake({}, { [imageKey]: validId });
+    fake.ctx.container.running = false;
+    fake.exec = async () => { throw new Error('status must not exec'); };
+    expect(await fake.getImageId()).toBe(validId);
+    const next = await makeFake({}, Object.fromEntries(store));
+    expect(await next.fake.getImageId()).toBe(validId);
+    const fresh = await makeFake({});
+    fresh.fake.ctx.container.running = false;
+    expect(await fresh.fake.getImageId()).toBeNull();
+  });
+
+  it('does not record a codec result after its container stops', async () => {
+    const { fake, store } = await imageFake(validId);
+    const exec = fake.exec;
+    fake.exec = async (command: string) => {
+      const result = await exec(command);
+      if (command.includes('"op":"sys-cleanup"')) fake.ctx.container.running = false;
+      return result;
+    };
+    await operations.flush(fake);
+    expect(store.has(imageKey)).toBe(false);
+  });
+
+  it('a new container start clears the previous image until its codec reports one', async () => {
+    const { fake, store } = await makeFake({}, { [imageKey]: validId });
+    const start = spyOn(Object.getPrototypeOf(await proto()), 'onStart').mockResolvedValue(undefined);
+    fake.observeRuntimeExit = () => {};
+    try {
+      await fake.onStart();
+      expect(store.has(imageKey)).toBe(false);
+      expect(await fake.getImageId()).toBeNull();
+      expect(start).toHaveBeenCalledTimes(1);
+    } finally { start.mockRestore(); }
+  });
+});
 
 describe('runWorkspaceFlush store wiring', () => {
   const flush = async (env: FakeEnv) => {

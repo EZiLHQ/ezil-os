@@ -109,6 +109,7 @@ function simulateCodeServerEnsureOrigin(headers: Record<string, string>, origin:
  */
 function fakeSandboxNamespace(options: {
   exposedPorts?: Array<{ port: number; url: string; status: string }>;
+  imageId?: string | null;
   terminateResult?: Record<string, unknown>;
   /** Upstream response the fake container returns for `containerFetch`. */
   containerResponse?: () => Response;
@@ -296,6 +297,7 @@ function fakeSandboxNamespace(options: {
       calls.getExposedPortHosts.push(args[0] as string);
       return options.exposedPorts ?? [];
     },
+    getImageId: async () => options.imageId ?? null,
     exec: async (...args: unknown[]) => {
       calls.exec++;
       const [command] = args as [string | undefined];
@@ -662,6 +664,23 @@ describe('DELETE /sandbox/:name reports what actually happened', () => {
 // ── GET /sandbox/:name/status — the confirmation signal ─────────────────────
 
 describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
+  it('returns the stored imageId without container I/O or a start', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ imageId: 'ezil-os:2026.10_20-build' });
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/status`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true, sandboxName: SANDBOX_NAME, guacamoleRunning: false, mode: 'guacamole',
+      desktopRunning: false, runningModes: [], modeSource: 'default', imageId: 'ezil-os:2026.10_20-build',
+    });
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
+    expect(calls.flushWorkspaceNow).toBe(0);
+  });
+
   it('reports guacamoleRunning:true / mode:"neko" for a live neko desktop with no desktopMode param', async () => {
     const { binding, calls } = fakeSandboxNamespace({
       exposedPorts: [
@@ -686,7 +705,7 @@ describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
     expect(calls.getExposedPorts).toBe(1);
   });
 
-  it('reports false for a sandbox with nothing exposed, and does not wake it', async () => {
+  it('reports false and imageId:null before any hydrate, and does not wake it', async () => {
     const { binding, calls } = fakeSandboxNamespace({ exposedPorts: [] });
     const res = await worker.fetch(
       new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/status`),
@@ -696,7 +715,10 @@ describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
     expect(body.guacamoleRunning).toBe(false);
     expect(body.desktopRunning).toBe(false);
     expect(body.modeSource).toBe('default');
+    expect(body.imageId).toBeNull();
     expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
   });
 
   it('honors an explicit ?desktopMode= literally (unchanged contract)', async () => {
