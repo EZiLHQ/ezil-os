@@ -77,8 +77,10 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         status: pendingUpgrade && plan.planActive ? 'upgrade_pending' : plan.status,
         renewal: plan.renewsAt !== null ? input.renewal ?? null : null, cancelsAt: plan.cancelsAt,
         scheduledChange, pendingUpgrade, paymentIssue },
-        computer: { vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: plan.sessionMaxSeconds,
-            opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline },
+        computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: plan.sessionMaxSeconds,
+            opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline,
+            machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
+                size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const })) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
         storage: { usedBytes: usedBytes.toString(), capBytes: capBytes.toString(), state: storage === 'over_cap' ? 'exhausted' : storage },
         actions: { checkout: enabled && plan.family === 'free',

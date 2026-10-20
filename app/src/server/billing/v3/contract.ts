@@ -160,12 +160,16 @@ export interface BillingSummaryV3 {
         paymentIssue: 'payment_failed' | 'requires_action' | null;
     };
     computer: {
+        /** The size the next session opens with (the chosen size on Premium). */
+        size: SizeCode;
         vcpu: number;
         memoryGiB: number;
         sessionMaxSeconds: number;
         opening: OpeningSpeed;
         /** Deadline of the running session, if any. */
         activeDeadline: string | null;
+        /** Sizes this plan may choose (one entry unless Premium); x86 only until ARM is verified. */
+        machineChoice: readonly MachineOptionV3[];
     };
     fairUse: { status: FairUseStatus; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
@@ -200,3 +204,25 @@ export const ROUTER_V3_PROCEDURES = [
     'summary', 'createCheckout', 'previewUpgrade', 'confirmUpgrade', 'scheduleDowngrade', 'cancelAtPeriodEnd',
     'history', 'portal', 'checkoutStatus',
 ] as const;
+
+// ── Machine choice (Premium) ─────────────────────────────────────────────────
+
+export interface MachineOptionV3 {
+    size: SizeCode;
+    vcpu: number;
+    memoryGiB: number;
+    /** Standard-seconds used per running second (1, 2 or 4). */
+    weight: number;
+    arch: 'x86_64';
+}
+
+/** `billing.selectMachine` input. Refused unless `size` is in the plan's `machineChoice`. */
+export interface SelectMachineInputV3 {
+    size: SizeCode;
+}
+
+/** Takes effect when the next session opens; a running session keeps its size. */
+export interface SelectMachineOutputV3 {
+    size: SizeCode;
+    effective: 'next_open';
+}
