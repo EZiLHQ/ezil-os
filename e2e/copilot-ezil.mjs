@@ -266,7 +266,9 @@ try {
   await send(PROMPT);
   await page.waitForTimeout(3000);
   await page.screenshot({ path: join(OUT, 'after-send.png') });
-  const confirmation = aux.locator('.chat-confirmation-widget-container, .chat-confirmation-widget2').filter({ hasText: /terminal-confirmed|printf/ }).first();
+  // 1.141 may show the pending terminal confirmation inline or docked above the input; match its command text.
+  const confirmation = aux.locator('.chat-confirmation-widget-container, .chat-confirmation-widget2, [class*="confirmation"]').filter({ hasText: /terminal-confirmed/ })
+    .or(aux.getByText(/terminal-confirmed\.txt/)).first();
   await confirmation.waitFor({ state: 'visible', timeout: T });
   check('terminal tool requires confirmation in the UI', true);
   check('terminal command has not run before confirmation', file('terminal-confirmed.txt') === '');
