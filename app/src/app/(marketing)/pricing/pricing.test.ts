@@ -1,3 +1,4 @@
+import { v3CopyForAudit, honestyBans } from '../../../../../shell/ezil/ui/Settings/billing-copy-test-helpers.mjs';
 import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createPrinter, createSourceFile, ScriptKind, ScriptTarget } from 'typescript';
@@ -32,10 +33,10 @@ describe('v3 public plans', () => {
             expect(card).toContain(offer.tagline);
             expect(card).toContain(`$${offer.priceCents / 100}`);
             expect(card.match(/<a\b/g)).toHaveLength(1);
-            expect(card.match(/<li\b/g)).toHaveLength(3);
+            expect(card.match(/<li\b/g)).toHaveLength(offer.bullets.length);
             expect(card).not.toMatch(/progressbar|standard-hour|overage/i);
             for (const bullet of offer.bullets) expect(card).toContain(bullet);
-            expect(card.includes('Most popular')).toBe(offer.highlighted);
+            expect(card).not.toContain('Most popular');
             expect(card.includes(styles.premium)).toBe(offer.highlighted);
         });
         expect(articles[1]).toContain('Everything in Free, plus:');
@@ -58,18 +59,22 @@ describe('v3 public plans', () => {
         }
     });
 
-    it('explains sessions, fair use, persistence and billing changes in four FAQs', () => {
+    it('explains sessions, fair use, persistence and billing changes in five FAQs', () => {
         const faq = getPricingContent().faq.items;
-        expect(faq).toHaveLength(4);
+        expect(faq).toHaveLength(5);
         expect(faq[0].answer).toContain('Free sessions last up to 1 hour; Standard sessions last up to 2 hours; Premium sessions last up to 6 hours');
         expect(faq[0].answer).toContain('computer stops');
-        for (const offer of Object.values(CATALOG_V3)) expect(faq[1].answer).toContain(`about ${offer.fairUseSeconds / 3600} hours a month on ${offer.name}`);
+        for (const offer of Object.values(CATALOG_V3)) expect(faq[1].answer).toContain(`about ${offer.fairUseSeconds / 3600} ${offer.tier === 'premium' ? 'standard-hours' : 'hours'} a month on ${offer.name}`);
         expect(faq[1].answer).toContain('does not reset fair use');
         expect(faq[2].answer).toContain('files and installed tools stay');
         expect(faq[2].answer).toContain('Running processes stop');
         expect(faq[3].answer).toContain('once payment succeeds');
         expect(faq[3].answer).toContain('end of your billing period');
-        expect(cards(render()).join('')).not.toMatch(/40 hours a month|80 hours a month|5 hours a month/);
+        expect(faq[4].question).toBe('Why do bigger computers use time faster?');
+        expect(faq[4].answer).toContain('4 vCPU counts double and 8 vCPU counts four times');
+        expect(cards(render()).join('')).not.toMatch(/standard-hour|500|40 hours a month|5 hours a month/);
+        expect(cards(render())[0]).toContain('2 vCPU · 6 GB');
+        expect(cards(render())[2]).toContain('Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) in Mumbai');
     });
 
     it('respects the pricing gate with fake config, including the unavailable state', () => {
@@ -88,8 +93,13 @@ describe('v3 copy contract', () => {
     });
     it('scans content, metadata, rendered accessible names and comment-free sources', () => {
         for (const value of [JSON.stringify([getPricingContent(), marketingContent, pricingMetadata]), render(), render(true),
-            ...['./page.tsx', '../_components/home-page.tsx', './pricing-content.ts'].map(file => withoutComments(source(file)))]) expect(value).not.toMatch(banned);
-        expect('Within fair use · Opens from a ready computer · 2 vCPU · 8 GB').not.toMatch(banned);
+            ...['./page.tsx', '../_components/home-page.tsx', './pricing-content.ts'].map(file => withoutComments(source(file)))]) {
+            expect(v3CopyForAudit(value, { faq: true }).replaceAll("offer.tier === 'premium' ? 'standard-hours' : 'hours'", '')).not.toMatch(banned);
+            expect(value).not.toMatch(honestyBans);
+        }
+        expect('Opens from a ready computer').toMatch(honestyBans);
+        expect(v3CopyForAudit('Your computer opens faster')).toMatch(banned);
+        expect(v3CopyForAudit('500 standard-hours')).toMatch(banned);
         expect(withoutComments('// unlimited\nconst title = "Free";')).not.toMatch(banned);
         expect(withoutComments('const el = <nav aria-label="instant" />;')).toMatch(banned);
     });

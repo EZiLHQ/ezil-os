@@ -1,3 +1,4 @@
+import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // upgrade-sheet-test.mjs — EZiL-authored. Like the Settings harness, this
 // drives DOM controls in jsdom with no transport. Bundle the real modules
 // so fake Stripe and a deterministic clock exercise every race.
@@ -734,8 +735,8 @@ for ( const tier of ['standard', 'premium'] ) test(`v3 ${tier} checkout requires
     h.summary = async () => summaryV3('free');
     h.open({ sku: offer.sku, offer, sizes: undefined }); await settle();
     assert.equal(h.mounted, 1); assert.equal(h.calls[0].input.sku, offer.sku);
-    assert.equal(h.document.querySelectorAll('.ezil-upgrade-allowances li').length, 3);
-    assert.match(h.text(), /Usage included/); assert.doesNotMatch(h.text(), banned);
+    assert.equal(h.document.querySelectorAll('.ezil-upgrade-allowances li').length, offer.bullets.length);
+    assert.match(h.text(), /Usage included/); assert.doesNotMatch(v3CopyForAudit(h.text()), banned); assert.doesNotMatch(h.text(), honestyBans);
     h.complete(); await settle(); assert.equal(h.q('[data-role="upgrade-success"]'), null);
     h.summary = async () => summary;
     await h.tick(1500); assert.match(h.text(), new RegExp(`You're on ${offer.name}`));
@@ -757,7 +758,7 @@ test('v3 failed checkout creation retries the chosen SKU and unpaid timeout neve
 let failed = 0;
 for ( const { name, fn } of tests ) {
     const h = harness();
-    try { await fn(h); await settle(); for ( const state of h.rendered ) assert.doesNotMatch(h.v3 ? state : state.replace(/standard-hours?/gi, ''), banned); console.log(`PASS ${name}`); }
+    try { await fn(h); await settle(); for ( const state of h.rendered ) { assert.doesNotMatch(state, honestyBans); assert.doesNotMatch(h.v3 ? v3CopyForAudit(state) : state.replace(/standard-hours?/gi, ''), banned); } console.log(`PASS ${name}`); }
     catch (error) { failed++; console.error(`FAIL ${name}\n${error.stack}`); }
     finally { h.cleanup(); }
 }

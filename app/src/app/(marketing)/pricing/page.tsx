@@ -12,5 +12,5 @@ export default function PricingPage() {
     const config = readBillingConfig();
     if (!config.pricingPageEnabled) notFound();
 
-    return <MarketingHome largeStorageEnabled={config.largeStorageEnabled} focusPlans />;
+    return <MarketingHome focusPlans />;
 }

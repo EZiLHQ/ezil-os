@@ -187,7 +187,16 @@ function nudgeHtml (summary) {
             ? actionHtml('overage', 'Turn on overage…') : ''}</aside>` : '';
 }
 
-function summaryV3Html (summary) {
+function machineV3Html ({ plan, computer }) {
+    if ( plan.sku !== 'premium_monthly_v3' ) return paragraph(`${computer.vcpu} vCPU · ${computer.memoryGiB} GB`);
+    return `<fieldset class="ezil-billing-sizes" data-role="machine-picker"><legend>Next session's computer</legend>
+        <div class="ezil-billing-size-options">${computer.machineChoice.map(machine => `<label class="ezil-billing-size">
+            <input type="radio" name="ezil-billing-machine" value="${encode(machine.size)}"${machine.size === computer.size ? ' checked' : ''}>
+            <span><strong>${encode(`${machine.vcpu} vCPU · ${machine.memoryGiB} GB`)}</strong>${machine.weight > 1 ? `<span>${encode(`uses time ${machine.weight}× faster`)}</span>` : ''}</span>
+        </label>`).join('')}</div><p data-role="machine-status" role="status" aria-live="polite"></p></fieldset>`;
+}
+
+export function summaryV3Html (summary) {
     const { plan, computer, fairUse, actions } = summary;
     const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
     const hours = computer.sessionMaxSeconds / 3600;
@@ -207,10 +216,9 @@ function summaryV3Html (summary) {
             <div class="ezil-billing-actions" data-role="plan-actions">${actions.upgrade ? actionHtml('upgrade', 'Upgrade', true) : ''}${changeAction}${actions.cancel ? actionHtml(plan.status === 'cancels' ? 'resume' : 'cancel', plan.status === 'cancels' ? 'Resume plan' : 'Cancel') : ''}</div>
         </section>
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
-            ${paragraph(`${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
+            ${machineV3Html(summary)}
             ${paragraph(`Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
-            ${paragraph(computer.opening === 'standard' ? 'Standard opening' : 'Opens from a ready computer')}
-            ${computer.opening === 'fastest' ? paragraph('First in line for a ready computer', 'ezil-billing-note') : ''}
+            ${plan.sku !== 'free_v3' ? paragraph('Your own computer in Mumbai') : ''}
         </section>
         <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
         <p class="ezil-billing-note">Prices before tax.</p>
@@ -385,15 +393,19 @@ async function act ($win, state, action, value) {
     if ( state.pending || state.sheet || ! state.summary || state.closed ) return;
     const summary = state.summary;
     const flag = { resume: 'cancel', 'overage-off': 'overage', size: 'selectSize', 'open-invoice': 'portal' }[action] ?? action;
-    if ( action !== 'open-invoice' && summary.actions[flag] !== true ) return;
+    const machineAction = action === 'machine' && summary.version === 3 && summary.plan.sku === 'premium_monthly_v3';
+    if ( action === 'machine' && (! machineAction || value === summary.computer.size || ! summary.computer.machineChoice.some(machine => machine.size === value)) ) return;
+    if ( action !== 'open-invoice' && ! machineAction && summary.actions[flag] !== true ) return;
     if ( action === 'size' && (value === summary.compute.selectedSize || ! summary.compute.allowedSizes.includes(value)) ) return;
     const $pane = $win.find('[data-pane="billing"]');
-    const previousSize = summary.compute?.selectedSize;
+    const previousSize = machineAction ? summary.computer.size : summary.compute?.selectedSize;
+    const focused = $pane.get(0).ownerDocument.activeElement;
     const controls = $pane.find('button, input[type="radio"]').get().map(element => [element, element.disabled]);
     state.pending = true;
     controls.forEach(([element]) => { element.disabled = true; });
     actionError($win, '');
     if ( action === 'size' ) $pane.find('[data-role="size-status"]').text('Saving…');
+    if ( machineAction ) $pane.find('[data-role="machine-status"]').text('Saving…');
     let reload = false;
     try {
         let result;
@@ -410,15 +422,26 @@ async function act ($win, state, action, value) {
             if ( action === 'resume' ) result = await trpc.mutate('billing.cancelAtPeriodEnd', { cancel: false });
             else if ( action === 'overage-off' ) result = await trpc.mutate('billing.setOverage', { enabled: false, capCents: summary.overage.capCents, termsVersion: summary.overage.termsVersion });
             else if ( action === 'size' ) result = await trpc.mutate('billing.selectSize', { size: value });
+            else if ( machineAction ) result = await trpc.mutate('billing.selectMachine', { size: value });
             if ( ! result?.ok ) throw new Error(result?.message);
-            if ( action === 'size' ) {
+            if ( state.closed || ! $win.get(0).isConnected ) return;
+            if ( machineAction ) {
+                const machine = summary.computer.machineChoice.find(machine => machine.size === result.data.size);
+                if ( ! machine || result.data.effective !== 'next_open' ) throw new Error('unavailable');
+                Object.assign(summary.computer, { size: machine.size, vcpu: machine.vcpu, memoryGiB: machine.memoryGiB });
+                $pane.find('[data-role="machine-status"]').text(`Your next session opens with ${machine.vcpu} vCPU`);
+            } else if ( action === 'size' ) {
                 summary.compute.selectedSize = result.data.selectedSize;
                 $pane.find('[data-role="size-status"]').text('Size saved.');
                 $pane.find('[data-role="billing-nudge"] > p').text(nudgeCopy(summary));
             } else reload = true;
         }
     } catch (error) {
-        if ( action === 'size' ) {
+        if ( state.closed || ! $win.get(0).isConnected ) return;
+        if ( machineAction ) {
+            summary.computer.size = previousSize;
+            $pane.find('[data-role="machine-status"]').text(errorCopy(error.message));
+        } else if ( action === 'size' ) {
             summary.compute.selectedSize = previousSize;
             $pane.find('[data-role="size-status"]').text(errorCopy(error.message));
         } else actionError($win, errorCopy(error.message, summary.overage?.maxCapCents));
@@ -426,7 +449,9 @@ async function act ($win, state, action, value) {
         state.pending = false;
         controls.forEach(([element, disabled]) => { element.disabled = disabled; });
         $pane.find('[data-role="invoices"] button').prop('disabled', false);
-        $pane.find('input[name="ezil-billing-size"]').each(function () { this.checked = this.value === summary.compute.selectedSize; });
+        $pane.find('input[name="ezil-billing-size"]').each(function () { this.checked = this.value === summary.compute?.selectedSize; });
+        $pane.find('input[name="ezil-billing-machine"]').each(function () { this.checked = this.value === summary.computer?.size; });
+        if ( machineAction && ! state.closed && focused?.isConnected ) focused.focus();
     }
     if ( reload ) await load($win, state);
 }
@@ -455,6 +480,20 @@ export default {
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {
             if ( ! this.disabled && this.checked ) void act($win, state, 'size', this.value);
+        });
+        $pane.on('change', 'input[name="ezil-billing-machine"]', function () {
+            if ( ! this.disabled && this.checked ) void act($win, state, 'machine', this.value);
+        });
+        $pane.on('keydown', 'input[name="ezil-billing-machine"]', function (event) {
+            if ( this.disabled || ! ['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End', ' '].includes(event.key) ) return;
+            event.preventDefault();
+            const radios = $pane.find('input[name="ezil-billing-machine"]:enabled').get();
+            const index = radios.indexOf(this);
+            const next = event.key === 'Home' ? 0 : event.key === 'End' ? radios.length - 1
+                : event.key === ' ' ? index : (index + (['ArrowDown', 'ArrowRight'].includes(event.key) ? 1 : -1) + radios.length) % radios.length;
+            radios[next].focus();
+            radios[next].checked = true;
+            void act($win, state, 'machine', radios[next].value);
         });
         $win.on('remove.billing', () => {
             state.closed = true;

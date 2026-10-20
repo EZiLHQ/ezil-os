@@ -1,3 +1,4 @@
+import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Real sheet modules, deterministic tRPC DTO fakes, no network or browser.
 import { summaryV3 } from './billing-v3-fixtures.mjs';
 import assert from 'node:assert/strict';
@@ -88,7 +89,8 @@ function harness () {
     };
     h.ready = async kind => { h.open(kind); await settle(); h.audit(); if ( kind === 'overage' ) h.click('input[type="checkbox"]'); };
     h.audit = () => {
-        assert.doesNotMatch(h.summary.version === 2 ? h.text().replace(/standard-hours?/gi, '') : h.text(), banned);
+        assert.doesNotMatch(h.text(), honestyBans);
+        assert.doesNotMatch(h.summary.version === 2 ? h.text().replace(/standard-hours?/gi, '') : v3CopyForAudit(h.text()), banned);
         for ( const element of doc.querySelectorAll('[role="dialog"] button, [role="dialog"] input, [role="dialog"] a, [role="dialog"] summary') ) {
             const name = element.getAttribute('aria-label') || (element.tagName === 'INPUT' ? [...element.labels].map(label => label.textContent).join('') : element.textContent);
             assert.ok(name?.trim(), `accessible name: ${element.outerHTML}`);
@@ -399,8 +401,9 @@ test('v3 upgrade shows catalog benefits, prorated price, exact target and recove
     h.summary = summaryV3();
     h.reply = method => method === 'billing.previewUpgrade' ? ok({ ...preview, toSku: 'premium_monthly_v3', lines: [{ description: 'Remaining Premium', amountCents: 1200 }], amountDueCents: 1200 }) : fail('stripe_unavailable');
     await h.ready('upgrade');
-    assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$40\/month/);
+    assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$100\/month/);
     assert.match(h.text(), /Usage included/); assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 3);
+    assert.match(h.text(), /after payment\. Your Mumbai computer is prepared then/);
     assert.match(h.text(), /Due now \$12/); assert.doesNotMatch(h.text(), /standard-hour|\bcompute\b/i);
     assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
@@ -423,12 +426,12 @@ test('v3 preview failure has Retry and never offers payment without a price', as
     h.reply = () => ok({ ...preview, lines: [] }); h.click('[data-action="retry"]'); await settle();
     assert.ok(h.q('[data-action="confirm"]'));
 });
-test('v3 plan picker has two choices, three benefits each, then embedded checkout', async h => {
+test('v3 plan picker has two choices and catalog benefits, then embedded checkout', async h => {
     h.summary = summaryV3('free'); const chosen = [];
     h.window.api.openPlanPickerSheet({ ...h.options(), checkout: options => chosen.push(options) });
     assert.equal(h.doc.querySelectorAll('[data-action="checkout"]').length, 2);
-    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 6);
-    assert.match(h.text(), /Most popular/); assert.match(h.text(), /\$20\/month/); assert.match(h.text(), /\$40\/month/);
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 5);
+    assert.doesNotMatch(h.text(), /Most popular/); assert.match(h.text(), /\$20\/month/); assert.match(h.text(), /\$100\/month/);
     h.click('[data-sku="premium_monthly_v3"]');
     assert.equal(chosen.length, 1); assert.equal(chosen[0].sku, 'premium_monthly_v3');
     assert.equal(h.q('[role="dialog"]'), null);
@@ -447,8 +450,8 @@ for ( const tier of ['free', 'standard'] ) test(`v3 ${tier} limit stop opens one
     h.window.api.openSessionEndSheet(opts);
     assert.ok(h.q('[data-sheet="session-end"]'));
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
-    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 3);
-    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard gives you 2-hour sessions and opens from a ready computer — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, tier === 'free' ? 2 : 3);
+    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard gives you 2-hour sessions — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
     h.click('[data-action="continue"]'); await settle();
     if ( tier === 'free' ) assert.equal(chosen[0].sku, 'standard_monthly_v3');
     else assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
@@ -486,7 +489,7 @@ for ( const { name, fn } of tests ) {
     const h = harness();
     try {
         await fn(h); await settle(); h.audit();
-        for ( const state of h.states ) assert.doesNotMatch(h.summary.version === 2 ? state.replace(/standard-hours?/gi, '') : state, banned);
+        for ( const state of h.states ) assert.doesNotMatch(h.summary.version === 2 ? state.replace(/standard-hours?/gi, '') : v3CopyForAudit(state), banned);
         states += h.states.length;
         console.log(`PASS ${name}`);
     } catch (error) { failed++; console.error(`FAIL ${name}\n${error.stack}`); }

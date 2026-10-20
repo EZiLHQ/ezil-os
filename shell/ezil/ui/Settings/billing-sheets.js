@@ -116,7 +116,7 @@ export function openComputeUpgradeSheet (options) {
             node('p', `Due now ${money(data.amountDueCents)}`).className = 'ezil-billing-sheet-total';
             node('p', 'USD. Any applicable tax appears on the invoice.').className = 'ezil-upgrade-caption';
             if ( ! v3 ) node('p', `Adds ${stdHoursLabel(data.grantStdSeconds, { round: 'down' })} standard-hours for the rest of this period (until ${dateLabel(data.periodEnd)}). Your usage so far carries over.`);
-            node('p', 'Your plan changes once payment is confirmed.');
+            node('p', v3 ? 'Your upgrade takes effect after payment. Your Mumbai computer is prepared then.' : 'Your plan changes once payment is confirmed.');
             const actions = node('div', null);
             actions.className = 'ezil-billing-sheet-actions';
             button(`Pay ${money(data.amountDueCents)} and upgrade`, 'confirm', () => {
@@ -239,7 +239,7 @@ export function openOverageSheet (options) {
     return sheet.handle;
 }
 
-/** PublicOfferV3 only: price, included usage and the catalog's three benefits. */
+/** PublicOfferV3 only: price, included usage and catalog benefits. */
 function offerDetails (sheet, offer, parent = sheet.body) {
     sheet.node('p', `${money(offer.priceCents)}/month`, parent).className = 'ezil-billing-sheet-total';
     sheet.node('p', 'Usage included · Prices before tax.', parent);
@@ -297,7 +297,7 @@ export function openSessionEndSheet (options) {
     const sheet = billingSheet(options, action, 'Your session ended');
     if ( sheet.existing ) return null;
     sheet.dialog.dataset.sheet = 'session-end';
-    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name} gives you ${offer.sessionMaxSeconds / 3600}-hour sessions and opens from a ready computer — ${money(offer.priceCents)}/month.`);
+    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name} gives you ${offer.sessionMaxSeconds / 3600}-hour sessions — ${money(offer.priceCents)}/month.`);
     offerDetails(sheet, offer);
     sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');
     sheet.button(free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {

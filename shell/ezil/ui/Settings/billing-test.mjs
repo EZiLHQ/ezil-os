@@ -1,3 +1,4 @@
+import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
 import { summaryV3 } from './billing-v3-fixtures.mjs';
 import assert from 'node:assert/strict';
@@ -164,13 +165,14 @@ const changeSize = code => {
 const banned = /faster|instant|unlimited|priority|gpu|heavy\s+use|gpt|claude|gemini|llama|memory\s+is\s+kept|memory\s+survives|processes\s+keep\s+running|ai\s+included|includes\s+ai|compute\s+hours|standard-hour/i;
 let audited = 0, groups = 0;
 function audit () {
-    assert.equal(banned.test(summary.version === 2 ? text().replace(/standard-hours?/gi, '') : text()), false, 'whole pane passes v2 copy scan');
+    assert.equal(banned.test(summary.version === 2 ? text().replace(/standard-hours?/gi, '') : v3CopyForAudit(text())), false, 'whole pane passes v2 copy scan');
     for ( const element of qa('[data-pane="billing"] button, [data-pane="billing"] a, [data-pane="billing"] input[type="radio"]') ) {
         assert.ok(element.getAttribute('aria-label') || (element.type === 'radio' ? [...element.labels].map(label => label.textContent).join('').trim() : element.textContent.trim()), 'control has an accessible name');
     }
     assert.ok(qa('.ezil-billing-header .ezil-settings-btn-primary, [data-role="plan-card"] .ezil-settings-btn-primary, [data-role="billing-nudge"] .ezil-settings-btn-primary').length <= 1, 'at most one primary on the main surface');
     assert.equal(qa('.ezil-billing-card h3, .ezil-billing-meter h3').length, 0, 'card headings use h4');
     assert.deepEqual(errors, []);
+    assert.doesNotMatch(text(), honestyBans);
     audited++;
 }
 const pass = label => { groups++; console.log(`PASS Billing v2: ${label}`); };
@@ -838,8 +840,8 @@ try {
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
         contains('[data-role="your-computer"]', `Sessions up to ${summary.computer.sessionMaxSeconds / 3600} hour`);
         if ( tier !== 'free' ) {
-            contains('[data-role="plan-card"]', `Renews on Nov 1 for $${tier === 'standard' ? 20 : 40}`);
-            contains('[data-role="your-computer"]', 'Opens from a ready computer');
+            contains('[data-role="plan-card"]', `Renews on Nov 1 for $${tier === 'standard' ? 20 : 100}`);
+            contains('[data-role="your-computer"]', 'Your own computer in Mumbai');
             contains('[data-action="portal"]', 'Manage payment');
             contains('[data-action="cancel"]', 'Cancel');
         }
@@ -850,7 +852,7 @@ try {
         click(q(`[data-action="${action}"]`));
         if ( tier === 'free' ) {
             has('[data-sheet="choose"]');
-            assert.equal(qa('[data-sheet="choose"] li').length, 6);
+            assert.equal(qa('[data-sheet="choose"] li').length, 5);
             click(q('[data-sheet="choose"] [data-sku="standard_monthly_v3"]'));
             assert.equal(sheets.at(-1).kind, 'checkout');
             assert.equal(sheets.at(-1).sku, 'standard_monthly_v3');
@@ -858,6 +860,50 @@ try {
         } else assert.equal(sheets.at(-1).kind, action);
         await closeSheet();
     }
+    summary = summaryV3('premium'); await refresh();
+    assert.equal(qa('[data-role="machine-picker"] input').length, 3);
+    assert.equal(q('input[name="ezil-billing-machine"]:checked').value, 'std-2');
+    for ( const [size, label, weight] of [['std-2', '2 vCPU · 8 GB', 1], ['cmp-4', '4 vCPU · 16 GB', 2], ['cmp-8', '8 vCPU · 32 GB', 4]] ) {
+        const radio = q(`input[name="ezil-billing-machine"][value="${size}"]`);
+        assert.ok(radio.labels[0].textContent.includes(label));
+        assert.equal(radio.labels[0].textContent.includes('uses time'), weight > 1);
+        if ( weight > 1 ) assert.ok(radio.labels[0].textContent.includes(`uses time ${weight}× faster`));
+    }
+    let releaseMachine;
+    mutation = () => new Promise(resolve => { releaseMachine = resolve; });
+    changeSize('cmp-4');
+    assert.ok(calls.at(-1).url.endsWith('/billing.selectMachine'));
+    assert.deepEqual(calls.at(-1).input, { size: 'cmp-4' });
+    assert.equal(qa('[data-role="machine-picker"] input:disabled').length, 3);
+    contains('[data-role="machine-status"]', 'Saving…');
+    releaseMachine(reply({ size: 'cmp-4', effective: 'next_open' })); await settle(); audit();
+    contains('[data-role="machine-status"]', 'Your next session opens with 4 vCPU');
+    assert.equal(q('input[name="ezil-billing-machine"]:checked').value, 'cmp-4');
+    const savedCallCount = count('selectMachine');
+    changeSize('cmp-4'); await settle(); assert.equal(count('selectMachine'), savedCallCount);
+    mutation = () => failure('size_not_allowed');
+    changeSize('cmp-8'); await settle(); audit();
+    contains('[data-role="machine-status"]', "That size isn't included in your plan.");
+    assert.equal(q('input[name="ezil-billing-machine"]:checked').value, 'cmp-4');
+    assert.equal(qa('[data-role="machine-picker"] input:disabled').length, 0);
+    mutation = call => reply({ size: call.input.size, effective: 'next_open' });
+    const key = (value, key) => {
+        const radio = q(`input[name="ezil-billing-machine"][value="${value}"]`);
+        radio.focus();
+        radio.dispatchEvent(new window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    };
+    for ( const [from, pressed, to] of [['cmp-4', 'ArrowRight', 'cmp-8'], ['cmp-8', 'ArrowDown', 'std-2'], ['std-2', 'ArrowLeft', 'cmp-8'], ['cmp-8', 'Home', 'std-2'], ['std-2', 'End', 'cmp-8'], ['cmp-4', ' ', 'cmp-4']] ) {
+        key(from, pressed); await settle(); audit();
+        assert.deepEqual(calls.at(-1).input, { size: to });
+        assert.equal(q('input[name="ezil-billing-machine"]:checked').value, to);
+        assert.equal(window.document.activeElement.value, to);
+    }
+    for ( const tier of ['free', 'standard'] ) {
+        summary = summaryV3(tier); await refresh();
+        has('[data-role="machine-picker"]', false);
+        assert.equal(qa('input[name="ezil-billing-machine"]').length, 0);
+    }
+    pass('Premium machine picker labels, exact mutation, pending guard, rollback and keyboard navigation; other plans read-only');
     summary = summaryV3(); await refresh();
     for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1 — upgrade to keep working']] ) {
         summary.fairUse.status = status; await refresh(); contains('[data-role="fair-use"]', copy);
