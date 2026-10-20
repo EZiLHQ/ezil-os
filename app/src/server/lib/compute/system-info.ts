@@ -28,6 +28,8 @@ export const AWS_INSTANCE_SIZES: Readonly<Record<string, { vcpu: number; memoryM
     't3a.medium': { vcpu: 2, memoryMiB: 4096 },
     't3.medium': { vcpu: 2, memoryMiB: 4096 },
     'm6i.large': { vcpu: 2, memoryMiB: 8192 },
+    'm6i.xlarge': { vcpu: 4, memoryMiB: 16384 },
+    'm6i.2xlarge': { vcpu: 8, memoryMiB: 32768 },
 });
 
 /**
