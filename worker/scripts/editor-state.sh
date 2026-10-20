@@ -76,27 +76,55 @@ seed_codeserver_chat_models() {
   node - "$1/User/chatLanguageModels.json" <<'CODESERVER_CHAT_MODELS_JS'
 const fs = require("fs");
 const dst = process.argv[2];
-let groups = [];
-if (fs.existsSync(dst)) {
-  const original = fs.readFileSync(dst, "utf8");
+const entry = { name: "EZiL", vendor: "ezil" };
+// The workbench reads this file as JSONC: drop comments and trailing commas,
+// leaving string contents untouched.
+function jsonc(text) {
+  let out = "", i = 0, inString = false;
+  while (i < text.length) {
+    const c = text[i], n = text[i + 1];
+    if (inString) { out += c; if (c === "\\") { out += n ?? ""; i += 2; continue; } if (c === '"') inString = false; i++; continue; }
+    if (c === '"') { inString = true; out += c; i++; continue; }
+    if (c === "/" && n === "/") { while (i < text.length && text[i] !== "\n") i++; continue; }
+    if (c === "/" && n === "*") { const close = text.indexOf("*/", i + 2); i = close < 0 ? text.length : close + 2; continue; }
+    out += c; i++;
+  }
+  return JSON.parse(out.replace(/,(\s*[\]}])/g, "$1"));
+}
+function write(text) {
+  const temporary = dst + "." + process.pid;
   try {
-    groups = JSON.parse(original);
-    if (!Array.isArray(groups)) throw new Error("expected array");
-  } catch {
-    fs.writeFileSync(dst + ".invalid-" + Date.now(), original, { flag: "wx", mode: 0o600 });
-    groups = [];
+    fs.writeFileSync(temporary, text, { flag: "wx", mode: 0o600 });
+    fs.renameSync(temporary, dst);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
   }
 }
-if (!groups.some(group => group?.vendor === "ezil" && group?.name === "EZiL")) {
-  groups.push({ name: "EZiL", vendor: "ezil" });
+if (!fs.existsSync(dst)) {
+  write(JSON.stringify([entry], null, 2) + "\n");
+  process.exit(0);
 }
-const temporary = dst + "." + process.pid;
+const original = fs.readFileSync(dst, "utf8");
+let groups;
 try {
-  fs.writeFileSync(temporary, JSON.stringify(groups, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-  fs.renameSync(temporary, dst);
-} finally {
-  if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  groups = jsonc(original);
+  if (!Array.isArray(groups)) throw new Error("expected array");
+} catch {
+  // Unreadable even as JSONC: keep the original bytes as a backup, then seed.
+  fs.writeFileSync(dst + ".invalid-" + Date.now(), original, { flag: "wx", mode: 0o600 });
+  write(JSON.stringify([entry], null, 2) + "\n");
+  process.exit(0);
 }
+if (groups.some(group => group?.vendor === "ezil" && group?.name === "EZiL")) process.exit(0); // untouched
+// Insert right after the opening bracket (the first "[" outside comments), so
+// the user's comments, layout and trailing-comment lines survive untouched.
+let open = 0;
+while (open < original.length && original[open] !== "[") {
+  if (original.startsWith("//", open)) open = original.indexOf("\n", open) < 0 ? original.length : original.indexOf("\n", open);
+  else if (original.startsWith("/*", open)) open = original.indexOf("*/", open + 2) < 0 ? original.length : original.indexOf("*/", open + 2) + 2;
+  else open++;
+}
+write(original.slice(0, open + 1) + "\n  " + JSON.stringify(entry) + (groups.length ? "," : "") + original.slice(open + 1));
 CODESERVER_CHAT_MODELS_JS
 }
 

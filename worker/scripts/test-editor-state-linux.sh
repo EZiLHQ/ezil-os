@@ -75,10 +75,23 @@ node - "$root/fresh/User/chatLanguageModels.json" <<'JS'
 const assert = require('node:assert/strict'), fs = require('node:fs');
 const groups = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 assert.equal(groups.length, 3);
-assert.deepEqual(groups[0], { name: 'Other', vendor: 'openai', extra: { keep: true } });
-assert.deepEqual(groups[1], { name: 'custom', vendor: 'ezil' });
-assert.deepEqual(groups[2], { name: 'EZiL', vendor: 'ezil' });
+assert.deepEqual(groups.filter(g => g.name !== 'EZiL'), [
+  { name: 'Other', vendor: 'openai', extra: { keep: true } },
+  { name: 'custom', vendor: 'ezil' },
+]);
+assert.equal(groups.filter(g => g.name === 'EZiL' && g.vendor === 'ezil').length, 1);
 JS
+# JSONC (comments, trailing commas) is what the workbench accepts: user groups and
+# comments survive, the file is not treated as malformed, and a second run is a no-op.
+printf '// mine\n[\n  {"name":"Mine","vendor":"openai"}, // keep\n]\n' >"$root/fresh/User/chatLanguageModels.json"
+ezil_editor_prepare "$root/fresh" "$root/fresh-workspace"
+grep -q '// keep' "$root/fresh/User/chatLanguageModels.json"
+grep -q '"name":"Mine"' "$root/fresh/User/chatLanguageModels.json"
+grep -q '"name":"EZiL","vendor":"ezil"' "$root/fresh/User/chatLanguageModels.json"
+! ls "$root/fresh/User/"chatLanguageModels.json.invalid-* >/dev/null 2>&1
+cp "$root/fresh/User/chatLanguageModels.json" "$root/jsonc-once.json"
+ezil_editor_prepare "$root/fresh" "$root/fresh-workspace"
+cmp "$root/jsonc-once.json" "$root/fresh/User/chatLanguageModels.json"
 # Malformed input is preserved for recovery, and cannot spoof the vendor gate.
 printf 'broken "vendor":"ezil"' >"$root/fresh/User/chatLanguageModels.json"
 ezil_editor_prepare "$root/fresh" "$root/fresh-workspace"
