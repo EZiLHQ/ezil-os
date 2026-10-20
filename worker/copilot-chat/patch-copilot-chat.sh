@@ -104,6 +104,13 @@ R_ENABLE_MORE='"EZiL Chat runs on the models configured for this workspace."'
 # row has no setting; the picker's own visibility filter learns to skip that one type.
 A_PICKER='_isVisible(e){return y8t(e,this.configurationService,this.chatSessionsService,this.workspaceContextService.getWorkspace(),this.agentHostEnablementService.managedSandboxEnforced.get(),this.agentHostEnablementService.enabled.get())}'
 R_PICKER='_isVisible(e){return e!==cn.AgentHostCopilot&&y8t(e,this.configurationService,this.chatSessionsService,this.workspaceContextService.getWorkspace(),this.agentHostEnablementService.managedSandboxEnforced.get(),this.agentHostEnablementService.enabled.get())}'
+# Part 2 — the chat status-bar entry turns into "Sign In" (and a GitHub setup click) when the chat
+# entitlement is signed out, which an anonymous BYOK session always is (workbench.js). Drop that branch so
+# the entry keeps showing chat status, and never label the setup variant "Sign In".
+A_STATUS_SIGNIN='if(this.chatEntitlementService.entitlement===1)return this.getSetupEntryProps();'
+R_STATUS_SIGNIN='/* EZiL: no GitHub sign-in prompt in the chat status entry */'
+A_STATUS_SETUP_TEXT='getSetupEntryProps(){let e=!this.isSignInTitleBarAffordanceVisible(),'
+R_STATUS_SETUP_TEXT='getSetupEntryProps(){let e=!1,'
 # Part 2 — extension manifest display names (package.json / package.nls.json, compact JSON)
 PKG="$ROOT/extensions/copilot/package.json"
 PKG_NLS="$ROOT/extensions/copilot/package.nls.json"
@@ -136,6 +143,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   patch accounts-menu  "$WB"  1  "$A_ACCOUNTS" "$R_ACCOUNTS"
   patch target-picker  "$WB"  1  "$A_PICKER"   "$R_PICKER"
+  patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
+  patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
   patch submenu-label  "$PKG_NLS" 1 "$A_SUBMENU"     "$R_SUBMENU"
   patch walkthrough    "$PKG_NLS" 1 "$A_WALKTHROUGH" "$R_WALKTHROUGH"
@@ -169,6 +178,8 @@ for nls in "$NLS_JS" "$NLS_JSON"; do
 done
 gate accounts-menu    "$WB"  0  "$A_ACCOUNTS";     gate accounts-menu    "$WB"  1  "$R_ACCOUNTS"
 gate target-picker    "$WB"  0  "$A_PICKER";       gate target-picker    "$WB"  1  "$R_PICKER"
+gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
+gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"
 gate submenu-label    "$PKG_NLS" 0 "$A_SUBMENU";   gate submenu-label    "$PKG_NLS" 1 "$R_SUBMENU"
 gate walkthrough      "$PKG_NLS" 0 "$A_WALKTHROUGH"; gate walkthrough    "$PKG_NLS" 1 "$R_WALKTHROUGH"

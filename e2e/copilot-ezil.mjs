@@ -85,6 +85,15 @@ const pickerRows = async () => {
   const rows = page.locator('.context-view .monaco-list-row, .quick-input-widget .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item, .context-view .action-item');
   return (await rows.allInnerTexts()).map(clean).filter(Boolean);
 };
+// VS Code 1.141 lists recent/default models at the top and the rest under "Other Models".
+const expandOtherModels = async () => {
+  const other = page.locator('.context-view .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item').filter({ hasText: /^\s*Other Models/ }).first();
+  if (!(await other.count())) return false;
+  await other.hover().catch(() => {});
+  await other.click().catch(() => {});
+  await page.waitForTimeout(700);
+  return true;
+};
 const dialogTexts = async () => {
   const d = page.locator('.monaco-dialog-box');
   const n = await d.count(); const out = [];
@@ -214,16 +223,27 @@ try {
   check('Qwen is selected by default', (await modelButton().innerText()).includes(MODEL_NAME));
   await modelButton().click();
   await page.waitForTimeout(800);
-  const models = await pickerRows();
+  let models = await pickerRows();
+  if (!models.some(row => row.includes(KIMI_NAME)) && await expandOtherModels()) models = [...new Set([...models, ...await pickerRows()])];
   check('model picker contains Qwen and Kimi with no sign-in entry', models.some(row => row.includes(MODEL_NAME)) && models.some(row => row.includes(KIMI_NAME)) && !models.some(row => /sign in/i.test(row)), JSON.stringify(models));
-  await page.keyboard.press('Escape');
+  for (let i = 0; i < 3; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
 
+  // Type only once the chat input really has focus, and send only what landed there.
+  let sendAttempt = 0;
   const send = async prompt => {
     const editor = aux.locator('.chat-input-container .monaco-editor').first();
     await editor.waitFor({ state: 'visible', timeout: T });
-    await editor.click({ position: { x: 40, y: 12 }, force: true });
-    await page.keyboard.type(prompt, { delay: 3 });
-    await page.keyboard.press('Enter');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await editor.locator('.view-lines').first().click({ force: true });
+      await page.waitForTimeout(250);
+      await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
+      await page.keyboard.type(prompt, { delay: 3 });
+      await page.waitForTimeout(250);
+      if (clean(await editor.innerText()).includes(prompt.slice(0, 20))) { await page.keyboard.press('Enter'); return; }
+      await page.screenshot({ path: join(OUT, `send-attempt-${++sendAttempt}.png`) });
+      for (let i = 0; i < 2; i++) await page.keyboard.press('Escape');
+    }
+    throw new Error('the prompt never reached the chat input: ' + prompt.slice(0, 40));
   };
   const until = async (predicate, label) => {
     const started = Date.now();
@@ -244,12 +264,40 @@ try {
   };
 
   await send(PROMPT);
-  const confirmation = aux.locator('.chat-confirmation-widget-container, .chat-confirmation-widget2').filter({ hasText: /terminal-confirmed|printf/ }).first();
-  await confirmation.waitFor({ state: 'visible', timeout: T });
+  await page.waitForTimeout(3000);
+  await page.screenshot({ path: join(OUT, 'after-send.png') });
+  // 1.141 may show the pending terminal confirmation inline or docked above the input; match its command text.
+  const confirmation = aux.locator('.chat-confirmation-widget-container, .chat-confirmation-widget2, [class*="confirmation"]').filter({ hasText: /terminal-confirmed/ })
+    .or(aux.getByText(/terminal-confirmed\.txt/));
+  // Several elements carry the command text and the first in DOM order can be hidden: wait for any visible one.
+  await until(async () => { for (const c of await confirmation.all()) if (await c.isVisible().catch(() => false)) return true; return false; }, 'terminal confirmation visible');
   check('terminal tool requires confirmation in the UI', true);
   check('terminal command has not run before confirmation', file('terminal-confirmed.txt') === '');
   await page.screenshot({ path: join(OUT, 'terminal-confirmation.png') });
-  await confirmation.getByRole('button', { name: /^(Allow|Continue|Run)(\b|$)/i }).first().click();
+  // Approve the pending terminal tool. 1.141's markup differs from 1.139's; try accessible names first
+  // and dump what the confirmation offers if nothing matches, so a failure is diagnosable.
+  const approve = async () => {
+    const candidates = [
+      aux.getByRole('button', { name: /^(Allow|Continue|Run)\b/i }),
+      page.getByRole('button', { name: /^(Allow|Continue|Run)\b/i }),
+      aux.locator('.monaco-button, a[role="button"], button').filter({ hasText: /^\s*(Allow|Continue|Run)\b/i }),
+    ];
+    for (const candidate of candidates) {
+      const all = await candidate.all();
+      for (const button of all) {
+        if (!(await button.isVisible().catch(() => false))) continue;
+        // A covering element (tips, hovers) makes a normal click wait forever: fall back to force, then keyboard.
+        if (await button.click({ timeout: 5000 }).then(() => true, () => false)) return;
+        if (await button.click({ force: true, timeout: 5000 }).then(() => true, () => false)) return;
+        if (await button.focus().then(() => page.keyboard.press('Enter')).then(() => true, () => false)) return;
+      }
+    }
+    const names = await aux.locator('[role="button"], button, .monaco-button').evaluateAll(els => els.map(e => (e.getAttribute('aria-label') || e.textContent || '').trim()).filter(Boolean));
+    writeFileSync(join(OUT, 'confirmation-buttons.json'), JSON.stringify(names, null, 2));
+    writeFileSync(join(OUT, 'confirmation.html'), await confirmation.first().evaluate(e => e.closest('.interactive-item-container, .chat-tool-invocation-part, .monaco-list-row')?.outerHTML ?? e.outerHTML).catch(() => ''));
+    throw new Error('no Allow/Continue/Run button for the terminal confirmation: ' + JSON.stringify(names).slice(0, 300));
+  };
+  await approve();
   await until(async () => (await transcript()).includes('EZIL_E2E_DONE') && !await busy(), 'agent completion');
   check('agent created hello.txt', file('hello.txt') === 'hi\n');
   check('agent edited existing.txt', file('existing.txt') === 'after\n');
@@ -257,19 +305,24 @@ try {
   await editAction('Keep');
   check('Keep retains created and edited files on disk', file('hello.txt') === 'hi\n' && file('existing.txt') === 'after\n');
   await page.screenshot({ path: join(OUT, 'kept-edits.png') });
+  const statusText = clean(await page.locator('.part.statusbar').innerText().catch(() => ''));
+  check('status bar offers no Sign In after an agent run', !/sign in/i.test(statusText), statusText.slice(0, 200));
 
   await runCommand('Chat: New Chat');
   await send('EZIL_E2E_UNDO: change existing.txt from after to undo candidate so I can review and undo it.');
   await until(async () => file('existing.txt') === 'undo candidate\n' && !await busy(), 'undo candidate');
   await editAction('Undo');
   // Some workbench versions confirm discarding the proposed edits.
-  const discard = page.locator('.monaco-dialog-box').getByRole('button', { name: /^(Undo|Discard)/i }).first();
-  if (await discard.isVisible().catch(() => false)) await discard.click();
+  // 1.141 asks "This will undo changes made in <file>. Do you want to proceed?" (Yes / Cancel).
+  const discard = page.locator('.monaco-dialog-box').getByRole('button', { name: /^(Yes|Undo|Discard)/i }).first();
+  if (await discard.waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false)) await discard.click();
   await until(async () => file('existing.txt') === 'after\n', 'Undo restores prior content');
   check('Undo restores the last kept content on disk', true);
 
   await runCommand('Chat: New Chat');
   await modelButton().click();
+  await page.waitForTimeout(600);
+  if (!(await pickerRows()).some(row => row.includes(KIMI_NAME))) await expandOtherModels();
   const kimiRow = page.locator('.context-view .monaco-list-row, .quick-input-widget .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item').filter({ hasText: KIMI_NAME }).first();
   await kimiRow.click();
   await send('EZIL_E2E_KIMI: reply with the JSON smoke-test completion.');
