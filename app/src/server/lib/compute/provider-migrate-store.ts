@@ -82,12 +82,12 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
             const revoke = !['exported', 'provisioning'].includes(m.state) || !!pendingRecovery(m);
             const updated = one(await db.execute(sql`UPDATE public.ezil_compute_migrations SET
                 state = ${m.state}, generation = ${m.generation}::uuid, source_etag = ${m.sourceEtag}, source_system_etag = ${m.sourceSystemEtag},
-                workspace_head = ${JSON.stringify(m.workspaceHead)}::jsonb, system_head = ${JSON.stringify(m.systemHead)}::jsonb,
+                workspace_head = (${JSON.stringify(m.workspaceHead)}::text)::jsonb, system_head = (${JSON.stringify(m.systemHead)}::text)::jsonb,
                 migrated_etag = ${m.migratedEtag}, attempts = ${m.attempts}, last_error = ${m.lastError},
                 restore_token_sha256 = ${revoke ? null : expected.restoreTokenSha256},
                 restore_token_expires_at = ${revoke ? null : expected.restoreTokenExpiresAt?.toISOString() ?? null}::timestamptz,
                 updated_at = ${STAMP}
-                WHERE id = ${expected.id}::uuid AND state = ${expected.state} AND updated_at = ${expected.updatedAt}::timestamptz
+                WHERE id = ${expected.id}::uuid AND state = ${expected.state} AND updated_at::text = ${expected.updatedAt}
                 RETURNING ${COLUMNS}`));
             if (!updated) throw new MigrationConflictError();
             return { ...decision, migration: updated };
@@ -100,7 +100,7 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
                 SET restore_token_sha256 = ${digest(token).toString('hex')},
                     restore_token_expires_at = ${new Date(now().getTime() + 15 * 60_000).toISOString()}::timestamptz, updated_at = ${STAMP}
                 WHERE id = ${m.id}::uuid AND computer_id = ${m.computerId}::uuid AND generation = ${m.generation}::uuid
-                    AND state = ${m.state} AND state IN ('exported', 'provisioning') AND updated_at = ${m.updatedAt}::timestamptz
+                    AND state = ${m.state} AND state IN ('exported', 'provisioning') AND updated_at::text = ${m.updatedAt}
                 RETURNING ${COLUMNS}`));
             if (!updated) throw new MigrationConflictError();
             // Callers re-read the row before their next transition; plaintext is never persisted.

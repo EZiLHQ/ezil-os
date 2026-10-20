@@ -65,7 +65,7 @@ describe('restore tokens', () => {
         expect(q.params).toContain(createHash('sha256').update(first).digest('hex'));
         expect(q.params).toContain('2026-10-20T12:15:00.000Z');
         expect(q.sql).toMatch(/computer_id = [\s\S]*generation =/);
-        expect(q.sql).toMatch(/state = [\s\S]*state IN \('exported', 'provisioning'\)[\s\S]*updated_at =/);
+        expect(q.sql).toMatch(/state = [\s\S]*state IN \('exported', 'provisioning'\)[\s\S]*updated_at::text =/);
         expect(q.params).toContain(m.updatedAt);
         await expect(setup([[]]).store.mintRestoreToken(m)).rejects.toThrow('migration_conflict');
     });
@@ -96,7 +96,9 @@ describe('migration persistence', () => {
         expect(m.updatedAt).toBe(row.updated_at);
         const f = setup();
         await f.store.applyTransition(m, { type: 'provisioned' });
-        expect(f.queries[0]!.sql).toMatch(/WHERE id = [\s\S]* AND state = [\s\S]* AND updated_at = [\s\S]*::timestamptz/);
+        // Compared as text: a timestamptz-cast parameter is re-encoded by the driver and never matches.
+        expect(f.queries[0]!.sql).toMatch(/WHERE id = [\s\S]* AND state = [\s\S]* AND updated_at::text = /);
+        expect(f.queries[0]!.sql).toMatch(/workspace_head = \([\s\S]*::text\)::jsonb/);
         expect(f.queries[0]!.sql).toContain("updated_at + interval '1 microsecond'");
         expect(f.queries[0]!.params).toContain(row.updated_at);
         await expect(setup([]).store.applyTransition(m, { type: 'provisioned' })).rejects.toThrow('migration_conflict');
