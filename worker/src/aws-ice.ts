@@ -284,7 +284,8 @@ export function awsScreenDesktop(record: AwsTunnelRecord, zone: string, fetchFn:
   };
 }
 
-export type RelayMint = (signal: AbortSignal) => Promise<{ servers: IceServerEntry[]; expiresAt: number } | null>;
+/** Boot can apply its clock margin independently of the existing renewal lifetime. */
+export type RelayMint = (signal: AbortSignal, purpose?: 'boot' | 'renewal') => Promise<{ servers: IceServerEntry[]; expiresAt: number } | null>;
 
 /** Cloudflare's `relayRefresh`, for an AWS computer: read the relay state, or renew it in place. */
 export async function awsRelayRefresh(p: {
@@ -346,7 +347,7 @@ export async function ensureAwsDesktop(p: {
   const fresh = status.configured && status.expiresAt !== null && status.expiresAt > p.nowMs() + RELAY_MIN_AHEAD_MS;
   const stalled = !running && status.unit !== null && STALLED_DESKTOP_UNITS.includes(status.unit);
   if ((!running && (!fresh || stalled)) || (running && status.ice !== 'applied')) {
-    const minted = await p.mint(AbortSignal.timeout(20_000));
+    const minted = await p.mint(AbortSignal.timeout(20_000), 'boot');
     if (!minted) throw new RelayFailure('turn_unavailable');
     const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
     const res = await pushAwsDesktopConfig(p.record, p.zone, config, p.fetch, nowS());
