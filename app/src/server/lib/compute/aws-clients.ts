@@ -5,15 +5,17 @@
  * - `LifecycleExecutionReader`  → Step Functions `DescribeExecution`
  * - `Ec2EnrollmentDescriber`    → EC2 `DescribeInstances` / `DescribeVolumes`
  *
- * 🔴 CREDENTIALS. There are NO long-lived AWS keys. The app runs on Vercel, and
- * every call is made with short-lived credentials from
+ * 🔴 CREDENTIALS. There are NO long-lived AWS keys. On Vercel, every call uses
+ * short-lived credentials from
  * `AssumeRoleWithWebIdentity` on the region's app-caller role, using the Vercel
  * OIDC token of the CURRENT request (`x-vercel-oidc-token` in the request
  * context, else `VERCEL_OIDC_TOKEN_FILE`, else `VERCEL_OIDC_TOKEN`; Vercel
  * docs, "OIDC Federation Reference"). Every client is built with an explicit
  * credentials function, so the SDK's default chain (env keys, shared files,
  * instance metadata) is never consulted. A missing token is
- * `aws_caller_unavailable`; there is no fallback of any kind.
+ * `aws_caller_unavailable`; there is no fallback of any kind. Off Vercel,
+ * explicit IMDSv2 credentials sign STS `AssumeRole` into the SAME regional
+ * app-caller role; instance-role credentials never sign downstream calls.
  *
  * 🔴 REGIONS. A computer lives in its placement's region; every call names
  * that region, and an ARN from another region (or another account than the
@@ -23,13 +25,15 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
 import { DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
 import { DescribeExecutionCommand, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
-import { AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
+import { AssumeRoleCommand, AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 
 import { AWS_REGION_PATTERN, isAwsComputersEnabled, readAwsRegions, type Env } from './aws-config';
 import { AwsClientError, toAwsClientError } from './aws-errors';
+import { instanceMetadataCredentials } from './aws-instance-credentials';
 import type { Ec2EnrollmentDescriber, Ec2EnrollmentView } from './aws-enroll';
 import type { LifecycleStarter } from './aws-ec2';
 import type { LifecycleExecutionReader } from './aws-receipts';
@@ -153,6 +157,52 @@ export function webIdentityCredentials(opts: {
 const NO_AMBIENT_CREDENTIALS = async (): Promise<never> => {
     throw new AwsClientError('aws_caller_unavailable', false, 'AmbientCredentialsRefused');
 };
+
+/** EC2 base credentials are used only by STS; downstream clients use this regional session. */
+export function instanceRoleCallerCredentials(opts: {
+    roleArn: string;
+    sts: Sender;
+    now?: () => Date;
+}): () => Promise<AwsCredentials> {
+    if (!ROLE_ARN.test(opts.roleArn)) throw new AwsClientError('aws_config', false, 'AppCallerRoleArnInvalid');
+    const now = opts.now ?? (() => new Date());
+    let cached: AwsCredentials | null = null;
+    let pending: Promise<AwsCredentials> | null = null;
+    const assume = async (): Promise<AwsCredentials> => {
+        let out: { Credentials?: { AccessKeyId?: string; SecretAccessKey?: string; SessionToken?: string; Expiration?: Date } };
+        try {
+            out = await opts.sts.send(new AssumeRoleCommand({
+                RoleArn: opts.roleArn,
+                RoleSessionName: `ezil-os-ec2-${randomBytes(6).toString('hex')}`,
+                DurationSeconds: 900,
+            })) as typeof out;
+        } catch (error) {
+            const mapped = toAwsClientError(error);
+            if (mapped.code === 'credentials_unavailable' || mapped.code === 'aws_throttled') throw mapped;
+            throw new AwsClientError('aws_caller_unavailable', false, mapped.awsName);
+        }
+        const c = out.Credentials;
+        if (!c?.AccessKeyId || !c.SecretAccessKey || !c.SessionToken || !(c.Expiration instanceof Date)
+            || !Number.isFinite(c.Expiration.getTime()) || c.Expiration.getTime() <= now().getTime()) {
+            throw new AwsClientError('aws_caller_unavailable', false, 'StsCredentialsIncomplete');
+        }
+        return { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken, expiration: c.Expiration };
+    };
+    return async () => {
+        if (cached && cached.expiration.getTime() - CREDENTIAL_MARGIN_MS > now().getTime()) return cached;
+        pending ??= assume().finally(() => { pending = null; });
+        cached = await pending;
+        return cached;
+    };
+}
+
+const CREDENTIAL_SOURCE_LOGGED = Symbol.for('ezil.aws-credential-source-logged');
+function logCredentialSource(source: 'vercel-oidc' | 'ec2-instance-role'): void {
+    const state = globalThis as Record<symbol, unknown>;
+    if (state[CREDENTIAL_SOURCE_LOGGED]) return;
+    state[CREDENTIAL_SOURCE_LOGGED] = true;
+    console.info(source);
+}
 
 // ── ARN pinning ─────────────────────────────────────────────────────────
 
@@ -412,7 +462,7 @@ export function createEc2EnrollmentDescriber(
 export interface AwsSdkFactories {
     /** Defaults to the Vercel OIDC token of the current request. */
     token?: () => string | null;
-    sts?: (region: string) => Sender;
+    sts?: (region: string, credentials: () => Promise<AwsCredentials>) => Sender;
     sfn?: (region: string, credentials: () => Promise<AwsCredentials>) => Sender;
     ec2?: (region: string, credentials: () => Promise<AwsCredentials>) => Sender;
     now?: () => Date;
@@ -444,9 +494,11 @@ export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): Aw
     if (!regions.regions.every((r) => ROLE_ARN.test(env[appCallerRoleEnv(r.name)]?.trim() ?? ''))) return {};
     const configured = new Set(regions.regions.map((r) => r.name));
     const token = f.token ?? (() => readVercelOidcToken(env));
+    const vercel = env.VERCEL === '1';
+    const baseCredentials = vercel ? NO_AMBIENT_CREDENTIALS : instanceMetadataCredentials({ now: f.now });
     // `requestHandler` is spread only when a test supplies it; production uses the SDK's own HTTP handler.
     const http = f.requestHandler ? { requestHandler: f.requestHandler as never } : {};
-    const stsFor = f.sts ?? ((region: string) => new STSClient({ region, credentials: NO_AMBIENT_CREDENTIALS, maxAttempts: 2, ...http }));
+    const stsFor = f.sts ?? ((region: string, credentials: () => Promise<AwsCredentials>) => new STSClient({ region, credentials, maxAttempts: 2, ...http }));
     const sfnFactory =
         f.sfn ?? ((region: string, credentials: () => Promise<AwsCredentials>) => new SFNClient({ region, credentials, maxAttempts: 3, ...http }));
     const ec2Factory =
@@ -460,7 +512,14 @@ export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): Aw
             const roleArn = env[appCallerRoleEnv(region)]?.trim() ?? '';
             const m = ROLE_ARN.exec(roleArn);
             if (!m) throw new AwsClientError('aws_config', false, 'AppCallerRoleUnset');
-            c = { account: m[1]!, credentials: webIdentityCredentials({ roleArn, region, token, sts: stsFor(region), now: f.now }) };
+            const sts = stsFor(region, baseCredentials);
+            const credentials = vercel
+                ? webIdentityCredentials({ roleArn, region, token, sts, now: f.now })
+                : instanceRoleCallerCredentials({ roleArn, sts, now: f.now });
+            c = { account: m[1]!, credentials: () => {
+                logCredentialSource(vercel ? 'vercel-oidc' : 'ec2-instance-role');
+                return credentials();
+            } };
             credentialsByRegion.set(region, c);
         }
         return c;
@@ -495,7 +554,7 @@ export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): Aw
 /** The settings the shared collaborators depend on; a change rebuilds them. */
 function collaboratorKey(env: Env): string {
     const regions = (env.AWS_REGIONS ?? '').split(',');
-    return JSON.stringify([env.EZIL_AWS_COMPUTERS_ENABLED ?? '', env.AWS_REGIONS ?? '', ...regions.map((r) => env[appCallerRoleEnv(r)] ?? '')]);
+    return JSON.stringify([env.EZIL_AWS_COMPUTERS_ENABLED ?? '', env.VERCEL ?? '', env.AWS_REGIONS ?? '', ...regions.map((r) => env[appCallerRoleEnv(r)] ?? '')]);
 }
 let shared: { key: string; value: AwsSdkCollaborators } | null = null;
 
