@@ -285,7 +285,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 128479,
-          "default": 24000,
+          "default": 60000,
           "description": "Gateway input allowance reserved for tool schemas, which Copilot does not count."
         },
         "topP": {
@@ -393,7 +393,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 128479,
-          "default": 24000,
+          "default": 60000,
           "description": "Gateway input allowance reserved for tool schemas, which Copilot does not count."
         },
         "topP": {

@@ -105,6 +105,8 @@ describe('gateway sanitizer', () => {
         expect(gatewayTokenCount(msg('system', thinking))).toBe(0);
         expect(gatewayInputTokens(gw())).toBe(104480);
         expect(gatewayInputTokens({ ...gw(), toolReserve: 1000 })).toBe(127480);
+        // Default reserve covers Copilot 0.69's measured Agent tool schemas (54,221 bytes).
+        expect(gatewayInputTokens({ maxInputTokens: 131072 })).toBe(131072 - 1056 - 1536 - 60000);
     });
     test('actual body bytes plus 1056 are bounded before sending', () => {
         expect(() => build(ask([msg('user', txt('字'.repeat(44000)))]))).toThrow('Conversation too large');

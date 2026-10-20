@@ -271,7 +271,9 @@ try {
   check('terminal tool requires confirmation in the UI', true);
   check('terminal command has not run before confirmation', file('terminal-confirmed.txt') === '');
   await page.screenshot({ path: join(OUT, 'terminal-confirmation.png') });
-  await confirmation.getByRole('button', { name: /^(Allow|Continue|Run)(\b|$)/i }).first().click();
+  // 1.141 renders the confirmation's buttons beside, not inside, the text block matched above.
+  await aux.locator('.chat-confirmation-widget-container .monaco-button, .chat-confirmation-widget2 .monaco-button, .chat-confirmation-widget-buttons .monaco-button')
+    .filter({ hasText: /^\s*(Allow|Continue|Run)\s*$/i }).first().click();
   await until(async () => (await transcript()).includes('EZIL_E2E_DONE') && !await busy(), 'agent completion');
   check('agent created hello.txt', file('hello.txt') === 'hi\n');
   check('agent edited existing.txt', file('existing.txt') === 'after\n');

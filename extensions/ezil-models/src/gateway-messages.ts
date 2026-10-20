@@ -8,7 +8,10 @@ export const KIMI = 'us.moonshotai.kimi-k3';
 export const GATEWAY_INPUT_TOKENS = 131_072;
 export const INPUT_FRAMING = 1056;
 export const ENVELOPE_RESERVE = 1536;
-export const DEFAULT_TOOL_RESERVE = 24_000;
+// Copilot 0.69 Agent mode offers 38 tools whose schemas measured 54,221 bytes (image e2e, 2026-10-20),
+// and Copilot does not count them against maxInputTokens. Reserve them so its own summarisation
+// starts before the gateway byte bound would refuse the request.
+export const DEFAULT_TOOL_RESERVE = 60_000;
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 type ObjectValue = Record<string, unknown>;
 export type TextBlock = { type: 'text'; text: string };
