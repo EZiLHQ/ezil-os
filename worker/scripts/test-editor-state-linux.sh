@@ -51,6 +51,8 @@ const machine = JSON.parse(fs.readFileSync(root + '/Machine/settings.json', 'utf
 assert.equal(machine['chat.allowAnonymousAccess'], true);
 assert.equal(machine['chat.disableAIFeatures'], false);
 assert.equal(machine['chat.byokUtilityModelDefault'], 'mainAgent');
+assert.equal(machine['chat.utilityModel'], 'ezil/qwen.qwen3-coder-next');
+assert.equal(machine['chat.utilitySmallModel'], 'ezil/qwen.qwen3-coder-next');
 assert.equal(machine['telemetry.telemetryLevel'], 'off');
 assert.equal(machine['github.copilot.chat.tools.viewImage.enabled'], false);
 assert.equal(machine['github.copilot.chat.virtualTools.threshold'], 64);
