@@ -1,11 +1,10 @@
-/**
- * QA: UI honesty (CONTRACT-v2 §1, §4, §5). Reads the shipped shell/pricing sources
- * directly; the five copy-ban lists must be one list.
- */
+/** V3 rendered-copy honesty; existing v2 subscriptions retain their consent terms. */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { createRequire } from 'node:module';
+import { afterAll, describe, expect, it } from 'vitest';
 
+import { publicOffers } from '@/server/billing/v3/catalog';
 import { getPricingContent } from '@/app/(marketing)/pricing/pricing-content';
 
 const ROOT = path.resolve(__dirname, '../../../../../..');
@@ -17,11 +16,38 @@ const REGEX_FILES = [
     'shell/ezil/ui/Settings/upgrade-sheet-test.mjs',
     'app/src/app/(marketing)/pricing/pricing.test.ts',
 ];
-const UI_SOURCES = [
-    'shell/ezil/ui/Settings/tabs/billing.js', 'shell/ezil/ui/Settings/billing-sheets.js',
-    'shell/ezil/ui/Settings/upgrade-sheet.js', 'shell/ezil/ui/Settings/billing-format.js',
-    'app/src/app/(marketing)/pricing/pricing-content.ts', 'app/src/app/(marketing)/_components/home-page.tsx',
-];
+// Bundle the actual renderer and sheets, without booting a desktop or using the network.
+const appRequire = createRequire(path.join(ROOT, 'app/package.json'));
+const shellRequire = createRequire(path.join(ROOT, 'shell/package.json'));
+const { buildSync } = appRequire('esbuild');
+const { JSDOM } = shellRequire('jsdom');
+const bundle = buildSync({
+    stdin: { contents: `
+        import { summaryV3Html } from './tabs/billing.js';
+        import { summaryV3 } from './billing-v3-fixtures.mjs';
+        import * as sheets from './billing-sheets.js';
+        import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
+        window.copyQA = { summaryV3Html, summaryV3, sheets, v3CopyForAudit, honestyBans };
+    `, resolveDir: path.join(ROOT, 'shell/ezil/ui/Settings') },
+    bundle: true, write: false, format: 'iife', target: 'es2022',
+}).outputFiles[0].text;
+const dom = new JSDOM('<!doctype html><body><main></main></body>', { runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://example.test/os' });
+dom.window.html_encode = (text: string) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+dom.window.structuredClone = structuredClone;
+dom.window.eval(bundle);
+const api = dom.window.copyQA;
+afterAll(() => dom.window.close());
+function summary(tier: string) {
+    const value = api.summaryV3(tier);
+    value.catalog.offers = publicOffers();
+    return value;
+}
+function assertHonest(copy: string, faq = false) {
+    const banned = new RegExp(arrayTerms().map(t => t.replace(/ /g, '\\s+')).join('|'), 'i');
+    expect(api.v3CopyForAudit(copy, { faq })).not.toMatch(banned);
+    expect(copy).not.toMatch(api.honestyBans);
+    expect(copy).not.toMatch(/ai (credit|usage)? ?(is )?included|includes ai|with ai\b/i);
+}
 
 function regexTerms(rel: string): string[] {
     const m = read(rel).match(/const banned = \/(.+)\/i;/);
@@ -44,33 +70,63 @@ describe('qa UI honesty', () => {
         for (const rel of REGEX_FILES) expect([rel, regexTerms(rel)]).toEqual([rel, reference]);
     });
 
-    it('no shipped billing/pricing source contains a banned term or a speed / memory-survival promise', () => {
-        const extra = /\bfast\b|speed|in seconds|lightning|blazing|ram is kept|memory is preserved|processes (are )?kept|processes survive|keeps? running after/i;
-        const banned = new RegExp(arrayTerms().map(t => t.replace(/ /g, '\\s+')).join('|'), 'i');
-        for (const rel of UI_SOURCES) {
-            const code = read(rel).replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, '')
-                // The ban list itself is not copy.
-                .replace(/^export const BANNED_COPY = .*$/m, '');
-            const strings = [...code.matchAll(/(['"`])((?:\\.|(?!\1)[^\\])*)\1/g)].map(m => m[2]).join('\n');
-            expect([rel, strings.match(banned)?.[0] ?? null]).toEqual([rel, null]);
-            expect([rel, strings.match(extra)?.[0] ?? null]).toEqual([rel, null]);
+    it('shell offer fixtures match the pinned public catalog', () => {
+        expect(api.summaryV3().catalog.offers).toEqual(publicOffers());
+    });
+
+    it.each(['free', 'standard', 'premium'])('v3 %s renders honest plan copy without v2 meters or overage', tier => {
+        const value = summary(tier);
+        for (const status of ['ok', 'near', 'paused']) {
+            value.fairUse.status = status;
+            const html = api.summaryV3Html(value);
+            assertHonest(html);
+            expect(html).not.toMatch(/standard-hour|overage|billed separately|progressbar/i);
+            expect(html).toContain('Prices before tax.');
+            if (tier === 'free') expect(html).toContain('2 vCPU · 6 GB');
+            if (tier === 'premium') for (const spec of ['2 vCPU · 8 GB', '4 vCPU · 16 GB', '8 vCPU · 32 GB']) expect(html).toContain(spec);
         }
     });
 
-    it.each([[null], ['2026-12-01T00:00:00Z']])('pricing (Free effective %s): Free never 8 GiB, prices before tax, overage names rate, cap and billed separately, no AI included', effective => {
+    it('v3 plan, upgrade, downgrade and cancellation sheets render honest copy', async () => {
+        const container = dom.window.document.querySelector('main');
+        for (const [tier, opener] of [['free', 'openPlanPickerSheet'], ['standard', 'openComputeUpgradeSheet'], ['premium', 'openDowngradeSheet'], ['premium', 'openCancelSheet']]) {
+            const handle = api.sheets[opener]({ container, summary: summary(tier), trpc: {
+                mutate: async () => ({ ok: true, data: { lines: [], amountDueCents: 1200, prorationDate: 1 } }),
+            } });
+            await new Promise<void>(resolve => setImmediate(resolve));
+            const html = dom.window.document.querySelector('[role="dialog"]').outerHTML;
+            assertHonest(html);
+            expect(html).not.toMatch(/standard-hour|overage|billed separately/i);
+            if (opener === 'openComputeUpgradeSheet') {
+                expect(html).toContain('$100/month');
+                expect(html).toContain('after payment. Your Mumbai computer is prepared then.');
+            }
+            handle.close();
+        }
+    });
+
+    it('keeps banned terms and opening/memory promises rejected outside the exact approved phrases', () => {
+        for (const copy of ['opens faster', '500 standard-hours', 'instant', 'memory survives', 'Opens from a ready computer', 'opens in seconds', 'Most popular']) {
+            expect(() => assertHonest(copy)).toThrow();
+        }
+        assertHonest('uses time 2× faster');
+        assertHonest('uses time 4× faster');
+    });
+
+    it.each([[null], ['2026-12-01T00:00:00Z']])('v3 pricing (legacy display flag %s): catalog prices, GB, no overage or AI included', effective => {
         const content = getPricingContent(false, effective);
         const text = allText(content);
-        const free = (content as unknown as { plans: { id: string }[] }).plans.find(p => p.id === 'free');
+        const free = content.plans.find(p => p.id === 'free');
         expect(free).toBeDefined();
-        expect(allText(free)).not.toMatch(/8\s*GiB/);
-        expect(allText(free)).toMatch(/6\s*GiB/);
+        expect(allText(free)).not.toMatch(/8\s*G(?:i)?B/);
+        expect(allText(free)).toMatch(/2 vCPU · 6 GB/);
         expect(text).toMatch(/before tax/i);
-        expect(text).toMatch(/\$0\.25 per standard-hour/);
-        expect(text).toMatch(/billed separately/i);
-        expect(text).toMatch(/cap/i);
-        expect(text).toMatch(/\$100/);
-        expect(text).not.toMatch(/ai (credit|usage)? ?(is )?included|includes ai|with ai\b/i);
-        expect(text).toMatch(/running processes start fresh/i);
+        expect(text).not.toMatch(/overage|billed separately|\$0\.25/);
+        expect(content.plans.map(plan => plan.price)).toEqual(publicOffers().map(offer => `$${offer.priceCents / 100}`));
+        expect(allText(content.plans[2])).toContain('2, 4 or 8 vCPU (8, 16 or 32 GB)');
+        expect(text).toContain('Running processes stop; they start fresh');
+        assertHonest(allText(content.plans));
+        assertHonest(text, true);
     });
 
     it('the overage consent sheet names the rate, the cap and "billed separately" in the consent copy', () => {

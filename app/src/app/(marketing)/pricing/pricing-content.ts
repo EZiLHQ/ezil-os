@@ -72,7 +72,7 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
                 },
                 {
                     question: 'What does fair use mean?',
-                    answer: `Usage is included for everyday work: ${offers.map(offer => `about ${hours(offer.fairUseSeconds)} hours a month on ${offer.name}`).join(', ')}. Older Free accounts keep ${hours(CATALOG_V3.free_v3.legacyFairUseSeconds!)} hours. If you reach fair use, your computer pauses until your allowance renews, or you can upgrade. Free renews each calendar month in UTC; paid plans renew each billing period. Starting another session does not reset fair use.`,
+                    answer: `Usage is included for everyday work: ${offers.map(offer => `about ${hours(offer.fairUseSeconds)} ${offer.tier === 'premium' ? 'standard-hours' : 'hours'} a month on ${offer.name}`).join(', ')}. Older Free accounts keep ${hours(CATALOG_V3.free_v3.legacyFairUseSeconds!)} hours. If you reach fair use, your computer pauses until your allowance renews, or you can upgrade. Free renews each calendar month in UTC; paid plans renew each billing period. Starting another session does not reset fair use.`,
                 },
                 {
                     question: 'What stays after a session?',
@@ -81,6 +81,10 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
                 {
                     question: 'How do upgrades and cancellations work?',
                     answer: 'Start a paid plan from Settings → Billing. Standard to Premium upgrades show the prorated price before you pay and apply once payment succeeds. Cancellations and changes to a lower plan take effect at the end of your billing period. Your paid plan stays active until then.',
+                },
+                {
+                    question: 'Why do bigger computers use time faster?',
+                    answer: 'Bigger computers use more resources: 4 vCPU counts double and 8 vCPU counts four times toward your monthly time. One hour on 2 vCPU uses one hour of that time; on 4 vCPU it uses two, and on 8 vCPU it uses four. Your choice applies to your next session.',
                 },
             ],
         },
