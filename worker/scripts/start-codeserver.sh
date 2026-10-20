@@ -93,6 +93,7 @@ nohup code-server \
     --bind-addr 0.0.0.0:${PORT} \
     --auth none \
     --disable-telemetry \
+    --disable-update-check \
     --user-data-dir="$USER_DATA_DIR" \
     --extensions-dir="$EXTENSIONS_DIR" \
     "$WORKSPACE_ROOT" \
