@@ -6,10 +6,21 @@ const base: Parameters<AdmitStartV3>[0] = { sku: 'free_v3', planActive: true, pa
     usedSeconds: 0, legacyFree: false, runningComputers: 0, poolHostAvailable: true, now: '2026-10-19T12:00:00Z' };
 
 describe('v3 admission golden cases', () => {
+    it.each([['std-2', 1], ['cmp-4', 2], ['cmp-8', 4]] as const)(
+        'converts standard-seconds to actual seconds for %s', (size, weight) => {
+            const args = { ...base, sku: 'premium_monthly_v3' as const, size };
+            expect(admitStart({ ...args, usedSeconds: 0 })).toMatchObject({ admit: true, size, maxRunSeconds: 21600 });
+            expect(admitStart({ ...args, usedSeconds: 1800000 - (60 * weight - 1) })).toEqual({ admit: false, reason: 'fair_use_paused' });
+            expect(admitStart({ ...args, usedSeconds: 1800000 - 60 * weight })).toMatchObject({ admit: true, maxRunSeconds: 60, deadline: '2026-10-19T12:01:00Z' });
+            expect(admitStart({ ...args, usedSeconds: 1800000 })).toEqual({ admit: false, reason: 'fair_use_paused' });
+        });
+    it.each([['free_v3', 'std-2'], ['standard_monthly_v3', 'cmp-8'], ['premium_monthly_v3', 'free-cf']] as const)(
+        '%s refuses disallowed %s', (sku, size) => expect(admitStart({ ...base, sku, size })).toEqual({ admit: false, reason: 'size_not_allowed' }));
+
     it.each([
         ['free_v3', 3600, 'free-cf', false, 0],
         ['standard_monthly_v3', 7200, 'std-2', true, 1],
-        ['premium_monthly_v3', 21600, 'cmp-4', true, 2],
+        ['premium_monthly_v3', 21600, 'std-2', true, 2],
     ] as const)('%s session cap', (sku, maxRunSeconds, size, fromPool, poolPriority) => {
         expect(admitStart({ ...base, sku })).toEqual({ admit: true, size, maxRunSeconds, fromPool, poolPriority,
             deadline: new Date(Date.parse(base.now) + maxRunSeconds * 1000).toISOString().replace('.000Z', 'Z') });

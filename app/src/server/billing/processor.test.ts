@@ -1486,7 +1486,7 @@ describe('v3 paid invoice grants', () => {
         f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), lookupKey: `ezil_${sku}` }];
         return f;
     }
-    it.each([['standard_monthly_v3', 144000], ['premium_monthly_v3', 288000]] as const)
+    it.each([['standard_monthly_v3', 144000], ['premium_monthly_v3', 1800000]] as const)
     ('%s grants the invoiced period once and reverses it on a refund', async (sku, seconds) => {
         const { store, stripe, deps } = v3Fixture(sku);
         expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
@@ -1524,7 +1524,7 @@ describe('v3 paid invoice grants', () => {
             { ...baseLine('compute_monthly_v2'), lookupKey: 'ezil_premium_monthly_v3', amount: 2000, proration: true, periodStart: now },
         ];
         expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
-        const expected = BigInt(144000) * BigInt((periodEnd.getTime() - now.getTime()) / 1000) / BigInt((periodEnd.getTime() - periodStart.getTime()) / 1000);
+        const expected = BigInt(1656000) * BigInt((periodEnd.getTime() - now.getTime()) / 1000) / BigInt((periodEnd.getTime() - periodStart.getTime()) / 1000);
         expect([...store.grants.values()][0]).toMatchObject({ kind: 'upgrade_prorated', amount: expected, periodStart, periodEnd });
         const other = v3Fixture('premium_monthly_v3');
         other.stripe.invoice.billingReason = 'subscription_update';

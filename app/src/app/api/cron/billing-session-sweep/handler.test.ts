@@ -285,15 +285,22 @@ describe('billing session sweep', () => {
 });
 
 describe('v3 session deadlines', () => {
+    it('stops cmp-8 after one actual hour consumes four standard-hours', async () => {
+        const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 14400 });
+        expect(await f.run(3599)).toMatchObject({ stopped: 0 });
+        expect(await f.run(3600)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'allowance_exhausted' });
+    });
+
     it.each([[null, 3600], ['standard_monthly_v3', 7200], ['premium_monthly_v3', 21600]] as const)
     ('stops %s exactly at its plan cap, even with no stored deadline', async (sku, cap) => {
-        const f = fixture([epoch()], { sku, allowance: 288000 });
+        const f = fixture([epoch()], { sku, allowance: 1800000 });
         expect(await f.run(cap - 1)).toMatchObject({ stopped: 0 });
         expect(await f.run(cap)).toMatchObject({ stopped: 1, closed: 1 });
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(cap), endReason: 'session_max' });
     });
     it('v3 receipt revocation exhausts the running session', async () => {
-        const f = fixture([epoch()], { sku: 'premium_monthly_v3', allowance: 288000 });
+        const f = fixture([epoch()], { sku: 'premium_monthly_v3', allowance: 1800000 });
         await f.run(100);
         f.store.grantsForPeriod.mockResolvedValue([]);
         await f.run(200);

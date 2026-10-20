@@ -4,6 +4,7 @@ import { storageState } from '../meters';
 import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type Window } from '../v2/contract';
 import { buildSummaryV2 } from '../v2/summary';
+import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
@@ -12,14 +13,12 @@ import { CATALOG_V3_VERSION, type BillingSummaryV3, type SellableSkuV3 } from '.
 const iso = (date: Date) => isoSeconds(epochSeconds(date));
 const sellable = (sku: string | null): sku is SellableSkuV3 => sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3';
 
-/** Wall-clock seconds, clipped to the allowance window; size weights never multiply v3 usage. */
+/** Standard seconds, using v2's validated epoch weights and session bounds. */
 export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineAt?: string | null })[], window: Window, now: Date): number {
-    return epochs.reduce((total, epoch) => {
-        const start = Math.max(epochSeconds(epoch.readyAt, 'ceil'), epochSeconds(window.start));
-        const end = Math.min(epochSeconds(epoch.endedAt ?? iso(now)), epochSeconds(now), epochSeconds(window.end),
-            epoch.deadlineAt == null ? Infinity : epochSeconds(epoch.deadlineAt));
-        return total + Math.max(0, end - start);
-    }, 0);
+    return rateWindow({ epochs: epochs.map(epoch => ({ ...epoch,
+        endedAt: isoSeconds(Math.min(epochSeconds(epoch.endedAt ?? iso(now)), epochSeconds(now),
+            epoch.deadlineAt == null ? Infinity : epochSeconds(epoch.deadlineAt))),
+    })), window, now: iso(now) }).stdSeconds;
 }
 
 /** Paid receipts and reversals keep the same subscription/period isolation as v2. */
@@ -54,13 +53,15 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         : issues.length || plan.status === 'past_due' || plan.status === 'incomplete' ? 'payment_failed' : null;
     const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now);
     const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants);
-    const size = legacy ? SIZES[legacy.compute.selectedSize] : plan.sku === 'legacy' ? SIZES[plan.offer.defaultSize] : SIZES[plan.offer.size];
+    const size = legacy ? SIZES[legacy.compute.selectedSize] : plan.sku === 'legacy' ? SIZES[plan.offer.defaultSize]
+        : SIZES[input.sizePreference !== null && plan.offer.machineChoice.includes(input.sizePreference)
+            ? input.sizePreference : plan.offer.size];
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
         .sort((a, b) => Date.parse(b.readyAt) - Date.parse(a.readyAt))[0];
     const activeDeadline = legacy ? legacy.compute.session.activeDeadline : latest ? isoSeconds(Math.min(
         epochSeconds(latest.readyAt, 'ceil') + plan.sessionMaxSeconds,
         latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
-        epochSeconds(input.now) + Math.max(0, allowance - usedSeconds),
+        epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight),
     )) : null;
     const newest = new Map<string, typeof input.storage[number]>();
     for (const sample of input.storage) {

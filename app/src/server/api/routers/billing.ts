@@ -9,9 +9,10 @@ import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3 } from '@/server/billing/v3/summary';
-import type { BillingSummaryV3Result } from '@/server/billing/v3/contract';
+import type { BillingSummaryV3Result, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
-    CATALOG_V2, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
+    CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
+    type SizeCode,
     type BillingErrorCode, type BillingInvoiceDTO, type CheckoutStartDTO,
     type CheckoutStatusDTO, type ConfirmUpgradeOutput, type PreviewUpgradeOutput, type ScheduleDowngradeOutput,
     type CancelAtPeriodEndOutput, type SetOverageOutput, type SelectSizeOutput,
@@ -313,12 +314,26 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     planChanges: changes, paymentIssues, overageInvoices, storage, sizePreference, hasCustomer: customer !== null }).overage!;
             }),
 
+        selectMachine: protectedProcedure.input(z.object({ size: z.custom<SizeCode>(
+            value => typeof value === 'string' && Object.prototype.hasOwnProperty.call(SIZES, value),
+            { message: 'size_not_allowed' },
+        ) })).mutation(async ({ ctx, input }): Promise<SelectMachineOutputV3> => {
+            const deps = getDeps();
+            const { plan } = await currentPlan(deps, ctx.user.id);
+            if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active'
+                || !plan.offer.machineChoice.includes(input.size)) {
+                throw billingError('size_not_allowed', 'BAD_REQUEST');
+            }
+            await deps.store.setSizePreference(ctx.user.id, input.size);
+            return { size: input.size, effective: 'next_open' };
+        }),
+
         selectSize: protectedProcedure.input(z.object({ size: z.string() }))
             .mutation(async ({ ctx, input }): Promise<SelectSizeOutput> => {
                 const deps = getDeps();
                 configuredStripe(deps);
                 const { plan } = await currentPlan(deps, ctx.user.id);
-                if (plan.sku !== 'legacy') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+                if (plan.sku !== 'legacy' || plan.offer.sku !== 'compute_monthly_v2') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
                 const size = plan.offer.sizes.find(size => size === input.size);
                 if (!size) throw billingError('size_not_allowed', 'BAD_REQUEST');
                 await deps.store.setSizePreference(ctx.user.id, size);
