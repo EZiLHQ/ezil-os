@@ -144,6 +144,23 @@ describe('gateway errors and credits', () => {
         await gatewayModels(provider, s.fetch, 300001); expect(s.calls).toHaveLength(2);
         await gatewayModels({ ...provider }, s.fetch, 300002); expect(s.calls).toHaveLength(3);
     });
+    for (const field of ['max_input_tokens', 'max_output_tokens']) {
+        for (const value of [undefined, null, '4096', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+            test(`rejects and does not cache catalog ${field}=${String(value)}`, async () => {
+                const s = server((_, i) => json(i === 0 ? { data: [{ ...catalog.data[0], [field]: value }] } : catalog));
+                const provider = gw().provider;
+                expect(await gatewayModels(provider, s.fetch, 0)).toBeUndefined();
+                expect((await gatewayModels(provider, s.fetch, 1))?.data).toEqual(catalog.data);
+                await gatewayModels(provider, s.fetch, 2);
+                expect(s.calls).toHaveLength(2);
+            });
+        }
+    }
+    test('catalog accepts positive safe integer boundaries', async () => {
+        const data = [{ ...catalog.data[0]!, max_input_tokens: Number.MAX_SAFE_INTEGER, max_output_tokens: 1 }];
+        const s = server(() => json({ data }));
+        expect((await gatewayModels(gw().provider, s.fetch, 0))?.data).toEqual(data);
+    });
     test('credit states and command only use allowed GET endpoints', async () => {
         const balance = { available_micro: 0, held_micro: 0, grants: [] };
         expect(creditState(undefined, undefined, '').state).toBe('unknown');

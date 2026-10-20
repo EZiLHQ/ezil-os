@@ -264,16 +264,27 @@ const { frames, messageJson } = await import('./fixtures/gateway-response');
 const { gatewayTokenCount, KIMI } = await import('../src/gateway-messages');
 
 describe('EZiL gateway VS Code bridge', () => {
-    function gatewayHost(doFetch: typeof fetch) {
+    function catalog(maxInputTokens = 131072, maxOutputTokens = 8192) {
+        return { data: [gw(), gw(KIMI)].map(model => ({ id: model.model, alias: model.model, upstream_model: 'upstream', enabled: true,
+            max_input_tokens: maxInputTokens, max_output_tokens: maxOutputTokens })) };
+    }
+    function gatewayHost(doFetch: typeof fetch, getCatalog: () => Response = () => Response.json(catalog())) {
         const models = [gw(), gw(KIMI)];
+        models[1]!.provider = models[0]!.provider;
         models[0]!.default = true; models[1]!.default = false;
         const lines: string[] = []; const usage: Usage[] = [];
+        const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+            init?.signal?.throwIfAborted();
+            return String(input).endsWith('/models') ? getCatalog() : doFetch(input, init);
+        }) as typeof globalThis.fetch;
         return { models: () => models, configError: () => undefined, secrets: () => ['synthetic-proxy-token'], logRequests: () => true,
-            log: (s: string) => lines.push(s), recordUsage: (_m: ResolvedModel, u: Usage) => usage.push(u), fetch: doFetch, lines, usage };
+            log: (s: string) => lines.push(s), recordUsage: (_m: ResolvedModel, u: Usage) => usage.push(u), fetch, lines, usage };
     }
     test('advertises reserved input and per-model output; hides disabled models and caches catalog', async () => {
         let gets = 0;
-        const host = gatewayHost((async () => { gets++; return Response.json({ data: [{ id: gw().id, enabled: true }, { id: KIMI, enabled: false }] }); }) as unknown as typeof fetch);
+        const host = gatewayHost((async () => { throw new Error('unexpected POST'); }) as unknown as typeof fetch, () => {
+            gets++; const models = catalog(); models.data[1]!.enabled = false; return Response.json(models);
+        });
         const provider = new EZiLModelsProvider(host);
         const info = await provider.provideLanguageModelChatInformation({} as never, token() as never);
         expect(info).toHaveLength(1); expect(info[0]).toMatchObject({ maxInputTokens: 104480, maxOutputTokens: 8192, capabilities: { imageInput: false }, isDefault: true });
@@ -284,6 +295,69 @@ describe('EZiL gateway VS Code bridge', () => {
         expect(await provider.provideTokenCount(info[0]!, value as never, token() as never)).toBe(gatewayTokenCount(toNeutralMessage(value as never)));
         expect(toInformation(host.models()[1]!)).toMatchObject({ maxOutputTokens: 4096 });
     });
+    for (const [configured, advertised, effective] of [[8192, 4096, 4096], [1024, 8192, 1024], [65536, 65536, 16384], [1, 4096, 16]] as const) {
+        test(`output config=${configured} catalog=${advertised} advertises and sends ${effective}`, async () => {
+            let gets = 0;
+            const bodies: Record<string, unknown>[] = [];
+            const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+                bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
+                return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } });
+            }) as unknown as typeof fetch, () => { gets++; return Response.json(catalog(131072, advertised)); });
+            host.models()[0]!.maxOutputTokens = configured;
+            host.models()[0]!.id = 'configured-picker-id'; // Catalog lookup uses the wire model, not the picker ID.
+            const provider = new EZiLModelsProvider(host);
+            // A response must load limits even when VS Code has not requested model information yet.
+            await provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+                { tools: [], modelOptions: { max_tokens: 16384 } } as never, { report: () => {} }, token() as never);
+            const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+            expect(infos[0]!.maxOutputTokens).toBe(effective);
+            expect(bodies).toHaveLength(1); expect(bodies[0]!.max_tokens).toBe(effective);
+            expect(gets).toBe(1); expect(host.models()[0]!.maxOutputTokens).toBe(configured);
+        });
+    }
+    for (const [configured, advertised] of [[131072, 32768], [32768, 65536]] as const) {
+        test(`input config=${configured} catalog=${advertised} reserves space and bounds UTF-8 bytes`, async () => {
+            const bodies: Uint8Array[] = [];
+            const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+                bodies.push(init!.body as Uint8Array);
+                return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } });
+            }) as unknown as typeof fetch, () => Response.json(catalog(advertised)));
+            host.models()[0]!.maxInputTokens = configured;
+            const provider = new EZiLModelsProvider(host);
+            const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+            expect(infos[0]!.maxInputTokens).toBe(32768 - 1056 - 1536 - 24000);
+            const send = (text: string) => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
+                { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+            await send('字'.repeat(10000));
+            expect(bodies[0]!.byteLength + 1056).toBeLessThanOrEqual(32768);
+            await expect(send('字'.repeat(11000))).rejects.toThrow('Conversation too large');
+            expect(bodies).toHaveLength(1); expect(host.models()[0]!.maxInputTokens).toBe(configured);
+        });
+    }
+    for (const [status, code] of [[400, 'max_output_tokens_invalid'], [413, 'input_too_large']] as const) {
+        test(`${status} ${code} clears cached limits for the next call without retrying`, async () => {
+            let gets = 0;
+            const bodies: Record<string, unknown>[] = [];
+            const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+                bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
+                if (bodies.length === 1) return Response.json({ error: { code } }, { status });
+                return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } });
+            }) as unknown as typeof fetch, () => { gets++; return Response.json(gets === 1 ? catalog() : catalog(32768, 4096)); });
+            const provider = new EZiLModelsProvider(host);
+            const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+            expect(infos[0]).toMatchObject({ maxInputTokens: 104480, maxOutputTokens: 8192 });
+            const send = (text = 'q') => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
+                { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+            await expect(send()).rejects.toThrow(code === 'input_too_large' ? 'Conversation too large' : code);
+            expect(bodies).toHaveLength(1); expect(gets).toBe(1);
+            await send(); // Still passes the old VS Code information object.
+            expect(bodies.map(body => body.max_tokens)).toEqual([8192, 4096]); expect(gets).toBe(2);
+            const refreshed = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+            expect(refreshed[0]).toMatchObject({ maxInputTokens: 6176, maxOutputTokens: 4096 });
+            await expect(send('字'.repeat(11000))).rejects.toThrow('Conversation too large');
+            expect(bodies).toHaveLength(2); expect(gets).toBe(2);
+        });
+    }
     test('Kimi reports JSON parts in order and never logs bodies even with logRequests enabled', async () => {
         const host = gatewayHost((async () => Response.json(messageJson(), { headers: { 'x-ezil-request-id': 'bridge-json' } })) as unknown as typeof fetch);
         const provider = new EZiLModelsProvider(host); const parts: unknown[] = [];
@@ -298,13 +372,24 @@ describe('EZiL gateway VS Code bridge', () => {
         const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
             bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
             return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } });
-        }) as unknown as typeof fetch);
+        }) as unknown as typeof fetch, () => Response.json(catalog(131072, 2048)));
         const provider = new EZiLModelsProvider(host);
         for (const requestInitiator of ['title', 'copilot.summary', 'progress', 'utilitySmall']) {
             await provider.provideLanguageModelChatResponse(toInformation(host.models()[1]!), [message(1, [new TextPart('q')])] as never,
                 { tools: [], modelOptions: { requestInitiator } } as never, { report: () => {} }, token() as never);
         }
         expect(bodies.every(b => b.model === gw().model && b.stream === true)).toBe(true);
+        expect(bodies.map(b => b.max_tokens)).toEqual([2048, 2048, 2048, 2048]);
+    });
+    test('cancellation before catalog lookup makes no requests', async () => {
+        let gets = 0; let posts = 0;
+        const host = gatewayHost((async () => { posts++; throw new Error('unexpected POST'); }) as unknown as typeof fetch,
+            () => { gets++; return Response.json(catalog()); });
+        const provider = new EZiLModelsProvider(host);
+        const cancel = token(); cancel.cancel();
+        await provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => { throw new Error('unexpected response'); } }, cancel as never);
+        expect(gets).toBe(0); expect(posts).toBe(0);
     });
     test('cancellation after first streamed text suppresses all further parts and usage', async () => {
         const cancel = token(); let wireCancelled = false;

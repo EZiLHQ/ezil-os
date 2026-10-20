@@ -54,7 +54,7 @@ export type GatewayBalance = { state?: string; available_micro: number; held_mic
 
 const modelsCache = new Map<ResolvedProvider, { at: number; models: GatewayModels }>();
 
-/** Clear the `/v1/models` cache (after `killswitch` / `model_disabled` / `max_output_tokens_invalid`, and in tests). */
+/** Clear the `/v1/models` cache after availability/limit refusals, and in tests. */
 export function forgetGatewayModels(baseUrl?: string): void {
     if (baseUrl === undefined) modelsCache.clear();
     else for (const provider of modelsCache.keys()) if (provider.baseUrl === baseUrl) modelsCache.delete(provider);
@@ -81,8 +81,19 @@ async function getJson(provider: ResolvedProvider, path: string, doFetch: typeof
 function asModels(json: unknown): GatewayModels | undefined {
     if (typeof json !== 'object' || json === null || !Array.isArray((json as GatewayModels).data)) return undefined;
     const raw = json as Record<string, unknown>;
-    if (raw.data === undefined || !Array.isArray(raw.data) || raw.data.some(entry => typeof entry !== 'object' || entry === null || typeof entry.id !== 'string' || typeof entry.enabled !== 'boolean')) return undefined;
+    if (raw.data === undefined || !Array.isArray(raw.data) || raw.data.some(entry => typeof entry !== 'object' || entry === null
+        || typeof entry.id !== 'string' || typeof entry.enabled !== 'boolean'
+        || !Number.isSafeInteger(entry.max_input_tokens) || entry.max_input_tokens <= 0
+        || !Number.isSafeInteger(entry.max_output_tokens) || entry.max_output_tokens <= 0)) return undefined;
     return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data: raw.data as GatewayModel[] };
+}
+
+/** Apply validated catalog caps without mutating config; callers still apply wire clamps/reserves. */
+export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayModels | undefined): ResolvedModel {
+    const entry = catalog?.data.find(entry => entry.id === model.model);
+    if (!entry || model.provider.type !== 'ezil-gateway') return model;
+    return { ...model, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
+        maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens) };
 }
 
 /** `GET /v1/models`, cached for five minutes per resolved provider (including its auth context). `undefined` when it cannot be read. */
@@ -287,7 +298,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 await (options.sleep ?? defaultSleep)(retryDelay(response.headers.get('retry-after'), body.code === 'rate_limited' ? 60 : 5, now()) * 1000, options.signal);
                 continue;
             }
-            if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
+            if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
             throw describeGatewayError(model.model, status, response.headers.get('retry-after'), body, requestId ?? null);
         }
         options.signal.throwIfAborted();

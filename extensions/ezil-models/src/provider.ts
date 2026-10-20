@@ -2,7 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
-import { gatewayModels } from './gateway';
+import { gatewayModels, withGatewayModelLimits } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel } from './config';
@@ -131,7 +131,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const providers = [...new Set(models.filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
             const catalog = new Map(await Promise.all(providers.map(async provider => [provider, await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), controller.signal)] as const)));
             if (token.isCancellationRequested) return [];
-            return models.filter(model => catalog.get(model.provider)?.data.find(entry => entry.id === model.model)?.enabled !== false).map(toInformation);
+            return models.filter(model => catalog.get(model.provider)?.data.find(entry => entry.id === model.model)?.enabled !== false)
+                .map(model => toInformation(withGatewayModelLimits(model, catalog.get(model.provider))));
         } finally { cancel.dispose(); }
     }
 
@@ -161,6 +162,13 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         const Thinking = thinkingCtor();
         let emittedText = false;
         try {
+            controller.signal.throwIfAborted();
+            if (resolved.provider.type === 'ezil-gateway') {
+                // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
+                const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
+                resolved = withGatewayModelLimits(resolved, catalog);
+                controller.signal.throwIfAborted();
+            }
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
