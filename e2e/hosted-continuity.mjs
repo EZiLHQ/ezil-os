@@ -182,21 +182,24 @@ try {
   const code = () => page.frames().find(f => /-code\./.test(f.url()));
   const openCode = async () => { await launch('code'); return bounded('Code workbench', async () => { const f = code(); return f && await f.locator('.monaco-workbench').count() ? f : null; }); };
   const editorModifier = process.platform === 'darwin' ? 'Meta' : 'Control';
-  const closeModal = async f => {
+  const closeModal = async (f, name = 'Code file saved and closed') => {
     const modal = f.locator('.monaco-modal-editor-block:visible');
     if (await modal.count()) {
-      await modal.locator('.codicon-close').last().click();
-      await bounded('Code file saved and closed', async () => {
+      await bounded(name, async () => {
+        if (!await modal.count()) return true;
+        // A close click can land while the workbench is still loading and be
+        // lost; click again on every pass until the editor or its prompt reacts.
         const save = f.getByRole('button', { name: 'Save', exact: true });
         if (await save.isVisible()) await save.click();
-        return !await modal.count();
+        else await modal.locator('.codicon-close').last().click({ timeout: 2000 }).catch(() => {});
+        return false;
       }, 15000);
     }
   };
   const command = async (f, text) => {
     evidence.command = text;
     await launch('code');
-    await closeModal(f);
+    await closeModal(f, 'Code leftover editor closed');
     const quick = f.locator('.quick-input-widget input:visible');
     // The visible row also contains shortcut and history labels. Select the
     // command's observed workbench identity rather than concatenated row text.
@@ -250,7 +253,7 @@ try {
     assert.ok((await readDocument(f)).includes(text.trim().split('\n')[0]),'Code document edit was not applied');
     // Close the edited file and handle Code's explicit Save confirmation.
     // Browser keyboard shortcuts can be intercepted on macOS.
-    if (await f.locator('.monaco-modal-editor-block:visible').count()) await closeModal(f);
+    if (await f.locator('.monaco-modal-editor-block:visible').count()) await closeModal(f, 'Code edited file saved and closed');
     else {
       const activeTab = f.locator('.tabs-container .tab.active');
       const fileName = await activeTab.locator('.label-name').innerText();
@@ -570,9 +573,26 @@ try {
     'Disk reload probe did not reach Code': 'reload_probe_missing',
     'Disk reload did not discard the unsaved probe': 'reload_probe_not_discarded',
     'Restored keybinding did not save the workspace edit': 'shortcut_not_saved',
+    'Current viewer frame progression timed out': 'viewer_progress_timeout',
+    'Runtime changed before session hold': 'hold_runtime_changed_before',
+    'Session hold relay baseline unavailable or expired': 'hold_relay_baseline_unavailable',
+    'Session hold relay unavailable or expired': 'hold_relay_unavailable',
+    'Session hold replaced runtime': 'hold_runtime_replaced',
+    'Session hold relay expiry moved backwards': 'hold_relay_expiry_backwards',
+    'Automatic credential renewal did not occur during session hold': 'hold_no_renewal',
   };
   const assertionCode = assertionCodes[error?.message];
   if (assertionCode) evidence.assertionCode = assertionCode;
+  // bounded() and api() failures name a literal operation or a query-free path.
+  const deadline = String(error?.message).match(/^([A-Za-z][A-Za-z ]{0,60}): deadline exceeded$/);
+  if (deadline) evidence.deadlineExceeded = deadline[1];
+  if (error?.relay) evidence.relayHold = error.relay;
+  try {
+    const state = await page?.evaluate(() => document.querySelector('.window[data-app="desktop"]')?.dataset.relayState ?? null);
+    if (typeof state === 'string' && /^[a-z]{1,20}$/.test(state)) evidence.desktopRelayState = state;
+  } catch { /* the page may be gone */ }
+  const http = String(error?.message).match(/^HTTP failure (\/api\/[a-z/-]{1,60})$/);
+  if (http) evidence.httpFailure = http[1];
   const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z0-9_]+)$/);
   if (missing) evidence.missingPrerequisite = missing[1];
   evidence.failedPhase = evidence.phases.at(-1)?.name || 'setup';

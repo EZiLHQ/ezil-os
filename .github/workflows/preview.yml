@@ -1,323 +1,262 @@
-# Cloud CI/CD: CI -> staging Worker -> source-built Vercel preview -> deployed
-# tests -> (main only) production Worker -> source-built Vercel app -> tests.
-# Manual and tag entry points call this same gate; local release drafts stay separate.
-#
-# Prerequisites, configured outside this workflow:
-# - GitHub environments `staging` and `production`, with environment-scoped
-#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, VERCEL_TOKEN, VERCEL_ORG_ID,
-#   VERCEL_PROJECT_ID, EZIL_E2E_EMAIL, EZIL_E2E_PASSWORD secrets, OS_WORKER_URL
-#   variable, and optional VERCEL_AUTOMATION_BYPASS_SECRET secret.
-# - Vercel project rootDirectory=app. Preview settings must use staging auth,
-#   matching Worker HMAC. The shared SQL database is never migrated from PRs.
-#   Disable overlapping Vercel Git deployments; this workflow owns ordering.
-# - worker/wrangler.toml must define env.staging with isolated routes, Sandbox
-#   bindings/containers, R2 buckets and vars. Provision secrets/resources out of
-#   band. A workers.dev URL is insufficient for the desktop's exposed ports.
-#   The Worker owner must also isolate preview-host routing: current
-#   normalizeSandboxHostname collapses every *.ezil.org host to ezil.org.
-# No schema migration, desktop release publication or production alias promotion
-# from preview: production is rebuilt with its own environment settings.
-name: Cloud preview and main deploy
+# Pushes deploy the selected environment before running its live check.
+# Configure staging/production environment secrets and OS_WORKER_URL separately.
+# Vercel rootDirectory=app; this workflow owns deployments and preview aliasing.
+name: Deploy and live check
 
 on:
-  workflow_call:
-    inputs:
-      source:
-        required: true
-        type: string
+  push:
+    branches: [preview, main]
+    tags: ['v*']
   workflow_dispatch:
-    inputs:
-      preview_pr:
-        description: 'Optional same-repository PR number: create a manual staging preview only'
-        required: false
-        type: string
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write
+
+# Image-plan trees plus every worker/Dockerfile context source. The offline
+# checker derives required roots from both files and rejects missing coverage.
+env:
+  IMAGE_INPUTS: |-
+    docker/neko
+    worker/neko
+    worker/assets
+    worker/bootstrap
+    worker/guacamole
+    worker/sandbox-template
+    worker/scripts
+    worker/sidecar
+    worker/Dockerfile
+    worker/.dockerignore
+    .github/scripts/image-plan.mjs
+    .github/scripts/build-images.sh
+    .github/scripts/test-desktop.sh
+    .github/workflows/image.yml
+
+concurrency:
+  group: os-live-${{ github.ref }}
+  cancel-in-progress: false
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  trust:
-    name: Admit successful trusted CI source
+  changes:
+    name: Detect container image inputs
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
     permissions:
       contents: read
       actions: read
-      pull-requests: read
     outputs:
-      allowed: ${{ steps.source.outputs.allowed }}
-      sha: ${{ steps.source.outputs.sha }}
-      production: ${{ steps.source.outputs.production }}
-      manual_preview: ${{ steps.source.outputs.manual_preview }}
-      preview_pr: ${{ steps.source.outputs.preview_pr }}
-      reason: ${{ steps.source.outputs.reason }}
+      image_changed: ${{ steps.image_changes.outputs.changed }}
+      image_source: ${{ steps.image_changes.outputs.source }}
     steps:
-      # No checkout, artifacts, caches, environments or deployment secrets here.
-      # workflow_run is privileged even for a fork PR: head_repository alone
-      # is insufficient, so re-read the PR's actual head repository and SHA.
-      - uses: actions/github-script@v8
-        id: source
-        env:
-          REQUESTED_SOURCE: ${{ inputs.source || github.sha }}
-          PREVIEW_PR: ${{ inputs.preview_pr }}
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Locate last successful deployment evidence
+        id: deployed
+        if: github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
         with:
           script: |
-            core.setOutput('allowed', 'false');
-            core.setOutput('production', 'false');
-            core.setOutput('manual_preview', 'false');
-            const deny = reason => {
-              core.setOutput('reason', reason);
-              core.warning(`No deployment admitted: ${reason}`);
-            };
-            core.setOutput('reason', 'CI did not qualify: source, event, trust, or current-main check failed');
-            const repo = context.repo;
-            const fullName = `${repo.owner}/${repo.repo}`;
-            if (context.eventName === 'workflow_dispatch' && process.env.PREVIEW_PR) {
-              const number = Number(process.env.PREVIEW_PR);
-              if (!Number.isSafeInteger(number) || number < 1) { core.setFailed('Invalid preview PR number'); return; }
-              const { data: initial } = await github.rest.pulls.get({ ...repo, pull_number: number });
-              if (initial.state !== 'open' || initial.base.ref !== 'main' ||
-                  initial.base.repo.full_name.toLowerCase() !== fullName.toLowerCase() ||
-                  initial.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase() ||
-                  initial.head.sha !== process.env.REQUESTED_SOURCE) {
-                core.setFailed('Manual preview must use the current head of an open same-repository PR to main'); return;
-              }
-              const sha = initial.head.sha;
-              for (let attempt = 0; attempt < 120; attempt++) {
-                const { data } = await github.rest.actions.listWorkflowRuns({
-                  ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'pull_request', per_page: 20,
-                });
-                const ci = data.workflow_runs.find(run => run.head_sha === sha && run.path === '.github/workflows/ci.yml' &&
-                  run.event === 'pull_request' && run.head_repository?.full_name.toLowerCase() === fullName.toLowerCase());
-                if (ci?.status === 'completed') {
-                  if (ci.conclusion !== 'success') { core.setFailed(`Manual preview CI concluded ${ci.conclusion}`); return; }
-                  const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
-                  if (current.state !== 'open' || current.head.sha !== sha ||
-                      current.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) {
-                    core.setFailed('Manual preview PR changed while awaiting CI'); return;
-                  }
-                  core.setOutput('sha', sha);
-                  core.setOutput('allowed', 'true');
-                  core.setOutput('manual_preview', 'true');
-                  core.setOutput('preview_pr', String(number));
-                  core.setOutput('reason', 'Tested PR admitted for manual staging preview; hosted acceptance remains pending');
-                  return;
-                }
-                await new Promise(resolve => setTimeout(resolve, 20000));
-              }
-              core.setFailed('Timed out waiting for manual preview CI'); return;
-            }
-            if (context.eventName === 'workflow_dispatch' || context.eventName === 'push') {
-              const sha = process.env.REQUESTED_SOURCE;
-              const { data: ref } = await github.rest.git.getRef({ ...repo, ref: 'heads/main' });
-              if (sha !== ref.object.sha) { core.setFailed('Manual/tag source must equal current main'); return; }
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'push', per_page: 100,
+            // A failed image push must remain drift on the following app-only push.
+            // Use the image receipt from the last successful deployment, never event.before.
+            try {
+              const branch = context.ref.replace('refs/heads/', '');
+              const {data} = await github.rest.actions.listWorkflowRuns({
+                ...context.repo, workflow_id: 'preview.yml', branch, status: 'success', per_page: 100,
               });
-              const ci = data.workflow_runs.find(r => r.head_sha === sha && r.head_branch === 'main' &&
-                r.path === '.github/workflows/ci.yml' && r.head_repository?.full_name === fullName);
-              if (ci?.status !== 'completed' || ci.conclusion !== 'success') {
-                core.setFailed('Current main requires a completed successful push CI run'); return;
-              }
-              core.setOutput('sha', sha);
-              core.setOutput('allowed', 'true');
-              core.setOutput('production', 'true');
-              core.setOutput('reason', 'Current main push CI passed');
-              return;
+              const run = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
+                && run.head_branch === branch && run.conclusion === 'success'
+                && ['push', 'workflow_dispatch'].includes(run.event)
+                && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))[0];
+              if (!run) return;
+              core.setOutput('run', String(run.id));
+              core.setOutput('sha', run.head_sha);
+              core.setOutput('artifact', `live-evidence-${branch}-${run.id}-${run.run_attempt}`);
+            } catch {
+              core.warning('Deployment evidence unavailable; rebuilding images');
             }
-            if (context.eventName === 'pull_request') {
-              const number = context.payload.pull_request?.number;
-              if (!number) { deny('Missing PR number'); return; }
-              const { data: initial } = await github.rest.pulls.get({ ...repo, pull_number: number });
-              if (initial.state !== 'open' || initial.draft || initial.base.ref !== 'main' ||
-                  initial.base.repo.full_name.toLowerCase() !== fullName.toLowerCase() ||
-                  initial.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) { deny('PR must be open, ready and from this repository to main'); return; }
-              const sha = initial.head.sha;
-              for (let attempt = 0; attempt < 120; attempt++) {
-                const { data } = await github.rest.actions.listWorkflowRuns({
-                  ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'pull_request', per_page: 20,
-                });
-                const ci = data.workflow_runs.find(run => run.head_sha === sha && run.path === '.github/workflows/ci.yml');
-                if (ci?.status === 'completed') {
-                  if (ci.conclusion !== 'success') { deny(`PR CI concluded ${ci.conclusion}`); return; }
-                  const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
-                  if (current.state !== 'open' || current.head.sha !== sha ||
-                      current.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) return;
-                  core.setOutput('sha', sha);
-                  core.setOutput('allowed', 'true');
-                  core.setOutput('reason', 'Trusted current PR CI passed');
-                  return;
-                }
-                await new Promise(resolve => setTimeout(resolve, 20000));
-              }
-              core.setFailed('Timed out waiting for public CI on this PR commit');
-              return;
-            }
-            const run = context.payload.workflow_run;
-            if (run.conclusion !== 'success' || context.payload.repository?.full_name !== fullName ||
-                run.head_repository?.full_name !== fullName ||
-                !/^[a-f0-9]{40}$/.test(run.head_sha) ||
-                run.actor?.login === 'dependabot[bot]') { deny('CI failed or its repository, SHA or actor is not trusted'); return; }
-            const { data: workflow } = await github.rest.actions.getWorkflow({
-              ...repo, workflow_id: run.workflow_id,
-            });
-            if (workflow.path !== '.github/workflows/ci.yml') { deny('Unexpected upstream workflow path'); return; }
-            if (run.event === 'push' && run.head_branch === 'main') {
-              const { data: ref } = await github.rest.git.getRef({ ...repo, ref: 'heads/main' });
-              if (ref.object.sha !== run.head_sha) { deny('CI source was superseded on main'); return; }
-              core.setOutput('production', 'true');
-            } else { deny('Only push CI on main admits automatic production; PR previews use their PR event'); return; }
-            core.setOutput('reason', 'Current main push CI passed');
-            core.setOutput('sha', run.head_sha);
-            core.setOutput('allowed', 'true');
+      - name: Download last successful deployment evidence
+        id: deployed_evidence
+        if: steps.deployed.outputs.run != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.deployed.outputs.run }}
+          name: ${{ steps.deployed.outputs.artifact }}
+          path: deployed-evidence
+      - name: Detect container image changes
+        id: image_changes
+        env:
+          DEPLOYED_SHA: ${{ steps.deployed.outputs.sha }}
+          EVIDENCE_DOWNLOADED: ${{ steps.deployed_evidence.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p live-evidence
+          printf 'source=%s\nbranch=%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" > live-evidence/run.txt
+          source="$(node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          try {
+            assert.equal(process.env.EVIDENCE_DOWNLOADED, 'true');
+            const receipt = JSON.parse(fs.readFileSync('deployed-evidence/live-evidence/image-source.json', 'utf8'));
+            assert.equal(receipt.deployment, process.env.DEPLOYED_SHA);
+            assert.equal(receipt.branch, process.env.GITHUB_REF_NAME);
+            assert.equal(receipt.tested, true);
+            assert.match(receipt.source, /^[a-f0-9]{40}$/);
+            console.log(receipt.source);
+          } catch { /* Missing or invalid evidence must rebuild, including the first run. */ }
+          JS
+          )"
+          # Tags verify production in place; they never build or deploy.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          elif [[ -z "$source" ]] || ! git cat-file -e "$source^{commit}"; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "source=$source" >> "$GITHUB_OUTPUT"
+            git diff --name-only --no-renames "$source" "$GITHUB_SHA" > live-evidence/changed-files.txt
+            mapfile -t image_inputs <<< "$IMAGE_INPUTS"
+            if git diff --quiet --no-renames "$source" "$GITHUB_SHA" -- "${image_inputs[@]}"; then
+              echo 'changed=false' >> "$GITHUB_OUTPUT"
+            else
+              status=$?
+              (( status == 1 )) || exit "$status"
+              echo 'changed=true' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+      - name: Upload live evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-changes-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: live-evidence
+          if-no-files-found: warn
+
+  images:
+    name: Build and test release images
+    needs: changes
+    if: >-
+      needs.changes.outputs.image_changed == 'true' &&
+      (github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main')
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/image.yml
+    with:
+      source: ${{ github.sha }}
+    secrets: inherit
 
   preview:
     name: Deploy and verify staging
-    needs: [trust, images]
-    if: needs.trust.outputs.allowed == 'true'
+    needs: [changes, images]
+    # A skipped image build must not skip deployments for app/Worker-only pushes.
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/preview' &&
+          needs.changes.result == 'success' &&
+          (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 150
-    # Lock through verification so another trusted branch cannot replace the
-    # shared staging Worker while the browser suites are running.
+    timeout-minutes: 42
+    environment: staging
     concurrency:
       group: deploy-staging
       cancel-in-progress: false
-    environment:
-      name: staging
-      url: ${{ steps.app.outputs.url }}
     permissions:
       contents: read
       packages: read
       id-token: write
-      pull-requests: read
-    outputs:
-      url: ${{ steps.app.outputs.url }}
-      worker_version: ${{ steps.identity.outputs.worker_version }}
-      vercel_deployment: ${{ steps.identity.outputs.vercel_deployment }}
     env:
-      EZIL_DEPLOY_SHA: ${{ needs.trust.outputs.sha }}
+      EZIL_DEPLOY_SHA: ${{ github.sha }}
       EZIL_DEPLOY_TARGET: preview
-      EZIL_E2E_REQUIRE_TARGET: '1'
-      EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
       EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
+      EZIL_WORKER_NAME: ezil-os-worker-staging
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.trust.outputs.sha }}
-          persist-credentials: false
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: '22.16.0'
       - name: Assert preview environment contract
         run: node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment preview
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.3.14'
-      - name: Validate cloud test helpers without network requests
-        env:
-          EZIL_E2E_APP: https://preview-test.vercel.app
-        run: node e2e/cloud-ci.test.mjs
-      - name: Check source and named staging isolation before any deployment
+      - name: Validate staging Worker hostname and routes
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EZIL_DEPLOY_SHA"
           python3 - <<'PY'
-          import fnmatch, os, re, tomllib
+          import fnmatch, os, tomllib
           from urllib.parse import urlparse
           with open('worker/wrangler.toml', 'rb') as f:
               config = tomllib.load(f)
-          stage = config.get('env', {}).get('staging')
-          assert stage, 'Configure worker/wrangler.toml [env.staging]; refusing default-env fallback'
-          name = stage.get('name', '')
-          assert re.fullmatch(r'[a-zA-Z0-9-]+', name) and name != config['name'], 'Staging needs a distinct explicit Worker name'
-          for key in ('routes', 'containers', 'durable_objects', 'r2_buckets', 'vars'):
-              assert stage.get(key), f'env.staging must explicitly configure {key}'
-          assert stage['vars'].get('SANDBOX_DEFAULT_DESKTOP_MODE') == 'neko', 'Staging must enable neko'
-          assert stage['vars'].get('SANDBOX_NEKO_ICE_POLICY') == 'relay', 'Staging must use TURN relay'
-          assert str(stage['vars'].get('SANDBOX_NEKO_TURN_TTL_SECONDS')) == '300', 'Short cloud gate requires five-minute TURN credentials'
+          stage = config.get('env', {}).get('staging', {})
+          assert stage.get('name') == os.environ['EZIL_WORKER_NAME'] != config['name'], 'Staging must use its named Worker'
+          routes = stage.get('routes', [])
           production_routes = {r['pattern'] for r in config.get('routes', [])}
-          assert all(r['pattern'] not in production_routes for r in stage['routes']), 'Staging reuses a production route'
           production_zones = {r['zone_name'] for r in config.get('routes', []) if r.get('zone_name')}
-          assert all(r.get('zone_name') not in production_zones for r in stage['routes']), 'Use a separate staging zone with the current Worker routing'
-          production_buckets = {b['bucket_name'] for b in config.get('r2_buckets', [])}
-          assert all(b.get('bucket_name') and b['bucket_name'] not in production_buckets for b in stage['r2_buckets']), 'Staging must use separate R2 buckets'
-          bindings = stage['durable_objects'].get('bindings', [])
-          assert any(b.get('name') == 'Sandbox' and b.get('class_name') == 'Sandbox' for b in bindings), 'Missing staging Sandbox binding'
-          assert all(not b.get('script_name') for b in bindings), 'Staging must not bind another Worker namespace'
+          assert routes and all(r['pattern'] not in production_routes and r.get('zone_name') not in production_zones for r in routes), 'Staging must use separate routes and zones'
           url = urlparse(os.environ['EZIL_E2E_WORKER'])
-          assert url.scheme == 'https' and url.hostname and not url.username and not url.password and not url.query and not url.fragment and url.path in ('', '/'), 'OS_WORKER_URL must be an HTTPS origin'
+          assert url.scheme == 'https' and url.hostname and not url.username and not url.password and not url.port and not url.query and not url.fragment and url.path in ('', '/'), 'OS_WORKER_URL must be an HTTPS origin'
           assert not url.hostname.endswith('.workers.dev'), 'Staging requires a custom desktop domain'
-          assert url.hostname != 'ezil.org' and not url.hostname.endswith('.ezil.org'), 'Current Worker folds *.ezil.org into production preview routes; use a separate staging domain'
-          assert any(fnmatch.fnmatch(f'{url.netloc}/health', r['pattern']) or
+          assert url.hostname != 'ezil.org' and not url.hostname.endswith('.ezil.org'), 'Staging cannot use production ezil.org routing'
+          assert any(fnmatch.fnmatchcase(f'{url.netloc}/health', r['pattern']) or
                      (r.get('custom_domain') and r['pattern'] == url.hostname)
-                     for r in stage['routes']), 'Staging routes must cover OS_WORKER_URL'
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f'EZIL_WORKER_NAME={name}\n')
+                     for r in routes), 'Staging routes must cover OS_WORKER_URL'
           PY
-          bash shell/build-shell.sh --check
-      - name: Validate configured secrets
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
-          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
-          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
-          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
-          EZIL_ACCEPTANCE_SANDBOX: ${{ secrets.EZIL_ACCEPTANCE_SANDBOX }}
-          EZIL_ACCEPTANCE_HMAC_SECRET: ${{ secrets.EZIL_ACCEPTANCE_HMAC_SECRET }}
-          MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
+      - name: Reserve time for deployment and evidence
+        id: deadline
+        # Leave one minute for runner overhead and evidence upload.
+        run: echo "at=$(( $(date +%s) + 41 * 60 ))" >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - name: Initialize live evidence
         run: |
-          set -euo pipefail
-          keys=(CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID)
-          if [[ "$MANUAL_PREVIEW" != true ]]; then
-            keys+=(EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_COMPUTER_ID EZIL_E2E_WORKSPACE_PATH EZIL_E2E_R2_BUCKET EZIL_E2E_R2_PREFIX EZIL_ACCEPTANCE_SANDBOX EZIL_ACCEPTANCE_HMAC_SECRET)
-          fi
-          for key in "${keys[@]}"; do
-            if [[ -z "${!key}" ]]; then echo "::error::Missing staging secret: $key"; exit 1; fi
-          done
-          node e2e/verify-cloud-deployment.mjs project
+          mkdir -p live-evidence
+          printf 'source=%s\nbranch=%s\nimage_changed=%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" '${{ needs.changes.outputs.image_changed }}' > live-evidence/run.txt
       - name: Install Worker dependencies
         working-directory: worker
         run: bun install --frozen-lockfile
+      - name: Install app dependencies
+        working-directory: app
+        run: bun install --frozen-lockfile
       - name: Install Vercel CLI
         run: npm install --global vercel@57.0.0
-      - uses: docker/login-action@v3
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+      - name: Setup image builder
+        if: needs.changes.outputs.image_changed == 'true'
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: 'v0.25.0'
+      - name: Log in to the image registry
+        if: needs.changes.outputs.image_changed == 'true'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Download tested candidate image identities
+        if: needs.changes.outputs.image_changed == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: os-images-${{ needs.trust.outputs.sha }}
-      - name: Prepare staging from the tested candidate digest
+          name: os-images-${{ github.sha }}
+      - name: Prepare Dockerfile.release from the tested image
+        if: needs.changes.outputs.image_changed == 'true'
         run: |
+          set -euo pipefail
           node .github/scripts/release-state.mjs prepare
+          # prepare changes the default container; staging must use it too.
           python3 - <<'PY'
           from pathlib import Path
           path = Path('worker/wrangler.toml')
           path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
           PY
+      # GitHub concurrency is repository-local; this lease also fences other repos.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
@@ -328,278 +267,218 @@ jobs:
         env:
           LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 10800 --wait 1200
-      - name: Recheck manual preview PR before deployment
-        if: needs.trust.outputs.manual_preview == 'true'
-        uses: actions/github-script@v8
-        env:
-          PREVIEW_PR: ${{ needs.trust.outputs.preview_pr }}
-        with:
-          script: |
-            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: Number(process.env.PREVIEW_PR) });
-            if (pr.state !== 'open' || pr.head.sha !== process.env.EZIL_DEPLOY_SHA ||
-                pr.head.repo?.full_name.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()) {
-              core.setFailed('Manual preview PR changed before deployment');
-            }
-      - name: Deploy named staging Worker
-        working-directory: worker
-        timeout-minutes: 25
+      - name: Capture container version before deploy
+        id: container_before
+        if: needs.changes.outputs.image_changed == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          EZIL_ACCEPTANCE_SANDBOX: ${{ secrets.EZIL_ACCEPTANCE_SANDBOX }}
-          MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
+        run: node .github/scripts/release-state.mjs container-version
+      - name: Deploy Worker
+        id: worker
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          ttl=300
-          if [[ "${{ needs.trust.outputs.production }}" == true ]]; then ttl=1800; fi
-          fault_args=()
-          if [[ "$MANUAL_PREVIEW" != true ]]; then
-            test -n "$EZIL_ACCEPTANCE_SANDBOX" || { echo '::error::Missing isolated acceptance sandbox'; exit 1; }
-            fault_args=(--var "EZIL_ACCEPTANCE_ENV:staging" --var "EZIL_ACCEPTANCE_SANDBOX:$EZIL_ACCEPTANCE_SANDBOX")
-          fi
-          ./node_modules/.bin/wrangler deploy --env staging --var "SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl" "${fault_args[@]}" --message "git:$EZIL_DEPLOY_SHA"
-      - name: Verify active staging Worker SHA and health
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node e2e/verify-cloud-deployment.mjs worker
-      - name: Deploy Vercel preview from repository source
-        id: app
-        timeout-minutes: 15
+          args=(--env staging)
+          rollout=none
+          if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]; then rollout=immediate; fi
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
+          timeout --kill-after=10s "${remaining}s" ./node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"
+      - name: Deploy Vercel preview and set stable alias
+        id: preview_app
+        working-directory: app
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           set -euo pipefail
-          url="$(vercel deploy --yes --token="$VERCEL_TOKEN" \
+          # The Vercel project has rootDirectory=app; upload the repository root.
+          url="$(vercel deploy .. --yes --token="$VERCEL_TOKEN" \
             --meta "githubCommitSha=$EZIL_DEPLOY_SHA" \
             --env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER" \
             --build-env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER")"
           [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.vercel\.app$ ]]
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "EZIL_E2E_APP=$url" >> "$GITHUB_ENV"
-      - name: Verify preview deployment identity
-        id: identity
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-        run: node e2e/verify-cloud-deployment.mjs
-      - name: Verify and record manual preview
-        if: needs.trust.outputs.manual_preview == 'true'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: |
-          node e2e/await-deployed-bundle.mjs
-          node .github/scripts/record-manual-preview.mjs
-      - name: Upload manual preview identity
-        if: needs.trust.outputs.manual_preview == 'true' && success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: manual-preview-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
-          path: manual-preview.json
-          if-no-files-found: error
-      - uses: ./.github/actions/setup-playwright
+          cd ..
+          node .github/scripts/vercel-api.mjs alias "$url" ezil-os-staging.vercel.app
       - name: Wait for staging container rollout
+        id: rollout
+        if: needs.changes.outputs.image_changed == 'true'
         timeout-minutes: 11
         env:
+          EZIL_PREVIOUS_CONTAINER_VERSION: ${{ steps.container_before.outputs.version }}
+          EZIL_CONTAINER_APPLICATION_ID: ${{ steps.container_before.outputs.id }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node e2e/await-container-rollout.mjs
-      - name: Prepare isolated staging computer after rollout
-        if: needs.trust.outputs.manual_preview != 'true'
-        timeout-minutes: 7
-        env:
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: node e2e/prepare-hosted-computer.mjs
-      - name: Test the returned preview URL
-        if: needs.trust.outputs.manual_preview != 'true'
-        timeout-minutes: 22
-        env:
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
         run: |
           set -euo pipefail
-          node e2e/await-deployed-bundle.mjs
-          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
-            node "e2e/$suite.mjs"
-          done
-      - name: Renew staging lease credentials before long acceptance
-        if: needs.trust.outputs.manual_preview != 'true'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
-          aws-region: us-east-1
-          role-duration-seconds: 7200
-      - name: Hosted continuity release gate
-        if: needs.trust.outputs.manual_preview != 'true'
-        timeout-minutes: 90
+          EZIL_EXPECTED_CONTAINER_DIGEST="$(node .github/scripts/release-state.mjs rollout-target)"
+          export EZIL_EXPECTED_CONTAINER_DIGEST
+          node e2e/await-container-rollout.mjs
+      - name: Verify staging deployment identity
+        id: identity
+        timeout-minutes: 3
         env:
-          EZIL_CONTINUITY_MODE: ${{ needs.trust.outputs.production == 'true' && 'full' || 'short' }}
-          EZIL_ACCEPTANCE_HMAC_SECRET: ${{ secrets.EZIL_ACCEPTANCE_HMAC_SECRET }}
+          EZIL_E2E_APP: ${{ steps.preview_app.outputs.url }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          node e2e/verify-cloud-deployment.mjs > live-evidence/deployment-identity.json
+          # The live check uses the stable alias; bind it to the returned URL too.
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { assertVercelDeployment } from './e2e/verify-cloud-deployment.mjs';
+          const identity = JSON.parse(fs.readFileSync('live-evidence/deployment-identity.json', 'utf8'));
+          const response = await fetch(`https://api.vercel.com/v13/deployments/ezil-os-staging.vercel.app?teamId=${encodeURIComponent(process.env.VERCEL_ORG_ID)}`, {
+            headers: { authorization: `Bearer ${process.env.VERCEL_TOKEN}` },
+            redirect: 'error', signal: AbortSignal.timeout(15000),
+          });
+          assert.ok(response.ok, `Vercel alias HTTP ${response.status}`);
+          const id = assertVercelDeployment(await response.json(), {
+            sha: process.env.EZIL_DEPLOY_SHA, app: process.env.EZIL_E2E_APP,
+            project: process.env.VERCEL_PROJECT_ID, target: process.env.EZIL_DEPLOY_TARGET,
+          });
+          assert.equal(id, identity.vercel_deployment, 'Stable preview alias points at another deployment');
+          JS
+      - name: Check stable preview
+        id: live_preview
+        timeout-minutes: 14
+        env:
+          EZIL_E2E_APP: https://ezil-os-staging.vercel.app
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
-          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
-          EZIL_WRANGLER_BIN: ./worker/node_modules/.bin/wrangler
-          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
-          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          EZIL_E2E_REQUIRE_TARGET: '1'
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: node e2e/hosted-continuity.mjs
-      - name: Confirm deployment identity after tests
+          EZIL_LIVE_OUT: live-evidence
+        run: |
+          set -euo pipefail
+          live_seconds="$(node --input-type=module -e "import { MAX_RUN_MS } from './e2e/live-check.mjs'; console.log(Math.ceil(MAX_RUN_MS / 1000));")"
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) ))
+          (( remaining >= live_seconds + 10 )) || { echo '::error::Insufficient time for live checks and final stop'; exit 1; }
+          timeout --kill-after=10s "$((live_seconds + 10))s" node e2e/live-check.mjs
+      - name: Record successfully deployed image source
+        if: steps.live_preview.outcome == 'success'
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-        run: node e2e/verify-cloud-deployment.mjs
-      - name: Stop isolated staging test computer
-        if: always() && steps.lease.outcome == 'success' && needs.trust.outputs.manual_preview != 'true'
-        timeout-minutes: 7
-        env:
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: node e2e/cleanup-hosted-computer.mjs
-      - name: Upload hosted continuity evidence
-        if: always() && needs.trust.outputs.manual_preview != 'true'
+          IMAGE_CHANGED: ${{ needs.changes.outputs.image_changed }}
+          REUSED_IMAGE_SOURCE: ${{ needs.changes.outputs.image_source }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          let source = process.env.REUSED_IMAGE_SOURCE;
+          if (process.env.IMAGE_CHANGED === 'true') {
+            const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
+            assert.equal(images.tested, true);
+            assert.equal(images.source, process.env.EZIL_DEPLOY_SHA);
+            source = images.source;
+          }
+          assert.match(source ?? '', /^[a-f0-9]{40}$/);
+          fs.writeFileSync('live-evidence/image-source.json', JSON.stringify({source, tested:true,
+            deployment:process.env.EZIL_DEPLOY_SHA, branch:process.env.GITHUB_REF_NAME}));
+          JS
+      - name: Upload live evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hosted-continuity-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
-          path: hosted-continuity-evidence/
-          if-no-files-found: error
+          name: live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            live-evidence
+            hosted-continuity-evidence/container-rollout.json
+          if-no-files-found: warn
       - name: Release shared staging lease
         if: always() && steps.lease.outcome == 'success'
         env:
           LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 .github/scripts/staging-lock.py release --owner "$LEASE_OWNER"
 
-  images:
-    name: Build and test release images
-    needs: trust
-    if: needs.trust.outputs.allowed == 'true'
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    uses: ./.github/workflows/image.yml
-    with:
-      source: ${{ needs.trust.outputs.sha }}
-    secrets: inherit
-
   production:
-    name: Deploy main after staging passes
-    needs: [trust, preview, images]
-    if: needs.trust.outputs.production == 'true'
+    name: Deploy and verify production
+    needs: [changes, images]
+    # A skipped image build must not skip deployments for app/Worker-only pushes.
+    if: >-
+      ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
+          needs.changes.result == 'success' &&
+          (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    # Every production entry point shares this lock through rollback.
+    timeout-minutes: 71
+    environment: production
     concurrency:
       group: deploy-production
       cancel-in-progress: false
-    environment:
-      name: production
-      url: ${{ steps.app.outputs.url }}
     permissions:
-      contents: read
+      contents: write
+      packages: write
       actions: read
-      packages: read
       id-token: write
-    outputs:
-      url: ${{ steps.app.outputs.url }}
-      worker_version: ${{ steps.identity.outputs.worker_version }}
-      vercel_deployment: ${{ steps.identity.outputs.vercel_deployment }}
     env:
-      EZIL_DEPLOY_SHA: ${{ needs.trust.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      EZIL_DEPLOY_SHA: ${{ github.sha }}
       EZIL_DEPLOY_TARGET: production
-      EZIL_E2E_REQUIRE_TARGET: '1'
-      EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
-      EZIL_E2E_WORKER: https://api-desktop.ezil.org
+      EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
       EZIL_WORKER_NAME: ezil-os-worker
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.trust.outputs.sha }}
-          persist-credentials: false
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
-        with:
-          name: os-images-${{ needs.trust.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: '22.16.0'
       - name: Assert production environment contract
         run: node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment production
+      - name: Reserve time for production recovery
+        id: deadline
+        # Main has a 53-minute deployment/rollout/recovery budget. Tags also have room
+        # for image verification and the original 30-minute installer wait.
+        run: echo "at=$(( $(date +%s) + 53 * 60 ))" >> "$GITHUB_OUTPUT"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
-      - name: Refuse a superseded main commit
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
-            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved; wait for its CI run');
-      - name: Validate production configuration
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
-          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
-          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
-          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
+      - name: Initialize live evidence
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EZIL_DEPLOY_SHA"
-          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_WORKER EZIL_E2E_COMPUTER_ID EZIL_E2E_WORKSPACE_PATH EZIL_E2E_R2_BUCKET EZIL_E2E_R2_PREFIX; do
-            if [[ -z "${!key}" ]]; then echo "::error::Missing production configuration: $key"; exit 1; fi
-          done
-          node e2e/verify-cloud-deployment.mjs project
-          python3 - <<'PY'
-          import os, tomllib
-          with open('worker/wrangler.toml', 'rb') as f:
-              config = tomllib.load(f)
-          assert config['name'] == 'ezil-os-worker', 'Unexpected production Worker'
-          assert os.environ['EZIL_E2E_WORKER'].rstrip('/') == 'https://api-desktop.ezil.org', 'Unexpected production Worker URL'
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f"EZIL_WORKER_NAME={config['name']}\n")
-          PY
+          mkdir -p live-evidence
+          printf 'source=%s\nbranch=%s\nimage_changed=%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" '${{ needs.changes.outputs.image_changed }}' > live-evidence/run.txt
       - name: Install Worker dependencies
         working-directory: worker
         run: bun install --frozen-lockfile
+      - name: Install app dependencies
+        working-directory: app
+        run: bun install --frozen-lockfile
       - name: Install Vercel CLI
+        if: github.ref == 'refs/heads/main'
         run: npm install --global vercel@57.0.0
-      - uses: docker/login-action@v3
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+      - name: Setup image builder
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: 'v0.25.0'
+      - name: Log in to the image registry
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Download tested candidate image identities
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: os-images-${{ github.sha }}
+      # Main snapshots and tag live checks both require the cross-repository lease.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
@@ -610,7 +489,50 @@ jobs:
         env:
           LEASE_OWNER: os-prod-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 .github/scripts/staging-lock.py acquire --scope shared-production --owner "$LEASE_OWNER" --ttl 7200 --wait 1200
+      - name: Record previous Worker version
+        if: github.ref == 'refs/heads/main'
+        id: previous_worker
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/wrangler deployments list --json > "$RUNNER_TEMP/worker-deployments.json"
+          version="$(jq -er 'sort_by(.created_on) | last | .versions |
+            if length == 1 and .[0].percentage == 100 then .[0].version_id
+            else error("Expected one active Worker version") end |
+            select(test("^[a-f0-9-]{36}$"))' "$RUNNER_TEMP/worker-deployments.json")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$version" > ../live-evidence/previous-worker.txt
+      - name: Record previous production deployment
+        if: github.ref == 'refs/heads/main'
+        id: previous_app
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          const response = await fetch(`https://api.vercel.com/v13/deployments/os.ezil.work?teamId=${encodeURIComponent(process.env.VERCEL_ORG_ID)}`, {
+            headers: { authorization: `Bearer ${process.env.VERCEL_TOKEN}` },
+            redirect: 'error', signal: AbortSignal.timeout(15000),
+          });
+          assert.ok(response.ok, `Vercel capture HTTP ${response.status}`);
+          const deployment = await response.json();
+          assert.equal(deployment.projectId, process.env.VERCEL_PROJECT_ID);
+          assert.equal(deployment.target, 'production');
+          assert.equal(deployment.readyState, 'READY');
+          assert.match(deployment.id, /^dpl_[a-zA-Z0-9]+$/);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `deployment=${deployment.id}\n`);
+          fs.writeFileSync('live-evidence/previous-vercel.txt', `${deployment.id}\n`);
+          JS
       - name: Capture previous production identities
+        id: previous_container
+        # Every main deployment needs a receipt for the post-recovery readback.
+        if: github.ref == 'refs/heads/main'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -621,188 +543,178 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: node .github/scripts/release-state.mjs capture
       - name: Preserve recovery identities before production mutation
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
-          name: os-recovery-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
+          name: os-recovery-${{ github.sha }}-${{ github.run_attempt }}
           path: previous-release.json
           if-no-files-found: error
+      - name: Refuse a superseded main commit before migrations
+        id: current_main
+        if: github.ref == 'refs/heads/main'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
+            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved; wait for its CI run');
       - name: Verify or apply reviewed production migrations
+        if: github.ref == 'refs/heads/main'
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node .github/scripts/production-migrations.mjs apply
-      - name: Prepare Wrangler image from the tested GHCR digest
+      - name: Prepare Dockerfile.release from the tested image
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
         run: |
+          set -euo pipefail
           node .github/scripts/release-state.mjs prepare
-          docker pull "ghcr.io/ezilhq/ezil-os-desktop@$(jq -er .desktop_digest tested-images.json)"
-      - name: Recheck main immediately before production mutation
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
-            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved; refusing stale release');
-      - name: Deploy production Worker
-        id: worker_deploy
+          # prepare changes the default container; staging must use it too.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('worker/wrangler.toml')
+          path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
+          PY
+      - name: Capture container version before deploy
+        id: container_before
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node .github/scripts/release-state.mjs container-version
+      - name: Deploy Worker
+        if: github.ref == 'refs/heads/main'
+        id: worker
         working-directory: worker
-        timeout-minutes: 25
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: ./node_modules/.bin/wrangler deploy --message "git:$EZIL_DEPLOY_SHA"
-      - name: Verify active production Worker SHA and health
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node e2e/verify-cloud-deployment.mjs worker
-      - name: Recheck main before Vercel production mutation
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
-            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved during Worker deploy');
-      - name: Deploy Vercel production from repository source
-        id: app
-        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          args=()
+          rollout=none
+          if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]; then rollout=immediate; fi
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$current_main" == "$EZIL_DEPLOY_SHA" ]] || { echo '::error::main moved; refusing Worker deploy'; exit 1; }
+          timeout --kill-after=10s "${remaining}s" ./node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"
+      - name: Deploy Vercel production
+        if: github.ref == 'refs/heads/main'
+        id: production_app
+        working-directory: app
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           set -euo pipefail
-          url="$(vercel deploy --yes --prod --token="$VERCEL_TOKEN" \
+          # Keep the same source root as preview and the existing workflows.
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$current_main" == "$EZIL_DEPLOY_SHA" ]] || { echo '::error::main moved; refusing Vercel deploy'; exit 1; }
+          url="$(timeout --kill-after=10s "${remaining}s" vercel deploy .. --yes --prod --token="$VERCEL_TOKEN" \
             --meta "githubCommitSha=$EZIL_DEPLOY_SHA" \
             --env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER" \
             --build-env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER")"
           [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.vercel\.app$ ]]
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "EZIL_E2E_APP=$url" >> "$GITHUB_ENV"
-      - name: Verify production deployment identity
-        id: identity
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-        run: node e2e/verify-cloud-deployment.mjs
-      - uses: ./.github/actions/setup-playwright
       - name: Wait for production container rollout
+        id: rollout
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
         timeout-minutes: 11
         env:
+          EZIL_PREVIOUS_CONTAINER_VERSION: ${{ steps.container_before.outputs.version }}
+          EZIL_CONTAINER_APPLICATION_ID: ${{ steps.container_before.outputs.id }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node e2e/await-container-rollout.mjs
-      - name: Prepare isolated production computer after rollout
-        timeout-minutes: 7
-        env:
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: node e2e/prepare-hosted-computer.mjs
-      - name: Test the returned production URL
-        timeout-minutes: 22
-        env:
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
         run: |
           set -euo pipefail
-          node e2e/await-deployed-bundle.mjs
-          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
-            node "e2e/$suite.mjs"
-          done
-      - name: Hosted production persistence verification
-        timeout-minutes: 25
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Candidate image verification budget exhausted'; exit 1; }
+          EZIL_EXPECTED_CONTAINER_DIGEST="$(timeout --kill-after=10s "${remaining}s" node .github/scripts/release-state.mjs rollout-target)"
+          export EZIL_EXPECTED_CONTAINER_DIGEST
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Container rollout budget exhausted'; exit 1; }
+          timeout --kill-after=10s "${remaining}s" node e2e/await-container-rollout.mjs
+      - name: Verify production deployment identity
+        id: identity
+        if: github.ref == 'refs/heads/main'
+        timeout-minutes: 3
+        env:
+          EZIL_E2E_APP: ${{ steps.production_app.outputs.url }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 15 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Deployment identity budget exhausted'; exit 1; }
+          timeout --kill-after=10s "${remaining}s" node e2e/verify-cloud-deployment.mjs > live-evidence/deployment-identity.json
+      - name: Check production
+        id: live_production
+        timeout-minutes: 14
+        continue-on-error: true
         env:
           EZIL_E2E_APP: https://os.ezil.work
-          EZIL_CONTINUITY_IDENTITY_APP: ${{ steps.app.outputs.url }}
-          EZIL_CONTINUITY_MODE: essential
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
-          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
-          EZIL_WRANGLER_BIN: ./worker/node_modules/.bin/wrangler
-          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
-          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: node e2e/hosted-continuity.mjs
-      - name: Confirm deployment identity after tests
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-        run: node e2e/verify-cloud-deployment.mjs
-
-      - name: Test the canonical production URL
-        timeout-minutes: 22
-        env:
-          EZIL_E2E_APP: https://os.ezil.work
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          EZIL_E2E_REQUIRE_TARGET: '1'
+          EZIL_LIVE_OUT: live-evidence
         run: |
           set -euo pipefail
-          node e2e/await-deployed-bundle.mjs
-          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
-            node "e2e/$suite.mjs"
-          done
-      - name: Record canonical identity and distinct Cloudflare container digest
+          # Reserve ownership guard (1m), Worker (2m), Containers (7m), Vercel (2m), and readback (3m).
+          live_seconds="$(node --input-type=module -e "import { MAX_RUN_MS } from './e2e/live-check.mjs'; console.log(Math.ceil(MAX_RUN_MS / 1000));")"
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 15 * 60 ))
+          (( remaining >= live_seconds + 10 )) || { echo '::error::Insufficient time for live checks and final stop'; exit 1; }
+          timeout --kill-after=10s "$((live_seconds + 10))s" node e2e/live-check.mjs
+      - name: Record successfully deployed image source
+        if: github.ref == 'refs/heads/main' && steps.live_production.outcome == 'success'
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          IMAGE_CHANGED: ${{ needs.changes.outputs.image_changed }}
+          REUSED_IMAGE_SOURCE: ${{ needs.changes.outputs.image_source }}
         run: |
-          node e2e/verify-cloud-deployment.mjs
-          node .github/scripts/release-state.mjs record
-      - name: Refuse success if main moved during verification
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
-            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved during verification; rolling back');
-      - name: Check rollback ownership
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          let source = process.env.REUSED_IMAGE_SOURCE;
+          if (process.env.IMAGE_CHANGED === 'true') {
+            const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
+            assert.equal(images.tested, true);
+            assert.equal(images.source, process.env.EZIL_DEPLOY_SHA);
+            source = images.source;
+          }
+          assert.match(source ?? '', /^[a-f0-9]{40}$/);
+          fs.writeFileSync('live-evidence/image-source.json', JSON.stringify({source, tested:true,
+            deployment:process.env.EZIL_DEPLOY_SHA, branch:process.env.GITHUB_REF_NAME}));
+          JS
+      - name: Guard production recovery ownership
         id: rollback_guard
-        if: failure() && (steps.worker_deploy.outcome == 'success' || steps.worker_deploy.outcome == 'failure')
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.previous_container.outcome == 'success'
+        timeout-minutes: 1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-        run: node .github/scripts/release-state.mjs rollback-guard
-      - name: Restore previous Vercel production deployment
-        if: failure() && steps.rollback_guard.outcome == 'success'
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: node .github/scripts/release-state.mjs vercel-rollback
-      - name: Restore previous Worker version (never reverse SQL)
-        if: failure() && steps.rollback_guard.outcome == 'success'
+        run: |
+          if ! node .github/scripts/release-state.mjs rollback-guard; then
+            echo '::error::Recovery ownership check failed: another release may own production; no rollback mutations will run.'
+            exit 1
+          fi
+      - name: Roll back production Worker
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
+        timeout-minutes: 2
         working-directory: worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: ./node_modules/.bin/wrangler rollback "$(jq -er .worker_version ../previous-release.json)" --yes --message "rollback:$EZIL_DEPLOY_SHA"
+        run: ./node_modules/.bin/wrangler rollback '${{ steps.previous_worker.outputs.version }}' -y
       - name: Restore previous container image and await rollback rollout
-        if: failure() && steps.rollback_guard.outcome == 'success'
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.rollback_guard.outcome == 'success' && needs.changes.outputs.image_changed == 'true' && steps.previous_container.outcome == 'success'
         timeout-minutes: 7
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -813,98 +725,181 @@ jobs:
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: node .github/scripts/release-state.mjs container-rollback
-      - name: Verify rollback and report container restoration limitations
-        if: failure() && steps.rollback_guard.outcome == 'success'
+      - name: Restore previous Vercel production deployment
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
+        timeout-minutes: 2
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: node .github/scripts/vercel-api.mjs promote '${{ steps.previous_app.outputs.deployment }}'
+      - name: Verify production recovery identities
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
+        timeout-minutes: 3
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: |
           for attempt in {1..12}; do
             if node .github/scripts/release-state.mjs rollback-check; then exit 0; fi
             sleep 5
           done
           exit 1
-      - name: Stop isolated production test computer
-        if: always() && steps.production_lease.outcome == 'success'
-        timeout-minutes: 7
+      - name: Fail after production recovery
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure')
+        run: |
+          if [[ '${{ steps.rollback_guard.outcome }}' != success ]]; then
+            echo '::error::Production failed and recovery ownership was not established; rollback mutations were skipped.'
+          fi
+          echo '::error::Production deployment or live check failed; see the preceding rollback results.'
+          exit 1
+      - name: Identify the deployed image for tag verification
+        id: tag_image
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
         env:
-          EZIL_E2E_APP: https://os.ezil.work
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-        run: node e2e/cleanup-hosted-computer.mjs
-      - name: Upload production release and recovery evidence
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { readState, pullCloudflareImage } from './.github/scripts/release-state.mjs';
+          const state = await readState(process.env);
+          assert.equal(state.worker_source, process.env.EZIL_DEPLOY_SHA);
+          assert.equal(state.vercel_source, process.env.EZIL_DEPLOY_SHA);
+          await pullCloudflareImage(state.cloudflare_container.image, process.env);
+          const image = JSON.parse(execFileSync('docker', ['image', 'inspect', state.cloudflare_container.image], {encoding:'utf8'}))[0];
+          const source = image.Config.Labels?.['org.opencontainers.image.revision'];
+          assert.match(source ?? '', /^[a-f0-9]{40}$/);
+          // App-only pushes can reuse an older tested image, but its inputs must
+          // still match the tag. Use the same path list as change detection.
+          execFileSync('git', ['merge-base', '--is-ancestor', source, process.env.EZIL_DEPLOY_SHA]);
+          execFileSync('git', ['diff', '--exit-code', source, process.env.EZIL_DEPLOY_SHA, '--', ...process.env.IMAGE_INPUTS.trim().split(/\s+/)], {stdio:'pipe'});
+          fs.writeFileSync('live-evidence/tag-state.json', JSON.stringify(state));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `source=${source}\n`);
+          JS
+      - name: Locate tested image evidence from a successful branch run
+        id: tag_receipt
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        uses: actions/github-script@v8
+        env:
+          IMAGE_SOURCE: ${{ steps.tag_image.outputs.source }}
+        with:
+          script: |
+            const source = process.env.IMAGE_SOURCE;
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              ...context.repo, name: `os-images-${source}`, per_page: 100,
+            });
+            for (const artifact of artifacts) {
+              if (artifact.expired || artifact.workflow_run?.head_sha !== source) continue;
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: artifact.workflow_run.id,
+              });
+              if (run.path !== '.github/workflows/preview.yml' || run.conclusion !== 'success' ||
+                  run.head_sha !== source || !['preview', 'main'].includes(run.head_branch) ||
+                  !['push', 'workflow_dispatch'].includes(run.event) ||
+                  run.head_repository?.full_name !== `${context.repo.owner}/${context.repo.repo}`) continue;
+              core.setOutput('run_id', String(run.id));
+              return;
+            }
+            core.setFailed('No retained tested image evidence from a successful branch deployment');
+      - name: Download the deployed image test receipt
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: os-images-${{ steps.tag_image.outputs.source }}
+          run-id: ${{ steps.tag_receipt.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Record verified tag production identities and image layers
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          IMAGE_SOURCE: ${{ steps.tag_image.outputs.source }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { canonical, readState } from './.github/scripts/release-state.mjs';
+          const state = await readState(process.env);
+          assert.deepEqual(state, JSON.parse(fs.readFileSync('live-evidence/tag-state.json', 'utf8')), 'Production changed during tag verification');
+          const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
+          assert.equal(images.source, process.env.IMAGE_SOURCE);
+          assert.equal(images.tested, true);
+          assert.equal(images.desktop, `ghcr.io/ezilhq/ezil-os-desktop:sha-${images.source}`);
+          assert.match(images.desktop_digest, /^sha256:[a-f0-9]{64}$/);
+          const ref = `ghcr.io/ezilhq/ezil-os-desktop@${images.desktop_digest}`;
+          execFileSync('docker', ['pull', ref], {stdio:'inherit'});
+          const inspect = ref => JSON.parse(execFileSync('docker', ['image', 'inspect', ref], {encoding:'utf8'}))[0];
+          const deployed = inspect(state.cloudflare_container.image), tested = inspect(ref);
+          for (const image of [deployed, tested]) assert.equal(image.Config.Labels?.['org.opencontainers.image.revision'], images.source);
+          assert.deepEqual(deployed.RootFS.Layers, tested.RootFS.Layers, 'Deployed layers differ from tested GHCR image');
+          state.cloudflare_container.ghcr_layers_verified = true;
+          fs.writeFileSync('production-release.json', JSON.stringify({source:process.env.EZIL_DEPLOY_SHA,
+            run:process.env.GITHUB_RUN_ID, canonical, ghcr:images, ...state}, null, 2));
+          JS
+      - name: Verify release evidence and wait for signed installer
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        run: |
+          set -euo pipefail
+          jq -e --arg sha "$GITHUB_SHA" '.source == $sha and .worker_source == $sha and .vercel_source == $sha and .cloudflare_container.ghcr_layers_verified == true' production-release.json >/dev/null
+          version="${GITHUB_REF_NAME#v}"
+          expected="EZiL-OS-${version}-AppleSilicon.dmg"
+          for attempt in {1..180}; do
+            if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq "$expected"; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::Signed native installer did not arrive; leaving release as a draft"
+          exit 1
+      - name: Attach semantic image alias to the verified digest
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.ghcr.desktop_digest | select(test("^sha256:[a-f0-9]{64}$"))' production-release.json)"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]
+          docker buildx imagetools create --prefer-index=false --tag "ghcr.io/ezilhq/ezil-os-desktop:${GITHUB_REF_NAME#v}" "ghcr.io/ezilhq/ezil-os-desktop@$digest"
+      - name: Publish release with verified cloud identities
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          gh release view "$GITHUB_REF_NAME" --json body --jq .body > "$notes"
+          {
+            printf '\nVerified production release: %s\n\n' "$RUN_URL"
+            jq -r '"Source: " + .source, "Desktop: ghcr.io/ezilhq/ezil-os-desktop@" + .ghcr.desktop_digest, "Worker version: " + .worker_version, "Vercel deployment: " + .vercel_deployment, "Canonical URL: " + .canonical' production-release.json
+          } >> "$notes"
+          gh release edit "$GITHUB_REF_NAME" --notes-file "$notes" --draft=false
+      - name: Fail unverified tag
+        if: always() && startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'failure'
+        run: exit 1
+      - name: Upload live evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: os-production-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
+          name: live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            tested-images.json
+            live-evidence
             previous-release.json
-            production-release.json
-            rollback-state.json
             container-rollback.json
-            hosted-continuity-evidence/
+            rollback-state.json
+            production-release.json
+            hosted-continuity-evidence/container-rollout.json
           if-no-files-found: warn
       - name: Release shared production lease
         if: always() && steps.production_lease.outcome == 'success'
         env:
           LEASE_OWNER: os-prod-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 .github/scripts/staging-lock.py release --scope shared-production --owner "$LEASE_OWNER"
-
-  summary:
-    name: ${{ github.event_name == 'pull_request' && 'Hosted continuity PR gate' || 'Cloud deployment summary' }}
-    permissions:
-      contents: read
-    if: always()
-    needs: [trust, preview, images, production]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/github-script@v8
-        env:
-          SOURCE_SHA: ${{ needs.trust.outputs.sha }}
-          TRUSTED: ${{ needs.trust.outputs.allowed }}
-          ADMISSION_REASON: ${{ needs.trust.outputs.reason }}
-          PRODUCTION_REQUIRED: ${{ needs.trust.outputs.production }}
-          MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
-          IMAGE_RESULT: ${{ needs.images.result }}
-          PREVIEW_RESULT: ${{ needs.preview.result }}
-          PREVIEW_URL: ${{ needs.preview.outputs.url }}
-          PREVIEW_WORKER: ${{ needs.preview.outputs.worker_version }}
-          PREVIEW_DEPLOYMENT: ${{ needs.preview.outputs.vercel_deployment }}
-          PRODUCTION_RESULT: ${{ needs.production.result }}
-          PRODUCTION_URL: ${{ needs.production.outputs.url }}
-          PRODUCTION_WORKER: ${{ needs.production.outputs.worker_version }}
-          PRODUCTION_DEPLOYMENT: ${{ needs.production.outputs.vercel_deployment }}
-        with:
-          script: |
-            const e = process.env;
-            core.summary.addHeading('Cloud deployment');
-            core.summary.addRaw(`Source SHA: ${e.SOURCE_SHA || 'not admitted'}\n\n`);
-            core.summary.addRaw(`Admission: ${e.ADMISSION_REASON || 'not admitted'}. Images: ${e.IMAGE_RESULT}\n\n`);
-            if (e.TRUSTED !== 'true') core.summary.addRaw('No deployment: failed, stale, unsupported or untrusted CI source. Fork PRs receive public CI only.\n\n');
-            core.summary.addTable([
-              [{ data: 'Target', header: true }, { data: 'Result', header: true },
-               { data: 'URL', header: true }, { data: 'Worker version', header: true },
-               { data: 'Vercel deployment', header: true }],
-              ['staging / preview', e.PREVIEW_RESULT, e.PREVIEW_URL || '—', e.PREVIEW_WORKER || '—', e.PREVIEW_DEPLOYMENT || '—'],
-              ['production', e.PRODUCTION_RESULT, e.PRODUCTION_URL || '—', e.PRODUCTION_WORKER || '—', e.PRODUCTION_DEPLOYMENT || '—'],
-            ]);
-            if (e.MANUAL_PREVIEW === 'true') {
-              core.summary.addLink('Open manual preview', `${e.PREVIEW_URL}/os`);
-              core.summary.addRaw('\nManual preview only: deployment and image identity verified; hosted acceptance remains pending. No test computer was started or stopped. This run cannot satisfy the Hosted continuity PR gate.\n');
-            } else {
-              core.summary.addRaw('Success requires provider SHA identity, a matching served shell bundle, and deployed browser suites. Worker SHA is verified via the control plane; /health has no commit field. No desktop release is published here.\n');
-            }
-            await core.summary.write();
-            if (e.TRUSTED !== 'true') core.setFailed(`No deployment performed: ${e.ADMISSION_REASON}`);
-            else if (e.PREVIEW_RESULT !== 'success' || (e.PRODUCTION_REQUIRED === 'true' &&
-                     (e.IMAGE_RESULT !== 'success' || e.PRODUCTION_RESULT !== 'success'))) {
-              core.setFailed('Required deployments or tested images did not succeed');
-            }

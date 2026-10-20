@@ -9,7 +9,7 @@
  */
 import { call, type CallOptions } from './transport';
 import { EzilError } from './errors';
-import type { Computer, DesktopStatus, DesktopUrl, EzilClientOptions } from './types';
+import type { Computer, DesktopStatus, DesktopUrl, EzilClientOptions, SystemInfo } from './types';
 
 /** Per-call escape hatches. */
 export interface RequestOptions {
@@ -31,6 +31,12 @@ export interface EzilClient {
         /** The user's default computer, created on first call. Idempotent. */
         getOrCreateDefault(opts?: RequestOptions): Promise<Computer>;
         rename(id: string, name: string, opts?: RequestOptions): Promise<Computer>;
+        /**
+         * Where the computer is recorded to run (`cloudflare`, `aws-ec2`, or
+         * `unassigned`/`unknown`) and the configured size of that machine. Owner
+         * only (NOT_FOUND otherwise). Read only: never assigns a provider.
+         */
+        systemInfo(computerId: string, opts?: RequestOptions): Promise<SystemInfo>;
         /** Soft-delete, and terminate the container. The row is never hard-deleted. */
         delete(id: string, opts?: RequestOptions): Promise<{ id: string } | unknown>;
     };
@@ -102,6 +108,7 @@ export const createEzilClient = (options: EzilClientOptions): EzilClient => {
             create: (input, opts) => mutate<Computer>('computer.create', { ...(input?.name ? { name: input.name } : {}) }, opts),
             getOrCreateDefault: (opts) => mutate<Computer>('computer.getOrCreateDefault', undefined, opts),
             rename: (id, name, opts) => mutate<Computer>('computer.rename', { id, name }, opts),
+            systemInfo: (computerId, opts) => query<SystemInfo>('computer.systemInfo', { computerId }, opts),
             delete: (id, opts) => mutate('computer.delete', { id }, opts),
         },
         desktop: {

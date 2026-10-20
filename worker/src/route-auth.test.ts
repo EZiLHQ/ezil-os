@@ -47,10 +47,12 @@ async function mintToken(secret = SECRET, now = Date.now()): Promise<string> {
 
 interface CallLog {
   terminateSandbox: number;
+  resetRuntimeForAcceptance: number;
   restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
   destroy: number;
   flushWorkspaceNow: number;
   getExposedPorts: number;
+  getImageId: number;
   getExposedPortHosts: string[];
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
@@ -108,6 +110,8 @@ function simulateCodeServerEnsureOrigin(headers: Record<string, string>, origin:
  */
 function fakeSandboxNamespace(options: {
   exposedPorts?: Array<{ port: number; url: string; status: string }>;
+  imageId?: string | null;
+  getImageId?: () => Promise<string | null>;
   terminateResult?: Record<string, unknown>;
   /** Upstream response the fake container returns for `containerFetch`. */
   containerResponse?: () => Response;
@@ -132,6 +136,10 @@ function fakeSandboxNamespace(options: {
    * only proves the ROUTE TABLE (auth, kill switch, response mapping).
    */
   restartResult?: Record<string, unknown>;
+  /** Canned `resetRuntimeForAcceptance` answer (default: the reset is scheduled). */
+  resetResult?: Record<string, unknown>;
+  /** Make `resetRuntimeForAcceptance` throw, as an object on an older revision does. */
+  resetThrows?: Error;
   /**
    * When set, any `exec()` command touching the container's boot-telemetry
    * NDJSON path (`ezil-telemetry.ndjson` — see `drainContainerBootTelemetry`,
@@ -163,10 +171,12 @@ function fakeSandboxNamespace(options: {
   let openedWith = SANDBOX_NAME;
   const calls: CallLog = {
     terminateSandbox: 0,
+    resetRuntimeForAcceptance: 0,
     restartDesktopStack: [],
     destroy: 0,
     flushWorkspaceNow: 0,
     getExposedPorts: 0,
+    getImageId: 0,
     getExposedPortHosts: [],
     exec: 0,
     containerFetch: [],
@@ -290,6 +300,10 @@ function fakeSandboxNamespace(options: {
       calls.getExposedPortHosts.push(args[0] as string);
       return options.exposedPorts ?? [];
     },
+    getImageId: async () => {
+      calls.getImageId++;
+      return options.getImageId ? await options.getImageId() : options.imageId ?? null;
+    },
     exec: async (...args: unknown[]) => {
       calls.exec++;
       const [command] = args as [string | undefined];
@@ -338,6 +352,7 @@ function fakeSandboxNamespace(options: {
   };
   impl.runningContainerFetch = impl.containerFetch!;
   impl.stopRuntimeForAcceptance = impl.terminateSandbox!;
+  impl.resetRuntimeForAcceptance = async () => { calls.resetRuntimeForAcceptance++; if (options.resetThrows) throw options.resetThrows; return options.resetResult ?? { ok: true }; };
 
   const stub = new Proxy(
     {},
@@ -390,6 +405,50 @@ describe('isolated runtime stop for stale recovery acceptance', () => {
     expect(calls.terminateSandbox).toBe(0);
     expect((await worker.fetch(request(SANDBOX_NAME), env)).status).toBe(200);
     expect(calls.terminateSandbox).toBe(1);
+  });
+});
+
+describe('isolated object reset onto the deployed code for acceptance', () => {
+  it('requires staging scope and signed authorization before resetting anything', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = await mintToken();
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET,
+      EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME };
+    const request = (name: string, signed = true) => new Request(`https://api-desktop.ezil.org/sandbox/${name}/acceptance-reset`, {
+      method: 'POST', headers: signed ? { authorization: `Bearer ${token}` } : {},
+    });
+    expect((await worker.fetch(request(SANDBOX_NAME), {...env,EZIL_ACCEPTANCE_ENV:'production'})).status).toBe(404);
+    expect((await worker.fetch(request(SANDBOX_NAME), {...env,EZIL_ACCEPTANCE_ENV:undefined})).status).toBe(404);
+    expect((await worker.fetch(request('guac-other-computer'), env)).status).toBe(404);
+    expect((await worker.fetch(request(SANDBOX_NAME, false), env)).status).toBe(401);
+    expect(calls.resetRuntimeForAcceptance).toBe(0);
+    const response = await worker.fetch(request(SANDBOX_NAME), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(calls.resetRuntimeForAcceptance).toBe(1);
+    expect(calls.terminateSandbox).toBe(0);
+  });
+
+  it('reports a running test computer as a conflict instead of resetting it', async () => {
+    const { binding } = fakeSandboxNamespace({ resetResult: { ok: false, error: 'runtime_running' } });
+    const response = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/acceptance-reset`, {
+      method: 'POST', headers: { authorization: `Bearer ${await mintToken()}` },
+    }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'runtime_running' });
+  });
+  it('reports an object still on the previous revision as unsupported, any other failure as failed', async () => {
+    const env = (resetThrows: Error) => ({ Sandbox: fakeSandboxNamespace({ resetThrows }).binding, SANDBOX_HMAC_SECRET: SECRET,
+      EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME });
+    const call = async (resetThrows: Error) => worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/acceptance-reset`, {
+      method: 'POST', headers: { authorization: `Bearer ${await mintToken()}` },
+    }), env(resetThrows));
+    const old = await call(new TypeError('The RPC receiver does not implement the method "resetRuntimeForAcceptance".'));
+    expect(old.status).toBe(501);
+    expect(await old.json()).toEqual({ ok: false, error: 'acceptance_reset_unsupported' });
+    const broken = await call(new Error('storage unavailable'));
+    expect(broken.status).toBe(502);
+    expect(await broken.json()).toEqual({ ok: false, error: 'acceptance_reset_failed' });
   });
 });
 
@@ -608,9 +667,124 @@ describe('DELETE /sandbox/:name reports what actually happened', () => {
   });
 });
 
+describe('GET /sandbox/:name/system protects storage-only image metadata', () => {
+  const path = `/sandbox/${SANDBOX_NAME}/system`;
+  const endpoint = `https://api-desktop.ezil.org${path}`;
+  const imageId = 'ezil-os:2026.10_20-build';
+  const v2Token = (patch: Partial<PreviewTokenV2Claims> = {}, signedPath = path, secret = SECRET) =>
+    mintPreviewTokenV2(secret, {
+      ts: Date.now(), sandboxId: SANDBOX_NAME, computerId: 'computer-1', userId: 'user-1',
+      provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0, ...patch,
+    }, { method: 'GET', path: signedPath, body: '' });
+
+  function expectNoContainerCalls(calls: CallLog) {
+    expect(calls.getExposedPorts).toBe(0);
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
+    expect(calls.flushWorkspaceNow).toBe(0);
+  }
+
+  it('refuses unsigned, bad, expired and unconfigured auth before reading metadata', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ imageId });
+    for (const token of [undefined, await mintToken('wrong-secret'), await mintToken(SECRET, Date.now() - TOKEN_MAX_AGE_MS - 1_000)]) {
+      const res = await worker.fetch(new Request(endpoint, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+      expect(res.status).toBe(401);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: false });
+      expect(body).not.toHaveProperty('imageId');
+      expect(JSON.stringify(body)).not.toContain(imageId);
+    }
+    const unconfigured = await worker.fetch(new Request(endpoint), { Sandbox: binding });
+    expect(unconfigured.status).toBe(401);
+    expect(await unconfigured.json()).toEqual({ ok: false, error: 'system_auth_not_configured' });
+    expect(calls.getImageId).toBe(0);
+    expectNoContainerCalls(calls);
+  });
+
+  it('accepts v1 bearer/query and v2 signatures without container I/O', async () => {
+    for (const version of ['v1-bearer', 'v1-query', 'v2']) {
+      const { binding, calls } = fakeSandboxNamespace({ imageId });
+      const token = version === 'v2' ? await v2Token() : await mintToken();
+      const request = version === 'v1-query'
+        ? new Request(`${endpoint}?token=${encodeURIComponent(token)}`)
+        : new Request(endpoint, { headers: version === 'v2' ? { 'x-ezil-auth': token } : { Authorization: `Bearer ${token}` } });
+      const res = await worker.fetch(request, { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, imageId });
+      expect(calls.getImageId).toBe(1);
+      expectNoContainerCalls(calls);
+    }
+  });
+
+  it('refuses bad or mismatched v2 signatures before reading metadata', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ imageId });
+    for (const token of [await v2Token({}, path, 'wrong-secret'), await v2Token({ sandboxId: 'another-sandbox' }), await v2Token({}, `${path}-other`)]) {
+      const res = await worker.fetch(new Request(endpoint, { headers: { 'x-ezil-auth': token } }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+      expect(res.status).toBe(401);
+      expect(await res.json()).not.toHaveProperty('imageId');
+    }
+    expect(calls.getImageId).toBe(0);
+    expectNoContainerCalls(calls);
+  });
+
+  it('returns null for missing metadata or storage errors without waking a container', async () => {
+    for (const getImageId of [async () => null, async () => { throw new Error('private storage failure'); }]) {
+      const { binding, calls } = fakeSandboxNamespace({ getImageId });
+      const res = await worker.fetch(new Request(endpoint, { headers: { Authorization: `Bearer ${await mintToken()}` } }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, imageId: null });
+      expect(calls.getImageId).toBe(1);
+      expectNoContainerCalls(calls);
+    }
+  });
+});
+
 // ── GET /sandbox/:name/status — the confirmation signal ─────────────────────
 
 describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
+  it('never reads image metadata and preserves the public response shape', async () => {
+    const { binding, calls } = fakeSandboxNamespace({
+      exposedPorts: [{ port: 8181, url: 'https://8181-x-nekodesktop.ezil.org', status: 'active' }],
+      getImageId: async () => { throw new Error('storage unavailable'); },
+    });
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/status`),
+      { Sandbox: binding },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true, sandboxName: SANDBOX_NAME, guacamoleRunning: true, mode: 'neko',
+      desktopRunning: true, runningModes: ['neko'], modeSource: 'detected',
+    });
+    expect(calls.getImageId).toBe(0);
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
+  });
+
+  it('does not expose a stored imageId on the unauthenticated route', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ imageId: 'ezil-os:2026.10_20-build' });
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/status`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true, sandboxName: SANDBOX_NAME, guacamoleRunning: false, mode: 'guacamole',
+      desktopRunning: false, runningModes: [], modeSource: 'default',
+    });
+    expect(calls.getImageId).toBe(0);
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
+    expect(calls.flushWorkspaceNow).toBe(0);
+  });
+
   it('reports guacamoleRunning:true / mode:"neko" for a live neko desktop with no desktopMode param', async () => {
     const { binding, calls } = fakeSandboxNamespace({
       exposedPorts: [
@@ -635,7 +809,7 @@ describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
     expect(calls.getExposedPorts).toBe(1);
   });
 
-  it('reports false for a sandbox with nothing exposed, and does not wake it', async () => {
+  it('reports false before any hydrate, omits imageId, and does not wake it', async () => {
     const { binding, calls } = fakeSandboxNamespace({ exposedPorts: [] });
     const res = await worker.fetch(
       new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/status`),
@@ -645,7 +819,10 @@ describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
     expect(body.guacamoleRunning).toBe(false);
     expect(body.desktopRunning).toBe(false);
     expect(body.modeSource).toBe('default');
+    expect(body).not.toHaveProperty('imageId');
     expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
   });
 
   it('honors an explicit ?desktopMode= literally (unchanged contract)', async () => {

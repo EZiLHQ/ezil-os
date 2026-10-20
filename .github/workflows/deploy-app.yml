@@ -1,17 +1,16 @@
-# All production paths use the current-main CI, staging, image and SQL gates.
+# Retained manual entry point for the pinned environment contract.
 name: Deploy App
 on:
   workflow_dispatch:
 permissions:
   contents: read
-  actions: read
-  pull-requests: read
-  packages: write
-  id-token: write
-  attestations: write
 jobs:
   gated-production:
-    uses: ./.github/workflows/preview.yml
-    with:
-      source: ${{ github.sha }}
-    secrets: inherit
+    name: Use the main-branch deployment flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Explain the release flow
+        run: |
+          echo '::error::This legacy deploy entry point is disabled; push/merge to main runs preview.yml#production. For a manual rerun, dispatch preview.yml on main.'
+          exit 1

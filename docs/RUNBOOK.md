@@ -25,6 +25,37 @@ system, which is out of scope for a docs-only pass.
 
 ---
 
+## Release flow
+
+Open a feature PR and merge it to the long-lived `preview` branch. Each push
+runs `preview.yml`: deploy the staging Worker and app, update the stable preview
+URL <https://ezil-os-staging.vercel.app>, then run `e2e/live-check.mjs`.
+After that check passes, merge `preview` to `main`. The same workflow deploys
+production at <https://os.ezil.work> and runs the live check. Main first applies
+reviewed production migrations; a failed apply stops deployment. A failed deploy
+or live check restores the previous Worker version and Vercel deployment and,
+when the image changed, restores the captured container image and waits for its
+rollout. Recovery uses `previous-release.json`, uploaded before mutation; SQL is
+never reversed. Recovery failures remain visible and fail the run. Live-check
+and recovery evidence is uploaded on every run. PR CI runs on
+Ubuntu; `preview.yml` also supports manual dispatch on `preview` or `main`,
+and the macOS workflows remain available manually. Container images build
+only when their inputs change; other pushes leave the container rollout
+disabled. `preview.yml` keeps the shared `IMAGE_INPUTS` list, checked against
+`image-plan.mjs` and every local `worker/Dockerfile` COPY/ADD source. Manual
+dispatch on branches and new branches rebuild images conservatively.
+
+Push a `v*` tag for the deployed production commit to publish its draft release.
+The production job checks <https://os.ezil.work> without redeploying or applying
+migrations. It verifies Worker/app source identities and the deployed container
+against retained tested-image evidence from a successful preview/main run.
+An older image is accepted only when it is an ancestor with unchanged image
+inputs and matching tested layers. Missing/expired evidence or a failed check
+leaves the release unpublished. After the signed Apple Silicon installer arrives
+(up to 30 minutes), the job attaches the semantic image alias to the verified
+digest and publishes the draft with the verified identities. `deploy.yml` and
+`deploy-app.yml` remain dispatch-only fallbacks directing operators to this flow.
+
 ## What is live (as of 2026-10-01)
 
 > **2026-10-18:** production moved to `https://os.ezil.work`, which is the

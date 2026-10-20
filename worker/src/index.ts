@@ -18,6 +18,7 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *          (`mode` is DETECTED from the live exposed-port list when the caller
  *          omits `?desktopMode=`; `guacamoleRunning` means "the desktop port
  *          for the reported `mode` is exposed" — read the two together)
+ *   GET    /sandbox/:name/system   → { ok, imageId } (HMAC-gated, storage-only)
  *   POST   /sandbox/:name/workspace-diag → { ok, sandboxId, op, slot, exists, bytes, sha256, expectedSha256, matches, wrote }
  *          (HMAC-gated diagnostic: mounts the R2 workspace bucket and operates on
  *          named, allowlisted marker slots to prove deterministic R2 persistence
@@ -681,6 +682,8 @@ import {
 const DESKTOP_PORT = 8080;
 /** Preview validity window reported to the client. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
+// Lets the reset reply leave the object before `ctx.abort()` discards it.
+export const ACCEPTANCE_RESET_DELAY_MS = 100;
 /**
  * Sandbox auto-sleep when idle. BACKSTOP ONLY, not the real mechanism:
  * `EzilSandboxDO.flushWorkspaceScheduled`'s explicit idle-stop path
@@ -813,8 +816,10 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  getImageId(): Promise<string | null>;
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
+  resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }>;
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
@@ -1942,6 +1947,8 @@ const SYSTEM_CHANGES_NOT_SAVED_KEY = 'ezil:systemChangesNotSaved';
 const SYSTEM_TOO_LARGE_KEY = 'ezil:systemTooLarge';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+/** Image observed by the system codec on the current container, never the restored snapshot's image. */
+const IMAGE_ID_KEY = 'ezil:imageId';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
@@ -2443,6 +2450,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
   }
   override async onStart(): Promise<void> {
+    // A replacement container may run a different image; wait for its own codec result.
+    try {
+      await this.ctx.storage.delete(IMAGE_ID_KEY);
+    } catch {
+      console.error('[image_id] could not clear previous image');
+    }
     this.observeRuntimeExit();
     bootLog('runtime_lifecycle', 'start');
     await super.onStart();
@@ -2486,6 +2499,33 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const next = (this.runtimeMutationTail ?? Promise.resolve()).catch(() => undefined).then(operation);
     this.runtimeMutationTail = next.then(() => undefined, () => undefined);
     return next;
+  }
+  /**
+   * Relay credential operations change only the running neko process's in-memory
+   * ICE configuration. They used to queue behind `withRuntimeMutation` and
+   * `withWorkspacePersistence`, so any checkpoint longer than the relay budget
+   * (a 36 s system-layer flush was observed) refused renewals with `relay_busy`
+   * while the desktop was healthy, and the viewer then dropped to its error state.
+   * They now serialize only with each other, and with the operations that actually
+   * stop, restart or replace the runtime (`withRuntimeTransition`): a transition
+   * fences new relay operations off and waits for an in-flight one to finish,
+   * exactly the exclusion the runtime lock used to give.
+   */
+  private relayTail: Promise<unknown> = Promise.resolve();
+  private runtimeTransitionsInFlight = 0;
+  private withRelayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.relayTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.relayTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  private async withRuntimeTransition<T>(operation: () => Promise<T>): Promise<T> {
+    this.runtimeTransitionsInFlight++;
+    try {
+      await (this.relayTail ?? Promise.resolve()).catch(() => undefined);
+      return await operation();
+    } finally {
+      this.runtimeTransitionsInFlight--;
+    }
   }
   async desktopReachable(): Promise<boolean> {
     try {
@@ -2532,11 +2572,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
     const requestedAt = Date.now();
     try {
-      const state = await this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      const state = await this.withRelayOperation(async () => {
         // A queued request that outlived the caller's forwarding budget must
         // never apply a late configuration change to a resumed runtime.
         remainingRelayBudget(requestedAt);
-        if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
+        if (this.runtimeTransitionsInFlight > 0 || !this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
         const credentials = await deriveNekoCredentials(this.env, sandboxId);
         // Local TCP transport cannot start a stopped container, and its signal
         // is cancellable here without crossing the Sandbox RPC boundary.
@@ -2548,7 +2588,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           if (!servers) throw new RelayFailure('turn_unavailable');
           return { servers, expiresAt: relayExpiryFor(issuedAt, resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS)) };
         } } : {}) });
-      }));
+      });
       return { ok: true, ...state };
     } catch (error) { return relayFailureResult(error); }
   }
@@ -2650,6 +2690,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const systemStartedAt = Date.now();
           const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
             log: (message) => console.error(message) });
+          if (system.ok) await this.recordImageId(system.imageId);
           bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
             detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
         }
@@ -2839,6 +2880,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     try {
       const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
         log: (message) => console.error(`[system_flush] ${message}`) });
+      if (system.ok) await this.recordImageId(system.imageId);
       // `too_large` stays too large until the user deletes something, so it
       // waits out the interval too. Re-walking up to 512 MiB on every 10-60 s
       // cycle was already waste for a present user; SIGNAL C's hold
@@ -3157,7 +3199,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // does because the absence of a reschedule (below) is the only thing
         // marking this loop retired.
         try {
-          await this.stop();
+          await this.withRuntimeTransition(() => this.stop());
         } catch (err) {
           console.error(
             `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=workspace_operation_failed`,
@@ -3253,6 +3295,23 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     await this.ctx.storage.put(SYSTEM_CHANGES_NOT_SAVED_KEY, { reason, at: now });
     bootLog('system_flush', 'end', { status: 'error', detail: `persistence_health=system_changes_not_saved,reason=${reason}` });
     return { proceed: true, unsaved: reason };
+  }
+
+  private async recordImageId(imageId: unknown): Promise<void> {
+    try {
+      if (typeof imageId === 'string' && imageId !== 'unknown' && imageId.length > 0 && imageId.length <= 128
+          && !/[^A-Za-z0-9._:-]/.test(imageId) && this.containerIsRunning()) {
+        await this.ctx.storage.put(IMAGE_ID_KEY, imageId);
+      }
+    } catch {
+      // Optional system metadata must never change a persistence outcome.
+      console.error('[image_id] could not record running image');
+    }
+  }
+
+  /** Storage-only system metadata: never probes or starts the container. */
+  async getImageId(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(IMAGE_ID_KEY)) ?? null;
   }
 
   /** Persistence-health signals for operators and the app (no file content). */
@@ -3540,12 +3599,34 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * label) rather than `<sandboxId>`.
    */
   async terminateSandbox(): Promise<TerminateReport> {
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint()));
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint())));
   }
 
   async stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport> {
     assertAcceptanceScope(this.env, sandboxId);
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true)));
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true))));
+  }
+
+  /**
+   * Staging acceptance only: discard this object instance so the next request
+   * constructs it from the currently deployed code. After a deploy, Cloudflare
+   * keeps a live object on its old code and resets it later ("Durable Object
+   * reset because its code was updated"); on staging that reset landed inside
+   * timed acceptance, failing a desktop open with 500 and pushing the cold first
+   * paint past its budget. The prepare step stops the test computer and then
+   * calls this, so the reset happens before any timing starts.
+   *
+   * Refuses while a container runs: only an already stopped test computer, with
+   * its final checkpoint committed, is ever reset. The abort runs after the reply
+   * and after any queued runtime or persistence work, so it cannot cut a write.
+   */
+  async resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }> {
+    assertAcceptanceScope(this.env, sandboxId);
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      if (this.containerIsRunning()) return { ok: false as const, error: 'runtime_running' as const };
+      setTimeout(() => this.ctx.abort('acceptance_reset'), ACCEPTANCE_RESET_DELAY_MS);
+      return { ok: true as const };
+    }));
   }
 
   private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {
@@ -3722,7 +3803,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       };
     }
     this.restartInProgress = true;
-    return this.withRuntimeMutation(async () => {
+    return this.withRuntimeMutation(() => this.withRuntimeTransition(async () => {
     try {
       const exposedBefore = await this.getExposedPorts(hostname);
       const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
@@ -3920,7 +4001,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     } finally {
       this.restartInProgress = false;
     }
-    });
+    }));
   }
 }
 
@@ -3967,10 +4048,14 @@ async function awsControlTarget(env: Env, request: Request, name: string, prefix
 
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
-  return async (signal) => {
+  return async (signal, purpose = 'renewal') => {
     const issuedAt = Date.now();
     const servers = await generateTurnCredentials(env, signal);
-    return servers ? { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 } : null;
+    const ttl = resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS);
+    // Apply the boot margin without changing the existing AWS renewal lifetime.
+    return servers ? { servers, expiresAt: purpose === 'boot'
+      ? relayExpiryFor(issuedAt, ttl)
+      : issuedAt + ttl * 1000 } : null;
   };
 }
 
@@ -4150,11 +4235,11 @@ async function generateTurnCredentials(env: Env, signal: AbortSignal = AbortSign
  * set (no username/credential) when only that is configured. Returns `null`
  * when neither is configured (diagnostic/no-TURN path — behavior unchanged).
  */
-async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
+export async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
   const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
   if (cloudflare) return { ...buildNekoIceEnv(cloudflare),
-    EZIL_RELAY_EXPIRES_AT: String(issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000) };
+    EZIL_RELAY_EXPIRES_AT: String(relayExpiryFor(issuedAt, resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS))) };
 
   const staticUrls = env.SANDBOX_NEKO_TURN_URLS?.trim();
   if (staticUrls) {
@@ -7005,6 +7090,18 @@ export default {
       return handleStatus(env, url, decodeURIComponent(statusMatch[1]), url.searchParams.get('desktopMode') ?? undefined);
     }
 
+    const systemMatch = path.match(/^\/sandbox\/([^/]+)\/system$/);
+    if (method === 'GET' && systemMatch) {
+      if (resolvePreviewSecrets(env).length === 0) return json({ ok: false, error: 'system_auth_not_configured' }, 401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      let imageId: string | null = null;
+      try {
+        imageId = await openSandbox(env, decodeURIComponent(systemMatch[1])).getImageId();
+      } catch { /* Optional storage metadata; never probe or start a container. */ }
+      return json({ ok: true, imageId });
+    }
+
     const workspaceDiagMatch = path.match(/^\/sandbox\/([^/]+)\/workspace-diag$/);
     if (method === 'POST' && workspaceDiagMatch) {
       // Production kill-switch: the diagnostic surface is HMAC-gated, returns no
@@ -7114,6 +7211,23 @@ export default {
       if (unauthorized) return unauthorized;
       try { return json(await openSandbox(env, name).stopRuntimeForAcceptance(name)); }
       catch { return json({ok:false,error:'acceptance_stop_failed'},502); }
+    }
+    const acceptanceReset = path.match(/^\/sandbox\/([^/]+)\/acceptance-reset$/);
+    if (method === 'POST' && acceptanceReset) {
+      const name = decodeURIComponent(acceptanceReset[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try {
+        const result = await openSandbox(env, name).resetRuntimeForAcceptance(name);
+        return json(result, result.ok ? 200 : 409);
+      } catch (error) {
+        // An object still on the previous revision (the state this route exists
+        // for) has no such method yet; say so, so the prepare step can skip it.
+        if (/does not implement|not a function|no such method/i.test(String(error))) return json({ok:false,error:'acceptance_reset_unsupported'},501);
+        return json({ok:false,error:'acceptance_reset_failed'},502);
+      }
     }
     const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
     if (method === 'POST' && acceptanceMatch) {

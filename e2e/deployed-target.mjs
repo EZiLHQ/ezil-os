@@ -1,4 +1,7 @@
 /** Shared target and optional Vercel protection bypass for deployed suites. */
+import http from 'node:http';
+import https from 'node:https';
+
 export function deployedTarget(env = process.env) {
   if (env.EZIL_E2E_REQUIRE_TARGET === '1' && !env.EZIL_E2E_APP) {
     throw new Error('EZIL_E2E_APP is required for cloud CI');
@@ -48,14 +51,79 @@ export function redactedFetchError(error, request) {
   return redacted;
 }
 
-export async function configureAppContext(context, { app, headers } = { app: APP, headers: appHeaders }) {
-  if (!Object.keys(headers).length) return;
+// Hop-by-hop and transport headers the transport below sets itself.
+const OWN_HEADERS = new Set(['host', 'connection', 'keep-alive', 'content-length', 'transfer-encoding', 'accept-encoding', 'cookie']);
+
+/**
+ * Playwright's request client pools sockets with TCP keep-alive probes every
+ * second and fails the request with `read ETIMEDOUT` after ten unanswered
+ * probes. A network path that drops probes for ten seconds then fails a
+ * healthy request whose response is still being prepared: a cold desktop
+ * start or a final checkpoint can hold the connection silent for minutes.
+ * App API calls therefore use a fresh connection without probes. Redirects
+ * are returned, never followed; errors carry no request headers.
+ */
+export function appRequest(url, { method = 'GET', headers = {}, body, timeout = APP_FETCH_TIMEOUT_MS, signal } = {}) {
+  const target = new URL(url);
+  const client = target.protocol === 'https:' ? https : http;
+  const sent = Object.fromEntries(Object.entries(headers)
+    .filter(([name]) => !name.startsWith(':') && !OWN_HEADERS.has(name.toLowerCase())));
+  if (headers.cookie) sent.cookie = headers.cookie;
+  sent['accept-encoding'] = 'identity';
+  return new Promise((resolve, reject) => {
+    const request = client.request(target, { method, headers: sent, agent: false,
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(timeout), signal]) : AbortSignal.timeout(timeout) }, (response) => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('error', reject);
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) }));
+    });
+    request.on('socket', socket => socket.setKeepAlive(false));
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
+export function cookieHeader(cookies) {
+  return cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+}
+
+// The shape route.fulfill expects: one string per header, Set-Cookie lines
+// separated by newlines as Playwright's own APIResponse.headers() returns them.
+function fulfillHeaders(headers) {
+  return Object.fromEntries(Object.entries(headers)
+    .filter(([name]) => !['connection', 'keep-alive', 'content-length', 'transfer-encoding'].includes(name))
+    .map(([name, value]) => [name, Array.isArray(value) ? value.join(name === 'set-cookie' ? '\n' : ', ') : String(value)]));
+}
+
+export async function configureAppContext(context, { app = APP, headers = appHeaders, send = appRequest } = {}) {
+  const bypass = Object.keys(headers).length > 0;
+  // A closed context cannot cancel the standalone API requests below; abort them.
+  const closed = new AbortController();
+  context.on?.('close', () => closed.abort());
   // Scope the bypass to this deployment. Global context headers would also
   // send it to the Worker, container frames and arbitrary external resources.
+  // The route is installed without a bypass too: API calls still need the
+  // probe-free transport on a public target.
   await context.route('**/*', async (route) => {
     const request = route.request();
     try {
-      if (new URL(request.url()).origin !== app) return await route.continue();
+      const url = new URL(request.url());
+      if (url.origin !== app) return await route.continue();
+      if (url.pathname.startsWith('/api/')) {
+        // Intercepted requests carry no Cookie header; route.fetch reads the
+        // context jar, and so does this.
+        const cookies = await context.cookies(request.url());
+        const response = await send(request.url(), {
+          method: request.method(),
+          headers: { ...request.headers(), ...headers, ...(cookies.length ? { cookie: cookieHeader(cookies) } : {}) },
+          body: request.postDataBuffer() ?? undefined,
+          timeout: appFetchTimeout(request),
+          signal: closed.signal,
+        });
+        return await route.fulfill({ status: response.status, headers: fulfillHeaders(response.headers), body: response.body });
+      }
+      if (!bypass) return await route.continue();
       // fetch(maxRedirects: 0) prevents custom headers following cross-origin
       // redirects; the browser makes the next request through this route again.
       const response = await route.fetch({
@@ -63,9 +131,10 @@ export async function configureAppContext(context, { app, headers } = { app: APP
       });
       await route.fulfill({ response });
     } catch (error) {
-      // A media request can still be in flight when a completed test closes its
-      // browser context. Playwright then rejects route.fetch after disposal.
-      if (String(error).includes('Request context disposed')) return;
+      // A request can still be in flight when a completed test closes its
+      // browser context. Playwright then rejects route.fetch after disposal,
+      // and the API transport is aborted with the context.
+      if (closed.signal.aborted || String(error).includes('Request context disposed')) return;
       throw redactedFetchError(error, request);
     }
   });
