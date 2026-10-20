@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { promoteDeployment } from './vercel-api.mjs';
 // The public production origin (Vercel project `ezil-os-preview`, team ezil1;
 // moved from os.ezil.org on 2026-10-18). `legacyAlias` is that project's own
 // production alias; it resolves to the same deployment and is verified
@@ -26,7 +27,7 @@ export function vercelIdentity(app, project) {
   }
   return {vercel_deployment:app.id, vercel_source:app.meta.githubCommitSha, vercel_url:app.url};
 }
-export async function restoreVercel(previous, env, fetchImpl = fetch, exec = execFileSync) {
+export async function restoreVercel(previous, env, fetchImpl = fetch) {
   assert.match(env.VERCEL_ORG_ID ?? '', /^team_[a-zA-Z0-9]+$/, 'Missing Vercel team scope');
   assert.ok(env.VERCEL_PROJECT_ID && env.VERCEL_TOKEN, 'Missing Vercel configuration');
   assert.match(previous.vercel_deployment ?? '', /^dpl_[a-zA-Z0-9]+$/, 'Invalid previous Vercel deployment ID');
@@ -48,12 +49,9 @@ export async function restoreVercel(previous, env, fetchImpl = fetch, exec = exe
   const current = await read(new URL(canonical).hostname);
   assert.ok(current.vercel_deployment === previous.vercel_deployment || current.vercel_source === env.EZIL_DEPLOY_SHA,
     'Another Vercel release owns production');
-  try {
-    exec('vercel', ['promote', target.vercel_url, '--scope', env.VERCEL_ORG_ID, '--yes', `--token=${env.VERCEL_TOKEN}`],
-      {stdio:['ignore','pipe','pipe'], timeout:120000});
-  } catch { throw new Error('Vercel rollback promotion failed; verify the team-scoped deployment manually'); }
+  await promoteDeployment(target.vercel_deployment, env, {fetchImpl});
   // The workflow's bounded rollback-check verifies the canonical identity after
-  // all three restorations. CLI success alone never declares rollback complete.
+  // all three restorations, in addition to the promotion's alias readback.
   return target;
 }
 export async function readState(env, fetchImpl = fetch) {
