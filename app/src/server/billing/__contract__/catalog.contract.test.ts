@@ -62,8 +62,8 @@ describe('billing configuration contract', () => {
     });
 
     it('requires both the checkout flag and a nonempty key', () => {
-        expect(checkoutAvailable(readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'synthetic-key' }))).toBe(true);
-        expect(checkoutAvailable(readBillingConfig({ STRIPE_SECRET: 'synthetic-key' }))).toBe(false);
+        expect(checkoutAvailable(readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' }))).toBe(true);
+        expect(checkoutAvailable(readBillingConfig({ STRIPE_SECRET: 'sk_test_fixture' }))).toBe(false);
         for (const value of [undefined, '', '   ']) {
             expect(checkoutAvailable(readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: value }))).toBe(false);
         }
@@ -73,7 +73,7 @@ describe('billing configuration contract', () => {
         const methods = ['log', 'info', 'warn', 'error', 'debug'] as const;
         const spies = methods.map(method => vi.spyOn(console, method));
         const env = {
-            CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'synthetic-stripe-key',
+            CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_synthetic',
             STRIPE_WEBHOOK_SECRET: 'synthetic-webhook-key', STRIPE_PRICE_PRO_MONTHLY: 'synthetic-price',
             BILLING_USAGE_HMAC_SECRET: 'synthetic-usage-key', BILLING_FUNDING_URL: 'synthetic-funding-url',
             BILLING_FUNDING_HMAC_SECRET: 'synthetic-funding-key',

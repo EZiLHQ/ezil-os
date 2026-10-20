@@ -173,7 +173,7 @@ describe('billing summary wire contract', () => {
     });
 
     it('keeps all actions off with flags off despite configured keys, and gates checkout positively', () => {
-        const keys = { STRIPE_SECRET: 'synthetic-stripe-key', STRIPE_WEBHOOK_SECRET: 'synthetic-webhook-key' };
+        const keys = { STRIPE_SECRET: 'sk_test_synthetic', STRIPE_WEBHOOK_SECRET: 'synthetic-webhook-key' };
         expect(summary({ config: readBillingConfig(keys) }).actions).toEqual({ checkout: false, portal: false, topup: false });
         const enabled = summary({ config: readBillingConfig({ ...keys, BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1' }) });
         expect(enabled.actions.checkout).toBe(true);

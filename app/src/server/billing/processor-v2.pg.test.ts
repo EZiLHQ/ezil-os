@@ -22,7 +22,7 @@ const START = new Date('2026-10-01T00:00:00Z');
 const END = new Date('2026-11-01T00:00:00Z');
 const NOW = new Date('2026-10-18T12:00:00Z');
 const window = { start: START, end: END };
-const config = readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'fixture-only' });
+const config = readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' });
 
 function tenant(): Tenant {
     return { userId: randomUUID(), computerId: randomUUID(), customerId: `cus_${randomUUID()}`, subscriptionId: `sub_${randomUUID()}` };

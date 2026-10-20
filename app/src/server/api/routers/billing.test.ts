@@ -150,12 +150,12 @@ function fixture() {
         retrieveCharge: vi.fn<StripeApi['retrieveCharge']>(),
     } satisfies StripeApi;
     const deps: BillingDeps = {
-        config: readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'fixture-only' }),
+        config: readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' }),
         store, stripe, usage: null, now: () => now,
     };
     const ctx: Awaited<ReturnType<typeof createTRPCContext>> = {
         db: {} as Awaited<ReturnType<typeof createTRPCContext>>['db'],
-        headers: new Headers({ origin: 'https://app.example' }),
+        headers: new Headers({ origin: 'https://os.ezil.work' }),
         user: { id: userId, email: 'fixture@example.org', aud: 'authenticated', app_metadata: {}, user_metadata: {}, created_at: now.toISOString() },
     };
     const router = createBillingRouter(() => deps);
@@ -258,7 +258,7 @@ describe('billing router', () => {
         expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(0);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(0);
         f.deps.config.checkoutEnabled = true;
-        f.deps.config.stripeSecret = 'fixture-only';
+        f.deps.config.stripeSecret = 'sk_test_fixture';
         f.deps.stripe = f.stripe;
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
@@ -314,8 +314,8 @@ describe('billing router', () => {
         expect(calls).toHaveLength(2);
         expect(calls[0][0]).toMatchObject({
             userId, customerId: 'cus_fixture', sku,
-            uiMode: 'hosted', returnUrl: 'https://app.example/billing/return?session_id={CHECKOUT_SESSION_ID}',
-            successUrl: 'https://app.example/billing/return?session_id={CHECKOUT_SESSION_ID}', cancelUrl: 'https://app.example/os',
+            uiMode: 'hosted', returnUrl: 'https://os.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}',
+            successUrl: 'https://os.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}', cancelUrl: 'https://os.ezil.work/os',
         });
         expect(calls[0][0].idempotencyKey).toMatch(new RegExp(`^checkout:${userId}:${sku}:`));
         expect(new Set(calls.map(([input]) => input.idempotencyKey)).size).toBe(2);
@@ -346,7 +346,7 @@ describe('billing router', () => {
         expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(0);
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
-        expect(f.stripe.createPortalSession).toHaveBeenCalledWith({ customerId: 'cus_fixture', returnUrl: 'https://app.example/os' });
+        expect(f.stripe.createPortalSession).toHaveBeenCalledWith({ customerId: 'cus_fixture', returnUrl: 'https://os.ezil.work/os' });
     });
 
     it.each(['other-user', null])('hides sessions belonging to %s with an owner control', async owner => {
@@ -397,7 +397,7 @@ describe('billing router', () => {
         });
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({
             customerId: 'cus_fixture', userId, sku, uiMode: 'embedded',
-            returnUrl: 'https://app.example/billing/return?session_id={CHECKOUT_SESSION_ID}',
+            returnUrl: 'https://os.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}',
         }));
     });
 
@@ -476,7 +476,16 @@ describe('billing publishable-key configuration', () => {
         for (const value of ['pk_test_fixture', 'pk_live_fixture']) {
             expect(readBillingConfig({ [name]: ` ${value} ` }).stripePublishableKey).toBe(value);
         }
-        for (const value of ['sk_test_fixture', 'sk_live_fixture', 'rk_test_fixture', 'whsec_fixture', 'pk_invalid', 'prefix_pk_test_fixture', '', ' ']) {
+        // A set-but-invalid publishable value is a misconfiguration: never sent to
+        // a browser, and checkout refuses rather than silently selling hosted.
+        for (const value of ['sk_test_fixture', 'sk_live_fixture', 'rk_test_fixture', 'whsec_fixture', 'pk_invalid', 'prefix_pk_test_fixture']) {
+            const f = fixture();
+            f.deps.config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture', [name]: value });
+            expect(f.deps.config.stripePublishableKey).toBeUndefined();
+            await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+            expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(0);
+        }
+        for (const value of ['', ' ']) {
             const f = fixture();
             f.deps.config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture', [name]: value });
             expect(f.deps.config.stripePublishableKey).toBeUndefined();

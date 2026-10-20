@@ -26,7 +26,7 @@ export const END = new Date('2026-11-01T00:00:00Z');
 export const NOW = new Date('2026-10-18T12:00:00Z');
 export const WEBHOOK_SECRET = 'whsec_qa_fixture_only';
 export const config = readBillingConfig({
-    BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'fixture-only', STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET,
+    BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture', STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET,
 });
 
 export const sec = (d: Date) => Math.floor(d.getTime() / 1000);

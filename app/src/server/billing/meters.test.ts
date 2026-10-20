@@ -299,7 +299,7 @@ describe('buildSummary', () => {
             actions: { checkout: false, portal: false, topup: false },
             catalog: { pro: catalogPro(), packs: AI_PACKS },
         });
-        expect(summary({ config: readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'test-only' }), subs: [subscription()] }).actions)
+        expect(summary({ config: readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' }), subs: [subscription()] }).actions)
             .toEqual({ checkout: true, portal: true, topup: false });
     });
 
@@ -362,7 +362,7 @@ describe('buildSummary', () => {
     });
 
     it.each(['active', 'trialing', 'past_due', 'unpaid', 'canceled'])('gates checkout and portal for %s', status => {
-        const available = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'test-only' });
+        const available = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' });
         expect(summary({ config: available, subs: [subscription()] }).actions.portal).toBe(true);
         for (const config of [
             available,
@@ -377,7 +377,7 @@ describe('buildSummary', () => {
     });
 
     it('offers checkout to Free and the portal to a canceling Pro subscription', () => {
-        const config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'test-only' });
+        const config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' });
         expect(summary({ config }).actions).toEqual({ checkout: true, portal: false, topup: false });
         const result = summary({ config, subs: [subscription({ cancelAtPeriodEnd: true })] });
         expect(result.actions).toEqual({ checkout: true, portal: true, topup: false });
@@ -389,7 +389,7 @@ describe('buildSummary', () => {
     it.each(['active', 'past_due', 'canceled'])('round-trips %s through JSON with exact strings and AI unavailable', status => {
         const result = summary({
             config: readBillingConfig({
-                CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'test-only', BILLING_LARGE_STORAGE: '1',
+                CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture', BILLING_LARGE_STORAGE: '1',
                 BILLING_FUNDING_URL: 'https://example.com/funding', BILLING_FUNDING_HMAC_SECRET: 'test-only',
             }),
             subs: [subscription({ status })],

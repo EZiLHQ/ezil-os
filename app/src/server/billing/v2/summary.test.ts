@@ -61,7 +61,7 @@ function issue(overrides: Partial<PaymentIssueRow> = {}): PaymentIssueRow {
 
 function input(overrides: Partial<Input> = {}): Input {
     return {
-        config: readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'fixture-only' }),
+        config: readBillingConfig({ BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' }),
         now: NOW, userCreatedAt: null, subs: [], epochs: [], grants: [], consent: null,
         planChanges: [], paymentIssues: [], storage: [], sizePreference: null, hasCustomer: false, ...overrides,
     };

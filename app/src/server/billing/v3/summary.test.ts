@@ -7,7 +7,7 @@ const now = new Date('2026-10-19T12:00:00Z');
 const start = new Date('2026-10-10T00:00:00Z'), end = new Date('2026-11-10T00:00:00Z');
 type Input = Parameters<typeof buildSummaryV3>[0];
 function input(sku?: SellableSkuV3): Input {
-    return { config: readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'fixture' }), now, userCreatedAt: null,
+    return { config: readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' }), now, userCreatedAt: null,
         subs: sku ? [{ sku, stripeSubscriptionId: 'sub', status: 'active', currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }] : [],
         epochs: [], grants: sku ? [{ id: 'grant', userId: 'u', subscriptionId: 'sub', kind: 'plan_period', meter: 'compute_std_seconds',
             amount: BigInt(CATALOG_V3[sku].fairUseSeconds), periodStart: start, periodEnd: end, sourceType: 'invoice', sourceId: 'in', createdAt: start }] : [],
