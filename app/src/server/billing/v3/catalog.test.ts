@@ -1,15 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import type { SubscriptionRow } from '../meters';
-import { offerByLookupKey, offerBySku, planFromSubscriptions, publicOffers } from './catalog';
+import { offerByLookupKey, offerBySku, planFromSubscriptions, publicOffers, upgradeGrantSeconds } from './catalog';
 
 const now = new Date('2026-10-19T12:00:00Z');
 const sub = (sku: string, status = 'active'): SubscriptionRow => ({ sku, status, stripeSubscriptionId: sku,
     currentPeriodStart: new Date('2026-10-10Z'), currentPeriodEnd: new Date('2026-11-10Z'), cancelAtPeriodEnd: false });
 
 describe('v3 catalog', () => {
-    it('publishes only Free, Standard $20, Premium $40', () => {
-        expect(publicOffers().map(({ name, priceCents }) => [name, priceCents])).toEqual([['Free', 0], ['Standard', 2000], ['Premium', 4000]]);
-        expect(publicOffers()[2]).toMatchObject({ highlighted: true, badge: 'Most popular', fairUseHours: 80 });
+    it.each([['2026-10-01T00:00:00Z', 1656000], ['2026-10-11T00:00:00Z', 828000],
+        ['2026-10-21T00:00:00Z', 0], ['2026-10-22T00:00:00Z', 0], ['2026-09-30T00:00:00Z', 1656000]])(
+        'prorates only the 460-hour difference at %s', (effectiveAt, expected) => {
+            expect(upgradeGrantSeconds({ periodStart: '2026-10-01T00:00:00Z', periodEnd: '2026-10-21T00:00:00Z', effectiveAt })).toBe(expected);
+        });
+
+    it('publishes only Free, Standard $20, Premium $100 with machine choice', () => {
+        expect(publicOffers().map(({ name, priceCents }) => [name, priceCents])).toEqual([['Free', 0], ['Standard', 2000], ['Premium', 10000]]);
+        expect(publicOffers()[2]).toMatchObject({ highlighted: true, badge: null, fairUseHours: 500, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], vcpu: 2, memoryGiB: 8 });
         expect(offerByLookupKey('ezil_standard_monthly_v3')?.sku).toBe('standard_monthly_v3');
         expect(offerByLookupKey('ezil_premium_monthly_v3')?.sku).toBe('premium_monthly_v3');
         for (const key of ['toString', '__proto__', 'compute_monthly_v2', 'unknown']) expect(offerBySku(key)).toBeUndefined();

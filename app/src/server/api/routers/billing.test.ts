@@ -773,6 +773,11 @@ describe('billing v3 mutations', () => {
     it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const)('selects only %s sizes', async planSku => {
         const f = await paidFixture(planSku);
         for (const size of ['free-cf', 'std-2', 'cmp-4', 'cmp-8', 'unknown']) {
+            if (planSku !== 'compute_monthly_v2') {
+                await domainFailure(() => f.caller.selectSize({ size }), 'upgrade_not_allowed');
+                expect(f.store.setSizePreference).not.toHaveBeenCalled();
+                continue;
+            }
             const allowed = CATALOG_V2[planSku].sizes.some(code => code === size);
             if (allowed) {
                 const input = { size, userId: 'foreign', subscriptionId: 'sub_foreign' };
@@ -875,7 +880,7 @@ describe('v3-only sales and renewal', () => {
         await expect(f.caller.createCheckout({ sku: oldSku as typeof sku })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
     });
-    it.each(['free_v3', 'standard_monthly_v3', 'premium_monthly_v3'])('%s has no overage or size selection', async planSku => {
+    it.each(['free_v3', 'standard_monthly_v3', 'premium_monthly_v3'])('%s rejects legacy overage and selectSize', async planSku => {
         const f = planSku === 'free_v3' ? fixture() : await paidFixture(planSku);
         await domainFailure(() => f.caller.setOverage(overageInput), 'upgrade_not_allowed');
         await domainFailure(() => f.caller.selectSize({ size: 'cmp-8' }), 'upgrade_not_allowed');
@@ -894,5 +899,49 @@ describe('v3-only sales and renewal', () => {
         expect(await f.caller.summary()).toMatchObject({ plan: { renewal: null } });
         expect(preview).not.toHaveBeenCalled();
         expect(log).toHaveBeenCalledWith('Billing renewal preview unavailable');
+    });
+});
+
+
+describe('v3 Premium machine selection', () => {
+    it.each(['std-2', 'cmp-4', 'cmp-8'] as const)('persists %s for the authenticated user and reports next_open', async size => {
+        const f = await paidFixture('premium_monthly_v3');
+        f.store.setSizePreference.mockImplementation(async (_userId, chosen) => { f.store.sizePreference.mockResolvedValue(chosen); });
+        const untrusted = { size, userId: 'foreign', subscriptionId: 'foreign' };
+        await expect(f.caller.selectMachine(untrusted)).resolves.toEqual({ size, effective: 'next_open' });
+        expect(f.store.setSizePreference).toHaveBeenCalledExactlyOnceWith(userId, size);
+        expect(await f.caller.summary()).toMatchObject({ computer: { size } });
+        expect(f.store.openEpoch).not.toHaveBeenCalled();
+        expect(f.store.closeEpoch).not.toHaveBeenCalled();
+    });
+    it.each(['free_v3', 'standard_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'])(
+        'refuses %s even when std-2 would otherwise be allowed', async planSku => {
+            const f = planSku === 'free_v3' ? fixture() : await paidFixture(planSku);
+            await expect(f.caller.selectMachine({ size: 'std-2' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'size_not_allowed' });
+            expect(f.store.setSizePreference).not.toHaveBeenCalled();
+        });
+    it.each(['past_due', 'incomplete', 'canceled', 'unpaid'])(
+        'refuses Premium in %s', async status => {
+            const f = fixture(); f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status })]);
+            await expect(f.caller.selectMachine({ size: 'cmp-8' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'size_not_allowed' });
+            expect(f.store.setSizePreference).not.toHaveBeenCalled();
+        });
+    it('refuses expired and canceling Premium subscriptions', async () => {
+        for (const overrides of [{ currentPeriodEnd: new Date('2026-10-01T00:00:00Z') }, { cancelAtPeriodEnd: true }]) {
+            const f = fixture(); f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', ...overrides })]);
+            await expect(f.caller.selectMachine({ size: 'cmp-8' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'size_not_allowed' });
+            expect(f.store.setSizePreference).not.toHaveBeenCalled();
+        }
+    });
+    it.each(['free-cf', 'unknown', '__proto__', 'toString', '', 4, null])('refuses invalid Premium size %s before writing', async size => {
+        const f = await paidFixture('premium_monthly_v3');
+        await expect(f.caller.selectMachine({ size: size as 'cmp-8' })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(f.store.setSizePreference).not.toHaveBeenCalled();
+        if (size !== 'free-cf') expect(f.store.subscriptionsFor).not.toHaveBeenCalled();
+    });
+    it('requires authentication before reading or writing preferences', async () => {
+        const f = fixture();
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).selectMachine({ size: 'cmp-8' })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+        for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
     });
 });

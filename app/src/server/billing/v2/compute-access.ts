@@ -28,7 +28,7 @@ export interface ComputeBillingState {
     entitledSize: SizeCode;
     provider: 'cloudflare' | 'aws';
     window: Window;
-    /** Legacy uses weighted seconds; v3 uses actual seconds in these compatibility fields. */
+    /** Standard seconds (actual running seconds multiplied by the epoch weight). */
     usedStdSeconds: number;
     allowanceStdSeconds: number;
     overage: { enabled: boolean; capCents: number } | null;
@@ -48,13 +48,14 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
     ]);
     const resolved = planV3({ subs, now, userCreatedAt });
     if (resolved.sku !== 'legacy') {
-        const [epochs, grants, paymentIssues] = await Promise.all([
+        const [epochs, grants, paymentIssues, sizePreference] = await Promise.all([
             deps.store.epochsFor(userId, new Date(resolved.window.start)),
             deps.store.grantsForPeriod(userId, { start: new Date(resolved.window.start), end: new Date(resolved.window.end) }, summaryMeters(resolved.family)),
             deps.store.openPaymentIssues(userId),
+            deps.store.sizePreference(userId),
         ]);
         const summary = buildSummaryV3({ config: deps.config, now, userCreatedAt, subs, epochs, grants, planChanges,
-            paymentIssues, consent: null, storage: [], sizePreference: null, hasCustomer: false });
+            paymentIssues, consent: null, storage: [], sizePreference, hasCustomer: false });
         const paymentIssue = summary.plan.paymentIssue !== null;
         return {
             planSku: resolved.sku, v3: { sku: resolved.sku, legacyFree: resolved.legacyFree },
@@ -62,7 +63,7 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             openEpochs: epochs.filter(epoch => epoch.endedAt === null), family: resolved.family,
             planActive: resolved.planActive, delinquent: resolved.status === 'past_due' || resolved.status === 'incomplete',
             paymentIssue, upgradePending: summary.plan.pendingUpgrade !== null,
-            entitledSize: resolved.offer.size, provider: resolved.offer.provider, window: resolved.window,
+            entitledSize: summary.computer.size, provider: resolved.offer.provider, window: resolved.window,
             usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now),
             allowanceStdSeconds: fairUseAllowance(resolved, grants), overage: null, summary,
         };
@@ -117,9 +118,10 @@ function decideStart(state: ComputeBillingState, computerId: string, size: SizeC
     if (state.v3) {
         const offer = CATALOG_V3[state.v3.sku];
         if (size !== 'free-cf' && state.paymentIssue) return { admit: false, reason: 'payment_issue' };
-        if (size !== 'free-cf' && size !== offer.size) return { admit: false, reason: 'size_not_allowed' };
         const ceiling = state.v3.legacyFree ? offer.legacyFairUseSeconds ?? offer.fairUseSeconds : offer.fairUseSeconds;
         return admitStartV3({ sku: state.v3.sku, legacyFree: state.v3.legacyFree,
+            // An existing Cloudflare machine consumes weight one on a paid plan.
+            size: size === 'free-cf' && state.provider === 'aws' ? 'std-2' : size,
             planActive: state.v3.sku === 'free_v3' || state.planActive,
             paymentIssue: state.v3.sku === 'free_v3' ? size !== 'free-cf' && state.paymentIssue : state.paymentIssue,
             // Prorated receipts/reversals reserve the ungranted portion of the guardrail.
@@ -174,14 +176,14 @@ export async function gateComputerStart({ deps, userId, computerId, kind, instan
         // AWS opens resize to the entitled size: gating the old type would reject
         // a downgrade before the replacement can run, or under-rate an upgrade.
         // A paid user's pre-existing Cloudflare computer uses the paid allowance:
-        // legacy billing rates it as std-2; v3 admission uses the plan's size.
+        // billing rates its actual weight as std-2.
         const meteredSize = meteredSizeForInstanceType(instanceType);
         // Null means no machine selected yet. An explicitly unlisted type must
         // not borrow the entitlement's size, even when a resize is planned.
         const size = kind === 'aws-ec2'
             ? instanceType !== null && meteredSize === null ? null
                 : state.provider === 'aws' ? state.entitledSize : instanceType !== null ? meteredSize : state.entitledSize
-            : state.provider === 'aws' ? state.v3 ? state.entitledSize : 'std-2' : 'free-cf';
+            : state.provider === 'aws' ? 'std-2' : 'free-cf';
         const decision: AdmitDecision | AdmitDecisionV3 = size === null
             ? { admit: false, reason: 'size_not_allowed' }
             : kind === 'aws-ec2' && state.paymentIssue

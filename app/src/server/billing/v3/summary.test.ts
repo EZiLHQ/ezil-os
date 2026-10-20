@@ -17,7 +17,57 @@ function input(sku?: SellableSkuV3): Input {
 const epoch = (overrides: Partial<Input['epochs'][number]> = {}): Input['epochs'][number] => ({ id: 'e', userId: 'u', computerId: 'c',
     size: 'cmp-4', weight: 2, readyAt: '2026-10-19T11:00:00Z', endedAt: null, endReason: null, overheadSeconds: 100, ...overrides });
 
+function sessions(hours: number, size: 'std-2' | 'cmp-8'): Input['epochs'] {
+    return Array.from({ length: Math.ceil(hours / 6) }, (_, i) => epoch({ id: `session_${i}`, size,
+        weight: size === 'cmp-8' ? 4 : 1, readyAt: new Date(start.getTime() + i * 6 * 3600000).toISOString(),
+        endedAt: new Date(start.getTime() + Math.min(hours, (i + 1) * 6) * 3600000).toISOString(),
+    }));
+}
+
 describe('v3 summary', () => {
+    it.each([[100, 400, 'near'], [125, 500, 'paused']] as const)(
+        '%s hours at cmp-8 uses %s standard-hours and is %s', (hours, standardHours, status) => {
+            const args = input('premium_monthly_v3');
+            args.epochs = sessions(hours, 'cmp-8');
+            expect(usedSecondsInWindow(args.epochs, { start: start.toISOString(), end: end.toISOString() }, now)).toBe(standardHours * 3600);
+            expect(buildSummaryV3(args).fairUse.status).toBe(status);
+        });
+    it('one hour at cmp-8 is four standard-hours and verifies stored weights', () => {
+        const window = { start: start.toISOString(), end: end.toISOString() };
+        expect(usedSecondsInWindow([epoch({ size: 'cmp-8', weight: 4 })], window, now)).toBe(14400);
+        expect(() => usedSecondsInWindow([epoch({ size: 'cmp-8', weight: 2 })], window, now)).toThrow(RangeError);
+    });
+    it('clips usage at the deadline, now, and window end', () => {
+        const e = epoch({ size: 'cmp-8', weight: 4, endedAt: '2026-10-19T15:00:00Z', deadlineAt: '2026-10-19T11:30:00Z' });
+        const window = { start: start.toISOString(), end: end.toISOString() };
+        expect(usedSecondsInWindow([e], window, now)).toBe(7200);
+        expect(usedSecondsInWindow([{ ...e, deadlineAt: null }], window, now)).toBe(14400);
+        expect(usedSecondsInWindow([e], { ...window, end: '2026-10-19T11:15:00Z' }, now)).toBe(3600);
+    });
+    it('bounds the active deadline by the running weight, even after a preference change', () => {
+        const args = input('premium_monthly_v3');
+        args.sizePreference = 'std-2';
+        args.epochs = [epoch({ size: 'cmp-8', weight: 4 })];
+        args.grants = [{ ...args.grants[0]!, amount: BigInt(14400 + 241) }];
+        expect(buildSummaryV3(args).computer.activeDeadline).toBe('2026-10-19T12:01:00Z');
+    });
+    it.each([['std-2', 2, 8], ['cmp-4', 4, 16], ['cmp-8', 8, 32]] as const)(
+        'reports selected Premium %s and all choices', (size, vcpu, memoryGiB) => {
+            const args = input('premium_monthly_v3'); args.sizePreference = size;
+            expect(buildSummaryV3(args).computer).toMatchObject({ size, vcpu, memoryGiB,
+                machineChoice: [{ size: 'std-2', weight: 1 }, { size: 'cmp-4', weight: 2 }, { size: 'cmp-8', weight: 4 }] });
+            args.subs[0]!.sku = 'standard_monthly_v3';
+            expect(buildSummaryV3(args).computer).toMatchObject({ size: 'std-2', vcpu: 2, memoryGiB: 8 });
+        });
+    it('defaults Premium to std-2 and rejects an incompatible stored preference', () => {
+        const args = input('premium_monthly_v3');
+        expect(buildSummaryV3(args).computer.size).toBe('std-2');
+        args.sizePreference = 'free-cf';
+        expect(buildSummaryV3(args).computer.size).toBe('std-2');
+        args.subs = []; args.sizePreference = 'cmp-8';
+        expect(buildSummaryV3(args).computer.size).toBe('free-cf');
+    });
+
     it('Free wire shape has one fair-use status and no usage meters', () => {
         const summary = buildSummaryV3(input());
         expect(summary).toMatchObject({ enabled: true, version: 3, plan: { sku: 'free_v3', name: 'Free', status: 'free', renewal: null },
@@ -34,15 +84,15 @@ describe('v3 summary', () => {
         const args = input('standard_monthly_v3'); args.subs[0]!.cancelAtPeriodEnd = true;
         expect(buildSummaryV3(args).plan).toMatchObject({ status: 'cancels', renewal: null, cancelsAt: '2026-11-10T00:00:00Z' });
     });
-    it('counts actual running time across sizes, clips the window, and excludes overhead', () => {
+    it('counts weighted running time across sizes, clips the window, and excludes overhead', () => {
         expect(usedSecondsInWindow([epoch({ readyAt: '2026-10-09T23:00:00Z', endedAt: '2026-10-10T01:00:00Z' }), epoch()],
-            { start: start.toISOString(), end: end.toISOString() }, now)).toBe(7200);
-        const args = input('premium_monthly_v3'); args.epochs = [epoch()];
-        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: 21600, opening: 'fastest', activeDeadline: '2026-10-19T17:00:00Z' });
+            { start: start.toISOString(), end: end.toISOString() }, now)).toBe(14400);
+        const args = input('premium_monthly_v3'); args.epochs = [epoch()]; args.sizePreference = 'cmp-4';
+        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: 21600, opening: 'standard', activeDeadline: '2026-10-19T17:00:00Z' });
     });
     it.each([[0.8, 'near'], [1, 'paused']] as const)('reports %s usage as %s', (ratio, status) => {
         const args = input('standard_monthly_v3');
-        args.epochs = [epoch({ readyAt: start.toISOString(), endedAt: new Date(start.getTime() + 40 * 3600 * ratio * 1000).toISOString() })];
+        args.epochs = sessions(40 * ratio, 'std-2');
         expect(buildSummaryV3(args).fairUse.status).toBe(status);
     });
     it('ignores grants for other subscriptions and stops after a refund reversal', () => {
