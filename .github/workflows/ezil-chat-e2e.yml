@@ -1,6 +1,8 @@
-# EZiL Chat image e2e against an already-built desktop digest, without a deploy.
-# image.yml runs the same suite on every new image; this workflow lets a change to
-# the e2e itself be proven on a PR (or by hand) against a published digest.
+# EZiL Chat image e2e on a PR, without publishing or deploying anything.
+# On a PR it builds the desktop image from the PR's own sources on top of the
+# published neko overlay (as build-images.sh does) and tests that local image;
+# by hand it can instead test any published desktop reference.
+# image.yml runs the same suite on every release image.
 name: EZiL Chat e2e
 
 on:
@@ -8,10 +10,15 @@ on:
     paths:
       - 'e2e/copilot-ezil*'
       - '.github/workflows/ezil-chat-e2e.yml'
+      - 'worker/Dockerfile'
+      - 'worker/copilot-chat/**'
+      - 'worker/ezil-models/**'
+      - 'worker/scripts/editor-state.sh'
+      - 'worker/scripts/start-neko.sh'
   workflow_dispatch:
     inputs:
       image:
-        description: 'Desktop image reference (digest preferred)'
+        description: 'Published desktop image to test instead of building (digest preferred)'
         required: false
         type: string
 
@@ -24,15 +31,12 @@ concurrency:
 
 jobs:
   e2e:
-    name: EZiL Chat e2e (published digest)
+    name: EZiL Chat e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: read
-    env:
-      # The preview image that first carried EZiL Chat (#222/#223, run 39489076217).
-      DEFAULT_IMAGE: ghcr.io/ezilhq/ezil-os-desktop@sha256:b82a27e9552fac2168af87e778ac240ab2460fe78daaed1ae08b7e959cfa1385
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,13 +47,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Pull the desktop image
+      - name: Make room for the desktop build
+        if: inputs.image == ''
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+      - name: Build the desktop image from this PR (not pushed)
+        if: inputs.image == ''
+        env:
+          EZIL_DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          GITHUB_OUTPUT=/dev/null node .github/scripts/image-plan.mjs
+          overlay="$(jq -r .overlay image-plan.json)"
+          docker pull "$overlay"
+          docker build --build-arg "NEKO_IMAGE=$overlay" -t ezil-os-desktop:ezil-chat-e2e -f worker/Dockerfile worker
+          echo "EZIL_E2E_IMAGE=ezil-os-desktop:ezil-chat-e2e" >> "$GITHUB_ENV"
+      - name: Pull the requested published image
+        if: inputs.image != ''
         env:
           INPUT_IMAGE: ${{ inputs.image }}
         run: |
-          image="${INPUT_IMAGE:-$DEFAULT_IMAGE}"
-          docker pull "$image"
-          echo "EZIL_E2E_IMAGE=$image" >> "$GITHUB_ENV"
+          docker pull "$INPUT_IMAGE"
+          echo "EZIL_E2E_IMAGE=$INPUT_IMAGE" >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-playwright
       - name: EZiL Chat image e2e
         env:

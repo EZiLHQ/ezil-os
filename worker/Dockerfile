@@ -272,6 +272,9 @@ COPY copilot-chat/PATCHES.md /usr/local/lib/ezil/PATCHES.md
 RUN chmod 0755 /usr/local/lib/ezil/patch-copilot-chat.sh \
   && /usr/local/lib/ezil/patch-copilot-chat.sh /usr/lib/code-server/lib/vscode \
   && /usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode
+# telemetry.telemetryLevel is application-scoped, so the Machine settings seed cannot turn
+# extension telemetry off in the web workbench; the product switch does, for every user.
+RUN node -e "const f='/usr/lib/code-server/lib/vscode/product.json',fs=require('fs'),j=JSON.parse(fs.readFileSync(f,'utf8'));if(j.enableTelemetry!==true)throw new Error('expected enableTelemetry true in the pinned product.json');j.enableTelemetry=false;fs.writeFileSync(f,JSON.stringify(j,null,'\\t'));if(JSON.parse(fs.readFileSync(f,'utf8')).enableTelemetry!==false||!j.defaultChatAgent)throw new Error('product.json telemetry switch failed')"
 ENV APPLICATION_INSIGHTS_NO_STATSBEAT=true
 
 # Built-in vendor ezil survives ephemeral user extension directories. The VSIX

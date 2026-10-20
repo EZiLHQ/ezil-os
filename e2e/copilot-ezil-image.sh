@@ -192,7 +192,7 @@ echo '[{"name":"Someone else","vendor":"openai","apiKey":"${input:chat.lm.secret
 boot "$ST2"
 container_checks "$OUT/returning-container-checks.txt" || fail=1
 inx 'cmp /home/neko/project/.ezil/settings.json /tmp/code-server-data/User/settings.json' || fail=1
-inx 'grep -q "\"vendor\": \"openai\"" /tmp/code-server-data/User/chatLanguageModels.json' && echo "PASS  pre-existing BYOK group survived the merge" || { echo "FAIL  pre-existing BYOK group was clobbered"; fail=1; }
+inx 'grep -Eq "\"vendor\": ?\"openai\"" /tmp/code-server-data/User/chatLanguageModels.json' && echo "PASS  pre-existing BYOK group survived the merge" || { echo "FAIL  pre-existing BYOK group was clobbered"; fail=1; }
 start_mock || fail=1
 run_browser "$OUT/returning" || fail=1
 collect_logs returning
