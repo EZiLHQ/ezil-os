@@ -37,8 +37,10 @@ import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
 import { syncAiCredential } from '@/server/lib/ai-credential';
-import { createClient } from '@/utils/supabase/server';
 import { stampOpened } from './computer-store';
+
+/** Loaded on use: the Supabase server module validates the server env at import time. */
+const supabaseServerClient = async () => (await import('@/utils/supabase/server')).createClient();
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
     composeAppPreviewBootstrapUrl,
@@ -212,7 +214,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             await syncAiCredential({
                 config, hmacSecret,
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
-                userId: ctx.user.id, headers: ctx.headers, supabase: createClient,
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
@@ -639,7 +641,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             await syncAiCredential({
                 config, hmacSecret,
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
-                userId: ctx.user.id, headers: ctx.headers, supabase: createClient,
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
@@ -1217,7 +1219,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 await syncAiCredential({
                     config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
                     sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
-                    userId: ctx.user.id, headers: ctx.headers, supabase: createClient,
+                    userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
                 });
             }
             const result = await routed.provider.activity({ correlationId }, computer, {

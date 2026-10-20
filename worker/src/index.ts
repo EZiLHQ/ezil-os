@@ -3233,8 +3233,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // does because the absence of a reschedule (below) is the only thing
         // marking this loop retired.
         try {
-          await this.dropAiCredential();
-          await this.ctx.storage.delete(AI_PROXY_NONCE_STORAGE_KEY);
+          await this.forgetAiCredentialBestEffort('idle_stop');
           await this.withRuntimeTransition(() => this.stop());
         } catch (err) {
           console.error(
@@ -3584,6 +3583,20 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
   }
 
+  /**
+   * Stop and teardown forget the AI credential and proxy nonce, but cleanup
+   * must never be the reason a computer keeps running: a storage failure is
+   * logged and the stop goes ahead. The next launch rotates the nonce anyway.
+   */
+  private async forgetAiCredentialBestEffort(phase: 'idle_stop' | 'teardown'): Promise<void> {
+    try {
+      await this.dropAiCredential();
+      await this.ctx.storage.delete(AI_PROXY_NONCE_STORAGE_KEY);
+    } catch {
+      console.error(`[ezil-ai] phase=${phase} event=credential_forget_failed`);
+    }
+  }
+
   /** True when a container is actually alive under this DO right now. */
   private containerIsRunning(): boolean {
     return this.ctx.container?.running === true;
@@ -3784,8 +3797,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     await this.cancelWorkspaceFlushLoop();
-    await this.dropAiCredential();
-    await this.ctx.storage.delete(AI_PROXY_NONCE_STORAGE_KEY);
+    await this.forgetAiCredentialBestEffort('teardown');
 
     let destroyError: string | undefined;
     try {
