@@ -1,116 +1,5 @@
-# CI — the checks that must pass before anything ships.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# WHAT THIS RUNS, AND WHAT IT DELIBERATELY DOES NOT
-# ─────────────────────────────────────────────────────────────────────────────
-# `worker`, `app`, `connectors` (sdk + mcp) and `shell` each run on a THREE-OS
-# matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`, `fail-fast: false`
-# so one OS's failure does not hide the other two's results) — every `run:`
-# step in those four jobs sets `shell: bash` explicitly, because the default
-# shell on a Windows runner is PowerShell, not bash. A matrix job's check-run
-# name is `<name> (<matrix.os value>)` — e.g. `worker (typecheck + unit)
-# (windows-latest)` — so a required-status list naming the base job names
-# alone will not match; it has to name (or wildcard) the OS suffix too.
-#
-# It also runs three ubuntu-only jobs: `tools` (typecheck + unit — the one
-# package with neither a `strategy.matrix` need nor a Windows-portability
-# question), and two that pull the REAL published desktop image and run
-# against it instead of silently skipping:
-#
-#   `container` — logs in to GHCR with this workflow's own token, pulls
-#   `ghcr.io/ezilhq/ezil-os-desktop:latest` (rows T3/T7 publish it; see
-#   "WHICH TAG, AND WHY" below), tags it locally as `ezil-integrated:local`
-#   and exports `EZIL_VALIDATE_IMAGE`/`EZIL_NEKO_IMAGE` so it resolves for
-#   `worker/src/browser-sidecar.container.test.ts`,
-#   `worker/src/neko-browser-window.container.test.ts` and
-#   `worker/scripts/mobile-keyboard.container.test.ts` (both env spellings —
-#   that file's own header explains why it reads two names), then runs
-#   exactly those three suites and hard-fails on ANY skip, not just a
-#   failure: a skip here means the image gate above did not see the pulled
-#   image, which is a finding about this job, never a pass.
-#
-#   `local` — installs and typechecks `local/` for real, and pulls the
-#   PINNED reference it reads out of `deploy/images.env`
-#   (`ghcr.io/ezilhq/ezil-os-desktop:$EZIL_DESKTOP_TAG`), not `latest` and not
-#   a re-tag of one — see that job's own comment for why the pin is the only
-#   thing that proves anything here. It runs
-#   `bun run doctor` (`working-directory: local`) as an independent health
-#   check, then
-#   `bun test local/` and inspects the result: `bun test` itself exits 0 when
-#   tests are SKIPPED, not just when they pass, so a job that only checked the
-#   exit code would go green while `local/src/host/docker-host.container.test.ts`
-#   and `local/tests/local-smoke.container.test.ts` — the suites that boot a
-#   real desktop in a real browser — never ran. This job parses bun's own
-#   pass/skip/fail counts and fails outright if anything was skipped, then
-#   proves teardown by failing if any `ezil-os-*` container is still running.
-#
-# ── WHICH TAG, AND WHY: `latest`, NOT `<sha8>` ──────────────────────────────
-# `.github/workflows/image.yml` and this workflow trigger off the SAME push
-# and run CONCURRENTLY — there is no `needs:`/`workflow_run` between them (see
-# each file's own `on:` block) — so the commit's own `<sha8>` tag may not
-# exist in GHCR yet by the time this job's pull runs; pinning to `<sha8>`
-# would make this job red on a timing coincidence, not a real defect.
-# `latest` (moved to the last successful push to `main` by image.yml's
-# `desktop` job — see `deploy/images.env`'s own tag-scheme comment) is always
-# resolvable once image.yml has run at least once, on every trigger this
-# workflow has (`push` to `main` AND `pull_request`, since image.yml never
-# runs on a PR — see its own `on:` block). The pulled digest is printed so the
-# log names exactly which build was tested; a PR is therefore tested against
-# the last GOOD build of `main`, not against its own untested changes to
-# `worker/Dockerfile` or `docker/neko/**` — a real gap, called out again in
-# the `container` job's own comment.
-#
-# ── HAND-OFFS FOR THE SUPERVISOR, NOT FIXED IN THIS FILE ───────────────────
-#
-#   FORK PRs CANNOT PULL THE PRIVATE PACKAGE. `pull_request` runs this
-#   workflow with a read-only, fork-scoped `GITHUB_TOKEN` for a fork's PR —
-#   that token cannot pull a private `ezilhq/ezil-os-desktop`, so both
-#   `container` ("Pull the desktop image") and `local` ("Pull the pinned
-#   desktop image") fail at their pull step on every external contribution,
-#   regardless of anything the contributor wrote. A contributor who wants to
-#   run `local/` on their own machine sets `EZIL_LAUNCHER_IMAGE=<image:tag>`
-#   (`local/src/container/run-spec.ts`'s `DESKTOP_IMAGE_OVERRIDE_ENV`, the
-#   same variable `deploy/launcher/ezil-os.sh` reads) against an image they
-#   built themselves; CI deliberately does not, because this job's job is to
-#   prove the PIN resolves. Row G4's required-status list must NOT add "container (real
-#   image)" or "local (typecheck + unit + smoke)" until the package is made
-#   Public (already tracked as a founder step, docs/ORCHESTRATION-LOG.md
-#   2026-09-04 14:50Z) — otherwise no fork PR could ever merge.
-#
-#   MERGE ORDER WITH ROW M1. `worker/scripts/mobile-keyboard.container.test.ts`
-#   is being rewritten on `task/M1` (not yet merged) and, per that file's own
-#   `main`-branch version today, is diagnosed-broken independent of the
-#   image (row M1's hypothesis (b): a bare `require('playwright')` that
-#   cannot resolve it even with `PLAYWRIGHT_REQUIRE_DIR` set — measured on
-#   this box: still 0 pass / 8 fail with the variable exported). So this
-#   row's own PR will show `container (real image)` RED until M1 lands —
-#   expected, and it does not block THIS PR's merge, because neither new
-#   display name is in ruleset 22265548 yet. The supervisor should add both
-#   exact strings to the ruleset only after the first GREEN `container` run
-#   that comes AFTER row M1 merges, not after this row's own PR.
-#
-# What NONE of the above runs:
-#
-#   * the CONTAINER tests (`*.container.test.ts`) inside `worker`'s own matrix
-#     job. They boot the real neko image with Docker, which only the ubuntu
-#     leg even has a daemon for (GitHub's macOS runners have no Docker daemon
-#     and Windows runners cannot run a Linux container), and every one still
-#     gates on `docker image inspect` and SKIPS rather than fails there —
-#     that job never pulls an image (this row's jobs do, below) — which is
-#     exactly why the `container` job exists to make those same three suites
-#     run for real, and why `local`'s job makes its own skip loud too. A
-#     skipped test that looks like a pass is how a suite stops meaning
-#     anything.
-#
-#   * the PRODUCTION suites (`e2e/prod-*.mjs`). They sign in to the live
-#     deployment with real credentials and drive a real container. They belong
-#     to a deploy, not to a pull request, and they live in `deploy.yml`.
-#
-# 🔴 The bundle check is not decoration. `app/public/os/bundle.min.js` is
-# COMMITTED, and a source change without a rebuild ships the old behaviour while
-# every local test passes against the new source. That has happened here. (On
-# the Windows leg specifically, this check is SKIPPED for a measured,
-# unrelated reason — see the step's own comment below, not this one.)
+# CI: Ubuntu checks for the web app, Worker, SDK and cloud images.
+# Deployment and live acceptance run on preview/main pushes in preview.yml.
 name: CI
 
 on:
@@ -134,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -153,53 +42,12 @@ jobs:
         working-directory: worker
         run: bun run typecheck
       - name: Unit tests
-        # Runs on all three OSes as of row M4. PR #14's eighth run had 227 macOS
-        # failures and this step was gated to Linux while they were understood.
-        # They were two things, both now fixed or gated with a MEASURED cause:
-        #   * 205 were one missing line. `index.test.ts` loaded `./index` without
-        #     registering the workerd-only `cloudflare:workers` specifier, which
-        #     bun resolves on NO platform; it passed only when the filesystem's
-        #     directory order happened to put a file that DID register it first.
-        #     On APFS it went first instead, and bun then served that same
-        #     rejection to the four files that were correct. A source pin in
-        #     `index.test.ts` now refuses any `./index` loader without a stub.
-        #   * 22 were suites executing the container's Ubuntu boot scripts, or
-        #     GNU-coreutils commands, against a BSD userland. Row M3 gated most;
-        #     row M4 gated the last three (BSD `wc -c` space-pads its count, so
-        #     the tail's `bytes=` meta line does not parse — measured with a stub
-        #     on Linux, 10 pass / 3 fail, the same three names as the macOS leg).
-        # Windows additionally needed CRLF: `.gitattributes` says `* text=auto`, so
-        # a Windows checkout writes `.ts` with CRLF and the multi-line source-text
-        # regexes in `index.test.ts` (8 failures, PR #14 run 44) and
-        # `workspace-idle.test.ts` (2, found by converting the package and running
-        # it) stopped matching. Both files now normalise line endings on read.
         shell: bash
         working-directory: worker
-        # Container tests skip themselves when Docker has no image (or, on
-        # macOS/Windows, no daemon at all); everything else must pass. This
-        # includes `shell-scripts-parse.test.ts`, which runs `bash -n` on
-        # every shipped `.sh` — on the Windows leg that resolves `bash` from
-        # Git for Windows, which every GitHub-hosted Windows runner ships.
-        #
-        # `--reporter=junit`: bun's default console reporter, MEASURED,
-        # prints per-test names for FAILURES only — a fully passing run
-        # prints just the ` N pass / N fail` summary, never the individual
-        # test names. That is true on every OS, but it means this row's own
-        # verify_cmd ("Windows leg log shows bash -n file list") would be
-        # unsatisfiable from `bun test` alone even on a green run. The JUnit
-        # XML lists every test regardless of outcome; exit code is unchanged
-        # by adding a second reporter (measured: still 0 on pass, nonzero on
-        # any failure).
+        # Container coverage runs separately against a published image.
         run: bun test --reporter=junit --reporter-outfile=worker-junit.xml
-      # Prints exactly the evidence this row's verify_cmd asks for, without
-      # dumping the full (much larger) JUnit report into the log.
       - name: Show the bash -n file list (verify_cmd evidence)
-        # Runs on all three OSes as of row M4, same as the step above.
         shell: bash
-        # Same working directory as the step that wrote it: the report path is
-        # relative, because `/tmp` is not a location bun (a native Windows binary,
-        # resolving it against the current drive) and Git Bash (MSYS, mapping it
-        # into the user's temp) agree on.
         working-directory: worker
         run: |
           echo "bash -n was run, this leg (${{ runner.os }}), against:"
@@ -213,7 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -233,10 +81,6 @@ jobs:
       - name: Typecheck
         shell: bash
         working-directory: app
-        # `bun run`, not `npx`: on the Windows runner npx does not resolve the
-        # bun-created node_modules/.bin shim and quietly installs an unrelated
-        # npm package named `tsc` instead (PR #14, fifth run). bun resolves its
-        # own shims on every OS.
         run: bun run typecheck
       # `app/eslint.config.mjs` has existed and been configured all along; it
       # was simply never run by anything. A configured linter nobody runs is a
@@ -255,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -301,7 +145,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -311,36 +155,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
-      # 🔴 The committed bundle must match its sources. Without this a source
-      # change without a rebuild ships the OLD behaviour while every other check
-      # passes against the NEW source.
-      #
-      # 🔴 WINDOWS-ONLY EXCLUSION — MEASURED, NOT ASSUMED, AND NOT THIS ROW'S
-      # FILE TO FIX. `.gitattributes` (owned by row T0) pins `*.sh`, `*.bash`,
-      # `*.mjs`, `*.ps1` and the three committed `app/public/os/*` bundle
-      # files to a fixed line ending, but NOT `shell/src/**/*.css`,
-      # `shell/src/icons/*.svg`, or `shell/ezil/**/*.js` (non-`.mjs`) — the
-      # SOURCES this script reads to rebuild the bundle for comparison.
-      # Measured on this repo at commit b4c0c98, with `core.autocrlf=true`
-      # (Git for Windows' documented default — the exact fact
-      # `.gitattributes`'s own header cites for why `*.sh` needed pinning):
-      # those source files check out CRLF, and rebuilding from them produces a
-      # `bundle.min.css` and `icons.js` that byte-differ from the LF-built
-      # committed copy (`diff -r` exits 1 on `bundle.min.css` and `icons.js`;
-      # `bundle.min.js` happens not to differ). That is a false failure of
-      # this DRIFT GUARD, not evidence of real drift — the three committed
-      # bundle files are `-text` in `.gitattributes` and are therefore
-      # byte-identical on every OS's checkout, so the suites below still test
-      # the real, unmodified bundle on Windows; only this rebuild-and-compare
-      # step is unreliable there. The guard still runs on the other two OSes,
-      # so staleness is still caught elsewhere in the matrix.
-      #
-      # HAND-OFF (not this row's `owns_files`): extend `.gitattributes` to pin
-      # `shell/src/**/*.css`, `shell/src/icons/*.svg` and `shell/ezil/**/*.js`
-      # (excluding `*.mjs`, already pinned) to `eol=lf` the same way `*.sh` is
-      # pinned, then drop this `if:`.
+      # The committed bundle must match the source shipped by the app.
       - name: Committed bundle matches source
-        if: runner.os != 'Windows'
         shell: bash
         run: bash shell/build-shell.sh --check
       # 🔴 `shell/` HAS dependencies, and this job never installed them. Five of
@@ -353,9 +169,6 @@ jobs:
         shell: bash
         working-directory: shell
         run: bun install --frozen-lockfile
-      # See .github/actions/setup-playwright/action.yml for why this is a
-      # composite action rather than an inline `/opt/ezil-testkit` install:
-      # `/opt` does not exist on the Windows or macOS runner images.
       - name: Setup Playwright
         uses: ./.github/actions/setup-playwright
         with:
@@ -384,16 +197,7 @@ jobs:
           done
       # PLAYWRIGHT_REQUIRE_DIR is exported to $GITHUB_ENV by the Setup
       # Playwright step above — no env: block needed here.
-      # Two families. The PORTABLE suites assert behaviour (focus, stacking,
-      # paint order, a mobile keyboard) and run on every OS. The GEOMETRY suites
-      # assert pixel deltas and settle times of a real Chromium and were designed
-      # and measured on Linux; on macOS Chromium the same shell settles at 1919px
-      # instead of 1920 and a minimise/restore cycle differs by 5-6px (PR #14,
-      # fourth run) — rendering-platform noise, not a product defect, and a
-      # threshold tuned per OS would measure nothing. They run on the Linux leg
-      # only, by a STEP-level condition (a job-level `if:` would drop the check
-      # run the ruleset requires). A geometry claim that must hold on macOS or
-      # Windows belongs in a suite written and measured there.
+      # Keep both local browser-suite families covered on Ubuntu.
       - name: Shell real-browser suites (portable)
         shell: bash
         run: |
@@ -821,50 +625,6 @@ jobs:
             exit 1
           fi
 
-  macos-native:
-    name: native Mac host (unit + sandbox smoke)
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24.15.0'
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.3.14'
-      - run: npm install --global npm@11.12.1 --no-audit --no-fund
-      - run: npm --prefix macos-electron ci --no-audit --no-fund
-      - name: Native helper and VS Code connector
-        run: |
-          bun install --cwd native --frozen-lockfile --ignore-scripts
-          bun run --cwd native typecheck
-          bun test native/tests
-          bun install --cwd extensions/ezil-vscode --frozen-lockfile --ignore-scripts
-          bun run --cwd extensions/ezil-vscode typecheck
-          bun test extensions/ezil-vscode/tests
-          bun run --cwd extensions/ezil-vscode build
-          git diff --exit-code -- extensions/ezil-vscode/dist/extension.js
-      - run: npm --prefix macos-electron run check
-      - run: npm --prefix macos-electron test
-      - name: Electron Linux sandbox smoke
-        if: runner.os == 'Linux'
-        run: |
-          sudo chown root:root macos-electron/node_modules/electron/dist/chrome-sandbox
-          sudo chmod 4755 macos-electron/node_modules/electron/dist/chrome-sandbox
-          xvfb-run -a npm --prefix macos-electron run test:electron
-      - name: Electron macOS GUI and legacy migration compatibility
-        if: runner.os == 'macOS'
-        run: |
-          test "$(uname -m)" = arm64
-          sw_vers
-          xcodebuild -version
-          npm --prefix macos-electron run test:electron
-          bash macos/test.sh
-
   cloud-release-contract:
     name: OS cloud release contracts
     runs-on: ubuntu-24.04
@@ -873,7 +633,7 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - name: Cloud identity, admission and rollback tests
-        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs
+        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/live-check.test.mjs
       - name: Validate production migration manifest and lease
         run: |
           node .github/scripts/production-migrations.mjs validate
@@ -893,4 +653,4 @@ jobs:
         run: |
           curl --fail --silent --show-error --location https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= .github/workflows/preview.yml .github/workflows/image.yml .github/workflows/deploy.yml .github/workflows/deploy-app.yml
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= .github/workflows/ci.yml .github/workflows/preview.yml .github/workflows/image.yml .github/workflows/deploy.yml .github/workflows/deploy-app.yml

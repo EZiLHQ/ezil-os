@@ -109,6 +109,62 @@ export async function pullCloudflareImage(image, env, fetchImpl = fetch, exec = 
   } catch { throw new Error('Cannot pull the deployed Cloudflare image for layer verification'); }
   finally { fs.rmSync(config,{recursive:true,force:true}); }
 }
+async function readContainer(env, suffix, fetchImpl) {
+  assert.match(env.CLOUDFLARE_ACCOUNT_ID ?? '', /^[a-f0-9]{32}$/);
+  assert.ok(env.CLOUDFLARE_API_TOKEN, 'Missing Cloudflare credentials');
+  const response = await fetchImpl(`https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/containers/applications${suffix}`, {
+    headers:{authorization:`Bearer ${env.CLOUDFLARE_API_TOKEN}`}, redirect:'error', signal:AbortSignal.timeout(15000),
+  });
+  assert.ok(response.ok, `Container identity HTTP ${response.status}`);
+  const body = await response.json();
+  assert.notEqual(body.success, false, 'Container identity lookup failed');
+  return body.result ?? body;
+}
+export async function captureContainerVersion(env, fetchImpl = fetch) {
+  assert.ok(['ezil-os-worker', 'ezil-os-worker-staging'].includes(env.EZIL_WORKER_NAME), 'Unexpected container application');
+  const apps = await readContainer(env, '', fetchImpl);
+  assert.ok(Array.isArray(apps), 'Container applications unavailable');
+  const app = apps.find(a => a.name === `${env.EZIL_WORKER_NAME}-sandbox`);
+  assert.ok(app?.id && Number.isSafeInteger(app.version) && app.version >= 0, 'Pre-deploy container identity missing');
+  return {id:app.id, version:app.version};
+}
+// Wrangler wraps the tested GHCR image in a separate Cloudflare manifest.
+// Bind that manifest to the tested digest before handing it to the rollout waiter.
+export async function candidateRolloutDigest(images, env, {
+  fetchImpl = fetch, exec = execFileSync, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+} = {}) {
+  assert.equal(images.tested, true);
+  assert.equal(images.source, env.EZIL_DEPLOY_SHA);
+  assert.match(images.source ?? '', /^[a-f0-9]{40}$/);
+  assert.match(images.desktop_digest ?? '', /^sha256:[a-f0-9]{64}$/);
+  assert.match(env.EZIL_PREVIOUS_CONTAINER_VERSION ?? '', /^\d+$/);
+  const previous = Number(env.EZIL_PREVIOUS_CONTAINER_VERSION);
+  assert.ok(Number.isSafeInteger(previous) && env.EZIL_CONTAINER_APPLICATION_ID);
+  const captured = await captureContainerVersion(env, fetchImpl);
+  assert.equal(captured.id, env.EZIL_CONTAINER_APPLICATION_ID, 'Container application replaced since capture');
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const rollouts = await readContainer(env, `/${encodeURIComponent(captured.id)}/rollouts?limit=10`, fetchImpl);
+    assert.ok(Array.isArray(rollouts), 'Container rollout evidence missing');
+    const latest = [...rollouts].sort((a,b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+    if (!latest || (Number.isInteger(latest.target_version) && latest.target_version <= previous)) {
+      await sleep(5000);
+      continue;
+    }
+    assert.ok(latest.id && Number.isInteger(latest.target_version) && latest.target_version > previous, 'New container rollout identity missing');
+    const image = latest.target_configuration?.image;
+    assert.ok(typeof image === 'string', 'Candidate container image missing');
+    await pullCloudflareImage(image, env, fetchImpl, exec);
+    const tested = `ghcr.io/ezilhq/ezil-os-desktop@${images.desktop_digest}`;
+    exec('docker', ['pull', tested], {stdio:['ignore','pipe','pipe'], timeout:600000});
+    const inspect = ref => JSON.parse(exec('docker', ['image','inspect',ref], {encoding:'utf8', stdio:['ignore','pipe','pipe']}))[0];
+    const deployed = inspect(image), candidate = inspect(tested);
+    assert.equal(deployed.Config?.Labels?.['org.opencontainers.image.revision'], images.source, 'Candidate container source differs');
+    assert.ok(deployed.RootFS?.Layers?.length && candidate.RootFS?.Layers?.length, 'Candidate image layers missing');
+    assert.deepEqual(deployed.RootFS.Layers, candidate.RootFS.Layers, 'Candidate container differs from tested image digest');
+    return image.match(/@(sha256:[a-f0-9]{64})$/)[1];
+  }
+  throw new Error('No distinct container rollout appeared after deployment');
+}
 export function assertRollbackOwner(previous, state, sha) {
   assert.ok(state.worker_version === previous.worker_version || state.worker_source === sha, 'Another Worker release owns production');
   assert.ok(state.vercel_deployment === previous.vercel_deployment || state.vercel_source === sha, 'Another Vercel release owns production');
@@ -150,7 +206,17 @@ export async function restoreContainer(previous, state, env, fetchImpl = fetch) 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const mode = process.argv[2];
   const env = process.env;
-  if (mode === 'prepare') {
+  if (mode === 'container-version') {
+    const captured = await captureContainerVersion(env);
+    fs.appendFileSync(env.GITHUB_OUTPUT, `version=${captured.version}\nid=${captured.id}\n`);
+  } else if (mode === 'rollout-target') {
+    try {
+      console.log(await candidateRolloutDigest(JSON.parse(fs.readFileSync('tested-images.json', 'utf8')), env));
+    } catch {
+      console.error('FAIL candidate container digest verification');
+      process.exitCode = 1;
+    }
+  } else if (mode === 'prepare') {
     const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
     assert.equal(images.source, env.EZIL_DEPLOY_SHA);
     assert.equal(images.tested, true);

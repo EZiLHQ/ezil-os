@@ -1,70 +1,16 @@
-# All production paths use the current-main CI, staging, image and SQL gates.
+# Retained manual entry point for the pinned environment contract.
 name: Deploy
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 permissions:
   contents: read
-  actions: read
-  pull-requests: read
-  packages: write
-  id-token: write
-  attestations: write
 jobs:
   gated-production:
-    uses: ./.github/workflows/preview.yml
-    with:
-      source: ${{ github.sha }}
-    secrets: inherit
-  release:
-    name: Publish signed native release after cloud verification
-    needs: gated-production
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Use the main-branch deployment flow
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    permissions:
-      contents: write
-      packages: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
+    timeout-minutes: 1
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: os-production-${{ github.sha }}-${{ github.run_attempt }}
-      - name: Verify release evidence and wait for signed installer
+      - name: Explain the release flow
         run: |
-          set -euo pipefail
-          jq -e --arg sha "$GITHUB_SHA" '.source == $sha and .worker_source == $sha and .vercel_source == $sha and .cloudflare_container.ghcr_layers_verified == true' production-release.json >/dev/null
-          version="${GITHUB_REF_NAME#v}"
-          expected="EZiL-OS-${version}-AppleSilicon.dmg"
-          for attempt in {1..180}; do
-            if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq "$expected"; then exit 0; fi
-            sleep 10
-          done
-          echo "::error::Signed native installer did not arrive; leaving release as a draft"
+          echo '::error::This legacy deploy entry point is disabled; push/merge to main runs preview.yml#production. For a manual rerun, dispatch preview.yml on main.'
           exit 1
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Attach semantic image alias to the verified digest
-        run: |
-          set -euo pipefail
-          digest="$(jq -er '.ghcr.desktop_digest | select(test("^sha256:[a-f0-9]{64}$"))' production-release.json)"
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]
-          docker buildx imagetools create --prefer-index=false --tag "ghcr.io/ezilhq/ezil-os-desktop:${GITHUB_REF_NAME#v}" "ghcr.io/ezilhq/ezil-os-desktop@$digest"
-      - name: Publish release with verified cloud identities
-        env:
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          notes="$(mktemp)"
-          gh release view "$GITHUB_REF_NAME" --json body --jq .body > "$notes"
-          {
-            printf '\nVerified production release: %s\n\n' "$RUN_URL"
-            jq -r '"Source: " + .source, "Desktop: ghcr.io/ezilhq/ezil-os-desktop@" + .ghcr.desktop_digest, "Worker version: " + .worker_version, "Vercel deployment: " + .vercel_deployment, "Canonical URL: " + .canonical' production-release.json
-          } >> "$notes"
-          gh release edit "$GITHUB_REF_NAME" --notes-file "$notes" --draft=false
