@@ -281,6 +281,8 @@ try {
   await editAction('Keep');
   check('Keep retains created and edited files on disk', file('hello.txt') === 'hi\n' && file('existing.txt') === 'after\n');
   await page.screenshot({ path: join(OUT, 'kept-edits.png') });
+  const statusText = clean(await page.locator('.part.statusbar').innerText().catch(() => ''));
+  check('status bar offers no Sign In after an agent run', !/sign in/i.test(statusText), statusText.slice(0, 200));
 
   await runCommand('Chat: New Chat');
   await send('EZIL_E2E_UNDO: change existing.txt from after to undo candidate so I can review and undo it.');
