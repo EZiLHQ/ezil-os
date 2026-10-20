@@ -1477,3 +1477,71 @@ describe('scheduled downgrade completion', () => {
         expect(store.planChanges[0]).toEqual(before);
     });
 });
+
+describe('v3 paid invoice grants', () => {
+    function v3Fixture(sku: 'standard_monthly_v3' | 'premium_monthly_v3' = 'standard_monthly_v3') {
+        const f = fixture();
+        f.stripe.subscription.sku = sku;
+        f.stripe.subscription.items = [{ id: 'si_v3', priceId: 'price_v3', lookupKey: `ezil_${sku}` }];
+        f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), lookupKey: `ezil_${sku}` }];
+        return f;
+    }
+    it.each([['standard_monthly_v3', 144000], ['premium_monthly_v3', 288000]] as const)
+    ('%s grants the invoiced period once and reverses it on a refund', async (sku, seconds) => {
+        const { store, stripe, deps } = v3Fixture(sku);
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()]).toEqual([expect.objectContaining({ amount: BigInt(seconds), periodStart, periodEnd,
+            subscriptionId: 'sub_local', meter: 'compute_std_seconds', kind: 'plan_period' })]);
+        stripe.charge.invoiceId = stripe.invoice.id;
+        stripe.charge.refunded = true;
+        const delivery = event('charge.refunded', { id: stripe.charge.id, refunded: true, refunds: { data: [{ id: 're_v3' }] } });
+        expect(await processStripeEvent(delivery, deps)).toBe('applied');
+        expect([...store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
+        expect(store.outbox.size).toBe(0);
+    });
+    it('late Standard invoices retain Standard terms after Premium upgrade', async () => {
+        const { store, stripe, deps } = v3Fixture('premium_monthly_v3');
+        stripe.invoice.lines[0]!.lookupKey = 'ezil_standard_monthly_v3';
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        expect([...store.grants.values()][0]!.amount).toBe(BigInt(144000));
+    });
+    it.each(['open', 'manual', 'foreign', 'ambiguous'] as const)('does not grant %s invoices', async scenario => {
+        const { store, stripe, deps } = v3Fixture();
+        if (scenario === 'open') stripe.invoice.status = 'open';
+        if (scenario === 'manual') stripe.invoice.billingReason = 'manual';
+        if (scenario === 'foreign') stripe.invoice.lines[0]!.subscriptionId = 'sub_foreign';
+        if (scenario === 'ambiguous') stripe.invoice.lines.push({ ...stripe.invoice.lines[0]!, lookupKey: 'ezil_premium_monthly_v3' });
+        expect(await processStripeEvent(paidV2(), deps)).toBe(scenario === 'foreign' ? 'review:no_base_line'
+            : scenario === 'ambiguous' ? 'review:ambiguous_base_line' : 'ignored');
+        expect(store.grants.size).toBe(0);
+    });
+    it('a paid v3 upgrade grants only its prorated delta, and rejects mixed-version credit lines', async () => {
+        const { store, stripe, deps } = v3Fixture('premium_monthly_v3');
+        stripe.invoice.billingReason = 'subscription_update';
+        stripe.invoice.lines = [
+            { ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3', amount: -1000, proration: true, periodStart: now },
+            { ...baseLine('compute_monthly_v2'), lookupKey: 'ezil_premium_monthly_v3', amount: 2000, proration: true, periodStart: now },
+        ];
+        expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
+        const expected = BigInt(144000) * BigInt((periodEnd.getTime() - now.getTime()) / 1000) / BigInt((periodEnd.getTime() - periodStart.getTime()) / 1000);
+        expect([...store.grants.values()][0]).toMatchObject({ kind: 'upgrade_prorated', amount: expected, periodStart, periodEnd });
+        const other = v3Fixture('premium_monthly_v3');
+        other.stripe.invoice.billingReason = 'subscription_update';
+        other.stripe.invoice.lines = stripe.invoice.lines.map(line => ({ ...line }));
+        other.stripe.invoice.lines[0]!.lookupKey = 'ezil_standard_monthly_v2';
+        expect(await processStripeEvent(paidV2(), other.deps)).toBe('ignored');
+        expect(other.store.grants.size).toBe(0);
+    });
+    it('resolves Premium from the line lookup key despite stale Standard checkout metadata', async () => {
+        const f = v3Fixture('premium_monthly_v3');
+        const client = createStripeClient({ secretKey: 'fixture', fetch: vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+            id: 'sub_local', customer: 'cus_local', status: 'active', cancel_at_period_end: false, metadata: { sku: 'standard_monthly_v3' },
+            items: { data: [{ id: 'si_v3', price: { id: 'price_v3', lookup_key: 'ezil_premium_monthly_v3' },
+                current_period_start: periodStart.getTime() / 1000, current_period_end: periodEnd.getTime() / 1000 }] },
+        })) });
+        vi.spyOn(f.stripe, 'retrieveSubscription').mockImplementation(client.retrieveSubscription);
+        expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+        expect(f.store.subscriptions.get('sub_local')?.sku).toBe('premium_monthly_v3');
+    });
+});

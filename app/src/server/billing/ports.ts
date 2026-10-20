@@ -354,10 +354,11 @@ export interface StripeInvoiceSummary {
 export type StripeInvoicePaymentState = 'paid' | 'requires_action' | 'processing' | 'failed' | 'none';
 
 export interface StripeApi {
+    previewRenewal?(subscriptionId: string): Promise<{ at: Date; amountCents: number } | null>;
     resolvePrice(lookupKey: string): Promise<StripePrice>;
-    previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number }): Promise<StripeUpgradePreview>;
-    confirmUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2'; prorationDate: number; now: Date; idempotencyKey: string }): Promise<StripeUpgradeResult>;
-    scheduleDowngrade(input: { subscriptionId: string; toSku: 'standard_monthly_v2'; idempotencyKey: string }): Promise<{ scheduleId: string; effectiveAt: Date }>;
+    previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2' | 'premium_monthly_v3'; prorationDate: number }): Promise<StripeUpgradePreview>;
+    confirmUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2' | 'premium_monthly_v3'; prorationDate: number; now: Date; idempotencyKey: string }): Promise<StripeUpgradeResult>;
+    scheduleDowngrade(input: { subscriptionId: string; toSku: 'standard_monthly_v2' | 'standard_monthly_v3'; idempotencyKey: string }): Promise<{ scheduleId: string; effectiveAt: Date }>;
     cancelScheduledChange(input: { scheduleId: string }): Promise<void>;
     setCancelAtPeriodEnd(input: { subscriptionId: string; cancel: boolean; idempotencyKey: string }): Promise<{ cancelsAt: Date | null }>;
     createCustomer(input: { userId: string; email: string | null; idempotencyKey: string }): Promise<{ id: string }>;

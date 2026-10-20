@@ -40,7 +40,7 @@ The example files in `config/` hold public placeholders only.
 
 | Field | Type | Rule |
 |---|---|---|
-| `stage` | `pilot` \| `production` | |
+| `stage` | shared workload namespace (for example `pilot`, `production`, `mum`) | Must match identity/keys/ops; only `production` enables termination protection. |
 | `region` | string | commercial region, e.g. `ap-south-1` |
 | `zoneIds` | string[1..3] | each matches `^[a-z]{2,4}\d-az\d+$` and belongs to `region` (e.g. `aps1-az1`). One subnet per ZoneId. |
 | `instanceType` | `t3a.medium` \| `t3.medium` \| `m6i.large` \| `c6i.xlarge` \| `m6i.xlarge` \| `m6i.2xlarge` | launch-template default; the workflow sets the per-computer type (and, for T types, the credit option) |

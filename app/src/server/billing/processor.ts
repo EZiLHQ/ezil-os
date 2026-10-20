@@ -6,7 +6,8 @@
 import { findPack, PRO_PLAN } from './catalog';
 import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, UsageEvent } from './ports';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
-import { offerBySku } from './v2/catalog';
+import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
+import { CATALOG_V3 } from './v3/contract';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
 
@@ -47,9 +48,12 @@ function invoiceGrantKind(invoice: StripeInvoice):
     if (PERIOD_GRANT_BILLING_REASONS.some(reason => reason === invoice.billingReason)) return { kind: 'period' };
     if (invoice.billingReason === UPGRADE_GRANT_BILLING_REASON) {
         const ownedLines = invoice.lines.filter(line => line.subscriptionId === invoice.subscriptionId || line.subscriptionId === null);
-        const compute = ownedLines.find(line => line.lookupKey === CATALOG_V2.compute_monthly_v2.stripeLookupKey
+        const compute = ownedLines.find(line => (line.lookupKey === CATALOG_V2.compute_monthly_v2.stripeLookupKey
+            || line.lookupKey === CATALOG_V3.premium_monthly_v3.stripeLookupKey)
             && line.amount > 0 && validPeriod(line.periodStart, line.periodEnd));
-        const credit = ownedLines.find(line => line.lookupKey === CATALOG_V2.standard_monthly_v2.stripeLookupKey);
+        const creditKey = compute?.lookupKey === CATALOG_V3.premium_monthly_v3.stripeLookupKey
+            ? CATALOG_V3.standard_monthly_v3.stripeLookupKey : CATALOG_V2.standard_monthly_v2.stripeLookupKey;
+        const credit = ownedLines.find(line => line.lookupKey === creditKey);
         if (compute && credit) return { kind: 'upgrade', compute };
     }
     return { kind: 'none' };
@@ -113,7 +117,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 } else {
                     // Delayed invoices retain the offer sold for their own period,
                     // even when the subscription has since changed its price.
-                    const bases = Object.values(CATALOG_V2).filter(candidate => candidate.sellable).flatMap(candidate => {
+                    const bases = paidBillingOffers().flatMap(candidate => {
                         const base = invoice.lines.find(line => candidate.stripeLookupKey !== null
                             && line.lookupKey === candidate.stripeLookupKey
                             && (line.subscriptionId === subscription.id || line.subscriptionId === null)
@@ -143,7 +147,9 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 // A late upgrade invoice must not grant against a later renewal.
                 if (Math.floor(periodEnd.getTime() / 1000) !== Math.floor(currentPeriodEnd!.getTime() / 1000)
                     || effectiveAt < periodStart! || effectiveAt >= periodEnd) return 'review:upgrade_period_mismatch';
-                const amount = upgradeGrantStdSeconds({
+                const amount = compute.lookupKey === CATALOG_V3.premium_monthly_v3.stripeLookupKey ? upgradeGrantSeconds({
+                    periodStart: periodStart!.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: effectiveAt.toISOString(),
+                }) : upgradeGrantStdSeconds({
                     fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
                     periodStart: periodStart!.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: effectiveAt.toISOString(),
                 });

@@ -5,14 +5,16 @@ import { checkoutAvailable } from '@/server/billing/config';
 import { getBillingDeps } from '@/server/billing/deps';
 import type { BillingDeps, StripeApi } from '@/server/billing/ports';
 import { BillingProviderError } from '@/server/billing/stripe/client';
-import { planFromSubscriptions } from '@/server/billing/v2/catalog';
+import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
+import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
+import { buildSummaryV3 } from '@/server/billing/v3/summary';
+import type { BillingSummaryV3Result } from '@/server/billing/v3/contract';
 import {
     CATALOG_V2, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
-    type BillingErrorCode, type BillingInvoiceDTO, type BillingSummaryV2Result, type CheckoutStartDTO,
+    type BillingErrorCode, type BillingInvoiceDTO, type CheckoutStartDTO,
     type CheckoutStatusDTO, type ConfirmUpgradeOutput, type PreviewUpgradeOutput, type ScheduleDowngradeOutput,
     type CancelAtPeriodEndOutput, type SetOverageOutput, type SelectSizeOutput,
 } from '@/server/billing/v2/contract';
-import { upgradeGrantStdSeconds } from '@/server/billing/v2/rating';
 import { buildSummaryV2, hasOveragePaymentFailure, summaryMeters } from '@/server/billing/v2/summary';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
@@ -65,7 +67,7 @@ async function currentPlan(deps: BillingDeps, userId: string) {
     return { plan, subs, userCreatedAt, changes: changes.filter(change => change.subscriptionId === plan.subscriptionId) };
 }
 
-function paidSubscription(plan: Awaited<ReturnType<typeof currentPlan>>['plan']): string {
+function paidSubscription(plan: { subscriptionId: string | null; planActive: boolean }): string {
     if (!plan.subscriptionId || !plan.planActive) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
     return plan.subscriptionId;
 }
@@ -79,10 +81,10 @@ async function ownedSubscription(deps: BillingDeps, stripe: StripeApi, userId: s
 }
 
 async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: string, toSku: string) {
-    if (toSku !== 'compute_monthly_v2') throw billingError('unknown_sku', 'BAD_REQUEST');
+    if (toSku !== 'premium_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
     const { plan, changes } = await currentPlan(deps, userId);
     const subscriptionId = paidSubscription(plan);
-    if (plan.sku !== 'standard_monthly_v2' || plan.status !== 'active') {
+    if (plan.sku !== 'standard_monthly_v3' || plan.status !== 'active') {
         throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     }
     if (changes.some(change => change.kind === 'upgrade')) throw billingError('upgrade_pending', 'CONFLICT');
@@ -95,7 +97,7 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 export function createBillingRouter(getDeps: () => BillingDeps) {
     return createTRPCRouter({
-        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV2Result> => {
+        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV3Result> => {
             const deps = getDeps();
             if (!deps.config.tabEnabled) return { enabled: false };
             const now = deps.now();
@@ -116,18 +118,26 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 deps.store.stripeCustomerFor(ctx.user.id),
                 deps.store.overageInvoicesFor(ctx.user.id),
             ]);
-            return buildSummaryV2({
+            let renewal = null;
+            if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
+                try {
+                    await ownedSubscription(deps, deps.stripe, ctx.user.id, plan.subscriptionId);
+                    const next = await deps.stripe.previewRenewal(plan.subscriptionId);
+                    renewal = next ? { at: isoSeconds(epochSeconds(next.at)), amountCents: next.amountCents } : null;
+                } catch {
+                    // Billing remains readable if Stripe cannot preview the next invoice.
+                    console.error('Billing renewal preview unavailable');
+                }
+            }
+            return buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
-                storage, sizePreference, hasCustomer: customer !== null, overageInvoices,
+                storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal,
             });
         }),
 
-        createCheckout: protectedProcedure.input(z.object({ sku: z.string() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
+        createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
-            if (input.sku !== 'standard_monthly_v2' && input.sku !== 'compute_monthly_v2') {
-                throw billingError('unknown_sku', 'BAD_REQUEST');
-            }
             const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.family !== 'free') throw billingError('already_subscribed', 'CONFLICT');
 
@@ -167,20 +177,20 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
         }),
 
         previewUpgrade: protectedProcedure.input(z.object({ toSku: z.string() }))
-            .mutation(async ({ ctx, input }): Promise<PreviewUpgradeOutput> => {
+            .mutation(async ({ ctx, input }): Promise<Omit<PreviewUpgradeOutput, 'toSku'> & { toSku: 'premium_monthly_v3' }> => {
                 const deps = getDeps();
                 const stripe = configuredStripe(deps);
                 const { subscriptionId } = await upgradeContext(deps, stripe, ctx.user.id, input.toSku);
                 const prorationDate = epochSeconds(deps.now());
                 const preview = await stripeCall(() => stripe.previewUpgrade({
-                    subscriptionId, toSku: 'compute_monthly_v2', prorationDate,
+                    subscriptionId, toSku: 'premium_monthly_v3', prorationDate,
                 }), 'upgrade_not_allowed');
                 const periodStart = isoSeconds(epochSeconds(preview.periodStart));
                 const periodEnd = isoSeconds(epochSeconds(preview.periodEnd));
                 return {
-                    toSku: 'compute_monthly_v2', prorationDate, amountDueCents: preview.amountDueCents,
+                    toSku: 'premium_monthly_v3', prorationDate, amountDueCents: preview.amountDueCents,
                     currency: 'usd', lines: preview.lines, periodEnd,
-                    grantStdSeconds: upgradeGrantStdSeconds({ fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
+                    grantStdSeconds: upgradeGrantSeconds({
                         periodStart, periodEnd, effectiveAt: isoSeconds(prorationDate) }),
                 };
             }),
@@ -192,13 +202,13 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 const { subscriptionId } = await upgradeContext(deps, stripe, ctx.user.id, input.toSku);
                 const change = { userId: ctx.user.id, subscriptionId, kind: 'upgrade' as const };
                 const inserted = await deps.store.recordPlanChange({
-                    ...change, fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2', state: 'pending',
+                    ...change, fromSku: 'standard_monthly_v3', toSku: 'premium_monthly_v3', state: 'pending',
                     stripeInvoiceId: null, stripeScheduleId: null, hostedInvoiceUrl: null, effectiveAt: null, expiresAt: null,
                 });
                 if (inserted === 'exists') throw billingError('upgrade_pending', 'CONFLICT');
                 const result = await stripeCall(async () => {
                     try {
-                        return await stripe.confirmUpgrade({ subscriptionId, toSku: 'compute_monthly_v2',
+                        return await stripe.confirmUpgrade({ subscriptionId, toSku: 'premium_monthly_v3',
                             prorationDate: input.prorationDate, now: deps.now(),
                             idempotencyKey: `upgrade:${subscriptionId}:${input.prorationDate}` });
                     } catch (error) {
@@ -218,21 +228,21 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             .mutation(async ({ ctx, input }): Promise<ScheduleDowngradeOutput> => {
                 const deps = getDeps();
                 const stripe = configuredStripe(deps);
-                if (input.toSku !== 'standard_monthly_v2') throw billingError('unknown_sku', 'BAD_REQUEST');
+                if (input.toSku !== 'standard_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
                 const { plan, changes } = await currentPlan(deps, ctx.user.id);
                 const subscriptionId = paidSubscription(plan);
-                if (plan.sku !== 'compute_monthly_v2' || plan.status !== 'active'
+                await ownedSubscription(deps, stripe, ctx.user.id, subscriptionId, 'downgrade_not_allowed');
+                if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active'
                     || changes.some(change => change.kind === 'downgrade')) {
                     throw billingError('downgrade_not_allowed', 'PRECONDITION_FAILED');
                 }
-                await ownedSubscription(deps, stripe, ctx.user.id, subscriptionId, 'downgrade_not_allowed');
                 const result = await stripeCall(() => stripe.scheduleDowngrade({
-                    subscriptionId, toSku: 'standard_monthly_v2',
+                    subscriptionId, toSku: 'standard_monthly_v3',
                     idempotencyKey: `downgrade:${subscriptionId}:${epochSeconds(plan.window.end)}`,
                 }), 'downgrade_not_allowed');
                 await deps.store.recordPlanChange({
-                    userId: ctx.user.id, subscriptionId, kind: 'downgrade', fromSku: 'compute_monthly_v2',
-                    toSku: 'standard_monthly_v2', state: 'scheduled', stripeScheduleId: result.scheduleId,
+                    userId: ctx.user.id, subscriptionId, kind: 'downgrade', fromSku: 'premium_monthly_v3',
+                    toSku: 'standard_monthly_v3', state: 'scheduled', stripeScheduleId: result.scheduleId,
                     effectiveAt: result.effectiveAt, stripeInvoiceId: null, hostedInvoiceUrl: null, expiresAt: null,
                 });
                 return { effectiveAt: isoSeconds(epochSeconds(result.effectiveAt)) };
@@ -263,10 +273,16 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             .mutation(async ({ ctx, input }): Promise<SetOverageOutput> => {
                 const deps = getDeps();
                 configuredStripe(deps);
+                const current = await currentPlan(deps, ctx.user.id);
+                if (current.plan.sku !== 'legacy' && !(current.plan.sku === 'free_v3'
+                    && current.subs.some(sub => sub.sku === 'compute_monthly_v2'))) {
+                    throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+                }
                 if (input.termsVersion !== OVERAGE_TERMS_VERSION) throw billingError('terms_version_mismatch', 'BAD_REQUEST');
                 if (!Number.isInteger(input.capCents) || input.capCents < 0 || input.capCents > OVERAGE_MAX_CAP_CENTS
                     || input.capCents % 100 !== 0) throw billingError('cap_out_of_range', 'BAD_REQUEST');
-                const { plan, subs, userCreatedAt, changes } = await currentPlan(deps, ctx.user.id);
+                const { subs, userCreatedAt, changes } = current;
+                const plan = current.plan.legacy ?? legacyPlanFromSubscriptions({ subs, userCreatedAt, now: deps.now() });
                 // Opt-out depends on ownership, even when the subscription no longer supplies a current plan.
                 const ownedCompute = subs.filter(sub => sub.sku === 'compute_monthly_v2')
                     .sort((a, b) => (b.currentPeriodEnd?.getTime() ?? 0) - (a.currentPeriodEnd?.getTime() ?? 0));
@@ -315,6 +331,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 const deps = getDeps();
                 configuredStripe(deps);
                 const { plan } = await currentPlan(deps, ctx.user.id);
+                if (plan.sku !== 'legacy') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
                 const size = plan.offer.sizes.find(size => size === input.size);
                 if (!size) throw billingError('size_not_allowed', 'BAD_REQUEST');
                 await deps.store.setSizePreference(ctx.user.id, size);

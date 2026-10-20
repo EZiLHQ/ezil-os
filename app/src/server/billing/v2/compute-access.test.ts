@@ -7,7 +7,9 @@ import { freeSkuFor } from './catalog';
 import { CATALOG_V2, SIZES, type ComputeEpoch } from './contract';
 import { billingMeteringActive, billingV2EntitlementReader, loadComputeBillingState, gateComputerStart, openComputeEpochAtReady } from './compute-access';
 import { buildSummaryV2 } from './summary';
+import { buildSummaryV3 } from '../v3/summary';
 import * as rating from './rating';
+import * as admissionV3 from '../v3/admission';
 import { epochSeconds, isoSeconds } from './time';
 import { resolveEntitlement } from '../../lib/compute/tier';
 
@@ -99,13 +101,13 @@ describe('loadComputeBillingState', () => {
         const { deps, input, calls } = fixture({ epochs: [epoch('2026-10-02T00:00:00Z', '2026-10-02T01:00:00Z')] });
         const state = await loadComputeBillingState(deps, USER, NOW);
         expect(state).toMatchObject({
-            planSku: freeSkuFor(null), family: 'free', planActive: true, delinquent: false, paymentIssue: false,
+            planSku: 'free_v3', family: 'free', planActive: true, delinquent: false, paymentIssue: false,
             upgradePending: false, entitledSize: 'free-cf', provider: 'cloudflare', window: MONTH,
-            usedStdSeconds: 14400, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null,
+            usedStdSeconds: 3600, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null,
         });
-        expect(state.summary).toEqual(buildSummaryV2(input));
+        expect(state.summary).toEqual(buildSummaryV3(input));
         expect(calls.map(c => c.name).sort()).toEqual([
-            'epochsFor', 'grantsForPeriod', 'openPaymentIssues', 'openPlanChanges', 'sizePreference', 'subscriptionsFor', 'userCreatedAt',
+            'epochsFor', 'grantsForPeriod', 'openPaymentIssues', 'openPlanChanges', 'subscriptionsFor', 'userCreatedAt',
         ]);
     });
 
@@ -133,17 +135,17 @@ describe('loadComputeBillingState', () => {
             epoch('2026-10-02T00:00:00Z', '2026-10-02T01:00:00Z'), epoch(START, '2026-10-10T01:00:00Z'),
         ] });
         const state = await loadComputeBillingState(deps, USER, NOW);
-        expect(state).toMatchObject({ planSku: freeSkuFor(null), family: 'standard', planActive: false, delinquent: true,
+        expect(state).toMatchObject({ planSku: 'free_v3', family: 'standard', planActive: false, delinquent: true,
             paymentIssue: true, entitledSize: 'free-cf', provider: 'cloudflare', window: MONTH,
-            usedStdSeconds: 28800, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null });
-        expect(state.summary.compute.usedStdSeconds).toBe(14400);
+            usedStdSeconds: 7200, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null });
+        expect(state.summary.version === 2 && state.summary.compute.usedStdSeconds).toBe(14400);
         expect(calls.filter(c => c.name === 'epochsFor').map(c => c.args)).toEqual([[USER, new Date(START)], [USER, new Date(MONTH.start)]]);
     });
 
     it.each(['subscription', 'upgrade'] as const)('an unresolved %s payment issue on an active plan uses Free', async invoiceKind => {
         const { deps } = fixture({ subs: [subscription({ sku: 'compute_monthly_v2' })], grants: [grant()],
             sizePreference: 'cmp-8', paymentIssues: [issue({ invoiceKind })] });
-        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: freeSkuFor(null), planActive: true,
+        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: 'free_v3', planActive: true,
             paymentIssue: true, entitledSize: 'free-cf', provider: 'cloudflare', window: MONTH,
             allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null });
     });
@@ -192,7 +194,7 @@ describe('loadComputeBillingState', () => {
             currentPeriodStart: new Date('2026-09-20T00:00:00Z'), currentPeriodEnd: new Date('2026-10-20T00:00:00Z'),
         })], epochs: [epoch('2026-09-30T23:00:00Z', '2026-10-01T01:00:00Z')] });
         const state = await loadComputeBillingState(deps, USER, NOW);
-        expect(state).toMatchObject({ window: MONTH, usedStdSeconds: 14400, paymentIssue: true });
+        expect(state).toMatchObject({ window: MONTH, usedStdSeconds: 3600, paymentIssue: true });
         expect(calls.filter(c => c.name === 'epochsFor')).toHaveLength(1);
     });
 });
@@ -285,12 +287,12 @@ describe('gateComputerStart', () => {
     });
 
     it('delinquent Cloudflare uses the active Free allowance, including its earlier monthly usage', async () => {
-        const admit = vi.spyOn(rating, 'admitStart');
+        const admit = vi.spyOn(admissionV3, 'admitStart');
         const { deps } = fixture({ config: enforced(), subs: [subscription({ status: 'past_due' })], grants: [grant()],
             epochs: [epoch('2026-10-02T00:00:00Z', '2026-10-02T01:00:00Z')] });
         expect(await gate(deps, { kind: 'cloudflare', instanceType: null })).toEqual({ allowed: true });
-        expect(admit).toHaveBeenLastCalledWith(expect.objectContaining({ planSku: freeSkuFor(null), planActive: true,
-            paymentIssue: false, size: 'free-cf', usedStdSeconds: 14400, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds }));
+        expect(admit).toHaveBeenLastCalledWith(expect.objectContaining({ sku: 'free_v3', planActive: true, legacyFree: true,
+            paymentIssue: false, usedSeconds: 3600 }));
     });
 
     it('a paid user with a pre-existing Cloudflare computer is admitted as std-2', async () => {
@@ -399,5 +401,55 @@ describe('openComputeEpochAtReady', () => {
         deps.store[method] = async () => { throw new Error('unavailable'); };
         expect(await open(deps)).toBe('error');
         expect(warn).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('v3 compute enforcement', () => {
+    it.each([
+        ['standard_monthly_v3', 'std-2', 144000, 7200],
+        ['premium_monthly_v3', 'cmp-4', 288000, 21600],
+    ] as const)('%s uses actual seconds and its session limit', async (sku, size, allowance, maxRunSeconds) => {
+        const { deps, calls } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
+            subs: [subscription({ sku })], grants: [grant({ amount: BigInt(allowance) })],
+            epochs: [epoch(START, '2026-10-10T01:00:00Z')], sizePreference: 'cmp-8' });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: maxRunSeconds,
+            usedStdSeconds: 3600, allowanceStdSeconds: allowance, overage: null });
+        const readyAt = new Date('2026-10-18T13:00:00Z');
+        expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size, readyAt, overheadSeconds: 0 }))
+            .toMatchObject({ status: 'opened', decision: { admit: true, maxRunSeconds },
+                deadlineAt: isoSeconds(epochSeconds(readyAt) + maxRunSeconds) });
+        expect(calls.find(call => call.name === 'epochsFor')?.args).toEqual([USER, new Date(START)]);
+    });
+    it('Free creates a one-hour deadline and refuses the next session with 59 seconds left', async () => {
+        const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }) });
+        expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'free-cf', readyAt: NOW, overheadSeconds: 0 }))
+            .toMatchObject({ decision: { admit: true, maxRunSeconds: 3600 } });
+        input.epochs = [epoch('2026-10-10T00:00:00Z', '2026-10-10T07:59:01Z')];
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW }))
+            .toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+    it('requires a paid-period receipt, and rejects revoked or foreign grants', async () => {
+        const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }), subs: [subscription({ sku: 'standard_monthly_v3' })] });
+        const gate = () => gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW });
+        expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        input.grants = [grant({ amount: BigInt(144000), subscriptionId: 'foreign' })];
+        expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        input.grants = [grant({ amount: BigInt(144000) })];
+        expect(await gate()).toEqual({ allowed: true });
+        input.grants = [...input.grants, grant({ kind: 'revoke', amount: BigInt(-144000) })];
+        expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+    it('retains paid Standard while an upgrade requires payment and blocks a second computer', async () => {
+        const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
+            subs: [subscription({ sku: 'standard_monthly_v3' })], grants: [grant({ amount: BigInt(144000) })],
+            paymentIssues: [issue({ invoiceKind: 'upgrade', issue: 'requires_action' })] });
+        const gate = () => gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW });
+        expect(await gate()).toEqual({ allowed: true });
+        input.epochs = [{ ...epoch('2026-10-18T11:00:00Z', '2026-10-18T12:00:00Z'), endedAt: null }];
+        expect(await gate()).toEqual({ allowed: false, reason: 'concurrent_limit' });
+        input.epochs = [];
+        input.paymentIssues = [issue()];
+        expect(await gate()).toEqual({ allowed: false, reason: 'payment_issue' });
     });
 });

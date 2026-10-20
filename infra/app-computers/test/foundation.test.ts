@@ -6,7 +6,7 @@ import test from 'node:test';
 import { App, assertions } from 'aws-cdk-lib';
 
 import { AppComputerFoundationStack, FoundationConfigSchema, type FoundationConfig } from '../lib/foundation.js';
-import { zoneIdMatchesRegion, zoneIdPrefix } from '../lib/lifecycle/deployment.js';
+import { RESERVED_NAMESPACES, zoneIdMatchesRegion, zoneIdPrefix } from '../lib/lifecycle/deployment.js';
 
 const base: FoundationConfig = { stage: 'pilot', region: 'ap-south-1', zoneIds: ['aps1-az1'], instanceType: 'm6i.large', rootDeviceName: '/dev/sda1', rootVolumeGiB: 30 };
 function template(config: Partial<FoundationConfig> = {}) {
@@ -14,6 +14,15 @@ function template(config: Partial<FoundationConfig> = {}) {
     const stack = new AppComputerFoundationStack(app, 'TestAppComputers', { config: merged, env: { region: merged.region } });
     return assertions.Template.fromStack(stack);
 }
+
+test('foundation stage accepts workload namespaces and rejects invalid or reserved names', () => {
+    for (const stage of ['pilot', 'production', 'mum', 'a', 'mum2', 'a'.repeat(21)]) {
+        assert.equal(FoundationConfigSchema.parse({ ...base, stage }).stage, stage);
+    }
+    for (const stage of ['', 'Mum', '2mum', 'mum-2', 'mum_2', 'mum/2', ' mum', 'mum ', 'a'.repeat(22), ...RESERVED_NAMESPACES, null]) {
+        assert.equal(FoundationConfigSchema.safeParse({ ...base, stage }).success, false, String(stage));
+    }
+});
 
 test('item 1: region and ZoneIds are configuration; ap-south-1 / aps1-az1 synthesizes one subnet pinned by ZoneId', () => {
     const output = template();

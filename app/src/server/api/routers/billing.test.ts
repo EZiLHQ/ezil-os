@@ -6,7 +6,7 @@ import type { BillingDeps, BillingStore, GrantRow, PlanChangeRow, OverageConsent
 import { CATALOG_V2, type BillingErrorCode, OVERAGE_TERMS_VERSION } from '@/server/billing/v2/contract';
 import { BillingProviderError, StripeRequestError } from '@/server/billing/stripe/client';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
-import { upgradeGrantStdSeconds } from '@/server/billing/v2/rating';
+import { upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
@@ -18,7 +18,7 @@ vi.mock('@/server/billing/deps', () => ({
 import { createBillingRouter } from './billing';
 
 const now = new Date('2026-10-11T12:00:00Z');
-const sku = 'standard_monthly_v2';
+const sku = 'standard_monthly_v3';
 const userId = '11111111-1111-4111-8111-111111111111';
 const session: StripeCheckoutSession = {
     id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: userId,
@@ -169,16 +169,15 @@ async function checkoutControl(f = fixture()) {
 }
 
 describe('billing router', () => {
-    it('does no store reads with the tab off and returns v2 legacy Free with epochs when enabled', async () => {
+    it('does no store reads with the tab off and returns v3 legacy Free with epochs when enabled', async () => {
         const f = fixture();
         f.deps.config.tabEnabled = false;
         await expect(f.caller.summary()).resolves.toEqual({ enabled: false });
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
         f.deps.config.tabEnabled = true;
-        await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true, version: 2,
-            plan: { sku: 'free_v1_legacy', family: 'free' },
-            compute: { allowanceStdSeconds: 28800, usedStdSeconds: 60, remainingStdSeconds: 28740 },
-            storage: { usedBytes: '123' }, overage: null });
+        await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true, version: 3,
+            plan: { sku: 'free_v3' }, fairUse: { status: 'ok' },
+            computer: { sessionMaxSeconds: 3600 }, storage: { usedBytes: '123' } });
         expect(f.store.subscriptionsFor).toHaveBeenCalledWith(userId);
         expect(f.store.epochsFor).toHaveBeenCalledWith(userId, new Date('2026-10-01T00:00:00Z'));
         expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
@@ -193,8 +192,7 @@ describe('billing router', () => {
         f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' }),
             subscription({ stripeSubscriptionId: 'sub_old', status: 'canceled', currentPeriodStart: new Date('2026-01-01T00:00:00Z') })]);
         f.store.grantsForPeriod.mockResolvedValue([grant(120000)]);
-        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { family: 'standard' },
-            compute: { allowanceStdSeconds: 120000, usedStdSeconds: 60, remainingStdSeconds: 119940 } });
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'legacy', name: 'Standard (legacy)' }, fairUse: { status: 'ok' } });
         expect(f.store.epochsFor).toHaveBeenCalledWith(userId, new Date('2026-09-20T00:00:00Z'));
         expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
             { start: new Date('2026-09-20T00:00:00Z'), end: new Date('2026-10-20T00:00:00Z') }, ['compute_std_seconds']);
@@ -217,18 +215,15 @@ describe('billing router', () => {
             termsVersion: OVERAGE_TERMS_VERSION, catalogVersion: 2, rateCentsPerStdHour: 25, actor: 'user', acceptedAt: now,
         });
         f.store.sizePreference.mockResolvedValue('cmp-8');
-        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { family: 'compute' },
-            compute: { allowanceStdSeconds: 144, usedStdSeconds: 288, remainingStdSeconds: 0, selectedSize: 'cmp-8' },
-            overage: { enabled: true, capCents: 100, accruedCents: 1 },
-            estimate: { subscriptionCents: 10000, accruedOverageCents: 1, worstCaseOverageCents: 100 } });
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'legacy', name: 'Compute (legacy)' },
+            computer: { vcpu: 8, memoryGiB: 32, sessionMaxSeconds: 21600 }, fairUse: { status: 'paused' } });
     });
 
     it('loads both compute and legacy workspace grants for Pro', async () => {
         const f = fixture();
         f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'pro_monthly_v1' })]);
         f.store.grantsForPeriod.mockResolvedValue([grant(72000, 'workspace_seconds')]);
-        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { family: 'pro_legacy' },
-            compute: { allowanceStdSeconds: 72000, remainingStdSeconds: 71940 }, overage: null });
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'legacy', name: 'Pro (legacy)' }, fairUse: { status: 'ok' } });
         expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
             { start: subscription().currentPeriodStart, end: subscription().currentPeriodEnd }, ['compute_std_seconds', 'workspace_seconds']);
     });
@@ -276,14 +271,14 @@ describe('billing router', () => {
 
     it.each(['ai_pack_10_v1', 'ai_pack_25_v1', 'pro_monthly_v1'])('refuses unsellable %s', async pack => {
         const f = fixture();
-        await expect(f.caller.createCheckout({ sku: pack })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_sku' });
+        await expect(f.caller.createCheckout({ sku: pack as typeof sku })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(0);
         await checkoutControl(f);
     });
 
     it('rejects unknown SKUs and permits the catalog Standard SKU', async () => {
         const f = fixture();
-        await expect(f.caller.createCheckout({ sku: 'invented' })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.caller.createCheckout({ sku: 'invented' as typeof sku })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(0);
         await checkoutControl(f);
     });
@@ -505,12 +500,12 @@ async function paidFixture(planSku = sku) {
 
 function change(overrides: Partial<PlanChangeRow> = {}): PlanChangeRow {
     return { id: 'change_fixture', userId, subscriptionId: 'sub_fixture', kind: 'upgrade', fromSku: sku,
-        toSku: 'compute_monthly_v2', stripeInvoiceId: null, stripeScheduleId: null, hostedInvoiceUrl: null,
+        toSku: 'premium_monthly_v3', stripeInvoiceId: null, stripeScheduleId: null, hostedInvoiceUrl: null,
         state: 'pending', effectiveAt: null, expiresAt: null, createdAt: now, updatedAt: now, ...overrides };
 }
 
-const toCompute = { toSku: 'compute_monthly_v2' };
-const toStandard = { toSku: 'standard_monthly_v2' };
+const toCompute = { toSku: 'premium_monthly_v3' };
+const toStandard = { toSku: 'standard_monthly_v3' };
 const confirmInput = { ...toCompute, prorationDate: epochSeconds(now) };
 const overageInput = { enabled: true, capCents: 2500, termsVersion: OVERAGE_TERMS_VERSION };
 const errorCodes = [
@@ -537,7 +532,7 @@ async function domainFailure(call: () => Promise<unknown>, message: BillingError
     expect(errorCodes).toContain((error as Error).message);
 }
 
-describe('billing v2 mutations', () => {
+describe('billing v3 mutations', () => {
     it.each(mutations)('%s requires billing configuration and authentication', async (_name, call) => {
         for (const missing of ['flag', 'secret', 'stripe'] as const) {
             const f = fixture();
@@ -553,7 +548,7 @@ describe('billing v2 mutations', () => {
         await expect(call(f)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
     });
 
-    it.each(['standard_monthly_v2', 'compute_monthly_v2'])('sells %s and strips smuggled checkout ownership', async sku => {
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'] as const)('sells %s and strips smuggled checkout ownership', async sku => {
         const f = fixture();
         const input = { sku, userId: 'foreign', subscriptionId: 'sub_foreign' };
         await f.caller.createCheckout(input);
@@ -570,7 +565,7 @@ describe('billing v2 mutations', () => {
         const periodEnd = isoSeconds(epochSeconds(subscription().currentPeriodEnd!));
         expect(preview).toEqual({ ...toCompute, prorationDate: epochSeconds(now), amountDueCents: 2400, currency: 'usd',
             lines: [{ description: 'Proration', amountCents: 2400 }], periodEnd,
-            grantStdSeconds: upgradeGrantStdSeconds({ fromSku: sku, toSku: 'compute_monthly_v2', periodStart, periodEnd, effectiveAt: isoSeconds(epochSeconds(now)) }) });
+            grantStdSeconds: upgradeGrantSeconds({ periodStart, periodEnd, effectiveAt: isoSeconds(epochSeconds(now)) }) });
         f.stripe.confirmUpgrade.mockImplementationOnce(async () => {
             expect(f.changes).toEqual([expect.objectContaining({ state: 'pending', userId, subscriptionId: 'sub_fixture' })]);
             return { status: 'applied', invoiceId: 'in_upgrade', hostedInvoiceUrl: null, expiresAt: null };
@@ -604,13 +599,13 @@ describe('billing v2 mutations', () => {
     });
 
     it.each(['preview', 'confirm'] as const)('%s upgrade refusals use only BillingErrorCode messages', async operation => {
-        const call = (f: Fixture, toSku = 'compute_monthly_v2') => operation === 'preview'
+        const call = (f: Fixture, toSku = 'premium_monthly_v3') => operation === 'preview'
             ? f.caller.previewUpgrade({ toSku }) : f.caller.confirmUpgrade({ ...confirmInput, toSku });
-        for (const wrong of ['standard_monthly_v2', 'pro_monthly_v1', 'invented']) {
+        for (const wrong of ['standard_monthly_v3', 'pro_monthly_v1', 'invented']) {
             await domainFailure(() => call(fixture(), wrong), 'unknown_sku');
         }
         await domainFailure(() => call(fixture()), 'not_subscribed');
-        for (const overrides of [{ sku: 'compute_monthly_v2' }, { sku: 'pro_monthly_v1' }, { cancelAtPeriodEnd: true }]) {
+        for (const overrides of [{ sku: 'premium_monthly_v3' }, { sku: 'pro_monthly_v1' }, { cancelAtPeriodEnd: true }]) {
             const f = await paidFixture();
             f.store.subscriptionsFor.mockResolvedValue([subscription(overrides)]);
             await domainFailure(() => call(f), 'upgrade_not_allowed');
@@ -636,7 +631,7 @@ describe('billing v2 mutations', () => {
     });
 
     it('schedules a downgrade, persists its identity, and ignores foreign plan changes', async () => {
-        const f = await paidFixture('compute_monthly_v2');
+        const f = await paidFixture('premium_monthly_v3');
         f.changes.push(change({ subscriptionId: 'sub_foreign', kind: 'downgrade', state: 'scheduled' }));
         const input = { ...toStandard, userId: 'foreign', subscriptionId: 'sub_foreign' };
         await expect(f.caller.scheduleDowngrade(input)).resolves.toEqual({ effectiveAt: '2026-10-20T00:00:00Z' });
@@ -650,7 +645,7 @@ describe('billing v2 mutations', () => {
     it('maps all downgrade refusals', async () => {
         await domainFailure(() => fixture().caller.scheduleDowngrade(toCompute), 'unknown_sku');
         await domainFailure(() => fixture().caller.scheduleDowngrade(toStandard), 'not_subscribed');
-        for (const overrides of [{ sku }, { sku: 'pro_monthly_v1' }, { sku: 'compute_monthly_v2', cancelAtPeriodEnd: true }]) {
+        for (const overrides of [{ sku }, { sku: 'pro_monthly_v1' }, { sku: 'premium_monthly_v3', cancelAtPeriodEnd: true }]) {
             const f = await paidFixture();
             f.store.subscriptionsFor.mockResolvedValue([subscription(overrides)]);
             await domainFailure(() => f.caller.scheduleDowngrade(toStandard), 'downgrade_not_allowed');
@@ -658,7 +653,7 @@ describe('billing v2 mutations', () => {
     });
 
     it('releases the downgrade before canceling and checks tenancy before both writes', async () => {
-        const f = await paidFixture('compute_monthly_v2');
+        const f = await paidFixture('premium_monthly_v3');
         f.changes.push(change({ kind: 'downgrade', state: 'scheduled', stripeScheduleId: 'sched_fixture' }));
         f.stripe.setCancelAtPeriodEnd.mockImplementationOnce(async () => {
             expect(f.changes[0].state).toBe('canceled');
@@ -698,9 +693,10 @@ describe('billing v2 mutations', () => {
     });
 
     it('requires current overage terms and an active Compute plan', async () => {
-        await domainFailure(() => fixture().caller.setOverage({ ...overageInput, termsVersion: 'old' }), 'terms_version_mismatch');
-        await domainFailure(() => fixture().caller.setOverage(overageInput), 'not_subscribed');
-        for (const overrides of [{ sku }, { sku: 'pro_monthly_v1' }, { sku: 'compute_monthly_v2', cancelAtPeriodEnd: true },
+        const legacy = await paidFixture('compute_monthly_v2');
+        await domainFailure(() => legacy.caller.setOverage({ ...overageInput, termsVersion: 'old' }), 'terms_version_mismatch');
+        await domainFailure(() => fixture().caller.setOverage(overageInput), 'upgrade_not_allowed');
+        for (const overrides of [{ sku: 'standard_monthly_v2' }, { sku: 'pro_monthly_v1' }, { sku: 'compute_monthly_v2', cancelAtPeriodEnd: true },
             { sku: 'compute_monthly_v2', status: 'past_due' }]) {
             const f = await paidFixture();
             f.store.subscriptionsFor.mockResolvedValue([subscription(overrides)]);
@@ -728,8 +724,8 @@ describe('billing v2 mutations', () => {
     });
 
     it('allows opting out of an owned Compute subscription while Standard supplies the current plan', async () => {
-        const f = await paidFixture();
-        f.store.subscriptionsFor.mockResolvedValue([subscription(), subscription({ stripeSubscriptionId: 'sub_compute',
+        const f = await paidFixture('standard_monthly_v2');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' }), subscription({ stripeSubscriptionId: 'sub_compute',
             sku: 'compute_monthly_v2', status: 'past_due' })]);
         await expect(f.caller.setOverage({ ...overageInput, enabled: false })).resolves.toMatchObject({ enabled: false, available: false });
         expect(f.store.recordConsent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
@@ -744,7 +740,7 @@ describe('billing v2 mutations', () => {
             periodStart: new Date('2026-08-20T00:00:00Z'), periodEnd: subscription().currentPeriodStart!,
             ratingVersion: 1, stdSecondsOver: BigInt(14400), cents: 100, stripeInvoiceId: 'in_previous', status,
             createdAt: now, updatedAt: now }]);
-        await expect(f.caller.summary()).resolves.toMatchObject({ overage: { enabled: false, pausedReason: 'payment_failed' } });
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'legacy' } });
         await domainFailure(() => f.caller.setOverage(overageInput), 'not_subscribed');
         await expect(f.caller.setOverage({ ...overageInput, enabled: false })).resolves.toMatchObject({ enabled: false });
     });
@@ -765,8 +761,8 @@ describe('billing v2 mutations', () => {
         await expect(f.caller.setOverage(overageInput)).resolves.toMatchObject({ enabled: true });
     });
 
-    it.each(['free_v1_legacy', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const)('selects only %s sizes', async planSku => {
-        const f = planSku === 'free_v1_legacy' ? fixture() : await paidFixture(planSku);
+    it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const)('selects only %s sizes', async planSku => {
+        const f = await paidFixture(planSku);
         for (const size of ['free-cf', 'std-2', 'cmp-4', 'cmp-8', 'unknown']) {
             const allowed = CATALOG_V2[planSku].sizes.some(code => code === size);
             if (allowed) {
@@ -777,8 +773,11 @@ describe('billing v2 mutations', () => {
         }
     });
 
-    it.each(['preview', 'confirm', 'downgrade', 'cancel', 'portal'] as const)('%s refuses foreign Stripe ownership before all writes', async name => {
-        const f = await paidFixture(name === 'downgrade' || name === 'cancel' ? 'compute_monthly_v2' : sku);
+    it.each([
+        ['preview', sku], ['confirm', sku], ['downgrade', 'premium_monthly_v3'],
+        ['downgrade', sku], ['cancel', 'premium_monthly_v3'], ['portal', sku],
+    ] as const)('%s from %s refuses foreign Stripe ownership before all writes', async (name, planSku) => {
+        const f = await paidFixture(planSku);
         const sub = await f.stripe.retrieveSubscription('sub_fixture');
         f.stripe.retrieveSubscription.mockClear().mockResolvedValue({ ...sub, customer: 'cus_foreign' });
         if (name === 'cancel') f.changes.push(change({ kind: 'downgrade', state: 'scheduled', stripeScheduleId: 'sched_fixture' }));
@@ -795,7 +794,7 @@ describe('billing v2 mutations', () => {
         for (const error of [new BillingProviderError('price_not_found'), new BillingProviderError('portal_configuration_missing'),
             new BillingProviderError('preview_expired'), new BillingProviderError('invalid_subscription_state'),
             new StripeRequestError(500, 'private data', 'api_error'), new Error('private data')]) {
-            const f = await paidFixture(name === 'downgrade' ? 'compute_monthly_v2' : sku);
+            const f = await paidFixture(name === 'downgrade' ? 'premium_monthly_v3' : sku);
             const log = vi.spyOn(console, 'error').mockImplementation(() => {});
             const method = name === 'preview' ? f.stripe.previewUpgrade : name === 'confirm' ? f.stripe.confirmUpgrade : f.stripe.scheduleDowngrade;
             method.mockRejectedValueOnce(error);
@@ -836,7 +835,7 @@ describe('billing v2 mutations', () => {
     it('covers remaining domain errors with pinned messages', async () => {
         const f = fixture();
         await domainFailure(() => f.caller.portal(), 'not_subscribed');
-        await domainFailure(() => f.caller.createCheckout({ sku: 'bad' }), 'unknown_sku');
+        await expect(f.caller.createCheckout({ sku: 'bad' as typeof sku })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         f.store.linkCustomer.mockResolvedValueOnce('conflict');
         await domainFailure(() => f.caller.createCheckout({ sku }), 'customer_conflict');
         f.store.subscriptionsFor.mockResolvedValue([subscription()]);
@@ -858,5 +857,33 @@ describe('billing v2 mutations', () => {
             { id: 'subscription', kind: 'subscription', amountDueCents: 2000 },
             { id: 'other', kind: 'other', amountDueCents: 2000 },
         ]);
+    });
+});
+
+describe('v3-only sales and renewal', () => {
+    it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'])('does not sell dormant %s', async oldSku => {
+        const f = fixture();
+        await expect(f.caller.createCheckout({ sku: oldSku as typeof sku })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+    it.each(['free_v3', 'standard_monthly_v3', 'premium_monthly_v3'])('%s has no overage or size selection', async planSku => {
+        const f = planSku === 'free_v3' ? fixture() : await paidFixture(planSku);
+        await domainFailure(() => f.caller.setOverage(overageInput), 'upgrade_not_allowed');
+        await domainFailure(() => f.caller.selectSize({ size: 'cmp-8' }), 'upgrade_not_allowed');
+        expect(f.store.recordConsent).not.toHaveBeenCalled();
+        expect(f.store.setSizePreference).not.toHaveBeenCalled();
+    });
+    it('previews renewal only for the session-owned subscription and keeps provider failure readable', async () => {
+        const f = await paidFixture();
+        const preview = vi.fn<NonNullable<StripeApi['previewRenewal']>>().mockResolvedValue({ at: new Date('2026-10-20T00:00:00Z'), amountCents: 1734 });
+        f.deps.stripe = { ...f.stripe, previewRenewal: preview };
+        expect(await f.caller.summary()).toMatchObject({ plan: { sku, renewal: { at: '2026-10-20T00:00:00Z', amountCents: 1734 } } });
+        expect(preview).toHaveBeenCalledExactlyOnceWith('sub_fixture');
+        f.stripe.retrieveSubscription.mockResolvedValue({ ...(await f.stripe.retrieveSubscription('sub_fixture')), customer: 'cus_foreign' });
+        preview.mockClear();
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        expect(await f.caller.summary()).toMatchObject({ plan: { renewal: null } });
+        expect(preview).not.toHaveBeenCalled();
+        expect(log).toHaveBeenCalledWith('Billing renewal preview unavailable');
     });
 });

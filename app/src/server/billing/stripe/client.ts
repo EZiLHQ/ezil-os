@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 
 import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
 import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult } from '../ports';
-import { offerByLookupKey, offerBySku } from '../v2/catalog';
+import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offerBySku } from '../v3/catalog';
+import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
@@ -90,6 +91,8 @@ export interface InvoiceResponse {
     customer: StripeReference;
     status: string;
     amount_due?: number;
+    period_end?: number | null;
+    next_payment_attempt?: number | null;
     currency?: string;
     billing_reason?: string | null;
     metadata?: Metadata | null;
@@ -329,13 +332,19 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         resolvePrice,
         retrieveInvoicePaymentState,
 
+        async previewRenewal(subscriptionId) {
+            const invoice = await request<InvoiceResponse>('/invoices/create_preview', { subscription: subscriptionId });
+            const at = date(invoice.next_payment_attempt ?? invoice.period_end);
+            return at && Number.isSafeInteger(invoice.amount_due) ? { at, amountCents: Math.max(0, invoice.amount_due!) } : null;
+        },
+
         async previewUpgrade(input) {
             const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`);
-            const item = planItem(subscription, CATALOG_V2.standard_monthly_v2.stripeLookupKey!);
+            const item = planItem(subscription, (input.toSku === 'premium_monthly_v3' ? CATALOG_V3.standard_monthly_v3 : CATALOG_V2.standard_monthly_v2).stripeLookupKey!);
             const periodStart = date(item.current_period_start);
             const periodEnd = date(item.current_period_end);
             if (!periodStart || !periodEnd || periodEnd <= periodStart) throw new BillingProviderError('invalid_subscription_state');
-            const price = await resolvePrice(CATALOG_V2[input.toSku].stripeLookupKey!);
+            const price = await resolvePrice(offerBySku(input.toSku)!.stripeLookupKey!);
             const invoice = await request<InvoiceResponse>('/invoices/create_preview', {
                 subscription: input.subscriptionId,
                 subscription_details: {
@@ -365,8 +374,8 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             }
             const path = `/subscriptions/${encodeURIComponent(input.subscriptionId)}`;
             const subscription = await request<SubscriptionResponse>(path);
-            const item = planItem(subscription, CATALOG_V2.standard_monthly_v2.stripeLookupKey!);
-            const price = await resolvePrice(CATALOG_V2[input.toSku].stripeLookupKey!);
+            const item = planItem(subscription, (input.toSku === 'premium_monthly_v3' ? CATALOG_V3.standard_monthly_v3 : CATALOG_V2.standard_monthly_v2).stripeLookupKey!);
+            const price = await resolvePrice(offerBySku(input.toSku)!.stripeLookupKey!);
             let updated: SubscriptionResponse;
             try {
                 updated = await request<SubscriptionResponse>(path, {
@@ -388,9 +397,9 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
 
         async scheduleDowngrade(input) {
             const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`);
-            const item = planItem(subscription, CATALOG_V2.compute_monthly_v2.stripeLookupKey!);
+            const item = planItem(subscription, (input.toSku === 'standard_monthly_v3' ? CATALOG_V3.premium_monthly_v3 : CATALOG_V2.compute_monthly_v2).stripeLookupKey!);
             if (subscription.schedule !== null) throw new BillingProviderError('invalid_subscription_state');
-            const price = await resolvePrice(CATALOG_V2[input.toSku].stripeLookupKey!);
+            const price = await resolvePrice(offerBySku(input.toSku)!.stripeLookupKey!);
             const schedule = await request<{ id: string; current_phase?: { start_date: number; end_date: number } | null }>(
                 '/subscription_schedules', { from_subscription: input.subscriptionId }, `${input.idempotencyKey}:create`,
             );
@@ -471,7 +480,7 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 const price = await resolvePrice(lookupKey);
                 fields.mode = 'subscription';
                 fields.line_items = [{ quantity: 1, price: price.id }];
-                fields.subscription_data = { metadata: { sku: input.sku, ezil_catalog: 'v2' } };
+                fields.subscription_data = { metadata: { sku: input.sku, ezil_catalog: input.sku.endsWith('_v3') ? 'v3' : 'v2' } };
             } else if (input.sku === PRO_PLAN.sku) {
                 fields.mode = 'subscription';
                 fields.line_items = [{
@@ -550,7 +559,8 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             const metadataSku = subscription.metadata?.sku;
             const itemOffer = items.map(item => item.lookupKey ? offerByLookupKey(item.lookupKey) : undefined).find(Boolean);
             // Pending upgrades change the item Price without changing checkout metadata.
-            const sku = itemOffer?.sku ?? (metadataSku && offerBySku(metadataSku) ? metadataSku : null);
+            // A v3 entitlement always requires its recognized line lookup key.
+            const sku = itemOffer?.sku ?? (metadataSku && !metadataSku.endsWith('_v3') && offerBySku(metadataSku) ? metadataSku : null);
             const offer = sku ? offerBySku(sku) : undefined;
             const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
             return {

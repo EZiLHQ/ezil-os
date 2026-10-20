@@ -1039,3 +1039,63 @@ describe('additional endive mappings', () => {
         await expect(client.createCustomer(customerRequest)).rejects.toThrow('Stripe request failed (HTTP 400)');
     });
 });
+
+describe('v3 Stripe prices and pending updates', () => {
+    const start = 1790812800, end = 1793491200;
+    const subscription = (lookupKey = 'ezil_standard_monthly_v3') => ({ id: 'sub_v3', customer: 'cus_fixture', status: 'active',
+        cancel_at_period_end: false, schedule: null, metadata: { sku: 'standard_monthly_v3' },
+        items: { data: [{ id: 'si_v3', price: { id: 'price_old', lookup_key: lookupKey }, current_period_start: start, current_period_end: end }] } });
+    function v3Client() {
+        const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+            const path = new URL(String(url));
+            if (path.pathname.endsWith('/prices')) return Response.json({ data: [{ id: 'price_v3', lookup_key: path.searchParams.get('lookup_keys[]'),
+                active: true, unit_amount: 4000, currency: 'usd', recurring: { interval: 'month' } }] });
+            if (path.pathname.endsWith('/checkout/sessions')) return Response.json({ id: 'cs_v3', url: 'https://checkout.example' });
+            if (path.pathname.endsWith('/invoices/create_preview')) return Response.json({ id: 'in_preview', amount_due: 1734, period_end: end, currency: 'usd', lines: { data: [] } });
+            if (init?.method === 'POST') return Response.json({ ...subscription(), pending_update: { expires_at: end },
+                latest_invoice: { id: 'in_upgrade', status: 'open', hosted_invoice_url: 'https://invoice.example' } });
+            return Response.json(subscription());
+        });
+        return { fetcher, client: createStripeClient({ secretKey: 'fixture_v3', fetch: fetcher }) };
+    }
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'])('checkout resolves %s by its v3 lookup key', async sku => {
+        const { client, fetcher } = v3Client();
+        await client.createCheckoutSession({ ...checkoutRequest, sku });
+        expect(String(fetcher.mock.calls[0]![0])).toContain(encodeURIComponent(`ezil_${sku}`));
+        const checkout = fetcher.mock.calls.find(([url]) => String(url).includes('/checkout/sessions'))!;
+        const body = new URLSearchParams(String(checkout[1]!.body));
+        expect(body.get('line_items[0][price]')).toBe('price_v3');
+        expect(body.get('subscription_data[metadata][ezil_catalog]')).toBe('v3');
+    });
+    it('previews the next invoice without changing a subscription', async () => {
+        const { client, fetcher } = v3Client();
+        expect(await client.previewRenewal!('sub_v3')).toEqual({ at: new Date(end * 1000), amountCents: 1734 });
+        expect(new URLSearchParams(String(fetcher.mock.calls[0]![1]!.body)).get('subscription')).toBe('sub_v3');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+    it('confirms Premium with pending_if_incomplete and keeps the proration date', async () => {
+        const { client, fetcher } = v3Client();
+        const now = new Date((start + 100) * 1000);
+        await client.confirmUpgrade({ subscriptionId: 'sub_v3', toSku: 'premium_monthly_v3', prorationDate: start + 100, now, idempotencyKey: 'v3-upgrade' });
+        const write = fetcher.mock.calls.find(([url, init]) => String(url).endsWith('/subscriptions/sub_v3') && init?.method === 'POST')!;
+        const body = new URLSearchParams(String(write[1]!.body));
+        expect(body.get('payment_behavior')).toBe('pending_if_incomplete');
+        expect(body.get('proration_behavior')).toBe('always_invoice');
+        expect(body.get('proration_date')).toBe(String(start + 100));
+        expect(body.get('items[0][price]')).toBe('price_v3');
+    });
+    it('refuses a v3 upgrade from a v2 line before any write', async () => {
+        const { client, fetcher } = v3Client();
+        fetcher.mockResolvedValueOnce(Response.json(subscription('ezil_standard_monthly_v2')));
+        await expect(client.previewUpgrade({ subscriptionId: 'sub_v3', toSku: 'premium_monthly_v3', prorationDate: start }))
+            .rejects.toMatchObject({ code: 'invalid_subscription_state' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+});
+
+
+it('never infers a v3 subscription from metadata without a v3 line', async () => {
+    const { client } = fixture({ id: 'sub_v3', customer: 'cus_fixture', status: 'active', cancel_at_period_end: false,
+        metadata: { sku: 'premium_monthly_v3' }, items: { data: [{ price: { id: 'price_unknown', lookup_key: 'unknown' } }] } });
+    expect((await client.retrieveSubscription('sub_v3')).sku).toBeNull();
+});

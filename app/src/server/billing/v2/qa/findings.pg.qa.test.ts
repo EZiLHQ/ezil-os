@@ -15,7 +15,7 @@ import { closePeriodAndInvoiceOverage } from '../close-period';
 import { GRANT_METER_COMPUTE, OVERAGE_TERMS_VERSION, SESSION_MAX_SECONDS } from '../contract';
 import { rateWindow } from '../rating';
 import {
-    END, NOW, START, config, connect, fakeStripe, fakeUsage, invoicePaidEvent, seedTenant, stripeSubscription, tenant,
+    END, NOW, START, config, legacySummary, connect, fakeStripe, fakeUsage, invoicePaidEvent, seedTenant, stripeSubscription, tenant,
     type Database, type Tenant,
 } from './harness';
 
@@ -62,8 +62,10 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
         userId: owner.userId, subscriptionId: owner.subscriptionId, enabled, capCents, termsVersion,
         catalogVersion: 2, rateCentsPerStdHour: 25, actor, acceptedAt: at,
     });
+
     const caller = (owner: Tenant, now = NOW) => createBillingRouter((): BillingDeps => ({ config, store, stripe: stripe.api, usage: usage.port, now: () => now }))
         .createCaller({ db: {} as never, headers: new Headers(), user: { id: owner.userId, email: null, aud: 'authenticated', app_metadata: {}, user_metadata: {}, created_at: START.toISOString() } } as never);
+
 
     it('F-STALE-TERMS: a consent to a superseded terms version never bills overage', async () => {
         await subscribe(a, 'compute_monthly_v2');
@@ -77,7 +79,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
     it('F-STALE-TERMS: the summary does not present a superseded consent as enabled overage', async () => {
         await subscribe(a, 'compute_monthly_v2');
         await consent(a, START, true, 2_500, 'overage-v1-2026-01-01');
-        const s = await caller(a).summary();
+        const s = await legacySummary(store, a.userId);
         expect(s.enabled && s.overage?.enabled).toBe(false);
         expect(s.enabled && s.estimate.worstCaseOverageCents).toBe(0);
     });
@@ -85,7 +87,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
     it('F-OPT-OUT: a Compute subscriber who set cancel-at-period-end can still turn overage OFF', async () => {
         await subscribe(a, 'compute_monthly_v2', true);
         await consent(a, START, true, 2_500);
-        const s = await caller(a).summary();
+        const s = await legacySummary(store, a.userId);
         expect(s.enabled && s.actions.overage).toBe(true); // the UI offers the toggle
         await expect(caller(a).setOverage({ enabled: false, capCents: 2_500, termsVersion: OVERAGE_TERMS_VERSION })).resolves.toMatchObject({ enabled: false });
     });
@@ -108,7 +110,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
         await processStripeEvent(invoicePaidEvent(stripe.invoices.get('in_prev_overage')!, failedAt, 'invoice.payment_failed'),
             { store, stripe: stripe.api, now: () => new Date('2026-10-04T00:00:00Z') });
         // Summary now says overage is off / paused for payment.
-        const s = await caller(a, new Date('2026-10-04T00:00:00Z')).summary();
+        const s = await legacySummary(store, a.userId, new Date('2026-10-04T00:00:00Z'));
         expect(s.enabled && [s.overage?.enabled, s.overage?.pausedReason]).toEqual([false, 'payment_failed']);
         // Heavy usage after the failure, with the issue still unpaid at close.
         await burn(a, new Date('2026-10-05T00:00:00Z'), 30);
@@ -143,7 +145,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
             { type: 'start', computerId: a.computerId, at: startAt.toISOString() },
             { type: 'stop', computerId: a.computerId, at: new Date(startAt.getTime() + H).toISOString() },
         ], { store });
-        const s = await caller(a).summary();
+        const s = await legacySummary(store, a.userId);
         expect(s.enabled && s.compute.usedStdSeconds).toBe(3_600);
     });
 
@@ -155,7 +157,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
         await store.closeEpoch({ computerId: a.computerId, endedAt: new Date('2026-10-05T05:30:00Z'), reason: 'user_stop' }); // 59.5 h
         const ready = new Date('2026-10-18T11:59:00Z');
         await store.openEpoch({ userId: a.userId, computerId: a.computerId, subscriptionId: a.subscriptionId, size: 'std-2', readyAt: ready });
-        const s = await caller(a).summary();
+        const s = await legacySummary(store, a.userId);
         const deadline = s.enabled ? s.compute.session.activeDeadline : null;
         expect(deadline).not.toBeNull();
         expect(Date.parse(deadline!) - ready.getTime()).toBeLessThanOrEqual(1_800 * 1000);

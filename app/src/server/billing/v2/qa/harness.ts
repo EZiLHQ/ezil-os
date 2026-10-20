@@ -151,3 +151,20 @@ export async function seedTenant(client: ReturnType<typeof postgres>, db: Databa
     ]);
     await store.linkCustomer(owner.userId, owner.customerId);
 }
+
+/** Sold-v2 meter QA stays on the v2 summary after the public router moves to v3. */
+export async function legacySummary(store: import('../../ports').BillingStore, userId: string, now: Date = NOW) {
+    const { planFromSubscriptions } = await import('../catalog');
+    const { buildSummaryV2, summaryMeters } = await import('../summary');
+    const subs = await store.subscriptionsFor(userId);
+    const userCreatedAt = await store.userCreatedAt(userId);
+    const plan = planFromSubscriptions({ subs, userCreatedAt, now });
+    const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
+    return buildSummaryV2({ config, now, subs, userCreatedAt,
+        epochs: await store.epochsFor(userId, window.start), grants: await store.grantsForPeriod(userId, window, summaryMeters(plan.family)),
+        consent: plan.subscriptionId ? await store.latestConsent(userId, plan.subscriptionId) : null,
+        planChanges: await store.openPlanChanges(userId), paymentIssues: await store.openPaymentIssues(userId),
+        overageInvoices: await store.overageInvoicesFor(userId), storage: await store.latestStorageFor(userId),
+        sizePreference: await store.sizePreference(userId), hasCustomer: !!(await store.stripeCustomerFor(userId)),
+    });
+}

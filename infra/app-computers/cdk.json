@@ -1,5 +1,5 @@
 {
-  "app": "npx tsx bin/main.ts",
+  "app": "node --import tsx bin/main.ts",
   "context": {
     "@aws-cdk/core:checkSecretUsage": true
   }

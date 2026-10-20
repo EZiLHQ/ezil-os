@@ -1,6 +1,5 @@
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
 import { billingMeteringActive, loadComputeBillingState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
-import { SESSION_MAX_SECONDS } from '@/server/billing/v2/contract';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import type { PolicyStopReason, StopOutcome } from '@/server/lib/compute/stop-policy';
 
@@ -68,17 +67,17 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     }
 
     for (const epoch of policyCandidates) {
-        const maximum = Date.parse(epoch.readyAt) + SESSION_MAX_SECONDS * 1000;
+        const state = await stateFor(epoch.userId);
+        const maximum = Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
         const deadline = Math.min(maximum, epoch.deadlineAt === null ? maximum : Date.parse(epoch.deadlineAt));
         const due = now.getTime() >= deadline;
         let reason: SweepReason;
         if (due && deadline === maximum) reason = 'session_max';
         else {
-            const state = await stateFor(epoch.userId);
             const overageOn = state.family === 'compute' && state.overage?.enabled === true;
             if (!due) {
                 const exhausted = overageOn
-                    ? (state.summary.overage?.accruedCents ?? 0) >= state.overage!.capCents
+                    ? (state.summary.version === 2 ? state.summary.overage?.accruedCents ?? 0 : 0) >= state.overage!.capCents
                     : state.usedStdSeconds >= state.allowanceStdSeconds;
                 if (!exhausted) continue;
             }

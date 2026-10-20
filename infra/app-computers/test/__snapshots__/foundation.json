@@ -1,0 +1,610 @@
+{
+  "pilot": {
+    "terminationProtection": false,
+    "template": {
+      "Resources": {
+        "ComputerVpc": {
+          "Type": "AWS::EC2::VPC",
+          "Properties": {
+            "CidrBlock": "10.76.0.0/24",
+            "EnableDnsHostnames": true,
+            "EnableDnsSupport": true,
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "pilot"
+              },
+              {
+                "Key": "Name",
+                "Value": "ezil-app-computers-pilot"
+              }
+            ]
+          }
+        },
+        "InternetGateway": {
+          "Type": "AWS::EC2::InternetGateway",
+          "Properties": {
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "pilot"
+              }
+            ]
+          }
+        },
+        "InternetGatewayAttachment": {
+          "Type": "AWS::EC2::VPCGatewayAttachment",
+          "Properties": {
+            "InternetGatewayId": {
+              "Ref": "InternetGateway"
+            },
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "PublicRoutes": {
+          "Type": "AWS::EC2::RouteTable",
+          "Properties": {
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "pilot"
+              }
+            ],
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "DefaultRoute": {
+          "Type": "AWS::EC2::Route",
+          "Properties": {
+            "DestinationCidrBlock": "0.0.0.0/0",
+            "GatewayId": {
+              "Ref": "InternetGateway"
+            },
+            "RouteTableId": {
+              "Ref": "PublicRoutes"
+            }
+          },
+          "DependsOn": [
+            "InternetGatewayAttachment"
+          ]
+        },
+        "ComputerSubnet0": {
+          "Type": "AWS::EC2::Subnet",
+          "Properties": {
+            "AvailabilityZoneId": "aps1-az1",
+            "CidrBlock": "10.76.0.0/27",
+            "MapPublicIpOnLaunch": true,
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "pilot"
+              },
+              {
+                "Key": "ezil:zone-id",
+                "Value": "aps1-az1"
+              }
+            ],
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "ComputerSubnetRoutes0": {
+          "Type": "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties": {
+            "RouteTableId": {
+              "Ref": "PublicRoutes"
+            },
+            "SubnetId": {
+              "Ref": "ComputerSubnet0"
+            }
+          }
+        },
+        "ComputerSecurityGroup": {
+          "Type": "AWS::EC2::SecurityGroup",
+          "Properties": {
+            "GroupDescription": "EZiL application computers; no inbound connections",
+            "SecurityGroupEgress": [
+              {
+                "CidrIp": "0.0.0.0/0",
+                "Description": "All outbound (metered outside the guest)",
+                "IpProtocol": "-1"
+              }
+            ],
+            "SecurityGroupIngress": [],
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "pilot"
+              }
+            ],
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "ApplicationImages439F25F1": {
+          "Type": "AWS::ECR::Repository",
+          "Properties": {
+            "EncryptionConfiguration": {
+              "EncryptionType": "AES256"
+            },
+            "ImageScanningConfiguration": {
+              "ScanOnPush": true
+            },
+            "ImageTagMutability": "IMMUTABLE",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "pilot"
+              }
+            ]
+          },
+          "UpdateReplacePolicy": "Retain",
+          "DeletionPolicy": "Retain"
+        },
+        "ComputerLaunchTemplate": {
+          "Type": "AWS::EC2::LaunchTemplate",
+          "Properties": {
+            "LaunchTemplateData": {
+              "BlockDeviceMappings": [
+                {
+                  "DeviceName": "/dev/sda1",
+                  "Ebs": {
+                    "DeleteOnTermination": true,
+                    "Encrypted": true,
+                    "VolumeSize": 30,
+                    "VolumeType": "gp3"
+                  }
+                }
+              ],
+              "EbsOptimized": true,
+              "HibernationOptions": {
+                "Configured": false
+              },
+              "ImageId": {
+                "Ref": "HostAmiId"
+              },
+              "InstanceInitiatedShutdownBehavior": "stop",
+              "InstanceType": "m6i.large",
+              "MetadataOptions": {
+                "HttpEndpoint": "enabled",
+                "HttpPutResponseHopLimit": 1,
+                "HttpTokens": "required",
+                "InstanceMetadataTags": "disabled"
+              },
+              "Monitoring": {
+                "Enabled": false
+              },
+              "SecurityGroupIds": [
+                {
+                  "Fn::GetAtt": [
+                    "ComputerSecurityGroup",
+                    "GroupId"
+                  ]
+                }
+              ],
+              "TagSpecifications": [
+                {
+                  "ResourceType": "instance",
+                  "Tags": [
+                    {
+                      "Key": "ezil:managed-by",
+                      "Value": "app-computer-platform"
+                    },
+                    {
+                      "Key": "ezil:stage",
+                      "Value": "pilot"
+                    }
+                  ]
+                }
+              ]
+            },
+            "LaunchTemplateName": "ezil-app-computer-pilot",
+            "TagSpecifications": [
+              {
+                "ResourceType": "launch-template",
+                "Tags": [
+                  {
+                    "Key": "ezil:namespace",
+                    "Value": "pilot"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "Outputs": {
+        "SubnetId0": {
+          "Description": "Public computer subnet in aps1-az1",
+          "Value": {
+            "Ref": "ComputerSubnet0"
+          }
+        },
+        "VpcId": {
+          "Value": {
+            "Ref": "ComputerVpc"
+          }
+        },
+        "SecurityGroupId": {
+          "Value": {
+            "Fn::GetAtt": [
+              "ComputerSecurityGroup",
+              "GroupId"
+            ]
+          }
+        },
+        "LaunchTemplateId": {
+          "Value": {
+            "Ref": "ComputerLaunchTemplate"
+          }
+        },
+        "ApplicationImageRepositoryUri": {
+          "Value": {
+            "Fn::Join": [
+              "",
+              [
+                {
+                  "Fn::Select": [
+                    4,
+                    {
+                      "Fn::Split": [
+                        ":",
+                        {
+                          "Fn::GetAtt": [
+                            "ApplicationImages439F25F1",
+                            "Arn"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                ".dkr.ecr.",
+                {
+                  "Fn::Select": [
+                    3,
+                    {
+                      "Fn::Split": [
+                        ":",
+                        {
+                          "Fn::GetAtt": [
+                            "ApplicationImages439F25F1",
+                            "Arn"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                ".",
+                {
+                  "Ref": "AWS::URLSuffix"
+                },
+                "/",
+                {
+                  "Ref": "ApplicationImages439F25F1"
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "Parameters": {
+        "HostAmiId": {
+          "Type": "AWS::EC2::Image::Id",
+          "Description": "Approved Linux/amd64 host AMI (OS plus pre-pulled desktop image)"
+        }
+      }
+    }
+  },
+  "production": {
+    "terminationProtection": true,
+    "template": {
+      "Resources": {
+        "ComputerVpc": {
+          "Type": "AWS::EC2::VPC",
+          "Properties": {
+            "CidrBlock": "10.76.0.0/24",
+            "EnableDnsHostnames": true,
+            "EnableDnsSupport": true,
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "production"
+              },
+              {
+                "Key": "Name",
+                "Value": "ezil-app-computers-production"
+              }
+            ]
+          }
+        },
+        "InternetGateway": {
+          "Type": "AWS::EC2::InternetGateway",
+          "Properties": {
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "production"
+              }
+            ]
+          }
+        },
+        "InternetGatewayAttachment": {
+          "Type": "AWS::EC2::VPCGatewayAttachment",
+          "Properties": {
+            "InternetGatewayId": {
+              "Ref": "InternetGateway"
+            },
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "PublicRoutes": {
+          "Type": "AWS::EC2::RouteTable",
+          "Properties": {
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "production"
+              }
+            ],
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "DefaultRoute": {
+          "Type": "AWS::EC2::Route",
+          "Properties": {
+            "DestinationCidrBlock": "0.0.0.0/0",
+            "GatewayId": {
+              "Ref": "InternetGateway"
+            },
+            "RouteTableId": {
+              "Ref": "PublicRoutes"
+            }
+          },
+          "DependsOn": [
+            "InternetGatewayAttachment"
+          ]
+        },
+        "ComputerSubnet0": {
+          "Type": "AWS::EC2::Subnet",
+          "Properties": {
+            "AvailabilityZoneId": "aps1-az1",
+            "CidrBlock": "10.76.0.0/27",
+            "MapPublicIpOnLaunch": true,
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "production"
+              },
+              {
+                "Key": "ezil:zone-id",
+                "Value": "aps1-az1"
+              }
+            ],
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "ComputerSubnetRoutes0": {
+          "Type": "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties": {
+            "RouteTableId": {
+              "Ref": "PublicRoutes"
+            },
+            "SubnetId": {
+              "Ref": "ComputerSubnet0"
+            }
+          }
+        },
+        "ComputerSecurityGroup": {
+          "Type": "AWS::EC2::SecurityGroup",
+          "Properties": {
+            "GroupDescription": "EZiL application computers; no inbound connections",
+            "SecurityGroupEgress": [
+              {
+                "CidrIp": "0.0.0.0/0",
+                "Description": "All outbound (metered outside the guest)",
+                "IpProtocol": "-1"
+              }
+            ],
+            "SecurityGroupIngress": [],
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "production"
+              }
+            ],
+            "VpcId": {
+              "Ref": "ComputerVpc"
+            }
+          }
+        },
+        "ApplicationImages439F25F1": {
+          "Type": "AWS::ECR::Repository",
+          "Properties": {
+            "EncryptionConfiguration": {
+              "EncryptionType": "AES256"
+            },
+            "ImageScanningConfiguration": {
+              "ScanOnPush": true
+            },
+            "ImageTagMutability": "IMMUTABLE",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "production"
+              }
+            ]
+          },
+          "UpdateReplacePolicy": "Retain",
+          "DeletionPolicy": "Retain"
+        },
+        "ComputerLaunchTemplate": {
+          "Type": "AWS::EC2::LaunchTemplate",
+          "Properties": {
+            "LaunchTemplateData": {
+              "BlockDeviceMappings": [
+                {
+                  "DeviceName": "/dev/sda1",
+                  "Ebs": {
+                    "DeleteOnTermination": true,
+                    "Encrypted": true,
+                    "VolumeSize": 30,
+                    "VolumeType": "gp3"
+                  }
+                }
+              ],
+              "EbsOptimized": true,
+              "HibernationOptions": {
+                "Configured": false
+              },
+              "ImageId": {
+                "Ref": "HostAmiId"
+              },
+              "InstanceInitiatedShutdownBehavior": "stop",
+              "InstanceType": "m6i.large",
+              "MetadataOptions": {
+                "HttpEndpoint": "enabled",
+                "HttpPutResponseHopLimit": 1,
+                "HttpTokens": "required",
+                "InstanceMetadataTags": "disabled"
+              },
+              "Monitoring": {
+                "Enabled": false
+              },
+              "SecurityGroupIds": [
+                {
+                  "Fn::GetAtt": [
+                    "ComputerSecurityGroup",
+                    "GroupId"
+                  ]
+                }
+              ],
+              "TagSpecifications": [
+                {
+                  "ResourceType": "instance",
+                  "Tags": [
+                    {
+                      "Key": "ezil:managed-by",
+                      "Value": "app-computer-platform"
+                    },
+                    {
+                      "Key": "ezil:stage",
+                      "Value": "production"
+                    }
+                  ]
+                }
+              ]
+            },
+            "LaunchTemplateName": "ezil-app-computer-production",
+            "TagSpecifications": [
+              {
+                "ResourceType": "launch-template",
+                "Tags": [
+                  {
+                    "Key": "ezil:namespace",
+                    "Value": "production"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "Outputs": {
+        "SubnetId0": {
+          "Description": "Public computer subnet in aps1-az1",
+          "Value": {
+            "Ref": "ComputerSubnet0"
+          }
+        },
+        "VpcId": {
+          "Value": {
+            "Ref": "ComputerVpc"
+          }
+        },
+        "SecurityGroupId": {
+          "Value": {
+            "Fn::GetAtt": [
+              "ComputerSecurityGroup",
+              "GroupId"
+            ]
+          }
+        },
+        "LaunchTemplateId": {
+          "Value": {
+            "Ref": "ComputerLaunchTemplate"
+          }
+        },
+        "ApplicationImageRepositoryUri": {
+          "Value": {
+            "Fn::Join": [
+              "",
+              [
+                {
+                  "Fn::Select": [
+                    4,
+                    {
+                      "Fn::Split": [
+                        ":",
+                        {
+                          "Fn::GetAtt": [
+                            "ApplicationImages439F25F1",
+                            "Arn"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                ".dkr.ecr.",
+                {
+                  "Fn::Select": [
+                    3,
+                    {
+                      "Fn::Split": [
+                        ":",
+                        {
+                          "Fn::GetAtt": [
+                            "ApplicationImages439F25F1",
+                            "Arn"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                ".",
+                {
+                  "Ref": "AWS::URLSuffix"
+                },
+                "/",
+                {
+                  "Ref": "ApplicationImages439F25F1"
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "Parameters": {
+        "HostAmiId": {
+          "Type": "AWS::EC2::Image::Id",
+          "Description": "Approved Linux/amd64 host AMI (OS plus pre-pulled desktop image)"
+        }
+      }
+    }
+  }
+}

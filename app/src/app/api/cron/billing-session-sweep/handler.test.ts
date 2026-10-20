@@ -98,7 +98,7 @@ describe('billing session sweep', () => {
         const f = fixture([epoch({ deadlineAt })]);
         await f.run(24000);
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(21600), endReason: 'session_max' });
-        expect(f.store.subscriptionsFor).not.toHaveBeenCalled();
+        expect(f.store.subscriptionsFor).toHaveBeenCalledWith(ref.userId);
     });
 
     it('a six-hour restart adds the next session to the same monthly meter', async () => {
@@ -143,7 +143,7 @@ describe('billing session sweep', () => {
 
     it('Free without headroom closes at detection time', async () => {
         const f = fixture([
-            epoch({ id: 'past', computerId: 'past', readyAt: iso(-21600), endedAt: iso(0), endReason: 'session_max', size: 'cmp-8', weight: 4 }),
+            epoch({ id: 'past', computerId: 'past', readyAt: iso(-28800), endedAt: iso(0), endReason: 'session_max', size: 'cmp-8', weight: 4 }),
             epoch({ size: 'free-cf', lastHeartbeatAt: iso(100) }),
         ], { sku: null });
         await f.run(100);
@@ -281,5 +281,22 @@ describe('billing session sweep', () => {
         f.isStillRunning.mockRejectedValue(new Error('status unavailable'));
         expect(await f.run(1)).toEqual(zeros);
         expect(f.stop).not.toHaveBeenCalled();
+    });
+});
+
+describe('v3 session deadlines', () => {
+    it.each([[null, 3600], ['standard_monthly_v3', 7200], ['premium_monthly_v3', 21600]] as const)
+    ('stops %s exactly at its plan cap, even with no stored deadline', async (sku, cap) => {
+        const f = fixture([epoch()], { sku, allowance: 288000 });
+        expect(await f.run(cap - 1)).toMatchObject({ stopped: 0 });
+        expect(await f.run(cap)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(cap), endReason: 'session_max' });
+    });
+    it('v3 receipt revocation exhausts the running session', async () => {
+        const f = fixture([epoch()], { sku: 'premium_monthly_v3', allowance: 288000 });
+        await f.run(100);
+        f.store.grantsForPeriod.mockResolvedValue([]);
+        await f.run(200);
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(200), endReason: 'allowance_exhausted' });
     });
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,10 +13,16 @@ function synth(bin: string, env: Record<string, string>) {
     const out = mkdtempSync(join(tmpdir(), 'ezil-bin-'));
     try {
         const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('AWS_') && !k.startsWith('EZIL_')));
-        execFileSync(process.execPath, ['--import', 'tsx', bin], { cwd: root, stdio: 'pipe', env: { ...clean, ...offline, ...env, CDK_OUTDIR: out } });
+        // File-backed output also works in sandboxes that reject child-process pipes.
+        const logPath = join(out, 'synth.log'), log = openSync(logPath, 'w');
+        try {
+            execFileSync(process.execPath, ['--import', 'tsx', bin], { cwd: root, stdio: ['ignore', log, log], env: { ...clean, ...offline, ...env, CDK_OUTDIR: out } });
+        } catch (cause) {
+            throw new Error(`${bin} synthesis failed:\n${readFileSync(logPath, 'utf8')}`, { cause });
+        } finally { closeSync(log); }
         const manifest = JSON.parse(readFileSync(join(out, 'manifest.json'), 'utf8'));
         const stacks = Object.entries(manifest.artifacts as Record<string, any>).filter(([, a]) => a.type === 'aws:cloudformation:stack');
-        return Object.fromEntries(stacks.map(([name, a]) => [name, { terminationProtection: a.properties.terminationProtection, template: JSON.parse(readFileSync(join(out, a.properties.templateFile), 'utf8')),
+        return Object.fromEntries(stacks.map(([name, a]) => [name, { stackName: a.properties.stackName ?? name, terminationProtection: a.properties.terminationProtection, template: JSON.parse(readFileSync(join(out, a.properties.templateFile), 'utf8')),
             assets: (a.dependencies ?? []).filter((d: string) => d.endsWith('.assets')).map((d: string) =>
                 JSON.parse(readFileSync(join(out, manifest.artifacts[d].properties.file), 'utf8'))) }]));
     } finally { rmSync(out, { recursive: true, force: true }); }
@@ -38,11 +44,45 @@ test('bin/lifecycle applies the workload identity: path, boundary, namespace tag
     for (const d of destinations as any[]) { assert.equal(d.bucketName, 'ezil-pilot-deploy-assets-123456789012'); assert.match(d.objectKey, /^assets\//);
         assert.equal(d.assumeRoleArn, undefined, 'no bootstrap publishing role'); }
 });
-test('bin/main (foundation), bin/identity and bin/ops synthesize without bootstrap under their fixed names', () => {
-    const foundation = synth('bin/main.ts', { EZIL_FOUNDATION_CONFIG: 'config/foundation.example.json' })['ezil-pilot-foundation']!.template;
-    assert.ok(!JSON.stringify(foundation).includes('BootstrapVersion'));
-    const vpc = Object.values(foundation.Resources as Record<string, any>).find(r => r.Type === 'AWS::EC2::VPC');
-    assert.ok(vpc.Properties.Tags.some((t: any) => t.Key === 'ezil:namespace' && t.Value === 'pilot'));
+for (const stage of ['pilot', 'production', 'mum']) test(`bin/main foundation: ${stage} names, resource tags and termination protection`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ezil-foundation-config-'));
+    try {
+        const config = JSON.parse(readFileSync(join(root, 'config/foundation.example.json'), 'utf8'));
+        const path = join(dir, 'foundation.json');
+        writeFileSync(path, JSON.stringify({ ...config, stage }));
+        const stacks = synth('bin/main.ts', { EZIL_FOUNDATION_CONFIG: path });
+        assert.deepEqual(Object.keys(stacks), [`ezil-${stage}-foundation`]);
+        const { stackName, template, terminationProtection, assets } = stacks[`ezil-${stage}-foundation`]!;
+        assert.equal(stackName, `ezil-${stage}-foundation`);
+        assert.equal(terminationProtection, stage === 'production');
+        assert.deepEqual(assets, []);
+        assert.ok(!JSON.stringify(template).includes('BootstrapVersion'));
+        // These three CloudFormation resource types do not support tags.
+        const untaggable = new Set(['AWS::EC2::VPCGatewayAttachment', 'AWS::EC2::Route', 'AWS::EC2::SubnetRouteTableAssociation']);
+        for (const [id, resource] of Object.entries(template.Resources as Record<string, any>)) {
+            if (untaggable.has(resource.Type)) continue;
+            const tags = resource.Type === 'AWS::EC2::LaunchTemplate'
+                ? resource.Properties.TagSpecifications.find((s: any) => s.ResourceType === 'launch-template')?.Tags
+                : resource.Properties.Tags;
+            assert.deepEqual(tags?.filter((t: any) => t.Key === 'ezil:namespace'),
+                [{ Key: 'ezil:namespace', Value: stage }], `${id} (${resource.Type}) namespace tag`);
+        }
+        const resources = Object.values(template.Resources as Record<string, any>);
+        const vpc = resources.find(r => r.Type === 'AWS::EC2::VPC');
+        assert.deepEqual(vpc.Properties.Tags.filter((t: any) => t.Key === 'Name'),
+            [{ Key: 'Name', Value: `ezil-app-computers-${stage}` }]);
+        const launchTemplate = resources.find(r => r.Type === 'AWS::EC2::LaunchTemplate');
+        assert.equal(launchTemplate.Properties.LaunchTemplateName, `ezil-app-computer-${stage}`);
+        const instanceTags = launchTemplate.Properties.LaunchTemplateData.TagSpecifications.find((s: any) => s.ResourceType === 'instance').Tags;
+        assert.deepEqual(instanceTags.filter((t: any) => t.Key === 'ezil:stage'), [{ Key: 'ezil:stage', Value: stage }]);
+        if (stage === 'pilot' || stage === 'production') {
+            // Captured from HEAD before broadening foundation stage validation.
+            const snapshots = JSON.parse(readFileSync(join(__dirname, '__snapshots__/foundation.json'), 'utf8'));
+            assert.deepEqual({ terminationProtection, template }, snapshots[stage]);
+        }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test('bin/identity and bin/ops synthesize without bootstrap under their fixed names', () => {
     const identity = synth('bin/identity.ts', { EZIL_IDENTITY_CONFIG: 'config/identity.example.json' })['ezil-identity-pilot']!.template;
     assert.deepEqual(roles(identity).map(r => r.Properties.RoleName).sort(), ['ezil-pilot-cfn-exec', 'ezil-pilot-deploy']);
     const ops = synth('bin/ops.ts', { EZIL_OPS_CONFIG: 'config/ops.example.json' })['ezil-pilot-ops']!.template;

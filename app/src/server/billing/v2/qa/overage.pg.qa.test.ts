@@ -16,7 +16,7 @@ import { processStripeEvent } from '../../processor';
 import { closePeriodAndInvoiceOverage } from '../close-period';
 import { GRANT_METER_COMPUTE, OVERAGE_TERMS_VERSION, type SizeCode } from '../contract';
 import {
-    END, NOW, START, config, connect, fakeStripe, fakeUsage, invoicePaidEvent, seedTenant, stripeSubscription, tenant,
+    END, NOW, START, config, legacySummary, connect, fakeStripe, fakeUsage, invoicePaidEvent, seedTenant, stripeSubscription, tenant,
     type Database, type Tenant,
 } from './harness';
 
@@ -184,7 +184,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
             const deps: BillingDeps = { config, store, stripe: stripe.api, usage: usage.port, now: () => new Date(END.getTime() + 3 * 86_400_000) };
             const caller = createBillingRouter(() => deps).createCaller(ctxFor(a));
             await expect(caller.setOverage({ enabled: true, capCents: 2_500, termsVersion: OVERAGE_TERMS_VERSION })).rejects.toThrow();
-            const summary = await caller.summary();
+            const summary = await legacySummary(store, a.userId, deps.now());
             expect(summary.enabled && summary.overage).toMatchObject({ enabled: false, pausedReason: 'payment_failed' });
 
             // November heavy usage is not billed.
@@ -233,7 +233,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
 
         it('a Compute subscriber starts with overage OFF (no auto-enrolment)', async () => {
             await subscribe(a, 'compute_monthly_v2');
-            const s = await caller(a).summary();
+            const s = await legacySummary(store, a.userId);
             expect(s.enabled && s.overage).toMatchObject({ enabled: false, acceptedVersion: null, capCents: 2_500 });
             expect(s.enabled && s.estimate.worstCaseOverageCents).toBe(0);
         });
@@ -243,23 +243,32 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
             await consent(b, START);
             await burn(b, new Date('2026-10-02T00:00:00Z'), 25);
             const s = await caller(a).summary();
-            expect(s.enabled && [s.plan.family, s.compute.usedStdSeconds, s.overage]).toEqual(['free', 0, null]);
+            expect(s.enabled && [s.plan.sku, s.fairUse.status, s.plan.pendingUpgrade]).toEqual(['free_v3', 'ok', null]);
         });
 
         it.each([
             ['free', null, 'std-2'], ['free', null, 'cmp-8'], ['standard', 'standard_monthly_v2', 'cmp-4'], ['compute', 'compute_monthly_v2', 'free-cf'],
         ] as const)('selectSize refuses a size the %s plan does not include (%s → %s)', async (_f, sku, size) => {
             if (sku) await subscribe(a, sku);
-            await expect(caller(a).selectSize({ size })).rejects.toThrow(/size_not_allowed/);
+            // docs/billing/CONTRACT-v3.md: Free is v3, where selectSize is unavailable; sold v2 plans retain their terms.
+            await expect(caller(a).selectSize({ size })).rejects.toThrow(sku === null ? /upgrade_not_allowed/ : /size_not_allowed/);
         });
 
         it('plan-changing procedures refuse a subscription whose provider customer is someone else, before any Stripe write', async () => {
-            await subscribe(a, 'compute_monthly_v2');
+            await store.upsertSubscription({
+                stripeSubscriptionId: a.subscriptionId, userId: a.userId, status: 'active', sku: 'standard_monthly_v3',
+                currentPeriodStart: START, currentPeriodEnd: END, cancelAtPeriodEnd: false, stripeEventCreated: START,
+            });
             // Provider says A's subscription id belongs to B's customer.
-            stripe.subscriptions.set(a.subscriptionId, { ...stripeSubscription(b, 'compute_monthly_v2'), id: a.subscriptionId });
+            stripe.subscriptions.set(a.subscriptionId, {
+                ...stripeSubscription(b), id: a.subscriptionId, sku: 'standard_monthly_v3',
+                items: [{ id: 'si_1', priceId: 'price_standard_monthly_v3', lookupKey: 'ezil_standard_monthly_v3' }],
+            });
+            await expect(caller(a).previewUpgrade({ toSku: 'premium_monthly_v3' })).rejects.toThrow(/customer_conflict/);
+            await expect(caller(a).confirmUpgrade({ toSku: 'premium_monthly_v3', prorationDate: Math.floor(NOW.getTime() / 1000) })).rejects.toThrow(/customer_conflict/);
             await expect(caller(a).cancelAtPeriodEnd({ cancel: true })).rejects.toThrow(/customer_conflict/);
             await expect(caller(a).portal()).rejects.toThrow(/customer_conflict/);
-            await expect(caller(a).scheduleDowngrade({ toSku: 'standard_monthly_v2' })).rejects.toThrow(/customer_conflict/);
+            await expect(caller(a).scheduleDowngrade({ toSku: 'standard_monthly_v3' })).rejects.toThrow(/customer_conflict/);
             expect(stripe.calls).toEqual([]);
         });
 

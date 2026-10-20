@@ -564,7 +564,7 @@ function scenario(n: number, name: string, body: (s: Scenario, expect: TestConte
         const free = await createTenant(s); // Prelinked clock customer; the router must reuse it.
         const keys = publishableKey ? [publishableKey, undefined] : [undefined];
         for (const key of keys) {
-            const result = await callerFor(s, free, key).createCheckout({ sku: STANDARD });
+            const result = await callerFor(s, free, key).createCheckout({ sku: 'standard_monthly_v3' });
             s.stripe.checkoutSessions.push(result.sessionId);
             try {
                 expect(result.mode).toBe(key ? 'embedded' : 'redirect');
