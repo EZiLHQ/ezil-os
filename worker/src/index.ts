@@ -3370,7 +3370,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const systemTooLarge = await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY);
       if (systemTooLarge === true) return { ok: false as const, reason: 'system_too_large' };
       if (systemHead && systemTooLarge !== false) return { ok: false as const, reason: 'system_size_unknown' };
-      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag }));
+      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag,
+        systemHeadEtag: systemHead?.etag ?? null }));
       if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
       const s = head.snapshot;
       return {
@@ -3463,25 +3464,30 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
   }
 
-  async exportMigration(index?: number, generation?: string): Promise<Response> {
+  async exportMigration(index?: number, generation?: string, layer: 'workspace' | 'system' = 'workspace'): Promise<Response> {
     return this.withWorkspacePersistence(async () => {
       const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
       if (!wctx) return json({ ok: false, error: 'no_context' }, 409);
       const store = await this.selectWorkspaceStore();
       if (!store.ok || !store.store) return json({ ok: false, error: 'store_unavailable' }, 503);
+      const prefix = layer === 'system' ? systemPrefixOf(wctx.prefix) : wctx.prefix;
+      if (!prefix) return json({ ok: false, error: 'no_system_snapshot' }, 404);
       try {
         if (index === undefined) {
-          const head = await exportedSnapshot(store.store, wctx.prefix);
+          const head = await exportedSnapshot(store.store, prefix, wctx.prefix);
           const response = json(head.snapshot);
-          // The current marker etag is the expectedMigratedEtag for rollback after commit.
+          // Identifies this layer's current head; rollback uses the workspace marker etag.
           response.headers.set('etag', `"${head.etag}"`);
           response.headers.set('cache-control', 'no-store');
           return response;
         }
-        const { body, chunk } = await exportedChunk(store.store, wctx.prefix, index, generation);
+        const { body, chunk } = await exportedChunk(store.store, prefix, index, generation, wctx.prefix);
         return new Response(body, { headers: { ...corsHeaders, 'content-type': 'application/octet-stream',
           'content-length': String(chunk.size), 'x-ezil-chunk-sha256': chunk.sha256, 'cache-control': 'no-store' } });
       } catch (err) {
+        if (layer === 'system' && err instanceof MigrationRequestError && err.reason === 'no_checkpoint') {
+          return json({ ok: false, error: 'no_system_snapshot' }, 404);
+        }
         return json({ ok: false, error: err instanceof MigrationRequestError ? err.reason : 'export_failed' },
           err instanceof MigrationRequestError ? err.status : 503);
       }
@@ -7418,7 +7424,7 @@ export default {
       return handleTelemetryAck(request, env);
     }
 
-    const migrationMatch = path.match(/^\/sandbox\/([^/]+)\/migrate\/(begin|commit|abort|reopen|export\/head|export\/chunk\/([^/]+))$/);
+    const migrationMatch = path.match(/^\/sandbox\/([^/]+)\/migrate\/(begin|commit|abort|reopen|export\/(?:system\/)?(?:head|chunk\/([^/]+)))$/);
     if (migrationMatch && ((method === 'POST' && !migrationMatch[2].startsWith('export/'))
       || (method === 'GET' && migrationMatch[2].startsWith('export/')))) {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
@@ -7445,7 +7451,8 @@ export default {
       }
       try {
         const sandbox = openSandbox(env, decodeURIComponent(migrationMatch[1]));
-        if (action.startsWith('export/')) return await sandbox.exportMigration(index, url.searchParams.get('generation') ?? undefined);
+        if (action.startsWith('export/')) return await sandbox.exportMigration(index, url.searchParams.get('generation') ?? undefined,
+          action.startsWith('export/system/') ? 'system' : 'workspace');
         if (action === 'begin') {
           const result = await sandbox.beginMigrationExport();
           if (!result.ok) return json({ ok: false, error: result.reason }, 409);
