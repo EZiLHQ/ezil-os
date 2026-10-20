@@ -56,7 +56,8 @@ export async function promoteDeployment(deploymentId, env = process.env, {
     const request = client(env, fetchImpl);
     requireValue(typeof deploymentId === 'string' && deploymentIdPattern.test(deploymentId));
     await request(`/v10/projects/${encodeURIComponent(env.VERCEL_PROJECT_ID)}/promote/${encodeURIComponent(deploymentId)}`, {
-      method: 'POST', statuses: [200, 201, 202], readJson: false,
+      // The endpoint requires a JSON body; the Vercel CLI sends {} too.
+      method: 'POST', body: {}, statuses: [200, 201, 202], readJson: false,
     });
     for (let attempt = 0; attempt < 12; attempt++) {
       const deployment = await request(`/v13/deployments/${productionAlias}`);

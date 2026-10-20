@@ -96,7 +96,8 @@ test('Vercel promotion accepts 200/201/202 and polls the production alias until 
       ['POST', `/v10/projects/${env.VERCEL_PROJECT_ID}/promote/${deployment.id}`],
       ...Array.from({ length: 4 }, () => ['GET', '/v13/deployments/os.ezil.work']),
     ]);
-    assert.equal(mock.calls[0].options.body, undefined);
+    assert.equal(mock.calls[0].options.body, '{}');
+    assert.equal(mock.calls[0].options.headers['content-type'], 'application/json');
     assert.deepEqual(sleeps, [5000, 5000, 5000]);
     checkTransport(mock.calls);
   }
