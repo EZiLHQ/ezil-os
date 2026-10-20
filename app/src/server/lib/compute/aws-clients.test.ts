@@ -4,7 +4,7 @@
  * (credentials, signing, serialization) against a stub HTTP layer.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
     AwsClientError,
@@ -14,6 +14,7 @@ import {
     createSfnExecutionReader,
     createSfnLifecycleStarter,
     CREDENTIAL_MARGIN_MS,
+    instanceRoleCallerCredentials,
     readVercelOidcToken,
     sharedAwsSdkCollaborators,
     toAwsClientError,
@@ -48,8 +49,16 @@ function fakeSender(handler: (command: unknown) => unknown): Sender & { calls: u
 }
 const regional = (client: Sender, account = A) => (): RegionalClient => ({ client, account });
 
+beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected metadata request'); }));
+    for (const method of ['info', 'log', 'warn', 'error', 'debug'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('ezil.aws-credential-source-logged')];
+});
 afterEach(() => {
     delete (globalThis as Record<symbol, unknown>)[REQUEST_CONTEXT];
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
 });
 
 describe('error mapping', () => {
@@ -298,6 +307,7 @@ describe('EC2 enrollment describer', () => {
 
 const ROLE_MUMBAI = `arn:aws:iam::${A}:role/ezil/pilot/ezil-app-caller-aps1`;
 const ENV_ON = {
+    VERCEL: '1',
     EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_REGIONS: `ap-south-1,${R}`, EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
     [appCallerRoleEnv(R)]: ROLE, [appCallerRoleEnv('ap-south-1')]: ROLE_MUMBAI,
 };
@@ -478,5 +488,160 @@ describe('findComputerResources: the evidence an UNCONFIRMED placement that reco
         const ec2 = fakeSender(() => ({}));
         await expect(createEc2EnrollmentDescriber(regional(ec2)).findComputerResources(R, 'not-a-uuid')).rejects.toMatchObject({ awsName: 'ComputerIdInvalid' });
         expect(ec2.calls).toEqual([]);
+    });
+});
+
+const EC2_ENV = { ...ENV_ON, VERCEL: undefined };
+const INSTANCE_CREDS = {
+    Code: 'Success', AccessKeyId: 'ASIAINSTANCEKEY', SecretAccessKey: 'instance-secret', Token: 'instance-session', Expiration: '2099-01-01T00:00:00Z',
+};
+function mockInstanceMetadata() {
+    const fetch = vi.fn<typeof globalThis.fetch>()
+        .mockResolvedValueOnce(new Response('imds-token'))
+        .mockResolvedValueOnce(new Response('host-role'))
+        .mockResolvedValueOnce(new Response(JSON.stringify(INSTANCE_CREDS)));
+    vi.stubGlobal('fetch', fetch);
+    return fetch;
+}
+const ASSUME_XML = STS_XML.replaceAll('AssumeRoleWithWebIdentity', 'AssumeRole');
+const workFor = (region: string) => ({ stateMachineArn: VERSION.replace(R, region), name: NAME, input: '{}' });
+
+describe('credential source selection and regional EC2 caller sessions', () => {
+    it.each(['success', 'missing token', 'STS refusal'])('VERCEL=1 uses only OIDC (%s), never IMDS', async (scenario) => {
+        const sts = fakeSender(() => {
+            if (scenario === 'STS refusal') throw awsError('AccessDenied');
+            return STS_OK(new Date('2099-01-01'));
+        });
+        const stsFactory = vi.fn(() => sts);
+        const token = vi.fn(() => scenario === 'missing token' ? null : 'oidc-secret');
+        const sfn = (_region: string, credentials: () => Promise<unknown>) => fakeSender(async () => { await credentials(); return {}; });
+        const c = createAwsSdkCollaborators(ENV_ON, { sts: stsFactory, token, sfn });
+        const attempt = c.starter!.start(R, workFor(R));
+        if (scenario === 'success') await attempt;
+        else await expect(attempt).rejects.toMatchObject({ code: 'aws_caller_unavailable' });
+        expect(token).toHaveBeenCalledTimes(1);
+        expect(fetch).not.toHaveBeenCalled();
+        expect(sts.calls.every((command) => cmdName(command) === 'AssumeRoleWithWebIdentityCommand')).toBe(true);
+        if (scenario !== 'missing token') expect(input(sts.calls[0])).toEqual({
+            RoleArn: ROLE, RoleSessionName: `ezil-app-${R}`, WebIdentityToken: 'oidc-secret', DurationSeconds: 3600,
+        });
+        expect(console.info).toHaveBeenCalledExactlyOnceWith('vercel-oidc');
+    });
+
+    it.each([undefined, '0'])('off Vercel (%s): IMDS signs STS, each regional app-caller signs SFN, with no ambient/OIDC fallback', async (vercel) => {
+        const fetch = mockInstanceMetadata();
+        vi.stubEnv('AWS_ACCESS_KEY_ID', 'AKIAAMBIENT');
+        vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'ambient-secret');
+        vi.stubEnv('AWS_SESSION_TOKEN', 'ambient-session');
+        const token = vi.fn(() => { throw new Error('OIDC must not be read'); });
+        const http = stubHttp((req) => req.hostname.startsWith('sts.')
+            ? { headers: { 'content-type': 'text/xml' }, body: ASSUME_XML }
+            : { headers: { 'content-type': 'application/x-amz-json-1.0' }, body: JSON.stringify({ executionArn: EXECUTION, startDate: 1791936000 }) });
+        const c = createAwsSdkCollaborators({ ...EC2_ENV, VERCEL: vercel }, { token, requestHandler: http.handler });
+        for (const region of ['ap-south-1', R]) await c.starter!.start(region, workFor(region));
+        await c.starter!.start(R, workFor(R));
+        const sts = http.requests.filter((req) => req.hostname.startsWith('sts.'));
+        expect(sts).toHaveLength(2);
+        for (const [i, region] of ['ap-south-1', R].entries()) {
+            const req = sts[i]!;
+            expect(req.hostname).toBe(`sts.${region}.amazonaws.com`);
+            const params = new URLSearchParams(req.body);
+            expect(params.get('Action')).toBe('AssumeRole');
+            expect(params.get('RoleArn')).toBe(region === R ? ROLE : ROLE_MUMBAI);
+            expect(params.get('RoleSessionName')).toMatch(/^ezil-os-ec2-[a-f0-9]{12}$/);
+            expect(params.get('DurationSeconds')).toBe('900');
+            expect(params.has('WebIdentityToken')).toBe(false);
+            expect(req.headers.authorization).toContain('Credential=ASIAINSTANCEKEY/');
+            expect(req.headers.authorization).toContain(`/${region}/sts/aws4_request`);
+            expect(req.headers['x-amz-security-token']).toBe('instance-session');
+        }
+        const sfn = http.requests.filter((req) => req.hostname.startsWith('states.'));
+        expect(sfn).toHaveLength(3);
+        for (const req of sfn) {
+            expect(req.headers.authorization).toContain('Credential=ASIAASSUMEDKEY/');
+            expect(req.headers['x-amz-security-token']).toBe('assumed-session');
+        }
+        expect(fetch).toHaveBeenCalledTimes(3);
+        expect(token).not.toHaveBeenCalled();
+        expect(JSON.stringify(http.requests)).not.toContain('AKIAAMBIENT');
+        expect(console.info).toHaveBeenCalledExactlyOnceWith('ec2-instance-role');
+        const logs = JSON.stringify(['info', 'log', 'warn', 'error', 'debug'].map((method) => vi.mocked(console[method as 'info']).mock.calls));
+        for (const secret of ['ASIAINSTANCEKEY', 'instance-secret', 'instance-session', 'ASIAASSUMEDKEY', 'assumed-secret', 'assumed-session', 'imds-token']) {
+            expect(logs).not.toContain(secret);
+        }
+    });
+
+    it('unreachable IMDS fails with the typed error before STS or downstream HTTP, even with env keys', async () => {
+        vi.stubEnv('AWS_ACCESS_KEY_ID', 'AKIAAMBIENT');
+        vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'ambient-secret');
+        const fetch = vi.fn().mockRejectedValue(new Error('instance-secret'));
+        vi.stubGlobal('fetch', fetch);
+        const token = vi.fn(() => 'oidc-secret');
+        const http = stubHttp(() => ({ body: '{}' }));
+        const c = createAwsSdkCollaborators(EC2_ENV, { token, requestHandler: http.handler });
+        const error = await c.starter!.start(R, workFor(R)).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(AwsClientError);
+        expect(error).toMatchObject({ code: 'credentials_unavailable' });
+        expect(http.requests).toHaveLength(0);
+        expect(token).not.toHaveBeenCalled();
+        expect(console.info).toHaveBeenCalledExactlyOnceWith('ec2-instance-role');
+        expect(String(error)).not.toContain('instance-secret');
+    });
+
+    it('missing ARN preserves disabled collaborators and a later removed ARN fails with the original typed error', async () => {
+        const http = stubHttp(() => ({ body: '{}' }));
+        expect(createAwsSdkCollaborators({ ...EC2_ENV, [appCallerRoleEnv(R)]: undefined }, { requestHandler: http.handler })).toEqual({});
+        const env: Record<string, string | undefined> = { ...EC2_ENV };
+        const c = createAwsSdkCollaborators(env, { requestHandler: http.handler });
+        delete env[appCallerRoleEnv(R)];
+        const error = await c.starter!.start(R, workFor(R)).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(AwsClientError);
+        expect(error).toMatchObject({ code: 'aws_config', awsName: 'AppCallerRoleUnset' });
+        expect(fetch).not.toHaveBeenCalled();
+        expect(http.requests).toHaveLength(0);
+    });
+
+    it('changing VERCEL rebuilds shared collaborators', () => {
+        expect(sharedAwsSdkCollaborators(ENV_ON)).not.toBe(sharedAwsSdkCollaborators(EC2_ENV));
+    });
+
+    it('logs only the source once across separate collaborator instances and failures', async () => {
+        const token = vi.fn(() => null);
+        const sfn = (_region: string, credentials: () => Promise<unknown>) => fakeSender(async () => { await credentials(); return {}; });
+        for (let i = 0; i < 2; i++) {
+            const c = createAwsSdkCollaborators(ENV_ON, { token, sfn, sts: () => fakeSender(() => ({})) });
+            await expect(c.starter!.start(R, workFor(R))).rejects.toMatchObject({ code: 'aws_caller_unavailable' });
+        }
+        expect(console.info).toHaveBeenCalledExactlyOnceWith('vercel-oidc');
+    });
+});
+
+describe('EC2 app-caller credential cache', () => {
+    it('coalesces requests, caches until exactly five minutes before expiry, then refreshes', async () => {
+        let now = NOW;
+        const sts = fakeSender(() => STS_OK(new Date(now.getTime() + 900_000)));
+        const provider = instanceRoleCallerCredentials({ roleArn: ROLE, sts, now: () => now });
+        const [first, concurrent] = await Promise.all([provider(), provider()]);
+        expect(concurrent).toBe(first);
+        expect(sts.calls).toHaveLength(1);
+        now = new Date(first.expiration.getTime() - CREDENTIAL_MARGIN_MS - 1);
+        expect(await provider()).toBe(first);
+        now = new Date(first.expiration.getTime() - CREDENTIAL_MARGIN_MS);
+        expect(await provider()).not.toBe(first);
+        expect(sts.calls).toHaveLength(2);
+        expect(input(sts.calls[0]).RoleSessionName).not.toBe(input(sts.calls[1]).RoleSessionName);
+    });
+
+    it.each([['AccessDenied', 'aws_caller_unavailable'], ['Throttling', 'aws_throttled']])('maps STS %s to %s and does not cache failures', async (name, code) => {
+        const sts = fakeSender(() => { throw awsError(name); });
+        const provider = instanceRoleCallerCredentials({ roleArn: ROLE, sts });
+        await expect(provider()).rejects.toMatchObject({ code });
+        await expect(provider()).rejects.toMatchObject({ code });
+        expect(sts.calls).toHaveLength(2);
+    });
+
+    it.each([{}, STS_OK(new Date('invalid')), STS_OK(NOW)])('refuses missing or invalid/expired STS credentials', async (response) => {
+        const provider = instanceRoleCallerCredentials({ roleArn: ROLE, sts: fakeSender(() => response), now: () => NOW });
+        await expect(provider()).rejects.toMatchObject({ code: 'aws_caller_unavailable', awsName: 'StsCredentialsIncomplete' });
     });
 });
