@@ -271,9 +271,30 @@ try {
   check('terminal tool requires confirmation in the UI', true);
   check('terminal command has not run before confirmation', file('terminal-confirmed.txt') === '');
   await page.screenshot({ path: join(OUT, 'terminal-confirmation.png') });
-  // 1.141 renders the confirmation's buttons beside, not inside, the text block matched above.
-  await aux.locator('.chat-confirmation-widget-container .monaco-button, .chat-confirmation-widget2 .monaco-button, .chat-confirmation-widget-buttons .monaco-button')
-    .filter({ hasText: /^\s*(Allow|Continue|Run)\s*$/i }).first().click();
+  // Approve the pending terminal tool. 1.141's markup differs from 1.139's; try accessible names first
+  // and dump what the confirmation offers if nothing matches, so a failure is diagnosable.
+  const approve = async () => {
+    const candidates = [
+      aux.getByRole('button', { name: /^(Allow|Continue|Run)\b/i }),
+      page.getByRole('button', { name: /^(Allow|Continue|Run)\b/i }),
+      aux.locator('.monaco-button, a[role="button"], button').filter({ hasText: /^\s*(Allow|Continue|Run)\b/i }),
+    ];
+    for (const candidate of candidates) {
+      const all = await candidate.all();
+      for (const button of all) {
+        if (!(await button.isVisible().catch(() => false))) continue;
+        // A covering element (tips, hovers) makes a normal click wait forever: fall back to force, then keyboard.
+        if (await button.click({ timeout: 5000 }).then(() => true, () => false)) return;
+        if (await button.click({ force: true, timeout: 5000 }).then(() => true, () => false)) return;
+        if (await button.focus().then(() => page.keyboard.press('Enter')).then(() => true, () => false)) return;
+      }
+    }
+    const names = await aux.locator('[role="button"], button, .monaco-button').evaluateAll(els => els.map(e => (e.getAttribute('aria-label') || e.textContent || '').trim()).filter(Boolean));
+    writeFileSync(join(OUT, 'confirmation-buttons.json'), JSON.stringify(names, null, 2));
+    writeFileSync(join(OUT, 'confirmation.html'), await confirmation.evaluate(e => e.closest('.interactive-item-container, .chat-tool-invocation-part, .monaco-list-row')?.outerHTML ?? e.outerHTML).catch(() => ''));
+    throw new Error('no Allow/Continue/Run button for the terminal confirmation: ' + JSON.stringify(names).slice(0, 300));
+  };
+  await approve();
   await until(async () => (await transcript()).includes('EZIL_E2E_DONE') && !await busy(), 'agent completion');
   check('agent created hello.txt', file('hello.txt') === 'hi\n');
   check('agent edited existing.txt', file('existing.txt') === 'after\n');
