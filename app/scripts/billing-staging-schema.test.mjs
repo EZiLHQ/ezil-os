@@ -69,8 +69,8 @@ test('query routing overrides and malformed URLs are refused', () => {
 });
 
 test('ordering is explicit, independent of directory order, and appends optional v3 once', () => {
-    const drizzle = EXPLICIT_FILES.slice(0, 6).map((file) => file.split('/').at(-1)).reverse();
-    const placement = EXPLICIT_FILES.slice(6).map((file) => file.split('/').at(-1)).reverse();
+    const drizzle = EXPLICIT_FILES.filter((file) => file.startsWith('app/drizzle/')).map((file) => file.split('/').at(-1)).reverse();
+    const placement = EXPLICIT_FILES.filter((file) => file.startsWith('docs/')).map((file) => file.split('/').at(-1)).reverse();
     assert.deepEqual(orderFiles(drizzle, placement), EXPLICIT_FILES);
     assert.deepEqual(orderFiles([...drizzle, '0007_billing_v3.sql', 'meta', '0006_billing_v3.sql', 'other.sql', '0007_billing_v3.sql'], placement),
         [...EXPLICIT_FILES, 'app/drizzle/0006_billing_v3.sql', 'app/drizzle/0007_billing_v3.sql']);
@@ -231,4 +231,92 @@ test('a failed migration stops immediately and never attempts later files', () =
     assert.match(output.join('\n'), /stopped without retry/);
     assert.equal(output.join('\n').includes(': applied'), false);
     assert.equal(output.join('\n').includes(password), false);
+});
+
+const previewId = '7568749223372036854'; // Deliberately larger than JS's safe integer.
+const previewUrl = `postgres://postgres:${password}@127.0.0.1:15432/postgres`;
+const previewArgs = ['--target', 'aws-preview', '--expect-system-id', previewId];
+function previewHarness(actual = previewId) {
+    const h = harness([], { BILLING_STAGING_DATABASE_URL: previewUrl, PGHOSTADDR: '10.63.20.1' });
+    const original = h.options.spawnSyncImpl;
+    h.options.spawnSyncImpl = (...args) => {
+        const result = original(...args);
+        if (args[1].includes('SELECT system_identifier FROM pg_control_system();')) result.stdout = `${actual}\n`;
+        return result;
+    };
+    return h;
+}
+
+test('aws-preview accepts only the exact tunnel or private preview host and explicit port', () => {
+    for (const host of ['127.0.0.1:15432', 'localhost:15432', '10.61.20.35:5432']) {
+        assert.doesNotThrow(() => validateDatabaseUrl(`postgres://postgres@${host}/postgres`, 'aws-preview'));
+    }
+    for (const host of ['127.0.0.1:5432', 'localhost', 'localhost:15433', '10.61.20.35',
+        '10.61.20.35:15432', '10.63.20.35:5432', '13.203.99.168:5432', '127.1:15432',
+        'localhost.example:15432', '[::1]:15432']) {
+        assert.throws(() => validateDatabaseUrl(`postgres://postgres@${host}/postgres`, 'aws-preview'));
+    }
+    assert.throws(() => validateDatabaseUrl(direct, 'aws-preview'));
+    assert.throws(() => validateDatabaseUrl(`${previewUrl}?host=10.63.20.35`, 'aws-preview'));
+    for (const ref of ['btgqfmnzycdecmeyqubx', 'curomaahbwlrddzijatd']) {
+        assert.throws(() => validateDatabaseUrl(previewUrl.replace(password, ref), 'aws-preview'), /forbidden/);
+        assert.throws(() => validateDatabaseUrl(previewUrl.replace(password, `%${ref.charCodeAt(0).toString(16)}${ref.slice(1)}`), 'aws-preview'), /forbidden/);
+    }
+});
+
+test('targets and system-id arguments fail closed before any SQL', () => {
+    assert.equal(parseArgs(['--target', 'ezil-os-awstest', 'plan']).target, 'ezil-os-awstest');
+    for (const args of [['--target', 'aws-preview'], ['--target', 'production'],
+        ['--target'], ['--expect-system-id', previewId],
+        [...previewArgs, '--target', 'aws-preview'],
+        ...['', '1e10', '-123', '123.0', "123'; SELECT 1"].map(id => ['--target', 'aws-preview', '--expect-system-id', id])]) {
+        const h = previewHarness();
+        assert.equal(run(args, h.options), 1);
+        assert.equal(h.calls.length, 0);
+    }
+    const h = previewHarness();
+    h.options.env.BILLING_STAGING_DATABASE_URL = undefined;
+    assert.equal(run(previewArgs, h.options), 1, 'preview never offers an unpinned offline plan');
+    assert.equal(h.calls.length, 0);
+});
+
+test('preview system identifier mismatch or malformed output blocks all modes before writes', () => {
+    for (const mode of [['plan'], ['apply', '--yes'], ['baseline', files[0].file, '--yes']]) {
+        for (const actual of ['7568749223372036855', '', 'garbage', `${previewId}\n${previewId}`]) {
+            const h = previewHarness(actual);
+            assert.equal(run([...mode, ...previewArgs], h.options), 1);
+            assert.equal(h.calls.length, 1);
+            assert.equal(h.calls[0].args.at(-1), 'SELECT system_identifier FROM pg_control_system();');
+            assert.match(h.output.join('\n'), /identifier mismatch/);
+            assert.equal(h.output.join('\n').includes(password), false);
+        }
+    }
+});
+
+test('preview pins before the log and inside every subsequent plan/apply/baseline connection', () => {
+    for (const mode of [['plan'], ['apply', '--yes'], ['baseline', files[0].file, '--yes']]) {
+        const h = previewHarness();
+        assert.equal(run([...mode, ...previewArgs], h.options), 0);
+        assert.equal(h.calls[0].args.at(-1), 'SELECT system_identifier FROM pg_control_system();');
+        assert.ok(h.calls.length >= 3);
+        for (const { args, settings } of h.calls.slice(1)) {
+            const guardIndex = args.findIndex(arg => arg.startsWith('DO $pin$'));
+            assert.ok(guardIndex > 0);
+            assert.ok(args[guardIndex].includes(previewId));
+            assert.ok(guardIndex < args.length - 1);
+            if (args.includes('-f')) assert.ok(guardIndex < args.indexOf('-f'));
+            assert.equal(settings.env.PGHOST, '127.0.0.1');
+            assert.equal(settings.env.PGPORT, '15432');
+            assert.equal(settings.env.PGHOSTADDR, undefined);
+            assert.equal(settings.env.PGSSLMODE, 'disable');
+        }
+    }
+});
+
+test('a failed preview pin query stops immediately without exposing child diagnostics', () => {
+    const h = previewHarness();
+    h.options.spawnSyncImpl = () => ({ status: 1, stdout: '', stderr: previewUrl });
+    assert.equal(run(previewArgs, h.options), 1);
+    assert.equal(h.output.join('\n').includes(password), false);
+    assert.ok(EXPLICIT_FILES.includes('app/drizzle/0006_compute_migrations.sql'));
 });
