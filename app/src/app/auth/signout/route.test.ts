@@ -4,7 +4,11 @@
  * status, the destination and which cookies are expired by hand — not that
  * Supabase's own cookie writes land on the response.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('server-only', () => ({}));
+beforeEach(() => { vi.stubEnv('AUTH0_CLIENT_ID', ''); vi.stubEnv('AUTH0_SECRET_ID', ''); });
+afterEach(() => vi.unstubAllEnvs());
 
 const stub = vi.hoisted(() => ({
     scopes: [] as (string | undefined)[],
@@ -72,5 +76,29 @@ describe('POST /auth/signout', () => {
     it('exports no GET: an <img src> must not be able to sign anyone out', async () => {
         const route = await import('./route');
         expect('GET' in route).toBe(false);
+    });
+});
+
+describe('Auth0 sign-out', () => {
+    it('ends Supabase locally before redirecting through the fixed OIDC logout endpoint', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'private-secret');
+        stub.scopes = []; stub.error = null;
+        const response = await POST(signOutRequest());
+        const url = new URL(response.headers.get('location')!);
+        expect(response.status).toBe(303);
+        expect(stub.scopes).toEqual(['local']);
+        expect(url.origin + url.pathname).toBe('https://id.ezil.work/oidc/logout');
+        expect(Object.fromEntries(url.searchParams)).toEqual({ client_id: 'test-client', post_logout_redirect_uri: `${ORIGIN}/login` });
+        expect(url.toString()).not.toContain('private-secret');
+    });
+    it('still logs out of Auth0 and clears cookies without logging provider details on Supabase error', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'private-secret');
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.error = { message: 'private-secret private-user@example.com' };
+        const response = await POST(signOutRequest('__Host-ezil-os-auth=token'));
+        expect(new URL(response.headers.get('location')!).pathname).toBe('/oidc/logout');
+        expect(response.cookies.get('__Host-ezil-os-auth')?.maxAge).toBe(0);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('private-');
+        warn.mockRestore();
     });
 });
