@@ -110,6 +110,7 @@ function simulateCodeServerEnsureOrigin(headers: Record<string, string>, origin:
 function fakeSandboxNamespace(options: {
   exposedPorts?: Array<{ port: number; url: string; status: string }>;
   imageId?: string | null;
+  getImageId?: () => Promise<string | null>;
   terminateResult?: Record<string, unknown>;
   /** Upstream response the fake container returns for `containerFetch`. */
   containerResponse?: () => Response;
@@ -297,7 +298,7 @@ function fakeSandboxNamespace(options: {
       calls.getExposedPortHosts.push(args[0] as string);
       return options.exposedPorts ?? [];
     },
-    getImageId: async () => options.imageId ?? null,
+    getImageId: options.getImageId ?? (async () => options.imageId ?? null),
     exec: async (...args: unknown[]) => {
       calls.exec++;
       const [command] = args as [string | undefined];
@@ -664,6 +665,25 @@ describe('DELETE /sandbox/:name reports what actually happened', () => {
 // ── GET /sandbox/:name/status — the confirmation signal ─────────────────────
 
 describe('GET /sandbox/:name/status tells the truth for a neko desktop', () => {
+  it('keeps healthy status when reading optional image metadata rejects', async () => {
+    const { binding, calls } = fakeSandboxNamespace({
+      exposedPorts: [{ port: 8181, url: 'https://8181-x-nekodesktop.ezil.org', status: 'active' }],
+      getImageId: async () => { throw new Error('storage unavailable'); },
+    });
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/status`),
+      { Sandbox: binding },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true, sandboxName: SANDBOX_NAME, guacamoleRunning: true, mode: 'neko',
+      desktopRunning: true, runningModes: ['neko'], modeSource: 'detected', imageId: null,
+    });
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch).toEqual([]);
+    expect(calls.startProcess).toEqual([]);
+  });
+
   it('returns the stored imageId without container I/O or a start', async () => {
     const { binding, calls } = fakeSandboxNamespace({ imageId: 'ezil-os:2026.10_20-build' });
     const res = await worker.fetch(

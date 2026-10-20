@@ -116,11 +116,38 @@ describe('running container image ID storage', () => {
     hydrate: async (fake: Awaited<ReturnType<typeof imageFake>>['fake']) => {
       const result = await fake.hydrateWorkspace({ mountPath: MOUNT_PATH, prefix });
       expect(result.mounted).toBe(true);
+      return result;
     },
     flush: async (fake: Awaited<ReturnType<typeof imageFake>>['fake']) => fake.runSystemFlush(fake.env.SANDBOX_WORKSPACE_R2_BUCKET, prefix, true),
   };
 
   for (const [name, operation] of Object.entries(operations)) {
+    it(`${name} preserves its successful outcome when image metadata storage rejects`, async () => {
+      const control = await imageFake(validId);
+      const expected = await operation(control.fake);
+      const { fake, store, commands } = await imageFake(validId);
+      const put = fake.ctx.storage.put;
+      fake.ctx.storage.put = async (key: string, value: unknown) => {
+        if (key === imageKey) throw new Error('private upstream details must not be logged');
+        return put(key, value);
+      };
+      const log = spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        expect(await operation(fake)).toEqual(name === 'flush'
+          ? { ...expected, checkpoint: expect.any(String) } : expected);
+        expect(commands).toEqual(control.commands);
+        expect(store.has(imageKey)).toBe(false);
+        expect(log.mock.calls.filter(([line]) => String(line).startsWith('[image_id]')))
+          .toEqual([['[image_id] could not record running image']]);
+        expect(JSON.stringify(log.mock.calls)).not.toContain('private upstream details');
+        if (name === 'flush') {
+          expect(expected.ok).toBe(true);
+          expect(store.get('ezil:systemLastFlushAt')).toEqual(expect.any(Number));
+          expect(store.get('ezil:systemTooLarge')).toBe(false);
+        }
+      } finally { log.mockRestore(); }
+    });
+
     it(`${name} stores valid image IDs, including the 1 and 128 character boundaries`, async () => {
       for (const imageId of [validId, 'a', 'Z'.repeat(128)]) {
         const { fake, store, commands } = await imageFake(imageId);

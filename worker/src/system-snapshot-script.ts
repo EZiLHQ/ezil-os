@@ -53,6 +53,8 @@ ROOTS = ['/usr', '/etc', '/opt', '/var/lib/dpkg', '/var/lib/apt', '/root', '/hom
 # Caches, logs, per-boot platform files and anything credential-like the
 # platform writes at boot. Persisting browser logins is a separate decision.
 EXCLUDE = [
+    # Baked identity and inventories belong to the receiving image, never the user's layer.
+    '/etc/ezil-image-id', IMAGE_MANIFEST, '/etc/ezil-image-apt-manual.txt', '/etc/ezil-image-npm-global.txt',
     STATE, '/var/lib/apt/lists', '/var/lib/dpkg/lock', '/var/lib/dpkg/lock-frontend', '/var/lib/apt/lists/lock',
     '/etc/hostname', '/etc/hosts', '/etc/resolv.conf', '/etc/mtab', '/etc/machine-id', '/etc/neko',
     '/root/.cache', '/root/.npm/_cacache', '/root/.npm/_logs', '/root/.bun/install/cache', '/root/.config/chromium',
@@ -275,7 +277,8 @@ def capture(path):
         with open(BASELINE_MISSING) as f: missing_at_baseline = set(json.load(f))
     except (OSError, ValueError): missing_at_baseline = set()
     _, previously_deleted = load_manifest()
-    deleted = sorted((missing_image_paths(image) - missing_at_baseline) | {p for p in previously_deleted if not os.path.lexists(p)})
+    deleted = sorted((missing_image_paths(image) - missing_at_baseline) | {
+        p for p in previously_deleted if in_roots(p) and not excluded(p) and not os.path.lexists(p)})
     assert len(deleted) <= MAX_DELETED, 'snapshot entry limit'
     logical = hashlib.sha256()
     entries = 0
@@ -393,8 +396,9 @@ def merged_dpkg_status(snapshot_text):
     return ('\n\n'.join(blocks) + '\n').encode('utf-8', 'surrogateescape')
 
 def restore():
+    receiving_image_id = image_id()
     if os.path.exists(MANIFEST):
-        print(json.dumps({'skipped': 'already_restored', 'imageId': image_id()}))
+        print(json.dumps({'skipped': 'already_restored', 'imageId': receiving_image_id}))
         return
     archive = os.path.join(work, 'archive.tar')
     digest = hashlib.sha256()
@@ -405,7 +409,7 @@ def restore():
             out.write(data)
             digest.update(data)
     assert digest.hexdigest() == p['snapshot'].get('archiveSha256', p['snapshot']['sha256']), 'corrupt archive'
-    same_image = p['snapshot'].get('imageId') == image_id() and image_id() != 'unknown'
+    same_image = p['snapshot'].get('imageId') == receiving_image_id and receiving_image_id != 'unknown'
     image_names, image_owned = (set(), set()) if same_image else image_packages()
     locks = hold_package_locks(block=True) or []
     restored, skipped, conflicts, times = [], 0, 0, []
@@ -483,10 +487,10 @@ def restore():
     for fd in locks: os.close(fd)
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     with open(MANIFEST + '.tmp', 'w') as f:
-        json.dump({'paths': restored, 'deleted': deleted, 'imageId': image_id(), 'snapshotImageId': p['snapshot'].get('imageId'), 'restoredAt': time.time()}, f)
+        json.dump({'paths': restored, 'deleted': deleted, 'imageId': receiving_image_id, 'snapshotImageId': p['snapshot'].get('imageId'), 'restoredAt': time.time()}, f)
     os.replace(MANIFEST + '.tmp', MANIFEST)
     mark_hydrated(p['snapshot'].get('generation'))
-    print(json.dumps({'restored': len(restored), 'skippedImageScoped': skipped, 'conflicts': conflicts, 'sameImage': same_image, 'imageId': image_id()}))
+    print(json.dumps({'restored': len(restored), 'skippedImageScoped': skipped, 'conflicts': conflicts, 'sameImage': same_image, 'imageId': receiving_image_id}))
 
 def baseline():
     os.makedirs(STATE, mode=0o700, exist_ok=True)

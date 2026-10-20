@@ -23,7 +23,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 // A monitor that invents a number is worse than no monitor, because it is
 // believed. So there is no estimation anywhere in this file:
 //
-//   * the linked computer comes from the boot payload the shell was handed.
+//   * the linked computer comes from the session's current selection.
 //   * the desktop's screen comes from `session.getScreen()` — an OBSERVATION
 //     of the live X display, not the last thing this side asked for. That
 //     distinction is the whole reason that route exists.
@@ -73,6 +73,10 @@ let screenError = null;
 let systemInfo = null;      // `computer.systemInfo`: recorded provider + reported image + configured size
 let systemInfoReason = null; // why it is null, when it is
 let refreshTimer = null;
+let systemInfoTimer = null;
+let computerId = null;
+let viewGeneration = 0;     // discard reads completed after a switch or tab close
+const SYSTEM_INFO_REFRESH_MS = 15_000;
 let nativeProvider = { configured: false, pending: false, error: '' };
 let nativeTools = null;
 let nativePreview = { message: '', pending: false, workspaceId: null, draft: '3000' };
@@ -121,20 +125,34 @@ function stopListening () {
 }
 
 /**
- * The computer this session is bound to.
- *
- * 🔴 From the `ctx` Settings hands every tab, NOT from `session.payload()`.
- * The other tabs already take it from there, and it is the only source that is
- * populated in every path that can open this window — a Settings window opened
- * without a full boot has no module-level payload to read, and this tab would
- * then report "unknown" for the one fact it exists to state.
+ * Follow switches made after Settings opened. The context also supports
+ * windows opened without a full boot/session payload.
  */
 let tabCtx = null;
 
 function linkedComputer () {
+    const current = typeof session.currentComputer === 'function' ? session.currentComputer() : null;
+    if ( current ) return current;
     if ( tabCtx && tabCtx.computer ) return tabCtx.computer;
     const p = typeof session.payload === 'function' ? session.payload() : null;
     return p && p.computer ? p.computer : null;
+}
+
+function syncComputer () {
+    const id = linkedComputer()?.id ?? null;
+    if ( id === computerId ) return false;
+    computerId = id;
+    viewGeneration++;
+    clearTimeout(systemInfoTimer);
+    systemInfoTimer = null;
+    systemInfo = systemInfoReason = screenObserved = screenError = vitals = null;
+    vitalsAt = 0;
+    paint();
+    return true;
+}
+
+function isCurrentRead (generation, id) {
+    return listening && generation === viewGeneration && id === linkedComputer()?.id;
 }
 
 /**
@@ -146,14 +164,17 @@ function linkedComputer () {
  */
 async function refreshScreen () {
     const computer = linkedComputer();
+    const generation = viewGeneration;
     if (isNative(tabCtx)) { screenObserved = null; screenError = null; paint(); return; }
     if ( ! computer || typeof session.getScreen !== 'function' ) {
         screenObserved = null;
         screenError = 'not available in this deployment';
+        paint();
         return;
     }
     try {
         const res = await session.getScreen(computer.id);
+        if ( ! isCurrentRead(generation, computer.id) ) return;
         if ( res && res.ok === true ) {
             screenObserved = { width: res.width, height: res.height };
             screenError = null;
@@ -162,6 +183,7 @@ async function refreshScreen () {
             screenError = describeScreenError(res && res.code, res && res.message);
         }
     } catch ( err ) {
+        if ( ! isCurrentRead(generation, computer.id) ) return;
         screenObserved = null;
         screenError = 'unreachable';
     }
@@ -173,7 +195,11 @@ async function refreshScreen () {
  * READ: the server never assigns a provider for this call.
  */
 async function refreshSystemInfo () {
+    syncComputer();
+    clearTimeout(systemInfoTimer);
+    systemInfoTimer = null;
     const computer = linkedComputer();
+    const generation = viewGeneration;
     if ( isNative(tabCtx) ) return;
     if ( ! computer || typeof session.getSystemInfo !== 'function' ) {
         systemInfo = null;
@@ -183,13 +209,19 @@ async function refreshSystemInfo () {
     }
     try {
         const res = await session.getSystemInfo(computer.id);
+        if ( ! isCurrentRead(generation, computer.id) ) return;
         systemInfo = res && res.ok === true ? res.info : null;
         systemInfoReason = res && res.ok === true ? null : (res && res.code) || 'UPSTREAM';
     } catch ( err ) {
+        if ( ! isCurrentRead(generation, computer.id) ) return;
         systemInfo = null;
         systemInfoReason = 'UPSTREAM';
     }
     paint();
+    const providerKnown = ['aws-ec2', 'cloudflare'].includes(systemInfo?.provider);
+    if ( ! providerKnown || ! describeImage(systemInfo).title ) {
+        systemInfoTimer = setTimeout(() => { void refreshSystemInfo(); }, SYSTEM_INFO_REFRESH_MS);
+    }
 }
 
 function row (label, value, hint) {
@@ -303,6 +335,7 @@ export default {
 
     init ($win, ctx) {
         tabCtx = ctx ?? tabCtx;
+        syncComputer();
         $win.off('submit.ezil-native-preview').on('submit.ezil-native-preview', '[data-native-preview-form]', async function (event) {
             event.preventDefault();
             if (!isNative(tabCtx) || nativePreview.pending) return;
@@ -338,6 +371,7 @@ export default {
     onActivate ($win, ctx) {
         tabCtx = ctx ?? tabCtx;
         startListening();
+        syncComputer();
         requestVitals(true);
         void refreshScreen();
         void refreshSystemInfo();
@@ -346,12 +380,18 @@ export default {
         // troubleshoot restart or a window resize changes it while this tab is
         // open, and a monitor showing a value from a minute ago is a monitor
         // that lies quietly.
-        if ( ! refreshTimer ) refreshTimer = setInterval(() => { void refreshScreen(); }, 10_000);
+        if ( ! refreshTimer ) refreshTimer = setInterval(() => {
+            if ( syncComputer() ) void refreshSystemInfo();
+            void refreshScreen();
+        }, 10_000);
     },
 
     onDeactivate () {
         requestVitals(false);
         stopListening();
+        viewGeneration++;
+        clearTimeout(systemInfoTimer);
+        systemInfoTimer = null;
         if ( refreshTimer ) { clearInterval(refreshTimer); refreshTimer = null; }
     },
 };

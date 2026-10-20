@@ -3293,9 +3293,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
 
   private async recordImageId(imageId: unknown): Promise<void> {
-    if (typeof imageId === 'string' && imageId.length > 0 && imageId.length <= 128
-        && !/[^A-Za-z0-9._:-]/.test(imageId) && this.containerIsRunning()) {
-      await this.ctx.storage.put(IMAGE_ID_KEY, imageId);
+    try {
+      if (typeof imageId === 'string' && imageId.length > 0 && imageId.length <= 128
+          && !/[^A-Za-z0-9._:-]/.test(imageId) && this.containerIsRunning()) {
+        await this.ctx.storage.put(IMAGE_ID_KEY, imageId);
+      }
+    } catch {
+      // Optional status metadata must never change a persistence outcome.
+      console.error('[image_id] could not record running image');
     }
   }
 
@@ -4756,6 +4761,8 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT),
     );
     const status = describeDesktopStatus(exposed, explicitMode, modeResult.mode);
+    let imageId: string | null = null;
+    try { imageId = await sandbox.getImageId(); } catch { /* Best-effort status metadata. */ }
     return json({
       ok: true,
       sandboxName,
@@ -4764,7 +4771,7 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       desktopRunning: status.desktopRunning,
       runningModes: status.runningModes,
       modeSource: status.modeSource,
-      imageId: await sandbox.getImageId(),
+      imageId,
     });
   } catch (err) {
     return json(
