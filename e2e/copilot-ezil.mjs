@@ -56,7 +56,9 @@ try {
 
 // A brand-new context = a cold browser profile: no IndexedDB, no storage
 // state, so the `ensureChatExtensionInitialDisabledState` path runs.
-const browser = await chromium.launch();
+// The e2e reaches code-server on a container bridge address over http, which is not a secure context
+// (no crypto.subtle) unlike production's https host; treat exactly that origin as secure.
+const browser = await chromium.launch({ args: [`--unsafely-treat-insecure-origin-as-secure=${new URL(process.env.EZIL_CODE_URL ?? 'http://127.0.0.1:8443').origin}`] });
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
   recordVideo: { dir: join(OUT, 'video'), size: { width: 1440, height: 900 } },
@@ -268,8 +270,9 @@ try {
   await page.screenshot({ path: join(OUT, 'after-send.png') });
   // 1.141 may show the pending terminal confirmation inline or docked above the input; match its command text.
   const confirmation = aux.locator('.chat-confirmation-widget-container, .chat-confirmation-widget2, [class*="confirmation"]').filter({ hasText: /terminal-confirmed/ })
-    .or(aux.getByText(/terminal-confirmed\.txt/)).first();
-  await confirmation.waitFor({ state: 'visible', timeout: T });
+    .or(aux.getByText(/terminal-confirmed\.txt/));
+  // Several elements carry the command text and the first in DOM order can be hidden: wait for any visible one.
+  await until(async () => { for (const c of await confirmation.all()) if (await c.isVisible().catch(() => false)) return true; return false; }, 'terminal confirmation visible');
   check('terminal tool requires confirmation in the UI', true);
   check('terminal command has not run before confirmation', file('terminal-confirmed.txt') === '');
   await page.screenshot({ path: join(OUT, 'terminal-confirmation.png') });
@@ -293,7 +296,7 @@ try {
     }
     const names = await aux.locator('[role="button"], button, .monaco-button').evaluateAll(els => els.map(e => (e.getAttribute('aria-label') || e.textContent || '').trim()).filter(Boolean));
     writeFileSync(join(OUT, 'confirmation-buttons.json'), JSON.stringify(names, null, 2));
-    writeFileSync(join(OUT, 'confirmation.html'), await confirmation.evaluate(e => e.closest('.interactive-item-container, .chat-tool-invocation-part, .monaco-list-row')?.outerHTML ?? e.outerHTML).catch(() => ''));
+    writeFileSync(join(OUT, 'confirmation.html'), await confirmation.first().evaluate(e => e.closest('.interactive-item-container, .chat-tool-invocation-part, .monaco-list-row')?.outerHTML ?? e.outerHTML).catch(() => ''));
     throw new Error('no Allow/Continue/Run button for the terminal confirmation: ' + JSON.stringify(names).slice(0, 300));
   };
   await approve();
