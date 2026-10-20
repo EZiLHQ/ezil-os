@@ -425,5 +425,116 @@ class GuardTests(RestoreFixture, unittest.TestCase):
         self.assertEqual(self.state(), {'state': 'failed', 'reason': 'restore_failed'})
         self.assertFalse((self.data / guard.MARKER).exists())
 
+
+
+class ReferenceTests(RestoreFixture, unittest.TestCase):
+    def reference(self, system=False):
+        self.set_archive([file()])
+        if system:
+            self.set_archive([file('root/file')], 'system')
+        self.heads = {k: copy.deepcopy(self.spec.get(k)) for k in ('workspace', 'system')}
+        self.spec = {'kind': 'cf-snapshot', 'migrationId': GEN2, 'generation': GEN,
+                     'fetchBase': 'https://export.test/base', 'identityToken': 'restore-token', 'system': system}
+        return restore.SnapshotClient({}, {'restore': self.spec})
+
+    def response(self, method, url, **kwargs):
+        self.assertEqual(method, 'GET')
+        self.assertEqual(kwargs['headers'], {'Authorization': 'Bearer restore-token'})
+        self.assertEqual(kwargs['timeout'], 20)
+        self.assertTrue(url.endswith('?generation=' + GEN))
+        kind = 'system' if '/system/' in url else 'workspace'
+        if '/head?' in url:
+            self.assertEqual(kwargs['response_limit'], restore.CHUNK)
+            if self.heads[kind] is None:
+                return 404, b''
+            return 200, json.dumps(self.heads[kind]).encode()
+        self.assertEqual(kwargs['response_limit'], restore.CHUNK + 1)
+        return 200, self.raw[kind]
+
+    def test_reference_roundtrip_with_both_heads_and_same_bearer(self):
+        client = self.reference(system=True)
+        with mock.patch.object(restore.http, 'request', side_effect=self.response) as req:
+            fetch = restore.http_fetch({}, client)
+            self.assertEqual(req.call_count, 2)
+            restore.run_restore(self.spec, str(self.data), fetch)
+        self.assertEqual(req.call_count, 4)
+        self.assertEqual((self.data / 'workspace/hello').read_bytes(), b'hello')
+        self.assertEqual((self.data / 'root/upper/root/file').read_bytes(), b'hello')
+        self.assertEqual(self.state()['state'], 'done')
+
+    def test_false_system_never_fetches_missing_404_system_head(self):
+        client = self.reference()
+        self.heads['system'] = None
+        with mock.patch.object(restore.http, 'request', side_effect=self.response) as req:
+            fetch = restore.http_fetch({}, client)
+            restore.run_restore(self.spec, str(self.data), fetch)
+        self.assertEqual(req.call_count, 2)
+        self.assertTrue(all('/system/' not in args[0][1] for args in req.call_args_list))
+        self.assertIsNone(self.spec['system'])
+
+    def test_generation_mismatch_in_either_head(self):
+        for kind in ('workspace', 'system'):
+            with self.subTest(kind=kind):
+                client = self.reference(system=True)
+                self.heads[kind]['generation'] = GEN2
+                with mock.patch.object(restore.http, 'request', side_effect=self.response):
+                    with self.assertRaisesRegex(Refused, 'generation_mismatch'):
+                        restore.http_fetch({}, client)
+                self.assertNotIn('workspace', self.spec)
+                self.assertFalse((self.data / restore.STATE).exists())
+
+    def test_missing_or_invalid_token_prevents_head_fetch(self):
+        for token in (None, '', 'bad\nvalue', 'bad\x7fvalue', 42):
+            client = self.reference()
+            client.token = token
+            with mock.patch.object(restore.http, 'request') as req:
+                with self.assertRaisesRegex(Refused, 'identity_token_missing'):
+                    restore.http_fetch({}, client)
+                req.assert_not_called()
+
+    def test_missing_required_system_head_fails(self):
+        client = self.reference(system=True)
+        self.heads['system'] = None
+        with mock.patch.object(restore.http, 'request', side_effect=self.response) as req:
+            with self.assertRaisesRegex(Refused, 'fetch_status'):
+                restore.http_fetch({}, client)
+        self.assertEqual(req.call_count, 2)
+        self.assertNotIn('workspace', self.spec)
+
+    def test_reference_scope_guards_before_fetch(self):
+        for key, value in (('generation', None), ('generation', '../bad'), ('system', None), ('system', 1), ('kind', 'other')):
+            client = self.reference()
+            self.spec[key] = value
+            with mock.patch.object(restore.http, 'request') as req:
+                with self.assertRaises(Refused):
+                    restore.http_fetch({}, client)
+                req.assert_not_called()
+
+    def test_malformed_and_oversized_heads(self):
+        for data, reason in ((b'not-json', 'head_invalid'), (b'null', 'head_invalid'),
+                             (b'{}', 'head_invalid'), (b'x' * (restore.CHUNK + 1), 'fetch_size')):
+            client = self.reference()
+            with mock.patch.object(restore.http, 'request', return_value=(200, data)):
+                with self.assertRaisesRegex(Refused, reason):
+                    restore.http_fetch({}, client)
+
+    def test_head_retry_policy_matches_chunks(self):
+        client = self.reference()
+        raw = json.dumps(self.heads['workspace']).encode()
+        with mock.patch.object(restore.http, 'request', side_effect=[TimeoutError(), (503, b''), (200, raw)]) as req, mock.patch.object(restore.time, 'sleep') as sleep:
+            restore.http_fetch({}, client)
+        self.assertEqual(req.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(2)])
+
+    def test_reference_keeps_chunk_integrity_checks(self):
+        client = self.reference()
+        with mock.patch.object(restore.http, 'request', side_effect=self.response):
+            fetch = restore.http_fetch({}, client)
+            self.raw['workspace'] = b'x' * len(self.raw['workspace'])
+            with self.assertRaisesRegex(Refused, 'chunk_sha256'):
+                restore.run_restore(self.spec, str(self.data), fetch)
+        self.assertFalse((self.data / 'workspace/hello').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

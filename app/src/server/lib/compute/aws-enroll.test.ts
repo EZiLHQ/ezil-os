@@ -69,6 +69,15 @@ describe('buildEnrollmentUserData (the host lease JSON)', () => {
         expect(() => buildEnrollmentUserData({ ...base, ...over })).toThrow(new EnrollmentUserDataError(reason));
     });
 
+    it('reference restore fits comfortably with the longest enrollment nonce and restore token', () => {
+        const restore = { kind: 'cf-snapshot' as const, migrationId: FS, generation: FS,
+            fetchBase: `https://app.example.test/api/compute/restore/${C1.toLowerCase()}`,
+            identityToken: '_'.repeat(43), system: true };
+        const encoded = buildEnrollmentUserData({ ...base, nonce: '_'.repeat(128), volumeId: null, provision: true, restore });
+        expect(encoded.length).toBeLessThan(USER_DATA_MAX / 2);
+        expect(decode(encoded).restore).toEqual(restore);
+    });
+
     it('stays inside the intent userData limit (4096 base64 chars); an oversized URL is refused', () => {
         expect(buildEnrollmentUserData({ ...base, volumeId: 'vol-11111111111111111', provision: false }).length).toBeLessThan(USER_DATA_MAX);
         const long = `https://${'a'.repeat(3100)}.example.test/api/compute/aws/enroll`;

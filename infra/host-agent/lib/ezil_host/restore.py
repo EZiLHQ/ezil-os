@@ -324,16 +324,17 @@ class SnapshotClient:
         self.cfg, self.lease = cfg, lease
         self.token = lease["restore"].get("identityToken")
 
-    def get(self, path, token):
+    def get(self, path, token, response_limit=CHUNK + 1):
         return http.request("GET", path, headers={"Authorization": "Bearer " + token},
                             timeout=20, ca_file=self.cfg.get("caFile"),
-                            server_name=self.cfg.get("tlsServerName"), response_limit=CHUNK + 1)
+                            server_name=self.cfg.get("tlsServerName"), response_limit=response_limit)
 
 
 def http_fetch(cfg, lease_client):
     """Return fetch(kind, index); four attempts, only 5xx/timeouts retried."""
     spec = lease_client.lease["restore"]
-    identity(spec)
+    if not isinstance(spec, dict) or spec.get("kind") != "cf-snapshot":
+        refuse("kind_invalid")
     base = spec.get("fetchBase", "")
     try:
         url = urllib.parse.urlsplit(base)
@@ -345,30 +346,58 @@ def http_fetch(cfg, lease_client):
     if not valid:
         refuse("fetch_url")
 
-    def fetch(kind, index):
-        if kind not in ("workspace", "system") or spec.get(kind) is None:
-            refuse("fetch_kind")
-        head = spec[kind]
-        if type(index) is not int or not 0 <= index < len(head["chunks"]):
-            refuse("fetch_index")
+    def request(path, limit=CHUNK + 1):
         token = lease_client.token
         if not isinstance(token, str) or not token or any(ord(c) < 32 or ord(c) == 127 for c in token):
             refuse("identity_token_missing")
-        # The export endpoint fences the HEAD generation; it resolves chunkGeneration.
-        path = base.rstrip("/") + f"/{kind}/chunk/{index}?generation=" + head["generation"]
         for attempt in range(4):
             try:
-                status, data = lease_client.get(path, token)
+                status, data = lease_client.get(path, token, response_limit=limit)
             except TimeoutError:
                 pass
             except Exception:
                 refuse("fetch_transport")
             else:
                 if status == 200:
+                    if not isinstance(data, bytes) or len(data) > limit:
+                        refuse("fetch_size")
                     return data
                 if not 500 <= status <= 599:
                     refuse("fetch_status")
             if attempt < 3:
                 time.sleep(2 ** attempt)
         refuse("fetch_exhausted")
+
+    if spec.get("workspace") is None:
+        generation = spec.get("generation")
+        if not isinstance(generation, str) or not GENERATION.fullmatch(generation):
+            refuse("generation_invalid")
+        if type(spec.get("system")) is not bool:
+            refuse("head_invalid")
+        heads = {"system": None}
+        for kind in ("workspace", "system") if spec["system"] else ("workspace",):
+            path = base.rstrip("/") + f"/{kind}/head?generation=" + generation
+            raw = request(path, CHUNK)
+            try:
+                h = json.loads(raw)
+            except (ValueError, UnicodeError):
+                refuse("head_invalid")
+            _head(h)
+            if h["generation"] != generation:
+                refuse("generation_mismatch")
+            heads[kind] = h
+        # Publish only after every head validates. guard.run_guard passes this same
+        # object to run_restore, retaining all existing archive and state checks.
+        spec.update(heads)
+    identity(spec)
+
+    def fetch(kind, index):
+        if kind not in ("workspace", "system") or spec.get(kind) is None:
+            refuse("fetch_kind")
+        head = spec[kind]
+        if type(index) is not int or not 0 <= index < len(head["chunks"]):
+            refuse("fetch_index")
+        # The export endpoint fences the HEAD generation; it resolves chunkGeneration.
+        path = base.rstrip("/") + f"/{kind}/chunk/{index}?generation=" + head["generation"]
+        return request(path)
     return fetch

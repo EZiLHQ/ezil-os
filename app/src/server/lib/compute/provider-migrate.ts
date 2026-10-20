@@ -74,8 +74,9 @@ export function reduceMigration(m: MigrationProgress, event: MigrationEvent): Mi
 
 export interface RestoreLease {
     kind: 'cf-snapshot';
-    workspace: SnapshotHead;
-    system: SnapshotHead | null;
+    migrationId: string;
+    generation: string;
+    system: boolean;
     fetchBase: string;
     identityToken: string;
 }
@@ -83,12 +84,13 @@ export function restoreFetchBase(appOrigin: string, computerId: string): string 
     if (!UUID.test(computerId)) throw new Error('invalid migration computer');
     return `${new URL(appOrigin).origin}/api/compute/restore/${computerId}`;
 }
-export function restoreLeaseFor(m: MigrationProgress & { computerId: string }, token: string, fetchBase: string): RestoreLease {
+export function restoreLeaseFor(m: MigrationProgress & { id: string; computerId: string }, token: string, fetchBase: string): RestoreLease {
     const url = new URL(fetchBase);
     if (!['exported', 'provisioning'].includes(m.state) || pendingRecovery(m) || !m.generation
+        || !UUID.test(m.id) || !UUID.test(m.computerId) || !UUID.test(m.generation)
         || !m.workspaceHead || m.workspaceHead.generation !== m.generation
         || !/^[A-Za-z0-9_-]{43}$/.test(token)
         || !['https:', 'http:'].includes(url.protocol) || url.username || url.password
         || url.search || url.hash || url.pathname !== `/api/compute/restore/${m.computerId}`) throw new Error('invalid migration restore lease');
-    return { kind: 'cf-snapshot', workspace: m.workspaceHead, system: m.systemHead, fetchBase, identityToken: token };
+    return { kind: 'cf-snapshot', migrationId: m.id, generation: m.generation, fetchBase, identityToken: token, system: m.systemHead !== null };
 }

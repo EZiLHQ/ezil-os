@@ -3221,3 +3221,118 @@ export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hma
         return { ok: true, runtimeId: data.runtimeId, expiresAt: data.expiresAt };
     } catch { return { ok: false, error: 'relay_refresh_unavailable' }; }
 }
+
+// Cloudflare snapshot migration uses the same v1 control signer as restart.
+export type MigrateKind = 'workspace' | 'system';
+export type MigrateResult<T> = { ok: true; data: T } | { ok: false; error: 'not_found' | 'conflict' | 'unavailable' };
+export interface MigrateBeginResult {
+    etag: string;
+    systemEtag: string | null;
+    generation: string;
+    chunkCount: number;
+    totalBytes: number;
+    sha256: string;
+}
+export interface MigrateCommitInput {
+    targetProvider: 'aws-ec2' | 'cloudflare';
+    expectedEtag: string;
+    expectedSystemEtag: string | null;
+}
+export const MIGRATE_HEAD_LIMIT = 1024 * 1024;
+export const MIGRATE_CHUNK_LIMIT = 1024 * 1024 + 1024;
+
+/** Limits bytes even without Content-Length; cancellation propagates upstream. */
+function boundedMigrationBody(response: Response, limit: number): Response {
+    const length = response.headers.get('content-length');
+    if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) {
+        void response.body?.cancel().catch(() => {});
+        throw new Error('migration_response_size');
+    }
+    if (!response.body) throw new Error('migration_response_empty');
+    const reader = response.body.getReader();
+    let bytes = 0;
+    return new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            try {
+                const next = await reader.read();
+                if (next.done) { controller.close(); return; }
+                bytes += next.value.byteLength;
+                if (bytes > limit) {
+                    void reader.cancel().catch(() => {});
+                    controller.error(new Error('migration_response_size'));
+                    return;
+                }
+                controller.enqueue(next.value);
+            } catch {
+                controller.error(new Error('migration_response_unavailable'));
+            }
+        },
+        cancel(reason) { return reader.cancel(reason); },
+    }), { status: response.status, headers: response.headers });
+}
+
+async function migrateRequest(name: string, action: string, body?: object, generation?: string): Promise<MigrateResult<Response>> {
+    const config = resolveCloudflareGuacamoleConfig();
+    const secret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+    if (!config.isConfigured || !secret) return { ok: false, error: 'unavailable' };
+    try {
+        const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(name)}/migrate/${action}`
+            + (generation === undefined ? '' : `?generation=${encodeURIComponent(generation)}`);
+        const method = body === undefined ? 'GET' : 'POST';
+        const payload = body === undefined ? '' : JSON.stringify(body);
+        const response = await fetch(endpoint, {
+            method,
+            headers: {
+                ...controlAuthHeaders(secret, { kind: 'v1' }, method, endpoint, payload),
+                'Content-Type': 'application/json', 'Accept-Encoding': 'identity',
+                [CORRELATION_HEADER]: newCorrelationId(),
+            },
+            ...(body === undefined ? {} : { body: payload }),
+            signal: AbortSignal.timeout(action === 'begin' ? 120_000 : 30_000),
+            cache: 'no-store', redirect: 'error',
+        });
+        if (!response.ok) {
+            void response.body?.cancel().catch(() => {});
+            return { ok: false, error: response.status === 404 ? 'not_found' : response.status === 409 ? 'conflict' : 'unavailable' };
+        }
+        return { ok: true, data: boundedMigrationBody(response, action.includes('/chunk/') ? MIGRATE_CHUNK_LIMIT : MIGRATE_HEAD_LIMIT) };
+    } catch {
+        // Do not propagate upstream messages or credentials into errors/logs.
+        return { ok: false, error: 'unavailable' };
+    }
+}
+
+async function migrateJson<T>(request: Promise<MigrateResult<Response>>, valid: (value: Record<string, unknown>) => boolean): Promise<MigrateResult<T>> {
+    const result = await request;
+    if (!result.ok) return result;
+    try {
+        const data: unknown = await result.data.json();
+        if (!data || typeof data !== 'object' || Array.isArray(data) || !valid(data as Record<string, unknown>))
+            return { ok: false, error: 'unavailable' };
+        return { ok: true, data: data as T };
+    } catch { return { ok: false, error: 'unavailable' }; }
+}
+
+export function migrateBegin(name: string): Promise<MigrateResult<MigrateBeginResult>> {
+    return migrateJson(migrateRequest(name, 'begin', {}), d => typeof d.etag === 'string'
+        && (d.systemEtag === null || typeof d.systemEtag === 'string') && typeof d.generation === 'string'
+        && Number.isSafeInteger(d.chunkCount) && Number.isSafeInteger(d.totalBytes) && typeof d.sha256 === 'string');
+}
+export function migrateCommit(name: string, input: MigrateCommitInput): Promise<MigrateResult<{ ok: true; systemFenced: boolean }>> {
+    return migrateJson(migrateRequest(name, 'commit', input), d => d.ok === true && typeof d.systemFenced === 'boolean');
+}
+export function migrateAbort(name: string): Promise<MigrateResult<{ ok: true }>> {
+    return migrateJson(migrateRequest(name, 'abort', {}), d => d.ok === true);
+}
+export function migrateReopen(name: string, input: { expectedMigratedEtag: string }): Promise<MigrateResult<{ ok: true }>> {
+    return migrateJson(migrateRequest(name, 'reopen', input), d => d.ok === true);
+}
+export function migrateExportHead(name: string, kind: MigrateKind): Promise<MigrateResult<import('./compute/provider-migrate').SnapshotHead>> {
+    return migrateJson(migrateExport(name, kind), d => typeof d.generation === 'string');
+}
+/** Streaming export for the host proxy; generation fences both head and chunk reads. */
+export function migrateExport(name: string, kind: MigrateKind, generation?: string, index?: number): Promise<MigrateResult<Response>> {
+    if (!['workspace', 'system'].includes(kind) || (index !== undefined && (!Number.isInteger(index) || index < 0 || index > 511)))
+        return Promise.resolve({ ok: false, error: 'unavailable' });
+    return migrateRequest(name, `export/${kind === 'system' ? 'system/' : ''}${index === undefined ? 'head' : `chunk/${index}`}`, undefined, generation);
+}
