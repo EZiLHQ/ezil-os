@@ -544,9 +544,9 @@ export interface CreatePlacementInput {
 
 export type CreatePlacementResult = { ok: true; placement: Placement } | { ok: false; reason: 'placement_exists' };
 
-async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput): Promise<CreatePlacementResult> {
+async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput, computerLocked = false): Promise<CreatePlacementResult> {
     const input = { ...rawInput, computerId: canonicalId(rawInput.computerId), ownerUserId: canonicalId(rawInput.ownerUserId) };
-    await lockComputer(tx, input.computerId);
+    if (!computerLocked) await lockComputer(tx, input.computerId);
     if ((await selectRows(tx, input.computerId)).length > 0) return { ok: false, reason: 'placement_exists' };
     const fields = input.fields ?? {};
     const keys = (Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[]).filter((k) => fields[k] !== undefined);
@@ -599,6 +599,54 @@ export async function createAwsPlacement(
     assertAdmissionLock(tx, lock);
     consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'create' });
     return createInTx(tx, { computerId: input.computerId, ownerUserId: input.ownerUserId, provider: 'aws-ec2', state: 'PROVISIONING', fields: input.fields });
+}
+
+export interface FlipPlacementToAwsInput {
+    computerId: string;
+    ownerUserId: string;
+    migrationId: string;
+    /** Receipt of the already admitted, restored AWS host. No new host is launched here. */
+    fields: PlacementFields & { region: 'ap-south-1'; instanceId: string; volumeId: string; fsUuid: string };
+}
+
+/** Retire/remove the old immutable row and publish the restored host atomically.
+ * The migration row lock also serializes this against migration state transitions.
+ * Admission for the actual launch belongs to the migration orchestrator; this is
+ * a publication of that existing host, under the global then computer lock order.
+ */
+export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInput): Promise<Placement> {
+    const computerId = canonicalId(input.computerId), ownerUserId = canonicalId(input.ownerUserId);
+    return withAdmission(db, async (tx) => {
+        await lockComputer(tx, computerId);
+        const migration = rowsOf(await tx.execute(sql`SELECT state, user_id::text, computer_id::text, to_provider, last_error
+            FROM public.ezil_compute_migrations WHERE id = ${input.migrationId}::uuid FOR UPDATE`))[0];
+        if (!migration || migration.state !== 'restored' || migration.user_id !== ownerUserId
+            || migration.computer_id !== computerId || migration.to_provider !== 'aws-ec2'
+            || String(migration.last_error ?? '').startsWith('recovery:')) throw new Error('migration_not_restored');
+        if (input.fields.region !== 'ap-south-1' || !input.fields.instanceId || !input.fields.volumeId || !input.fields.fsUuid) {
+            throw new Error('migration_aws_receipt_invalid');
+        }
+        const current = (await readPlacement(tx, computerId)).record;
+        if (current) {
+            if (current.provider !== 'cloudflare' || current.ownerUserId !== ownerUserId) throw new Error('migration_source_mismatch');
+            let retired = current;
+            for (const to of ['RETIRING', 'RETIRED'] as const) {
+                if (retired.state === 'RETIRED' || retired.state === to) continue;
+                if (!PLACEMENT_TRANSITIONS[retired.state].includes(to)) throw new Error('migration_source_not_retirable');
+                const result = await casInTx(tx, computerId, retired, to, { generation: 0, leaseEpoch: 0 }, {}, { ownerUserId, provider: 'cloudflare' });
+                if (!result.ok) throw new Error('migration_placement_conflict');
+                retired = result.placement;
+            }
+            const deleted = rowsOf(await tx.execute(sql`/* placement:migration-remove */ DELETE FROM public.ezil_computer_placements
+                WHERE computer_id = ${computerId}::uuid AND owner_user_id = ${ownerUserId}::uuid
+                    AND provider = 'cloudflare' AND state = 'RETIRED' AND generation = ${retired.generation} AND lease_epoch = ${retired.leaseEpoch}
+                RETURNING computer_id`));
+            if (deleted.length !== 1) throw new Error('migration_placement_conflict');
+        }
+        const created = await createInTx(tx, { computerId, ownerUserId, provider: 'aws-ec2', state: 'RUNNING', fields: input.fields }, true);
+        if (!created.ok) throw new Error('migration_placement_conflict');
+        return created.placement;
+    });
 }
 
 // ── Transitions (CAS) ────────────────────────────────────────────────────
