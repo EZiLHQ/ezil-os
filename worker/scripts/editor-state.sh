@@ -32,11 +32,106 @@ CODESERVER_SETTINGS_JSON
   return 1
 }
 
+# Machine settings belong to the image and are refreshed on every prepare.
+# User settings (including JSONC) continue through the existing restore path.
+seed_codeserver_machine_settings() {
+  local dst="$1/Machine/settings.json" temporary
+  mkdir -p "$(dirname "$dst")" || return 1
+  temporary="$(mktemp "${dst}.XXXXXX")" || return 1
+  if cat >"$temporary" <<'CODESERVER_MACHINE_SETTINGS_JSON'
+{
+  "chat.disableAIFeatures": false,
+  "chat.allowAnonymousAccess": true,
+  "chat.byokUtilityModelDefault": "mainAgent",
+  "chat.titleBar.signIn.enabled": false,
+  "chat.welcomePage.signIn.enabled": false,
+  "github.copilot.enable": { "*": false },
+  "github.copilot.nextEditSuggestions.enabled": false,
+  "github.copilot.chat.backgroundAgent.enabled": false,
+  "github.copilot.chat.cloudAgent.enabled": false,
+  "chat.viewSessions.enabled": false,
+  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "telemetry.telemetryLevel": "off",
+  "terminal.integrated.env.linux": {
+    "EZIL_AI_PROXY_TOKEN": null,
+    "EZIL_AI_BASE_URL": null
+  },
+  "github.copilot.chat.tools.viewImage.enabled": false,
+  "github.copilot.chat.virtualTools.threshold": 64
+}
+CODESERVER_MACHINE_SETTINGS_JSON
+  then
+    mv -f "$temporary" "$dst" && return 0
+  fi
+  rm -f "$temporary"
+  return 1
+}
+
+# Merge the ephemeral BYOK group list without removing user entries. Preserve
+# malformed input as a backup instead of silently discarding its original bytes.
+seed_codeserver_chat_models() {
+  mkdir -p "$1/User" || return 1
+  node - "$1/User/chatLanguageModels.json" <<'CODESERVER_CHAT_MODELS_JS'
+const fs = require("fs");
+const dst = process.argv[2];
+let groups = [];
+if (fs.existsSync(dst)) {
+  const original = fs.readFileSync(dst, "utf8");
+  try {
+    groups = JSON.parse(original);
+    if (!Array.isArray(groups)) throw new Error("expected array");
+  } catch {
+    fs.writeFileSync(dst + ".invalid-" + Date.now(), original, { flag: "wx", mode: 0o600 });
+    groups = [];
+  }
+}
+if (!groups.some(group => group?.vendor === "ezil" && group?.name === "EZiL")) {
+  groups.push({ name: "EZiL", vendor: "ezil" });
+}
+const temporary = dst + "." + process.pid;
+try {
+  fs.writeFileSync(temporary, JSON.stringify(groups, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+  fs.renameSync(temporary, dst);
+} finally {
+  if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+}
+CODESERVER_CHAT_MODELS_JS
+}
+
+# Copilot/telemetry-only sinks; never github.com or api.github.com. A read-only
+# hosts file must not fail boot. EZIL_HOSTS_FILE allows isolated Linux tests.
+seed_blocked_ai_hosts() {
+  local _h _hosts="${EZIL_HOSTS_FILE:-/etc/hosts}"
+  [ -w "$_hosts" ] || return 0
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    grep -q -F -w -- "$_h" "$_hosts" 2>/dev/null && continue
+    printf '127.0.0.1 %s\n' "$_h" >>"$_hosts" 2>/dev/null || return 0
+  done <<'EZIL_BLOCKED_AI_HOSTS'
+api.githubcopilot.com
+api-model-lab.githubcopilot.com
+copilot-proxy.githubusercontent.com
+copilot-telemetry.githubusercontent.com
+origin-tracker.githubusercontent.com
+default.exp-tas.com
+mobile.events.data.microsoft.com
+browser.events.data.microsoft.com
+dc.services.visualstudio.com
+westus-0.in.applicationinsights.azure.com
+westeurope-5.in.applicationinsights.azure.com
+main.vscode-cdn.net
+embeddings.vscode-cdn.net
+EZIL_BLOCKED_AI_HOSTS
+}
+
 ezil_editor_prepare() (
   local user_data="$1" workspace="$2" file
   mkdir -p "$user_data" || exit 1
   exec 8>"$user_data/.ezil-state.lock" || exit 1
   flock -w 10 8 || exit 1
+  seed_codeserver_machine_settings "$user_data" || exit 1
+  seed_codeserver_chat_models "$user_data" || exit 1
+  seed_blocked_ai_hosts || true
   # Within the same runtime, relaunches preserve the current editor state.
   if [ -f "$user_data/.ezil-state-ready" ]; then
     [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
