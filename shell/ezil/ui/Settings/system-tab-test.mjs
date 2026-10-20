@@ -109,7 +109,7 @@ test('detects a switch while System remains open and refetches even after metada
     assert.equal(screenCalls.at(-1), second.id);
 });
 
-test('retries every 15 seconds until both provider and running image are known', async () => {
+test('retries every 15 seconds until provider and image are known, then every 60 seconds', async () => {
     const answers = [{ ...known, provider: 'unassigned' }, { ...known, image: pending.image }, known];
     answer = () => ({ ok: true, info: answers.shift() ?? known });
     await activate();
@@ -120,9 +120,39 @@ test('retries every 15 seconds until both provider and running image are known',
     await advance(15_000);
     assert.match(host.innerHTML, /running-image/);
     assert.deepEqual(infoCalls.map(call => call.at), [0, 15_000, 30_000]);
+    await advance(59_999);
+    assert.equal(infoCalls.length, 3);
+    await advance(1);
+    assert.deepEqual(infoCalls.map(call => call.at), [0, 15_000, 30_000, 90_000]);
+    assert.equal(timers.size, 2, 'screen and slow system-info timers remain');
+});
+
+test('known metadata refreshes a replacement image while the same computer stays open', async () => {
+    await activate();
+    const replacement = { ...known, image: { id: 'replacement-image', source: 'running' } };
+    answer = () => ({ ok: true, info: replacement });
+    await advance(59_999);
+    assert.match(host.innerHTML, /running-image/);
+    assert.equal(infoCalls.length, 1);
+    await advance(1);
+    assert.match(host.innerHTML, /replacement-image/);
+    assert.doesNotMatch(host.innerHTML, /running-image/);
     await advance(60_000);
-    assert.equal(infoCalls.length, 3, 'known metadata stops further system-info requests');
-    assert.equal(timers.size, 1, 'only the existing screen timer remains');
+    assert.deepEqual(infoCalls, [0, 60_000, 120_000].map(at => ({ id: first.id, at })));
+    system.onDeactivate();
+    await advance(120_000);
+    assert.equal(infoCalls.length, 3, 'closing cancels known metadata refreshes');
+    assert.equal(timers.size, 0);
+});
+
+test('a failed slow refresh returns to the 15-second retry cadence', async () => {
+    await activate();
+    answer = () => { throw new Error('temporary failure'); };
+    await advance(60_000);
+    answer = () => ({ ok: true, info: known });
+    await advance(15_000);
+    assert.deepEqual(infoCalls.map(call => call.at), [0, 60_000, 75_000]);
+    assert.match(host.innerHTML, /running-image/);
 });
 
 test('closing with unknown metadata cancels retries', async () => {
@@ -164,12 +194,12 @@ test('late responses from the old computer cannot replace the current computer d
     assert.doesNotMatch(host.innerHTML, /old-image|AWS EC2/);
 });
 
-test('a failed read retries and stops after recovery', async () => {
+test('a failed read retries and refreshes slowly after recovery', async () => {
     answer = () => { throw new Error('temporary failure'); };
     await activate();
     answer = () => ({ ok: true, info: known });
     await advance(15_000);
     await advance(60_000);
-    assert.equal(infoCalls.length, 2);
+    assert.deepEqual(infoCalls.map(call => call.at), [0, 15_000, 75_000]);
     assert.match(host.innerHTML, /running-image/);
 });

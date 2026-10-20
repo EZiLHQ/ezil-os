@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as cloudflare from '../cloudflare-guacamole-provider';
 import { AWS_TIERS } from './aws-config';
+import { mintPreviewTokenV2, type WorkerAuth } from './preview-token-v2';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { AWS_INSTANCE_SIZES, CLOUDFLARE_CONTAINER_SIZE, describePlacement, readSystemInfo } from './system-info';
 
@@ -15,18 +16,21 @@ const computer = { userId: OWNER, computerId };
 const READS = { EZIL_COMPUTE_PLACEMENT_READS: '1' };
 const UNKNOWN_IMAGE = { id: null, source: 'unknown' };
 const workerFetch = vi.fn<typeof fetch>();
+const CONFIG = { workerUrl: 'https://worker.example', hasHmacSecret: true, isConfigured: true };
+const SANDBOX = 'guac-1111111111114111-2222222222224222';
+const SECRET = 'system-info-test-secret';
 
 beforeEach(() => {
-    vi.spyOn(cloudflare, 'resolveCloudflareGuacamoleConfig').mockReturnValue({
-        workerUrl: 'https://worker.example', hasHmacSecret: false, isConfigured: true,
-    });
+    vi.spyOn(cloudflare, 'resolveCloudflareGuacamoleConfig').mockReturnValue(CONFIG);
     vi.spyOn(cloudflare, 'getGuacamoleSandboxStatus');
+    vi.spyOn(cloudflare, 'getGuacamoleSandboxSystem').mockResolvedValue({ ok: true, imageId: null });
     workerFetch.mockReset().mockImplementation(async () => Response.json({ ok: true, imageId: null }));
     vi.spyOn(globalThis, 'fetch').mockImplementation(workerFetch);
 });
 
 afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
 });
 
 function cloudflareDb() {
@@ -37,6 +41,7 @@ function cloudflareDb() {
 
 function expectNoWorkerCall() {
     expect(cloudflare.getGuacamoleSandboxStatus).not.toHaveBeenCalled();
+    expect(cloudflare.getGuacamoleSandboxSystem).not.toHaveBeenCalled();
     expect(cloudflare.resolveCloudflareGuacamoleConfig).not.toHaveBeenCalled();
     expect(workerFetch).not.toHaveBeenCalled();
 }
@@ -105,37 +110,25 @@ describe('readSystemInfo — read only, honest about what is not known', () => {
         expect(info?.image).toEqual(UNKNOWN_IMAGE);
     });
 
-    it.each(['a', 'EZiL_os-2026.10:abcdef0123456789', 'a'.repeat(128)])('cloudflare image %s: reported via a bounded, non-waking status GET', async (imageId) => {
-        workerFetch.mockImplementationOnce(async () => Response.json({ ok: true, imageId }));
-        const timeout = vi.spyOn(AbortSignal, 'timeout');
+    it.each(['a', 'EZiL_os-2026.10:abcdef0123456789', 'a'.repeat(128)])('cloudflare image %s: uses the signed system helper', async (imageId) => {
+        vi.mocked(cloudflare.getGuacamoleSandboxSystem).mockResolvedValueOnce({ ok: true, imageId });
         const { db, statements } = cloudflareDb();
         const info = await readSystemInfo(db, computer, READS);
         expect(info?.image).toEqual({ id: imageId, source: 'running' });
-        expect(workerFetch).toHaveBeenCalledTimes(1);
-        const [url, init] = workerFetch.mock.calls[0]!;
-        expect(url).toBe('https://worker.example/sandbox/guac-1111111111114111-2222222222224222/status');
-        expect(init?.method ?? 'GET').toBe('GET');
-        expect(init?.signal).toBeInstanceOf(AbortSignal);
-        expect(timeout).toHaveBeenCalledWith(10_000);
+        expect(cloudflare.getGuacamoleSandboxSystem).toHaveBeenCalledExactlyOnceWith(CONFIG, SANDBOX);
+        expect(cloudflare.getGuacamoleSandboxStatus).not.toHaveBeenCalled();
+        expect(workerFetch).not.toHaveBeenCalled();
         expect(writes(statements)).toEqual([]);
     });
 
-    it.each([undefined, null, '', 'a'.repeat(129), 'image/tag', 'image tag', 'image\n', 'image\r', '<image>', 'ézil', 42, {}])('cloudflare invalid or missing image %j: unknown', async (imageId) => {
-        workerFetch.mockImplementationOnce(async () => Response.json({ ok: true, imageId }));
+    it.each([undefined, null, '', 'unknown', 'a'.repeat(129), 'image/tag', 'image tag', 'image\n', 'image\r', '<image>', 'ézil', 42, {}])('cloudflare invalid or missing image %j: unknown', async (imageId) => {
+        vi.mocked(cloudflare.getGuacamoleSandboxSystem).mockResolvedValueOnce({ ok: true, imageId: imageId as never });
         const { db } = cloudflareDb();
         expect((await readSystemInfo(db, computer, READS))?.image).toEqual(UNKNOWN_IMAGE);
     });
 
-    it.each([
-        ['HTTP error', () => Response.json({ ok: true, imageId: 'should-not-appear' }, { status: 503 })],
-        ['Worker error', () => Response.json({ ok: false, error: 'unavailable', imageId: 'should-not-appear' })],
-        ['error alongside success', () => Response.json({ ok: true, error: 'unavailable', imageId: 'should-not-appear' })],
-        ['invalid JSON', () => new Response('not JSON')],
-        ['null body', () => Response.json(null)],
-        ['network error', () => { throw new Error('fetch failed'); }],
-        ['timeout', () => { throw new DOMException('Timed out', 'TimeoutError'); }],
-    ] as const)('cloudflare %s: image unknown, provider and size still returned', async (_name, reply) => {
-        workerFetch.mockImplementationOnce(async () => reply());
+    it('cloudflare system error: image unknown, provider and size still returned', async () => {
+        vi.mocked(cloudflare.getGuacamoleSandboxSystem).mockResolvedValueOnce({ ok: false, imageId: 'should-not-appear' });
         const { db } = cloudflareDb();
         expect(await readSystemInfo(db, computer, READS)).toMatchObject({
             provider: 'cloudflare', image: UNKNOWN_IMAGE,
@@ -143,8 +136,8 @@ describe('readSystemInfo — read only, honest about what is not known', () => {
         });
     });
 
-    it('cloudflare status helper rejection does not fail system info', async () => {
-        vi.spyOn(cloudflare, 'getGuacamoleSandboxStatus').mockRejectedValueOnce(new Error('Worker unavailable'));
+    it('cloudflare system helper rejection does not fail system info', async () => {
+        vi.mocked(cloudflare.getGuacamoleSandboxSystem).mockRejectedValueOnce(new Error('Worker unavailable'));
         const { db } = cloudflareDb();
         expect(await readSystemInfo(db, computer, READS)).toMatchObject({ provider: 'cloudflare', image: UNKNOWN_IMAGE });
     });
@@ -163,6 +156,75 @@ describe('readSystemInfo — read only, honest about what is not known', () => {
         const unknown = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, provider: 'azure' })] });
         expect(await readSystemInfo(unknown.db, computer, READS)).toMatchObject({ provider: 'unknown', image: UNKNOWN_IMAGE });
         expectNoWorkerCall();
+    });
+});
+
+describe('getGuacamoleSandboxSystem — signed, bounded, best-effort reads', () => {
+    beforeEach(() => {
+        vi.mocked(cloudflare.getGuacamoleSandboxSystem).mockRestore();
+        vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', SECRET);
+    });
+
+    it.each(['v1', 'v2'] as const)('signs the system GET with %s and disables caching', async (kind) => {
+        const now = Date.now();
+        vi.spyOn(Date, 'now').mockReturnValue(now);
+        const timeout = vi.spyOn(AbortSignal, 'timeout');
+        const auth: WorkerAuth = kind === 'v1' ? { kind } : { kind, claims: {
+            sandboxId: SANDBOX, computerId, userId: OWNER, provider: 'cloudflare',
+            store: '', generation: 0, leaseEpoch: 0,
+        } };
+        workerFetch.mockResolvedValueOnce(Response.json({ ok: true, imageId: 'running-image' }));
+        expect(await cloudflare.getGuacamoleSandboxSystem({ ...CONFIG, workerUrl: `${CONFIG.workerUrl}/` }, SANDBOX, auth))
+            .toEqual({ ok: true, imageId: 'running-image' });
+        expect(workerFetch).toHaveBeenCalledTimes(1);
+        const [url, init] = workerFetch.mock.calls[0]!;
+        expect(url).toBe(`${CONFIG.workerUrl}/sandbox/${SANDBOX}/system`);
+        expect(init).toMatchObject({ method: 'GET', cache: 'no-store' });
+        expect(init?.body).toBeUndefined();
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        expect(timeout).toHaveBeenCalledWith(10_000);
+        const headers = new Headers(init?.headers);
+        if (auth.kind === 'v1') {
+            expect(headers.get('Authorization')).toBe(`Bearer ${cloudflare.mintSandboxPreviewToken(SECRET)}`);
+            expect(headers.has('x-ezil-auth')).toBe(false);
+        } else {
+            expect(headers.get('x-ezil-auth')).toBe(mintPreviewTokenV2(SECRET, { ...auth.claims, ts: now }, {
+                method: 'GET', path: `/sandbox/${SANDBOX}/system`, body: '',
+            }));
+            expect(headers.has('Authorization')).toBe(false);
+        }
+        expect(cloudflare.getGuacamoleSandboxStatus).not.toHaveBeenCalled();
+    });
+
+    it('defaults to a signed v1 bearer and preserves missing image metadata', async () => {
+        expect(await cloudflare.getGuacamoleSandboxSystem(CONFIG, SANDBOX)).toEqual({ ok: true, imageId: null });
+        expect(new Headers(workerFetch.mock.calls[0]![1]?.headers).get('Authorization')).toMatch(/^Bearer t=\d+,v1=[a-f0-9]{64}$/);
+    });
+
+    it('does not fetch when config or the HMAC secret is missing', async () => {
+        expect(await cloudflare.getGuacamoleSandboxSystem({ ...CONFIG, isConfigured: false }, SANDBOX))
+            .toEqual({ ok: false, imageId: null });
+        vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', ' ');
+        expect(await cloudflare.getGuacamoleSandboxSystem(CONFIG, SANDBOX)).toEqual({ ok: false, imageId: null });
+        expect(workerFetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['HTTP error', () => Response.json({ ok: true, imageId: 'should-not-appear' }, { status: 503 })],
+        ['unauthorized', () => Response.json({ ok: false, error: 'unauthorized' }, { status: 401 })],
+        ['Worker error', () => Response.json({ ok: false, error: 'unavailable', imageId: 'should-not-appear' })],
+        ['error alongside success', () => Response.json({ ok: true, error: 'unavailable', imageId: 'should-not-appear' })],
+        ['invalid JSON', () => new Response('not JSON')],
+        ['null body', () => Response.json(null)],
+        ['network error', () => { throw new Error('fetch failed'); }],
+        ['timeout', () => { throw new DOMException('Timed out', 'TimeoutError'); }],
+    ] as const)('%s yields no image and leaves system info available', async (_name, reply) => {
+        workerFetch.mockImplementationOnce(async () => reply());
+        const { db } = cloudflareDb();
+        expect(await readSystemInfo(db, computer, READS)).toMatchObject({
+            provider: 'cloudflare', image: UNKNOWN_IMAGE,
+            machine: { vcpu: 2, memoryMiB: 6144, source: 'configured' },
+        });
     });
 });
 

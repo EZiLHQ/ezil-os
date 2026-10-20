@@ -14,10 +14,11 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *   GET    /health                 → { ok, service, mode }
  *   POST   /sandbox/preview        → { ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }
  *   GET    /sandbox/:name/status   → { ok, sandboxName, guacamoleRunning, mode,
- *                                     desktopRunning, runningModes, modeSource, imageId }
+ *                                     desktopRunning, runningModes, modeSource }
  *          (`mode` is DETECTED from the live exposed-port list when the caller
  *          omits `?desktopMode=`; `guacamoleRunning` means "the desktop port
  *          for the reported `mode` is exposed" — read the two together)
+ *   GET    /sandbox/:name/system   → { ok, imageId } (HMAC-gated, storage-only)
  *   POST   /sandbox/:name/workspace-diag → { ok, sandboxId, op, slot, exists, bytes, sha256, expectedSha256, matches, wrote }
  *          (HMAC-gated diagnostic: mounts the R2 workspace bucket and operates on
  *          named, allowlisted marker slots to prove deterministic R2 persistence
@@ -2450,7 +2451,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
   override async onStart(): Promise<void> {
     // A replacement container may run a different image; wait for its own codec result.
-    await this.ctx.storage.delete(IMAGE_ID_KEY);
+    try {
+      await this.ctx.storage.delete(IMAGE_ID_KEY);
+    } catch {
+      console.error('[image_id] could not clear previous image');
+    }
     this.observeRuntimeExit();
     bootLog('runtime_lifecycle', 'start');
     await super.onStart();
@@ -3294,17 +3299,17 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   private async recordImageId(imageId: unknown): Promise<void> {
     try {
-      if (typeof imageId === 'string' && imageId.length > 0 && imageId.length <= 128
+      if (typeof imageId === 'string' && imageId !== 'unknown' && imageId.length > 0 && imageId.length <= 128
           && !/[^A-Za-z0-9._:-]/.test(imageId) && this.containerIsRunning()) {
         await this.ctx.storage.put(IMAGE_ID_KEY, imageId);
       }
     } catch {
-      // Optional status metadata must never change a persistence outcome.
+      // Optional system metadata must never change a persistence outcome.
       console.error('[image_id] could not record running image');
     }
   }
 
-  /** Storage-only status metadata: never probes or starts the container. */
+  /** Storage-only system metadata: never probes or starts the container. */
   async getImageId(): Promise<string | null> {
     return (await this.ctx.storage.get<string>(IMAGE_ID_KEY)) ?? null;
   }
@@ -4761,8 +4766,6 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT),
     );
     const status = describeDesktopStatus(exposed, explicitMode, modeResult.mode);
-    let imageId: string | null = null;
-    try { imageId = await sandbox.getImageId(); } catch { /* Best-effort status metadata. */ }
     return json({
       ok: true,
       sandboxName,
@@ -4771,7 +4774,6 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       desktopRunning: status.desktopRunning,
       runningModes: status.runningModes,
       modeSource: status.modeSource,
-      imageId,
     });
   } catch (err) {
     return json(
@@ -7082,6 +7084,18 @@ export default {
     const statusMatch = path.match(/^\/sandbox\/([^/]+)\/status$/);
     if (method === 'GET' && statusMatch) {
       return handleStatus(env, url, decodeURIComponent(statusMatch[1]), url.searchParams.get('desktopMode') ?? undefined);
+    }
+
+    const systemMatch = path.match(/^\/sandbox\/([^/]+)\/system$/);
+    if (method === 'GET' && systemMatch) {
+      if (resolvePreviewSecrets(env).length === 0) return json({ ok: false, error: 'system_auth_not_configured' }, 401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      let imageId: string | null = null;
+      try {
+        imageId = await openSandbox(env, decodeURIComponent(systemMatch[1])).getImageId();
+      } catch { /* Optional storage metadata; never probe or start a container. */ }
+      return json({ ok: true, imageId });
     }
 
     const workspaceDiagMatch = path.match(/^\/sandbox\/([^/]+)\/workspace-diag$/);

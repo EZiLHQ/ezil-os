@@ -86,7 +86,7 @@ describe('running container image ID storage', () => {
   const imageKey = 'ezil:imageId';
   const prefix = '11111111-2222-4333-8444-555555555555/branches/main';
   const validId = 'EZiL-os:2026.10_20';
-  const invalidIds = [undefined, null, 42, {}, '', 'x'.repeat(129), 'image id', 'image/id', 'image\nid', 'image\n', 'imagé', 'image\0'];
+  const invalidIds = [undefined, null, 42, {}, '', 'unknown', 'x'.repeat(129), 'image id', 'image/id', 'image\nid', 'image\n', 'imagé', 'image\0'];
 
   async function imageFake(imageId: unknown, failed = false) {
     const { fake, store } = await makeFake({});
@@ -230,6 +230,28 @@ describe('running container image ID storage', () => {
       expect(await fake.getImageId()).toBeNull();
       expect(start).toHaveBeenCalledTimes(1);
     } finally { start.mockRestore(); }
+  });
+
+  it('a rejected image delete never prevents the runtime watcher or SDK start hook', async () => {
+    const { fake } = await makeFake({}, { [imageKey]: validId });
+    const events: string[] = [];
+    fake.ctx.storage.delete = async (key: string) => {
+      expect(key).toBe(imageKey);
+      events.push('delete');
+      throw new Error('private upstream details must not be logged');
+    };
+    fake.observeRuntimeExit = () => { events.push('watch'); };
+    const start = spyOn(Object.getPrototypeOf(await proto()), 'onStart').mockImplementation(async () => { events.push('start'); });
+    const log = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await fake.onStart();
+      expect(events).toEqual(['delete', 'watch', 'start']);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls).toEqual([['[image_id] could not clear previous image']]);
+    } finally {
+      start.mockRestore();
+      log.mockRestore();
+    }
   });
 });
 

@@ -31,7 +31,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 //     provider and the CONFIGURED size of that machine (instance type or
 //     container class) — labelled as configured, never as a measurement. CPU
 //     and memory USE are not reported by any computer yet, and the tab says so.
-//     Its image comes from the non-waking sandbox status endpoint; if absent,
+//     Its image comes from the signed, non-waking sandbox system endpoint; if absent,
 //     the row says "Not reported yet". Wording lives in `./system-describe.js`.
 //   * the connection route (relayed through TURN or direct) comes from the
 //     selected candidate pair the streamed client measured — never from a
@@ -77,6 +77,7 @@ let systemInfoTimer = null;
 let computerId = null;
 let viewGeneration = 0;     // discard reads completed after a switch or tab close
 const SYSTEM_INFO_REFRESH_MS = 15_000;
+const SYSTEM_INFO_KNOWN_REFRESH_MS = 60_000;
 let nativeProvider = { configured: false, pending: false, error: '' };
 let nativeTools = null;
 let nativePreview = { message: '', pending: false, workspaceId: null, draft: '3000' };
@@ -219,9 +220,9 @@ async function refreshSystemInfo () {
     }
     paint();
     const providerKnown = ['aws-ec2', 'cloudflare'].includes(systemInfo?.provider);
-    if ( ! providerKnown || ! describeImage(systemInfo).title ) {
-        systemInfoTimer = setTimeout(() => { void refreshSystemInfo(); }, SYSTEM_INFO_REFRESH_MS);
-    }
+    const delay = providerKnown && describeImage(systemInfo).title
+        ? SYSTEM_INFO_KNOWN_REFRESH_MS : SYSTEM_INFO_REFRESH_MS;
+    systemInfoTimer = setTimeout(() => { void refreshSystemInfo(); }, delay);
 }
 
 function row (label, value, hint) {
