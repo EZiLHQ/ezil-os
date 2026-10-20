@@ -20,6 +20,7 @@ import './sign-in.test.mjs';
 import './code-picker.test.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 import { outline, parseWorkflow } from '../.github/scripts/env-contract.mjs';
+import { MAX_CHECK_MS, FINAL_STOP_TIMEOUT_MS, MAX_RUN_MS } from './live-check.mjs';
 
 const sha = 'a'.repeat(40);
 const target = { sha, app: 'https://preview-test.vercel.app', project: 'prj_test', target: 'preview' };
@@ -649,6 +650,107 @@ test('both live-check steps require their environment isolated computer secret',
     const env = live.children.find(node => node.line === 'env:').children.map(node => node.line);
     assert.ok(env.includes('EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}'), name);
     assert.ok(env.includes("EZIL_E2E_REQUIRE_TARGET: '1'"), name);
+  }
+});
+
+test('workflow deadlines admit a full live run including final stop or refuse to start it', () => {
+  assert.ok(MAX_CHECK_MS <= 8 * 60_000);
+  assert.equal(FINAL_STOP_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS);
+  assert.ok(MAX_RUN_MS >= MAX_CHECK_MS + APP_STOP_FETCH_TIMEOUT_MS + 15_000);
+  const runSeconds = Math.ceil(MAX_RUN_MS / 1000);
+  const jobs = outline(workflowText).children.find(node => node.line === 'jobs:');
+  for (const name of ['preview', 'production']) {
+    const job = previewWorkflow.jobs.find(job => job.name === name);
+    const step = job.steps.find(step => step.text.includes(`id: live_${name}\n`));
+    const stepMinutes = Number(step.text.match(/^timeout-minutes: (\d+)$/m)[1]);
+    const jobMinutes = Number(jobs.children.find(node => node.line === `${name}:`).children
+      .find(node => node.line.startsWith('timeout-minutes:')).line.split(':')[1]);
+    assert.ok(stepMinutes * 60 > runSeconds + 20);
+    assert.ok(jobMinutes > stepMinutes);
+    const reserve = name === 'production' ? 15 * 60 : 0;
+    for (const available of [runSeconds + 9, runSeconds + 10]) {
+      const script = step.text.match(/run: \|\n([\s\S]*)$/)[1]
+        .replaceAll('${{ steps.deadline.outputs.at }}', String(1000 + reserve + available));
+      const child = runWorkflowScript('bash', ['-e', '-c', `
+        date() { echo 1000; }
+        timeout() { printf 'START %s\\n' "$*"; }
+        ${script}
+      `]);
+      assert.equal(child.status, available === runSeconds + 10 ? 0 : 1, child.output);
+      if (child.status === 0) {
+        assert.match(child.output, new RegExp(`START --kill-after=10s ${runSeconds + 10}s node e2e/live-check.mjs`));
+      } else assert.doesNotMatch(child.output, /START/);
+    }
+  }
+});
+
+test('production refuses stale main before migrations without admitting any rollback', async () => {
+  const job = previewWorkflow.jobs.find(job => job.name === 'production');
+  const migration = job.steps.findIndex(step => /production-migrations.mjs apply/.test(step.text));
+  const gate = job.steps[migration - 1];
+  assert.match(gate.text, /^id: current_main$/m);
+  assert.match(gate.text, /^if: github.ref == 'refs\/heads\/main'$/m);
+  assert.ok(!gate.keys.includes('continue-on-error'));
+  const script = gate.text.match(/script: \|\n([\s\S]*)$/)[1];
+  const execute = new (Object.getPrototypeOf(async function () {}).constructor)('github', 'context', 'core', 'process', script);
+  for (const current of [sha, 'b'.repeat(40), undefined, 'api-error']) {
+    const failures = [], calls = [];
+    const github = { rest: { git: { getRef: async args => {
+      calls.push(args);
+      if (current === 'api-error') throw new Error('unavailable');
+      return { data: { object: { sha: current } } };
+    } } } };
+    const run = execute(github, { repo: { owner: 'test', repo: 'os' } },
+      { setFailed: message => failures.push(message) }, { env: { EZIL_DEPLOY_SHA: sha } });
+    if (current === 'api-error') await assert.rejects(run, /unavailable/);
+    else {
+      await run;
+      assert.equal(failures.length, current === sha ? 0 : 1);
+    }
+    assert.deepEqual(calls, [{ owner: 'test', repo: 'os', ref: 'heads/main' }]);
+  }
+  const steps = Object.fromEntries(job.steps.filter(step => /^id: /m.test(step.text)).map(step => [
+    step.text.match(/^id: (.+)$/m)[1], { outcome: job.steps.indexOf(step) < migration - 1 ? 'success' : 'skipped' },
+  ]));
+  steps.current_main.outcome = 'failure';
+  for (const step of job.steps.filter(step => /^if: always\(\)/m.test(step.text)
+      && step.text.includes('steps.previous_worker.outcome'))) {
+    const condition = step.text.match(/^if: (.+)$/m)[1];
+    const evaluate = new Function('github', 'needs', 'steps', 'always', `return (${condition})`);
+    assert.equal(evaluate({ ref: 'refs/heads/main' }, { changes: { outputs: { image_changed: 'true' } } }, steps, () => true), false);
+  }
+});
+
+test('Worker and Vercel production deploys re-read main and refuse stale or unavailable refs', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-current-main-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const job = previewWorkflow.jobs.find(job => job.name === 'production');
+  const mutations = path.join(dir, 'mutations');
+  for (const id of ['worker', 'production_app']) {
+    const step = job.steps.find(step => step.text.includes(`id: ${id}\n`));
+    const script = step.text.match(/run: \|\n([\s\S]*)$/)[1]
+      .replaceAll('${{ steps.deadline.outputs.at }}', '10000')
+      .replaceAll('${{ needs.changes.outputs.image_changed }}', 'false');
+    for (const current of [sha, 'b'.repeat(40), '', 'api-error']) {
+      fs.writeFileSync(mutations, '');
+      const child = runWorkflowScript('bash', ['-e', '-c', `
+        date() { echo 1000; }
+        gh() {
+          [[ "$*" == 'api repos/test/os/git/ref/heads/main --jq .object.sha' ]] || return 42
+          [[ "$TEST_CURRENT_MAIN" != api-error ]] || return 1
+          printf '%s\\n' "$TEST_CURRENT_MAIN"
+        }
+        timeout() {
+          printf 'deploy\\n' >> "$TEST_MUTATIONS"
+          printf 'https://new.vercel.app\\n'
+        }
+        ${script}
+      `], { env: { PATH: process.env.PATH, EZIL_DEPLOY_SHA: sha, GITHUB_REPOSITORY: 'test/os',
+        GITHUB_OUTPUT: path.join(dir, 'outputs'), TEST_CURRENT_MAIN: current, TEST_MUTATIONS: mutations,
+        VERCEL_TOKEN: 'test-token', EZIL_E2E_WORKER: 'https://worker.example.test' } });
+      assert.equal(child.status, current === sha ? 0 : 1, child.output);
+      assert.equal(fs.readFileSync(mutations, 'utf8'), current === sha ? 'deploy\n' : '');
+    }
   }
 });
 

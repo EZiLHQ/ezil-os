@@ -5,10 +5,33 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { aggregateResults, isRealStop, isValidRelayRenewal, MAX_RUN_MS, parseTerminalMarker, redactEvidence, renewWithOneRetry, runLiveCheck, terminalProbeCommand } from './live-check.mjs';
+import { aggregateResults, isMeaningfulFrame, isRealStop, isValidRelayRenewal, MAX_CHECK_MS, FINAL_STOP_TIMEOUT_MS, MAX_RUN_MS, parseTerminalMarker, redactEvidence, renewWithOneRetry, runLiveCheck, terminalProbeCommand } from './live-check.mjs';
+import { APP_STOP_FETCH_TIMEOUT_MS } from './deployed-target.mjs';
 import { verifySelectedComputer, stopIsolatedComputer } from './isolated-computer.mjs';
 
 const nonce = 'a1'.repeat(10);
+
+function sampleFrame(colorAt = () => [0, 0, 0]) {
+  return Uint8ClampedArray.from(Array.from({ length: 64 * 36 }, (_, i) => [...colorAt(i), 255]).flat());
+}
+
+const desktopFrame = sampleFrame(i => i % 64 < 12 ? [225, 230, 235] : [18, 32, 60]);
+
+test('paint verdict rejects all-black, one cursor pixel, and uniform grey frames', () => {
+  assert.equal(isMeaningfulFrame(sampleFrame()), false);
+  assert.equal(isMeaningfulFrame(sampleFrame(i => i === 1152 ? [255, 255, 255] : [0, 0, 0])), false);
+  assert.equal(isMeaningfulFrame(sampleFrame(() => [128, 128, 128])), false);
+});
+
+test('paint verdict accepts a desktop-like distribution and requires sufficient visible area and contrast', () => {
+  assert.equal(isMeaningfulFrame(desktopFrame), true);
+  assert.equal(isMeaningfulFrame(sampleFrame(i => i < 46 ? [255, 255, 255] : [0, 0, 0])), false);
+  assert.equal(isMeaningfulFrame(sampleFrame(i => i < 47 ? [255, 255, 255] : [0, 0, 0])), true);
+  assert.equal(isMeaningfulFrame(sampleFrame(i => i % 2 ? [50, 50, 50] : [80, 80, 80])), false);
+  assert.equal(isMeaningfulFrame(sampleFrame(i => i % 2 ? [10, 10, 10] : [24, 24, 24])), false);
+  for (const pixels of [null, [], [255, 255, 255, 255]]) assert.equal(isMeaningfulFrame(pixels), false);
+  assert.equal(isMeaningfulFrame(desktopFrame, 32, 72), false);
+});
 
 test('marker parsing ignores echoed warm and cold commands, including soft wraps', () => {
   for (const cold of [false, true]) {
@@ -228,7 +251,8 @@ const isolatedId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const otherId = '11111111-2222-3333-4444-555555555555';
 
 async function fakeLiveRun(t, { selectedId = isolatedId, coldId = isolatedId, failWarm = false,
-  failStop = false, alreadyStopped = false, relayRace = false, env: overrides = {} } = {}) {
+  failStop = false, alreadyStopped = false, relayRace = false, env: overrides = {},
+  onWarm = () => {}, onScreenshot = () => {}, onStop = () => {} } = {}) {
   const out = mkdtempSync(join(tmpdir(), 'ezil-live-fake-'));
   t.after(() => rmSync(out, { recursive: true, force: true }));
   const events = [], requests = [], emitted = [];
@@ -257,18 +281,19 @@ async function fakeLiveRun(t, { selectedId = isolatedId, coldId = isolatedId, fa
     },
     locator: () => ({ first() { return this; }, click: async () => {
       events.push(`browser:${selected}`);
+      onWarm();
       if (failWarm) {
         selected = otherId;
         throw new Error('private mid-run failure');
       }
     } }),
     frames: () => [
-      { url: () => 'https://nekodesktop.example.test', evaluate: async () => true },
+      { url: () => 'https://nekodesktop.example.test', evaluate: async () => desktopFrame },
       { url: () => 'https://test-code.example.test', locator: () => codeLocator,
         getByText: () => ({ count: async () => 1 }) },
     ],
     isClosed: () => false,
-    screenshot: async () => { events.push('screenshot'); },
+    screenshot: async () => { events.push('screenshot'); onScreenshot(); },
   };
   const context = {
     setDefaultTimeout: () => {}, newPage: async () => page,
@@ -288,6 +313,7 @@ async function fakeLiveRun(t, { selectedId = isolatedId, coldId = isolatedId, fa
       requests.push({ url, ...options });
       if (url.endsWith('/stop')) {
         events.push(`stop:${JSON.parse(options.body).computerId}`);
+        onStop();
         if (failStop) throw new Error('private stop failure');
         return { status: 200, body: Buffer.from(JSON.stringify({ ok: true,
           outcome: alreadyStopped ? 'not_running' : 'destroyed', terminated: !alreadyStopped })) };
@@ -351,8 +377,35 @@ test('final stop runs after a mid-run failure and targets only the previously va
     assert.deepEqual(JSON.parse(requests[0].body), { computerId: isolatedId });
     assert.equal(requests[0].headers.cookie, 'session=private-cookie');
     assert.equal(requests[0].headers['x-vercel-protection-bypass'], 'private-bypass');
-    assert.ok(requests[0].timeout > 0 && requests[0].timeout <= 290_000 && requests[0].timeout < MAX_RUN_MS);
+    assert.equal(requests[0].timeout, APP_STOP_FETCH_TIMEOUT_MS);
   }
+});
+
+test('exhausting normal checks leaves the full stop budget plus evidence and browser shutdown time', async t => {
+  assert.equal(MAX_CHECK_MS, 8 * 60_000);
+  assert.equal(FINAL_STOP_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS);
+  let elapsed = 0;
+  t.mock.method(performance, 'now', () => elapsed);
+  const delays = [];
+  const realSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => {
+    delays.push(ms);
+    return realSetTimeout(callback, ms, ...args);
+  });
+  const { report, requests, events } = await fakeLiveRun(t, {
+    onWarm: () => { elapsed = MAX_CHECK_MS; },
+    onScreenshot: () => { elapsed += 5000; },
+    onStop: () => { elapsed += APP_STOP_FETCH_TIMEOUT_MS - 1; },
+  });
+  assert.equal(report.result, 'FAIL');
+  assert.deepEqual(report.checks.filter(check => !check.ok).map(check => check.check), ['warm-browser-paint']);
+  assert.equal(report.checks.find(check => check.check === 'final-stop').ok, true);
+  assert.equal(requests.length, 1, 'no normal API calls may run after the deadline');
+  assert.equal(requests[0].timeout, APP_STOP_FETCH_TIMEOUT_MS);
+  assert.deepEqual(events.slice(-2), [`stop:${isolatedId}`, 'browser-close']);
+  assert.equal(delays[0], MAX_RUN_MS, 'hard exit must include cleanup and shutdown');
+  assert.ok(delays.includes(APP_STOP_FETCH_TIMEOUT_MS), 'cleanup bound must allow the full stop');
+  assert.ok(elapsed + 10_000 < MAX_RUN_MS, 'browser close and evidence must fit after a slow stop');
 });
 
 test('final-stop failure preserves earlier failure evidence and still closes the browser', async t => {

@@ -7,7 +7,10 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-export const MAX_RUN_MS = 8 * 60_000;
+export const MAX_CHECK_MS = 8 * 60_000;
+// Keep this aligned with APP_STOP_FETCH_TIMEOUT_MS without loading deployment code.
+export const FINAL_STOP_TIMEOUT_MS = 290_000;
+export const MAX_RUN_MS = MAX_CHECK_MS + FINAL_STOP_TIMEOUT_MS + 20_000;
 export const CHECK_NAMES = Object.freeze([
   'setup', 'sign-in', 'os-session-ready', 'warm-browser-paint',
   'relay-read', 'relay-renew', 'warm-code-ready', 'warm-terminal',
@@ -59,6 +62,20 @@ export function isRealStop(response) {
     && response.json.outcome === 'destroyed' && response.json.terminated === true;
 }
 
+/** Reject blank frames, cursors on black, and uniform loading backgrounds. */
+export function isMeaningfulFrame(pixels, width = 64, height = 36) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 64 || height < 36
+      || pixels?.length !== width * height * 4) return false;
+  let visible = 0, min = 255, max = 0;
+  for (let i = 0; i < pixels.length; i += 4) {
+    const luma = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+    if (luma > 24) visible++;
+    min = Math.min(min, luma);
+    max = Math.max(max, luma);
+  }
+  return visible / (width * height) >= 0.02 && max - min >= 40;
+}
+
 export function isValidRelayRenewal(read, response, now) {
   const renew = response?.json;
   return response?.status === 200 && renew?.ok === true
@@ -107,8 +124,8 @@ export async function runLiveCheck({
   emit = value => writeSync(1, `${JSON.stringify(value)}\n`),
 } = {}) {
   const started = performance.now();
-  // Reserve at least a minute for final stop, plus evidence and browser shutdown.
-  const deadline = started + MAX_RUN_MS - 60_000 - 15_000;
+  // Normal checks cannot consume the final stop or shutdown budgets.
+  const deadline = started + MAX_CHECK_MS;
   const out = resolve(env.EZIL_LIVE_OUT || join(tmpdir(), 'ezil-live-check'));
   const checks = [];
   const abort = new AbortController();
@@ -198,20 +215,16 @@ export async function runLiveCheck({
     for (;;) {
       remaining();
       for (const frame of page.frames().filter(frame => /nekodesktop/.test(frame.url()))) {
-        const painted = await frame.evaluate(() => {
+        const pixels = await frame.evaluate(() => {
           const video = document.querySelector('video');
-          if (!video?.videoWidth || video.readyState < 2) return false;
+          if (!video?.videoWidth || video.readyState < 2) return null;
           const canvas = document.createElement('canvas');
           canvas.width = 64; canvas.height = 36;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(video, 0, 0, 64, 36);
-          const pixels = ctx.getImageData(0, 0, 64, 36).data;
-          for (let i = 0; i < pixels.length; i += 4) {
-            if (pixels[i] + pixels[i + 1] + pixels[i + 2] > 30) return true;
-          }
-          return false;
-        }).catch(() => false);
-        if (painted) return;
+          return Array.from(ctx.getImageData(0, 0, 64, 36).data);
+        }).catch(() => null);
+        if (isMeaningfulFrame(pixels)) return;
       }
       await sleep(remaining(1000));
     }
@@ -343,8 +356,8 @@ export async function runLiveCheck({
     });
     await check('close-windows', 15_000, () => closeWindows('.window'));
     if (env.EZIL_LIVE_SKIP_COLD !== '1') {
-      await check('stop', 290_000, async () => {
-        if (!isRealStop(await api('/api/shell/stop', { computerId }, 290_000))) throw new Error('Real stop unconfirmed');
+      await check('stop', FINAL_STOP_TIMEOUT_MS, async () => {
+        if (!isRealStop(await api('/api/shell/stop', { computerId }, FINAL_STOP_TIMEOUT_MS))) throw new Error('Real stop unconfirmed');
       });
       await check('cold-os-session-ready', 60_000, async () => {
         const selected = await sessionReady();
@@ -369,7 +382,7 @@ export async function runLiveCheck({
     abort.abort();
     if (validatedComputerId) {
       const stopping = performance.now();
-      const timeout = Math.max(1, Math.floor(Math.min(290_000, started + MAX_RUN_MS - 10_000 - stopping)));
+      const timeout = FINAL_STOP_TIMEOUT_MS;
       // Cleanup has its own signal: a failed check has already aborted normal API calls.
       const cleanup = new AbortController();
       try {

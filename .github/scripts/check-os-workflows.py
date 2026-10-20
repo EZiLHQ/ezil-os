@@ -8,6 +8,10 @@ import subprocess
 import yaml
 
 root = Path(__file__).resolve().parents[2]
+live_run_ms = int(subprocess.check_output([
+    'node', '--input-type=module', '-e',
+    "import { MAX_RUN_MS } from './e2e/live-check.mjs'; console.log(MAX_RUN_MS);",
+], cwd=root, text=True))
 contract = json.loads((root / '.github/environment-contract.json').read_text())
 subprocess.run(['node', '.github/scripts/env-contract.mjs', 'check', '--repo', 'ezil-os'], cwd=root, check=True)
 workflows = {}
@@ -188,7 +192,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
 ):
     job = preview['jobs'][job_name]
     assert job['environment'] == environment
-    assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (36 if job_name == 'preview' else 65)
+    assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (42 if job_name == 'preview' else 71)
     assert job['needs'] == ['changes', 'images']
     ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
                      "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))")
@@ -265,6 +269,11 @@ for job_name, branch, environment, url, deploy_name, check_id in (
         assert identity['env'][key] == '${{ secrets.' + key + ' }}'
     assert deploy['working-directory'] == 'app' and 'vercel deploy .. --yes' in deploy['run']
     assert 'node e2e/live-check.mjs' in check['run']
+    assert check['timeout-minutes'] == 14
+    assert live_run_ms + 20_000 < check['timeout-minutes'] * 60_000 < job['timeout-minutes'] * 60_000
+    assert "import { MAX_RUN_MS } from './e2e/live-check.mjs'" in check['run']
+    assert '(( remaining >= live_seconds + 10 ))' in check['run']
+    assert 'timeout --kill-after=10s "$((live_seconds + 10))s" node e2e/live-check.mjs' in check['run']
     assert check['env']['EZIL_E2E_APP'] == url
     assert check['env']['EZIL_LIVE_OUT'] == 'live-evidence'
     for key in ('EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD', 'EZIL_E2E_COMPUTER_ID'):
@@ -287,6 +296,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert receipt['env']['REUSED_IMAGE_SOURCE'] == '${{ needs.changes.outputs.image_source }}'
     assert "assert.equal(images.tested, true)" in receipt['run']
     if job_name == 'preview':
+        assert '+ 41 * 60' in by_id['deadline']['run']
         routes = by_name['Validate staging Worker hostname and routes']
         assert 'if' not in routes and not routes.get('continue-on-error', False)
         assert position(checks[0]) < position(routes) < position(worker)
@@ -306,6 +316,11 @@ for job_name, branch, environment, url, deploy_name, check_id in (
         continue
 
     assert '--prod' in deploy['run'] and check['continue-on-error'] is True
+    for step in (worker, deploy):
+        assert 'set -euo pipefail' in step['run']
+        assert 'gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq \'.object.sha\'' in step['run']
+        assert '[[ "$current_main" == "$EZIL_DEPLOY_SHA" ]] ||' in step['run']
+        assert step['run'].index('gh api ') < step['run'].index('[[ "$current_main"') < step['run'].index('timeout --kill-after=10s')
     assert 'wrangler deployments list --json' in by_id['previous_worker']['run']
     assert '/deployments/os.ezil.work?teamId=' in by_id['previous_app']['run']
     assert by_id['previous_worker']['if'] == by_id['previous_app']['if'] == main
@@ -348,6 +363,12 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert migrations['run'] == 'node .github/scripts/production-migrations.mjs apply'
     assert migrations['env'] == {'SUPABASE_ACCESS_TOKEN': '${{ secrets.SUPABASE_ACCESS_TOKEN }}',
                                  'GITHUB_TOKEN': '${{ github.token }}'}
+    current_main = by_id['current_main']
+    assert current_main['if'] == main and not current_main.get('continue-on-error', False)
+    assert current_main['uses'] == 'actions/github-script@v8'
+    assert position(archive) < position(current_main) == position(migrations) - 1
+    assert "github.rest.git.getRef({ ...context.repo, ref: 'heads/main' })" in current_main['with']['script']
+    assert "if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed(" in current_main['with']['script']
     assert container['if'] == guarded_condition + " && needs.changes.outputs.image_changed == 'true' && steps.previous_container.outcome == 'success'"
     assert container['run'] == 'node .github/scripts/release-state.mjs container-rollback'
     assert container['timeout-minutes'] == 7 and not container.get('continue-on-error', False)
@@ -359,7 +380,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
                                     '  if node .github/scripts/release-state.mjs rollback-check; then exit 0; fi\n'
                                     '  sleep 5\ndone\nexit 1\n')
     assert {'previous-release.json', 'container-rollback.json', 'rollback-state.json', 'production-release.json'} <= set(upload['with']['path'].splitlines())
-    assert '+ 47 * 60' in by_id['deadline']['run']
+    assert '+ 53 * 60' in by_id['deadline']['run']
     # Tags only verify existing production, then use the original signed-native
     # release publication and verified semantic alias commands.
     tag_names = ('Identify the deployed image for tag verification',
