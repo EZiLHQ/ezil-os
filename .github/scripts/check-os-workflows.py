@@ -185,7 +185,7 @@ for job_name, job in preview['jobs'].items():
         assert bypass not in yaml.safe_dump(job), job_name
 
 for job_name, branch, environment, url, deploy_name, check_id in (
-    ('preview', 'preview', 'staging', 'https://ezil-os-preview.vercel.app',
+    ('preview', 'preview', 'staging', 'https://ezil-os-staging.vercel.app',
      'Deploy Vercel preview and set stable alias', 'live_preview'),
     ('production', 'main', 'production', 'https://os.ezil.work',
      'Deploy Vercel production', 'live_production'),
@@ -339,9 +339,9 @@ for job_name, branch, environment, url, deploy_name, check_id in (
                           'Staging cannot use production ezil.org routing', 'Staging routes must cover OS_WORKER_URL'):
             assert assertion in routes['run']
         assert '--prod' not in deploy['run']
-        assert 'vercel alias set "$url" ezil-os-preview.vercel.app' in deploy['run']
+        assert 'vercel alias set "$url" ezil-os-staging.vercel.app' in deploy['run']
         assert check['env'][bypass] == '${{ secrets.' + bypass + ' }}'
-        assert '/deployments/ezil-os-preview.vercel.app?teamId=' in identity['run']
+        assert '/deployments/ezil-os-staging.vercel.app?teamId=' in identity['run']
         assert 'assertVercelDeployment(await response.json()' in identity['run']
         assert 'assert.equal(id, identity.vercel_deployment' in identity['run']
         assert not check.get('continue-on-error', False)
