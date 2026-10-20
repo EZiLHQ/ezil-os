@@ -87,22 +87,32 @@ describe('migration reducer', () => {
 
 describe('restore lease', () => {
     const token = Buffer.alloc(32, 7).toString('base64url');
-    const migration = { ...base, state: 'exported' as const, computerId: G };
+    const migration = { ...base, state: 'exported' as const, id: H, computerId: G };
     const fetchBase = restoreFetchBase('https://app.example/path', G);
     const input = { computerId: G, volumeId: null, fsUuid: H, generation: 1, leaseEpoch: 1, nonce: token, provision: true, enrollUrl: 'https://app.example/enroll' };
     it('embeds the exact host restore shape only when explicitly supplied', () => {
         const restore = restoreLeaseFor(migration, token, fetchBase);
-        expect(restore).toEqual({ kind: 'cf-snapshot', workspace: head, system: null, fetchBase: `https://app.example/api/compute/restore/${G}`, identityToken: token });
+        expect(restore).toEqual({ kind: 'cf-snapshot', migrationId: H, generation: G, system: false, fetchBase: `https://app.example/api/compute/restore/${G}`, identityToken: token });
         const decode = (encoded: string) => JSON.parse(Buffer.from(encoded, 'base64').toString());
         expect(decode(buildAwsProvisionUserData(input))).not.toHaveProperty('restore');
         expect(decode(buildAwsProvisionUserData({ ...input, restore }))).toEqual({ ...decode(buildAwsProvisionUserData(input)), restore });
-        expect(restoreLeaseFor({ ...migration, systemHead: { ...head, generation: H } }, token, fetchBase).system?.generation).toBe(H);
+        expect(restoreLeaseFor({ ...migration, systemHead: { ...head, generation: H } }, token, fetchBase).system).toBe(true);
+    });
+    it('keeps maximal snapshot heads out of launch data with maximal credentials', () => {
+        const maximal = { ...head, chunks: Array.from({ length: 512 }, () => ({ size: 1048576, sha256: 'f'.repeat(64) })) };
+        const restore = restoreLeaseFor({ ...migration, workspaceHead: maximal, systemHead: maximal }, '_'.repeat(43), fetchBase);
+        expect(restore).not.toHaveProperty('workspace');
+        expect(restore.system).toBe(true);
+        expect(JSON.stringify(restore).length).toBeLessThan(512);
+        const encoded = buildAwsProvisionUserData({ ...input, nonce: '_'.repeat(128), restore });
+        expect(encoded.length).toBeLessThan(2048);
+        expect(JSON.parse(Buffer.from(encoded, 'base64').toString()).restore).toEqual(restore);
     });
     it.each(['requested', 'fenced', 'restored', 'committed', 'failed_reopened', 'failed_needs_operator'] as const)('refuses lease in %s', state => {
         expect(() => restoreLeaseFor({ ...migration, state }, token, fetchBase)).toThrow();
     });
     it('guards capability scope and exported generation', () => {
-        for (const bad of [{ generation: null }, { workspaceHead: null }, { generation: H }, { lastError: 'recovery:abort:export' }])
+        for (const bad of [{ id: 'bad' }, { computerId: 'bad' }, { generation: 'bad', workspaceHead: { generation: 'bad' } }, { generation: null }, { workspaceHead: null }, { generation: H }, { lastError: 'recovery:abort:export' }])
             expect(() => restoreLeaseFor({ ...migration, ...bad }, token, fetchBase)).toThrow();
         for (const url of [fetchBase + '?x=1', fetchBase + '#x', fetchBase.replace(G, H), fetchBase.replace('https:', 'ftp:'), fetchBase.replace('app.example', 'user@app.example')])
             expect(() => restoreLeaseFor(migration, token, url)).toThrow();
