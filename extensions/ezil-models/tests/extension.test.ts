@@ -5,7 +5,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-mock.module('vscode', () => ({}));
+import { fakeVscode } from './fixtures/fake-vscode';
+
+mock.module('vscode', () => fakeVscode);
 const { ConfigStore, resolveConfigPath, settingsSnippet } = await import('../src/extension');
 const { parseModelsConfig } = await import('../src/config');
 

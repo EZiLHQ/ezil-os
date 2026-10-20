@@ -7,23 +7,8 @@ import type { Usage } from '../src/types';
 import { startMockAnthropic, type MockServer as AnthropicMock } from './fixtures/mock-anthropic';
 import { startMockOpenAI, type MockServer as OpenAIMock } from './fixtures/mock-openai';
 
-class TextPart { constructor(public value: string) {} }
-class ToolCallPart { constructor(public callId: string, public name: string, public input: object) {} }
-class ToolResultPart { constructor(public callId: string, public content: unknown[]) {} }
-class DataPart { constructor(public data: Uint8Array, public mimeType: string) {} static text(value: string, mime = 'text/plain') { return new DataPart(new TextEncoder().encode(value), mime); } }
-class ThinkingPart { constructor(public value: string | string[], public id?: string, public metadata?: Record<string, unknown>) {} }
-class EventEmitter<T> { private listeners: ((value: T) => void)[] = []; event = (listener: (value: T) => void) => { this.listeners.push(listener); return { dispose: () => {} }; }; fire(value: T) { for (const listener of this.listeners) listener(value); } dispose() {} }
+import { TextPart, ToolCallPart, ToolResultPart, DataPart, ThinkingPart, EventEmitter, fakeVscode } from './fixtures/fake-vscode';
 
-const fakeVscode: Record<string, unknown> = {
-    LanguageModelTextPart: TextPart,
-    LanguageModelToolCallPart: ToolCallPart,
-    LanguageModelToolResultPart: ToolResultPart,
-    LanguageModelDataPart: DataPart,
-    LanguageModelThinkingPart: ThinkingPart,
-    LanguageModelChatMessageRole: { User: 1, Assistant: 2, System: 3 },
-    LanguageModelChatToolMode: { Auto: 1, Required: 2 },
-    EventEmitter,
-};
 mock.module('vscode', () => fakeVscode);
 
 const providerModule = await import('../src/provider');
