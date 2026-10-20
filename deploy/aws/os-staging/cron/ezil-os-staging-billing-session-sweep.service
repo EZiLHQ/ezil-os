@@ -1,0 +1,14 @@
+[Unit]
+Description=EZiL OS staging billing-session-sweep
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ezil-os-staging/cron.env
+ExecStart=/usr/bin/curl -fsS --max-time 50 -H "Authorization: Bearer ${CRON_SECRET}" https://os-staging.ezil.work/api/cron/billing-session-sweep
+TimeoutStartSec=55
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

@@ -1,0 +1,30 @@
+name: ezil-os-staging
+services:
+  web:
+    image: ezil-os-staging:${OS_STAGING_TAG:?Set OS_STAGING_TAG}
+    platform: linux/amd64
+    pull_policy: never
+    env_file:
+      - path: /etc/ezil-os-staging/app.env
+        format: raw
+    environment:
+      AWS_REGION: ap-south-1
+    restart: unless-stopped
+    init: true
+    expose: ['3000']
+    logging: &logging
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [web]
+    logging: *logging
+volumes:
+  caddy_data:
+  caddy_config:
