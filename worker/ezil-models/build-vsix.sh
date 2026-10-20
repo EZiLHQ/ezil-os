@@ -7,6 +7,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src="$(cd "$here/../../extensions/ezil-models" && pwd)"
 mode="${1:-build}"
 [[ "$mode" == build || "$mode" == --check ]] || { echo 'Usage: build-vsix.sh [--check]' >&2; exit 2; }
+# Bundle bytes depend on the Bun version, so build and check with CI's pinned Bun
+# (.github/workflows/ci.yml, ezil-models job).
+BUN_PINNED=1.3.14
+[[ "$(bun --version)" == "$BUN_PINNED" ]] || { echo "[build-vsix] FAIL: needs bun $BUN_PINNED (found $(bun --version)); the VSIX bytes depend on it" >&2; exit 2; }
 version="$(bun -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$src/package.json")"
 out="$here/dist/ezil-models-${version}.vsix"
 tmp="$(mktemp -d "$here/.build-XXXXXX")"
