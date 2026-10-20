@@ -170,6 +170,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      id-token: write
     env:
       EZIL_DEPLOY_SHA: ${{ github.sha }}
       EZIL_DEPLOY_TARGET: preview
@@ -255,6 +256,17 @@ jobs:
           path = Path('worker/wrangler.toml')
           path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
           PY
+      # GitHub concurrency is repository-local; this lease also fences other repos.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          role-duration-seconds: 7200
+      - name: Acquire shared staging lease
+        id: lease
+        env:
+          LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 10800 --wait 1200
       - name: Capture container version before deploy
         id: container_before
         if: needs.changes.outputs.image_changed == 'true'
@@ -383,6 +395,11 @@ jobs:
             live-evidence
             hosted-continuity-evidence/container-rollout.json
           if-no-files-found: warn
+      - name: Release shared staging lease
+        if: always() && steps.lease.outcome == 'success'
+        env:
+          LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py release --owner "$LEASE_OWNER"
 
   production:
     name: Deploy and verify production
@@ -402,6 +419,7 @@ jobs:
       contents: write
       packages: write
       actions: read
+      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -459,6 +477,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: os-images-${{ github.sha }}
+      # Main snapshots and tag live checks both require the cross-repository lease.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          role-duration-seconds: 7200
+      - name: Acquire shared production lease
+        id: production_lease
+        env:
+          LEASE_OWNER: os-prod-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py acquire --scope shared-production --owner "$LEASE_OWNER" --ttl 7200 --wait 1200
       - name: Record previous Worker version
         if: github.ref == 'refs/heads/main'
         id: previous_worker
@@ -869,3 +898,8 @@ jobs:
             production-release.json
             hosted-continuity-evidence/container-rollout.json
           if-no-files-found: warn
+      - name: Release shared production lease
+        if: always() && steps.production_lease.outcome == 'success'
+        env:
+          LEASE_OWNER: os-prod-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py release --scope shared-production --owner "$LEASE_OWNER"

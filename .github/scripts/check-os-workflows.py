@@ -201,8 +201,8 @@ for job_name, branch, environment, url, deploy_name, check_id in (
         "needs.changes.result == 'success' && "
         "(needs.images.result == 'success' || needs.images.result == 'skipped') }}")
     assert job['concurrency'] == {'group': f'deploy-{environment}', 'cancel-in-progress': False}
-    assert job['permissions'] == ({'contents': 'read', 'packages': 'read'} if job_name == 'preview' else
-                                  {'contents': 'write', 'packages': 'write', 'actions': 'read'})
+    assert job['permissions'] == ({'contents': 'read', 'packages': 'read', 'id-token': 'write'} if job_name == 'preview' else
+                                  {'contents': 'write', 'packages': 'write', 'actions': 'read', 'id-token': 'write'})
     assert job['env']['EZIL_DEPLOY_SHA'] == '${{ github.sha }}'
     assert job['env']['EZIL_DEPLOY_TARGET'] == job_name
     assert job['env']['EZIL_WORKER_NAME'] == ('ezil-os-worker-staging' if job_name == 'preview' else 'ezil-os-worker')
@@ -211,6 +211,39 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     by_name = {step.get('name'): step for step in steps}
     by_id = {step['id']: step for step in steps if 'id' in step}
     position = lambda step: steps.index(step)
+    # Repository-scoped concurrency cannot serialize other repositories' deploys
+    # or acceptance. Keep the original shared lease through evidence and recovery.
+    lease_id = 'lease' if job_name == 'preview' else 'production_lease'
+    scope = '' if job_name == 'preview' else '--scope shared-production '
+    ttl = 10800 if job_name == 'preview' else 7200
+    owner = ('os-' if job_name == 'preview' else 'os-prod-') + '${{ github.run_id }}-${{ github.run_attempt }}'
+    acquire = by_id[lease_id]
+    credentials = [step for step in steps if step.get('uses', '').startswith('aws-actions/configure-aws-credentials@')]
+    assert len(credentials) == 1
+    credentials = credentials[0]
+    assert credentials['uses'] == 'aws-actions/configure-aws-credentials@v4'
+    assert credentials['with'] == {
+        'role-to-assume': 'arn:aws:iam::452630323510:role/ezil-os-staging-lease',
+        'aws-region': 'us-east-1', 'role-duration-seconds': 7200,
+    }
+    # No branch/image condition: main and version-tag checks both acquire; any
+    # acquisition failure must retain GitHub's default success() gating.
+    for step in (credentials, acquire):
+        assert not {'if', 'continue-on-error', 'shell'} & set(step), (job_name, step)
+    assert not job.get('continue-on-error', False)
+    assert acquire['run'] == f'python3 .github/scripts/staging-lock.py acquire {scope}--owner "$LEASE_OWNER" --ttl {ttl} --wait 1200'
+    release = by_name[f'Release shared {environment} lease']
+    assert release['if'] == f"always() && steps.{lease_id}.outcome == 'success'"
+    assert release['run'] == f'python3 .github/scripts/staging-lock.py release {scope}--owner "$LEASE_OWNER"'
+    assert acquire['env'] == release['env'] == {'LEASE_OWNER': owner}
+    assert not release.get('continue-on-error', False)
+    assert position(credentials) < position(acquire) and steps[-1] == release
+    protected = [by_id[key] for key in ('container_before', 'worker', check_id)]
+    if job_name == 'production':
+        protected += [by_id[key] for key in ('previous_worker', 'previous_app', 'previous_container', 'rollback_guard')]
+        protected += [by_name['Verify or apply reviewed production migrations'],
+                      by_name['Fail after production recovery']]
+    assert all(position(acquire) < position(step) < position(release) for step in protected), job_name
     command = f'node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment {job_name}'
     checks = [step for step in steps if step.get('run') == command]
     assert len(checks) == 1 and set(checks[0]) <= {'name', 'id', 'run'}
@@ -287,7 +320,8 @@ for job_name, branch, environment, url, deploy_name, check_id in (
             assert job_name == 'preview' and step.get('id') == 'live_preview'
     upload = by_name['Upload live evidence']
     assert upload['if'] == 'always()' and upload['uses'].startswith('actions/upload-artifact@')
-    assert 'live-evidence' in upload['with']['path'].splitlines() and steps[-1] == upload
+    assert 'live-evidence' in upload['with']['path'].splitlines()
+    assert position(check) < position(upload) < position(release)
     assert 'hosted-continuity-evidence/container-rollout.json' in upload['with']['path'].splitlines()
     receipt = by_name['Record successfully deployed image source']
     assert receipt['if'] == ('' if job_name == 'preview' else main + ' && ') + f"steps.{check_id}.outcome == 'success'"

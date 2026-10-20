@@ -653,6 +653,99 @@ test('both live-check steps require their environment isolated computer secret',
   }
 });
 
+test('shared leases fence staging and production snapshots, mutations, live checks and evidence', () => {
+  const jobs = outline(workflowText).children.find(node => node.line === 'jobs:');
+  for (const [name, leaseId, scope, owner, ttl] of [
+    ['preview', 'lease', '', 'os-', 10800],
+    ['production', 'production_lease', '--scope shared-production ', 'os-prod-', 7200],
+  ]) {
+    const job = previewWorkflow.jobs.find(job => job.name === name);
+    const permissions = jobs.children.find(node => node.line === `${name}:`).children
+      .find(node => node.line === 'permissions:');
+    assert.ok(permissions.children.some(node => node.line === 'id-token: write'), name);
+    const credentials = job.steps.filter(step => step.text.includes('aws-actions/configure-aws-credentials@'));
+    const acquisitions = job.steps.filter(step => step.run?.includes('staging-lock.py acquire'));
+    const releases = job.steps.filter(step => step.run?.includes('staging-lock.py release'));
+    assert.equal(credentials.length, 1);
+    assert.equal(acquisitions.length, 1);
+    assert.equal(releases.length, 1);
+    const [auth] = credentials, [acquire] = acquisitions, [release] = releases;
+    assert.equal(auth.line, '- uses: aws-actions/configure-aws-credentials@v4');
+    assert.match(auth.text, /^role-to-assume: arn:aws:iam::452630323510:role\/ezil-os-staging-lease$/m);
+    assert.match(auth.text, /^aws-region: us-east-1$/m);
+    assert.match(auth.text, /^role-duration-seconds: 7200$/m);
+    for (const step of [auth, acquire]) {
+      assert.ok(!step.keys.some(key => ['if', 'continue-on-error', 'shell'].includes(key)), name);
+    }
+    assert.ok(acquire.text.includes(`id: ${leaseId}\n`));
+    assert.equal(acquire.run, `python3 .github/scripts/staging-lock.py acquire ${scope}--owner "$LEASE_OWNER" --ttl ${ttl} --wait 1200`);
+    assert.equal(release.text.match(/^run: (.+)$/m)[1], `python3 .github/scripts/staging-lock.py release ${scope}--owner "$LEASE_OWNER"`);
+    for (const step of [acquire, release]) {
+      assert.equal(step.text.match(/^LEASE_OWNER: (.+)$/m)[1], `${owner}\${{ github.run_id }}-\${{ github.run_attempt }}`);
+    }
+    assert.equal(release.text.match(/^if: (.+)$/m)[1], `always() && steps.${leaseId}.outcome == 'success'`);
+    assert.ok(!release.keys.includes('continue-on-error'));
+    const protectedIds = ['container_before', 'worker', `live_${name}`];
+    if (name === 'production') protectedIds.push('previous_worker', 'previous_app', 'previous_container', 'rollback_guard');
+    const protectedSteps = protectedIds.map(id => {
+      const step = job.steps.find(step => step.text.includes(`id: ${id}\n`));
+      assert.ok(step, id);
+      return step;
+    });
+    protectedSteps.push(...job.steps.filter(step => /vercel (?:deploy|promote)|wrangler rollback|production-migrations.mjs apply|release-state.mjs (?:container-rollback|rollback-check)|node e2e\/(?:await-container-rollout|verify-cloud-deployment).mjs/.test(step.text)));
+    assert.ok(job.steps.indexOf(auth) < job.steps.indexOf(acquire));
+    for (const step of protectedSteps) {
+      assert.ok(job.steps.indexOf(acquire) < job.steps.indexOf(step), `${name}: ${step.line} must hold the lease`);
+    }
+    const upload = job.steps.find(step => step.line === '- name: Upload live evidence');
+    assert.ok(job.steps.indexOf(upload) > job.steps.indexOf(protectedSteps[2]));
+    assert.equal(job.steps.at(-2), upload);
+    assert.equal(job.steps.at(-1), release);
+  }
+});
+
+test('failed lease acquisition skips snapshots, deployments, recovery and live checks on branches and tags', () => {
+  for (const [name, ref, leaseId] of [
+    ['preview', 'refs/heads/preview', 'lease'],
+    ['production', 'refs/heads/main', 'production_lease'],
+    ['production', 'refs/tags/v1.2.3', 'production_lease'],
+  ]) {
+    const job = previewWorkflow.jobs.find(job => job.name === name);
+    const acquire = job.steps.findIndex(step => step.text.includes(`id: ${leaseId}\n`));
+    for (const imageChanged of ['true', 'false']) {
+      const steps = Object.fromEntries(job.steps.flatMap(step => {
+        const id = step.text.match(/^id: (.+)$/m)?.[1];
+        return id ? [[id, { outcome: 'skipped' }]] : [];
+      }));
+      steps[leaseId].outcome = 'failure';
+      const admitted = job.steps.slice(acquire + 1).filter(step => {
+        const condition = step.text.match(/^if: (.+)$/m)?.[1] ?? 'success()';
+        // GitHub implicitly adds success() unless a status function is present.
+        if (!/\b(?:always|success|failure|cancelled)\(/.test(condition)) return false;
+        return new Function('github', 'needs', 'steps', 'always', 'success', 'failure', 'cancelled', 'startsWith', `return (${condition})`)(
+          { ref }, { changes: { outputs: { image_changed: imageChanged } } }, steps,
+          () => true, () => false, () => true, () => false, (value, prefix) => value.startsWith(prefix));
+      });
+      assert.deepEqual(admitted.map(step => step.line), ['- name: Upload live evidence'], `${ref}, images=${imageChanged}`);
+    }
+  }
+});
+
+test('lease release runs after failure or cancellation only when this run acquired it', () => {
+  for (const [name, leaseId] of [['preview', 'lease'], ['production', 'production_lease']]) {
+    const release = previewWorkflow.jobs.find(job => job.name === name).steps.at(-1);
+    const condition = release.text.match(/^if: (.+)$/m)[1];
+    for (const outcome of ['success', 'failure', 'cancelled', 'skipped']) {
+      for (const jobStatus of ['success', 'failure', 'cancelled']) {
+        const admitted = new Function('steps', 'always', 'success', 'failure', 'cancelled', `return (${condition})`)(
+          { [leaseId]: { outcome } }, () => true, () => jobStatus === 'success',
+          () => jobStatus === 'failure', () => jobStatus === 'cancelled');
+        assert.equal(admitted, outcome === 'success', `${name}, lease=${outcome}, job=${jobStatus}`);
+      }
+    }
+  }
+});
+
 test('workflow deadlines admit a full live run including final stop or refuse to start it', () => {
   assert.ok(MAX_CHECK_MS <= 8 * 60_000);
   assert.equal(FINAL_STOP_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS);
