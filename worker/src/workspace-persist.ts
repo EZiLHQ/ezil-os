@@ -35,6 +35,7 @@ export interface Snapshot {
   chunks: Array<{ size: number; sha256: string }>;
 }
 export interface HydrateR2ObjectBodyLike {
+  body?: ReadableStream<Uint8Array> | null;
   etag?: string;
   size?: number;
   arrayBuffer(): Promise<ArrayBuffer>;
@@ -181,6 +182,8 @@ export interface MigratedHead {
   exported: { generation: string; chunkGeneration: string; previousChunkGeneration?: string; sha256: string; entries: number };
   /** The head etag this marker replaced: lets a retried commit recognise its own marker. */
   exportedEtag?: string;
+  /** Complete replaced head for export and explicit rollback; absent on legacy markers. */
+  previous?: Snapshot;
 }
 /** Marker under a prefix while an export runs: garbage collection is suspended. Outside the chunk-key pattern. */
 export const MIGRATING_FLAG = '.ezil-snapshots/migrating.json';
@@ -198,6 +201,12 @@ export function parseMigratedHead(raw: string): MigratedHead | null {
     || !HASH.test(e.sha256) || !Number.isInteger(e.entries) || e.entries < 0 || e.entries > MAX_ENTRIES
     || (m.exportedEtag !== undefined && (typeof m.exportedEtag !== 'string' || m.exportedEtag === '' || m.exportedEtag.length > 256))) {
     throw new Error('invalid migrated head');
+  }
+  if (m.previous !== undefined) {
+    const previous = parseSnapshot(JSON.stringify(m.previous));
+    if (previous.generation !== e.generation || (previous.chunkGeneration ?? previous.generation) !== e.chunkGeneration
+      || previous.sha256 !== e.sha256 || previous.entries !== e.entries
+      || previous.previousChunkGeneration !== e.previousChunkGeneration) throw new Error('invalid migrated previous head');
   }
   return m;
 }
@@ -254,6 +263,7 @@ export async function writeMigratedHead(deps: {
     exported: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation,
       ...(s.previousChunkGeneration ? { previousChunkGeneration: s.previousChunkGeneration } : {}), sha256: s.sha256, entries: s.entries },
     exportedEtag: current.etag,
+    previous: s,
   };
   const put = await bucket.put(`${prefix}/${SNAPSHOT_HEAD}`, encoder.encode(JSON.stringify(head)), { onlyIf: { etagMatches: current.etag } });
   return put ? { ok: true, head } : { ok: false, reason: 'head_moved' };
