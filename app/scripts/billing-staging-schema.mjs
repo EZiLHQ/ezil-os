@@ -15,6 +15,7 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0003_billing.sql',
     'app/drizzle/0004_billing_v2.sql',
     'app/drizzle/0005_billing_sessions.sql',
+    'app/drizzle/0006_compute_migrations.sql',
     'docs/aws-computers/sql/0001_compute_placement.sql.txt',
     'docs/aws-computers/sql/0002_ready_pool.sql.txt',
 ]);
@@ -23,7 +24,8 @@ const HASH = /^[a-f0-9]{64}$/;
 class Refusal extends Error {}
 const refuse = (message) => { throw new Refusal(message); };
 
-export function validateDatabaseUrl(value) {
+export function validateDatabaseUrl(value, target = 'ezil-os-awstest') {
+    if (!['ezil-os-awstest', 'aws-preview'].includes(target)) refuse('Unknown staging target.');
     if (!value || typeof value !== 'string') refuse('BILLING_STAGING_DATABASE_URL is required.');
     let decoded = value;
     let invalidEncoding = false;
@@ -43,7 +45,11 @@ export function validateDatabaseUrl(value) {
         !/^[a-zA-Z0-9_-]*$/.test(decodeURIComponent(url.pathname.replace(/^\//, '')))) {
         refuse('Expected a single DNS host and a plain database name.');
     }
-    if (!url.hostname.includes(STAGING_REF) && !user.includes(STAGING_REF)) {
+    if (target === 'aws-preview') {
+        const tunnel = ['127.0.0.1', 'localhost'].includes(url.hostname) && url.port === '15432';
+        const privateHost = url.hostname === '10.61.20.35' && url.port === '5432';
+        if (!tunnel && !privateHost) refuse('aws-preview requires localhost or 127.0.0.1:15432, or 10.61.20.35:5432.');
+    } else if (!url.hostname.includes(STAGING_REF) && !user.includes(STAGING_REF)) {
         refuse(`Staging project pin missing: host or user must contain ${STAGING_REF}.`);
     }
     // libpq query parameters can override the pinned authority (host, user,
@@ -110,13 +116,28 @@ export function renderPlan(files, logged = null) {
 }
 
 export function parseArgs(args) {
-    const yes = args.includes('--yes');
-    const positional = args.filter((arg) => arg !== '--yes');
+    let yes = false, target = 'ezil-os-awstest', expectSystemId;
+    const positional = [], seen = new Set();
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--yes') { yes = true; continue; }
+        if (arg === '--target' || arg === '--expect-system-id') {
+            if (seen.has(arg) || !args[i + 1] || args[i + 1].startsWith('--')) refuse(`Missing or duplicate ${arg}.`);
+            seen.add(arg);
+            const value = args[++i];
+            if (arg === '--target') target = value;
+            else expectSystemId = value;
+        } else if (arg.startsWith('--')) refuse('Unknown staging option.');
+        else positional.push(arg);
+    }
+    if (!['ezil-os-awstest', 'aws-preview'].includes(target)) refuse('Unknown staging target.');
+    if (target === 'aws-preview' && !/^[0-9]+$/.test(expectSystemId ?? '')) refuse('aws-preview requires --expect-system-id <digits>.');
+    if (target !== 'aws-preview' && expectSystemId !== undefined) refuse('--expect-system-id requires --target aws-preview.');
     const mode = positional.shift() ?? 'plan';
-    if (!['plan', 'apply', 'baseline'].includes(mode)) refuse('Usage: billing-staging-schema.mjs [plan | apply --yes | baseline <file...> --yes]');
+    if (!['plan', 'apply', 'baseline'].includes(mode)) refuse('Usage: billing-staging-schema.mjs [plan | apply --yes | baseline <file...> --yes] [--target ezil-os-awstest|aws-preview] [--expect-system-id <digits>]');
     if (mode !== 'plan' && !yes) refuse(`${mode} requires --yes.`);
     if (mode === 'baseline' ? positional.length === 0 : positional.length !== 0) refuse('Only baseline accepts file arguments; baseline needs at least one file.');
-    return { mode, files: positional, yes };
+    return { mode, files: positional, yes, target, expectSystemId };
 }
 
 const literal = (value) => `E'${value.replaceAll('\\', '\\\\').replaceAll("'", "''")}'`;
@@ -130,9 +151,9 @@ export function run(args = process.argv.slice(2), {
     const databaseUrl = env.BILLING_STAGING_DATABASE_URL;
     const emit = (message) => write(redact(message, databaseUrl));
     try {
-        const { mode, files: requested } = parseArgs(args);
-        const connection = databaseUrl ? validateDatabaseUrl(databaseUrl) : null;
-        if (!connection && mode !== 'plan') refuse('BILLING_STAGING_DATABASE_URL is required.');
+        const { mode, files: requested, target, expectSystemId } = parseArgs(args);
+        const connection = databaseUrl ? validateDatabaseUrl(databaseUrl, target) : null;
+        if (!connection && (mode !== 'plan' || target === 'aws-preview')) refuse('BILLING_STAGING_DATABASE_URL is required.');
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
         const files = ordered.map((file) => ({ file, sha256: sha256(readFileSync(resolve(ROOT, file))) }));
         const selected = new Set(requested.map((name) => {
@@ -157,20 +178,27 @@ export function run(args = process.argv.slice(2), {
             PGUSER: decodeURIComponent(connection.username) || 'postgres',
             PGPASSWORD: decodeURIComponent(connection.password),
             PGDATABASE: decodeURIComponent(connection.pathname.replace(/^\//, '')) || 'postgres',
-            PGSSLMODE: connection.searchParams.get('sslmode') || 'require',
+            PGSSLMODE: connection.searchParams.get('sslmode') || (target === 'aws-preview' ? 'disable' : 'require'),
             PGCONNECT_TIMEOUT: connection.searchParams.get('connect_timeout') || '15',
             PGPASSFILE: '/dev/null',
         });
         const psql = (parameters) => {
             let result;
             try {
-                result = spawnSyncImpl('psql', ['-X', '--no-password', '-v', 'ON_ERROR_STOP=1', '-q', '-A', '-t', ...parameters], {
+                result = spawnSyncImpl('psql', ['-X', '--no-password', '-v', 'ON_ERROR_STOP=1', '-q', '-A', '-t', ...(target === 'aws-preview' && !parameters.includes('SELECT system_identifier FROM pg_control_system();') ?
+                        ['-c', `DO $pin$ BEGIN IF (SELECT system_identifier::text FROM pg_control_system()) IS DISTINCT FROM ${literal(expectSystemId)} THEN RAISE EXCEPTION 'Preview system identifier mismatch'; END IF; END; $pin$;`] : []), ...parameters], {
                     cwd: ROOT, env: childEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
                 });
             } catch { refuse('psql could not start; diagnostics suppressed to protect credentials.'); }
             if (result.error || result.signal || result.status !== 0) refuse('psql failed; stopped without retry. Outcome may be unconfirmed; run plan before retrying. Diagnostics suppressed to protect credentials.');
             return result.stdout;
         };
+        // Verify before even creating the log. Each later psql call opens a new
+        // connection, so repeat the pin inside that same session before its SQL.
+        if (target === 'aws-preview') {
+            const actual = psql(['-c', 'SELECT system_identifier FROM pg_control_system();']).trim();
+            if (!/^[0-9]+$/.test(actual) || actual !== expectSystemId) refuse('Preview system identifier mismatch; no schema operation performed.');
+        }
         psql(['--single-transaction', '-c', `CREATE TABLE IF NOT EXISTS ${TABLE} (file text primary key, sha256 text not null, applied_at timestamptz not null default now(), mode text not null);`]);
         let logged;
         try {

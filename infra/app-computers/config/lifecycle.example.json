@@ -36,6 +36,7 @@
   "recoveryEnabled": false,
   "appCaller": {
     "enabled": false,
+    "ec2CallerRoleArns": [],
     "providers": [
       {
         "name": "github",

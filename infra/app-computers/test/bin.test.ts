@@ -103,3 +103,22 @@ test('bin/ami is a protected founder stack with no assets, bootstrap or workload
 test('bin entrypoints refuse to run without a config', () => {
     for (const bin of ['bin/main.ts', 'bin/lifecycle.ts', 'bin/identity.ts', 'bin/ops.ts', 'bin/ami.ts']) assert.throws(() => synth(bin, {}), bin);
 });
+
+test('bin/lifecycle passes the optional exact EC2 caller list from deployment config', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ezil-ec2-caller-config-'));
+    try {
+        const config = JSON.parse(readFileSync(join(root, 'config/lifecycle.example.json'), 'utf8'));
+        const arn = 'arn:aws:iam::123456789012:role/ezil-os-staging-host';
+        config.appCaller.enabled = true;
+        config.appCaller.providers = config.appCaller.providers.filter((p: any) => p.name === 'vercel');
+        config.appCaller.ec2CallerRoleArns = [arn];
+        const path = join(dir, 'lifecycle.json');
+        writeFileSync(path, JSON.stringify(config));
+        const { template } = synth('bin/lifecycle.ts', { EZIL_LIFECYCLE_CONFIG: path })['ezil-pilot-lifecycle']!;
+        const caller = roles(template).find(r => r.Properties.AssumeRolePolicyDocument.Statement.some((s: any) => s.Action === 'sts:AssumeRoleWithWebIdentity'));
+        const statements = caller!.Properties.AssumeRolePolicyDocument.Statement;
+        assert.equal(statements.length, 2);
+        assert.deepEqual(statements[1], { Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { AWS: arn },
+            Condition: { StringEquals: { 'aws:PrincipalTag/ezil:env': 'billing-staging' } } });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+});

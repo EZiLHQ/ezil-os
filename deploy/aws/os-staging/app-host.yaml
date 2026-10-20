@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable EZiL OS billing staging host in the existing Mumbai preview VPC; no app or database deployed.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    must: [Deploy only in account 452630323510 and ap-south-1, Never use production resources]
+    ref: [INFRASTRUCTURE.md]
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0f6bc19fdfd4209aa
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0dd4cf8f7d3d92e20
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium]
+  AmazonLinuxAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  ArtifactBucket:
+    Type: String
+    AllowedPattern: '(?!ezil-main-prod-)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
+    Description: Existing non-production bucket reachable through the preview S3 endpoint.
+  AppCallerRoleArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::452630323510:role/[A-Za-z0-9+=,.@_/-]+'
+    Description: Exact existing app-caller role; no wildcard or account root.
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Public HTTP and HTTPS terminate on the staging host; administration uses SSM.
+        must: [No SSH ingress, No public database ingress]
+    Properties:
+      GroupDescription: OS billing staging HTTP and HTTPS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: 'ezil:env', Value: billing-staging}
+        - {Key: 'ezil:purpose', Value: os-staging}
+  InstanceRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: EC2 supplies temporary credentials for artifacts, staging secrets and the app caller.
+        must: [No secret writes, No bucket listing or writes, Exact app-caller role only]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BillingStagingRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/os-staging/images/*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ezil-os/billing-staging/app-*
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref AppCallerRoleArn
+      Tags:
+        - {Key: 'ezil:env', Value: billing-staging}
+        - {Key: 'ezil:purpose', Value: os-staging}
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # CloudFormation InstanceProfile has no Tags property; use stack tags as well.
+    Properties:
+      Roles: [!Ref InstanceRole]
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Single disposable host; container credentials need an IMDS hop limit of two.
+        must: [Encrypted disposable root, IMDSv2 required, No application in bootstrap]
+    Properties:
+      ImageId: !Ref AmazonLinuxAmi
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      DisableApiTermination: false
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref AppSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeType: gp3, VolumeSize: 30, Encrypted: true, DeleteOnTermination: true}
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - {Key: Name, Value: ezil-os-billing-staging-host}
+        - {Key: 'ezil:env', Value: billing-staging}
+        - {Key: 'ezil:purpose', Value: os-staging}
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set +x
+          umask 077
+          [[ $(uname -m) == x86_64 ]]
+          # EIP association follows instance creation; retry until egress is ready.
+          for attempt in $(seq 1 30); do
+            if dnf install -y docker python3 awscli-2 curl-minimal gzip tar util-linux; then break; fi
+            sleep 10
+          done
+          rpm -q docker python3 awscli-2 curl-minimal gzip tar util-linux
+          systemctl enable --now docker amazon-ssm-agent
+          # AL2023 does not consistently ship the Compose plugin in its repos.
+          # Fixed release, checksum verified; Compose >=2.30 is needed by raw env_file.
+          compose_version=v2.39.4
+          compose_asset=docker-compose-linux-x86_64
+          compose_base="https://github.com/docker/compose/releases/download/$compose_version"
+          temporary=$(mktemp -d)
+          trap 'rm -rf "$temporary"' EXIT
+          curl --fail --location --retry 5 "$compose_base/$compose_asset" -o "$temporary/$compose_asset"
+          curl --fail --location --retry 5 "$compose_base/checksums.txt" -o "$temporary/checksums.txt"
+          (cd "$temporary"; sha256sum --check --ignore-missing checksums.txt)
+          install -D -m 0755 "$temporary/$compose_asset" /usr/local/lib/docker/cli-plugins/docker-compose
+          docker compose version --short | python3 -c 'import re,sys; v=re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)",sys.stdin.read().strip()); assert v and tuple(map(int,v.groups())) >= (2,30,0)'
+          install -d -m 0755 /var/lib/ezil-os-staging
+          touch /var/lib/ezil-os-staging/bootstrap.done
+  PublicIp:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: 'ezil:env', Value: billing-staging}
+        - {Key: 'ezil:purpose', Value: os-staging}
+  PublicIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Associations do not support tags.
+    Properties:
+      AllocationId: !GetAtt PublicIp.AllocationId
+      InstanceId: !Ref AppInstance
+Outputs:
+  InstanceId:
+    Description: Staging instance to administer with SSM.
+    Value: !Ref AppInstance
+  PublicIp:
+    Description: DNS A record for os-staging.ezil.work.
+    Value: !Ref PublicIp
+  InstanceRoleArn:
+    Description: Add this exact ARN to appCaller.ec2CallerRoleArns after host creation.
+    Value: !GetAtt InstanceRole.Arn
+  AppSecurityGroupId:
+    Description: Source SG for the separate preview DB ingress stack.
+    Value: !Ref AppSecurityGroup
