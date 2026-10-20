@@ -56,9 +56,7 @@ try {
 
 // A brand-new context = a cold browser profile: no IndexedDB, no storage
 // state, so the `ensureChatExtensionInitialDisabledState` path runs.
-// The e2e reaches code-server on a container bridge address over http, which is not a secure context
-// (no crypto.subtle) unlike production's https host; treat exactly that origin as secure.
-const browser = await chromium.launch({ args: [`--unsafely-treat-insecure-origin-as-secure=${new URL(process.env.EZIL_CODE_URL ?? 'http://127.0.0.1:8443').origin}`] });
+const browser = await chromium.launch();
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
   recordVideo: { dir: join(OUT, 'video'), size: { width: 1440, height: 900 } },
