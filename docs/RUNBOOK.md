@@ -25,6 +25,20 @@ system, which is out of scope for a docs-only pass.
 
 ---
 
+## Release flow
+
+Open a feature PR and merge it to the long-lived `preview` branch. Each push
+runs `preview.yml`: deploy the staging Worker and app, update the stable preview
+URL <https://ezil-os-preview.vercel.app>, then run `e2e/live-check.mjs`.
+After that check passes, merge `preview` to `main`. The same workflow deploys
+production at <https://os.ezil.work> and runs the live check; a failed check
+automatically restores the previous Worker version and Vercel deployment and
+fails the run. Live-check evidence is uploaded on every run. PR CI runs on
+Ubuntu; `preview.yml` also supports manual dispatch on `preview` or `main`,
+and the macOS workflows remain available manually. Container images build
+only when their inputs change; other pushes leave the container rollout
+disabled. Manual dispatch and new branches rebuild images conservatively.
+
 ## What is live (as of 2026-10-01)
 
 > **2026-10-18:** production moved to `https://os.ezil.work`, which is the

@@ -18,6 +18,7 @@ import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FET
 import './sign-in.test.mjs';
 import './code-picker.test.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
+import { outline, parseWorkflow } from '../.github/scripts/env-contract.mjs';
 
 const sha = 'a'.repeat(40);
 const target = { sha, app: 'https://preview-test.vercel.app', project: 'prj_test', target: 'preview' };
@@ -416,74 +417,46 @@ test('Vercel rollback refuses mismatched identities, untrusted hostnames and los
   });
 });
 
-// Execute the actual admission script with fake GitHub readbacks. No checkout or secrets.
 const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
-test('rollback workflow keeps ownership admission and readback around the scoped Vercel helper', () => {
-  const restore = workflowText.split('      - name: Restore previous Vercel production deployment\n')[1].split('      - name:')[0];
-  assert.match(restore, /if: failure\(\) && steps\.rollback_guard\.outcome == 'success'/);
-  assert.match(restore, /VERCEL_ORG_ID: \$\{\{ secrets\.VERCEL_ORG_ID \}\}/);
-  assert.match(restore, /run: node \.github\/scripts\/release-state\.mjs vercel-rollback/);
-  assert.match(workflowText, /node \.github\/scripts\/release-state\.mjs rollback-check/);
+const previewWorkflow = parseWorkflow(workflowText);
+
+test('deployment triggers are exactly preview/main pushes and manual dispatch', () => {
+  const triggers = outline(workflowText).children.find(node => node.line === 'on:');
+  assert.ok(triggers, 'deployment workflow must declare its triggers');
+  assert.deepEqual(triggers.children.map(node => node.line).sort(), ['push:', 'workflow_dispatch:']);
+  const push = triggers.children.find(node => node.line === 'push:');
+  assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]']);
+  assert.equal(triggers.children.find(node => node.line === 'workflow_dispatch:').children.length, 0);
 });
-const admissionSource = workflowText.split('          script: |\n')[1].split('\n  preview:')[0]
-  .split('\n').filter(line => line.startsWith('            ')).map(line => line.slice(12)).join('\n');
-const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
-async function admission({ event='workflow_dispatch', current=sha, conclusion='success', eventSha=sha, path='.github/workflows/ci.yml', previewPR='', prPatch={}, changedPR=false, ciPatch={} } = {}) {
-  const outputs = {}, failures = [];
-  const run = {head_sha:eventSha,head_branch:'main',path,head_repository:{full_name:'owner/os'},status:'completed',conclusion,event:previewPR?'pull_request':'push',workflow_id:1,...ciPatch};
-  const pr = {state:'open',draft:true,base:{ref:'main',repo:{full_name:'owner/os'}},head:{sha,repo:{full_name:'owner/os'}},...prPatch};
-  let reads = 0;
-  const github = {rest:{git:{getRef:async()=>({data:{object:{sha:current}}})},actions:{
-    listWorkflowRuns:async()=>({data:{workflow_runs:[run]}}),getWorkflow:async()=>({data:{path}}),
-  },pulls:{get:async()=>({data:changedPR && reads++ > 0 ? {...pr,head:{...pr.head,sha:'b'.repeat(40)}} : pr})}}};
-  const core = {setOutput:(k,v)=>outputs[k]=v,warning:()=>{},setFailed:s=>failures.push(s)};
-  const context = {repo:{owner:'owner',repo:'os'},eventName:event,payload:{workflow_run:run,repository:{full_name:'owner/os'}}};
-  await new AsyncFunction('github','core','context','process','setTimeout',admissionSource)(github,core,context,
-    {env:{REQUESTED_SOURCE:sha,PREVIEW_PR:previewPR}}, callback=>callback());
-  return {outputs,failures};
-}
-test('manual, tag and automatic admission require tested current main', async () => {
-  for (const event of ['workflow_dispatch','push','workflow_run']) {
-    const good = await admission({event});
-    assert.equal(good.outputs.allowed,'true');
-    assert.equal(good.outputs.production,'true');
-    const stale = await admission({event,current:'b'.repeat(40)});
-    assert.equal(stale.outputs.allowed,'false');
-    assert.ok(stale.outputs.reason);
-    const failed = await admission({event,conclusion:'failure'});
-    assert.equal(failed.outputs.allowed,'false');
-    const wrongWorkflow = await admission({event,path:'.github/workflows/other.yml'});
-    assert.equal(wrongWorkflow.outputs.allowed,'false');
+
+test('both deploy jobs run live-check after deployment', () => {
+  for (const name of ['preview', 'production']) {
+    const job = previewWorkflow.jobs.find(job => job.name === name);
+    assert.ok(job, `${name} deploy job must exist`);
+    const checks = job.steps.filter(step => /\bnode e2e\/live-check\.mjs\s*$/m.test(step.text));
+    assert.equal(checks.length, 1, `${name} must run live-check once`);
+    assert.ok(!checks[0].keys.includes('if'), `${name} live-check must not have an extra condition`);
+    const deploy = job.steps.findIndex(step => /\bvercel deploy\b/.test(step.text));
+    assert.ok(deploy >= 0 && deploy < job.steps.indexOf(checks[0]), `${name} must deploy before live-check`);
   }
 });
 
-test('manual preview admits tested current draft PR without admitting production', async () => {
-  const result = await admission({ previewPR: '186' });
-  assert.equal(result.outputs.allowed, 'true');
-  assert.equal(result.outputs.manual_preview, 'true');
-  assert.equal(result.outputs.preview_pr, '186');
-  assert.equal(result.outputs.production, 'false');
-  assert.equal(result.failures.length, 0);
-});
-test('manual preview rejects invalid PRs, forks, stale source and failed CI', async () => {
-  for (const patch of [{ previewPR:'bad' }, { prPatch:{state:'closed'} },
-    { prPatch:{head:{sha,repo:{full_name:'fork/os'}}} },
-    { prPatch:{head:{sha:'b'.repeat(40),repo:{full_name:'owner/os'}}} },
-    { prPatch:{base:{ref:'other',repo:{full_name:'owner/os'}}} },
-    { conclusion:'failure' }, { changedPR:true }]) {
-    const result = await admission({previewPR:'186',...patch});
-    assert.equal(result.outputs.allowed,'false');
-    assert.equal(result.outputs.production,'false');
-    assert.ok(result.failures.length);
+test('production recovery restores captured deployments and fails after a deploy or live-check failure', () => {
+  const job = previewWorkflow.jobs.find(job => job.name === 'production');
+  const recovery = ['Roll back production Worker', 'Restore previous Vercel production deployment', 'Fail after production recovery']
+    .map(name => job.steps.find(step => step.line === `- name: ${name}`));
+  for (const step of recovery) {
+    assert.ok(step, 'production recovery step must exist');
+    assert.match(step.text, /if: always\(\) && steps\.previous_worker\.outcome == 'success' && steps\.previous_app\.outcome == 'success'/);
+    for (const id of ['worker', 'production_app', 'live_production']) {
+      assert.ok(step.text.includes(`steps.${id}.outcome == 'failure'`));
+    }
   }
-});
-test('manual preview ignores a CI run from another repository or event', async () => {
-  for (const ciPatch of [{head_repository:{full_name:'fork/os'}},{event:'push'}]) {
-    const result=await admission({previewPR:'186',ciPatch});
-    assert.equal(result.outputs.allowed,'false');
-    assert.equal(result.outputs.production,'false');
-    assert.match(result.failures[0],/Timed out/);
-  }
+  assert.match(recovery[0].text, /wrangler rollback '\$\{\{ steps\.previous_worker\.outputs\.version \}\}' -y/);
+  assert.match(recovery[1].text, /VERCEL_ORG_ID: \$\{\{ secrets\.VERCEL_ORG_ID \}\}/);
+  assert.match(recovery[1].text, /vercel promote '\$\{\{ steps\.previous_app\.outputs\.deployment \}\}' --scope "\$VERCEL_ORG_ID"/);
+  assert.match(recovery[2].text, /^exit 1$/m);
+  assert.ok(job.steps.indexOf(recovery[2]) > job.steps.indexOf(recovery[1]));
 });
 
 const { assertPreviewImage } = await import('../.github/scripts/record-manual-preview.mjs');
@@ -501,17 +474,6 @@ test('manual preview verifies the staged image source and exact tested layers', 
     [application,images,config,{...local,RootFS:{Layers:['other']}},local],
     [application,images,config,{...local,Config:{Labels:{'org.opencontainers.image.revision':'b'.repeat(40)}}},local],
   ]) assert.throws(()=>assertPreviewImage(...args));
-});
-
-test('manual preview does not run disruptive acceptance or authorize its required PR status', () => {
-  const preview=workflowText.split('\n  preview:\n')[1].split('\n  images:\n')[0];
-  for (const name of ['Test the returned preview URL','Hosted continuity release gate']) {
-    assert.match(preview.split(`      - name: ${name}\n`)[1].split('      - name:')[0],
-      /if: needs\.trust\.outputs\.manual_preview != 'true'/);
-  }
-  assert.match(preview.split('      - name: Stop isolated staging test computer\n')[1],
-    /if: always\(\) && steps\.lease\.outcome == 'success' && needs\.trust\.outputs\.manual_preview != 'true'/);
-  assert.match(workflowText,/This run cannot satisfy the Hosted continuity PR gate/);
 });
 
 const { assertRollbackOwner, restoreContainer } = await import('../.github/scripts/release-state.mjs');
@@ -535,16 +497,6 @@ test('rollback refuses another release and restores container image through a co
   assert.equal(JSON.parse(calls[2].options.body).target_configuration.image,previous.cloudflare_container.image);
   assert.equal(calls.length,4);
   await assert.rejects(restoreContainer(previous,state,{...env,EZIL_DEPLOY_SHA:sha},async()=>({ok:false,status:403})),/restore .* manually/);
-});
-
-test('summary cannot report success when both deployments were skipped', async () => {
-  const source = workflowText.slice(workflowText.indexOf('  summary:\n')).split('          script: |\n')[1]
-    .split('\n').map(line=>line.slice(12)).join('\n');
-  const failures=[];
-  const summary={addHeading(){},addRaw(){},addTable(){},async write(){}};
-  await new AsyncFunction('core','process',source)({summary,setFailed:s=>failures.push(s)},
-    {env:{TRUSTED:'false',PREVIEW_RESULT:'skipped',PRODUCTION_RESULT:'skipped',ADMISSION_REASON:'stale source'}});
-  assert.match(failures[0],/No deployment performed: stale source/);
 });
 
 test('registry reuse never overwrites immutable tags and an absent overlay never rebuilds its base', t => {
