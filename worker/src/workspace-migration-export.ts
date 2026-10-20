@@ -16,21 +16,24 @@ async function record(bucket: FlushR2BucketLike, prefix: string) {
   return { etag: object.etag, migrated, snapshot: migrated ? migrated.previous : parseSnapshot(raw) };
 }
 
-export async function exportedSnapshot(bucket: FlushR2BucketLike, prefix: string) {
+// Both layers share the workspace migration flag; each pins its own head etag.
+export async function exportedSnapshot(bucket: FlushR2BucketLike, prefix: string, workspacePrefix = prefix) {
   const head = await record(bucket, prefix);
   if (!head.migrated) {
-    const flag = await bucket.get(`${prefix}/${MIGRATING_FLAG}`);
+    const flag = await bucket.get(`${workspacePrefix}/${MIGRATING_FLAG}`);
     if (!flag) throw new MigrationRequestError('migration_not_started');
     const fence = JSON.parse(new TextDecoder().decode(await readBounded(flag, 4096)));
-    if (fence?.headEtag !== head.etag) throw new MigrationRequestError('head_moved');
+    const expectedEtag = prefix === workspacePrefix ? fence?.headEtag : fence?.systemHeadEtag;
+    if (expectedEtag !== head.etag) throw new MigrationRequestError('head_moved');
   }
   if (!head.snapshot) throw new MigrationRequestError('previous_head_missing');
   return { etag: head.etag, snapshot: head.snapshot };
 }
 
-/** Workspace export only; exporting the system layer is outside this API's scope. */
-export async function exportedChunk(bucket: FlushR2BucketLike, prefix: string, index: number, generation?: string) {
-  const head = await exportedSnapshot(bucket, prefix);
+/** Stream a chunk from either layer, retaining the same fencing and integrity guards. */
+export async function exportedChunk(bucket: FlushR2BucketLike, prefix: string, index: number, generation?: string,
+  workspacePrefix = prefix) {
+  const head = await exportedSnapshot(bucket, prefix, workspacePrefix);
   if (!Number.isSafeInteger(index) || index < 0 || index >= head.snapshot.chunks.length) {
     throw new MigrationRequestError('invalid_chunk_index', 400);
   }
@@ -40,7 +43,7 @@ export async function exportedChunk(bucket: FlushR2BucketLike, prefix: string, i
   const object = await bucket.get(chunkKey(prefix, owner, index));
   if (!object || object.size !== chunk.size) throw new MigrationRequestError('chunk_unavailable');
   // A head/flag change during storage I/O must not return bytes from a different export.
-  const current = await exportedSnapshot(bucket, prefix);
+  const current = await exportedSnapshot(bucket, prefix, workspacePrefix);
   if (current.snapshot.generation !== head.snapshot.generation
     || (current.snapshot.chunkGeneration ?? current.snapshot.generation) !== owner) {
     throw new MigrationRequestError('generation_mismatch');
