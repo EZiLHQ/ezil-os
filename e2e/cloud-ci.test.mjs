@@ -420,12 +420,12 @@ test('Vercel rollback refuses mismatched identities, untrusted hostnames and los
 const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
 const previewWorkflow = parseWorkflow(workflowText);
 
-test('deployment triggers are exactly preview/main pushes and manual dispatch', () => {
+test('deployment triggers are preview/main and version-tag pushes plus manual dispatch', () => {
   const triggers = outline(workflowText).children.find(node => node.line === 'on:');
   assert.ok(triggers, 'deployment workflow must declare its triggers');
   assert.deepEqual(triggers.children.map(node => node.line).sort(), ['push:', 'workflow_dispatch:']);
   const push = triggers.children.find(node => node.line === 'push:');
-  assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]']);
+  assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]', "tags: ['v*']"]);
   assert.equal(triggers.children.find(node => node.line === 'workflow_dispatch:').children.length, 0);
 });
 
@@ -443,20 +443,22 @@ test('both deploy jobs run live-check after deployment', () => {
 
 test('production recovery restores captured deployments and fails after a deploy or live-check failure', () => {
   const job = previewWorkflow.jobs.find(job => job.name === 'production');
-  const recovery = ['Roll back production Worker', 'Restore previous Vercel production deployment', 'Fail after production recovery']
+  const recovery = ['Roll back production Worker', 'Restore previous container image and await rollback rollout', 'Restore previous Vercel production deployment', 'Fail after production recovery']
     .map(name => job.steps.find(step => step.line === `- name: ${name}`));
   for (const step of recovery) {
     assert.ok(step, 'production recovery step must exist');
-    assert.match(step.text, /if: always\(\) && steps\.previous_worker\.outcome == 'success' && steps\.previous_app\.outcome == 'success'/);
+    assert.match(step.text, /if: always\(\) && github\.ref == 'refs\/heads\/main' && steps\.previous_worker\.outcome == 'success' && steps\.previous_app\.outcome == 'success'/);
     for (const id of ['worker', 'production_app', 'live_production']) {
       assert.ok(step.text.includes(`steps.${id}.outcome == 'failure'`));
     }
   }
   assert.match(recovery[0].text, /wrangler rollback '\$\{\{ steps\.previous_worker\.outputs\.version \}\}' -y/);
-  assert.match(recovery[1].text, /VERCEL_ORG_ID: \$\{\{ secrets\.VERCEL_ORG_ID \}\}/);
-  assert.match(recovery[1].text, /vercel promote '\$\{\{ steps\.previous_app\.outputs\.deployment \}\}' --scope "\$VERCEL_ORG_ID"/);
-  assert.match(recovery[2].text, /^exit 1$/m);
-  assert.ok(job.steps.indexOf(recovery[2]) > job.steps.indexOf(recovery[1]));
+  assert.match(recovery[1].text, /release-state\.mjs container-rollback/);
+  assert.match(recovery[1].text, /steps\.previous_container\.outcome == 'success'/);
+  assert.match(recovery[2].text, /VERCEL_ORG_ID: \$\{\{ secrets\.VERCEL_ORG_ID \}\}/);
+  assert.match(recovery[2].text, /vercel promote '\$\{\{ steps\.previous_app\.outputs\.deployment \}\}' --scope "\$VERCEL_ORG_ID"/);
+  assert.match(recovery[3].text, /^exit 1$/m);
+  assert.ok(job.steps.indexOf(recovery[3]) > job.steps.indexOf(recovery[2]));
 });
 
 const { assertPreviewImage } = await import('../.github/scripts/record-manual-preview.mjs');
@@ -558,4 +560,70 @@ test('container readback uses scoped pull credentials and removes temporary Dock
   assert.equal(calls.length,2);
   assert.equal(fs.existsSync(calls[0].args[1]),false);
   assert.equal(calls[1].args.at(-1),image);
+});
+
+test('image change paths cover desktop inputs without rebuilding for app/Worker source edits', () => {
+  const inputs = outline(workflowText).children.find(node => node.line === 'env:')
+    .children.find(node => node.line === 'IMAGE_INPUTS: |-').children.map(node => node.line);
+  const covered = file => inputs.some(input => file === input || file.startsWith(`${input}/`));
+  for (const file of ['docker/neko/build.sh', 'worker/neko/Dockerfile', 'worker/assets/browser-home.html',
+    'worker/assets/neko-branding/Dockerfile', 'worker/bootstrap/dist/workspace-bootstrap.mjs',
+    'worker/guacamole/root-index.html', 'worker/sandbox-template/package.json', 'worker/sidecar/index.js',
+    'worker/scripts/start-neko.sh', 'worker/Dockerfile', 'worker/.dockerignore',
+    '.github/scripts/image-plan.mjs', '.github/scripts/build-images.sh', '.github/scripts/test-desktop.sh']) {
+    assert.ok(covered(file), `image input omitted: ${file}`);
+  }
+  for (const file of ['app/src/page.tsx', 'worker/src/index.ts', 'docs/RUNBOOK.md']) assert.equal(covered(file), false, file);
+});
+
+test('tag verification never deploys or recovers production, and failed live checks cannot publish', () => {
+  const job = previewWorkflow.jobs.find(job => job.name === 'production');
+  for (const step of job.steps) {
+    if (/wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback)|production-migrations.mjs apply/.test(step.text)) {
+      assert.match(step.text, /if: .*github\.ref == 'refs\/heads\/main'/);
+    }
+    if (/gh release edit|imagetools create|release evidence and wait/.test(step.text)) {
+      assert.match(step.text, /if: startsWith\(github.ref, 'refs\/tags\/v'\) && steps.live_production.outcome == 'success'/);
+    }
+  }
+  const fail = job.steps.find(step => step.line === '- name: Fail unverified tag');
+  assert.match(fail.text, /always\(\).*steps.live_production.outcome == 'failure'/);
+  assert.match(fail.text, /^run: exit 1$/m);
+  const migration = job.steps.findIndex(step => /production-migrations.mjs apply/.test(step.text));
+  const prepare = job.steps.findIndex(step => /release-state.mjs prepare/.test(step.text));
+  assert.ok(migration > 0 && migration < prepare, 'migration authorization needs a clean checkout before prepare');
+  assert.ok(!job.steps[migration].keys.includes('continue-on-error'));
+});
+
+test('tag receipt accepts a reused tested image but rejects stale production, untested images and different layers', async () => {
+  const step = previewWorkflow.jobs.find(job => job.name === 'production').steps
+    .find(step => step.line === '- name: Record verified tag production identities and image layers');
+  const source = step.text.match(/<<'JS'\n([\s\S]*?)\nJS(?:\n|$)/)[1].replace(/^import .*;\n/gm, '');
+  const run = new (Object.getPrototypeOf(async function () {}).constructor)(
+    'assert', 'fs', 'execFileSync', 'canonical', 'readState', 'process', source);
+  const imageSource = 'b'.repeat(40);
+  const state = {worker_source:sha, vercel_source:sha, cloudflare_container:{image:'registry.cloudflare.com/test/desktop@sha256:abc'}};
+  const receipt = {source:imageSource, tested:true, desktop:`ghcr.io/ezilhq/ezil-os-desktop:sha-${imageSource}`, desktop_digest:`sha256:${'d'.repeat(64)}`};
+  const image = {Config:{Labels:{'org.opencontainers.image.revision':imageSource}}, RootFS:{Layers:['layer-one']}};
+  const verify = async (patch = {}) => {
+    let recorded;
+    await run(assert, {
+      readFileSync: file => JSON.stringify(file === 'tested-images.json' ? {...receipt, ...patch.receipt} : state),
+      writeFileSync: (file, value) => { assert.equal(file, 'production-release.json'); recorded = JSON.parse(value); },
+    }, (_command, args) => args[0] === 'pull' ? '' : JSON.stringify([
+      args.at(-1).startsWith('registry.cloudflare.com/') ? image : {...image, ...patch.image},
+    ]), 'https://os.ezil.work', async () => structuredClone({...state, ...patch.state}),
+    {env:{EZIL_DEPLOY_SHA:sha, IMAGE_SOURCE:imageSource, GITHUB_RUN_ID:'123'}});
+    return recorded;
+  };
+  const recorded = await verify();
+  assert.equal(recorded.source, sha);
+  assert.equal(recorded.ghcr.source, imageSource);
+  assert.equal(recorded.cloudflare_container.ghcr_layers_verified, true);
+  for (const patch of [
+    {receipt:{tested:false}}, {receipt:{source:sha}}, {receipt:{desktop_digest:'not-a-digest'}},
+    {state:{worker_source:imageSource}}, {state:{vercel_source:imageSource}},
+    {image:{RootFS:{Layers:['different-layer']}}},
+    {image:{Config:{Labels:{'org.opencontainers.image.revision':sha}}}},
+  ]) await assert.rejects(verify(patch));
 });

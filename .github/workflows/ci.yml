@@ -631,7 +631,7 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - name: Cloud identity, admission and rollback tests
-        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs
+        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/live-check.test.mjs
       - name: Validate production migration manifest and lease
         run: |
           node .github/scripts/production-migrations.mjs validate

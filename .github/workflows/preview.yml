@@ -6,10 +6,30 @@ name: Deploy and live check
 on:
   push:
     branches: [preview, main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Image-plan trees plus every worker/Dockerfile context source. The offline
+# checker derives required roots from both files and rejects missing coverage.
+env:
+  IMAGE_INPUTS: |-
+    docker/neko
+    worker/neko
+    worker/assets
+    worker/bootstrap
+    worker/guacamole
+    worker/sandbox-template
+    worker/scripts
+    worker/sidecar
+    worker/Dockerfile
+    worker/.dockerignore
+    .github/scripts/image-plan.mjs
+    .github/scripts/build-images.sh
+    .github/scripts/test-desktop.sh
+    .github/workflows/image.yml
 
 concurrency:
   group: os-live-${{ github.ref }}
@@ -38,15 +58,21 @@ jobs:
           mkdir -p live-evidence
           printf 'source=%s\nbranch=%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" > live-evidence/run.txt
           before='${{ github.event.before }}'
+          # Tags verify production in place; they never build or deploy.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
           # Dispatch has no before SHA. A new branch also needs a complete image.
-          if [[ -z "$before" || "$before" =~ ^0+$ ]]; then
+          elif [[ -z "$before" || "$before" =~ ^0+$ ]]; then
             echo 'changed=true' >> "$GITHUB_OUTPUT"
           else
             git diff --name-only --no-renames "$before" "$GITHUB_SHA" > live-evidence/changed-files.txt
-            if grep -qE '^worker/(Dockerfile$|neko/|assets/neko-branding/|scripts/)' live-evidence/changed-files.txt; then
-              echo 'changed=true' >> "$GITHUB_OUTPUT"
-            else
+            mapfile -t image_inputs <<< "$IMAGE_INPUTS"
+            if git diff --quiet --no-renames "$before" "$GITHUB_SHA" -- "${image_inputs[@]}"; then
               echo 'changed=false' >> "$GITHUB_OUTPUT"
+            else
+              status=$?
+              (( status == 1 )) || exit "$status"
+              echo 'changed=true' >> "$GITHUB_OUTPUT"
             fi
           fi
       - name: Upload live evidence
@@ -205,19 +231,22 @@ jobs:
     needs: [changes, images]
     # A skipped image build must not skip deployments for app/Worker-only pushes.
     if: >-
-      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+      ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 65
     environment: production
     concurrency:
       group: deploy-production
       cancel-in-progress: false
     permissions:
-      contents: read
-      packages: read
+      contents: write
+      packages: write
+      actions: read
     env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       EZIL_DEPLOY_SHA: ${{ github.sha }}
       EZIL_DEPLOY_TARGET: production
       EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
@@ -233,8 +262,9 @@ jobs:
         run: node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment production
       - name: Reserve time for production recovery
         id: deadline
-        # Leave one minute for runner overhead and evidence upload.
-        run: echo "at=$(( $(date +%s) + 24 * 60 ))" >> "$GITHUB_OUTPUT"
+        # Main has a 34-minute deployment/recovery budget. Tags also have room
+        # for image verification and the original 30-minute installer wait.
+        run: echo "at=$(( $(date +%s) + 34 * 60 ))" >> "$GITHUB_OUTPUT"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
@@ -249,38 +279,29 @@ jobs:
         working-directory: app
         run: bun install --frozen-lockfile
       - name: Install Vercel CLI
+        if: github.ref == 'refs/heads/main'
         run: npm install --global vercel@57.0.0
       - name: Setup Playwright
         uses: ./.github/actions/setup-playwright
       - name: Setup image builder
-        if: needs.changes.outputs.image_changed == 'true'
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true' || startsWith(github.ref, 'refs/tags/v')
         uses: docker/setup-buildx-action@v3
         with:
           version: 'v0.25.0'
       - name: Log in to the image registry
-        if: needs.changes.outputs.image_changed == 'true'
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true' || startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Download tested candidate image identities
-        if: needs.changes.outputs.image_changed == 'true'
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
         uses: actions/download-artifact@v4
         with:
           name: os-images-${{ github.sha }}
-      - name: Prepare Dockerfile.release from the tested image
-        if: needs.changes.outputs.image_changed == 'true'
-        run: |
-          set -euo pipefail
-          node .github/scripts/release-state.mjs prepare
-          # prepare changes the default container; staging must use it too.
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('worker/wrangler.toml')
-          path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
-          PY
       - name: Record previous Worker version
+        if: github.ref == 'refs/heads/main'
         id: previous_worker
         working-directory: worker
         env:
@@ -296,6 +317,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$version" > ../live-evidence/previous-worker.txt
       - name: Record previous production deployment
+        if: github.ref == 'refs/heads/main'
         id: previous_app
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -318,7 +340,44 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `deployment=${deployment.id}\n`);
           fs.writeFileSync('live-evidence/previous-vercel.txt', `${deployment.id}\n`);
           JS
+      - name: Capture previous production identities
+        id: previous_container
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+        run: node .github/scripts/release-state.mjs capture
+      - name: Preserve recovery identities before production mutation
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: os-recovery-${{ github.sha }}-${{ github.run_attempt }}
+          path: previous-release.json
+          if-no-files-found: error
+      - name: Verify or apply reviewed production migrations
+        if: github.ref == 'refs/heads/main'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/production-migrations.mjs apply
+      - name: Prepare Dockerfile.release from the tested image
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
+        run: |
+          set -euo pipefail
+          node .github/scripts/release-state.mjs prepare
+          # prepare changes the default container; staging must use it too.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('worker/wrangler.toml')
+          path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
+          PY
       - name: Deploy Worker
+        if: github.ref == 'refs/heads/main'
         id: worker
         working-directory: worker
         env:
@@ -329,10 +388,11 @@ jobs:
           args=()
           rollout=none
           if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]; then rollout=immediate; fi
-          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 5 * 60 ))
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 12 * 60 ))
           (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
           timeout --kill-after=10s "${remaining}s" ./node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"
       - name: Deploy Vercel production
+        if: github.ref == 'refs/heads/main'
         id: production_app
         working-directory: app
         env:
@@ -342,7 +402,7 @@ jobs:
         run: |
           set -euo pipefail
           # Keep the same source root as preview and the existing workflows.
-          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 5 * 60 ))
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 12 * 60 ))
           (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
           timeout --kill-after=10s "${remaining}s" vercel deploy .. --yes --prod --token="$VERCEL_TOKEN" \
             --meta "githubCommitSha=$EZIL_DEPLOY_SHA" \
@@ -358,20 +418,32 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           EZIL_LIVE_OUT: live-evidence
         run: |
-          # A slow build/deploy must not consume the two rollback steps' budget.
-          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 4 * 60 ))
+          # Reserve Worker (2m), Containers (7m), and Vercel (2m) recovery time.
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 11 * 60 ))
           (( remaining > 0 )) || { echo '::error::Live-check budget exhausted'; exit 1; }
           timeout --kill-after=10s "${remaining}s" node e2e/live-check.mjs
       - name: Roll back production Worker
-        if: always() && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')
         timeout-minutes: 2
         working-directory: worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: ./node_modules/.bin/wrangler rollback '${{ steps.previous_worker.outputs.version }}' -y
+      - name: Restore previous container image and await rollback rollout
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure') && needs.changes.outputs.image_changed == 'true' && steps.previous_container.outcome == 'success'
+        timeout-minutes: 7
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+        run: node .github/scripts/release-state.mjs container-rollback
       - name: Restore previous Vercel production deployment
-        if: always() && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')
         timeout-minutes: 2
         working-directory: app
         env:
@@ -380,14 +452,147 @@ jobs:
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: vercel promote '${{ steps.previous_app.outputs.deployment }}' --scope "$VERCEL_ORG_ID" --yes --token="$VERCEL_TOKEN"
       - name: Fail after production recovery
-        if: always() && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')
+        if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')
         run: |
           echo '::error::Production deployment or live check failed; see the preceding rollback results.'
           exit 1
+      - name: Identify the deployed image for tag verification
+        id: tag_image
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { readState, pullCloudflareImage } from './.github/scripts/release-state.mjs';
+          const state = await readState(process.env);
+          assert.equal(state.worker_source, process.env.EZIL_DEPLOY_SHA);
+          assert.equal(state.vercel_source, process.env.EZIL_DEPLOY_SHA);
+          await pullCloudflareImage(state.cloudflare_container.image, process.env);
+          const image = JSON.parse(execFileSync('docker', ['image', 'inspect', state.cloudflare_container.image], {encoding:'utf8'}))[0];
+          const source = image.Config.Labels?.['org.opencontainers.image.revision'];
+          assert.match(source ?? '', /^[a-f0-9]{40}$/);
+          // App-only pushes can reuse an older tested image, but its inputs must
+          // still match the tag. Use the same path list as change detection.
+          execFileSync('git', ['merge-base', '--is-ancestor', source, process.env.EZIL_DEPLOY_SHA]);
+          execFileSync('git', ['diff', '--exit-code', source, process.env.EZIL_DEPLOY_SHA, '--', ...process.env.IMAGE_INPUTS.trim().split(/\s+/)], {stdio:'pipe'});
+          fs.writeFileSync('live-evidence/tag-state.json', JSON.stringify(state));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `source=${source}\n`);
+          JS
+      - name: Locate tested image evidence from a successful branch run
+        id: tag_receipt
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        uses: actions/github-script@v8
+        env:
+          IMAGE_SOURCE: ${{ steps.tag_image.outputs.source }}
+        with:
+          script: |
+            const source = process.env.IMAGE_SOURCE;
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              ...context.repo, name: `os-images-${source}`, per_page: 100,
+            });
+            for (const artifact of artifacts) {
+              if (artifact.expired || artifact.workflow_run?.head_sha !== source) continue;
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: artifact.workflow_run.id,
+              });
+              if (run.path !== '.github/workflows/preview.yml' || run.conclusion !== 'success' ||
+                  run.head_sha !== source || !['preview', 'main'].includes(run.head_branch) ||
+                  !['push', 'workflow_dispatch'].includes(run.event) ||
+                  run.head_repository?.full_name !== `${context.repo.owner}/${context.repo.repo}`) continue;
+              core.setOutput('run_id', String(run.id));
+              return;
+            }
+            core.setFailed('No retained tested image evidence from a successful branch deployment');
+      - name: Download the deployed image test receipt
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: os-images-${{ steps.tag_image.outputs.source }}
+          run-id: ${{ steps.tag_receipt.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Record verified tag production identities and image layers
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          IMAGE_SOURCE: ${{ steps.tag_image.outputs.source }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { canonical, readState } from './.github/scripts/release-state.mjs';
+          const state = await readState(process.env);
+          assert.deepEqual(state, JSON.parse(fs.readFileSync('live-evidence/tag-state.json', 'utf8')), 'Production changed during tag verification');
+          const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
+          assert.equal(images.source, process.env.IMAGE_SOURCE);
+          assert.equal(images.tested, true);
+          assert.equal(images.desktop, `ghcr.io/ezilhq/ezil-os-desktop:sha-${images.source}`);
+          assert.match(images.desktop_digest, /^sha256:[a-f0-9]{64}$/);
+          const ref = `ghcr.io/ezilhq/ezil-os-desktop@${images.desktop_digest}`;
+          execFileSync('docker', ['pull', ref], {stdio:'inherit'});
+          const inspect = ref => JSON.parse(execFileSync('docker', ['image', 'inspect', ref], {encoding:'utf8'}))[0];
+          const deployed = inspect(state.cloudflare_container.image), tested = inspect(ref);
+          for (const image of [deployed, tested]) assert.equal(image.Config.Labels?.['org.opencontainers.image.revision'], images.source);
+          assert.deepEqual(deployed.RootFS.Layers, tested.RootFS.Layers, 'Deployed layers differ from tested GHCR image');
+          state.cloudflare_container.ghcr_layers_verified = true;
+          fs.writeFileSync('production-release.json', JSON.stringify({source:process.env.EZIL_DEPLOY_SHA,
+            run:process.env.GITHUB_RUN_ID, canonical, ghcr:images, ...state}, null, 2));
+          JS
+      - name: Verify release evidence and wait for signed installer
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        run: |
+          set -euo pipefail
+          jq -e --arg sha "$GITHUB_SHA" '.source == $sha and .worker_source == $sha and .vercel_source == $sha and .cloudflare_container.ghcr_layers_verified == true' production-release.json >/dev/null
+          version="${GITHUB_REF_NAME#v}"
+          expected="EZiL-OS-${version}-AppleSilicon.dmg"
+          for attempt in {1..180}; do
+            if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq "$expected"; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::Signed native installer did not arrive; leaving release as a draft"
+          exit 1
+      - name: Attach semantic image alias to the verified digest
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.ghcr.desktop_digest | select(test("^sha256:[a-f0-9]{64}$"))' production-release.json)"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]
+          docker buildx imagetools create --prefer-index=false --tag "ghcr.io/ezilhq/ezil-os-desktop:${GITHUB_REF_NAME#v}" "ghcr.io/ezilhq/ezil-os-desktop@$digest"
+      - name: Publish release with verified cloud identities
+        if: startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'success'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          gh release view "$GITHUB_REF_NAME" --json body --jq .body > "$notes"
+          {
+            printf '\nVerified production release: %s\n\n' "$RUN_URL"
+            jq -r '"Source: " + .source, "Desktop: ghcr.io/ezilhq/ezil-os-desktop@" + .ghcr.desktop_digest, "Worker version: " + .worker_version, "Vercel deployment: " + .vercel_deployment, "Canonical URL: " + .canonical' production-release.json
+          } >> "$notes"
+          gh release edit "$GITHUB_REF_NAME" --notes-file "$notes" --draft=false
+      - name: Fail unverified tag
+        if: always() && startsWith(github.ref, 'refs/tags/v') && steps.live_production.outcome == 'failure'
+        run: exit 1
       - name: Upload live evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: live-evidence
+          path: |
+            live-evidence
+            previous-release.json
+            container-rollback.json
+            production-release.json
           if-no-files-found: warn
