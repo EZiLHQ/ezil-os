@@ -51,6 +51,17 @@ export function describeProvider (info, reason) {
     }
 }
 
+/** The image row: only a reported running image, never a configured default.
+ * @returns {{ value: string, title: string }}
+ */
+export function describeImage (info) {
+    const image = info && info.image;
+    if ( image && image.source === 'running' && typeof image.id === 'string' && image.id ) {
+        return { value: image.id.slice(0, 12), title: image.id };
+    }
+    return { value: 'Not reported yet', title: '' };
+}
+
 /**
  * The machine row: the CONFIGURED size of the recorded machine, never a
  * measurement and never inferred from the user's plan.

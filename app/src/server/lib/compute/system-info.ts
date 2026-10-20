@@ -2,18 +2,20 @@
  * What Settings → System may say about the machine behind a computer.
  *
  * 🔴 READ ONLY. This never creates, pins, leases or moves a placement: it reads
- * the placement row (`readPlacement`) and nothing else, and it never calls
+ * the placement row (`readPlacement`) and, for Cloudflare, the non-waking
+ * sandbox status endpoint. It never starts a container and never calls
  * `resolveComputeProvider`, whose start path pins a no-row computer to
  * Cloudflare. A Settings tab that silently decided a computer's provider would
  * be the most expensive bug a monitor could have.
  *
- * 🔴 KNOWN OR SAID TO BE UNKNOWN. Nothing here is a live measurement; the
+ * 🔴 KNOWN OR SAID TO BE UNKNOWN. The image is reported by sandbox status; the
  * machine size is the CONFIGURED size of the recorded instance type (AWS) or of
  * the container class the desktop Worker requests (Cloudflare), and `usage` is
  * always null until a real metrics source exists. A computer with no placement
  * row is reported as `unassigned`, not as Cloudflare: until its next start
  * decides, nothing has recorded where it runs.
  */
+import { deriveGuacamoleSandboxId, getGuacamoleSandboxStatus, resolveCloudflareGuacamoleConfig } from '../cloudflare-guacamole-provider';
 import { isPlacementReadEnabled, type Env } from './aws-config';
 import { readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
 
@@ -49,6 +51,8 @@ export interface SystemInfo {
     providerSource: 'placement' | 'reads_off' | 'no_placement' | 'unavailable';
     /** Only with `reads_off`: where routing is CONFIGURED to start computers. A setting, not an observation. */
     configuredRouting?: 'cloudflare';
+    /** The image reported by the non-waking status endpoint; never inferred from configuration. */
+    image: { id: string | null; source: 'running' | 'unknown' };
     machine: {
         vcpu: number | null;
         memoryMiB: number | null;
@@ -63,18 +67,20 @@ export interface SystemInfo {
 }
 
 const UNKNOWN_MACHINE: SystemInfo['machine'] = Object.freeze({ vcpu: null, memoryMiB: null, instanceType: null, region: null, source: 'unknown' as const });
+const UNKNOWN_IMAGE: SystemInfo['image'] = Object.freeze({ id: null, source: 'unknown' });
 
 /** Pure: a resolved placement → what may be shown. */
 export function describePlacement(placement: ResolvedPlacement): SystemInfo {
     const record = placement.record;
     if (!record) {
-        return { provider: 'unassigned', providerSource: 'no_placement', machine: { ...UNKNOWN_MACHINE }, lifecycleState: null, usage: null };
+        return { provider: 'unassigned', providerSource: 'no_placement', image: { ...UNKNOWN_IMAGE }, machine: { ...UNKNOWN_MACHINE }, lifecycleState: null, usage: null };
     }
     if (record.provider === 'aws-ec2') {
         const size = record.instanceType ? AWS_INSTANCE_SIZES[record.instanceType] : undefined;
         return {
             provider: 'aws-ec2',
             providerSource: 'placement',
+            image: { ...UNKNOWN_IMAGE },
             machine: {
                 vcpu: size?.vcpu ?? null,
                 memoryMiB: size?.memoryMiB ?? null,
@@ -89,6 +95,7 @@ export function describePlacement(placement: ResolvedPlacement): SystemInfo {
     return {
         provider: 'cloudflare',
         providerSource: 'placement',
+        image: { ...UNKNOWN_IMAGE },
         machine: { ...CLOUDFLARE_CONTAINER_SIZE, instanceType: null, region: null, source: 'configured' },
         lifecycleState: null,
         usage: null,
@@ -114,6 +121,7 @@ export async function readSystemInfo(
             provider: 'unknown',
             providerSource: 'reads_off',
             configuredRouting: 'cloudflare',
+            image: { ...UNKNOWN_IMAGE },
             machine: { ...UNKNOWN_MACHINE },
             lifecycleState: null,
             usage: null,
@@ -123,8 +131,25 @@ export async function readSystemInfo(
     try {
         placement = await readPlacement(db, computer.computerId);
     } catch {
-        return { provider: 'unknown', providerSource: 'unavailable', machine: { ...UNKNOWN_MACHINE }, lifecycleState: null, usage: null };
+        return { provider: 'unknown', providerSource: 'unavailable', image: { ...UNKNOWN_IMAGE }, machine: { ...UNKNOWN_MACHINE }, lifecycleState: null, usage: null };
     }
     if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) return null;
-    return describePlacement(placement);
+    const info = describePlacement(placement);
+    if (info.provider === 'cloudflare') {
+        try {
+            // Read only, bounded by the status helper's existing 10-second timeout.
+            const status = await getGuacamoleSandboxStatus(
+                resolveCloudflareGuacamoleConfig(),
+                deriveGuacamoleSandboxId(computer.userId, computer.computerId),
+            );
+            const id = status.imageId;
+            if (status.ok === true && !status.error && typeof id === 'string'
+                && id.length >= 1 && id.length <= 128 && !/[^A-Za-z0-9._:-]/.test(id)) {
+                info.image = { id, source: 'running' };
+            }
+        } catch {
+            // An unavailable image must never hide the recorded provider or configured size.
+        }
+    }
+    return info;
 }

@@ -1,6 +1,6 @@
 // system-describe-test.mjs — EZiL-authored. Pure wording tests for Settings → System.
 // Run: node shell/ezil/ui/Settings/system-describe-test.mjs   (exit 0 pass, 1 fail)
-import { describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
+import { describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
 
 const results = [];
 const push = (name, ok, detail) => results.push({ name, ok: !! ok, detail });
@@ -22,6 +22,17 @@ push('🔴 reads off: the hint separates configured routing from verification',
     /configured to start computers on Cloudflare/.test(describeProvider(readsOff).hint) && /not verified/.test(describeProvider(readsOff).hint)
     && ! /Every computer/.test(describeProvider(readsOff).hint));
 push('🔴 reads off: no Cloudflare size is presented', describeMachine(readsOff).value === '—', describeMachine(readsOff));
+
+// Image
+const imageId = 'EZiL_os-2026.10:abcdef0123456789';
+const runningImage = describeImage({ ...cf, image: { id: imageId, source: 'running' } });
+push('Image row shows the first 12 characters of the running image', runningImage.value === imageId.slice(0, 12), runningImage);
+push('Image row preserves the full image ID for its title', runningImage.title === imageId, runningImage);
+push('short image IDs are shown in full', describeImage({ image: { id: 'abc123', source: 'running' } }).value === 'abc123');
+for ( const info of [null, cf, aws, unassigned, readsOff, { image: { id: null, source: 'unknown' } }, { image: { id: imageId, source: 'unknown' } }, { image: { id: '', source: 'running' } }] ) {
+    const image = describeImage(info);
+    push('unknown Image row explicitly says Not reported yet, with no guessed title', image.value === 'Not reported yet' && image.title === '', image);
+}
 
 // Machine
 push('AWS size from the recorded instance type', describeMachine(aws).value === '2 vCPU · 4 GiB RAM (t3a.medium)', describeMachine(aws).value);

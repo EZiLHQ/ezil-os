@@ -31,7 +31,8 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 //     provider and the CONFIGURED size of that machine (instance type or
 //     container class) — labelled as configured, never as a measurement. CPU
 //     and memory USE are not reported by any computer yet, and the tab says so.
-//     Wording lives in `./system-describe.js` so it is unit-tested.
+//     Its image comes from the non-waking sandbox status endpoint; if absent,
+//     the row says "Not reported yet". Wording lives in `./system-describe.js`.
 //   * the connection route (relayed through TURN or direct) comes from the
 //     selected candidate pair the streamed client measured — never from a
 //     provider-wide assumption.
@@ -40,7 +41,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 //     is a cross-origin iframe, so its `RTCPeerConnection` and its `<video>`
 //     are unreachable from here by construction.
 //
-// Anything not known right now renders as an em dash, never as a zero. "0 fps"
+// Unknown values are labelled or render as an em dash, never as a zero. "0 fps"
 // and "not measured yet" are different claims and a monitor must not blur
 // them.
 //
@@ -53,7 +54,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 // 2-vCPU container whose budget the encoder already dominates.
 
 import session from '../../../session.js';
-import { describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './system-describe.js';
+import { describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './system-describe.js';
 
 const PHASE = 'ezil-os:settings/system';
 
@@ -69,7 +70,7 @@ let vitals = null;          // the last payload the streamed client published
 let vitalsAt = 0;           // when it arrived, so staleness can be shown
 let screenObserved = null;  // { width, height } from the live read
 let screenError = null;
-let systemInfo = null;      // `computer.systemInfo`: recorded provider + configured size
+let systemInfo = null;      // `computer.systemInfo`: recorded provider + reported image + configured size
 let systemInfoReason = null; // why it is null, when it is
 let refreshTimer = null;
 let nativeProvider = { configured: false, pending: false, error: '' };
@@ -252,7 +253,7 @@ function paint () {
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to, and how that connection is doing.
-           Each value says whether it is recorded, configured or measured; anything not known right now shows as ${UNKNOWN}.</p>
+           Each value says whether it is recorded, configured or measured; anything not known right now is labelled or shows as ${UNKNOWN}.</p>
 
         <h4>Linked computer</h4>
         ${row('Name', computer ? esc(computer.name) : UNKNOWN)}
@@ -262,6 +263,7 @@ function paint () {
 
         <h4>Machine</h4>
         ${(() => { const p = describeProvider(systemInfo, systemInfoReason); return row('Provider', esc(p.value), esc(p.hint)); })()}
+        ${(() => { const i = describeImage(systemInfo); return row('Image', i.title ? `<code title="${esc(i.title)}">${esc(i.value)}</code>` : esc(i.value)); })()}
         ${(() => { const m = describeMachine(systemInfo); return row('Size', esc(m.value), esc(m.hint)); })()}
         ${(() => { const u = describeUsage(); return row('CPU and memory use', esc(u.value), esc(u.hint)); })()}
 

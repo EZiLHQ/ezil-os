@@ -27,7 +27,7 @@ import { computerRouter } from '@/server/api/routers/computer';
 
 const OWNER = '11111111-1111-4111-8111-111111111111';
 const C1 = '22222222-2222-4222-8222-222222222222';
-const INFO = { provider: 'aws-ec2', providerSource: 'placement', machine: { vcpu: 2, memoryMiB: 4096, instanceType: 't3a.medium', region: 'us-east-1', source: 'configured' }, lifecycleState: 'RUNNING', usage: null };
+const INFO = { provider: 'aws-ec2', providerSource: 'placement', image: { id: null, source: 'unknown' }, machine: { vcpu: 2, memoryMiB: 4096, instanceType: 't3a.medium', region: 'us-east-1', source: 'configured' }, lifecycleState: 'RUNNING', usage: null };
 
 function dbOwning(owned: boolean) {
     return { query: { computers: { findFirst: vi.fn(async () => (owned ? { id: C1 } : undefined)) } } };

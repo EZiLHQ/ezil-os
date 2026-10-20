@@ -11,6 +11,7 @@ import superjson from 'superjson';
 
 import { createEzilClient } from './client';
 import { EzilError } from './errors';
+import type { SystemInfo } from './types';
 
 /** A `fetch` that records what it was asked and replies with a canned body. */
 const stub = (reply: { status?: number; body: unknown }) => {
@@ -68,12 +69,15 @@ describe('createEzilClient', () => {
         expect(JSON.parse(url.searchParams.get('input')!)).toEqual({ json: { id: 'c1' } });
     });
 
-    it('systemInfo is a GET query of computer.systemInfo with { computerId }, returning the info', async () => {
+    it.each([
+        { id: null, source: 'unknown' },
+        { id: 'EZiL_os-2026.10:abcdef0123456789', source: 'running' },
+    ] satisfies SystemInfo['image'][])('systemInfo is a GET query of computer.systemInfo with { computerId }, returning image %j', async (image) => {
         const info = {
-            provider: 'aws-ec2', providerSource: 'placement',
-            machine: { vcpu: 2, memoryMiB: 4096, instanceType: 't3a.medium', region: 'us-east-1', source: 'configured' },
-            lifecycleState: 'RUNNING', usage: null,
-        } as const;
+            provider: 'cloudflare', providerSource: 'placement', image,
+            machine: { vcpu: 2, memoryMiB: 6144, instanceType: null, region: null, source: 'configured' },
+            lifecycleState: null, usage: null,
+        } satisfies SystemInfo;
         const { fetchImpl, seen } = stub({ body: ok(info) });
         const got = await client(fetchImpl).computers.systemInfo('c1');
         const url = new URL(seen[0]!.url);

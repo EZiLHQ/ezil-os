@@ -1203,12 +1203,12 @@ export async function requestGuacamoleDesktopRestart(
     }
 }
 
-/** Health-check the named sandbox. */
+/** Read the named sandbox's status without starting its container. */
 export async function getGuacamoleSandboxStatus(
     config: CloudflareGuacamoleConfig,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
-): Promise<{ ok: boolean; guacamoleRunning?: boolean; error?: string }> {
+): Promise<{ ok: boolean; guacamoleRunning?: boolean; imageId?: string | null; error?: string }> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
@@ -1218,7 +1218,7 @@ export async function getGuacamoleSandboxStatus(
             { headers: { [CORRELATION_HEADER]: correlationId }, signal: AbortSignal.timeout(10_000) },
         );
         if (!res.ok) return { ok: false, error: `http_${res.status}` };
-        return (await res.json()) as { ok: boolean; guacamoleRunning?: boolean; error?: string };
+        return (await res.json()) as { ok: boolean; guacamoleRunning?: boolean; imageId?: string | null; error?: string };
     } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }

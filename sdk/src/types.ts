@@ -26,8 +26,8 @@ export interface Computer {
 
 /**
  * Result of `computers.systemInfo` — where a computer is RECORDED to run and the
- * CONFIGURED size of that machine. A read: it never assigns a provider. Nothing
- * here is a live measurement, and `usage` is always `null` until the server
+ * CONFIGURED size of that machine, plus its reported image. A read: it never
+ * assigns a provider or starts a container. `usage` is always `null` until the server
  * reports CPU/memory use. Mirrors `SystemInfo` in
  * `app/src/server/lib/compute/system-info.ts`.
  */
@@ -37,6 +37,8 @@ export interface SystemInfo {
     providerSource: 'placement' | 'reads_off' | 'no_placement' | 'unavailable';
     /** Only with `reads_off`: where routing is CONFIGURED to start computers. A setting, not an observation. */
     configuredRouting?: 'cloudflare';
+    /** The image reported by the non-waking status endpoint; never inferred from configuration. */
+    image: { id: string | null; source: 'running' | 'unknown' };
     machine: {
         vcpu: number | null;
         memoryMiB: number | null;
