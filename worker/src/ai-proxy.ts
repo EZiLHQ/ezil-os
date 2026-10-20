@@ -17,6 +17,8 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
 export const AI_CREDENTIAL_MIN_REMAINING_MS = 30_000;
 /** DO storage key for the pushed access token. */
 export const AI_CREDENTIAL_STORAGE_KEY = 'ezil:aiCredential';
+/** Latest signed logout timestamp; retained even after the JWT is deleted. */
+export const AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY = 'ezil:aiCredentialRevokedAt';
 export const AI_PROXY_NONCE_STORAGE_KEY = 'ezil:aiProxyNonce';
 
 // ── Routes ───────────────────────────────────────────────────────────────────
@@ -141,7 +143,7 @@ export async function verifyAiCredentialSignature(
   body: Uint8Array,
   now: number = Date.now(),
   method: 'POST' | 'DELETE' = 'POST',
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<{ ok: true; timestamp: number } | { ok: false; error: string }> {
   const candidates = secrets.filter((s) => s && s.trim());
   if (candidates.length === 0) return { ok: false, error: 'ai_proxy_not_configured' };
   const match = /^t=(\d+),v1=([0-9a-f]{64})$/.exec(header?.trim() ?? '');
@@ -155,13 +157,15 @@ export async function verifyAiCredentialSignature(
   for (const candidate of candidates) {
     if (timingSafeEqualHex(await hmacSha256Hex(candidate, payload), match[2]!)) matched = true;
   }
-  return matched ? { ok: true } : { ok: false, error: 'ai_credential_signature_mismatch' };
+  return matched ? { ok: true, timestamp } : { ok: false, error: 'ai_credential_signature_mismatch' };
 }
 
 export interface StoredAiCredential {
   readonly token: string;
   /** JWT `exp`, in milliseconds. */
   readonly expiresAt: number;
+  /** Verified signature timestamp in milliseconds; absent on pre-watermark records. */
+  readonly signedAt?: number;
 }
 
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -214,11 +218,17 @@ export function sandboxBelongsToUser(sandboxId: string, userId: string): boolean
   return owner.length === 16 && sandboxId.toLowerCase().startsWith(`guac-${owner}-`);
 }
 
-/** Which credential to keep: the later-expiring one (a replayed older push never rolls the token back). */
+/** Order signed pushes first, then keep the later expiry. Exact replays are no-ops. */
 export function chooseAiCredential(
   current: StoredAiCredential | undefined,
   incoming: StoredAiCredential,
 ): { keep: StoredAiCredential; stored: boolean } {
+  if (current?.signedAt !== undefined && incoming.signedAt !== undefined && current.signedAt >= incoming.signedAt) {
+    if (current.signedAt !== incoming.signedAt || current.token !== incoming.token) {
+      return { keep: current, stored: false };
+    }
+    return { keep: current, stored: true };
+  }
   if (current && current.expiresAt >= incoming.expiresAt && current.token !== incoming.token) {
     return { keep: current, stored: false };
   }

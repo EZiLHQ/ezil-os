@@ -473,11 +473,26 @@ describe('pushed credential', () => {
     expect(usableAiCredential(undefined, now)).toBeNull();
   });
 
+  it('orders pushes by signed time even for the same JWT, and makes exact replays idempotent', () => {
+    const current = { token: 'current', expiresAt: now + 2000, signedAt: now };
+    for (const incoming of [
+      { token: 'older', expiresAt: now + 3000, signedAt: now - 1 },
+      { ...current, signedAt: now - 1 },
+      { ...current, token: 'different', expiresAt: now + 3000 },
+    ]) {
+      expect(chooseAiCredential(current, incoming)).toEqual({ keep: current, stored: false });
+    }
+    expect(chooseAiCredential(current, { ...current })).toEqual({ keep: current, stored: true });
+    expect(chooseAiCredential(current, { ...current }).keep).toBe(current);
+    const newer = { ...current, signedAt: now + 1 };
+    expect(chooseAiCredential(current, newer)).toEqual({ keep: newer, stored: true });
+  });
+
   it('verifies the push signature over sandbox id and body bytes', async () => {
     const body = new TextEncoder().encode(JSON.stringify({ accessToken: USER_JWT }));
     const sig = await mintAiCredentialSignature(SECRET, SANDBOX, body, now);
-    expect(await verifyAiCredentialSignature(sig, [SECRET], SANDBOX, body, now)).toEqual({ ok: true });
-    expect(await verifyAiCredentialSignature(sig, ['other', SECRET], SANDBOX, body, now)).toEqual({ ok: true });
+    expect(await verifyAiCredentialSignature(sig, [SECRET], SANDBOX, body, now)).toEqual({ ok: true, timestamp: now });
+    expect(await verifyAiCredentialSignature(sig, ['other', SECRET], SANDBOX, body, now)).toEqual({ ok: true, timestamp: now });
     expect((await verifyAiCredentialSignature(sig, [SECRET], 'guac-abcdef0123456789-0000000000000000', body, now)).ok).toBe(false);
     expect((await verifyAiCredentialSignature(sig, [SECRET], SANDBOX, new TextEncoder().encode('{"accessToken":"x"}'), now)).ok).toBe(false);
     expect((await verifyAiCredentialSignature(sig, [SECRET], SANDBOX, body, now + 6 * 60_000)).ok).toBe(false);
@@ -547,7 +562,7 @@ describe('v2 guards', () => {
     const now = Date.now();
     const body = new Uint8Array();
     const signature = await mintAiCredentialSignature(SECRET, SANDBOX, body, now, 'DELETE');
-    expect((await verifyAiCredentialSignature(signature, [SECRET], SANDBOX, body, now, 'DELETE')).ok).toBe(true);
+    expect(await verifyAiCredentialSignature(signature, [SECRET], SANDBOX, body, now, 'DELETE')).toEqual({ ok: true, timestamp: now });
     expect((await verifyAiCredentialSignature(signature, [SECRET], SANDBOX, body, now, 'POST')).ok).toBe(false);
     expect((await verifyAiCredentialSignature(signature, [SECRET], 'other', body, now, 'DELETE')).ok).toBe(false);
   });

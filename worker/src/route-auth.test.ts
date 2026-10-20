@@ -22,7 +22,7 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
@@ -3525,11 +3525,105 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     return { obj, values };
   }
 
+  // Route auth and storage ordering both run for real; only SDK plumbing and
+  // transactional storage are faked. Recreate the DO to prove durable revocation.
+  async function credentialRoute() {
+    const state = await object();
+    let obj = state.obj;
+    const stub = new Proxy({}, {
+      get(_target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'putAiCredential' || prop === 'dropAiCredential') return obj[prop].bind(obj);
+        return async () => undefined;
+      },
+    });
+    const env = { Sandbox: { idFromName: () => ({}), get: () => stub }, SANDBOX_HMAC_SECRET: SECRET };
+    return {
+      ...state,
+      recover: () => { obj = Object.assign(Object.create(Object.getPrototypeOf(obj)), { ctx: obj.ctx }); },
+      send: async (method: 'POST' | 'DELETE', signedAt: number, accessToken?: string) => {
+        const body = method === 'POST' ? JSON.stringify({ accessToken }) : '';
+        const response = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, {
+          method, body: body || undefined,
+          headers: { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), signedAt, method) },
+        }), env);
+        expect(response.status).toBe(200);
+        return response.json();
+      },
+    };
+  }
+
+  const sessionToken = (sessionId: string, issuedAt: number) => `e30.${Buffer.from(JSON.stringify({
+    sub: 'abcdef01-2345-6789-abcd-ef0123456789', role: 'authenticated',
+    session_id: sessionId, iat: Math.floor(issuedAt / 1000), exp: Math.floor(issuedAt / 1000) + 3600,
+  })).toString('base64url')}.c2ln`;
+
+  it('refuses a signed POST replay after logout, including timestamp ties and DO recovery', async () => {
+    const { obj, values, send, recover } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    const token = sessionToken('session-one', t);
+    expect(await send('POST', t, token)).toMatchObject({ stored: true });
+    const stored = values.get(AI_CREDENTIAL_STORAGE_KEY);
+    expect(await send('POST', t, token)).toMatchObject({ stored: true });
+    expect(values.get(AI_CREDENTIAL_STORAGE_KEY)).toBe(stored);
+    await send('DELETE', t + 1000);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(values.get(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY)).toBe(t + 1000);
+    recover();
+    expect(await send('POST', t, token)).toMatchObject({ stored: false });
+    expect(await send('POST', t + 1000, token)).toMatchObject({ stored: false });
+    await send('DELETE', t + 1000);
+    await send('DELETE', t);
+    expect(values.get(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY)).toBe(t + 1000);
+    expect(await obj.getAiCredential()).toBeNull();
+  });
+
+  it('an older signed DELETE cannot remove a newer push, even when both pushes carry the same JWT', async () => {
+    const { obj, values, send } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    const token = sessionToken('session-one', t);
+    await send('POST', t, token);
+    expect(await send('POST', t + 2000, token)).toMatchObject({ stored: true });
+    expect(await send('POST', t, token)).toMatchObject({ stored: false });
+    await send('DELETE', t + 1000);
+    await send('DELETE', t + 1000);
+    expect(await obj.getAiCredential()).toBe(token);
+    expect(values.get(AI_CREDENTIAL_STORAGE_KEY)).toMatchObject({ signedAt: t + 2000 });
+    // Logout wins ties regardless of whether the push arrived first or last.
+    await send('DELETE', t + 2000);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(await send('POST', t + 2000, token)).toMatchObject({ stored: false });
+  });
+
+  it('accepts a new login after logout and makes replaying the old DELETE harmless', async () => {
+    const { obj, values, send, recover } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    const oldToken = sessionToken('session-one', t);
+    const newToken = sessionToken('session-two', t + 2000);
+    await send('POST', t, oldToken);
+    await send('DELETE', t + 1000);
+    recover();
+    expect(await send('POST', t + 2000, newToken)).toMatchObject({ stored: true });
+    await send('DELETE', t + 1000);
+    expect(await send('POST', t, oldToken)).toMatchObject({ stored: false });
+    expect(await obj.getAiCredential()).toBe(newToken);
+    expect(values.get(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY)).toBe(t + 1000);
+  });
+
+  it('retains a logout watermark even if the signed DELETE arrives before the first push', async () => {
+    const { obj, send, recover } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    await send('DELETE', t + 1000);
+    recover();
+    expect(await send('POST', t, sessionToken('session-one', t))).toMatchObject({ stored: false });
+    expect(await obj.getAiCredential()).toBeNull();
+  });
+
   it('keeps credentials across DO instances, drops only the rejected token, and supports unconditional logout', async () => {
     const { obj, values } = await object();
     const expiresAt = Date.now() + 3600_000;
-    await obj.putAiCredential({ token: 'new', expiresAt });
-    await obj.putAiCredential({ token: 'old', expiresAt: expiresAt - 1000 });
+    await obj.putAiCredential({ token: 'new', expiresAt }, 1);
+    await obj.putAiCredential({ token: 'old', expiresAt: expiresAt - 1000 }, 2);
     const recovered = Object.create(Object.getPrototypeOf(obj));
     Object.assign(recovered, { ctx: obj.ctx });
     expect(await recovered.getAiCredential()).toBe('new');
@@ -3537,7 +3631,7 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(await recovered.getAiCredential()).toBe('new');
     await recovered.dropAiCredential('new');
     expect(await recovered.getAiCredential()).toBeNull();
-    await obj.putAiCredential({ token: 'new', expiresAt });
+    await obj.putAiCredential({ token: 'new', expiresAt }, 3);
     await obj.dropAiCredential();
     expect(values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
   });
@@ -3546,7 +3640,7 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     const { obj, values } = await object();
     let running = false;
     const launched: Record<string, string>[] = [];
-    obj.listProcesses = async () => running ? [{ id: 'launcher', command: '/usr/local/bin/start-desktop.sh', status: 'running' }] : [];
+    obj.listProcesses = async () => running ? [{ id: 'launcher', command: 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', status: 'running' }] : [];
     obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
       launched.push(options.env); running = true; return { id: 'launcher' };
     };
@@ -3562,6 +3656,34 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(launched[1]!.EZIL_AI_PROXY_TOKEN).not.toBe(launched[0]!.EZIL_AI_PROXY_TOKEN);
     const unconfigured = await object('');
     expect((await unconfigured.obj.aiProxyBootEnv('ezil.org', SANDBOX_NAME)).EZIL_AI_PROXY_TOKEN).toBe('');
+  });
+
+  it('starts Neko beside a Guacamole launcher, then reuses only the matching Neko launcher', async () => {
+    const { obj, values } = await object();
+    const command = 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh';
+    const processes = [{ id: 'guacamole', command: 'DESKTOP_MODE=guacamole bash /usr/local/bin/start-desktop.sh', status: 'running' }];
+    const launched: Array<{ command: string; env: Record<string, string> }> = [];
+    const killProcess = mock(async () => {});
+    obj.killProcess = killProcess;
+    obj.listProcesses = async () => processes;
+    obj.startProcess = async (command: string, options: { env: Record<string, string> }) => {
+      launched.push({ command, env: options.env });
+      processes.push({ id: 'neko', command, status: 'starting' });
+      return { id: 'neko' };
+    };
+    values.set(AI_PROXY_NONCE_STORAGE_KEY, 'old-boot');
+    const start = () => obj.startAiDesktop('ezil.org', SANDBOX_NAME, command, { DESKTOP_MODE: 'neko' });
+    expect(await start()).toBe('neko');
+    const nonce = values.get(AI_PROXY_NONCE_STORAGE_KEY) as string;
+    expect(nonce).not.toBe('old-boot');
+    expect(launched).toHaveLength(1);
+    expect(launched[0]).toMatchObject({ command, env: {
+      DESKTOP_MODE: 'neko', EZIL_AI_PROXY_TOKEN: await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce),
+    } });
+    expect(await start()).toBe('neko');
+    expect(launched).toHaveLength(1);
+    expect(values.get(AI_PROXY_NONCE_STORAGE_KEY)).toBe(nonce);
+    expect(killProcess).not.toHaveBeenCalled();
   });
 
   it('the real restart path rotates and injects a fresh boot token', async () => {

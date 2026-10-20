@@ -677,6 +677,7 @@ import {
   verifyAiCredentialSignature,
   DEFAULT_AI_GATEWAY_URL,
   AI_CREDENTIAL_STORAGE_KEY,
+  AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
   AI_PROXY_NONCE_STORAGE_KEY,
   readLimited,
   type StoredAiCredential,
@@ -863,9 +864,9 @@ interface EzilWorkspacePersistRpc {
   recordActivity(lastInputAgoMs: number): Promise<void>;
   startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
-  putAiCredential(credential: StoredAiCredential): Promise<{ stored: boolean; expiresAt: number }>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }>;
   getAiCredential(): Promise<string | null>;
-  dropAiCredential(token?: string): Promise<void>;
+  dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
    * what actually happened. Runs entirely inside the DO because only there is
@@ -3528,7 +3529,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   private async startAiDesktopUnlocked(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
     if (this.containerIsRunning()) {
       const processes = await this.listProcesses();
-      const launcher = findDesktopLauncherProcess(Array.isArray(processes) ? processes : []);
+      // ensureDesktop includes DESKTOP_MODE in this exact command. A different
+      // mode follows the original startProcess path, without stopping its stack.
+      const launcher = findDesktopLauncherProcess(Array.isArray(processes) ? processes.filter((p) => p.command === command) : []);
       if (launcher) return launcher.id;
     }
     const aiEnv = await this.aiProxyBootEnv(hostname, sandboxId);
@@ -3547,12 +3550,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return (await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) ?? null;
   }
 
-  /** Keep the later expiry atomically across concurrent pushes. No container access. */
-  async putAiCredential(credential: StoredAiCredential): Promise<{ stored: boolean; expiresAt: number }> {
+  /** Order pushes against logout and each other atomically. No container access. */
+  async putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }> {
     return this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
-      const { keep, stored } = chooseAiCredential(current, credential);
-      if (stored) await txn.put(AI_CREDENTIAL_STORAGE_KEY, keep);
+      const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+      if (revokedAt !== undefined && signedAt <= revokedAt) {
+        return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
+      }
+      const { keep, stored } = chooseAiCredential(current, { ...credential, signedAt });
+      if (stored && keep !== current) await txn.put(AI_CREDENTIAL_STORAGE_KEY, keep);
       return { stored, expiresAt: keep.expiresAt };
     });
   }
@@ -3561,15 +3568,19 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
   }
 
-  /** No argument: logout/teardown. Token argument: drop only the JWT refused by the gateway. */
-  async dropAiCredential(token?: string): Promise<void> {
-    if (token === undefined) {
-      await this.ctx.storage.delete(AI_CREDENTIAL_STORAGE_KEY);
-      return;
-    }
+  /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
+  async dropAiCredential(token?: string, signedAt?: number): Promise<void> {
     await this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
-      if (current?.token === token) await txn.delete(AI_CREDENTIAL_STORAGE_KEY);
+      if (signedAt !== undefined) {
+        const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+        if (revokedAt !== undefined && signedAt <= revokedAt) return;
+        await txn.put(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, signedAt);
+        // A delayed logout cannot remove a credential pushed after it. A
+        // timestamp tie belongs to logout so a same-millisecond replay fails.
+        if (current?.signedAt !== undefined && current.signedAt > signedAt) return;
+      }
+      if (token === undefined || current?.token === token) await txn.delete(AI_CREDENTIAL_STORAGE_KEY);
     });
   }
 
@@ -7135,7 +7146,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
 
   if (request.method === 'DELETE') {
     try {
-      await openSandbox(env, sandboxName).dropAiCredential();
+      await openSandbox(env, sandboxName).dropAiCredential(undefined, auth.timestamp);
       return json({ ok: true });
     } catch {
       return json({ ok: false, error: 'ai_credential_storage_failed' }, 500);
@@ -7154,7 +7165,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
 
   try {
     const sandbox = openSandbox(env, sandboxName);
-    const result = await sandbox.putAiCredential(parsed.credential);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp);
     return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
   } catch {
     return json(
