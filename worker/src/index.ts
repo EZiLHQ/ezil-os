@@ -4048,10 +4048,14 @@ async function awsControlTarget(env: Env, request: Request, name: string, prefix
 
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
-  return async (signal) => {
+  return async (signal, purpose = 'renewal') => {
     const issuedAt = Date.now();
     const servers = await generateTurnCredentials(env, signal);
-    return servers ? { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 } : null;
+    const ttl = resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS);
+    // Apply the boot margin without changing the existing AWS renewal lifetime.
+    return servers ? { servers, expiresAt: purpose === 'boot'
+      ? relayExpiryFor(issuedAt, ttl)
+      : issuedAt + ttl * 1000 } : null;
   };
 }
 
@@ -4231,11 +4235,11 @@ async function generateTurnCredentials(env: Env, signal: AbortSignal = AbortSign
  * set (no username/credential) when only that is configured. Returns `null`
  * when neither is configured (diagnostic/no-TURN path — behavior unchanged).
  */
-async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
+export async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
   const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
   if (cloudflare) return { ...buildNekoIceEnv(cloudflare),
-    EZIL_RELAY_EXPIRES_AT: String(issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000) };
+    EZIL_RELAY_EXPIRES_AT: String(relayExpiryFor(issuedAt, resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS))) };
 
   const staticUrls = env.SANDBOX_NEKO_TURN_URLS?.trim();
   if (staticUrls) {
