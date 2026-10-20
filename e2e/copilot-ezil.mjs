@@ -310,8 +310,9 @@ try {
   await until(async () => file('existing.txt') === 'undo candidate\n' && !await busy(), 'undo candidate');
   await editAction('Undo');
   // Some workbench versions confirm discarding the proposed edits.
-  const discard = page.locator('.monaco-dialog-box').getByRole('button', { name: /^(Undo|Discard)/i }).first();
-  if (await discard.isVisible().catch(() => false)) await discard.click();
+  // 1.141 asks "This will undo changes made in <file>. Do you want to proceed?" (Yes / Cancel).
+  const discard = page.locator('.monaco-dialog-box').getByRole('button', { name: /^(Yes|Undo|Discard)/i }).first();
+  if (await discard.waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false)) await discard.click();
   await until(async () => file('existing.txt') === 'after\n', 'Undo restores prior content');
   check('Undo restores the last kept content on disk', true);
 
