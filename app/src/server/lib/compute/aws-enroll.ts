@@ -50,6 +50,7 @@ export function issueEnrollmentNonce(now: Date, random: (n: number) => Buffer = 
 export const USER_DATA_MAX = 4096;
 
 export interface EnrollmentUserDataInput {
+    restore?: import('./provider-migrate').RestoreLease;
     computerId: string;
     /** null on a provision: the data volume does not exist yet when the intent is built. */
     volumeId: string | null;
@@ -91,6 +92,7 @@ export function buildEnrollmentUserData(i: EnrollmentUserDataInput): string {
         nonce: i.nonce,
         provision: i.provision,
         enrollUrl: i.enrollUrl,
+        ...(i.restore === undefined ? {} : { restore: i.restore }),
     };
     const encoded = Buffer.from(JSON.stringify(lease), 'utf8').toString('base64');
     if (encoded.length > USER_DATA_MAX) throw new EnrollmentUserDataError('too_large');

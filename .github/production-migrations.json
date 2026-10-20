@@ -35,6 +35,11 @@
       "path": "app/drizzle/0005_billing_sessions.sql",
       "sha256": "cf155c3d4f71f6414b6ce6097c929b8120da6c408b69c8f54e574c1cebec8413",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0006_compute_migrations.sql",
+      "sha256": "a99e2954187b58e6f5893cc9ad5adcc02da08f0d762d2f8b6ed9c9e41683b486",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

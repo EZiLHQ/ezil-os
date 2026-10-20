@@ -26,6 +26,9 @@
 
 import { randomBytes as nodeRandomBytes, randomUUID } from 'node:crypto';
 
+// Migration provisions use the same lease builder, with its optional restore input.
+export { buildEnrollmentUserData as buildAwsProvisionUserData } from './aws-enroll';
+
 import { runAdmission, type AdmissionRefusal } from './admission';
 import {
     AWS_TIER_DATA_GIB,
