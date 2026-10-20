@@ -77,6 +77,9 @@ assert 'shell/ezil/boot-test.mjs' in next(step['run'] for step in shell_steps if
 # Push/dispatch deployment uses only the jobs designated by the shared contract.
 # YAML 1.1 interprets "on" as True.
 preview = workflows['preview']
+preview_text = (root / '.github/workflows/preview.yml').read_text()
+assert '--scope "$VERCEL_ORG_ID"' not in preview_text
+assert not re.search(r'\bvercel\s+(?:alias\s+set|promote)\b', preview_text)
 triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
@@ -299,7 +302,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     for key in ('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID'):
         assert rollout['env'][key] == identity['env'][key] == '${{ secrets.' + key + ' }}'
     for key in ('VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID'):
-        assert identity['env'][key] == '${{ secrets.' + key + ' }}'
+        assert deploy['env'][key] == identity['env'][key] == '${{ secrets.' + key + ' }}'
     assert deploy['working-directory'] == 'app' and 'vercel deploy .. --yes' in deploy['run']
     assert 'node e2e/live-check.mjs' in check['run']
     assert check['timeout-minutes'] == 14
@@ -339,7 +342,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
                           'Staging cannot use production ezil.org routing', 'Staging routes must cover OS_WORKER_URL'):
             assert assertion in routes['run']
         assert '--prod' not in deploy['run']
-        assert 'vercel alias set "$url" ezil-os-staging.vercel.app' in deploy['run']
+        assert 'cd ..\nnode .github/scripts/vercel-api.mjs alias "$url" ezil-os-staging.vercel.app' in deploy['run']
         assert check['env'][bypass] == '${{ secrets.' + bypass + ' }}'
         assert '/deployments/ezil-os-staging.vercel.app?teamId=' in identity['run']
         assert 'assertVercelDeployment(await response.json()' in identity['run']
@@ -382,8 +385,10 @@ for job_name, branch, environment, url, deploy_name, check_id in (
         assert step['if'] == guarded_condition
         assert position(step) > position(check)
     assert "wrangler rollback '${{ steps.previous_worker.outputs.version }}' -y" in rollback_worker['run']
-    assert "vercel promote '${{ steps.previous_app.outputs.deployment }}'" in rollback_app['run']
-    assert '--scope "$VERCEL_ORG_ID"' in rollback_app['run']
+    assert rollback_app['run'] == "node .github/scripts/vercel-api.mjs promote '${{ steps.previous_app.outputs.deployment }}'"
+    assert rollback_app.get('working-directory', '.') == '.'
+    for key in ('VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID'):
+        assert rollback_app['env'][key] == '${{ secrets.' + key + ' }}'
     assert rollback_worker['timeout-minutes'] == rollback_app['timeout-minutes'] == 2
     capture = by_id['previous_container']
     archive = by_name['Preserve recovery identities before production mutation']
@@ -452,7 +457,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert by_name['Fail unverified tag']['run'] == 'exit 1'
     # No deployment, rollback, or migration can execute on a tag.
     for step in steps:
-        if re.search(r'wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply', step.get('run', '')):
+        if re.search(r'wrangler (?:deploy|rollback)|vercel deploy|vercel-api.mjs promote|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply', step.get('run', '')):
             assert main in step.get('if', ''), step.get('name')
     assert 'exit 1' in fail['run'] and not fail.get('continue-on-error', False)
 

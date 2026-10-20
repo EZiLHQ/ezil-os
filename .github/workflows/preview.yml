@@ -304,7 +304,8 @@ jobs:
             --build-env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER")"
           [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.vercel\.app$ ]]
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          vercel alias set "$url" ezil-os-staging.vercel.app --scope "$VERCEL_ORG_ID" --token="$VERCEL_TOKEN"
+          cd ..
+          node .github/scripts/vercel-api.mjs alias "$url" ezil-os-staging.vercel.app
       - name: Wait for staging container rollout
         id: rollout
         if: needs.changes.outputs.image_changed == 'true'
@@ -727,12 +728,11 @@ jobs:
       - name: Restore previous Vercel production deployment
         if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
         timeout-minutes: 2
-        working-directory: app
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel promote '${{ steps.previous_app.outputs.deployment }}' --scope "$VERCEL_ORG_ID" --yes --token="$VERCEL_TOKEN"
+        run: node .github/scripts/vercel-api.mjs promote '${{ steps.previous_app.outputs.deployment }}'
       - name: Verify production recovery identities
         if: always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
         timeout-minutes: 3
