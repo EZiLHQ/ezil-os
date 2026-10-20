@@ -1,5 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '../config';
 import type { BillingDeps, BillingStore, StripeApi } from '../ports';
@@ -30,7 +30,7 @@ function fixture() {
     };
     const deps: BillingDeps = {
         usage: null,
-        config: readBillingConfig({ STRIPE_WEBHOOK_SECRET: secret }),
+        config: readBillingConfig({ STRIPE_SECRET: 'sk_test_fixture', STRIPE_WEBHOOK_SECRET: secret }),
         store: store as unknown as BillingStore, stripe: {} as StripeApi,
         now: () => new Date(timestamp * 1000),
     };
@@ -50,6 +50,8 @@ async function positiveControl() {
 }
 
 describe('Stripe webhook HTTP handler', () => {
+    afterEach(() => vi.restoreAllMocks());
+
     it('wires the Node POST route through the configured ports and processor', async () => {
         const f = fixture();
         wiring.getDeps.mockReturnValue(f.deps);
@@ -73,7 +75,7 @@ describe('Stripe webhook HTTP handler', () => {
         });
     });
 
-    it.each(['secret', 'stripe'])('returns 503 without %s before reading or writing', async missing => {
+    it.each(['secret', 'stripe'])('returns 503 without %s before writing', async missing => {
         await positiveControl();
         const f = fixture();
         if (missing === 'secret') f.deps.config.stripeWebhookSecret = undefined;
@@ -83,6 +85,65 @@ describe('Stripe webhook HTTP handler', () => {
         expect(await response.json()).toEqual({ error: 'billing_not_configured' });
         expect(f.store.recordEvent).toHaveBeenCalledTimes(0);
         expect(f.process).toHaveBeenCalledTimes(0);
+    });
+
+    it.each(['sk_test_', 'rk_test_', 'sk_live_', 'rk_live_'])('processes matching livemode for %s', async prefix => {
+        const f = fixture();
+        f.deps.config.stripeSecret = `${prefix}fixture`;
+        const matching = { ...event, livemode: prefix.includes('_live_') };
+        const response = await handleStripeWebhook(request(JSON.stringify(matching)), f.deps, f.process);
+        expect(response.status).toBe(200);
+        expect(f.store.recordEvent).toHaveBeenCalledTimes(1);
+        expect(f.process).toHaveBeenCalledWith(matching, { store: f.deps.store, stripe: f.deps.stripe, now: f.deps.now });
+        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, 'applied');
+    });
+
+    it.each(['sk_test_', 'rk_test_', 'sk_live_', 'rk_live_'])('rejects mismatched livemode for %s before any inbox access', async prefix => {
+        const f = fixture();
+        f.deps.config.stripeSecret = `${prefix}fixture`;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const mismatched = { ...event, livemode: !prefix.includes('_live_') };
+        const response = await handleStripeWebhook(request(JSON.stringify(mismatched)), f.deps, f.process);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'livemode_mismatch' });
+        expect(f.store.recordEvent).not.toHaveBeenCalled();
+        expect(f.store.markEventProcessed).not.toHaveBeenCalled();
+        expect(f.process).not.toHaveBeenCalled();
+        expect(warn.mock.calls).toEqual([['[billing.webhook] livemode mismatch', { id: event.id, type: event.type }]]);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(f.deps.config.stripeSecret);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(secret);
+    });
+
+    it.each(['absent', 'mixed', 'unrecognized', 'invalid_publishable'].flatMap(reason =>
+        [false, true].flatMap(livemode => [false, true].map(noClient => ({ reason, livemode, noClient }))),
+    ))('rejects no mode ($reason, live=$livemode, noClient=$noClient)', async ({ reason, livemode, noClient }) => {
+        const f = fixture();
+        if (reason === 'absent') f.deps.config.stripeSecret = undefined;
+        if (reason === 'mixed') f.deps.config.stripePublishableKey = 'pk_live_fixture';
+        if (reason === 'unrecognized') f.deps.config.stripeSecret = 'fixture-only';
+        if (reason === 'invalid_publishable') f.deps.config.stripePublishableKeyInvalid = true;
+        if (noClient) f.deps.stripe = null;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const response = await handleStripeWebhook(request(JSON.stringify({ ...event, livemode })), f.deps, f.process);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'livemode_mismatch' });
+        expect(f.store.recordEvent).not.toHaveBeenCalled();
+        expect(f.store.markEventProcessed).not.toHaveBeenCalled();
+        expect(f.process).not.toHaveBeenCalled();
+        expect(warn.mock.calls).toEqual([['[billing.webhook] livemode mismatch', { id: event.id, type: event.type }]]);
+    });
+
+    it('checks signatures before diagnosing a mode mismatch', async () => {
+        const f = fixture();
+        f.deps.config.stripeSecret = undefined;
+        f.deps.stripe = null;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const response = await handleStripeWebhook(request(rawBody, 'invalid'), f.deps, f.process);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'invalid_signature' });
+        expect(warn).not.toHaveBeenCalled();
+        expect(f.store.recordEvent).not.toHaveBeenCalled();
+        expect(f.process).not.toHaveBeenCalled();
     });
 
     it('accepts 256 KiB and refuses the next byte regardless of Content-Length', async () => {

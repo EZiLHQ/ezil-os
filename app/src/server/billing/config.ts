@@ -2,8 +2,8 @@
  * Billing feature flags and provider configuration (contract §7).
  *
  * Every flag is OFF unless set to exactly `'1'`, so a deploy that configures
- * nothing behaves exactly as before billing existed. Secrets are only ever
- * tested for presence here; nothing in this module logs or returns a value.
+ * nothing behaves exactly as before billing existed. Mode checks inspect key
+ * prefixes only and never expose key text in their results or diagnostics.
  */
 export interface BillingConfig {
     /** Settings → Billing tab and `billing.summary`. */
@@ -26,6 +26,8 @@ export interface BillingConfig {
     stripeWebhookSecret: string | undefined;
     /** Publishable key (`pk_…`) for Stripe.js Embedded Checkout. Public by design. */
     stripePublishableKey: string | undefined;
+    /** Preserve invalid configuration without exposing a non-publishable key to a browser. */
+    stripePublishableKeyInvalid?: boolean;
     /** Optional: a dashboard-managed Price for Pro; otherwise Checkout uses inline price data. */
     stripePriceProMonthly: string | undefined;
     /** HMAC secret the desktop Worker signs usage events with. */
@@ -43,6 +45,8 @@ const publishable = (v: string | undefined) => (v && /^pk_(test|live)_/.test(v.t
 const nonEmpty = (v: string | undefined) => (v && v.trim() !== '' ? v : undefined);
 
 export function readBillingConfig(env: Env = process.env): BillingConfig {
+    const rawPublishableKey = nonEmpty(env.STRIPE_PUBLISHABLE_KEY ?? env.STRIPE_KEY);
+    const stripePublishableKey = publishable(rawPublishableKey);
     return {
         tabEnabled: on(env.BILLING_TAB_ENABLED),
         pricingPageEnabled: on(env.PRICING_PAGE_ENABLED),
@@ -54,7 +58,8 @@ export function readBillingConfig(env: Env = process.env): BillingConfig {
         managedPaymentsEnabled: on(env.BILLING_MANAGED_PAYMENTS),
         stripeSecret: nonEmpty(env.STRIPE_SECRET),
         stripeWebhookSecret: nonEmpty(env.STRIPE_WEBHOOK_SECRET),
-        stripePublishableKey: publishable(env.STRIPE_PUBLISHABLE_KEY ?? env.STRIPE_KEY),
+        stripePublishableKey,
+        stripePublishableKeyInvalid: rawPublishableKey !== undefined && stripePublishableKey === undefined,
         stripePriceProMonthly: nonEmpty(env.STRIPE_PRICE_PRO_MONTHLY),
         usageHmacSecret: nonEmpty(env.BILLING_USAGE_HMAC_SECRET),
         fundingUrl: nonEmpty(env.BILLING_FUNDING_URL),
@@ -62,7 +67,23 @@ export function readBillingConfig(env: Env = process.env): BillingConfig {
     };
 }
 
-/** Checkout and the portal need both the flag and a secret key. */
+export type StripeMode = 'test' | 'live';
+
+/** Return only the mode or a safe reason; key text stays inside the config. */
+export function stripeMode(config: BillingConfig): { mode: StripeMode } | { mode: null; reason: 'absent' | 'mixed' | 'unrecognized' } {
+    const secret = config.stripeSecret;
+    if (!secret) return { mode: null, reason: 'absent' };
+    const mode = /^(sk|rk)_test_/.test(secret) ? 'test'
+        : /^(sk|rk)_live_/.test(secret) ? 'live' : null;
+    if (mode === null) return { mode: null, reason: 'unrecognized' };
+    if (config.stripePublishableKeyInvalid
+        || (config.stripePublishableKey !== undefined && !config.stripePublishableKey.startsWith(`pk_${mode}_`))) {
+        return { mode: null, reason: 'mixed' };
+    }
+    return { mode };
+}
+
+/** Checkout and the portal need the flag and a consistent, recognized key mode. */
 export function checkoutAvailable(config: BillingConfig): boolean {
-    return config.checkoutEnabled && config.stripeSecret !== undefined;
+    return config.checkoutEnabled && stripeMode(config).mode !== null;
 }

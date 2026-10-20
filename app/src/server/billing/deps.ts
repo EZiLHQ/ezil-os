@@ -2,11 +2,13 @@ import 'server-only';
 
 import { db } from '@/server/db';
 
-import { readBillingConfig } from './config';
+import { readBillingConfig, stripeMode } from './config';
 import type { BillingDeps } from './ports';
 import { createBillingStore } from './store';
 import { createStripeClient } from './stripe/client';
 import { createStripeUsageBilling } from './stripe/usage-billing';
+
+let warnedStripeDisabled = false;
 
 /**
  * The billing composition root: the one place the real database, the real
@@ -21,13 +23,19 @@ import { createStripeUsageBilling } from './stripe/usage-billing';
  */
 export function getBillingDeps(): BillingDeps {
     const config = readBillingConfig();
+    const mode = stripeMode(config);
+    if (mode.mode === null && !warnedStripeDisabled) {
+        warnedStripeDisabled = true;
+        console.warn('[billing.config] stripe disabled', { reason: mode.reason });
+    }
+    const secretKey = mode.mode === null ? undefined : config.stripeSecret;
     return {
         config,
         store: createBillingStore(db),
-        stripe: config.stripeSecret
-            ? createStripeClient({ secretKey: config.stripeSecret, priceProMonthly: config.stripePriceProMonthly })
+        stripe: secretKey
+            ? createStripeClient({ secretKey, priceProMonthly: config.stripePriceProMonthly })
             : null,
-        usage: config.stripeSecret ? createStripeUsageBilling({ secretKey: config.stripeSecret }) : null,
+        usage: secretKey ? createStripeUsageBilling({ secretKey }) : null,
         now: () => new Date(),
     };
 }

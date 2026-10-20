@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { checkoutAvailable } from '@/server/billing/config';
 import { getBillingDeps } from '@/server/billing/deps';
 import type { BillingDeps, StripeApi } from '@/server/billing/ports';
+import { billingReturnOrigin } from '@/server/billing/return-origin';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
@@ -19,20 +20,6 @@ import { buildSummaryV2, hasOveragePaymentFailure, summaryMeters } from '@/serve
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
-
-/** Only an HTTP origin belongs in Stripe's return URLs; absent headers use the public app. */
-function requestOrigin(headers?: Headers): string {
-    const origin = headers?.get('origin');
-    if (origin) {
-        try {
-            const url = new URL(origin);
-            if (url.protocol === 'https:' || url.protocol === 'http:') return url.origin;
-        } catch {
-            // Non-browser callers may omit a usable Origin header.
-        }
-    }
-    return 'https://os.ezil.org';
-}
 
 /** All router domain failures use the pinned UI vocabulary. */
 function billingError(code: BillingErrorCode, trpcCode: TRPCError['code']): TRPCError {
@@ -152,7 +139,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 if (linked === 'conflict') throw billingError('customer_conflict', 'CONFLICT');
                 customerId = customer.id;
             }
-            const origin = requestOrigin(ctx.headers);
+            const origin = billingReturnOrigin(ctx.headers);
             const publishableKey = deps.config.stripePublishableKey;
             const returnUrl = `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`;
             const session = await stripeCall(() => stripe.createCheckoutSession({
@@ -372,7 +359,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             if (!customerId) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.subscriptionId) await ownedSubscription(deps, stripe, ctx.user.id, plan.subscriptionId);
-            return stripeCall(() => stripe.createPortalSession({ customerId, returnUrl: `${requestOrigin(ctx.headers)}/os` }));
+            return stripeCall(() => stripe.createPortalSession({ customerId, returnUrl: `${billingReturnOrigin(ctx.headers)}/os` }));
         }),
 
         checkoutStatus: protectedProcedure.input(z.object({ sessionId: z.string() }))

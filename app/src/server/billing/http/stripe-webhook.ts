@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { stripeMode } from '../config';
 import type { BillingDeps, ProcessorDeps } from '../ports';
 import type { StripeEventLike } from '../stripe/events';
 import { verifyStripeSignature, WebhookNotVerified } from '../stripe/verify';
@@ -40,7 +41,7 @@ type Process = (event: StripeEventLike, deps: ProcessorDeps) => Promise<string>;
 
 /** The inbox distinguishes a completed delivery from a retry whose effects still need applying. */
 export async function handleStripeWebhook(request: Request, deps: BillingDeps, process: Process): Promise<Response> {
-    if (!deps.config.stripeWebhookSecret || !deps.stripe) {
+    if (!deps.config.stripeWebhookSecret) {
         return Response.json({ error: 'billing_not_configured' }, { status: 503 });
     }
     let rawBody: string | null;
@@ -67,6 +68,14 @@ export async function handleStripeWebhook(request: Request, deps: BillingDeps, p
         event = envelope.parse(JSON.parse(rawBody));
     } catch {
         return Response.json({ error: 'invalid_event' }, { status: 400 });
+    }
+    const mode = stripeMode(deps.config).mode;
+    if (mode === null || event.livemode !== (mode === 'live')) {
+        console.warn('[billing.webhook] livemode mismatch', { id: event.id, type: event.type });
+        return Response.json({ error: 'livemode_mismatch' }, { status: 400 });
+    }
+    if (!deps.stripe) {
+        return Response.json({ error: 'billing_not_configured' }, { status: 503 });
     }
     try {
         const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawBody));
