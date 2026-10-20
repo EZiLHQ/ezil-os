@@ -29,7 +29,7 @@ system, which is out of scope for a docs-only pass.
 
 Open a feature PR and merge it to the long-lived `preview` branch. Each push
 runs `preview.yml`: deploy the staging Worker and app, update the stable preview
-URL <https://ezil-os-preview.vercel.app>, then run `e2e/live-check.mjs`.
+URL <https://ezil-os-staging.vercel.app>, then run `e2e/live-check.mjs`.
 After that check passes, merge `preview` to `main`. The same workflow deploys
 production at <https://os.ezil.work> and runs the live check. Main first applies
 reviewed production migrations; a failed apply stops deployment. A failed deploy

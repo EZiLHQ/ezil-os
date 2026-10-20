@@ -954,7 +954,7 @@ test('staging alias readback rejects stale or different deployments before the l
       const child = runWorkflowScript(process.execPath, ['--input-type=module', '-e',
         `globalThis.fetch = async (input, options) => {
           const url = new URL(input);
-          if (url.hostname !== 'api.vercel.com' || url.pathname !== '/v13/deployments/ezil-os-preview.vercel.app'
+          if (url.hostname !== 'api.vercel.com' || url.pathname !== '/v13/deployments/ezil-os-staging.vercel.app'
             || url.searchParams.get('teamId') !== 'team_test' || options.redirect !== 'error' || !options.signal) throw new Error('Unexpected alias request');
           return { ok: true, json: async () => (${JSON.stringify({ ...deployment, ...patch })}) };
         };\n${script}`,
