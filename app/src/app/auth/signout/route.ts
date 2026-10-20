@@ -1,4 +1,9 @@
+import { eq } from 'drizzle-orm';
 import { type NextRequest, NextResponse } from 'next/server';
+
+import { computers } from '@/server/db/schema';
+import { revokeAiCredentialsOnSignout } from '@/server/lib/ai-credential';
+import { resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 
 import { Routes } from '@/utils/constants';
 import { isLegacyAuthCookie, SECURE_AUTH_COOKIE_NAME } from '@/utils/supabase/cookie-options';
@@ -33,10 +38,33 @@ const isAuthCookie = (name: string) => name.startsWith(SECURE_AUTH_COOKIE_NAME) 
  */
 export async function POST(request: NextRequest) {
     const supabase = await createClient();
-    const { error } = await supabase.auth.signOut({ scope: 'local' });
+    // Revoke before signOut removes the identity. The total budget is three seconds,
+    // independent of whether Supabase subsequently succeeds or throws.
+    try {
+        await revokeAiCredentialsOnSignout({
+            config: resolveCloudflareGuacamoleConfig(),
+            hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+            getUserId: async () => (await supabase.auth.getUser()).data.user?.id ?? null,
+            listComputerIds: async (userId) => {
+                const { db } = await import('@/server/db');
+                const rows = await db.query.computers.findMany({
+                    where: eq(computers.userId, userId), columns: { id: true },
+                });
+                return rows.map((row) => row.id);
+            },
+        });
+    } catch {
+        // Configuration and client failures also leave signout available.
+    }
+    let error: unknown;
+    try {
+        ({ error } = await supabase.auth.signOut({ scope: 'local' }));
+    } catch {
+        error = true;
+    }
     const response = NextResponse.redirect(new URL(Routes.LOGIN, request.url), 303);
     if (error) {
-        console.warn(`[auth/signout] signOut failed, clearing cookies anyway: ${error.message}`);
+        console.warn('[auth/signout] signOut failed, clearing cookies anyway');
         for (const { name } of request.cookies.getAll()) {
             if (!isAuthCookie(name)) continue;
             const secure = name.startsWith('__Host-');

@@ -54,7 +54,14 @@ describe('staging Worker resources and routes', () => {
       SANDBOX_DEFAULT_DESKTOP_MODE: 'neko',
       SANDBOX_NEKO_ICE_POLICY: 'relay',
       SANDBOX_NEKO_TURN_TTL_SECONDS: '300',
+      SANDBOX_AI_PROXY: 'on',
+      EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work',
     });
+  });
+
+  it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {
+    expect(config.vars.SANDBOX_AI_PROXY).toBe('off');
+    expect(config.vars.EZIL_AI_GATEWAY_URL).toBe('https://ai.ezil.work');
   });
 
   it('covers the API and every preview token without claiming a zone catch-all', () => {

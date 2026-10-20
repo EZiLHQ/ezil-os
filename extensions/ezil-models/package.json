@@ -1,0 +1,122 @@
+{
+  "name": "ezil-models",
+  "displayName": "EZiL Models",
+  "description": "EZiL AI Gateway models for the built-in Copilot Chat UI.",
+  "version": "0.1.0",
+  "publisher": "ezil",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EZiLHQ/ezil-os",
+    "directory": "extensions/ezil-models"
+  },
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onLanguageModelChat:ezil",
+    "onLanguageModelChatProvider:ezil",
+    "onStartupFinished"
+  ],
+  "enabledApiProposals": [
+    "languageModelSystem",
+    "languageModelThinkingPart"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "The provider reads only its own config file and talks to the configured model endpoints; it never reads workspace files."
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "ezil",
+        "displayName": "EZiL",
+        "managementCommand": "ezil-models.manage"
+      }
+    ],
+    "commands": [
+      {
+        "command": "ezil-models.manage",
+        "title": "EZiL Models: Manage",
+        "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.reload",
+        "title": "EZiL Models: Reload Config",
+        "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.showUsage",
+        "title": "EZiL Models: Show Token Usage",
+        "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.openConfig",
+        "title": "EZiL Models: Open Config File",
+        "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.showCredits",
+        "title": "EZiL Models: Show AI Credits",
+        "category": "EZiL Models"
+      }
+    ],
+    "configuration": {
+      "title": "EZiL Models",
+      "properties": {
+        "ezilModels.configPath": {
+          "type": "string",
+          "default": "/etc/ezil/models.json",
+          "markdownDescription": "Path of the EZiL models config file (JSON, see the extension README). The environment variable `EZIL_MODELS_CONFIG` overrides this setting.",
+          "scope": "machine"
+        },
+        "ezilModels.logRequests": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Log request bodies for legacy direct providers only. EZiL Gateway always logs metadata only, never prompts, bodies, or credentials.",
+          "scope": "machine"
+        }
+      }
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": [
+          "models.json",
+          "ezil-models.json",
+          "*.ezil-models.json"
+        ],
+        "url": "./schema/models.schema.json"
+      }
+    ],
+    "configurationDefaults": {
+      "chat.defaultModel": "qwen.qwen3-coder-next",
+      "chat.planAgent.defaultModel": "qwen.qwen3-coder-next",
+      "chat.utilityModel": "ezil/qwen.qwen3-coder-next",
+      "chat.utilitySmallModel": "ezil/qwen.qwen3-coder-next"
+    }
+  },
+  "scripts": {
+    "build": "bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "package:vsix": "../../worker/ezil-models/build-vsix.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "@types/node": "22.10.2",
+    "@types/vscode": "1.106.1",
+    "typescript": "5.9.3"
+  }
+}
