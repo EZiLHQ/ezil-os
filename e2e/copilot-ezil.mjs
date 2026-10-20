@@ -85,6 +85,15 @@ const pickerRows = async () => {
   const rows = page.locator('.context-view .monaco-list-row, .quick-input-widget .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item, .context-view .action-item');
   return (await rows.allInnerTexts()).map(clean).filter(Boolean);
 };
+// VS Code 1.141 lists recent/default models at the top and the rest under "Other Models".
+const expandOtherModels = async () => {
+  const other = page.locator('.context-view .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item').filter({ hasText: /^\s*Other Models/ }).first();
+  if (!(await other.count())) return false;
+  await other.hover().catch(() => {});
+  await other.click().catch(() => {});
+  await page.waitForTimeout(700);
+  return true;
+};
 const dialogTexts = async () => {
   const d = page.locator('.monaco-dialog-box');
   const n = await d.count(); const out = [];
@@ -214,16 +223,27 @@ try {
   check('Qwen is selected by default', (await modelButton().innerText()).includes(MODEL_NAME));
   await modelButton().click();
   await page.waitForTimeout(800);
-  const models = await pickerRows();
+  let models = await pickerRows();
+  if (!models.some(row => row.includes(KIMI_NAME)) && await expandOtherModels()) models = [...new Set([...models, ...await pickerRows()])];
   check('model picker contains Qwen and Kimi with no sign-in entry', models.some(row => row.includes(MODEL_NAME)) && models.some(row => row.includes(KIMI_NAME)) && !models.some(row => /sign in/i.test(row)), JSON.stringify(models));
-  await page.keyboard.press('Escape');
+  for (let i = 0; i < 3; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
 
+  // Type only once the chat input really has focus, and send only what landed there.
+  let sendAttempt = 0;
   const send = async prompt => {
     const editor = aux.locator('.chat-input-container .monaco-editor').first();
     await editor.waitFor({ state: 'visible', timeout: T });
-    await editor.click({ position: { x: 40, y: 12 }, force: true });
-    await page.keyboard.type(prompt, { delay: 3 });
-    await page.keyboard.press('Enter');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await editor.locator('.view-lines').first().click({ force: true });
+      await page.waitForTimeout(250);
+      await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
+      await page.keyboard.type(prompt, { delay: 3 });
+      await page.waitForTimeout(250);
+      if (clean(await editor.innerText()).includes(prompt.slice(0, 20))) { await page.keyboard.press('Enter'); return; }
+      await page.screenshot({ path: join(OUT, `send-attempt-${++sendAttempt}.png`) });
+      for (let i = 0; i < 2; i++) await page.keyboard.press('Escape');
+    }
+    throw new Error('the prompt never reached the chat input: ' + prompt.slice(0, 40));
   };
   const until = async (predicate, label) => {
     const started = Date.now();
@@ -244,6 +264,8 @@ try {
   };
 
   await send(PROMPT);
+  await page.waitForTimeout(3000);
+  await page.screenshot({ path: join(OUT, 'after-send.png') });
   const confirmation = aux.locator('.chat-confirmation-widget-container, .chat-confirmation-widget2').filter({ hasText: /terminal-confirmed|printf/ }).first();
   await confirmation.waitFor({ state: 'visible', timeout: T });
   check('terminal tool requires confirmation in the UI', true);
@@ -270,6 +292,8 @@ try {
 
   await runCommand('Chat: New Chat');
   await modelButton().click();
+  await page.waitForTimeout(600);
+  if (!(await pickerRows()).some(row => row.includes(KIMI_NAME))) await expandOtherModels();
   const kimiRow = page.locator('.context-view .monaco-list-row, .quick-input-widget .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item').filter({ hasText: KIMI_NAME }).first();
   await kimiRow.click();
   await send('EZIL_E2E_KIMI: reply with the JSON smoke-test completion.');
