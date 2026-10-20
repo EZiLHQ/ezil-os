@@ -23,7 +23,7 @@ import stat
 import subprocess
 import time
 
-from . import canary, config as cfgmod
+from . import canary, config as cfgmod, restore
 from .fsops import DIR_FLAGS, Refused, read_regular_at, write_file_durable_at
 
 MARKER = ".ezil-marker.json"
@@ -255,10 +255,10 @@ def new_marker(lease, digest, instance_id=None):
     return m
 
 
-def run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
+def run_guard(cfg, lease, rebase_runner=None, allow_reboot=True, restore_runner=None):
     """Steps 1-6, with optional public console diagnostics."""
     try:
-        verdict = _run_guard(cfg, lease, rebase_runner, allow_reboot)
+        verdict = _run_guard(cfg, lease, rebase_runner, allow_reboot, restore_runner)
     except Refused:
         canary.guard_result(cfg, "refused")
         raise
@@ -269,7 +269,7 @@ def run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
     return verdict
 
 
-def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
+def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True, restore_runner=None):
     """Leaves the data volume mounted rw on success; unmounted on refusal."""
     digest = cfgmod.host_digest(cfg)
     instance_id = current_instance_id(cfg)
@@ -287,9 +287,19 @@ def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
             state = read_rebase_state(root)
             if state is not None:
                 raise Refused("rebase_failed", f"state={state.get('state')}; restore the pre-rebase snapshot")
+            restore_state = restore.read_state(root)
+            if restore_state is not None:
+                if lease.get("restore"):
+                    if not restore.matches(restore_state, lease["restore"]):
+                        raise Refused("restore_state_mismatch")
+                elif restore_state["state"] != "done":
+                    raise Refused("restore_incomplete")
             m = read_marker(root)
             if m is None:
                 entries = [e for e in os.listdir(root) if e != "lost+found"]
+                if restore_state is not None and lease.get("restore"):
+                    entries = [e for e in entries if e not in
+                               (restore.STATE, restore.STAGE, "workspace", "root", "profiles")]
                 if not lease.get("provision") or entries:
                     raise Refused("marker_missing", "init only on a provisioning lease and an empty volume")
                 verdict = "init"
@@ -309,6 +319,19 @@ def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
             root = os.open(cfg.dataMount, DIR_FLAGS)
             if verdict == "rebase_needed":
                 rebase_runner(cfg, lease, root)        # raises Refused('rebase_failed') on failure
+            if lease.get("restore"):
+                try:
+                    fetch = restore.http_fetch(cfg, restore.SnapshotClient(cfg, lease))
+                    (restore_runner or restore.run_restore)(lease["restore"], cfg.dataMount, fetch)
+                except BaseException:
+                    # Exception messages may contain user paths or HTTP credentials.
+                    try:
+                        state = restore.identity(lease["restore"])
+                    except Refused:
+                        state = {}
+                    state.update(state="failed", reason="restore_failed")
+                    write_file_durable_at(root, restore.STATE, json.dumps(state).encode())
+                    raise
             for d in ("root/upper", "root/work", "workspace", "profiles"):
                 _mkdirs_nofollow(root, d)          # not reachable by the guest: refuse if odd
             quarantined = []
@@ -318,7 +341,7 @@ def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True):
                     quarantined.append(q)
             if quarantined:
                 verdict += " quarantined=" + ",".join(quarantined)
-            # the marker is bumped only after every check, rebase and layout step passed
+            # the marker is bumped only after checks, rebase, restore and layout passed
             write_file_durable_at(root, MARKER, (json.dumps(new_marker(lease, digest, instance_id)) + "\n").encode(), 0o600)
         finally:
             if root is not None:
