@@ -250,6 +250,48 @@ describe('buildNekoIceEnv (neko v3 NEKO_WEBRTC_* env, creds via env not argv)', 
   });
 });
 
+describe('resolveNekoIceEnv: boot relay expiry', () => {
+  const issuedAt = 1_800_000_000_000;
+
+  async function bootEnv(ttlSeconds: number) {
+    const { resolveNekoIceEnv } = await import('./index');
+    const realNow = Date.now;
+    const realFetch = globalThis.fetch;
+    Date.now = () => issuedAt;
+    globalThis.fetch = (async (_input, init) => {
+      expect(JSON.parse(String(init?.body))).toEqual({ ttl: ttlSeconds });
+      return Response.json({ iceServers: [
+        { urls: ['turn:relay.example:3478'], username: 'test-user', credential: 'test-credential' },
+      ] });
+    }) as typeof fetch;
+    try {
+      return await resolveNekoIceEnv({
+        SANDBOX_NEKO_TURN_KEY_ID: 'test-key',
+        SANDBOX_NEKO_TURN_API_TOKEN: 'test-token',
+        SANDBOX_NEKO_TURN_TTL_SECONDS: String(ttlSeconds),
+      } as never);
+    } finally {
+      Date.now = realNow;
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it.each([300, 900, 1800])('uses the renewal clock margin at boot with TTL %i s', async (ttlSeconds) => {
+    const { relayExpiryFor } = await import('./relay-refresh');
+    const env = await bootEnv(ttlSeconds);
+    expect(env?.EZIL_RELAY_EXPIRES_AT).toBe(String(relayExpiryFor(issuedAt, ttlSeconds)));
+  });
+
+  it.each([300, 900, 1800])('a renewal 1 s after boot strictly extends expiry with TTL %i s', async (ttlSeconds) => {
+    const { relayExpiryFor } = await import('./relay-refresh');
+    const env = await bootEnv(ttlSeconds);
+    const bootExpiry = Number(env?.EZIL_RELAY_EXPIRES_AT);
+    const renewalExpiry = relayExpiryFor(issuedAt + 1000, ttlSeconds);
+    expect(renewalExpiry).toBeGreaterThan(bootExpiry);
+    expect(renewalExpiry - bootExpiry).toBe(1000);
+  });
+});
+
 describe('turnGenerateUrl (official Cloudflare Realtime endpoint)', () => {
   it('targets the generate-ice-servers path for the given key id', async () => {
     const { turnGenerateUrl } = await import('./desktop-mode');

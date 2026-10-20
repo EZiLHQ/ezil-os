@@ -361,6 +361,16 @@ RUN cd /opt/ezil-sidecar \
   && node --check /opt/ezil-sidecar/page-scripts.mjs \
   && node -e "import('/opt/ezil-sidecar/verbs.mjs').then(m=>{const n=Object.keys(m.VERBS).length;if(n!==10)throw new Error('expected 10 verbs, got '+n);console.log('sidecar verbs ok:',n)})"
 
+# Bake opencode into the system image before the npm inventory and manifest:
+# user installs exceed the per-computer system-layer save limit. Use the
+# global CLI prefix inventoried below, in the base image's root context.
+# Check both shell modes without changing the existing PATH order.
+RUN npm install --global --prefix /usr/local --no-audit --no-fund opencode-ai@1.19.0 \
+  && npm cache clean --force \
+  && test -x /usr/local/bin/opencode \
+  && bash -c 'test "$(command -v opencode)" = /usr/local/bin/opencode' \
+  && bash -lc 'test "$(command -v opencode)" = /usr/local/bin/opencode'
+
 # Required so `wrangler dev` can proxy the exposed port locally. 8080 serves the
 # Apache Guacamole HTML5 client (Tomcat); guacd (4822) and x11vnc (5901) stay
 # internal to the container. 8181 serves the alternate `neko` mode's HTTP UI +

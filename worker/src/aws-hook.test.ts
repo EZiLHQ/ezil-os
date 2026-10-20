@@ -6,7 +6,7 @@
  * bootstrap → gw1-signed origin forward; and Cloudflare bridge hosts still reach their own
  * dispatcher. Shipped with the hook in gw-index-hook.patch.
  */
-import { afterEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test';
 
 mock.module('cloudflare:workers', () => ({
   DurableObject: class {},
@@ -21,6 +21,7 @@ import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-ori
 import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
 import { deriveNekoCredentials, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 import { sha256Hex } from './aws-ice';
+import { relayExpiryFor } from './relay-refresh';
 
 const worker = (await import('./index')).default;
 const SECRET = 'aws-hook-test-secret';
@@ -90,7 +91,7 @@ afterEach(() => { globalThis.fetch = realFetch; });
  */
 interface FakeHost {
   configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
-  pushed?: { neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
+  pushed?: { expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
   turnCalls: number; bad: string[]; paths: string[];
 }
 function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
@@ -301,6 +302,36 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
     expect(host.pushed!.neko).toEqual(await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID));
     expect(host.pushed!.backend.flatMap((s) => s.urls).every((u) => /^turns?:/.test(u))).toBe(true);
     expect(host.bad).toEqual([]);
+  });
+
+  it.each([300, 1800])('boot uses the clock margin and a renewal 1 s later extends expiry with TTL %i s', async (ttlSeconds) => {
+    const issuedAt = 1_800_000_000_000;
+    const now = spyOn(Date, 'now').mockReturnValue(issuedAt);
+    try {
+      const e = relayEnv({ SANDBOX_NEKO_TURN_TTL_SECONDS: String(ttlSeconds) });
+      await withTunnel(e);
+      const host = installAwsHost();
+      const boot = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+      expect(boot.status).toBe(503);
+      const bootExpiry = host.pushed!.expiresAt;
+      expect(bootExpiry).toBe(relayExpiryFor(issuedAt, ttlSeconds));
+
+      host.configured = true;
+      host.desktop = 'running';
+      host.ice = 'applied';
+      host.relayExpiresAt = bootExpiry;
+      now.mockReturnValue(issuedAt + 1000);
+      const path = `/sandbox/${SID}/relay-refresh`;
+      const renewed = await worker.fetch(await signed('POST', path, JSON.stringify({ runtimeId: 'c'.repeat(32) })), e);
+      expect(renewed.status).toBe(200);
+      const { expiresAt } = await renewed.json() as { expiresAt: number };
+      expect(expiresAt).toBeGreaterThan(bootExpiry);
+      // Preserve the existing AWS renewal lifetime; only boot gains the margin.
+      expect(expiresAt).toBe(issuedAt + 1000 + ttlSeconds * 1000);
+      expect(host.bad).toEqual([]);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it('no TURN provider configured: fail closed (502 turn_unavailable), nothing pushed', async () => {

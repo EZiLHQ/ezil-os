@@ -23,16 +23,25 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 // A monitor that invents a number is worse than no monitor, because it is
 // believed. So there is no estimation anywhere in this file:
 //
-//   * the linked computer comes from the boot payload the shell was handed.
+//   * the linked computer comes from the session's current selection.
 //   * the desktop's screen comes from `session.getScreen()` — an OBSERVATION
 //     of the live X display, not the last thing this side asked for. That
 //     distinction is the whole reason that route exists.
+//   * the machine comes from `session.getSystemInfo()`: the RECORDED placement
+//     provider and the CONFIGURED size of that machine (instance type or
+//     container class) — labelled as configured, never as a measurement. CPU
+//     and memory USE are not reported by any computer yet, and the tab says so.
+//     Its image comes from the signed, non-waking sandbox system endpoint; if absent,
+//     the row says "Not reported yet". Wording lives in `./system-describe.js`.
+//   * the connection route (relayed through TURN or direct) comes from the
+//     selected candidate pair the streamed client measured — never from a
+//     provider-wide assumption.
 //   * the stream vitals come from `getStats()` inside the streamed client and
 //     arrive by `postMessage`. The shell CANNOT read them itself: the desktop
 //     is a cross-origin iframe, so its `RTCPeerConnection` and its `<video>`
 //     are unreachable from here by construction.
 //
-// Anything not known right now renders as an em dash, never as a zero. "0 fps"
+// Unknown values are labelled or render as an em dash, never as a zero. "0 fps"
 // and "not measured yet" are different claims and a monitor must not blur
 // them.
 //
@@ -45,6 +54,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 // 2-vCPU container whose budget the encoder already dominates.
 
 import session from '../../../session.js';
+import { describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './system-describe.js';
 
 const PHASE = 'ezil-os:settings/system';
 
@@ -60,7 +70,14 @@ let vitals = null;          // the last payload the streamed client published
 let vitalsAt = 0;           // when it arrived, so staleness can be shown
 let screenObserved = null;  // { width, height } from the live read
 let screenError = null;
+let systemInfo = null;      // `computer.systemInfo`: recorded provider + reported image + configured size
+let systemInfoReason = null; // why it is null, when it is
 let refreshTimer = null;
+let systemInfoTimer = null;
+let computerId = null;
+let viewGeneration = 0;     // discard reads completed after a switch or tab close
+const SYSTEM_INFO_REFRESH_MS = 15_000;
+const SYSTEM_INFO_KNOWN_REFRESH_MS = 60_000;
 let nativeProvider = { configured: false, pending: false, error: '' };
 let nativeTools = null;
 let nativePreview = { message: '', pending: false, workspaceId: null, draft: '3000' };
@@ -109,20 +126,34 @@ function stopListening () {
 }
 
 /**
- * The computer this session is bound to.
- *
- * 🔴 From the `ctx` Settings hands every tab, NOT from `session.payload()`.
- * The other tabs already take it from there, and it is the only source that is
- * populated in every path that can open this window — a Settings window opened
- * without a full boot has no module-level payload to read, and this tab would
- * then report "unknown" for the one fact it exists to state.
+ * Follow switches made after Settings opened. The context also supports
+ * windows opened without a full boot/session payload.
  */
 let tabCtx = null;
 
 function linkedComputer () {
+    const current = typeof session.currentComputer === 'function' ? session.currentComputer() : null;
+    if ( current ) return current;
     if ( tabCtx && tabCtx.computer ) return tabCtx.computer;
     const p = typeof session.payload === 'function' ? session.payload() : null;
     return p && p.computer ? p.computer : null;
+}
+
+function syncComputer () {
+    const id = linkedComputer()?.id ?? null;
+    if ( id === computerId ) return false;
+    computerId = id;
+    viewGeneration++;
+    clearTimeout(systemInfoTimer);
+    systemInfoTimer = null;
+    systemInfo = systemInfoReason = screenObserved = screenError = vitals = null;
+    vitalsAt = 0;
+    paint();
+    return true;
+}
+
+function isCurrentRead (generation, id) {
+    return listening && generation === viewGeneration && id === linkedComputer()?.id;
 }
 
 /**
@@ -134,26 +165,64 @@ function linkedComputer () {
  */
 async function refreshScreen () {
     const computer = linkedComputer();
+    const generation = viewGeneration;
     if (isNative(tabCtx)) { screenObserved = null; screenError = null; paint(); return; }
     if ( ! computer || typeof session.getScreen !== 'function' ) {
         screenObserved = null;
         screenError = 'not available in this deployment';
+        paint();
         return;
     }
     try {
         const res = await session.getScreen(computer.id);
+        if ( ! isCurrentRead(generation, computer.id) ) return;
         if ( res && res.ok === true ) {
             screenObserved = { width: res.width, height: res.height };
             screenError = null;
         } else {
             screenObserved = null;
-            screenError = (res && res.code) ? String(res.code).toLowerCase().replace(/_/g, ' ') : 'unavailable';
+            screenError = describeScreenError(res && res.code, res && res.message);
         }
     } catch ( err ) {
+        if ( ! isCurrentRead(generation, computer.id) ) return;
         screenObserved = null;
         screenError = 'unreachable';
     }
     paint();
+}
+
+/**
+ * Read where this computer runs and the configured size of that machine. A
+ * READ: the server never assigns a provider for this call.
+ */
+async function refreshSystemInfo () {
+    syncComputer();
+    clearTimeout(systemInfoTimer);
+    systemInfoTimer = null;
+    const computer = linkedComputer();
+    const generation = viewGeneration;
+    if ( isNative(tabCtx) ) return;
+    if ( ! computer || typeof session.getSystemInfo !== 'function' ) {
+        systemInfo = null;
+        systemInfoReason = 'UNSUPPORTED';
+        paint();
+        return;
+    }
+    try {
+        const res = await session.getSystemInfo(computer.id);
+        if ( ! isCurrentRead(generation, computer.id) ) return;
+        systemInfo = res && res.ok === true ? res.info : null;
+        systemInfoReason = res && res.ok === true ? null : (res && res.code) || 'UPSTREAM';
+    } catch ( err ) {
+        if ( ! isCurrentRead(generation, computer.id) ) return;
+        systemInfo = null;
+        systemInfoReason = 'UPSTREAM';
+    }
+    paint();
+    const providerKnown = ['aws-ec2', 'cloudflare'].includes(systemInfo?.provider);
+    const delay = providerKnown && describeImage(systemInfo).title
+        ? SYSTEM_INFO_KNOWN_REFRESH_MS : SYSTEM_INFO_REFRESH_MS;
+    systemInfoTimer = setTimeout(() => { void refreshSystemInfo(); }, delay);
 }
 
 function row (label, value, hint) {
@@ -177,7 +246,8 @@ function paint () {
     const computer = linkedComputer();
     const desktopOpen = !! desktopFrame();
     // Older than three publish intervals: the client has stopped talking.
-    const stale = vitals && (Date.now() - vitalsAt) > 6500;
+    const vitalsAge = vitals ? Date.now() - vitalsAt : Infinity;
+    const stale = vitals && vitalsAge > VITALS_STALE_MS;
     const v = (! vitals || stale) ? null : vitals;
 
     const num = (x, unit) => (typeof x === 'number' && Number.isFinite(x) ? `${x}${unit ?? ''}` : UNKNOWN);
@@ -216,13 +286,19 @@ function paint () {
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to, and how that connection is doing.
-           Everything here is measured; anything not known right now shows as ${UNKNOWN}.</p>
+           Each value says whether it is recorded, configured or measured; anything not known right now is labelled or shows as ${UNKNOWN}.</p>
 
         <h4>Linked computer</h4>
         ${row('Name', computer ? esc(computer.name) : UNKNOWN)}
         ${row('Slot', computer && computer.slot != null ? esc(computer.slot) : UNKNOWN)}
         ${row('Identifier', computer ? `<code>${esc(String(computer.id).slice(0, 8))}…</code>` : UNKNOWN,
               'The sandbox this session is bound to.')}
+
+        <h4>Machine</h4>
+        ${(() => { const p = describeProvider(systemInfo, systemInfoReason); return row('Provider', esc(p.value), esc(p.hint)); })()}
+        ${(() => { const i = describeImage(systemInfo); return row('Image', i.title ? `<code title="${esc(i.title)}">${esc(i.value)}</code>` : esc(i.value)); })()}
+        ${(() => { const m = describeMachine(systemInfo); return row('Size', esc(m.value), esc(m.hint)); })()}
+        ${(() => { const u = describeUsage(); return row('CPU and memory use', esc(u.value), esc(u.hint)); })()}
 
         <h4>Desktop screen</h4>
         ${row('Resolution',
@@ -242,8 +318,8 @@ function paint () {
         ${row('Picture', (v.width && v.height) ? `${v.width} × ${v.height}` : UNKNOWN)}
         ${row('Frame rate', num(v.fps, ' fps'))}
         ${row('Bitrate', num(v.kbps, ' kbit/s'), 'Measured between two samples, so it is blank on the first.')}
-        ${row('Round trip', num(v.rttMs, ' ms'),
-              'Every session is relayed through TURN — Cloudflare Containers have no UDP — so this has a floor that no quality setting can move.')}
+        ${(() => { const t = describeTransport(v, vitalsAge, systemInfo ? systemInfo.provider : null); return row('Route', esc(t.value), esc(t.hint)); })()}
+        ${row('Round trip', num(v.rttMs, ' ms'), 'Measured on the selected connection route.')}
         ${row('Jitter', num(v.jitterMs, ' ms'))}
         ${row('Packets lost', num(v.packetsLost))}`)}
     `;
@@ -260,6 +336,7 @@ export default {
 
     init ($win, ctx) {
         tabCtx = ctx ?? tabCtx;
+        syncComputer();
         $win.off('submit.ezil-native-preview').on('submit.ezil-native-preview', '[data-native-preview-form]', async function (event) {
             event.preventDefault();
             if (!isNative(tabCtx) || nativePreview.pending) return;
@@ -295,19 +372,27 @@ export default {
     onActivate ($win, ctx) {
         tabCtx = ctx ?? tabCtx;
         startListening();
+        syncComputer();
         requestVitals(true);
         void refreshScreen();
+        void refreshSystemInfo();
         paint();
         // The screen is re-read on a slow cadence rather than once: a
         // troubleshoot restart or a window resize changes it while this tab is
         // open, and a monitor showing a value from a minute ago is a monitor
         // that lies quietly.
-        if ( ! refreshTimer ) refreshTimer = setInterval(() => { void refreshScreen(); }, 10_000);
+        if ( ! refreshTimer ) refreshTimer = setInterval(() => {
+            if ( syncComputer() ) void refreshSystemInfo();
+            void refreshScreen();
+        }, 10_000);
     },
 
     onDeactivate () {
         requestVitals(false);
         stopListening();
+        viewGeneration++;
+        clearTimeout(systemInfoTimer);
+        systemInfoTimer = null;
         if ( refreshTimer ) { clearInterval(refreshTimer); refreshTimer = null; }
     },
 };
