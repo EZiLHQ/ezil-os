@@ -18,7 +18,7 @@ import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import type { EpochEndReason } from '@/server/billing/v2/contract';
 import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
-import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, sizeForInstanceType, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
+import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, meteredSizeForInstanceType, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
@@ -191,14 +191,19 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         // Billing tables are not installed in production: deliberately write epochs AFTER
         // the placement transaction commits, never in that transaction. Metering cannot roll it back.
         if (r.ok && to === 'RUNNING') {
-            const metered = await recordComputeMeter(() => deps.meter?.ready({
-                userId: p.ownerUserId, computerId: p.computerId, size: sizeForInstanceType(p.instanceType), readyAt: at,
-                overheadSeconds: startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
-            }));
-            // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
-            if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
-                userId: p.ownerUserId, computerId: p.computerId,
-            });
+            const size = meteredSizeForInstanceType(p.instanceType);
+            if (size === null) {
+                console.error('[billing.meter] unknown instance type, epoch not opened', { computerId: p.computerId });
+            } else {
+                const metered = await recordComputeMeter(() => deps.meter?.ready({
+                    userId: p.ownerUserId, computerId: p.computerId, size, readyAt: at,
+                    overheadSeconds: startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
+                }));
+                // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
+                if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
+                    userId: p.ownerUserId, computerId: p.computerId,
+                });
+            }
         }
         if (r.ok && usage?.kind === 'close') await recordComputeMeter(() => deps.meter?.stopped({
             userId: p.ownerUserId, computerId: p.computerId, endedAt: stopDate ?? at, reason: endReason,
