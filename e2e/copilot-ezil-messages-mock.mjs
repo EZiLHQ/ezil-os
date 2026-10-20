@@ -66,12 +66,16 @@ export function validateBody(body, bytes = Buffer.byteLength(JSON.stringify(body
 
 function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
-  const userText = body.messages.filter(turn => turn.role === 'user').flatMap(turn => typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
+  // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
+  const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI)/.test(t)) ?? '';
+  const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
     if (!body.tools?.some(tool => tool.name === name)) throw new Error('script requires offered tool ' + name);
     return [{ type: 'tool_use', id, name, input }];
   };
+  if (userText.includes('EZIL_E2E_KIMI')) return [{ type: 'text', text: 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' }];
   if (userText.includes('EZIL_E2E_UNDO')) {
     if (!done('ezil_undo')) return call('ezil_undo', 'replace_string_in_file', { filePath: join(folder, 'existing.txt'), oldString: 'after\n', newString: 'undo candidate\n' });
     return [{ type: 'text', text: 'EZiL Chat: undo candidate ready.' }];

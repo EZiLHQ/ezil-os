@@ -207,6 +207,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     store.watch();
     store.load();
     context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('ezil', provider));
+    // VS Code 1.141 subscribes to model changes at registration and does not enumerate models
+    // then; the change fired by the load above was missed, so announce the models once more.
+    provider.refresh();
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration('ezilModels.configPath')) store.setPath(resolveConfigPath(settings().get<string>('configPath')));
     }));

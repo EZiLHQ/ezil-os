@@ -11,6 +11,8 @@
 // `{env:NAME}` and `{file:/path}` references are resolved at load time. Resolved secrets are collected
 // in `ResolvedConfig.secrets` so callers can redact them from anything they log.
 
+import { DEFAULT_TOOL_RESERVE } from './gateway-messages';
+
 export const PROVIDER_TYPES = ['ezil-gateway', 'anthropic', 'anthropic-foundry', 'openai', 'azure-openai', 'openai-compatible'] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
 
@@ -372,7 +374,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 roles,
                 forcedToolChoice: provider.type === 'ezil-gateway' ? false : typeof merged.forcedToolChoice === 'boolean' ? merged.forcedToolChoice : supportsForcedToolChoice(merged.model),
                 stream: merged.model === 'us.moonshotai.kimi-k3' ? false : merged.stream !== false,
-                toolReserve: typeof merged.toolReserve === 'number' ? merged.toolReserve : 24_000,
+                toolReserve: typeof merged.toolReserve === 'number' ? merged.toolReserve : DEFAULT_TOOL_RESERVE,
                 topP: typeof merged.topP === 'number' ? merged.topP : undefined,
                 temperature: typeof merged.temperature === 'number' ? merged.temperature : undefined,
             };

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Lead-run image e2e: fresh and returning profiles, strict messages gateway,
-# browser assertions and DNS/HTTP/TLS sink. Publishes loopback port 8443 only.
+# browser assertions and DNS/HTTP/TLS sink. Nothing is published; the host reaches
+# code-server on the container's internal-bridge address (Linux Docker).
 # Run outside the projects tree: PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules
 #   /path/to/e2e/copilot-ezil-image.sh ezil-os-desktop:ezil-chat-lanec
 # Requires Docker, node, openssl and Playwright Chromium. Artifacts go to
@@ -9,7 +10,9 @@ set -euo pipefail
 
 IMAGE="${1:-${EZIL_COPILOT_E2E_IMAGE:-ezil-os-desktop:ezil-chat-lanec}}"
 OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && pwd)"
-HOST_PORT="${EZIL_COPILOT_E2E_PORT:-8443}"
+CODE_URL=""
+FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
+FORWARD_PID=""
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -24,6 +27,7 @@ fail=0
 BLOCKED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubcopilot\.com|exp-tas\.com|events\.data\.microsoft\.com|visualstudio\.com|applicationinsights\.azure\.com|vscode-cdn\.net)$'
 
 cleanup() {
+  [[ -n "${FORWARD_PID:-}" ]] && kill "$FORWARD_PID" 2>/dev/null || true
   docker rm --force "$NAME" "$DNS_NAME" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
   rm -rf "$WORK"
@@ -76,7 +80,6 @@ boot() { # boot <stage-dir>
   mkdir -p "$stage$SINK_DIR"
   cp "$here/copilot-ezil-netsink.py" "$WORK/sink.key" "$WORK/sink.crt" "$stage$SINK_DIR/"
   docker create --name "$NAME" --network "$NETWORK" --cpus=2 --memory=6g --dns "$DNS_IP" \
-    --publish "127.0.0.1:${HOST_PORT}:8443/tcp" \
     --env DESKTOP_MODE=neko --env NEKO_SCREEN=1280x720x24 \
     --env NEKO_MEMBER_MULTIUSER_USER_PASSWORD=neko --env NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=admin \
     --env NEKO_SESSION_IMPLICIT_HOSTING=true \
@@ -91,14 +94,24 @@ boot() { # boot <stage-dir>
     docker cp "$top/." "$NAME:/$(basename "$top")"
   done
   docker start "$NAME" >/dev/null
+  # The network is --internal (no egress, so every name resolves to the sinks),
+  # and Docker does not publish ports from internal networks: reach code-server
+  # on the container's address on that bridge instead.
+  local ip; ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}" "$NAME")"
+  # The browser must see a secure context (crypto.subtle), as production's https host is: forward a
+  # loopback port to the container's bridge address and browse http://127.0.0.1 instead.
+  [[ -n "${FORWARD_PID:-}" ]] && kill "$FORWARD_PID" 2>/dev/null || true
+  node -e 'const net=require("net");const [port,host]=process.argv.slice(1);net.createServer(c=>{const u=net.connect(8443,host);c.pipe(u).pipe(c);u.on("error",()=>c.destroy());c.on("error",()=>u.destroy())}).listen(+port,"127.0.0.1")' "$FORWARD_PORT" "$ip" &
+  FORWARD_PID=$!
+  CODE_URL="http://127.0.0.1:${FORWARD_PORT}"
   local i
   for i in $(seq 1 120); do
-    if curl -fsS -o /dev/null "http://127.0.0.1:${HOST_PORT}/healthz" 2>/dev/null; then
+    if curl -fsS -o /dev/null "${CODE_URL}/healthz" 2>/dev/null; then
       echo "[e2e] code-server up after ~${i}s"; return 0
     fi
     sleep 1
   done
-  echo "[e2e] FAIL: code-server never answered on :${HOST_PORT}" >&2
+  echo "[e2e] FAIL: code-server never answered on ${CODE_URL}" >&2
   docker logs "$NAME" 2>&1 | tail -40 >&2
   return 1
 }
@@ -108,7 +121,7 @@ inx() { docker exec "$NAME" bash -lc "$*"; }
 container_checks() { # container_checks <report-file>
   local rep="$1" ok=1
   {
-    inx 'code-server --version | head -1 | cut -d " " -f1 | grep -Fx 4.141.0' || ok=0
+    inx 'code-server --version | grep -q "^4.141.0 "' || ok=0
     inx '/usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode' || ok=0
     inx 'test -f /usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models/package.json' || ok=0
     inx 'test "$(opencode --version)" = 1.19.0' || ok=0
@@ -138,7 +151,7 @@ start_mock() {
 }
 
 run_browser() { # run_browser <outdir>
-  EZIL_CODE_URL="http://127.0.0.1:${HOST_PORT}" EZIL_E2E_FOLDER=/home/neko/project \
+  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project \
   EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
   EZIL_E2E_OUT="$1" node "$here/copilot-ezil.mjs"
 }
@@ -188,7 +201,7 @@ echo '[{"name":"Someone else","vendor":"openai","apiKey":"${input:chat.lm.secret
 boot "$ST2"
 container_checks "$OUT/returning-container-checks.txt" || fail=1
 inx 'cmp /home/neko/project/.ezil/settings.json /tmp/code-server-data/User/settings.json' || fail=1
-inx 'grep -q "\"vendor\": \"openai\"" /tmp/code-server-data/User/chatLanguageModels.json' && echo "PASS  pre-existing BYOK group survived the merge" || { echo "FAIL  pre-existing BYOK group was clobbered"; fail=1; }
+inx 'grep -Eq "\"vendor\": ?\"openai\"" /tmp/code-server-data/User/chatLanguageModels.json' && echo "PASS  pre-existing BYOK group survived the merge" || { echo "FAIL  pre-existing BYOK group was clobbered"; fail=1; }
 start_mock || fail=1
 run_browser "$OUT/returning" || fail=1
 collect_logs returning
