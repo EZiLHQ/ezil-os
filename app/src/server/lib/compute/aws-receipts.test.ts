@@ -140,6 +140,30 @@ describe('billing v2 observations', () => {
     const stoppedAt = new Date(NOW.getTime() - 42_321);
     const readyInput = { userId: U1, computerId: C1, size: 'cmp-8', readyAt: NOW, overheadSeconds: 12 };
 
+    it.each(['m7g.large', '', null, 'toString', '__proto__', 'constructor'])
+    ('unknown instance type %j completes readiness without opening an epoch', async instanceType => {
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const m = meter();
+        const s = setup([row({ state: 'STARTING', ...enrolled, instance_type: instanceType })],
+            { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 12_999) }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        await s.status();
+        expect(s.placements[0]).toMatchObject({ state: 'RUNNING', lifecycle_job_id: null });
+        expect(m.ready).not.toHaveBeenCalled();
+        expect(m.stopped).not.toHaveBeenCalled();
+        expect(error).toHaveBeenCalledExactlyOnceWith('[billing.meter] unknown instance type, epoch not opened', { computerId: C1 });
+    });
+
+    it('unknown instance type also skips metering when enrollment completes after the receipt', async () => {
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const m = meter();
+        const s = setup([row({ state: 'MOUNTING', ...enrolled, instance_type: 'm7g.large', lifecycle_job_id: null, lifecycle_digest: null })],
+            { status: 'RUNNING' }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        expect(m.ready).not.toHaveBeenCalled();
+        expect(error).toHaveBeenCalledExactlyOnceWith('[billing.meter] unknown instance type, epoch not opened', { computerId: C1 });
+    });
+
     it('provision waits for enrollment, then meters the actual cmp-8 instance once, after commit', async () => {
         const m = meter();
         const s = setup([row({ state: 'PROVISIONING', instance_type: 'm6i.2xlarge', volume_id: null })],

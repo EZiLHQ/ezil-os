@@ -163,12 +163,23 @@ export function awsTierForSize(size: SizeCode): AwsTier | null {
     }
 }
 
-/** Meter legacy benchmark types at their vCPU size; unknowns at the largest size. */
+/** Conservative legacy sizing; billing must use meteredSizeForInstanceType. */
 export function sizeForInstanceType(type: string | null | undefined): SizeCode {
     switch (instanceVcpu(type)) {
         case 2: return 'std-2';
         case 4: return 'cmp-4';
         default: return 'cmp-8';
+    }
+}
+
+/** Only explicitly listed machine types have a billing size. */
+export function meteredSizeForInstanceType(type: string | null | undefined): SizeCode | null {
+    if (!type || !Object.prototype.hasOwnProperty.call(INSTANCE_VCPU, type)) return null;
+    switch (INSTANCE_VCPU[type]) {
+        case 2: return 'std-2';
+        case 4: return 'cmp-4';
+        case 8: return 'cmp-8';
+        default: return null;
     }
 }
 

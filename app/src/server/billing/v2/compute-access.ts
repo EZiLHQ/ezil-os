@@ -1,5 +1,5 @@
 import type { EntitlementReader } from '../../lib/compute/tier';
-import { sizeForInstanceType } from '../../lib/compute/aws-config';
+import { meteredSizeForInstanceType } from '../../lib/compute/aws-config';
 import type { BillingConfig } from '../config';
 import { getBillingDeps } from '../deps';
 import type { BillingDeps } from '../ports';
@@ -175,10 +175,16 @@ export async function gateComputerStart({ deps, userId, computerId, kind, instan
         // a downgrade before the replacement can run, or under-rate an upgrade.
         // A paid user's pre-existing Cloudflare computer uses the paid allowance:
         // legacy billing rates it as std-2; v3 admission uses the plan's size.
+        const meteredSize = meteredSizeForInstanceType(instanceType);
+        // Null means no machine selected yet. An explicitly unlisted type must
+        // not borrow the entitlement's size, even when a resize is planned.
         const size = kind === 'aws-ec2'
-            ? state.provider === 'aws' ? state.entitledSize : instanceType !== null ? sizeForInstanceType(instanceType) : state.entitledSize
+            ? instanceType !== null && meteredSize === null ? null
+                : state.provider === 'aws' ? state.entitledSize : instanceType !== null ? meteredSize : state.entitledSize
             : state.provider === 'aws' ? state.v3 ? state.entitledSize : 'std-2' : 'free-cf';
-        const decision: AdmitDecision | AdmitDecisionV3 = kind === 'aws-ec2' && state.paymentIssue
+        const decision: AdmitDecision | AdmitDecisionV3 = size === null
+            ? { admit: false, reason: 'size_not_allowed' }
+            : kind === 'aws-ec2' && state.paymentIssue
             ? { admit: false, reason: 'payment_issue' }
             : kind === 'aws-ec2' && state.v3 && state.provider !== 'aws' ? { admit: false, reason: 'size_not_allowed' }
             : decideStart(state, computerId, size, now);

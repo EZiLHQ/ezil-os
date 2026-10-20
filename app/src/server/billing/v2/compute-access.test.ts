@@ -234,6 +234,31 @@ const running = (computerId = COMPUTER): StoredComputeEpoch => stored({
 const enforced = () => readBillingConfig({ BILLING_ENFORCEMENT: '1' });
 
 describe('gateComputerStart', () => {
+    it.each([
+        ['standard_monthly_v2', true], ['standard_monthly_v2', false],
+        ['premium_monthly_v3', true], ['premium_monthly_v3', false],
+    ] as const)('%s rejects unlisted AWS types with enforcement %s without rating them', async (sku, enforcement) => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const legacyAdmit = vi.spyOn(rating, 'admitStart');
+        const v3Admit = vi.spyOn(admissionV3, 'admitStart');
+        const { deps } = fixture({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1', BILLING_ENFORCEMENT: enforcement ? '1' : '0' }),
+            subs: [subscription({ sku })], grants: [grant()] });
+        for (const instanceType of ['m7g.large', '', 'toString', '__proto__', 'constructor']) {
+            const decision = { admit: false, reason: 'size_not_allowed' };
+            expect(await gate(deps, { instanceType })).toEqual(enforcement
+                ? { allowed: false, reason: 'size_not_allowed' } : { allowed: true, shadow: decision });
+            if (!enforcement) expect(info).toHaveBeenLastCalledWith('[billing.gate] shadow', { userId: USER, computerId: COMPUTER, decision });
+        }
+        expect(legacyAdmit).not.toHaveBeenCalled();
+        expect(v3Admit).not.toHaveBeenCalled();
+        if (enforcement) expect(info).not.toHaveBeenCalled();
+    });
+
+    it('an unlisted AWS type does not affect a Cloudflare start', async () => {
+        const { deps } = fixture({ config: enforced(), subs: [subscription()], grants: [grant()] });
+        expect(await gate(deps, { kind: 'cloudflare', instanceType: 'm7g.large' })).toEqual({ allowed: true });
+    });
+
     it('metering off makes zero store calls', async () => {
         const { deps, calls } = fixture({ config: readBillingConfig({}) });
         expect(await gate(deps)).toEqual({ allowed: true });
