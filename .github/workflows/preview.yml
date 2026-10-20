@@ -344,6 +344,8 @@ jobs:
           EZIL_E2E_APP: https://ezil-os-preview.vercel.app
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
+          EZIL_E2E_REQUIRE_TARGET: '1'
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           EZIL_LIVE_OUT: live-evidence
         run: node e2e/live-check.mjs
@@ -611,6 +613,8 @@ jobs:
           EZIL_E2E_APP: https://os.ezil.work
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
+          EZIL_E2E_REQUIRE_TARGET: '1'
           EZIL_LIVE_OUT: live-evidence
         run: |
           # Reserve ownership guard (1m), Worker (2m), Containers (7m), Vercel (2m), and readback (3m).

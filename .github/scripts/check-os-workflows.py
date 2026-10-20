@@ -267,8 +267,9 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert 'node e2e/live-check.mjs' in check['run']
     assert check['env']['EZIL_E2E_APP'] == url
     assert check['env']['EZIL_LIVE_OUT'] == 'live-evidence'
-    for key in ('EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD'):
+    for key in ('EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD', 'EZIL_E2E_COMPUTER_ID'):
         assert check['env'][key] == '${{ secrets.' + key + ' }}'
+    assert check['env']['EZIL_E2E_REQUIRE_TARGET'] == '1'
     assert position(worker) < position(deploy) < position(check)
     assert 'if' not in check
     assert ('if' not in deploy) if job_name == 'preview' else deploy['if'] == worker['if'] == main
@@ -405,7 +406,7 @@ preview_text = (root / '.github/workflows/preview.yml').read_text()
 assert set(re.findall(r'secrets\.([A-Z0-9_]+)', preview_text)) == {
     'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'VERCEL_TOKEN',
     'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID', 'VERCEL_AUTOMATION_BYPASS_SECRET',
-    'EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD', 'SUPABASE_ACCESS_TOKEN',
+    'EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD', 'EZIL_E2E_COMPUTER_ID', 'SUPABASE_ACCESS_TOKEN',
 }
 assert set(re.findall(r'vars\.([A-Z_]+)', preview_text)) == {'OS_WORKER_URL'}
 print('OS workflows: YAML, shell, JavaScript and release contracts passed')

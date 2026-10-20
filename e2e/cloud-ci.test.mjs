@@ -639,6 +639,19 @@ test('deployment triggers are preview/main and version-tag pushes plus manual di
   assert.equal(triggers.children.find(node => node.line === 'workflow_dispatch:').children.length, 0);
 });
 
+test('both live-check steps require their environment isolated computer secret', () => {
+  const jobs = outline(workflowText).children.find(node => node.line === 'jobs:');
+  for (const [name, environment] of [['preview', 'staging'], ['production', 'production']]) {
+    const job = jobs.children.find(node => node.line === `${name}:`);
+    assert.ok(job.children.some(node => node.line === `environment: ${environment}`));
+    const steps = job.children.find(node => node.line === 'steps:');
+    const live = steps.children.find(node => node.children.some(child => child.line === `id: live_${name}`));
+    const env = live.children.find(node => node.line === 'env:').children.map(node => node.line);
+    assert.ok(env.includes('EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}'), name);
+    assert.ok(env.includes("EZIL_E2E_REQUIRE_TARGET: '1'"), name);
+  }
+});
+
 test('both deploy jobs gate live-check on completed rollouts and deployment identity', () => {
   for (const name of ['preview', 'production']) {
     const job = previewWorkflow.jobs.find(job => job.name === name);

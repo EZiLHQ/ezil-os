@@ -12,7 +12,7 @@ export const CHECK_NAMES = Object.freeze([
   'setup', 'sign-in', 'os-session-ready', 'warm-browser-paint',
   'relay-read', 'relay-renew', 'warm-code-ready', 'warm-terminal',
   'close-windows', 'stop', 'cold-os-session-ready', 'cold-browser-paint',
-  'close-desktop', 'cold-code-ready', 'cold-marker', 'browser-close',
+  'close-desktop', 'cold-code-ready', 'cold-marker', 'final-stop', 'browser-close',
   'deadline', 'evidence',
 ]);
 
@@ -68,6 +68,20 @@ export function isValidRelayRenewal(read, response, now) {
     && renew.expiresAt > now && renew.expiresAt > read.expiresAt;
 }
 
+/** A booting viewer can renew between our read and renewal. Retry once using
+ * current credentials, but never follow a replacement runtime. */
+export async function renewWithOneRetry({ initialRead, read, renew, sleep, now = Date.now }) {
+  const response = await renew(initialRead);
+  if (isValidRelayRenewal(initialRead, response, now())) return response;
+
+  const freshRead = await read();
+  if (freshRead?.runtimeId !== initialRead.runtimeId) throw new Error('Relay runtime changed');
+  await sleep(2000);
+  const retry = await renew(freshRead);
+  if (!isValidRelayRenewal(freshRead, retry, now())) throw new Error('Relay renewal failed');
+  return retry;
+}
+
 async function bounded(action, ms) {
   let timer;
   try {
@@ -78,16 +92,29 @@ async function bounded(action, ms) {
   } finally { clearTimeout(timer); }
 }
 
-async function runLiveCheck() {
+async function loadLiveDependencies(env) {
+  const deployment = await import('./deployed-target.mjs');
+  const { signIn } = await import('./sign-in.mjs');
+  const { verifySelectedComputer, stopIsolatedComputer } = await import('./isolated-computer.mjs');
+  const require = createRequire(join(resolve(env.PLAYWRIGHT_REQUIRE_DIR), 'live-check.cjs'));
+  const { chromium } = require('playwright');
+  return { deployment, signIn, chromium, verifySelectedComputer, stopIsolatedComputer };
+}
+
+export async function runLiveCheck({
+  env = process.env,
+  loadDependencies = loadLiveDependencies,
+  emit = value => writeSync(1, `${JSON.stringify(value)}\n`),
+} = {}) {
   const started = performance.now();
-  // Reserve time for failure evidence and browser shutdown within the hard cap.
-  const deadline = started + MAX_RUN_MS - 15_000;
-  const out = resolve(process.env.EZIL_LIVE_OUT || join(tmpdir(), 'ezil-live-check'));
+  // Reserve at least a minute for final stop, plus evidence and browser shutdown.
+  const deadline = started + MAX_RUN_MS - 60_000 - 15_000;
+  const out = resolve(env.EZIL_LIVE_OUT || join(tmpdir(), 'ezil-live-check'));
   const checks = [];
   const abort = new AbortController();
   let browser, context, page, target, deployment, signIn, active, stepDeadline;
+  let verifySelectedComputer, stopIsolatedComputer, validatedComputerId;
   let finished = false;
-  const emit = value => writeSync(1, `${JSON.stringify(value)}\n`);
   const record = (check, ok, ms) => {
     const result = redactEvidence({ check, ok, ms });
     checks.push(result);
@@ -105,7 +132,6 @@ async function runLiveCheck() {
     catch { record('evidence', false, 0); }
     const report = aggregateResults(checks);
     emit(report);
-    process.exitCode = report.result === 'PASS' ? 0 : 1;
   };
   const hardTimer = setTimeout(() => {
     if (active) record(active.check, false, performance.now() - active.started);
@@ -266,14 +292,12 @@ async function runLiveCheck() {
   try {
     await check('setup', 30_000, async () => {
       mkdirSync(out, { recursive: true, mode: 0o700 });
-      if (!process.env.EZIL_E2E_EMAIL || !process.env.EZIL_E2E_PASSWORD || !process.env.PLAYWRIGHT_REQUIRE_DIR) {
+      if (!env.EZIL_E2E_EMAIL || !env.EZIL_E2E_PASSWORD || !env.PLAYWRIGHT_REQUIRE_DIR) {
         throw new Error('Missing live check inputs');
       }
-      deployment = await import('./deployed-target.mjs');
-      target = deployment.deployedTarget();
-      ({ signIn } = await import('./sign-in.mjs'));
-      const require = createRequire(join(resolve(process.env.PLAYWRIGHT_REQUIRE_DIR), 'live-check.cjs'));
-      const { chromium } = require('playwright');
+      let chromium;
+      ({ deployment, signIn, chromium, verifySelectedComputer, stopIsolatedComputer } = await loadDependencies(env));
+      target = deployment.deployedTarget(env);
       browser = await chromium.launch({ headless: true, timeout: remaining(25_000),
         args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader'] });
       context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -283,22 +307,33 @@ async function runLiveCheck() {
     });
     await check('sign-in', 90_000, async () => {
       await go('/login?method=email&returnUrl=%2Fcomputers');
-      await signIn(page, { email: process.env.EZIL_E2E_EMAIL, password: process.env.EZIL_E2E_PASSWORD, destination: '/computers' });
+      await signIn(page, { email: env.EZIL_E2E_EMAIL, password: env.EZIL_E2E_PASSWORD, destination: '/computers' });
     });
-    const computerId = await check('os-session-ready', 60_000, sessionReady);
+    const computerId = await check('os-session-ready', 60_000, async () => {
+      const selected = await sessionReady();
+      const verified = await verifySelectedComputer(page, {
+        computerId: env.EZIL_E2E_COMPUTER_ID ?? '', required: env.EZIL_E2E_REQUIRE_TARGET === '1',
+      });
+      remaining();
+      validatedComputerId = verified;
+      return verified ?? selected;
+    });
     await check('warm-browser-paint', 120_000, openBrowserAndPaint);
-    const relay = await check('relay-read', 60_000, async () => {
+    const readRelay = async () => {
       const response = await api(`/api/shell/relay-refresh?computerId=${encodeURIComponent(computerId)}`);
       if (response.status !== 200 || response.json?.ok !== true || !response.json.runtimeId
           || !Number.isSafeInteger(response.json.expiresAt) || response.json.expiresAt <= Date.now()) {
         throw new Error('Relay read failed');
       }
       return response.json;
-    });
-    await check('relay-renew', 60_000, async () => {
-      const response = await api('/api/shell/relay-refresh', { computerId, runtimeId: relay.runtimeId });
-      if (!isValidRelayRenewal(relay, response, Date.now())) throw new Error('Relay renewal failed');
-    });
+    };
+    const relay = await check('relay-read', 60_000, readRelay);
+    await check('relay-renew', 60_000, () => renewWithOneRetry({
+      initialRead: relay,
+      read: readRelay,
+      renew: current => api('/api/shell/relay-refresh', { computerId, runtimeId: current.runtimeId }),
+      sleep: ms => sleep(remaining(ms)),
+    }));
     const nonce = randomBytes(10).toString('hex');
     const warmFrame = await check('warm-code-ready', 60_000, codeFrame);
     await check('warm-terminal', 45_000, async () => {
@@ -307,12 +342,16 @@ async function runLiveCheck() {
       }
     });
     await check('close-windows', 15_000, () => closeWindows('.window'));
-    if (process.env.EZIL_LIVE_SKIP_COLD !== '1') {
+    if (env.EZIL_LIVE_SKIP_COLD !== '1') {
       await check('stop', 290_000, async () => {
         if (!isRealStop(await api('/api/shell/stop', { computerId }, 290_000))) throw new Error('Real stop unconfirmed');
       });
       await check('cold-os-session-ready', 60_000, async () => {
-        if (await sessionReady() !== computerId) throw new Error('Selected computer changed');
+        const selected = await sessionReady();
+        await verifySelectedComputer(page, {
+          computerId: env.EZIL_E2E_COMPUTER_ID ?? '', required: env.EZIL_E2E_REQUIRE_TARGET === '1',
+        });
+        if (selected !== computerId) throw new Error('Selected computer changed');
       });
       await check('cold-browser-paint', 180_000, openBrowserAndPaint);
       await check('close-desktop', 15_000, () => closeWindows('.window[data-app="desktop"]'));
@@ -328,6 +367,23 @@ async function runLiveCheck() {
     await bounded(failureScreenshot, 5000).catch(() => {});
   } finally {
     abort.abort();
+    if (validatedComputerId) {
+      const stopping = performance.now();
+      const timeout = Math.max(1, Math.floor(Math.min(290_000, started + MAX_RUN_MS - 10_000 - stopping)));
+      // Cleanup has its own signal: a failed check has already aborted normal API calls.
+      const cleanup = new AbortController();
+      try {
+        await bounded(() => stopIsolatedComputer(context, validatedComputerId, target.app, target.headers, timeout,
+          (url, options) => {
+            // A stalled cookie read must not issue a late stop after the bound expires.
+            cleanup.signal.throwIfAborted();
+            return deployment.appRequest(url, { ...options, signal: cleanup.signal });
+          }), timeout);
+        record('final-stop', true, performance.now() - stopping);
+      } catch {
+        record('final-stop', false, performance.now() - stopping);
+      } finally { cleanup.abort(); }
+    }
     if (browser) {
       const closing = performance.now();
       try {
@@ -342,10 +398,11 @@ async function runLiveCheck() {
     clearTimeout(hardTimer);
     process.removeListener('unhandledRejection', onUnhandled);
   }
+  return aggregateResults(checks);
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  await runLiveCheck();
+  const report = await runLiveCheck();
   // A failed browser shutdown must not leave the CLI held open by sockets.
-  process.exit(process.exitCode ?? 1);
+  process.exit(report.result === 'PASS' ? 0 : 1);
 }
