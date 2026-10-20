@@ -773,11 +773,6 @@ describe('billing v3 mutations', () => {
     it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const)('selects only %s sizes', async planSku => {
         const f = await paidFixture(planSku);
         for (const size of ['free-cf', 'std-2', 'cmp-4', 'cmp-8', 'unknown']) {
-            if (planSku !== 'compute_monthly_v2') {
-                await domainFailure(() => f.caller.selectSize({ size }), 'upgrade_not_allowed');
-                expect(f.store.setSizePreference).not.toHaveBeenCalled();
-                continue;
-            }
             const allowed = CATALOG_V2[planSku].sizes.some(code => code === size);
             if (allowed) {
                 const input = { size, userId: 'foreign', subscriptionId: 'sub_foreign' };

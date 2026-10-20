@@ -333,7 +333,8 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 const deps = getDeps();
                 configuredStripe(deps);
                 const { plan } = await currentPlan(deps, ctx.user.id);
-                if (plan.sku !== 'legacy' || plan.offer.sku !== 'compute_monthly_v2') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+                // v3 plans choose through selectMachine; only legacy v2 offers use this.
+                if (plan.sku !== 'legacy') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
                 const size = plan.offer.sizes.find(size => size === input.size);
                 if (!size) throw billingError('size_not_allowed', 'BAD_REQUEST');
                 await deps.store.setSizePreference(ctx.user.id, size);
