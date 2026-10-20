@@ -262,7 +262,7 @@ RUN curl --fail --location --silent --show-error \
   && dpkg -i /tmp/code-server.deb \
   && rm -f /tmp/code-server.deb \
   && test -x /usr/bin/code-server \
-  && test "$(code-server --version | awk 'NR==1 {print $1}')" = "${CODE_SERVER_VERSION}"
+  && code-server --version | grep -q "^${CODE_SERVER_VERSION} "
 RUN node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/copilot/package.json');if(j.publisher!=='GitHub'||j.name!=='copilot-chat'||j.version!=='0.69.0'||!j.contributes?.languageModelChatProviders)throw new Error('expected bundled GitHub.copilot-chat 0.69.0 with languageModelChatProviders');if(!require('/usr/lib/code-server/lib/vscode/product.json').defaultChatAgent)throw new Error('defaultChatAgent missing')"
 
 # MIT upstream code; exact anchors, copyright and modification notices are
