@@ -36,6 +36,8 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
+import { syncAiCredential } from '@/server/lib/ai-credential';
+import { createClient } from '@/utils/supabase/server';
 import { stampOpened } from './computer-store';
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
@@ -207,6 +209,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: createClient,
+            });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
@@ -629,6 +636,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: createClient,
+            });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
 
             if (!result.ok) {
@@ -1201,6 +1213,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind !== 'aws-ec2') {
+                await syncAiCredential({
+                    config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+                    sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                    userId: ctx.user.id, headers: ctx.headers, supabase: createClient,
+                });
+            }
             const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,
             });
