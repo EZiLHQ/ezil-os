@@ -420,6 +420,18 @@ test('Vercel rollback refuses mismatched identities, untrusted hostnames and los
 const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
 const previewWorkflow = parseWorkflow(workflowText);
 
+function runWorkflowScript(command, args, options = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-workflow-script-'));
+  const log = path.join(dir, 'output');
+  const fd = fs.openSync(log, 'w');
+  try {
+    // File descriptors avoid subprocess socket pairs in restricted runners.
+    const result = spawnSync(command, args, { ...options, timeout: 5000, stdio: ['ignore', fd, fd] });
+    assert.ifError(result.error);
+    return { status: result.status, output: fs.readFileSync(log, 'utf8') };
+  } finally { fs.closeSync(fd); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
 test('deployment triggers are preview/main and version-tag pushes plus manual dispatch', () => {
   const triggers = outline(workflowText).children.find(node => node.line === 'on:');
   assert.ok(triggers, 'deployment workflow must declare its triggers');
@@ -429,7 +441,7 @@ test('deployment triggers are preview/main and version-tag pushes plus manual di
   assert.equal(triggers.children.find(node => node.line === 'workflow_dispatch:').children.length, 0);
 });
 
-test('both deploy jobs run live-check after deployment', () => {
+test('both deploy jobs gate live-check on completed rollouts and deployment identity', () => {
   for (const name of ['preview', 'production']) {
     const job = previewWorkflow.jobs.find(job => job.name === name);
     assert.ok(job, `${name} deploy job must exist`);
@@ -437,28 +449,106 @@ test('both deploy jobs run live-check after deployment', () => {
     assert.equal(checks.length, 1, `${name} must run live-check once`);
     assert.ok(!checks[0].keys.includes('if'), `${name} live-check must not have an extra condition`);
     const deploy = job.steps.findIndex(step => /\bvercel deploy\b/.test(step.text));
-    assert.ok(deploy >= 0 && deploy < job.steps.indexOf(checks[0]), `${name} must deploy before live-check`);
+    const rollout = job.steps.findIndex(step => /node e2e\/await-container-rollout.mjs/.test(step.text));
+    const identity = job.steps.findIndex(step => /node e2e\/verify-cloud-deployment.mjs/.test(step.text));
+    assert.ok(deploy >= 0 && deploy < rollout && rollout < identity && identity < job.steps.indexOf(checks[0]),
+      `${name} must deploy, await rollout, and verify identity before live-check`);
+    assert.match(job.steps[rollout].text, /if: .*needs.changes.outputs.image_changed == 'true'/);
+    for (const index of [rollout, identity]) assert.ok(!job.steps[index].keys.includes('continue-on-error'));
+    assert.match(job.steps[identity].text, new RegExp(`EZIL_E2E_APP: \\$\\{\\{ steps\\.${name === 'preview' ? 'preview_app' : 'production_app'}\\.outputs\\.url \\}\\}`));
+    assert.match(job.steps[deploy].text, /echo "url=\$url" >> "\$GITHUB_OUTPUT"/);
   }
 });
 
-test('production recovery restores captured deployments and fails after a deploy or live-check failure', () => {
+test('production recovery verifies captured identities after all restores and still fails', () => {
   const job = previewWorkflow.jobs.find(job => job.name === 'production');
-  const recovery = ['Roll back production Worker', 'Restore previous container image and await rollback rollout', 'Restore previous Vercel production deployment', 'Fail after production recovery']
+  const recovery = ['Roll back production Worker', 'Restore previous container image and await rollback rollout', 'Restore previous Vercel production deployment', 'Verify production recovery identities', 'Fail after production recovery']
     .map(name => job.steps.find(step => step.line === `- name: ${name}`));
   for (const step of recovery) {
     assert.ok(step, 'production recovery step must exist');
     assert.match(step.text, /if: always\(\) && github\.ref == 'refs\/heads\/main' && steps\.previous_worker\.outcome == 'success' && steps\.previous_app\.outcome == 'success'/);
-    for (const id of ['worker', 'production_app', 'live_production']) {
+    for (const id of ['worker', 'production_app', 'rollout', 'identity', 'live_production']) {
       assert.ok(step.text.includes(`steps.${id}.outcome == 'failure'`));
     }
+    assert.ok(!step.keys.includes('continue-on-error'));
   }
   assert.match(recovery[0].text, /wrangler rollback '\$\{\{ steps\.previous_worker\.outputs\.version \}\}' -y/);
   assert.match(recovery[1].text, /release-state\.mjs container-rollback/);
   assert.match(recovery[1].text, /steps\.previous_container\.outcome == 'success'/);
   assert.match(recovery[2].text, /VERCEL_ORG_ID: \$\{\{ secrets\.VERCEL_ORG_ID \}\}/);
   assert.match(recovery[2].text, /vercel promote '\$\{\{ steps\.previous_app\.outputs\.deployment \}\}' --scope "\$VERCEL_ORG_ID"/);
-  assert.match(recovery[3].text, /^exit 1$/m);
-  assert.ok(job.steps.indexOf(recovery[3]) > job.steps.indexOf(recovery[2]));
+  assert.match(recovery[3].text, /release-state\.mjs rollback-check/);
+  assert.match(recovery[3].text, /timeout-minutes: 3/);
+  assert.match(recovery[4].text, /^exit 1$/m);
+  for (let i = 1; i < recovery.length; i++) assert.ok(job.steps.indexOf(recovery[i]) > job.steps.indexOf(recovery[i - 1]));
+  const capture = job.steps.find(step => /release-state\.mjs capture/.test(step.text));
+  assert.match(capture.text, /^if: github.ref == 'refs\/heads\/main'$/m);
+  assert.ok(job.steps.indexOf(capture) < job.steps.findIndex(step => /wrangler deploy\b/.test(step.text)));
+});
+
+test('rollout and identity failures recover main with or without a new image, never tags', () => {
+  const job = previewWorkflow.jobs.find(job => job.name === 'production');
+  const recoveries = job.steps.filter(step => /wrangler rollback|release-state.mjs (?:container-rollback|rollback-check)|vercel promote|Fail after production recovery/.test(step.text));
+  assert.equal(recoveries.length, 5);
+  for (const imageChanged of ['true', 'false']) {
+    for (const failure of ['worker', 'production_app', 'rollout', 'identity', 'live_production', null]) {
+      const steps = Object.fromEntries(['previous_worker', 'previous_app', 'previous_container',
+        'worker', 'production_app', 'rollout', 'identity', 'live_production'].map(id => [id, { outcome: 'success' }]));
+      if (failure) {
+        steps[failure].outcome = 'failure';
+        // Earlier gate failures skip the default-success live check.
+        if (failure !== 'live_production') steps.live_production.outcome = 'skipped';
+      }
+      for (const recovery of recoveries) {
+        const condition = recovery.text.match(/^if: (.+)$/m)[1];
+        const evaluate = new Function('github', 'needs', 'steps', 'always', `return (${condition})`);
+        const needs = { changes: { outputs: { image_changed: imageChanged } } };
+        const expected = failure !== null && (imageChanged === 'true' || !recovery.text.includes('release-state.mjs container-rollback'));
+        assert.equal(evaluate({ ref: 'refs/heads/main' }, needs, steps, () => true), expected);
+        assert.equal(evaluate({ ref: 'refs/tags/v1.2.3' }, needs, steps, () => true), false);
+      }
+    }
+  }
+});
+
+test('post-recovery readback retries convergence and fails after twelve unsuccessful checks', () => {
+  const job = previewWorkflow.jobs.find(job => job.name === 'production');
+  const step = job.steps.find(step => /release-state.mjs rollback-check/.test(step.text));
+  const script = step.text.match(/run: \|\n([\s\S]*)$/)[1];
+  for (const succeedsAt of [3, 13]) {
+    const child = runWorkflowScript('bash', ['-e', '-c', `
+      attempts=0
+      node() { attempts=$((attempts + 1)); echo "$attempts"; (( attempts >= ${succeedsAt} )); }
+      sleep() { :; }
+      ${script}
+    `]);
+    assert.equal(child.status, succeedsAt === 3 ? 0 : 1, child.output);
+    assert.equal(child.output.trim().split('\n').length, Math.min(succeedsAt, 12));
+  }
+});
+
+test('staging alias readback rejects stale or different deployments before the live check', () => {
+  const job = previewWorkflow.jobs.find(job => job.name === 'preview');
+  const step = job.steps.find(step => /node e2e\/verify-cloud-deployment.mjs/.test(step.text));
+  const script = step.text.match(/<<'JS'\n([\s\S]*?)\nJS/)[1]
+    .replace("'./e2e/verify-cloud-deployment.mjs'", JSON.stringify(new URL('./verify-cloud-deployment.mjs', import.meta.url).href));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-alias-readback-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'live-evidence'));
+    fs.writeFileSync(path.join(dir, 'live-evidence/deployment-identity.json'), JSON.stringify({ vercel_deployment: deployment.id }));
+    for (const patch of [{}, { id: 'dpl_other' }, { meta: { githubCommitSha: 'c'.repeat(40) } },
+      { projectId: 'prj_other' }, { target: 'production' }, { url: 'old.vercel.app' }, { readyState: 'BUILDING' }]) {
+      const child = runWorkflowScript(process.execPath, ['--input-type=module', '-e',
+        `globalThis.fetch = async (input, options) => {
+          const url = new URL(input);
+          if (url.hostname !== 'api.vercel.com' || url.pathname !== '/v13/deployments/ezil-os-preview.vercel.app'
+            || url.searchParams.get('teamId') !== 'team_test' || options.redirect !== 'error' || !options.signal) throw new Error('Unexpected alias request');
+          return { ok: true, json: async () => (${JSON.stringify({ ...deployment, ...patch })}) };
+        };\n${script}`,
+      ], { cwd: dir, env });
+      assert.equal(child.status, Object.keys(patch).length ? 1 : 0, child.output);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 const { assertPreviewImage } = await import('../.github/scripts/record-manual-preview.mjs');
@@ -579,7 +669,7 @@ test('image change paths cover desktop inputs without rebuilding for app/Worker 
 test('tag verification never deploys or recovers production, and failed live checks cannot publish', () => {
   const job = previewWorkflow.jobs.find(job => job.name === 'production');
   for (const step of job.steps) {
-    if (/wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback)|production-migrations.mjs apply/.test(step.text)) {
+    if (/wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check)|production-migrations.mjs apply/.test(step.text)) {
       assert.match(step.text, /if: .*github\.ref == 'refs\/heads\/main'/);
     }
     if (/gh release edit|imagetools create|release evidence and wait/.test(step.text)) {

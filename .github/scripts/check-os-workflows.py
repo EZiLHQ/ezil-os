@@ -169,7 +169,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
 ):
     job = preview['jobs'][job_name]
     assert job['environment'] == environment
-    assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (25 if job_name == 'preview' else 65)
+    assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (36 if job_name == 'preview' else 65)
     assert job['needs'] == ['changes', 'images']
     ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
                      "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))")
@@ -182,6 +182,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
                                   {'contents': 'write', 'packages': 'write', 'actions': 'read'})
     assert job['env']['EZIL_DEPLOY_SHA'] == '${{ github.sha }}'
     assert job['env']['EZIL_DEPLOY_TARGET'] == job_name
+    assert job['env']['EZIL_WORKER_NAME'] == ('ezil-os-worker-staging' if job_name == 'preview' else 'ezil-os-worker')
     assert bypass not in yaml.safe_dump({key: value for key, value in job.items() if key != 'steps'})
     steps = job['steps']
     by_name = {step.get('name'): step for step in steps}
@@ -216,9 +217,24 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert "if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]" in worker['run']
     assert './node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"' in worker['run']
     assert ('args=(--env staging)' if job_name == 'preview' else 'args=()') in worker['run']
-    assert ('5 * 60' if job_name == 'preview' else '12 * 60') in worker['run'] and 'timeout --kill-after=10s' in worker['run']
+    assert ('16 * 60' if job_name == 'preview' else '15 * 60') in worker['run'] and 'timeout --kill-after=10s' in worker['run']
     deploy = by_name[deploy_name]
     check = by_id[check_id]
+    rollout = by_id['rollout']
+    identity = by_id['identity']
+    assert rollout['if'] == image_condition and rollout['timeout-minutes'] == 11
+    assert 'node e2e/await-container-rollout.mjs' in rollout['run']
+    assert 'node e2e/verify-cloud-deployment.mjs' in identity['run']
+    assert identity['timeout-minutes'] == 3
+    assert not rollout.get('continue-on-error', False) and not identity.get('continue-on-error', False)
+    assert position(worker) < position(deploy) < position(rollout) < position(identity) < position(check)
+    assert ('if' not in identity) if job_name == 'preview' else identity['if'] == main
+    assert identity['env']['EZIL_E2E_APP'] == '${{ steps.' + deploy['id'] + '.outputs.url }}'
+    assert 'echo "url=$url" >> "$GITHUB_OUTPUT"' in deploy['run']
+    for key in ('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID'):
+        assert rollout['env'][key] == identity['env'][key] == '${{ secrets.' + key + ' }}'
+    for key in ('VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID'):
+        assert identity['env'][key] == '${{ secrets.' + key + ' }}'
     assert deploy['working-directory'] == 'app' and 'vercel deploy .. --yes' in deploy['run']
     assert 'node e2e/live-check.mjs' in check['run']
     assert check['env']['EZIL_E2E_APP'] == url
@@ -234,10 +250,14 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     upload = by_name['Upload live evidence']
     assert upload['if'] == 'always()' and upload['uses'].startswith('actions/upload-artifact@')
     assert 'live-evidence' in upload['with']['path'].splitlines() and steps[-1] == upload
+    assert 'hosted-continuity-evidence/container-rollout.json' in upload['with']['path'].splitlines()
     if job_name == 'preview':
         assert '--prod' not in deploy['run']
         assert 'vercel alias set "$url" ezil-os-preview.vercel.app' in deploy['run']
         assert check['env'][bypass] == '${{ secrets.' + bypass + ' }}'
+        assert '/deployments/ezil-os-preview.vercel.app?teamId=' in identity['run']
+        assert 'assertVercelDeployment(await response.json()' in identity['run']
+        assert 'assert.equal(id, identity.vercel_deployment' in identity['run']
         assert not check.get('continue-on-error', False)
         assert not re.search(r'ci-migrate|--apply|migrations apply|drizzle.*push',
                              '\n'.join(step.get('run', '') for step in steps))
@@ -248,14 +268,17 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert '/deployments/os.ezil.work?teamId=' in by_id['previous_app']['run']
     assert by_id['previous_worker']['if'] == by_id['previous_app']['if'] == main
     assert position(by_id['previous_worker']) < position(by_id['previous_app']) < position(worker)
-    assert '12 * 60' in deploy['run'] and 'timeout --kill-after=10s' in deploy['run']
-    assert '11 * 60' in check['run'] and 'timeout --kill-after=10s' in check['run']
+    assert '15 * 60' in deploy['run'] and 'timeout --kill-after=10s' in deploy['run']
+    assert '15 * 60' in rollout['run'] and 'timeout --kill-after=10s' in rollout['run']
+    for step in (identity, check):
+        assert '14 * 60' in step['run'] and 'timeout --kill-after=10s' in step['run']
     # Attempt all three restorations independently and never mask a failed check.
-    rollback_condition = "always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.live_production.outcome == 'failure')"
+    rollback_condition = "always() && github.ref == 'refs/heads/main' && steps.previous_worker.outcome == 'success' && steps.previous_app.outcome == 'success' && (steps.worker.outcome == 'failure' || steps.production_app.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure' || steps.live_production.outcome == 'failure')"
     rollback_worker = by_name['Roll back production Worker']
     rollback_app = by_name['Restore previous Vercel production deployment']
+    rollback_check = by_name['Verify production recovery identities']
     fail = by_name['Fail after production recovery']
-    for step in (rollback_worker, rollback_app, fail):
+    for step in (rollback_worker, rollback_app, rollback_check, fail):
         assert step['if'] == rollback_condition
         assert position(step) > position(check)
     assert "wrangler rollback '${{ steps.previous_worker.outputs.version }}' -y" in rollback_worker['run']
@@ -266,7 +289,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     archive = by_name['Preserve recovery identities before production mutation']
     migrations = by_name['Verify or apply reviewed production migrations']
     container = by_name['Restore previous container image and await rollback rollout']
-    assert capture['if'] == archive['if'] == image_condition
+    assert capture['if'] == archive['if'] == main
     assert capture['run'] == 'node .github/scripts/release-state.mjs capture'
     assert archive['with']['path'] == 'previous-release.json' and archive['with']['if-no-files-found'] == 'error'
     assert position(capture) < position(archive) < position(migrations) < position(prepare) < position(worker)
@@ -278,10 +301,14 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert container['run'] == 'node .github/scripts/release-state.mjs container-rollback'
     assert container['timeout-minutes'] == 7 and not container.get('continue-on-error', False)
     for key in ('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID'):
-        assert capture['env'][key] == container['env'][key] == '${{ secrets.' + key + ' }}'
-    assert position(rollback_worker) < position(container) < position(rollback_app) < position(fail)
-    assert {'previous-release.json', 'container-rollback.json', 'production-release.json'} <= set(upload['with']['path'].splitlines())
-    assert '+ 34 * 60' in by_id['deadline']['run']
+        assert capture['env'][key] == container['env'][key] == rollback_check['env'][key] == '${{ secrets.' + key + ' }}'
+    assert position(rollback_worker) < position(container) < position(rollback_app) < position(rollback_check) < position(fail)
+    assert rollback_check['timeout-minutes'] == 3 and not rollback_check.get('continue-on-error', False)
+    assert rollback_check['run'] == ('for attempt in {1..12}; do\n'
+                                    '  if node .github/scripts/release-state.mjs rollback-check; then exit 0; fi\n'
+                                    '  sleep 5\ndone\nexit 1\n')
+    assert {'previous-release.json', 'container-rollback.json', 'rollback-state.json', 'production-release.json'} <= set(upload['with']['path'].splitlines())
+    assert '+ 47 * 60' in by_id['deadline']['run']
     # Tags only verify existing production, then use the original signed-native
     # release publication and verified semantic alias commands.
     tag_names = ('Identify the deployed image for tag verification',
@@ -319,7 +346,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert by_name['Fail unverified tag']['run'] == 'exit 1'
     # No deployment, rollback, or migration can execute on a tag.
     for step in steps:
-        if re.search(r'wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback)|production-migrations.mjs apply', step.get('run', '')):
+        if re.search(r'wrangler (?:deploy|rollback)|vercel (?:deploy|promote)|release-state.mjs (?:prepare|capture|container-rollback|rollback-check)|production-migrations.mjs apply', step.get('run', '')):
             assert main in step.get('if', ''), step.get('name')
     assert 'exit 1' in fail['run'] and not fail.get('continue-on-error', False)
 

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { aggregateResults, isRealStop, parseTerminalMarker, redactEvidence, terminalProbeCommand } from './live-check.mjs';
+import { aggregateResults, isRealStop, isValidRelayRenewal, parseTerminalMarker, redactEvidence, terminalProbeCommand } from './live-check.mjs';
 
 const nonce = 'a1'.repeat(10);
 
@@ -83,6 +83,28 @@ test('real stop rejects already stopped, incomplete, failed, and non-200 respons
     { ...good, json: { ...good.json, terminated: false } },
     { ...good, json: { ok: true, terminated: true } }]) {
     assert.equal(isRealStop(response), false);
+  }
+});
+
+test('relay renewal requires the runtime from the preceding read', () => {
+  const read = { runtimeId: 'runtime-a', expiresAt: 2000 };
+  const renew = { status: 200, json: { ok: true, ...read, expiresAt: 3000 } };
+  assert.equal(isValidRelayRenewal(read, renew, 1000), true);
+  for (const runtimeId of ['runtime-b', '', undefined, null]) {
+    assert.equal(isValidRelayRenewal(read, { ...renew, json: { ...renew.json, runtimeId } }, 1000), false);
+  }
+});
+
+test('relay renewal must strictly extend expiry, even when the old expiry is still in the future', () => {
+  const read = { runtimeId: 'runtime-a', expiresAt: 2000 };
+  for (const expiresAt of [2000, 1999, 1000, '3000', NaN, Infinity, undefined]) {
+    assert.equal(isValidRelayRenewal(read, { status: 200, json: { ok: true, ...read, expiresAt } }, 1000), false);
+  }
+  const renew = { status: 200, json: { ok: true, ...read, expiresAt: 3000 } };
+  assert.equal(isValidRelayRenewal(read, renew, 3000), false);
+  for (const response of [null, { ...renew, status: 500 }, { status: 200, json: null },
+    { ...renew, json: { ...renew.json, ok: false } }]) {
+    assert.equal(isValidRelayRenewal(read, response, 1000), false);
   }
 });
 

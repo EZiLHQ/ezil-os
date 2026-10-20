@@ -59,6 +59,15 @@ export function isRealStop(response) {
     && response.json.outcome === 'destroyed' && response.json.terminated === true;
 }
 
+export function isValidRelayRenewal(read, response, now) {
+  const renew = response?.json;
+  return response?.status === 200 && renew?.ok === true
+    && typeof read?.runtimeId === 'string' && read.runtimeId.length > 0
+    && renew.runtimeId === read.runtimeId
+    && Number.isSafeInteger(read.expiresAt) && Number.isSafeInteger(renew.expiresAt)
+    && renew.expiresAt > now && renew.expiresAt > read.expiresAt;
+}
+
 async function bounded(action, ms) {
   let timer;
   try {
@@ -288,9 +297,7 @@ async function runLiveCheck() {
     });
     await check('relay-renew', 60_000, async () => {
       const response = await api('/api/shell/relay-refresh', { computerId, runtimeId: relay.runtimeId });
-      if (response.status !== 200 || response.json?.ok !== true
-          || !Number.isSafeInteger(response.json.expiresAt) || response.json.expiresAt <= Date.now()
-          || response.json.expiresAt < relay.expiresAt) throw new Error('Relay renewal failed');
+      if (!isValidRelayRenewal(relay, response, Date.now())) throw new Error('Relay renewal failed');
     });
     const nonce = randomBytes(10).toString('hex');
     const warmFrame = await check('warm-code-ready', 60_000, codeFrame);
