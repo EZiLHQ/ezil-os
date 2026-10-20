@@ -1,8 +1,10 @@
 /**
  * Billing contract v3 — PINNED (lead only). Simple plans: Free / Standard /
- * Premium. The paid difference is felt, not metered: longer sessions, opening
- * from a warm pool, a bigger computer on Premium. Monthly hours are a fair-use
- * guardrail, shown as a status, never as a meter.
+ * Premium. The paid difference is felt, not metered: longer sessions and a
+ * dedicated AWS computer in Mumbai; Premium chooses 2, 4 or 8 vCPU. Monthly
+ * time is a fair-use guardrail in standard-seconds (a size of weight w uses w
+ * per second), shown as a status, never as a meter. Founder 2026-10-20:
+ * Free / Standard $20 / Premium $100. No speed promise until it is measured.
  *
  * v2 (Standard/Compute, overage, std-hour meters) stays in the codebase,
  * dormant: already-sold v2 subscriptions keep their v2 terms, new checkouts
@@ -52,15 +54,18 @@ export interface PlanOfferV3 {
     opening: OpeningSpeed;
     poolPriority: PoolPriority;
     /**
-     * Fair-use guardrail in ACTUAL running seconds per allowance window (UTC
-     * month for Free, paid billing period otherwise). Enforced server-side;
-     * shown only as a status and in the FAQ.
+     * Fair-use guardrail in STANDARD seconds per allowance window (UTC month
+     * for Free, paid billing period otherwise): a running size of weight w
+     * (std-2 = 1, cmp-4 = 2, cmp-8 = 4) uses w per second. Enforced
+     * server-side; shown only as a status and in the FAQ.
      */
     fairUseSeconds: number;
     /** Free accounts created before FREE_V2_EFFECTIVE_AT keep 8 h. */
     legacyFairUseSeconds: number | null;
     highlighted: boolean;
     badge: 'Most popular' | null;
+    /** Sizes the user may choose; the first is the default. */
+    machineChoice: readonly SizeCode[];
     /** "Everything in X, plus:" bullets, plain language, 3–4 max. */
     bullets: readonly string[];
 }
@@ -74,26 +79,26 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'free-cf', provider: 'cloudflare', vcpu: 2, memoryGiB: 6,
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
-        highlighted: false, badge: null,
-        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', 'Sessions up to 1 hour'],
+        highlighted: false, badge: null, machineChoice: ['free-cf'],
+        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
     },
     standard_monthly_v3: {
         sku: 'standard_monthly_v3', tier: 'standard', name: 'Standard', tagline: 'For regular work, every day.',
         priceCents: 2_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_standard_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: 2 * H, opening: 'fast', poolPriority: 1,
+        sessionMaxSeconds: 2 * H, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
-        highlighted: false, badge: null,
-        bullets: ['Opens from a ready computer', 'Sessions up to 2 hours', '2 vCPU · 8 GB computer'],
+        highlighted: false, badge: null, machineChoice: ['std-2'],
+        bullets: ['Your own 2 vCPU · 8 GB computer in Mumbai', 'Sessions up to 2 hours'],
     },
     premium_monthly_v3: {
         sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For heavy builds and long sessions.',
-        priceCents: 4_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
-        size: 'cmp-4', provider: 'aws', vcpu: 4, memoryGiB: 16,
-        sessionMaxSeconds: 6 * H, opening: 'fastest', poolPriority: 2,
-        fairUseSeconds: 80 * H, legacyFairUseSeconds: null,
-        highlighted: true, badge: 'Most popular',
-        bullets: ['Opens first from a ready computer', 'Sessions up to 6 hours', '4 vCPU · 16 GB computer'],
+        priceCents: 10_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
+        size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
+        sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 2,
+        fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
+        highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) in Mumbai', 'Sessions up to 6 hours', 'Bigger computers use your monthly time faster'],
     },
 });
 
@@ -183,6 +188,8 @@ export interface PublicOfferV3 {
     fairUseHours: number;
     highlighted: boolean;
     badge: 'Most popular' | null;
+    /** Sizes the user may choose; the first is the default. */
+    machineChoice: readonly SizeCode[];
     bullets: readonly string[];
 }
 

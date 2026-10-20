@@ -17,7 +17,7 @@ export function publicOffers(): PublicOfferV3[] {
         sku: offer.sku, name: offer.name, tagline: offer.tagline, priceCents: offer.priceCents,
         vcpu: offer.vcpu, memoryGiB: offer.memoryGiB, sessionMaxSeconds: offer.sessionMaxSeconds,
         opening: offer.opening, fairUseHours: offer.fairUseSeconds / 3600, highlighted: offer.highlighted,
-        badge: offer.badge, bullets: [...offer.bullets],
+        badge: offer.badge, machineChoice: [...offer.machineChoice], bullets: [...offer.bullets],
     }));
 }
 
