@@ -190,6 +190,8 @@ describe('billing v2 dispatch wiring', () => {
     const provisionEnv = {
         ...AWS_ENV, EZIL_AWS_ENROLL_URL: 'https://app.example.test/api/compute/aws/enroll',
         EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+        // A NEW paid computer (created after the cutoff) provisions directly; older ones migrate (select.test.ts).
+        EZIL_AWS_CANARY_SINCE: '2020-01-01T00:00:00Z',
         [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({
             'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']),
             'us-east-1': fixtureDeployment('us-east-1', [...TYPES, 'm6i.2xlarge']),
