@@ -21,6 +21,7 @@ import { computers } from '@/server/db/schema/computers';
 import type { BillingStore, GrantKind, GrantMeter, GrantSource, StoredComputeEpoch } from './ports';
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
+import { AI_CREDIT_PROTOCOL } from './ai-credits';
 
 type Database = typeof import('@/server/db').db;
 
@@ -473,6 +474,16 @@ export function createBillingStore(db: Database): BillingStore {
             const inserted = await db.insert(billingOutbox).values(item)
                 .onConflictDoNothing().returning({ id: billingOutbox.id });
             return inserted.length > 0 ? 'queued' : 'duplicate';
+        },
+
+        async aiCreditGrantsByInvoice(userId, invoiceId) {
+            const rows = await db.select().from(billingOutbox).where(and(
+                eq(billingOutbox.userId, userId), eq(billingOutbox.kind, 'ai_grant'),
+                sql`${billingOutbox.payload}->>'protocol' = ${AI_CREDIT_PROTOCOL}`,
+                sql`${billingOutbox.payload}->>'invoiceId' = ${invoiceId}`,
+            ));
+            return rows.map(row => ({ eventKey: row.eventKey, userId: row.userId, kind: 'ai_grant' as const,
+                payload: row.payload as Record<string, unknown> }));
         },
 
         async latestIntervalFor(computerId) {

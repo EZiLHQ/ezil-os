@@ -9,6 +9,7 @@ import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, Us
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
 import { CATALOG_V3 } from './v3/contract';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem } from './ai-credits';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
 
@@ -140,6 +141,12 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                         amount: BigInt(invoicedOffer.allowanceStdSeconds), periodStart: base.periodStart, periodEnd: base.periodEnd,
                         sourceType: 'invoice', sourceId: invoice.id,
                     }, invoicedOffer.sku);
+                    if (invoicedOffer.sku === 'standard_monthly_v3' || invoicedOffer.sku === 'premium_monthly_v3') {
+                        await store.enqueueOutbox(aiCreditOutboxItem(userId, aiCreditEntitlement({
+                            userId, sku: invoicedOffer.sku, subscriptionId: subscription.id,
+                            periodStart: base.periodStart!, periodEnd: base.periodEnd, invoiceId: invoice.id,
+                        }), 'grant', invoice.id));
+                    }
                 }
                 return 'applied';
             }
@@ -290,6 +297,30 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 return action.type === 'revoke' ? 'failed:no_grant_for_refund' : 'failed:no_grant_for_dispute';
             }
             if (originals.some(grant => grant.userId !== userId)) return 'review:customer_mismatch';
+            // Invoice lines retain the sold SKU even after an upgrade/downgrade.
+            // Reconstructing also repairs a reversal arriving between ledger and outbox writes.
+            if (action.type !== 'restore' && charge.invoiceId !== null && originals.some(grant => grant.kind === 'plan_period')) {
+                const receipts = await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? [];
+                for (const receipt of receipts) await store.enqueueOutbox(aiCreditRevokeItem(receipt));
+                if (receipts.length === 0) {
+                    const invoice = await stripe.retrieveInvoice(charge.invoiceId);
+                    if (invoice.customer !== charge.customer) return 'review:customer_mismatch';
+                    for (const original of originals.filter(grant => grant.kind === 'plan_period')) {
+                        for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
+                            const line = invoice.lines.find(line => line.lookupKey === CATALOG_V3[sku].stripeLookupKey
+                                && (line.subscriptionId === original.subscriptionId || line.subscriptionId === null)
+                                && line.periodStart?.getTime() === original.periodStart?.getTime()
+                                && line.periodEnd?.getTime() === original.periodEnd?.getTime());
+                            if (line && original.subscriptionId && original.periodStart && original.periodEnd) {
+                                await store.enqueueOutbox(aiCreditOutboxItem(userId, aiCreditEntitlement({
+                                    userId, sku, subscriptionId: original.subscriptionId, periodStart: original.periodStart,
+                                    periodEnd: original.periodEnd, invoiceId: invoice.id,
+                                }), 'revoke', invoice.id));
+                            }
+                        }
+                    }
+                }
+            }
             const sourceType = action.type === 'revoke' ? 'refund' : 'dispute';
             const sourceId = action.type === 'revoke' ? action.refundId : action.disputeId;
             for (const original of originals) {

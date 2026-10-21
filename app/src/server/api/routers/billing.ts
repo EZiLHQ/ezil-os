@@ -2,6 +2,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
+import { aiBalanceState, enqueueFreeAiCredits, readAiBalance } from '@/server/billing/ai-balance';
 import { getBillingDeps } from '@/server/billing/deps';
 import type { BillingDeps, StripeApi } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
@@ -88,6 +89,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
         summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV3Result> => {
             const deps = getDeps();
             if (!deps.config.tabEnabled) return { enabled: false };
+            const aiBalance = readAiBalance({ config: deps.config, userId: ctx.user.id, headers: ctx.headers });
             const now = deps.now();
             const [subs, userCreatedAt, planChanges] = await Promise.all([
                 deps.store.subscriptionsFor(ctx.user.id),
@@ -117,10 +119,14 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     console.error('Billing renewal preview unavailable');
                 }
             }
-            return buildSummaryV3({
+            const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal,
             });
+            await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
+            summary.ai.balance = await aiBalance;
+            summary.ai.state = aiBalanceState(summary.ai.balance, summary.ai.grant.amount);
+            return summary;
         }),
 
         createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {

@@ -5,6 +5,7 @@ import { db } from '@/server/db';
 import { readBillingConfig, stripeMode } from './config';
 import type { BillingDeps } from './ports';
 import { createBillingStore } from './store';
+import { createAiCreditOutboxStore } from './ai-credit-outbox-store';
 import { createStripeClient } from './stripe/client';
 import { createStripeUsageBilling } from './stripe/usage-billing';
 
@@ -32,6 +33,7 @@ export function getBillingDeps(): BillingDeps {
     return {
         config,
         store: createBillingStore(db),
+        aiCredits: createAiCreditOutboxStore(db),
         stripe: secretKey
             ? createStripeClient({ secretKey, priceProMonthly: config.stripePriceProMonthly })
             : null,
