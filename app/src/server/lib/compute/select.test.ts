@@ -26,12 +26,48 @@ const ADMIT = {
 describe('billing v2 placement selection', () => {
     const paid: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', provider: 'aws', size: 'cmp-8', paymentIssue: false };
     const free: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'free_v1_legacy', provider: 'cloudflare', size: 'free-cf', paymentIssue: false };
+    const SINCE = '2026-10-14T00:00:00Z';
+    const DIRECT = { ...ON, EZIL_AWS_CANARY_SINCE: SINCE };
 
-    it('no row plus a paid AWS entitlement selects AWS without canary checks or a Cloudflare pin', async () => {
-        const { db, placements, statements } = createFakePlacementDb();
-        expect((await resolveComputeProvider(db, computer, ON, {}, { entitlement: paid, pinCloudflare: true })).kind).toBe('aws-ec2');
+    it.each([SINCE, '2026-10-14T00:00:00.001Z'])('(c) paid + no row + created at/after SINCE (%s) selects AWS without a canary list or Cloudflare pin', async createdAt => {
+        const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(createdAt) }] });
+        expect((await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid, pinCloudflare: true })).kind).toBe('aws-ec2');
         expect(placements).toEqual([]);
-        expect(statements).toHaveLength(1); // only the placement read; admission happens at ensure
+        expect(statements).toHaveLength(2); // placement and live computer reads; admission happens at ensure
+    });
+
+    it.each([false, true])('(a) paid + no row + created before SINCE stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date('2026-10-13T23:59:59.999Z') }] });
+        const provider = await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid, pinCloudflare });
+        expect(provider.kind).toBe('cloudflare');
+        expect(provider).toBe(cloudflareComputeProvider);
+        if (pinCloudflare) expect(placements).toMatchObject([{ provider: 'cloudflare', workspace_store: 'r2', state: 'STOPPED' }]);
+        else expect(placements).toEqual([]);
+    });
+
+    it.each([false, true])('(b) paid + no row + SINCE unset stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE) }] });
+        const provider = await resolveComputeProvider(db, computer, ON, {}, { entitlement: paid, pinCloudflare });
+        expect(provider.kind).toBe('cloudflare');
+        expect(provider).toBe(cloudflareComputeProvider);
+        if (pinCloudflare) expect(placements).toMatchObject([{ provider: 'cloudflare', workspace_store: 'r2', state: 'STOPPED' }]);
+        else expect(placements).toEqual([]);
+    });
+
+    it.each(['', '2026-10-14', '2026-10-14T00:00:00', 'yesterday', '2026-13-40T00:00:00Z'])('paid + no row + malformed SINCE %j stays Cloudflare', async since => {
+        const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE) }] });
+        expect(await resolveComputeProvider(db, computer, { ...ON, EZIL_AWS_CANARY_SINCE: since }, {}, { entitlement: paid })).toBe(cloudflareComputeProvider);
+        expect(placements).toEqual([]);
+        expect(statements).toHaveLength(1);
+    });
+
+    it.each([
+        { computers: [] },
+        { computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE), deleted_at: new Date(SINCE) }] },
+        { computers: [{ id: computerId, user_id: '33333333-3333-4333-8333-333333333333', created_at: new Date(SINCE) }] },
+    ])('paid route requires a live computer owned by the caller (%j)', async ({ computers }) => {
+        const { db } = createFakePlacementDb({ computers });
+        expect(await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid })).toBe(cloudflareComputeProvider);
     });
 
     it('AWS disabled preserves the Cloudflare pin behavior even for a paid user', async () => {

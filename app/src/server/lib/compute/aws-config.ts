@@ -62,12 +62,18 @@ export function inAwsCanary(canary: AwsCanaryConfig, userId: string): boolean {
 const CANARY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CANARY_SINCE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
+/** Cutoff for direct AWS creation, independent of canary user membership. Fail closed. */
+export function awsDirectSince(env: Env = process.env): Date | null {
+    const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
+    if (!sinceText || !CANARY_SINCE.test(sinceText)) return null;
+    const since = new Date(sinceText);
+    return Number.isFinite(since.getTime()) ? since : null;
+}
+
 export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null {
     const list = env.EZIL_AWS_CANARY_USER_IDS?.trim();
-    const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
-    if (!list || !sinceText || !CANARY_SINCE.test(sinceText)) return null;
-    const since = new Date(sinceText);
-    if (!Number.isFinite(since.getTime())) return null;
+    const since = awsDirectSince(env);
+    if (!list || !since) return null;
     // `*` only as the WHOLE value; `*` beside ids is not a uuid, so the list is malformed.
     if (list === '*') return { everyone: true, userIds: new Set(), since };
     const ids = list.split(',').map((id) => id.trim().toLowerCase());

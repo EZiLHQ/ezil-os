@@ -1,7 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import type { SizeCode } from '@/server/billing/v2/contract';
-import { AWS_TIERS, AWS_TIER_DATA_GIB, INSTANCE_VCPU, awsTierForSize, instanceTypeForTier, instanceVcpu, sizeForInstanceType, meteredSizeForInstanceType } from './aws-config';
+import { AWS_TIERS, AWS_TIER_DATA_GIB, INSTANCE_VCPU, awsCanaryConfig, awsDirectSince, awsTierForSize, instanceTypeForTier, instanceVcpu, sizeForInstanceType, meteredSizeForInstanceType } from './aws-config';
 import { KNOWN_INSTANCE_TYPES } from './aws-intent';
+
+describe('direct AWS creation cutoff', () => {
+    it.each([undefined, '', ' ', '2026-10-14', '2026-10-14T00:00:00', 'yesterday', '2026-13-40T00:00:00Z'])('fails closed for SINCE %j', since => {
+        expect(awsDirectSince({ EZIL_AWS_CANARY_SINCE: since })).toBeNull();
+    });
+
+    it.each(['2026-10-14T00:00Z', ' 2026-10-14T00:00:00Z ', '2026-10-14T05:30:00+05:30', '2026-10-14T00:00:00.000000000Z'])('shares the strict canary grammar for %j without requiring a user list', since => {
+        const env = { EZIL_AWS_CANARY_SINCE: since };
+        expect(awsDirectSince(env)).toEqual(new Date('2026-10-14T00:00:00Z'));
+        expect(awsCanaryConfig({ ...env, EZIL_AWS_CANARY_USER_IDS: '*' })?.since).toEqual(awsDirectSince(env));
+        expect(awsCanaryConfig(env)).toBeNull();
+        expect(awsDirectSince({ ...env, EZIL_AWS_CANARY_USER_IDS: 'not-a-uuid' })).toEqual(awsDirectSince(env));
+    });
+});
 
 describe('billing v2 AWS sizes', () => {
     it.each([

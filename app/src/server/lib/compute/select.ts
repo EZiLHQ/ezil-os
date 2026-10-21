@@ -25,7 +25,7 @@
  */
 
 import { precheckAdmission } from './admission';
-import { awsCanaryConfig, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
+import { awsCanaryConfig, awsDirectSince, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
 import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
@@ -75,7 +75,7 @@ export interface ResolveOptions {
     /**
      * The caller is about to START a sandbox (open, app/code preview, desktop restart).
      * A no-row computer neither billing nor the canary claims is PINNED to Cloudflare first
-     * (`pinCloudflare`), so it can never later be reassigned to AWS. Reads and stops
+     * (`pinCloudflare`), so moving it to AWS requires workspace migration. Reads and stops
      * never pin: a computer that never ran stays eligible.
      */
     pinCloudflare?: boolean;
@@ -99,11 +99,19 @@ export async function resolveComputeProvider(
         : options.entitlement !== undefined ? options.entitlement : aws.entitlement;
     const deps = isPlacementDb(db) ? { ...aws, entitlement, db, env: () => env } : undefined;
     if (!placement.record) {
-        // Paid placement bypasses the canary's graceful capacity fallback. ensure()
-        // admits the entitled size or refuses; it never pins a paid computer to R2.
+        // Only new paid computers may provision directly: older computers can have an
+        // R2 workspace without a placement row and must migrate through Cloudflare.
+        // Eligible paid computers bypass the canary's capacity fallback; ensure() admits or refuses.
         if (isAwsComputersEnabled(env) && entitlement?.source === 'billing_v2'
             && tierForEntitlement(entitlement, plusPlanIds(env)) !== 'free') {
-            return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+            const since = awsDirectSince(env);
+            if (since) {
+                const row = await readCanaryComputer(db, computer.computerId);
+                if (row && !row.deleted && row.userId === computer.userId.toLowerCase()
+                    && row.createdAt.getTime() >= since.getTime()) {
+                    return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+                }
+            }
         }
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
         if (await isAwsCanary(db, computer, env)) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
