@@ -2,7 +2,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
-import { readCredits, forgetGatewayModels } from './gateway';
+import { forgetGatewayModels } from './gateway';
+import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
 import type { Usage } from './types';
 
@@ -191,6 +192,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const settings = () => vscode.workspace.getConfiguration('ezilModels');
     const store = new ConfigStore(resolveConfigPath(settings().get<string>('configPath')), log);
     const usage = new UsageTracker();
+    const aiStatus = new EZiLAIStatus(() => store.models().find(model => model.provider.type === 'ezil-gateway')?.provider);
     const provider = new EZiLModelsProvider({
         models: () => store.models(),
         configError: () => store.error(),
@@ -199,11 +201,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         log,
         recordUsage: (model, used, elapsedMs) => {
             usage.record(model, used, elapsedMs);
+            if (model.provider.type === 'ezil-gateway') void aiStatus.refresh();
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);
         },
     });
-    context.subscriptions.push(output, store, provider);
-    context.subscriptions.push(store.onChange(() => provider.refresh()));
+    context.subscriptions.push(output, store, provider, aiStatus);
+    context.subscriptions.push(store.onChange(() => { provider.refresh(); void aiStatus.refresh(); }));
     store.watch();
     store.load();
     context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('ezil', provider));
@@ -240,11 +243,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 : vscode.window.showInformationMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}.`)
             : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
     };
-    const showCredits = async () => {
-        const model = store.models().find(candidate => candidate.provider.type === 'ezil-gateway');
-        const text = model ? (await readCredits(model.provider, model.model)).text : 'EZiL AI is not configured.';
-        void vscode.window.showInformationMessage(text);
-    };
+    const showCredits = () => aiStatus.show();
     const showUsage = () => { log(`[usage report]\n${usage.report()}`); output.show(); };
     const manage = async () => {
         type Item = vscode.QuickPickItem & { action?: () => void | Promise<void> };
@@ -273,6 +272,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.manage', manage),
         vscode.commands.registerCommand('ezil-models.reload', reload),
         vscode.commands.registerCommand('ezil-models.showCredits', showCredits),
+        vscode.commands.registerCommand('ezil-models.showStatus', showCredits),
         vscode.commands.registerCommand('ezil-models.showUsage', showUsage),
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
     );

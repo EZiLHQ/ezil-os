@@ -57,7 +57,7 @@ element equal. Resolve indices from the pinned `out/nls.keys.json`; they move be
 |---|---|---|---|---|---|
 | `terms-dot` | `vs/workbench/contrib/chat/browser/widget/chatWidget#settings` | `"By continuing with {0} Copilot, you agree to {1}'s [Terms]({2}) and [Privacy Statement]({3})."` | `"AI responses may be inaccurate. Review changes before applying them."` | 1 | The chat-welcome disclaimer, shown whenever `chatEntitlementService.anonymous && !sentiment.completed` — i.e. always, in EZiL's configuration; no setting hides it. No links. |
 | `terms` | `chatStatus/chatStatusDashboard#activeDescriptionAnonymous`, `widgetHosts/chatQuick#termsDisclaimer`, `inlineChat/browser/inlineChatWidget#termsDisclaimer`, `welcomeGettingStarted/common/gettingStartedContent#gettingStarted.copilotSetup.terms` | same text without the trailing period | same | 4 | The same sentence in the status hover, quick chat, inline chat and Getting Started. |
-| `status-aria` | `chatStatus/chatStatusEntry#chatStatusAria` | `"Copilot status"` | `"EZiL Chat status"` | 1 | Status-bar item aria label ("Copilot status" in the hover). The item itself can only be removed with `chat.disableAIFeatures`, which removes the chat too. |
+| `status-aria` | `chatStatus/chatStatusEntry#chatStatusAria` | `"Copilot status"` | `"EZiL Chat status"` | 1 | Legacy status-bar aria label. R2-D below suppresses this entry without disabling chat. |
 | `status-name` | `chatStatusEntry#chatStatus` | `"Copilot Status"` | `"EZiL Chat Status"` | 1 | Status-bar item name (context menu / hide list). |
 | `status-resumed` / `status-disabled` | `chatStatusEntry#chatResumedStatus` / `#copilotDisabledStatus` | `"Copilot Resumed"` / `"Copilot disabled"` | `"EZiL Chat resumed"` / `"EZiL Chat disabled"` | 1 / 1 | Other texts the same item can show. |
 | `enable-more` | `chatStatusDashboard#enableMoreDescription` | `"Sign in to enable more Copilot AI features."` | `"EZiL Chat runs on the models configured for this workspace."` | 1 | Status hover footer. Its button ("Enable more AI Features") still opens VS Code's GitHub sign-in flow; that flow's own dialogs are the real GitHub sign-in and are left as they are. |
@@ -105,6 +105,56 @@ result (Machine layer, both launchers): `github.copilot.chat.backgroundAgent.ena
 otherwise fills its empty state with the in-view "Sessions" list and the
 welcome — where the notice lives — never renders; sessions remain reachable
 from the view's toolbar).
+
+## R2-D — Gateway status instead of Copilot quota/account surfaces
+
+The bundled `extensions/copilot/package.json` contributes language models and chat
+participants, but **does not own this quota popover**. In the pinned workbench,
+`vs/workbench/contrib/chat/browser/chatStatus/chatStatusEntry` registers
+`workbench.contrib.chatStatusBarEntry` and adds `chat.statusBarEntry` through
+`statusbarService.addEntry`. Its tooltip instantiates `Xte`, the compiled
+`chatStatusDashboard`. That dashboard calls `renderHeader` with the Copilot plan
+and GitHub account icon, and renders the anonymous `Chat messages` / `Limited`
+row even when EZiL supplies all models.
+
+New exact anchors and gates (each count is one):
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `ai-entry` | workbench.js: `update(){if(this.chatEntitlementService.sentiment.hidden)this.entry?.dispose(),this.entry=void 0;else{let t=this.getEntryProps();` | Replace the condition with `!0`; always dispose the old entry. Anchor 0, replacement 1. Chat registration and AI features stay enabled. |
+| `ai-dashboard` | workbench.js: `static{this.QUICK_SETTINGS_COLLAPSED_KEY="chatStatusDashboard.quickSettingsCollapsed"}render(){let e=Rh(this._store),` | Before the existing body, clear the element, add the plain `EZiL AI` identity, a button invoking `ezil-models.showStatus`, the AI accuracy notice, and return. Exact replacement is `R_AI_DASHBOARD` in the script. Anchor 0, replacement 1. This bypasses the GitHub header/icon, plan, quota and setup sections for every dashboard entry point, including compact layouts. |
+| `ai-plan` | both NLS arrays, index 21958, `vs/workbench/services/chat/common/chatEntitlementService#plan.freeName`: `"Copilot Free"` | `"EZiL AI"`; old literal 0, replacement 1. Genuine GitHub signup error sentences are retained. |
+| `ai-quota` | both NLS arrays, index 10616, `chatStatusDashboard#chatsLabel`: `"Chat messages"` | `"Gateway usage"`; old literal 0, replacement 1. |
+| `ai-limit` | both NLS arrays, index 10657, `chatStatusDashboard#quotaLimited`: `"Limited"` | `"View EZiL AI status"`; old literal 0, replacement 1. No unlimited or fabricated balance. |
+
+The replacement extension status item is `ezil-models.aiStatus`, named **EZiL AI**.
+Hover exposes the balance/usage snapshot and click opens an accessible Quick Pick
+popover. Both `ezil-models.showStatus` and the existing `showCredits` command open
+it. It reads `/ai/v1/me/balance` and `/ai/v1/me/usage?limit=5` through the already
+resolved Gateway provider. Microcredits are divided by 1,000,000; recent charges
+subtract `uncollected_micro` and unsettled charges remain pending. Fetch failures
+show the Gateway/Worker code or a local transport/response code. Refresh occurs
+on activation, config change, completed usage, click and every 60 seconds.
+
+Preserved notices: Copilot `LICENSE.txt` (MIT and Microsoft copyright), the
+Microsoft JS copyright headers, existing build modification notices, all other
+license/attribution and third-party notice files, and the AI accuracy/review
+notice in the welcome screen and replacement dashboard/status popover. Neither
+`product.json` nor publisher/extension identity changes. Original GitHub sign-in
+legal dialogs remain intact; they are not shown by the EZiL status surface.
+
+Offline script regression test (copies only required bundle files into a temp
+directory and never changes the input):
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/status-patch.test.cjs
+```
+
+It applies the whole script, reruns `--verify`, checks literal replacements,
+byte-compares LICENSE/product, executes the dashboard/status branches with
+throwing entitlement accessors, and rejects restored quota text or anchor drift.
+Without a local pinned bundle it explicitly skips; release validation must supply
+`COPILOT_TEST_ROOT`.
 
 ## Re-deriving the 4.141.0 anchors
 

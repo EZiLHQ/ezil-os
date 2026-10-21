@@ -2,8 +2,8 @@
 # patch-copilot-chat.sh — build-time patches that turn the open-source Copilot
 # Chat bundled with code-server into "EZiL Chat": NO GitHub service is called
 # from the chat stack in anonymous mode, and the user-visible GitHub/Copilot
-# branding on the EZiL boot + Agent-prompt path is replaced. Strings only; no
-# command id, setting key, contribution point or license file is touched.
+# branding on the EZiL boot + Agent-prompt path is replaced. Strings and status
+# visibility change; command ids, setting keys, registrations and licenses stay intact.
 #
 #   patch-copilot-chat.sh [<vscode-root>]     default /usr/lib/code-server/lib/vscode
 #   patch-copilot-chat.sh --verify [<root>]   only run the post-patch gates
@@ -22,7 +22,7 @@
 # Files patched (all inside <root>):
 #   extensions/copilot/dist/extension.js               copilot-chat extension host bundle
 #   out/nls.messages.js, out/nls.messages.json         workbench English strings (index-addressed array)
-#   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker
+#   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status
 #   out/vs/code/browser/workbench/workbench.css        welcome disclaimer
 #   extensions/copilot/package{,.nls}.json            display strings
 set -euo pipefail
@@ -123,7 +123,19 @@ A_WALKTHROUGH='"github.copilot.walkthrough.title":"GitHub Copilot"'; R_WALKTHROU
 A_ACCOUNTS='id:"workbench.action.chat.triggerSetupFromAccounts",title:F(10538,"Sign in to use GitHub Copilot..."),menu:{id:O.AccountsContext,group:yyt,when:uqr}'
 R_ACCOUNTS='id:"workbench.action.chat.triggerSetupFromAccounts",title:F(10538,"Sign in to use GitHub Copilot..."),menu:{id:O.AccountsContext,group:yyt,when:T.false()}'
 
+# R2-D: the workbench owns the Copilot quota dashboard, including its account header.
+# Keep commands registered; suppress the old status item and forward dashboard entry points.
+A_AI_DASHBOARD='static{this.QUICK_SETTINGS_COLLAPSED_KEY="chatStatusDashboard.quickSettingsCollapsed"}render(){let e=Rh(this._store),'
+R_AI_DASHBOARD='static{this.QUICK_SETTINGS_COLLAPSED_KEY="chatStatusDashboard.quickSettingsCollapsed"}render(){this.element.replaceChildren();this.element.appendChild(_("div",void 0,"EZiL AI"));let ezil=this.element.appendChild(_("button",{type:"button"},"Show credits and recent usage"));this._store.add(q(ezil,"click",()=>this.runCommandAndClose("ezil-models.showStatus")));this.element.appendChild(_("p",void 0,"AI responses may be inaccurate. Review changes before applying them."));return;let e=Rh(this._store),'
+A_AI_ENTRY='update(){if(this.chatEntitlementService.sentiment.hidden)this.entry?.dispose(),this.entry=void 0;else{let t=this.getEntryProps();'
+R_AI_ENTRY='update(){if(!0)this.entry?.dispose(),this.entry=void 0;else{let t=this.getEntryProps();'
+A_AI_PLAN='"Copilot Free"'; R_AI_PLAN='"EZiL AI"'
+A_AI_QUOTA='"Chat messages"'; R_AI_QUOTA='"Gateway usage"'
+A_AI_LIMIT='"Limited"'; R_AI_LIMIT='"View EZiL AI status"'
+
 if [ "$VERIFY_ONLY" = 0 ]; then
+  patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
+  patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
   patch token          "$EXT" 1  "$A_TOKEN"  "$R_TOKEN"
   patch known-models   "$EXT" 1  "$A_KNOWN"  "$R_KNOWN"
   patch embeddings-cache  "$EXT" 1 "$A_EMB_CACHE"  "$R_EMB_CACHE"
@@ -133,6 +145,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch identity       "$EXT" 13 "$A_IDENT"  "$R_IDENT"
   patch identity-model "$EXT" 2  "$A_IDENT2" "$R_IDENT2"
   for nls in "$NLS_JS" "$NLS_JSON"; do
+    patch ai-plan "$nls" 1 "$A_AI_PLAN" "$R_AI_PLAN"
+    patch ai-quota "$nls" 1 "$A_AI_QUOTA" "$R_AI_QUOTA"
+    patch ai-limit "$nls" 1 "$A_AI_LIMIT" "$R_AI_LIMIT"
     patch terms-dot        "$nls" 1 "$A_TERMS_DOT"       "$R_TERMS"
     patch terms            "$nls" 4 "$A_TERMS"           "$R_TERMS"
     patch status-aria      "$nls" 1 "$A_STATUS_ARIA"     "$R_STATUS_ARIA"
@@ -157,6 +172,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
 fi
 
 # ── gates: anchors gone, replacements present, files still parse ────────────
+gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
+gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"
 gate known-models     "$EXT" 0  "$A_KNOWN";        gate known-models     "$EXT" 1  "$R_KNOWN"
 gate identity         "$EXT" 0  "$A_IDENT";        gate identity         "$EXT" 13 "$R_IDENT"
@@ -168,6 +185,9 @@ gate welcome-disclaimer "$CSS" 0 "$A_CSS";       gate welcome-disclaimer "$CSS" 
 gate no-devdeviceid-token "$EXT" 0 'await this.authFromDevDeviceId('
 gate no-known-models-url  "$EXT" 0 'https://main.vscode-cdn.net/extensions/copilotChat.json'
 for nls in "$NLS_JS" "$NLS_JSON"; do
+  gate ai-plan "$nls" 0 "$A_AI_PLAN"; gate ai-plan "$nls" 1 "$R_AI_PLAN"
+  gate ai-quota "$nls" 0 "$A_AI_QUOTA"; gate ai-quota "$nls" 1 "$R_AI_QUOTA"
+  gate ai-limit "$nls" 0 "$A_AI_LIMIT"; gate ai-limit "$nls" 1 "$R_AI_LIMIT"
   gate terms          "$nls" 0 "$A_TERMS";         gate terms           "$nls" 5 "$R_TERMS"
   gate status-aria    "$nls" 0 "$A_STATUS_ARIA";   gate status-aria     "$nls" 1 "$R_STATUS_ARIA"
   gate status-name    "$nls" 0 "$A_STATUS_NAME";   gate status-name     "$nls" 1 "$R_STATUS_NAME"

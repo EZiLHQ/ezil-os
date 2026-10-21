@@ -48,6 +48,11 @@
     ],
     "commands": [
       {
+        "command": "ezil-models.showStatus",
+        "title": "Show AI Status",
+        "category": "EZiL AI"
+      },
+      {
         "command": "ezil-models.manage",
         "title": "EZiL Models: Manage",
         "category": "EZiL Models"
