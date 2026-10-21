@@ -6,7 +6,7 @@ vi.mock('./provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn
 const start = new Date('2026-10-01'), end = new Date('2026-11-01');
 function fixture(sku = 'standard_monthly_v3') {
     const grant = vi.fn(async () => 'inserted');
-    const deps = { now: () => start, store: { userForStripeCustomer: async () => 'user', upsertSubscription: async () => 'applied',
+    const deps = { now: () => start, store: { userForStripeCustomer: async () => 'user', upsertSubscription: async () => 'applied', enqueueOutbox: async () => {},
         resolvePaymentIssue: async () => {}, insertGrant: grant }, stripe: {
         retrieveInvoice: async () => ({ id: 'in', status: 'paid', customer: 'cus', subscriptionId: 'sub', billingReason: 'subscription_create',
             lines: [{ lookupKey: `ezil_${sku}`, subscriptionId: 'sub', amount: 2000, periodStart: start, periodEnd: end }] }),
