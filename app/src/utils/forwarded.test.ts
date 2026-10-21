@@ -44,3 +44,16 @@ describe('withoutDefaultPort', () => {
         expect(withoutDefaultPort('os.ezil.org:80', 'https')).toBe('os.ezil.org:80');
     });
 });
+
+describe('publicOrigin', () => {
+    it('uses the forwarded host and scheme, never the loopback listener', async () => {
+        const { publicOrigin } = await import('./forwarded');
+        const h = new Headers({ host: 'localhost:3000', 'x-forwarded-host': 'os-staging.ezil.work', 'x-forwarded-proto': 'https' });
+        expect(publicOrigin(h, 'https://localhost:3000/auth/auth0/login')).toBe('https://os-staging.ezil.work');
+    });
+    it('falls back to the Host header, then to the request URL', async () => {
+        const { publicOrigin } = await import('./forwarded');
+        expect(publicOrigin(new Headers({ host: 'os.ezil.work', 'x-forwarded-proto': 'https' }), 'http://x/')).toBe('https://os.ezil.work');
+        expect(publicOrigin(new Headers(), 'https://os.ezil.org/a?b=1')).toBe('https://os.ezil.org');
+    });
+});

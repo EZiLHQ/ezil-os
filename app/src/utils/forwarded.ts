@@ -36,3 +36,13 @@ export function forwardedHost(headers: HeaderReader): string | null {
     const host = firstHop(headers.get('x-forwarded-host')) ?? firstHop(headers.get('host'));
     return host ? withoutDefaultPort(host, forwardedProto(headers)) : null;
 }
+
+/**
+ * The public origin the browser used (e.g. https://os-staging.ezil.work behind
+ * Caddy), not the app's own listener: `request.url` is the loopback address when
+ * the app sits behind a reverse proxy. Falls back to `fallback` with no host header.
+ */
+export function publicOrigin(headers: HeaderReader, fallback: string): string {
+    const host = forwardedHost(headers);
+    return host ? `${forwardedProto(headers) ?? 'http'}://${host}` : new URL(fallback).origin;
+}
