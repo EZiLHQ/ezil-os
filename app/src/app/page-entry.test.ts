@@ -15,7 +15,7 @@ vi.mock('@/server/billing/config', async importOriginal => {
     return { ...actual, readBillingConfig: () => actual.readBillingConfig({ PRICING_PAGE_ENABLED: state.enabled ? '1' : undefined }) };
 });
 
-import HomePage, { dynamic } from './page';
+import HomePage from './page';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8').replace(/\r\n/g, '\n');
@@ -26,17 +26,11 @@ beforeEach(() => {
     redirect.mockClear();
 });
 
-describe('root entry routing reads the public home flag per request', () => {
-    it('renders for anonymous visitors with the flag on, and preserves the exact login redirect with it off', async () => {
+describe('root entry routing: / is the OS or its login, never a marketing page', () => {
+    it.each([false, true])('anonymous visitors always get the computer-like login, never a marketing home (flag: %s)', async enabled => {
+        state.enabled = enabled;
         await expect(HomePage()).rejects.toThrow('redirect:/login');
-        expect(redirect).toHaveBeenCalledWith('/login');
-        redirect.mockClear();
-        state.enabled = true;
-        const html = renderToStaticMarkup(await HomePage());
-        expect(html).toContain('data-testid="home-hero"');
-        expect(html).toContain('Open EZiL OS and get to work.');
-        expect(redirect).not.toHaveBeenCalled();
-        expect(dynamic).toBe('force-dynamic');
+        expect(redirect).toHaveBeenCalledExactlyOnceWith('/login');
     });
 
     it.each([false, true])('signed-in visitors always enter /os (flag: %s)', async enabled => {
