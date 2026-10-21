@@ -28,6 +28,7 @@ function fixture(state: MigrationState = 'requested') {
             expect(JSON.parse(Buffer.from(data, 'base64').toString()).restore).toEqual({ kind: 'cf-snapshot', migrationId: G,
                 generation: G, system: false, identityToken: 'a'.repeat(43), fetchBase: `https://app.example/api/compute/restore/${C}` });
         }),
+        releaseProvision: vi.fn(async () => {}),
         restored: vi.fn(async () => { calls.push('ready'); return true; }),
         flip: vi.fn(async () => { calls.push('flip'); }), rollback: vi.fn(async () => { calls.push('rollback'); }),
         commit: vi.fn(async () => { calls.push('commit'); return { ok: true as const, data: {} }; }),
@@ -113,6 +114,7 @@ describe('migration orchestration', () => {
     });
     it.each(['committed', 'failed_reopened', 'failed_needs_operator'] as const)('ignores terminal %s', async state => {
         const f = fixture(state); await f.advance(); expect(f.calls).toEqual([]);
+        expect(f.deps.releaseProvision).toHaveBeenCalledTimes(state === 'committed' ? 0 : 1);
     });
 });
 describe('bounded cron', () => {

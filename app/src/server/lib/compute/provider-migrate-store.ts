@@ -68,7 +68,10 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
         async claimStale(limit: number): Promise<ComputeMigration[]> {
             const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
             return rows(await db.execute(sql`WITH stale AS (
-                SELECT id FROM public.ezil_compute_migrations WHERE ${ACTIVE}
+                SELECT id FROM public.ezil_compute_migrations WHERE (${ACTIVE}
+                  OR (state IN ('failed_reopened', 'failed_needs_operator')
+                    AND workspace_head ? '_awsProvision'
+                    AND COALESCE(workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'))
                   AND updated_at < clock_timestamp() - interval '30 seconds'
                 ORDER BY updated_at, id LIMIT ${count} FOR UPDATE SKIP LOCKED
             ) UPDATE public.ezil_compute_migrations m SET updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')

@@ -83,6 +83,17 @@ describe('restore tokens', () => {
 });
 
 describe('migration persistence', () => {
+    it('CAS guards reservation release and binds JSON text with an explicit jsonb cast', async () => {
+        const m = { ...await migration(), state: 'failed_reopened' as const }, f = setup();
+        const provision = { placement: { instanceId: null }, released: true };
+        await f.store.saveProvision(m, provision);
+        expect(f.queries[0]!.params).toContain(JSON.stringify(provision));
+        expect(f.queries[0]!.params).toContain(m.updatedAt);
+        expect(f.queries[0]!.params).toContain(m.state);
+        expect(f.queries[0]!.sql).toMatch(/jsonb_set\(workspace_head, '\{_awsProvision\}', \(\$\d+::text\)::jsonb\)/);
+        expect(f.queries[0]!.sql).toMatch(/WHERE id = [\s\S]* AND state = [\s\S]* AND updated_at::text = /);
+        await expect(setup([]).store.saveProvision(m, provision)).rejects.toThrow('migration_conflict');
+    });
     it.each([
         ['export', false, 'head_moved', 'recovery:abort:export:head_moved', 'abort'],
         ['export', false, 'generation_mismatch', 'recovery:abort:export:generation_mismatch', 'abort'],
@@ -145,13 +156,16 @@ describe('migration persistence', () => {
 });
 
 describe('stale migration claims and server status', () => {
-    it.each([-1, 0, 2, 10, 99, NaN])('bounds claim %s and locks only stale nonterminal rows', async limit => {
+    it.each([-1, 0, 2, 10, 99, NaN])('bounds claim %s and locks stale active rows and unreleased failed boots', async limit => {
         const f = setup(); await f.store.claimStale(limit);
         const q = f.queries[0]!;
         expect(q.params).toEqual([Number.isFinite(limit) ? Math.max(0, Math.min(10, limit)) : 0]);
         expect(q.sql).toContain("updated_at < clock_timestamp() - interval '30 seconds'");
         expect(q.sql).toContain('FOR UPDATE SKIP LOCKED');
         expect(q.sql).toContain("state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')");
+        expect(q.sql).toContain("state IN ('failed_reopened', 'failed_needs_operator')");
+        expect(q.sql).toContain("workspace_head ? '_awsProvision'");
+        expect(q.sql).toContain("COALESCE(workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'");
         expect(q.sql).toContain('UPDATE public.ezil_compute_migrations');
     });
     it.each(MIGRATION_STATES)('reports %s without exposing operational detail', async state => {

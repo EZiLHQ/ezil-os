@@ -9,7 +9,7 @@ import { sharedAwsSdkCollaborators } from './aws-clients';
 import { buildAwsProvisionUserData } from './aws-ec2';
 import { issueEnrollmentNonce } from './aws-enroll';
 import { buildLifecycleWork, readLifecycleDeployments, type LifecycleWork } from './aws-intent';
-import { readMigrationReadyReceipt, startLifecycleJob } from './aws-receipts';
+import { lifecycleExecutionArn, readMigrationReadyReceipt, startLifecycleJob } from './aws-receipts';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { cloudflareComputeProvider } from './cloudflare';
 import { flipPlacementToAws, rollbackMigrationPlacement, readAdmissionCounters, readPlacement, withAdmission, type Placement, type PlacementDb } from './placement';
@@ -99,6 +99,28 @@ export function createMigrationRuntime(db: PlacementDb, options: {
                 await currentStore.saveProvision(fresh, { placement, deployment, source, reservedAt: now.toISOString() });
             });
             if (work && await startLifecycleJob(starter, 'ap-south-1', work) === 'refused') throw new MigrationStepError(false);
+        },
+        async releaseProvision(m) {
+            if (!['failed_reopened', 'failed_needs_operator'].includes(m.state)) return;
+            const intent = provisionFor(m);
+            if (!intent || intent.released === true) return;
+            const p = intent.placement, { executions, describer } = sdk();
+            // A missing job identity is not proof that the launch never started.
+            if (!p.region || !p.lifecycleJobId || !executions) return;
+            try {
+                const execution = await executions.describe(p.region, lifecycleExecutionArn(intent.deployment, p.lifecycleJobId));
+                if (!['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status)) return;
+            } catch (error) {
+                // Match restore's visibility grace for an accepted start whose response was lost.
+                if (!isExecutionAbsent(error) || !(Date.now() - Date.parse(intent.reservedAt) >= 5 * 60_000)) return;
+            }
+            if (p.instanceId !== null) {
+                if (!describer || !/^i-[a-f0-9]{17}$/.test(p.instanceId)) return;
+                const instance = await describer.describeForEnrollment(p.region, p.instanceId);
+                if (instance !== null && (instance.instanceId !== p.instanceId || !['stopped', 'terminated'].includes(instance.state))) return;
+            }
+            // The terminal execution cannot launch again. CAS also rejects any changed boot evidence.
+            await store.saveProvision(m, { ...intent, released: true });
         },
         async restored(m) {
             const current = (await store.readById(m.id))!, intent = provisionFor(current), executions = sdk().executions;

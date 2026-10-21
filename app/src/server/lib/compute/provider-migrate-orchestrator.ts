@@ -12,6 +12,7 @@ export interface MigrationDeps {
     head(m: ComputeMigration, kind: 'workspace' | 'system'): Promise<MigrateResult<SnapshotHead>>;
     exportEtag(m: ComputeMigration): Promise<string>;
     provision(m: ComputeMigration): Promise<void>;
+    releaseProvision(m: ComputeMigration): Promise<void>;
     restored(m: ComputeMigration): Promise<boolean>;
     flip(m: ComputeMigration): Promise<void>;
     rollback(m: ComputeMigration): Promise<void>;
@@ -33,7 +34,11 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
     try {
         await deps.exclusive(migrationId, async () => {
             const m = await deps.store.readById(migrationId);
-            if (!m || TERMINAL_MIGRATION_STATES.includes(m.state)) return;
+            if (!m) return;
+            if (TERMINAL_MIGRATION_STATES.includes(m.state)) {
+                if (m.state !== 'committed') await deps.releaseProvision(m);
+                return;
+            }
             const transition = async (event: MigrationStoreEvent) => {
                 const current = await deps.store.readById(migrationId);
                 if (!current || current.state !== m.state) throw new MigrationConflictError();

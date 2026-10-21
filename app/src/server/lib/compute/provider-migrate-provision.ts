@@ -11,7 +11,7 @@ export interface MigrationProvision {
     deployment: LifecycleDeployment;
     source: Placement | null;
     reservedAt: string;
-    /** Capacity stays reserved after a failure until the orphan has been stopped. */
+    /** The stale sweep releases failed boots only after execution and instance checks. */
     released?: boolean;
 }
 function hydrate(p: Placement): Placement {

@@ -7,8 +7,15 @@ import type { ComputeMigration } from './provider-migrate-store';
 import { readEnrollmentPlacement, consumeMigrationEnrollment, finishMigrationEnrollment, provisionFor } from './provider-migrate-provision';
 import { reduceMigration } from './provider-migrate';
 import type { PlacementDb } from './placement';
+import { readAdmissionCounters, withAdmission } from './placement';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { advanceMigration, sweepMigrations } from './provider-migrate-orchestrator';
+import type { LifecycleExecutionReader } from './aws-receipts';
+import type { Ec2EnrollmentView } from './aws-enroll';
+import { MigrationConflictError } from './provider-migrate-store';
 const fake = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('./provider-migrate-store', async original => ({ ...await original<typeof import('./provider-migrate-store')>(), createProviderMigrationStore: () => fake.store }));
+vi.mock('./aws-clients', () => ({ sharedAwsSdkCollaborators: () => { throw new Error('AWS collaborators must be injected in tests'); } }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('No DB in tests'); } }));
 const C = '11111111-1111-4111-8111-111111111111', M = '22222222-2222-4222-8222-222222222222';
 const D = fixtureDeployment('ap-south-1', ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge']);
@@ -28,9 +35,12 @@ function fixture(patch: Record<string, string | undefined> = {}, plan = 'standar
         }) };
     fake.store = store;
     const db = createFakePlacementDb({ computers: [{ id: C, user_id: C }], placements: [] });
-    const start = vi.fn(async () => {}), deps = createMigrationRuntime(db.db, { env: { ...env, ...patch }, collaborators: { starter: { start } },
+    const executions = { describe: vi.fn<LifecycleExecutionReader['describe']>(async () => ({ status: 'FAILED' })) };
+    const describer = { describeForEnrollment: vi.fn(async (): Promise<Ec2EnrollmentView | null> => null),
+        describeVolume: vi.fn(async () => null), findComputerResources: vi.fn(async () => ({ instances: [], volumes: [] })) };
+    const start = vi.fn(async () => {}), deps = createMigrationRuntime(db.db, { env: { ...env, ...patch }, collaborators: { starter: { start }, executions, describer },
         entitlement: { read: async () => ({ status: 'active', planId: plan, provider: 'aws', source: 'billing_v2', size }) } });
-    return { deps, db, start, store, get: () => m };
+    return { deps, db, start, store, executions, describer, get: () => m };
 }
 beforeEach(() => { fake.store = {}; });
 describe('real migration admission and provisioning seam', () => {
@@ -66,6 +76,93 @@ describe('real migration admission and provisioning seam', () => {
         expect(f.store.createOrGetActive).toHaveBeenCalledTimes(provider === 'aws-ec2' ? 0 : 1);
         await startPaidMigration(C, 'standard_monthly_v2', { db, deps: f.deps });
         expect(f.store.createOrGetActive).toHaveBeenCalledTimes(provider === 'aws-ec2' ? 0 : 1);
+    });
+});
+
+describe('failed migration capacity release', () => {
+    async function failed(state: ComputeMigration['state'] = 'failed_reopened') {
+        const f = fixture(); await f.deps.provision(f.get());
+        f.get().state = state;
+        f.store.saveProvision.mockClear();
+        f.deps.exclusive = async (_, run) => run();
+        return f;
+    }
+    const instance = (state: string): Ec2EnrollmentView => ({ instanceId: 'i-11111111111111111', state,
+        availabilityZone: 'ap-south-1a', availabilityZoneId: D.zoneId, publicIp: null, tags: {}, volumes: [] });
+    it.each(['failed_reopened', 'failed_needs_operator'] as const)('sweeps %s with a terminal execution and no instance out of admission', async state => {
+        const f = await failed(state), dialect = new PgDialect();
+        // The placement fake has no migration table. Model its UNION row and pin the real SQL exclusion.
+        const counters = () => withAdmission({ ...f.db.db, transaction: run => f.db.db.transaction(tx => run({ execute: async query => {
+            const text = dialect.sqlToQuery(query).sql;
+            if (/placement:count-(running|running-region|user)/.test(text)) {
+                expect(text).toContain("COALESCE(m.workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'");
+                expect(text).toContain("m.state <> 'committed'");
+                const n = provisionFor(f.get())?.released === true ? 0 : 1;
+                if (text.includes('placement:count-running-region')) return n ? [{ region: 'ap-south-1', n, vcpu: 2 }] : [];
+                return [{ n: text.includes('placement:count-user') ? 0 : n, vcpu: n * 2 }];
+            }
+            return tx.execute(query);
+        } })) }, (tx, lock) => readAdmissionCounters(tx, lock, { computerId: C, userId: C, now: new Date(), monthStart: new Date(0) }));
+        expect((await counters()).runningCount).toBe(1);
+        await sweepMigrations({ claimStale: async () => [f.get()], advance: id => advanceMigration(f.deps, id) });
+        expect(provisionFor(f.get())?.released).toBe(true);
+        expect((await counters()).runningCount).toBe(0);
+        expect(f.describer.describeForEnrollment).not.toHaveBeenCalled();
+        await advanceMigration(f.deps, M);
+        expect(f.store.saveProvision).toHaveBeenCalledOnce();
+    });
+    it.each(['RUNNING', 'PENDING_REDRIVE', 'UNKNOWN'])('keeps the reservation while execution is %s', async status => {
+        const f = await failed(); f.executions.describe.mockResolvedValue({ status });
+        await advanceMigration(f.deps, M);
+        expect(provisionFor(f.get())?.released).not.toBe(true);
+        expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each(['pending', 'running', 'stopping', 'shutting-down', 'unknown'])('keeps a launched instance that is %s', async state => {
+        const f = await failed(), intent = provisionFor(f.get())!;
+        intent.placement.instanceId = instance(state).instanceId;
+        f.get().workspaceHead!._awsProvision = intent;
+        f.describer.describeForEnrollment.mockResolvedValue(instance(state));
+        await advanceMigration(f.deps, M);
+        expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each(['stopped', 'terminated', 'absent'])('releases after the recorded instance is confirmed %s', async state => {
+        const f = await failed(), intent = provisionFor(f.get())!;
+        intent.placement.instanceId = instance(state).instanceId;
+        f.get().workspaceHead!._awsProvision = intent;
+        f.describer.describeForEnrollment.mockResolvedValue(state === 'absent' ? null : instance(state));
+        await advanceMigration(f.deps, M);
+        expect(f.describer.describeForEnrollment).toHaveBeenCalledWith('ap-south-1', intent.placement.instanceId);
+        expect(provisionFor(f.get())?.released).toBe(true);
+    });
+    it.each(['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'])('accepts terminal execution %s', async status => {
+        const f = await failed(); f.executions.describe.mockResolvedValue({ status });
+        await advanceMigration(f.deps, M); expect(provisionFor(f.get())?.released).toBe(true);
+    });
+    it.each([0, 6 * 60_000])('treats absent execution as never started only after visibility grace (%s ms)', async age => {
+        const f = await failed(), intent = provisionFor(f.get())!;
+        intent.reservedAt = new Date(Date.now() - age).toISOString(); f.get().workspaceHead!._awsProvision = intent;
+        f.executions.describe.mockRejectedValue({ name: 'ExecutionDoesNotExist' });
+        await advanceMigration(f.deps, M); expect(provisionFor(f.get())?.released === true).toBe(age > 0);
+    });
+    it.each(['execution', 'instance', 'identity', 'missing-executions', 'missing-describer', 'cas'])('fails closed on %s uncertainty', async failure => {
+        const f = await failed(), intent = provisionFor(f.get())!;
+        if (failure === 'execution') f.executions.describe.mockRejectedValue(new Error('unavailable'));
+        if (failure === 'identity') intent.placement.lifecycleJobId = null;
+        if (failure === 'instance' || failure === 'missing-describer') {
+            intent.placement.instanceId = instance('running').instanceId;
+            f.describer.describeForEnrollment.mockRejectedValue(new Error('unavailable'));
+        }
+        if (failure === 'cas') f.store.saveProvision.mockRejectedValue(new MigrationConflictError());
+        f.get().workspaceHead!._awsProvision = intent;
+        const deps = failure.startsWith('missing-') ? createMigrationRuntime(f.db.db, { collaborators:
+            failure === 'missing-executions' ? { describer: f.describer } : { executions: f.executions } }) : f.deps;
+        await sweepMigrations({ claimStale: async () => [f.get()], advance: () => deps.releaseProvision(f.get()) });
+        expect(provisionFor(f.get())?.released).not.toBe(true);
+    });
+    it.each(['committed', 'provisioning'] as const)('does not release %s migrations', async state => {
+        const f = await failed(state); await f.deps.releaseProvision(f.get());
+        if (state === 'committed') await advanceMigration(f.deps, M);
+        expect(f.executions.describe).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
     });
 });
 
