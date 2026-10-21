@@ -220,17 +220,18 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             };
+            // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
-            await syncAiCredential({
-                config, hmacSecret,
-                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
-                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
-            });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
@@ -683,17 +684,18 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             };
+            // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
-            await syncAiCredential({
-                config, hmacSecret,
-                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
-                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
-            });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
@@ -1275,13 +1277,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer);
-            if (routed.kind !== 'aws-ec2') {
-                await syncAiCredential({
-                    config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
-                    sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
-                    userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
-                });
-            }
+            await syncAiCredential({
+                config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,
             });
