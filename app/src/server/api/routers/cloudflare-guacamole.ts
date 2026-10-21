@@ -40,7 +40,11 @@ import { getBillingDeps } from '@/server/billing/deps';
 import { gateComputerStart } from '@/server/billing/v2/compute-access';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
+import { syncAiCredential } from '@/server/lib/ai-credential';
 import { stampOpened } from './computer-store';
+
+/** Loaded on use: the Supabase server module validates the server env at import time. */
+const supabaseServerClient = async () => (await import('@/utils/supabase/server')).createClient();
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
     composeAppPreviewBootstrapUrl,
@@ -222,6 +226,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
@@ -680,6 +689,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
@@ -1261,6 +1275,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer);
+            if (routed.kind !== 'aws-ec2') {
+                await syncAiCredential({
+                    config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+                    sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                    userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+                });
+            }
             const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,
             });

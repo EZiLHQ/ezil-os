@@ -62,6 +62,20 @@ jobs:
           EZIL_VALIDATE_IMAGE: ${{ steps.build.outputs.desktop_ref }}
           EZIL_NEKO_IMAGE: ${{ steps.build.outputs.desktop_ref }}
         run: bash .github/scripts/test-desktop.sh
+      # EZiL Chat (bundled Copilot Chat on the gateway-subset mock): blocking since its first green
+      # run (ezil-chat-e2e.yml run 39506604051, 87 checks, fresh and returning profiles).
+      - name: EZiL Chat image e2e
+        id: ezil_chat_e2e
+        env:
+          EZIL_COPILOT_E2E_OUT: ${{ runner.temp }}/ezil-chat-e2e
+        run: bash e2e/copilot-ezil-image.sh "${{ steps.build.outputs.desktop_ref }}"
+      - name: Keep EZiL Chat e2e evidence
+        if: always() && steps.ezil_chat_e2e.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ezil-chat-e2e
+          path: ${{ runner.temp }}/ezil-chat-e2e
+          if-no-files-found: warn
       - name: Install pinned cosign
         uses: sigstore/cosign-installer@v3
         with:

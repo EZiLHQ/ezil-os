@@ -1976,6 +1976,7 @@ supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --bind-addr "0.0.0.0:${CODE_SERVER_PORT}" \
   --auth none \
   --disable-telemetry \
+  --disable-update-check \
   --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
   --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
   "$WORKSPACE_ROOT"

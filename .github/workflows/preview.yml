@@ -20,6 +20,8 @@ env:
     worker/neko
     worker/assets
     worker/bootstrap
+    worker/copilot-chat
+    worker/ezil-models
     worker/guacamole
     worker/sandbox-template
     worker/scripts

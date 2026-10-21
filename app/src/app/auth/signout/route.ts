@@ -1,6 +1,10 @@
+import { eq } from 'drizzle-orm';
 import { type NextRequest, NextResponse } from 'next/server';
 
 import { auth0Enabled, logoutUrl } from '@/server/auth/auth0';
+import { computers } from '@/server/db/schema';
+import { revokeAiCredentialsOnSignout } from '@/server/lib/ai-credential';
+import { resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { Routes } from '@/utils/constants';
 import { isLegacyAuthCookie, SECURE_AUTH_COOKIE_NAME } from '@/utils/supabase/cookie-options';
 import { createClient } from '@/utils/supabase/server';
@@ -34,12 +38,33 @@ const isAuthCookie = (name: string) => name.startsWith(SECURE_AUTH_COOKIE_NAME) 
  * by hand on that path.
  */
 export async function POST(request: NextRequest) {
+    const supabase = await createClient();
+    // Revoke before signOut removes the identity. The total budget is three seconds,
+    // independent of whether Supabase subsequently succeeds or throws.
+    try {
+        await revokeAiCredentialsOnSignout({
+            config: resolveCloudflareGuacamoleConfig(),
+            hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+            getUserId: async () => (await supabase.auth.getUser()).data.user?.id ?? null,
+            listComputerIds: async (userId) => {
+                const { db } = await import('@/server/db');
+                const rows = await db.query.computers.findMany({
+                    where: eq(computers.userId, userId), columns: { id: true },
+                });
+                return rows.map((row) => row.id);
+            },
+        });
+    } catch {
+        // Configuration and client failures also leave signout available.
+    }
     let error: unknown;
     try {
-        const supabase = await createClient();
         ({ error } = await supabase.auth.signOut({ scope: 'local' }));
-    } catch { error = true; }
-    const destination = auth0Enabled() ? logoutUrl(ownedPublicOrigin(request.headers, request.url)) : new URL(Routes.LOGIN, ownedPublicOrigin(request.headers, request.url));
+    } catch {
+        error = true;
+    }
+    const origin = ownedPublicOrigin(request.headers, request.url);
+    const destination = auth0Enabled() ? logoutUrl(origin) : new URL(Routes.LOGIN, origin);
     const response = NextResponse.redirect(destination, 303);
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Referrer-Policy', 'no-referrer');

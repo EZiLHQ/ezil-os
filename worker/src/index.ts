@@ -368,6 +368,10 @@ interface Env extends SandboxEnv {
   SANDBOX_NEKO_TURN_API_TOKEN?: string;
   /** Optional ephemeral TURN credential TTL in seconds (clamped to [300, 1800]). */
   SANDBOX_NEKO_TURN_TTL_SECONDS?: string;
+  /** AI gateway origin; the user JWT stays in this Worker's DO. */
+  EZIL_AI_GATEWAY_URL?: string;
+  /** `off` returns 503 for AI requests. Boot env and credential deletion stay available. */
+  SANDBOX_AI_PROXY?: string;
 }
 
 /**
@@ -660,6 +664,26 @@ import {
   type LogEvent,
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
+import {
+  aiProxyBaseUrl,
+  aiProxyDisabled,
+  chooseAiCredential,
+  deriveAiProxyToken,
+  handleAiProxyRequest,
+  isAiProxyPath,
+  parsePushedAccessToken,
+  proxyError,
+  resolveGatewayUrl,
+  usableAiCredential,
+  verifyAiCredentialSignature,
+  DEFAULT_AI_GATEWAY_URL,
+  AI_CREDENTIAL_STORAGE_KEY,
+  AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
+  AI_PROXY_NONCE_STORAGE_KEY,
+  readLimited,
+  type StoredAiCredential,
+} from './ai-proxy';
+
 import { captureEditorState } from './editor-state';
 import {
   selectTelemetryWorthy,
@@ -844,6 +868,11 @@ interface EzilWorkspacePersistRpc {
    * alive.
    */
   recordActivity(lastInputAgoMs: number): Promise<void>;
+  startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
+  getAiProxyNonce(): Promise<string | null>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }>;
+  getAiCredential(): Promise<string | null>;
+  dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
    * what actually happened. Runs entirely inside the DO because only there is
@@ -1087,6 +1116,7 @@ async function ensureDesktop(
    * ignore it entirely when telemetry is unconfigured).
    */
   onBootTelemetry?: (tail: ContainerTelemetryTail) => void,
+  aiStart?: (command: string, env: Record<string, string>) => Promise<string>,
 ): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
@@ -1156,9 +1186,13 @@ async function ensureDesktop(
   // argv), consistent with every other opt-in toggle above.
   const cpuDiagEnv: Record<string, string> =
     mode === 'neko' && cpuDiagFlagEnabled(cpuDiagFlag) ? { EZIL_NEKO_CPU_DIAG_ENABLED: '1' } : {};
-  const proc = await sandbox.startProcess(`DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`, {
-    env: { DESKTOP_MODE: mode, ...(iceEnv ?? {}), ...startupEnv, ...workspaceRootEnv, ...cpuDiagEnv },
-  });
+  const command = `DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`;
+  const launchEnv = { DESKTOP_MODE: mode, ...(iceEnv ?? {}), ...startupEnv, ...workspaceRootEnv, ...cpuDiagEnv };
+  // AI nonce rotation and process creation share the DO's lifecycle lock.
+  const proc = aiStart
+    ? await sandbox.getProcess(await aiStart(command, launchEnv))
+    : await sandbox.startProcess(command, { env: launchEnv });
+  if (!proc) throw new Error('desktop_launcher_missing');
   bootLog('container_start', 'end', {
     status: 'ok',
     phaseMs: Date.now() - bootT0,
@@ -3205,6 +3239,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // does because the absence of a reschedule (below) is the only thing
         // marking this loop retired.
         try {
+          await this.forgetAiCredentialBestEffort('idle_stop');
           await this.withRuntimeTransition(() => this.stop());
         } catch (err) {
           console.error(
@@ -3535,6 +3570,84 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     if (retry && lastActivityAt > retry.firstAt) await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
   }
 
+  /** Concurrent preview opens share a launcher and its nonce; teardown/restart use this same lock. */
+  async startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
+    return this.withRuntimeMutation(() => this.startAiDesktopUnlocked(hostname, sandboxId, command, env));
+  }
+
+  /** Restart already owns the lifecycle lock. Only RPC-safe process ids cross it. */
+  private async startAiDesktopUnlocked(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
+    if (this.containerIsRunning()) {
+      const processes = await this.listProcesses();
+      // ensureDesktop includes DESKTOP_MODE in this exact command. A different
+      // mode follows the original startProcess path, without stopping its stack.
+      const launcher = findDesktopLauncherProcess(Array.isArray(processes) ? processes.filter((p) => p.command === command) : []);
+      if (launcher) return launcher.id;
+    }
+    const aiEnv = await this.aiProxyBootEnv(hostname, sandboxId);
+    const process = await this.startProcess(command, { env: { ...env, ...aiEnv } });
+    return process.id;
+  }
+
+  /** Rotate only on the launch path, including restart; warm previews never call this. */
+  async aiProxyBootEnv(hostname: string, sandboxId: string): Promise<Record<string, string>> {
+    const nonce = crypto.randomUUID();
+    await this.ctx.storage.put(AI_PROXY_NONCE_STORAGE_KEY, nonce);
+    return aiProxyBootEnv(this.env, hostname, sandboxId, nonce);
+  }
+
+  async getAiProxyNonce(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) ?? null;
+  }
+
+  /** Order pushes against logout and each other atomically. No container access. */
+  async putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
+      const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+      if (revokedAt !== undefined && signedAt <= revokedAt) {
+        return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
+      }
+      const { keep, stored } = chooseAiCredential(current, { ...credential, signedAt });
+      if (stored && keep !== current) await txn.put(AI_CREDENTIAL_STORAGE_KEY, keep);
+      return { stored, expiresAt: keep.expiresAt };
+    });
+  }
+
+  async getAiCredential(): Promise<string | null> {
+    return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
+  }
+
+  /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
+  async dropAiCredential(token?: string, signedAt?: number): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
+      if (signedAt !== undefined) {
+        const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+        if (revokedAt !== undefined && signedAt <= revokedAt) return;
+        await txn.put(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, signedAt);
+        // A delayed logout cannot remove a credential pushed after it. A
+        // timestamp tie belongs to logout so a same-millisecond replay fails.
+        if (current?.signedAt !== undefined && current.signedAt > signedAt) return;
+      }
+      if (token === undefined || current?.token === token) await txn.delete(AI_CREDENTIAL_STORAGE_KEY);
+    });
+  }
+
+  /**
+   * Stop and teardown forget the AI credential and proxy nonce, but cleanup
+   * must never be the reason a computer keeps running: a storage failure is
+   * logged and the stop goes ahead. The next launch rotates the nonce anyway.
+   */
+  private async forgetAiCredentialBestEffort(phase: 'idle_stop' | 'teardown'): Promise<void> {
+    try {
+      await this.dropAiCredential();
+      await this.ctx.storage.delete(AI_PROXY_NONCE_STORAGE_KEY);
+    } catch {
+      console.error(`[ezil-ai] phase=${phase} event=credential_forget_failed`);
+    }
+  }
+
   /** True when a container is actually alive under this DO right now. */
   private containerIsRunning(): boolean {
     return this.ctx.container?.running === true;
@@ -3735,6 +3848,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     await this.cancelWorkspaceFlushLoop();
+    await this.forgetAiCredentialBestEffort('teardown');
 
     let destroyError: string | undefined;
     try {
@@ -4035,6 +4149,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           null,
           workspaceRoot,
           this.env.EZIL_NEKO_CPU_DIAG_ENABLED,
+          undefined,
+          (command, env) => this.startAiDesktopUnlocked(hostname, sandboxId, command, env),
         );
         bootLog('restart', 'end', { status: 'ok' });
         const report = buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: true });
@@ -4595,6 +4711,9 @@ async function handlePreview(
       (tail) => {
         containerTelemetry = tail;
       },
+      mode === 'neko' ? (command, launchEnv) => sandbox.startAiDesktop(
+        normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT), sandboxId, command, launchEnv,
+      ) : undefined,
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
     desktopDone('ok');
@@ -6462,6 +6581,8 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
+
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
 
   if (target === 'app' && request.method === 'GET' && path === '/preview-status') {
@@ -7025,6 +7146,98 @@ async function handleBrowserSidecar(
   }
 }
 
+// ── EZiL AI proxy (code bridge host `/ai/v1/*` + credential push) ────────────
+//
+// See `./ai-proxy.ts` for the contract. Two halves:
+//   - `POST /sandbox/:name/ai-credential  { accessToken }` (Worker API host):
+//     the Next server pushes the signed-in user's Supabase access token, signed
+//     with `x-ezil-signature` over sandbox id + body hash. Stored in the DO only.
+//   - `/ai/v1/*` on `<8443>-<id>-code.<zone>`: the container's chat extension,
+//     authenticated by the per-sandbox proxy token injected at boot
+//     (`EZIL_AI_PROXY_TOKEN`), forwarded to the gateway with the stored token.
+
+/** Boot env for the chat extension: where the proxy is and the sandbox's proxy token. Never the user's token. */
+async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, nonce: string): Promise<Record<string, string>> {
+  const secret = resolveNekoDerivationSecret(env);
+  const code = codePortFor('neko');
+  if (!code) return {};
+  return {
+    EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
+    EZIL_AI_PROXY_TOKEN: secret ? await deriveAiProxyToken(secret, sandboxId, nonce) : '',
+  };
+}
+
+async function handleAiProxy(request: Request, env: Env, sandboxId: string): Promise<Response> {
+  const disabled = aiProxyDisabled(env.SANDBOX_AI_PROXY);
+  let gatewayUrl: string;
+  try {
+    gatewayUrl = disabled ? DEFAULT_AI_GATEWAY_URL : resolveGatewayUrl(env.EZIL_AI_GATEWAY_URL);
+  } catch {
+    return proxyError(503, 'os_ai_unavailable', 'EZiL AI is not configured for this computer.');
+  }
+  const sandbox = disabled ? null : openSandbox(env, sandboxId);
+  return handleAiProxyRequest(request, {
+    gatewayUrl,
+    sandboxId,
+    enabled: env.SANDBOX_AI_PROXY,
+    proxySecret: resolveNekoDerivationSecret(env),
+    proxyNonce: sandbox ? await sandbox.getAiProxyNonce() : null,
+    credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
+    dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
+    fetch: (upstream) => fetch(upstream),
+    log: (fields) => console.log(JSON.stringify(fields)),
+  });
+}
+
+const AI_CREDENTIAL_MAX_BODY_BYTES = 32 * 1024;
+
+async function handleAiCredential(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  if (Number(request.headers.get('content-length') ?? 0) > AI_CREDENTIAL_MAX_BODY_BYTES) {
+    return json({ ok: false, error: 'body_too_large' }, 413);
+  }
+  const raw = await readLimited(request.body, AI_CREDENTIAL_MAX_BODY_BYTES);
+  if (raw === null) return json({ ok: false, error: 'body_too_large' }, 413);
+  const auth = await verifyAiCredentialSignature(
+    request.headers.get('x-ezil-signature'),
+    resolvePreviewSecrets(env),
+    sandboxName,
+    raw,
+    Date.now(),
+    request.method as 'POST' | 'DELETE',
+  );
+  if (!auth.ok) return json({ ok: false, error: auth.error }, auth.error === 'ai_proxy_not_configured' ? 503 : 401);
+
+  if (request.method === 'DELETE') {
+    try {
+      await openSandbox(env, sandboxName).dropAiCredential(undefined, auth.timestamp);
+      return json({ ok: true });
+    } catch {
+      return json({ ok: false, error: 'ai_credential_storage_failed' }, 500);
+    }
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+  const accessToken = (body as { accessToken?: unknown } | null)?.accessToken;
+  const parsed = parsePushedAccessToken(accessToken, sandboxName);
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp);
+    return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
+  } catch {
+    return json(
+      { ok: false, sandboxId: sandboxName, error: 'ai_credential_storage_failed' },
+      500,
+    );
+  }
+}
+
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export default {
@@ -7066,6 +7279,10 @@ export default {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
+    if (url.hostname.split('.')[0]!.startsWith('aws-') && isAiProxyPath(path)) {
+      return proxyError(404, 'os_ai_unavailable');
+    }
+
     // 0a) AWS computer browser hostnames (`aws-<port>-<sandboxId>.<zone>`, GW-4): fail-closed
     //     cookie gate, then a gw1-signed forward through the computer's tunnel. Returns null
     //     for every other hostname, so the Cloudflare dispatch below is unchanged.
@@ -7466,6 +7683,10 @@ export default {
         if (!result.ok) return json({ ok: false, error: 'reason' in result ? result.reason : 'migration_failed' }, 409);
         return json(result);
       } catch { return json({ ok: false, error: 'migration_failed' }, 503); }
+    }
+    const aiCredentialMatch = path.match(/^\/sandbox\/([^/]+)\/ai-credential$/);
+    if ((method === 'POST' || method === 'DELETE') && aiCredentialMatch) {
+      return handleAiCredential(request, env, decodeURIComponent(aiCredentialMatch[1]));
     }
 
     const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);

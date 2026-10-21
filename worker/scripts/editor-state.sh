@@ -32,11 +32,137 @@ CODESERVER_SETTINGS_JSON
   return 1
 }
 
+# Machine settings belong to the image and are refreshed on every prepare.
+# User settings (including JSONC) continue through the existing restore path.
+seed_codeserver_machine_settings() {
+  local dst="$1/Machine/settings.json" temporary
+  mkdir -p "$(dirname "$dst")" || return 1
+  temporary="$(mktemp "${dst}.XXXXXX")" || return 1
+  if cat >"$temporary" <<'CODESERVER_MACHINE_SETTINGS_JSON'
+{
+  "chat.disableAIFeatures": false,
+  "chat.allowAnonymousAccess": true,
+  "chat.byokUtilityModelDefault": "mainAgent",
+  "chat.utilityModel": "ezil/qwen.qwen3-coder-next",
+  "chat.utilitySmallModel": "ezil/qwen.qwen3-coder-next",
+  "chat.defaultModel": "qwen.qwen3-coder-next",
+  "chat.titleBar.signIn.enabled": false,
+  "chat.welcomePage.signIn.enabled": false,
+  "github.copilot.enable": { "*": false },
+  "github.copilot.nextEditSuggestions.enabled": false,
+  "github.copilot.chat.backgroundAgent.enabled": false,
+  "github.copilot.chat.cloudAgent.enabled": false,
+  "chat.viewSessions.enabled": false,
+  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "telemetry.telemetryLevel": "off",
+  "terminal.integrated.env.linux": {
+    "EZIL_AI_PROXY_TOKEN": null,
+    "EZIL_AI_BASE_URL": null
+  },
+  "github.copilot.chat.tools.viewImage.enabled": false,
+  "github.copilot.chat.virtualTools.threshold": 64
+}
+CODESERVER_MACHINE_SETTINGS_JSON
+  then
+    mv -f "$temporary" "$dst" && return 0
+  fi
+  rm -f "$temporary"
+  return 1
+}
+
+# Merge the ephemeral BYOK group list without removing user entries. Preserve
+# malformed input as a backup instead of silently discarding its original bytes.
+seed_codeserver_chat_models() {
+  mkdir -p "$1/User" || return 1
+  node - "$1/User/chatLanguageModels.json" <<'CODESERVER_CHAT_MODELS_JS'
+const fs = require("fs");
+const dst = process.argv[2];
+const entry = { name: "EZiL", vendor: "ezil" };
+// The workbench reads this file as JSONC: drop comments and trailing commas,
+// leaving string contents untouched.
+function jsonc(text) {
+  let out = "", i = 0, inString = false;
+  while (i < text.length) {
+    const c = text[i], n = text[i + 1];
+    if (inString) { out += c; if (c === "\\") { out += n ?? ""; i += 2; continue; } if (c === '"') inString = false; i++; continue; }
+    if (c === '"') { inString = true; out += c; i++; continue; }
+    if (c === "/" && n === "/") { while (i < text.length && text[i] !== "\n") i++; continue; }
+    if (c === "/" && n === "*") { const close = text.indexOf("*/", i + 2); i = close < 0 ? text.length : close + 2; continue; }
+    out += c; i++;
+  }
+  return JSON.parse(out.replace(/,(\s*[\]}])/g, "$1"));
+}
+function write(text) {
+  const temporary = dst + "." + process.pid;
+  try {
+    fs.writeFileSync(temporary, text, { flag: "wx", mode: 0o600 });
+    fs.renameSync(temporary, dst);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+if (!fs.existsSync(dst)) {
+  write(JSON.stringify([entry], null, 2) + "\n");
+  process.exit(0);
+}
+const original = fs.readFileSync(dst, "utf8");
+let groups;
+try {
+  groups = jsonc(original);
+  if (!Array.isArray(groups)) throw new Error("expected array");
+} catch {
+  // Unreadable even as JSONC: keep the original bytes as a backup, then seed.
+  fs.writeFileSync(dst + ".invalid-" + Date.now(), original, { flag: "wx", mode: 0o600 });
+  write(JSON.stringify([entry], null, 2) + "\n");
+  process.exit(0);
+}
+if (groups.some(group => group?.vendor === "ezil" && group?.name === "EZiL")) process.exit(0); // untouched
+// Insert right after the opening bracket (the first "[" outside comments), so
+// the user's comments, layout and trailing-comment lines survive untouched.
+let open = 0;
+while (open < original.length && original[open] !== "[") {
+  if (original.startsWith("//", open)) open = original.indexOf("\n", open) < 0 ? original.length : original.indexOf("\n", open);
+  else if (original.startsWith("/*", open)) open = original.indexOf("*/", open + 2) < 0 ? original.length : original.indexOf("*/", open + 2) + 2;
+  else open++;
+}
+write(original.slice(0, open + 1) + "\n  " + JSON.stringify(entry) + (groups.length ? "," : "") + original.slice(open + 1));
+CODESERVER_CHAT_MODELS_JS
+}
+
+# Copilot/telemetry-only sinks; never github.com or api.github.com. A read-only
+# hosts file must not fail boot. EZIL_HOSTS_FILE allows isolated Linux tests.
+seed_blocked_ai_hosts() {
+  local _h _hosts="${EZIL_HOSTS_FILE:-/etc/hosts}"
+  [ -w "$_hosts" ] || return 0
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    grep -q -F -w -- "$_h" "$_hosts" 2>/dev/null && continue
+    printf '127.0.0.1 %s\n' "$_h" >>"$_hosts" 2>/dev/null || return 0
+  done <<'EZIL_BLOCKED_AI_HOSTS'
+api.githubcopilot.com
+api-model-lab.githubcopilot.com
+copilot-proxy.githubusercontent.com
+copilot-telemetry.githubusercontent.com
+origin-tracker.githubusercontent.com
+default.exp-tas.com
+mobile.events.data.microsoft.com
+browser.events.data.microsoft.com
+dc.services.visualstudio.com
+westus-0.in.applicationinsights.azure.com
+westeurope-5.in.applicationinsights.azure.com
+main.vscode-cdn.net
+embeddings.vscode-cdn.net
+EZIL_BLOCKED_AI_HOSTS
+}
+
 ezil_editor_prepare() (
   local user_data="$1" workspace="$2" file
   mkdir -p "$user_data" || exit 1
   exec 8>"$user_data/.ezil-state.lock" || exit 1
   flock -w 10 8 || exit 1
+  seed_codeserver_machine_settings "$user_data" || exit 1
+  seed_codeserver_chat_models "$user_data" || exit 1
+  seed_blocked_ai_hosts || true
   # Within the same runtime, relaunches preserve the current editor state.
   if [ -f "$user_data/.ezil-state-ready" ]; then
     [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1

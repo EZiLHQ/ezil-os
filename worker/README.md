@@ -12,6 +12,41 @@ noVNC.
 > web-client change is required. Only what `guacamoleUrl` points at changed:
 > Apache Guacamole on port **8080** instead of noVNC on 6080.
 
+## EZiL Chat in Code
+
+The desktop pins code-server **4.141.0** (SHA-256 checked `.deb`) and patches
+its bundled MIT GitHub Copilot Chat **0.69.0** as **EZiL Chat**. The GitHub
+Copilot service is not used. [Patch anchors and gates](copilot-chat/PATCHES.md)
+are checked at build time, including the original licenses and manifest identity.
+
+Built-in `ezil.ezil-models` reads `/etc/ezil/models.json` (`EZIL_MODELS_CONFIG`).
+The only provider is `ezil-gateway`, using `EZIL_AI_BASE_URL` and
+`EZIL_AI_PROXY_TOKEN` from the container environment. Qwen3 Coder Next is the
+default; Kimi K3 uses JSON responses with `stream:false`. No API key is baked
+into the image. OpenCode remains at **1.19.0**.
+
+Both launchers use `scripts/editor-state.sh`: each prepare refreshes Machine
+settings and merges the EZiL vendor group without changing User settings.
+Machine settings disable telemetry, GitHub-only agents and image tools, set
+`chat.byokUtilityModelDefault` to the documented `mainAgent` value, and set
+the virtual tool grouping threshold to 64. Integrated terminals remove
+the gateway URL/token from their environment; the extension host retains them.
+Tool approval uses the editor defaults. Copilot/telemetry hosts are sunk to
+loopback when `/etc/hosts` is writable; `github.com` and `api.github.com` remain
+available to developer tools. See `seed_blocked_ai_hosts` for the exact list.
+
+The Docker build expects `worker/ezil-models/dist/ezil-models-0.1.0.vsix`;
+generate it with `worker/ezil-models/build-vsix.sh` if the checkout lacks it.
+
+Local checks: `bash scripts/test-editor-state-linux.sh` and, from the repo
+root, `node e2e/copilot-ezil-messages-mock.test.mjs`. The lead runs
+`e2e/copilot-ezil-image.sh ezil-os-desktop:ezil-chat-lanec` with
+`PLAYWRIGHT_REQUIRE_DIR` set, from outside the projects tree. This suite boots
+fresh/returning profiles on an internal Docker network, publishes a loopback
+Code port, captures gateway bodies, and tests branding, model selection, agent
+create/edit/terminal approval, Keep/Undo, token removal and outbound sinks.
+It requires a full desktop image; syntax or mock checks alone do not prove the UI.
+
 ## Architecture
 
 ```
