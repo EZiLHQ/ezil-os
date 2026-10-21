@@ -539,6 +539,7 @@ import {
   isOwnMigratedHead,
   WorkspaceMigratedError,
   MIGRATING_FLAG,
+  migrationFenceState,
   MIGRATION_TARGETS,
   type MigrationTarget,
   type FlushR2BucketLike,
@@ -2489,6 +2490,37 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       });
     });
   }
+  // Start operations and publishing the export fence share one queue. A start
+  // already in flight finishes before begin publishes the flag and stops it.
+  private migrationStartTail: Promise<unknown> = Promise.resolve();
+  private withMigrationStart<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.migrationStartTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.migrationStartTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  private async migrationStartBlocked(): Promise<boolean> {
+    const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+    if (!wctx) return false;
+    const store = await this.selectWorkspaceStore();
+    if (!store.ok || !store.store) return false;
+    return await migrationFenceState(store.store, wctx.prefix) === 'fresh';
+  }
+  override async start(...args: Parameters<CFSandboxClass<Env>['start']>): Promise<void> {
+    return this.withMigrationStart(async () => {
+      if (await this.migrationStartBlocked()) throw new Error('migrating');
+      return super.start(...args);
+    });
+  }
+  override async startAndWaitForPorts(...args: Parameters<CFSandboxClass<Env>['startAndWaitForPorts']>): Promise<void> {
+    return this.withMigrationStart(async () => {
+      if (await this.migrationStartBlocked()) throw new Error('migrating');
+      return super.startAndWaitForPorts(...args);
+    });
+  }
+  override async containerFetch(...args: Parameters<CFSandboxClass<Env>['containerFetch']>): Promise<Response> {
+    if (await this.migrationStartBlocked()) return json({ ok: false, error: 'migrating' }, 409);
+    return super.containerFetch(...args);
+  }
   override async onStart(): Promise<void> {
     // A replacement container may run a different image; wait for its own codec result.
     try {
@@ -2711,6 +2743,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         if (claim !== undefined && !isWorkspaceStoreKind(claim)) return { mounted: false, detail: 'workspace_store_claim_mismatch' };
         const store = await this.selectWorkspaceStore(claim);
         if (!store.ok) return { mounted: false, detail: store.detail };
+        if (store.store && await migrationFenceState(store.store, realR2KeyPrefix(params.prefix)) === 'fresh') {
+          return { mounted: false, detail: 'migrating' };
+        }
         // An S3-pinned computer committed its head to S3. A missing S3 head is
         // an anomaly, not an empty workspace: never seed over it.
         if (store.pinned && store.kind === 's3'
@@ -2766,6 +2801,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   private async runWorkspaceFlush(trigger: 'alarm' | 'explicit', options?: { allowDefer?: boolean }): Promise<FlushOutcome> {
     const t0 = Date.now();
     bootLog('workspace_flush', 'start', { detail: `trigger=${trigger}` });
+    let migrating: boolean;
+    try { migrating = await this.migrationStartBlocked(); } catch {
+      console.error('[migration-fence] flag read failed; checkpoint refused');
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+        failed: [], manifest: {}, heartbeatWritten: false, skippedReason: 'flush_threw' };
+    }
+    if (migrating) {
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+        failed: [], manifest: {}, heartbeatWritten: false, skippedReason: 'migrating' };
+    }
     if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
       return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
         failed: [], manifest: {}, heartbeatWritten: false };
@@ -3366,7 +3411,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * Start exporting this computer: take a final checkpoint of a running
    * container, REFUSE when the workspace or system layer is over the caps
    * (the committed head would be stale: exporting it would truncate), then
-   * raise the migrating flag (suspends GC on both prefixes) and return the
+   * raise the migrating flag, stop the Cloudflare writer, and return the
    * heads the export must copy and later commit against.
    */
   async beginMigrationExport(): Promise<
@@ -3407,7 +3452,32 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (systemHead && systemTooLarge !== false) return { ok: false as const, reason: 'system_size_unknown' };
       const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag,
         systemHeadEtag: systemHead?.etag ?? null }));
-      if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
+      const fenced = await this.withMigrationStart(async () => {
+        if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return 'flag_write_failed';
+        try {
+          if (this.containerIsRunning()) await this.withRuntimeTransition(async () => {
+            await this.stop();
+            // The SDK stop sends SIGTERM; it can return before the runtime exits.
+            if (this.containerIsRunning()) {
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([
+                  this.ctx.container!.monitor().catch(() => undefined),
+                  new Promise<void>((_, reject) => { timer = setTimeout(() => reject(new Error('stop_failed')), 10_000); }),
+                ]);
+              } finally { if (timer !== undefined) clearTimeout(timer); }
+            }
+            if (this.containerIsRunning()) throw new Error('stop_failed');
+          });
+          this.lastOkCheckpoint = null;
+          return null;
+        } catch {
+          console.error('[migration-fence] container stop failed; removing flag');
+          await store.store!.delete([`${wctx.prefix}/${MIGRATING_FLAG}`]);
+          return 'stop_failed';
+        }
+      });
+      if (fenced) return { ok: false as const, reason: fenced };
       const s = head.snapshot;
       return {
         ok: true as const, store: store.kind, prefix: wctx.prefix, systemEtag: systemHead?.etag ?? null,
@@ -3577,6 +3647,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   /** Restart already owns the lifecycle lock. Only RPC-safe process ids cross it. */
   private async startAiDesktopUnlocked(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
+    if (await this.migrationStartBlocked()) throw new Error('migrating');
     if (this.containerIsRunning()) {
       const processes = await this.listProcesses();
       // ensureDesktop includes DESKTOP_MODE in this exact command. A different
@@ -3956,6 +4027,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     explicitMode: DesktopMode | undefined,
     fallbackMode: DesktopMode,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }> {
+    if (await this.migrationStartBlocked()) {
+      return { ok: false, mode: explicitMode ?? fallbackMode, outcome: 'boot_failed',
+        wasRunning: this.containerIsRunning(), stopConfirmed: false, bootOk: false, error: 'migrating' };
+    }
     if (this.restartInProgress) {
       return {
         ok: false,
@@ -4708,6 +4783,7 @@ async function handlePreview(
     );
 
     if (!workspace.mounted) {
+      if (workspace.detail === 'migrating') return json({ ok: false, error: 'migrating', workspace }, 409);
       return json({ ok: false, error: 'workspace_persistence_unavailable', workspace }, 503);
     }
 
@@ -4854,7 +4930,7 @@ async function handlePreview(
     spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetry);
     return json(
       { ok: false, error: err instanceof Error ? err.message : String(err), mode },
-      500,
+      err instanceof Error && err.message === 'migrating' ? 409 : 500,
     );
   }
 }
@@ -4999,7 +5075,7 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
       explicitMode,
       modeResult.mode,
     );
-    const status = report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
+    const status = report.error === 'migrating' ? 409 : report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
     return json({ sandboxName, ...report }, status);
   } catch (err) {
     return json(

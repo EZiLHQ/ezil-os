@@ -2,7 +2,7 @@ import { describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
 mock.module('cloudflare:workers', () => ({ DurableObject: class {}, WorkerEntrypoint: class {}, RpcTarget: class {}, RpcStub: class {}, env: {} }));
 import { hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD, TOKEN_MAX_AGE_MS } from './hmac';
-import { readHead, WorkspaceMigratedError, SNAPSHOT_HEAD, MIGRATING_FLAG, chunkKey } from './workspace-persist';
+import { flushWorkspaceToR2, readHead, WorkspaceMigratedError, SNAPSHOT_HEAD, MIGRATING_FLAG, chunkKey } from './workspace-persist';
 import { r2AsWorkspaceStore } from './workspace-store-s3';
 import { exportedChunk } from './workspace-migration-export';
 
@@ -54,6 +54,7 @@ async function fixture(system = false) {
     exists: async () => ({ exists: false }), readFile: async () => ({ content: Buffer.from(bytes).toString('base64'), encoding: 'base64' }),
     writeFile: async () => ({ success: true }), mkdir: async () => ({ success: true }), listFiles: async () => ({ files: [] }),
     schedule: async () => {},
+    stop: async () => { fake.ctx.container.running = false; },
   });
   expect((await fake.runWorkspaceFlush('explicit')).ok).toBe(true);
   if (system) {
@@ -298,6 +299,17 @@ describe('migration route authentication', () => {
 });
 
 describe('signed migration lifecycle and guards', () => {
+  it('begin then an ordinary no-op flush still exports the pinned snapshot', async () => {
+    const f = await fixture();
+    const begun = await f.begin(), snapshot = f.json();
+    await flushWorkspaceToR2({ container: f.fake, bucket: f.bucket, realPrefix: PREFIX, mountPath: '/workspace',
+      hydrationComplete: true, manifest: {}, log: () => {} });
+    const response = await f.request('export/head');
+    expect(await response.json()).toEqual(snapshot);
+    expect(response.status).toBe(200);
+    expect(f.objects.get(HEAD)!.etag).toBe(begun.etag);
+  });
+
   for (const system of [false, true]) it(`exports, fences and reopens a workspace (system=${system})`, async () => {
     const f = await fixture(system);
     const begun = await f.begin();
@@ -315,7 +327,7 @@ describe('signed migration lifecycle and guards', () => {
     expect((await f.commit(begun)).status).toBe(200);
     expect(f.json().previous).toEqual(previous);
     await expect(readHead(f.bucket, PREFIX)).rejects.toBeInstanceOf(WorkspaceMigratedError);
-    expect(await f.fake.runWorkspaceFlush('explicit')).toMatchObject({ ok: false, skippedReason: 'migrated' });
+    expect(await f.fake.runWorkspaceFlush('explicit')).toMatchObject({ ok: false, skippedReason: 'migrating' });
     // Migrated snapshots remain exportable even without the in-progress flag.
     f.objects.delete(FLAG);
     const exported = await f.request('export/head');
@@ -329,6 +341,7 @@ describe('signed migration lifecycle and guards', () => {
     if (system) expect(f.json(SYS)).toEqual(systemPrevious);
     expect(f.objects.has(FLAG)).toBe(false);
     expect(f.objects.has(`${SYSTEM}/${MIGRATING_FLAG}`)).toBe(false);
+    f.fake.ctx.container.running = true; // reopen permits the normal boot/flush path again
     expect(await f.fake.runWorkspaceFlush('explicit')).toMatchObject({ ok: true });
     expect(f.names.every(name => name === NAME)).toBe(true);
   });
