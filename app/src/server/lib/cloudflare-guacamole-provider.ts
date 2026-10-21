@@ -3232,7 +3232,7 @@ export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hma
 // Cloudflare snapshot migration uses the same v1 control signer as restart.
 export type MigrateKind = 'workspace' | 'system';
 const MIGRATE_CONFLICT_REASONS = [
-    'head_moved', 'migration_not_started', 'no_checkpoint', 'previous_head_missing',
+    'head_moved', 'migration_not_started', 'no_checkpoint', 'no_context', 'no_workspace', 'previous_head_missing',
     'generation_mismatch', 'chunk_unavailable', 'already_migrated', 'workspace_too_large',
     'workspace_size_unknown', 'system_too_large', 'system_size_unknown', 'final_checkpoint_failed',
     'flag_write_failed', 'stop_failed', 'migrating', 'not_migrated',

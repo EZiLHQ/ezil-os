@@ -655,6 +655,52 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
     });
 }
 
+/** A concurrent first open cannot re-pin CF after empty-workspace cutover. */
+export async function pinCloudflarePlacement(db: PlacementDb, computer: { computerId: string; userId: string }): Promise<ResolvedPlacement> {
+    return db.transaction(async tx => {
+        await lockComputer(tx, computer.computerId);
+        const existing = await readPlacement(tx, computer.computerId);
+        if (existing.record) return existing;
+        const { createProviderMigrationStore } = await import('./provider-migrate-store');
+        const m = await createProviderMigrationStore(tx).readByComputer(computer.computerId);
+        if (m?.userId === computer.userId.toLowerCase() && m.state === 'committed' && m.lastError === 'fresh_provision')
+            return { provider: 'aws-ec2', store: 'ebs', record: null };
+        const created = await createInTx(tx, { computerId: computer.computerId, ownerUserId: computer.userId,
+            provider: 'cloudflare', state: 'STOPPED' }, true);
+        if (!created.ok) throw new PlacementIntegrityError('invalid_row', computer.computerId);
+        return { provider: 'cloudflare', store: created.placement.store, record: created.placement };
+    });
+}
+
+/** Retire an empty CF pin and finish its migration atomically under the computer lock.
+ * Recheck emptiness inside the lock; a STOPPED pin alone says nothing about R2.
+ */
+export async function finishFreshProvision(db: PlacementDb, m: import('./provider-migrate-store').ComputeMigration,
+    proveEmpty: () => Promise<boolean>): Promise<void> {
+    const { createProviderMigrationStore, MigrationConflictError } = await import('./provider-migrate-store');
+    await withAdmission(db, async tx => {
+        await lockComputer(tx, m.computerId);
+        const store = createProviderMigrationStore(tx);
+        const current = await store.readById(m.id);
+        if (!current || current.userId !== m.userId || current.computerId !== m.computerId
+            || current.state !== 'requested' || current.updatedAt !== m.updatedAt) throw new MigrationConflictError();
+        const p = (await readPlacement(tx, m.computerId)).record;
+        if (p && (p.provider !== 'cloudflare' || p.ownerUserId !== m.userId || p.state !== 'STOPPED'))
+            throw new MigrationConflictError();
+        if (!await proveEmpty()) throw new MigrationConflictError();
+        if (p) {
+            const deleted = rowsOf(await tx.execute(sql`/* placement:fresh-remove */ DELETE FROM public.ezil_computer_placements
+                WHERE computer_id = ${m.computerId}::uuid AND owner_user_id = ${m.userId}::uuid
+                  AND provider = 'cloudflare' AND state = 'STOPPED'
+                  AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+                RETURNING computer_id`));
+            if (deleted.length !== 1) throw new MigrationConflictError();
+        }
+        const result = await store.applyTransition(current, { type: 'fresh_provision' });
+        if (!result.accepted) throw new MigrationConflictError();
+    });
+}
+
 /** Compensate only this migration's unpublished boot. The retained CF snapshot is authoritative. */
 export function rollbackMigrationPlacement(db: PlacementDb, m: import('./provider-migrate-store').ComputeMigration, source: Placement | null): Promise<void> {
     return withAdmission(db, async tx => {
@@ -1383,6 +1429,8 @@ export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date,
           AND s.current_period_start <= ${now.toISOString()}::timestamptz
           AND s.current_period_end > ${now.toISOString()}::timestamptz
           AND (p.computer_id IS NULL OR p.provider = 'cloudflare')
+          AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations done WHERE done.computer_id = c.id
+            AND done.state = 'committed' AND done.last_error = 'fresh_provision')
           AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations m WHERE m.user_id = s.user_id
             AND (m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
               OR m.updated_at >= ${new Date(now.getTime() - 600_000).toISOString()}::timestamptz))

@@ -7,7 +7,9 @@ import * as cloudflare from '../cloudflare-guacamole-provider';
 import { AWS_TIERS } from './aws-config';
 import { mintPreviewTokenV2, type WorkerAuth } from './preview-token-v2';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { AWS_INSTANCE_SIZES, CLOUDFLARE_CONTAINER_SIZE, describePlacement, readSystemInfo } from './system-info';
+import { AWS_INSTANCE_SIZES, CLOUDFLARE_CONTAINER_SIZE, describePlacement, describePlanPlacement, readSystemInfo } from './system-info';
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('No live billing DB in tests'); } }));
 
 const OWNER = '11111111-1111-4111-8111-111111111111';
 const OTHER = '33333333-3333-4333-8333-333333333333';
@@ -252,3 +254,40 @@ function baseRecord() {
         fenceToken: null, lifecycleJobId: null, lifecycleDigest: null, lastError: null, updatedAt: new Date(0),
     };
 }
+
+describe('actual placement versus paid entitlement', () => {
+    const paid = { source: 'billing_v2' as const, status: 'active', provider: 'aws' as const, planId: 'standard_monthly_v3', size: 'std-2' as const };
+    const cf = describePlacement({ provider: 'cloudflare', store: 'r2', record: { ...baseRecord(), provider: 'cloudflare' } });
+    it('keeps CF region unknown and 6 GiB while preparing 8 GB in Mumbai', () => {
+        expect(describePlanPlacement(cf, paid, null, { EZIL_AWS_COMPUTERS_ENABLED: '1' })).toMatchObject({ vcpu: 2, memoryGB: 8, region: 'ap-south-1', status: 'preparing' });
+        expect(cf.machine).toMatchObject({ memoryMiB: 6144, region: null });
+    });
+    it.each([{}, { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '1' }])('explains operations pause with %j', env => {
+        expect(describePlanPlacement(cf, paid, null, env)).toMatchObject({ status: 'blocked', reason: 'AWS paused by operations' });
+    });
+    it('shows a failure and preserves the fresh-provision outcome while preparing', () => {
+        expect(describePlanPlacement(cf, paid, { state: 'failed_needs_operator', reason: 'head_moved', outcome: null }, ON_ENV)).toMatchObject({ status: 'failed' });
+        expect(describePlanPlacement(cf, paid, { state: 'committed', reason: 'fresh_provision', outcome: 'fresh_provision' }, ON_ENV)).toMatchObject({ status: 'preparing', outcome: 'fresh_provision' });
+    });
+    it('requires actual Mumbai size and a ready lifecycle before saying ready', () => {
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192 }, lifecycleState: 'RUNNING' };
+        expect(describePlanPlacement(aws, paid, null, ON_ENV)?.status).toBe('ready');
+        expect(describePlanPlacement({ ...aws, lifecycleState: 'PROVISIONING' }, paid, null, ON_ENV)?.status).toBe('preparing');
+        expect(describePlanPlacement({ ...aws, machine: { ...aws.machine, region: 'us-east-1' } }, paid, null, ON_ENV)?.status).toBe('preparing');
+    });
+    it('uses the Premium entitled size', () => {
+        expect(describePlanPlacement(cf, { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' }, null, ON_ENV)).toMatchObject({ vcpu: 8, memoryGB: 32 });
+    });
+});
+const ON_ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1' };
+
+it('wires computer-scoped migration status into the production System data path', async () => {
+    const billing = await import('@/server/billing/v2/compute-access');
+    const migrations = await import('./provider-migrate-orchestrator');
+    vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => ({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'standard_monthly_v3', size: 'std-2' }) });
+    const status = vi.spyOn(migrations, 'migrationStatusFor').mockResolvedValue({ state: 'committed', reason: 'fresh_provision', outcome: 'fresh_provision' });
+    const { db } = cloudflareDb();
+    const info = await readSystemInfo(db, computer, { ...READS, ...ON_ENV });
+    expect(status).toHaveBeenCalledWith(OWNER, computerId, db);
+    expect(info).toMatchObject({ provider: 'cloudflare', machine: { memoryMiB: 6144, region: null }, plan: { memoryGB: 8, status: 'preparing', outcome: 'fresh_provision' } });
+});

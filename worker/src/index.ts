@@ -3419,8 +3419,44 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     | { ok: false; reason: string }
   > {
     return this.withWorkspacePersistence(async () => {
-      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
-      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext & { freshProvision?: boolean }>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      // A missing DO context is not evidence that its R2 workspace is empty.
+      // The SDK persists the name; its computer UUID prefix conservatively covers
+      // every matching computer, including all branches, system heads and loose files.
+      const emptyWorkspace = async (): Promise<boolean> => this.withMigrationStart(async () => {
+        if (this.containerIsRunning() || this.env.SANDBOX_WORKSPACE_S3_PREFIX?.trim()) return false;
+        const selected = await this.selectWorkspaceStore();
+        if (!selected.ok || selected.kind !== 'r2' || !selected.store) return false;
+        const name = await this.ctx.storage.get<string>('sandboxName');
+        const match = /^guac-[a-f0-9]{16}-([a-f0-9]{16})$/.exec(name ?? '');
+        if (!match) return false;
+        const id = match[1];
+        const prefixes = [`${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}`, `${name}/`];
+        const fencePrefix = wctx?.prefix ?? `${name}/branches/main`;
+        const fenceKey = `${fencePrefix}/${MIGRATING_FLAG}`;
+        if (wctx && !(wctx.freshProvision && wctx.prefix === `${name}/branches/main`)) {
+          const root = /^([a-f0-9-]{36})\/branches\/[^/]+$/.exec(wctx.prefix)?.[1];
+          if (!root || !root.startsWith(prefixes[0])) return false;
+        }
+        try {
+          for (const prefix of prefixes) {
+            const listed = await selected.store.list({ prefix, limit: 2 });
+            if (listed.truncated || listed.objects.some(object => !(wctx?.freshProvision && object.key === fenceKey))) return false;
+          }
+          if (this.containerIsRunning()) return false;
+          // Reuse the existing start fence. For a never-started DO the opaque
+          // sandbox namespace is only a control marker, never a user workspace.
+          // Publish it before releasing the start queue so an in-flight CF open
+          // cannot create a workspace between this proof and the placement CAS.
+          if (!await selected.store.put(fenceKey, new TextEncoder().encode(JSON.stringify({
+            startedAt: new Date().toISOString(), freshProvision: true,
+          })))) return false;
+          await this.ctx.storage.put(WORKSPACE_FLUSH_CONTEXT_KEY, { prefix: fencePrefix,
+            mountPath: wctx?.mountPath ?? '/workspace', freshProvision: true });
+          return true;
+        } catch { return false; }
+      });
+      if (!wctx || wctx.freshProvision) return { ok: false as const, reason: await emptyWorkspace() ? 'no_workspace' : 'no_context' };
       const store = await this.selectWorkspaceStore();
       if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
       const bucket = store.store as unknown as FlushR2BucketLike;
@@ -3445,7 +3481,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       } catch (err) {
         return { ok: false as const, reason: err instanceof WorkspaceMigratedError ? 'already_migrated' : 'head_unreadable' };
       }
-      if (!head) return { ok: false as const, reason: 'no_checkpoint' };
+      if (!head) return { ok: false as const, reason: await emptyWorkspace() ? 'no_workspace' : 'no_checkpoint' };
       // An oversized system delta may never have committed a head at all: refuse on the flag alone.
       const systemTooLarge = await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY);
       if (systemTooLarge === true) return { ok: false as const, reason: 'system_too_large' };

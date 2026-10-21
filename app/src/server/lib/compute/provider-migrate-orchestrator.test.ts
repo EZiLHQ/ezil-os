@@ -28,6 +28,7 @@ function fixture(state: MigrationState = 'requested') {
             expect(JSON.parse(Buffer.from(data, 'base64').toString()).restore).toEqual({ kind: 'cf-snapshot', migrationId: G,
                 generation: G, system: false, identityToken: 'a'.repeat(43), fetchBase: `https://app.example/api/compute/restore/${C}` });
         }),
+        freshProvision: vi.fn(async () => { m = { ...m, state: 'committed', lastError: 'fresh_provision' }; }),
         releaseProvision: vi.fn(async () => {}),
         restored: vi.fn(async () => { calls.push('ready'); return true; }),
         flip: vi.fn(async () => { calls.push('flip'); }), rollback: vi.fn(async () => { calls.push('rollback'); }),
@@ -146,5 +147,24 @@ describe('nonblocking scheduling', () => {
         expect(schedulePaidMigration(G, 'standard_monthly_v3', 'invoice.paid', work => { task = work; }, run)).toBeUndefined();
         expect(run).not.toHaveBeenCalled(); await expect(task()).resolves.toBeUndefined();
         expect(() => schedulePaidMigration(G, 'standard_monthly_v3', 'invoice.paid', () => { throw new Error(); })).not.toThrow();
+    });
+});
+
+describe('fresh provisioning', () => {
+    it('accepts only Worker-proven no_workspace and skips restore and abort', async () => {
+        const f = fixture();
+        vi.mocked(f.deps.begin).mockResolvedValue({ ok: false, error: 'conflict', reason: 'no_workspace' });
+        await f.advance();
+        expect(f.get()).toMatchObject({ state: 'committed', lastError: 'fresh_provision' });
+        expect(f.deps.freshProvision).toHaveBeenCalledOnce();
+        expect(f.deps.provision).not.toHaveBeenCalled();
+        expect(f.deps.abort).not.toHaveBeenCalled();
+    });
+    it.each(['no_context', 'no_checkpoint'] as const)('never treats %s alone as empty', async reason => {
+        const f = fixture();
+        vi.mocked(f.deps.begin).mockResolvedValue({ ok: false, error: 'conflict', reason });
+        await f.advance();
+        expect(f.deps.freshProvision).not.toHaveBeenCalled();
+        expect(f.get().state).toBe('failed_reopened');
     });
 });

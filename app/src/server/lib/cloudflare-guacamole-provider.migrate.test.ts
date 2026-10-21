@@ -9,7 +9,7 @@ afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe('migration conflict reasons', () => {
     it.each([
-        'head_moved', 'migration_not_started', 'no_checkpoint', 'previous_head_missing',
+        'head_moved', 'migration_not_started', 'no_checkpoint', 'no_context', 'no_workspace', 'previous_head_missing',
         'generation_mismatch', 'chunk_unavailable', 'already_migrated', 'workspace_too_large',
         'workspace_size_unknown', 'system_too_large', 'system_size_unknown', 'final_checkpoint_failed',
         'flag_write_failed', 'stop_failed', 'migrating', 'not_migrated',

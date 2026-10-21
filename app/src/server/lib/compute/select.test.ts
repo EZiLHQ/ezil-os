@@ -6,12 +6,16 @@
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
 
+import * as awsFactories from './aws-ec2';
 import { AwsProviderNotImplementedError, createAwsEc2StubProvider } from './aws-ec2';
 import { cloudflareComputeProvider } from './cloudflare';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { PlacementIntegrityError, PlacementOwnerError } from './placement';
 import { providerForPlacement, resolveComputeProvider, selectComputeProvider } from './select';
 import type { EntitlementRecord } from './tier';
+
+const migrationRead = vi.hoisted(() => vi.fn(async (): Promise<any> => null));
+vi.mock('./provider-migrate-store', () => ({ createProviderMigrationStore: () => ({ readByComputer: migrationRead }) }));
 
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
@@ -371,4 +375,34 @@ describe('resolveComputeProvider: canary `*` (every user) with the admission fal
         const { db } = createFakePlacementDb({ computers: [{ ...mine, created_at: new Date('2026-10-13T00:00:00Z') }] });
         expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
     });
+});
+
+describe('fresh provision routing', () => {
+    it.each([{ EZIL_AWS_COMPUTERS_ENABLED: '1' }, { EZIL_COMPUTE_PLACEMENT_READS: '1' },
+        { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '1' }])('never re-pins a proven-empty old computer with %j', async env => {
+        migrationRead.mockResolvedValueOnce({ userId, state: 'committed', lastError: 'fresh_provision' });
+        const f = createFakePlacementDb();
+        expect((await resolveComputeProvider(f.db, computer, env, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(f.placements).toEqual([]);
+    });
+    it('does not use another owner’s fresh-provision outcome', async () => {
+        migrationRead.mockResolvedValueOnce({ userId: computerId, state: 'committed', lastError: 'fresh_provision' });
+        const f = createFakePlacementDb();
+        expect((await resolveComputeProvider(f.db, computer, ON)).kind).toBe('cloudflare');
+    });
+});
+
+it('rechecks fresh-provision completion while acquiring the Cloudflare pin lock', async () => {
+    migrationRead.mockResolvedValueOnce(null).mockResolvedValueOnce({ userId, state: 'committed', lastError: 'fresh_provision' });
+    const f = createFakePlacementDb();
+    expect((await resolveComputeProvider(f.db, computer, ON, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+    expect(f.placements).toEqual([]);
+});
+
+it('confines a fresh paid cutover to Mumbai even when other regions have capacity', async () => {
+    migrationRead.mockResolvedValueOnce({ userId, state: 'committed', lastError: 'fresh_provision' });
+    const factory = vi.spyOn(awsFactories, 'createAwsEc2Provider');
+    await resolveComputeProvider(createFakePlacementDb().db, computer, { ...ON, AWS_REGIONS: 'us-east-1,ap-south-1' });
+    expect(factory.mock.calls.at(-1)?.[0].env?.().AWS_REGIONS).toBe('ap-south-1');
+    factory.mockRestore();
 });

@@ -28,7 +28,7 @@ import { precheckAdmission } from './admission';
 import { awsCanaryConfig, awsDirectSince, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
-import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { pinCloudflarePlacement, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 
@@ -98,7 +98,19 @@ export async function resolveComputeProvider(
         ? await options.resolveEntitlement()
         : options.entitlement !== undefined ? options.entitlement : aws.entitlement;
     const deps = isPlacementDb(db) ? { ...aws, entitlement, db, env: () => env } : undefined;
+    const freshAwsProvider = () => {
+        // Fresh paid cutovers have the same Mumbai contract as restored ones.
+        // Admission must refuse absent/full Mumbai capacity, never spill elsewhere.
+        const mumbaiEnv = { ...env, AWS_REGIONS: 'ap-south-1' };
+        return providerForPlacement({ provider: 'aws-ec2' }, mumbaiEnv, deps ? { ...deps, env: () => mumbaiEnv } : undefined);
+    };
     if (!placement.record) {
+        const { createProviderMigrationStore } = await import('./provider-migrate-store');
+        const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId);
+        // A proven-empty predecessor is eligible regardless of its creation date.
+        // Keep AWS routing even when AWS is paused, so a reopen cannot re-pin CF.
+        if (migration?.userId === computer.userId.toLowerCase() && migration.state === 'committed'
+            && migration.lastError === 'fresh_provision') return freshAwsProvider();
         // Only new paid computers may provision directly: older computers can have an
         // R2 workspace without a placement row and must migrate through Cloudflare.
         // Eligible paid computers bypass the canary's capacity fallback; ensure() admits or refuses.
@@ -119,6 +131,7 @@ export async function resolveComputeProvider(
             placement = await pinCloudflare(db, computer);
             assertPlacementOwner(placement, computer);
             options.onPlacement?.(placement);
+            if (!placement.record && placement.provider === 'aws-ec2') return freshAwsProvider();
         }
     }
     return providerForPlacement(placement, env, deps);
@@ -140,13 +153,7 @@ function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRe
  * A concurrent writer's row wins (`placement_exists` → re-read), whatever its provider.
  */
 async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<ResolvedPlacement> {
-    const created = await createPlacement(db, {
-        computerId: computer.computerId, ownerUserId: computer.userId, provider: 'cloudflare', state: 'STOPPED',
-    });
-    if (created.ok) return { provider: 'cloudflare', store: created.placement.store, record: created.placement };
-    const existing = await readPlacement(db, computer.computerId);
-    if (!existing.record) throw new PlacementIntegrityError('invalid_row', computer.computerId.toLowerCase());
-    return existing;
+    return pinCloudflarePlacement(db, computer);
 }
 
 /**

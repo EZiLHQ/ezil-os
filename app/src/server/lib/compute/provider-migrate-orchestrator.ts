@@ -8,6 +8,7 @@ export interface MigrationDeps {
     store: Pick<ReturnType<typeof createProviderMigrationStore>, 'readById' | 'applyTransition'>;
     /** Cross-process lock; a busy migration returns immediately. */
     exclusive(id: string, run: () => Promise<void>): Promise<void>;
+    freshProvision(m: ComputeMigration): Promise<void>;
     begin(m: ComputeMigration): Promise<MigrateResult<MigrateBeginResult>>;
     head(m: ComputeMigration, kind: 'workspace' | 'system'): Promise<MigrateResult<SnapshotHead>>;
     exportEtag(m: ComputeMigration): Promise<string>;
@@ -68,7 +69,12 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
                 switch (m.state) {
                     case 'requested': {
                         step = 'begin';
-                        const begin = checked(await deps.begin(m));
+                        const result = await deps.begin(m);
+                        if (!result.ok && result.error === 'conflict' && result.reason === 'no_workspace') {
+                            await deps.freshProvision(m);
+                            break;
+                        }
+                        const begin = checked(result);
                         await transition({ type: 'fenced', etag: begin.etag, systemEtag: begin.systemEtag, generation: begin.generation });
                         break;
                     }
@@ -154,9 +160,13 @@ export function schedulePaidMigration(userId: string, sku: string, eventType: st
     catch { /* A scheduling failure cannot fail a paid webhook. Cron handles recorded work. */ }
 }
 
-export async function migrationStatusFor(userId: string): Promise<'preparing' | 'failed' | null> {
-    const { migrationStore } = await import('./provider-migrate-runtime');
-    return (await migrationStore()).statusFor(userId);
+export async function migrationStatusFor(userId: string, computerId?: string, db?: import('./placement').PlacementExecutor) {
+    const store = db ? (await import('./provider-migrate-store')).createProviderMigrationStore(db)
+        : await (await import('./provider-migrate-runtime')).migrationStore();
+    if (!computerId) return store.statusFor(userId);
+    const m = await store.readByComputer(computerId);
+    if (!m || m.userId !== userId.toLowerCase()) return null;
+    return { state: m.state, reason: m.lastError, outcome: m.state === 'committed' && m.lastError === 'fresh_provision' ? 'fresh_provision' : null };
 }
 
 export async function advanceStaleMigrations(startedAt = Date.now()): Promise<void> {

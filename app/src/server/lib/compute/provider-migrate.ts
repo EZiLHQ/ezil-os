@@ -15,6 +15,7 @@ export interface MigrationProgress {
     lastError: string | null;
 }
 export type MigrationEvent =
+    | { type: 'fresh_provision' }
     | { type: 'fenced'; etag: string; systemEtag: string | null; generation: string }
     | { type: 'exported'; workspaceHead: SnapshotHead; systemHead: SnapshotHead | null }
     | { type: 'provisioned' }
@@ -53,6 +54,11 @@ export function reduceMigration(m: MigrationProgress, event: MigrationEvent): Mi
     if (event.type === 'reopened') return recovery ? move({ state: 'failed_reopened' }) : unchanged();
     if (recovery) return unchanged();
     switch (event.type) {
+        // The deployed SQL enum remains compatible: committed + this marker is a
+        // distinct terminal outcome, with no fabricated snapshot or restore token.
+        case 'fresh_provision':
+            return m.state === 'requested' && !m.workspaceHead && !m.sourceEtag && !m.generation
+                ? move({ state: 'committed', lastError: 'fresh_provision' }) : unchanged();
         case 'fenced':
             return m.state === 'requested' && UUID.test(event.generation) && !!event.etag
                 ? move({ state: 'fenced', generation: event.generation, sourceEtag: event.etag, sourceSystemEtag: event.systemEtag, lastError: null }) : unchanged();

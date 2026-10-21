@@ -15,8 +15,9 @@
  * row is reported as `unassigned`, not as Cloudflare: until its next start
  * decides, nothing has recorded where it runs.
  */
+import { SIZES } from '@/server/billing/v2/contract';
 import { deriveGuacamoleSandboxId, getGuacamoleSandboxSystem, resolveCloudflareGuacamoleConfig } from '../cloudflare-guacamole-provider';
-import { isPlacementReadEnabled, type Env } from './aws-config';
+import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
 
 /**
@@ -66,7 +67,45 @@ export interface SystemInfo {
     lifecycleState: string | null;
     /** No live resource metrics exist yet. */
     usage: null;
+    plan?: { vcpu: number; memoryGB: number; region: 'ap-south-1'; status: 'preparing' | 'failed' | 'blocked' | 'ready'; reason: string | null; outcome: 'fresh_provision' | null };
 }
+
+export function describePlanPlacement(info: SystemInfo, entitlement: import('./tier').EntitlementRecord | null,
+    migration: { state: string; reason: string | null; outcome: string | null } | null, env: Env): SystemInfo['plan'] | undefined {
+    if (entitlement?.source !== 'billing_v2' || entitlement.status !== 'active' || entitlement.paymentIssue
+        || entitlement.provider !== 'aws' || !['standard_monthly_v3', 'premium_monthly_v3'].includes(entitlement.planId ?? '')) return;
+    const size = entitlement.planId === 'standard_monthly_v3' ? SIZES['std-2'] : entitlement.size && SIZES[entitlement.size];
+    if (!size || size.provider !== 'aws') return;
+    const blocked = !isAwsComputersEnabled(env) || (env.EZIL_AWS_KILL_SWITCH !== undefined && env.EZIL_AWS_KILL_SWITCH !== '0');
+    const ready = info.provider === 'aws-ec2' && info.machine.region === 'ap-south-1'
+        && info.machine.vcpu === size.vcpu && info.machine.memoryMiB === size.memoryGiB * 1024
+        && ['RUNNING', 'STOPPED'].includes(info.lifecycleState ?? '');
+    const failed = migration?.state.startsWith('failed_');
+    return { vcpu: size.vcpu, memoryGB: size.memoryGiB, region: 'ap-south-1',
+        status: blocked ? 'blocked' : ready ? 'ready' : failed ? 'failed' : 'preparing',
+        reason: blocked ? 'AWS paused by operations' : failed ? 'AWS preparation failed; your existing workspace is retained' : null,
+        outcome: migration?.outcome === 'fresh_provision' ? 'fresh_provision' : null };
+}
+
+async function withPlanInfo(info: SystemInfo, db: PlacementExecutor, computer: { computerId: string; userId: string }, env: Env): Promise<SystemInfo> {
+    try {
+        const { billingV2EntitlementReader } = await import('@/server/billing/v2/compute-access');
+        const entitlement = await billingV2EntitlementReader().read(computer.userId);
+        if (!entitlement || entitlement.provider !== 'aws') return info;
+        let migration = null;
+        if (isPlacementReadEnabled(env)) {
+            const { migrationStatusFor } = await import('./provider-migrate-orchestrator');
+            try {
+                const status = await migrationStatusFor(computer.userId, computer.computerId, db);
+                if (status && typeof status === 'object') migration = status;
+            } catch { migration = { state: 'failed_needs_operator', reason: 'status_unavailable', outcome: null }; }
+        }
+        const plan = describePlanPlacement(info, entitlement, migration, env);
+        if (plan) info.plan = plan;
+    } catch { /* Optional billing metadata cannot hide actual placement. */ }
+    return info;
+}
+
 
 const UNKNOWN_MACHINE: SystemInfo['machine'] = Object.freeze({ vcpu: null, memoryMiB: null, instanceType: null, region: null, source: 'unknown' as const });
 const UNKNOWN_IMAGE: SystemInfo['image'] = Object.freeze({ id: null, source: 'unknown' });
@@ -119,7 +158,7 @@ export async function readSystemInfo(
         // computers on Cloudflare, but that is a setting, not an observation of where this computer
         // runs (a computer placed while the flags were different could run elsewhere). So the provider
         // is unknown and no machine size is claimed; `configuredRouting` carries the setting separately.
-        return {
+        return withPlanInfo({
             provider: 'unknown',
             providerSource: 'reads_off',
             configuredRouting: 'cloudflare',
@@ -127,7 +166,7 @@ export async function readSystemInfo(
             machine: { ...UNKNOWN_MACHINE },
             lifecycleState: null,
             usage: null,
-        };
+        }, db, computer, env);
     }
     let placement: ResolvedPlacement;
     try {
@@ -153,5 +192,5 @@ export async function readSystemInfo(
             // An unavailable image must never hide the recorded provider or configured size.
         }
     }
-    return info;
+    return withPlanInfo(info, db, computer, env);
 }

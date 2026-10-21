@@ -12,7 +12,7 @@ import { buildLifecycleWork, readLifecycleDeployments, type LifecycleWork } from
 import { lifecycleExecutionArn, readMigrationReadyReceipt, startLifecycleJob } from './aws-receipts';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { cloudflareComputeProvider } from './cloudflare';
-import { flipPlacementToAws, rollbackMigrationPlacement, readAdmissionCounters, readPlacement, withAdmission, type Placement, type PlacementDb } from './placement';
+import { finishFreshProvision, flipPlacementToAws, rollbackMigrationPlacement, readAdmissionCounters, readPlacement, withAdmission, type Placement, type PlacementDb } from './placement';
 import { advanceMigration, MigrationStepError, type MigrationDeps } from './provider-migrate-orchestrator';
 import { createProviderMigrationStore, type ComputeMigration } from './provider-migrate-store';
 import { provisionFor } from './provider-migrate-provision';
@@ -46,6 +46,14 @@ export function createMigrationRuntime(db: PlacementDb, options: {
             });
         },
         begin: m => migrateBegin(sandbox(m)),
+        async freshProvision(m) {
+            const config = readAwsAdmissionConfig(options.env ?? process.env);
+            if (!config.enabled || config.killSwitch) throw new MigrationStepError(true);
+            await finishFreshProvision(db, m, async () => {
+                const result = await migrateBegin(sandbox(m));
+                return !result.ok && result.error === 'conflict' && result.reason === 'no_workspace';
+            });
+        },
         head: (m, kind) => migrateExportHead(sandbox(m), kind),
         async exportEtag(m) {
             const result = await migrateExport(sandbox(m), 'workspace');

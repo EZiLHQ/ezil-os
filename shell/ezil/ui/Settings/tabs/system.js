@@ -54,7 +54,7 @@ import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../na
 // 2-vCPU container whose budget the encoder already dominates.
 
 import session from '../../../session.js';
-import { describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './system-describe.js';
+import { describeRunningOn, describePlan, describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './system-describe.js';
 
 const PHASE = 'ezil-os:settings/system';
 
@@ -295,7 +295,8 @@ function paint () {
               'The sandbox this session is bound to.')}
 
         <h4>Machine</h4>
-        ${(() => { const p = describeProvider(systemInfo, systemInfoReason); return row('Provider', esc(p.value), esc(p.hint)); })()}
+        ${(() => { const p = describeRunningOn(systemInfo, systemInfoReason); return row('Running on', esc(p.value), esc(p.hint)); })()}
+        ${(() => { const p = describePlan(systemInfo); return row('Your plan', esc(p.value), esc(p.hint)); })()}
         ${(() => { const i = describeImage(systemInfo); return row('Image', i.title ? `<code title="${esc(i.title)}">${esc(i.value)}</code>` : esc(i.value)); })()}
         ${(() => { const m = describeMachine(systemInfo); return row('Size', esc(m.value), esc(m.hint)); })()}
         ${(() => { const u = describeUsage(); return row('CPU and memory use', esc(u.value), esc(u.hint)); })()}

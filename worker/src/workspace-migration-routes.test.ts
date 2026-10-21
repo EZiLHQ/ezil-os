@@ -488,3 +488,43 @@ describe('signed migration lifecycle and guards', () => {
     expect(f.chunkBuffers()).toBe(0);
   });
 });
+
+describe('empty workspace proof at begin', () => {
+  async function empty() {
+    const f = await fixture();
+    f.fake.ctx.container.running = false;
+    f.storage.set('sandboxName', 'guac-1111111111114111-2222222222224222');
+    f.storage.delete('ezil:workspaceFlushContext');
+    f.objects.clear();
+    f.bucket.list = async (options?: { prefix?: string }) => ({
+      objects: [...f.objects.keys()].filter(k => k.startsWith(options?.prefix ?? '')).map(key => ({ key })), truncated: false,
+    }) as any;
+    return f;
+  }
+  it('proves a never-started computer empty without DO workspace context', async () => {
+    const f = await empty();
+    await expectError(await f.request('begin'), 409, 'no_workspace');
+    await expectError(await f.request('begin'), 409, 'no_workspace');
+    expect(await f.fake.migrationStartBlocked()).toBe(true);
+  });
+  it.each([HEAD, SYS, PREFIX + '/loose.txt', '22222222-2222-4222-9999-999999999999/branches/main/file'])('preserves any object in the UUID namespace: %s', async key => {
+    const f = await empty(); await f.bucket.put(key, 'data');
+    await expectError(await f.request('begin'), 409, 'no_context');
+    expect(f.objects.has(key)).toBe(true);
+  });
+  it.each(['running', 'identity', 'unavailable', 'truncated', 'custom_prefix'])('fails closed for %s', async failure => {
+    const f = await empty();
+    if (failure === 'running') f.fake.ctx.container.running = true;
+    if (failure === 'identity') f.storage.delete('sandboxName');
+    if (failure === 'unavailable') f.bucket.list = async () => { throw new Error('offline'); };
+    if (failure === 'truncated') f.bucket.list = async () => ({ objects: [], truncated: true });
+    if (failure === 'custom_prefix') f.fake.env.SANDBOX_WORKSPACE_S3_PREFIX = 'custom';
+    await expectError(await f.request('begin'), 409, 'no_context');
+  });
+  it('proves no_checkpoint empty only when every workspace object is absent', async () => {
+    const f = await empty(); f.storage.set('ezil:workspaceFlushContext', { prefix: PREFIX, mountPath: '/workspace' });
+    await expectError(await f.request('begin'), 409, 'no_workspace');
+    await f.bucket.put(PREFIX + '/loose.txt', 'retained');
+    await expectError(await f.request('begin'), 409, 'no_context');
+  });
+});
