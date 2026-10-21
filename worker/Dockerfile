@@ -119,12 +119,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dbus-x11 \
       x11-utils \
       xdotool \
+      x11-xkb-utils \
+      x11-xserver-utils \
+      fontconfig \
       fonts-liberation \
+      fonts-noto-core \
+      fonts-noto-cjk \
+      fonts-noto-color-emoji \
       xterm \
   && wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb \
   && apt-get install -y --no-install-recommends /tmp/chrome.deb \
   && rm -f /tmp/chrome.deb \
   && test -x /usr/sbin/guacd \
+  && fc-cache -f \
   && rm -rf /var/lib/apt/lists/*
 
 # Apache Guacamole HTML5 client web application (version-matched to guacd).
@@ -243,11 +250,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=neko /usr/bin/neko   /usr/bin/neko
 COPY --from=neko /var/www        /var/www
 COPY --from=neko /etc/neko       /etc/neko
+COPY scripts/neko-client.js /var/www/ezil-input.js
+RUN sed -i 's#</head>#<script defer src="ezil-input.js"></script></head>#' /var/www/index.html \
+  && grep -q 'src="ezil-input.js"' /var/www/index.html
 RUN chmod +x /usr/bin/neko \
   && if ldd /usr/bin/neko | grep -qi "not found"; then echo "ERROR: neko has unresolved shared libraries:" >&2; ldd /usr/bin/neko | grep -i "not found" >&2; exit 1; fi \
   && test -x /usr/bin/neko \
   && test -d /var/www \
   && test -f /etc/neko/neko.yaml
+# Fail the image build on unsupported clipboard APIs instead of shipping a
+# configuration that merely looks enabled. No browser permissions are granted.
+RUN /usr/bin/neko serve --help | grep -- '--desktop.clipboard.enabled' >/dev/null \
+  && grep -rl 'setClipboard' /var/www/js >/dev/null
 
 # ── Pinned code-server + bundled Copilot Chat (EZiL Chat) ────────────────────
 # Update the release and digest together; patches are exact-count gated against
