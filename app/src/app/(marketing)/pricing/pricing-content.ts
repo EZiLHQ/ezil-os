@@ -68,7 +68,7 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
             items: [
                 {
                     question: 'What is a session?',
-                    answer: `A session is one stretch of time while your computer is running. ${offers.map(offer => `${offer.name} sessions last up to ${hours(offer.sessionMaxSeconds)} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}`).join('; ')}. At the limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
+                    answer: `A session is one stretch of time while your computer is running. Free sessions last up to 1 hour. Standard and Premium: No session time limit. Fair use still applies to every plan. At the Free session limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
                 },
                 {
                     question: 'What does fair use mean?',

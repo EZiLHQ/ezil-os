@@ -13,20 +13,28 @@ import {
 } from './contract';
 import { epochSeconds, isoSeconds } from './time';
 
-export const rateWindow: RateWindow = ({ epochs, window, now }) => {
+export const rateWindow = ({ epochs, window, now, sessionMaxSeconds = SESSION_MAX_SECONDS, allowanceStdSeconds }: Parameters<RateWindow>[0] & {
+    sessionMaxSeconds?: number | null;
+    /** Required for uncapped sessions: a missed stop cannot exceed fair use. */
+    allowanceStdSeconds?: number;
+}): WindowUsage => {
+    if (sessionMaxSeconds === null && (allowanceStdSeconds === undefined || !Number.isFinite(allowanceStdSeconds) || allowanceStdSeconds < 0))
+        throw new RangeError('Uncapped rating requires a finite fair-use allowance');
     const start = epochSeconds(window.start);
     const end = epochSeconds(window.end);
     const current = epochSeconds(now);
     const usage: WindowUsage = { actualSecondsBySize: {}, stdSeconds: 0 };
 
-    for (const epoch of epochs) {
+    for (const epoch of [...epochs].sort((a, b) => Date.parse(a.readyAt) - Date.parse(b.readyAt))) {
         const weight = SIZES[epoch.size].weight;
         if (epoch.weight !== weight) throw new RangeError('Epoch weight does not match its size');
         const ready = epochSeconds(epoch.readyAt, 'ceil');
         const ended = epoch.endedAt === null ? current : epochSeconds(epoch.endedAt);
         // Cap before clipping, including closed epochs whose verified stop arrived late.
-        const boundedEnd = Math.min(ended, ready + SESSION_MAX_SECONDS);
-        const actual = Math.max(0, Math.min(boundedEnd, end) - Math.max(ready, start));
+        const boundedEnd = Math.min(ended, ready + (sessionMaxSeconds ?? Infinity));
+        const remainingActual = sessionMaxSeconds === null
+            ? Math.floor(Math.max(0, allowanceStdSeconds! - usage.stdSeconds) / weight) : Infinity;
+        const actual = Math.min(remainingActual, Math.max(0, Math.min(boundedEnd, end) - Math.max(ready, start)));
         if (actual === 0) continue;
         usage.actualSecondsBySize[epoch.size] = (usage.actualSecondsBySize[epoch.size] ?? 0) + actual;
         usage.stdSeconds += actual * weight;

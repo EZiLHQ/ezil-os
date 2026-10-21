@@ -14,10 +14,11 @@ const iso = (date: Date) => isoSeconds(epochSeconds(date));
 const sellable = (sku: string | null): sku is SellableSkuV3 => sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3';
 
 /** Standard seconds, using v2's validated epoch weights and session bounds. */
-export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineAt?: string | null })[], window: Window, now: Date): number {
-    return rateWindow({ epochs: epochs.map(epoch => ({ ...epoch,
+export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineAt?: string | null })[], window: Window, now: Date,
+    bounds: { sessionMaxSeconds?: number | null; allowanceStdSeconds?: number } = {}): number {
+    return rateWindow({ ...bounds, epochs: epochs.map(epoch => ({ ...epoch,
         endedAt: isoSeconds(Math.min(epochSeconds(epoch.endedAt ?? iso(now)), epochSeconds(now),
-            epoch.deadlineAt == null ? Infinity : epochSeconds(epoch.deadlineAt))),
+            bounds.sessionMaxSeconds === null || epoch.deadlineAt == null ? Infinity : epochSeconds(epoch.deadlineAt))),
     })), window, now: iso(now) }).stdSeconds;
 }
 
@@ -51,17 +52,27 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         && issue.resolvedAt === null && issue.issue !== 'voided' && issue.invoiceKind === 'subscription');
     const paymentIssue = issues.some(issue => issue.issue === 'requires_action') ? 'requires_action'
         : issues.length || plan.status === 'past_due' || plan.status === 'incomplete' ? 'payment_failed' : null;
-    const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now);
     const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants);
+    const bounds = { sessionMaxSeconds: plan.sessionMaxSeconds, allowanceStdSeconds: allowance };
+    const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now, bounds);
     const size = legacy ? SIZES[legacy.compute.selectedSize] : plan.sku === 'legacy' ? SIZES[plan.offer.defaultSize]
         : SIZES[input.sizePreference !== null && plan.offer.machineChoice.includes(input.sizePreference)
             ? input.sizePreference : plan.offer.size];
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
         .sort((a, b) => Date.parse(b.readyAt) - Date.parse(a.readyAt))[0];
+    // Recompute uncapped deadlines from period usage before this epoch. Old paid
+    // epochs may still carry a 2/6-hour session deadline; it is no longer a limit.
+    const priorUsage = latest && plan.sessionMaxSeconds === null ? usedSecondsInWindow(
+        input.epochs.filter(epoch => epoch.id !== latest.id), plan.window, new Date(latest.readyAt), bounds) : 0;
+    const fairDeadline = latest && plan.sessionMaxSeconds === null
+        ? allowance <= priorUsage ? epochSeconds(input.now)
+            : Math.max(epochSeconds(latest.readyAt, 'ceil'), epochSeconds(plan.window.start))
+                + Math.floor((allowance - priorUsage) / latest.weight)
+        : latest ? epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight) : Infinity;
     const activeDeadline = legacy ? legacy.compute.session.activeDeadline : latest ? isoSeconds(Math.min(
-        epochSeconds(latest.readyAt, 'ceil') + plan.sessionMaxSeconds,
-        latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
-        epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight),
+        epochSeconds(latest.readyAt, 'ceil') + (plan.sessionMaxSeconds ?? Infinity),
+        plan.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
+        fairDeadline,
     )) : null;
     const newest = new Map<string, typeof input.storage[number]>();
     for (const sample of input.storage) {

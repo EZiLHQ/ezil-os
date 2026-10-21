@@ -34,7 +34,7 @@ export function billingOfferByLookupKey(key: string) {
 }
 
 type LegacyPlan = ReturnType<typeof legacyPlan>;
-type CommonPlan = Omit<LegacyPlan, 'sku' | 'offer'> & { legacyFree: boolean; sessionMaxSeconds: number };
+type CommonPlan = Omit<LegacyPlan, 'sku' | 'offer'> & { legacyFree: boolean; sessionMaxSeconds: number | null };
 export type ResolvedPlanV3 = CommonPlan & (
     | { sku: PlanSkuV3; offer: PlanOfferV3; legacy: null }
     | { sku: 'legacy'; offer: PlanOffer; legacy: LegacyPlan }

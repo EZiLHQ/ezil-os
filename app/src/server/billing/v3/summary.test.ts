@@ -88,7 +88,7 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([epoch({ readyAt: '2026-10-09T23:00:00Z', endedAt: '2026-10-10T01:00:00Z' }), epoch()],
             { start: start.toISOString(), end: end.toISOString() }, now)).toBe(14400);
         const args = input('premium_monthly_v3'); args.epochs = [epoch()]; args.sizePreference = 'cmp-4';
-        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: 21600, opening: 'standard', activeDeadline: '2026-10-19T17:00:00Z' });
+        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: null, opening: 'standard', activeDeadline: '2026-10-29T21:00:00Z' });
     });
     it.each([[0.8, 'near'], [1, 'paused']] as const)('reports %s usage as %s', (ratio, status) => {
         const args = input('standard_monthly_v3');
@@ -118,4 +118,21 @@ describe('v3 summary', () => {
         const args = input(); args.storage = [{ computerId: 'c', bytes: BigInt(1), measuredAt: start }, { computerId: 'c', bytes: BigInt(10) ** BigInt(15), measuredAt: now }];
         expect(buildSummaryV3(args).storage).toMatchObject({ usedBytes: '1000000000000000', state: 'exhausted' });
     });
+});
+
+describe('paid fair-use exhaustion deadlines', () => {
+    it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
+        ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
+        '%s / %s stays anchored after a missed stop and ignores the retired session deadline', (sku, size, weight) => {
+            const args = input(sku);
+            args.grants[0]!.amount = BigInt(144000);
+            const readyAt = '2026-10-19T00:00:00Z';
+            args.epochs = [epoch({ id: 'prior', size: 'std-2', weight: 1, readyAt: '2026-10-18T00:00:00Z', endedAt: '2026-10-18T01:00:00Z' }),
+                epoch({ size, weight, readyAt, deadlineAt: '2026-10-19T02:00:00Z' })];
+            const deadline = new Date(Date.parse(readyAt) + (144000 - 3600) / weight * 1000).toISOString().replace('.000Z', 'Z');
+            for (const current of [new Date(readyAt), new Date(Date.parse(deadline) + 3600000)]) {
+                args.now = current;
+                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: deadline });
+            }
+        });
 });

@@ -1,3 +1,4 @@
+import { reconcilePaidCloudflareUsers } from '@/server/lib/compute/provider-migrate-reconcile';
 import { advanceStaleMigrations } from '@/server/lib/compute/provider-migrate-orchestrator';
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
 import { billingMeteringActive, loadComputeBillingState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
@@ -70,11 +71,14 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
 
     for (const epoch of policyCandidates) {
         const state = await stateFor(epoch.userId);
-        const maximum = Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
-        const deadline = Math.min(maximum, epoch.deadlineAt === null ? maximum : Date.parse(epoch.deadlineAt));
+        const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
+        const storedDeadline = state.sessionMaxSeconds === null && state.summary.version === 3
+            ? state.summary.computer.activeDeadline : epoch.deadlineAt;
+        const deadline = Math.min(maximum, storedDeadline === null ? Infinity : Date.parse(storedDeadline));
         const due = now.getTime() >= deadline;
         let reason: SweepReason;
-        if (due && deadline === maximum) reason = 'session_max';
+        if (state.paymentIssue) reason = 'allowance_exhausted';
+        else if (state.sessionMaxSeconds !== null && due && deadline === maximum) reason = 'session_max';
         else {
             const overageOn = state.family === 'compute' && state.overage?.enabled === true;
             if (!due) {
@@ -104,6 +108,8 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         const recent = await deps.store.policyClosedEpochsSince(new Date(now.getTime() - RETRY_WINDOW_MS), limit);
         for (const epoch of recent) {
             if (attempted.has(epoch.computerId)) continue;
+            // A close under the retired paid cap must not stop a still-running job.
+            if (epoch.endReason === 'session_max' && (await stateFor(epoch.userId)).sessionMaxSeconds === null) continue;
             const computer = { userId: epoch.userId, computerId: epoch.computerId };
             let running = false;
             try { running = await isStillRunning(computer); } catch { /* No blind retries on an unavailable status. */ }
@@ -113,5 +119,6 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         }
     }
     await advanceStaleMigrations(startedAt);
+    await reconcilePaidCloudflareUsers(startedAt);
     return counts;
 }

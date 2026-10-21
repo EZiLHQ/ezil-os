@@ -264,7 +264,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
             .toEqual({ status: 'exists', epoch: opened.epoch });
     });
 
-    it.each([-1, 21601])('raw SQL cannot store an out-of-bounds deadline (%s seconds)', async seconds => {
+    it.each([-1])('raw SQL cannot store a deadline before readiness (%s seconds)', async seconds => {
         await rejectsSql(() => client`insert into ezil_billing_compute_epochs
             (user_id, computer_id, size, weight, ready_at, deadline_at)
             values (${userId}::uuid, ${computerId}::uuid, 'std-2', 1,
@@ -628,3 +628,16 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         expect(await store.userCreatedAt(randomUUID())).toBeNull();
     });
 });
+
+it.each([[undefined, 21600], [null, 144000], [3600, 3600]] as const)(
+    'stores admission deadline with session cap %s', async (sessionMaxSeconds, seconds) => {
+        const where = vi.fn().mockResolvedValueOnce([{ id: 'c' }]).mockResolvedValue([]);
+        const values = vi.fn((row: Record<string, unknown>) => ({ onConflictDoNothing: () => ({ returning: async () => [{
+            ...row, id: 'epoch', endedAt: null, endReason: null, lastHeartbeatAt: null, overheadSeconds: 0,
+        }] }) }));
+        const db = { select: () => ({ from: () => ({ where }) }), insert: () => ({ values }) } as unknown as Database;
+        const result = await createBillingStore(db).openEpoch({ userId: 'u', computerId: 'c', subscriptionId: 'sub',
+            size: 'std-2', readyAt: instant(0), deadlineAt: instant(144000), sessionMaxSeconds });
+        expect(result.epoch.deadlineAt).toBe(instant(seconds).toISOString().replace('.000Z', 'Z'));
+        expect(values.mock.calls[0]![0]).not.toHaveProperty('sessionMaxSeconds');
+    });

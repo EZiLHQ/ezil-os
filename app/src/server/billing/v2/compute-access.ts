@@ -15,7 +15,7 @@ import { epochSeconds, isoSeconds } from './time';
 
 export interface ComputeBillingState {
     planSku: PlanSku | PlanSkuV3;
-    sessionMaxSeconds: number;
+    sessionMaxSeconds: number | null;
     v3?: { sku: PlanSkuV3; legacyFree: boolean };
     subscriptionId: string | null;
     openEpochs: readonly ComputeEpoch[];
@@ -64,7 +64,7 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             planActive: resolved.planActive, delinquent: resolved.status === 'past_due' || resolved.status === 'incomplete',
             paymentIssue, upgradePending: summary.plan.pendingUpgrade !== null,
             entitledSize: summary.computer.size, provider: resolved.offer.provider, window: resolved.window,
-            usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now),
+            usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now, { sessionMaxSeconds: resolved.sessionMaxSeconds, allowanceStdSeconds: fairUseAllowance(resolved, grants) }),
             allowanceStdSeconds: fairUseAllowance(resolved, grants), overage: null, summary,
         };
     }
@@ -154,6 +154,7 @@ export async function openComputeEpochAtReady({ deps, userId, computerId, size, 
         const deadlineAt = new Date(readyAt.getTime() + (decision.admit ? decision.maxRunSeconds : 0) * 1000);
         const opened = await deps.store.openEpoch({
             userId, computerId, subscriptionId: state.subscriptionId, size, readyAt, deadlineAt, overheadSeconds,
+            ...(state.sessionMaxSeconds === null ? { sessionMaxSeconds: null } : {}),
         });
         if (opened.status === 'concurrent') console.info('[billing.epoch] concurrent', {
             userId, computerId, runningComputerId: opened.epoch.computerId,

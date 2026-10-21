@@ -7,6 +7,9 @@ import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 import { handleBillingSessionSweep } from './handler';
 
+vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
+vi.mock('@/server/lib/compute/provider-migrate-reconcile', () => ({ reconcilePaidCloudflareUsers: vi.fn() }));
+
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
 const T = new Date('2026-10-18T00:00:00Z');
@@ -143,11 +146,11 @@ describe('billing session sweep', () => {
 
     it('Free without headroom closes at detection time', async () => {
         const f = fixture([
-            epoch({ id: 'past', computerId: 'past', readyAt: iso(-28800), endedAt: iso(0), endReason: 'session_max', size: 'cmp-8', weight: 4 }),
+            ...Array.from({ length: 8 }, (_, i) => epoch({ id: `past-${i}`, computerId: `past-${i}`, readyAt: iso(-3600 * (i + 1)), endedAt: iso(-3600 * i), endReason: 'session_max', size: 'free-cf', weight: 1 })),
             epoch({ size: 'free-cf', lastHeartbeatAt: iso(100) }),
         ], { sku: null });
         await f.run(100);
-        expect(f.epochs[1]).toMatchObject({ endedAt: iso(100), endReason: 'allowance_exhausted' });
+        expect(f.epochs[8]).toMatchObject({ endedAt: iso(100), endReason: 'allowance_exhausted' });
     });
 
     it('Compute overage continues past its allowance until the billable cap is reached', async () => {
@@ -292,7 +295,7 @@ describe('v3 session deadlines', () => {
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'allowance_exhausted' });
     });
 
-    it.each([[null, 3600], ['standard_monthly_v3', 7200], ['premium_monthly_v3', 21600]] as const)
+    it.each([[null, 3600]] as const)
     ('stops %s exactly at its plan cap, even with no stored deadline', async (sku, cap) => {
         const f = fixture([epoch()], { sku, allowance: 1800000 });
         expect(await f.run(cap - 1)).toMatchObject({ stopped: 0 });
@@ -305,5 +308,49 @@ describe('v3 session deadlines', () => {
         f.store.grantsForPeriod.mockResolvedValue([]);
         await f.run(200);
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(200), endReason: 'allowance_exhausted' });
+    });
+});
+
+describe('paid sessions have no time cap', () => {
+    it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
+        ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
+        '%s / %s ignores 2h and 6h, stopping exactly at fair-use exhaustion', async (sku, size, weight) => {
+            const allowance = 144000, deadline = allowance / weight;
+            const f = fixture([epoch({ size, weight, deadlineAt: iso(sku === 'standard_monthly_v3' ? 7200 : 21600) })], { sku, allowance });
+            for (const seconds of [7200, 21600, deadline - 1]) expect(await f.run(seconds)).toMatchObject({ stopped: 0 });
+            expect(await f.run(deadline)).toMatchObject({ stopped: 1, closed: 1 });
+            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
+            expect(f.epochs[0]).toMatchObject({ endedAt: iso(deadline), endReason: 'allowance_exhausted' });
+        });
+    it('a late failed provider stop still closes at fair-use exhaustion', async () => {
+        const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 144000 });
+        f.stop.mockRejectedValue(new Error('missed stop'));
+        await f.run(144000);
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(36000), endReason: 'allowance_exhausted' });
+    });
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'])('does not retry the retired session cap for %s', async sku => {
+        const f = fixture([epoch({ endedAt: iso(7200), endReason: 'session_max' })], { sku });
+        f.isStillRunning.mockResolvedValue(true);
+        await f.run(7201);
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.isStillRunning).not.toHaveBeenCalled();
+    });
+    it('stops a paid session with a subscription payment issue before fair use', async () => {
+        const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
+        f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in', userId: ref.userId, subscriptionId: 'sub',
+            invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: T, updatedAt: T, resolvedAt: null }]);
+        await f.run(10);
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
+        expect(f.epochs[0].endedAt).toBe(iso(10));
+    });
+    it('runs reconciliation after existing migration work with the original launch budget', async () => {
+        const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
+        const { reconcilePaidCloudflareUsers } = await import('@/server/lib/compute/provider-migrate-reconcile');
+        vi.mocked(advanceStaleMigrations).mockClear(); vi.mocked(reconcilePaidCloudflareUsers).mockClear();
+        vi.spyOn(Date, 'now').mockReturnValue(1234);
+        await fixture().run(1);
+        expect(advanceStaleMigrations).toHaveBeenCalledExactlyOnceWith(1234);
+        expect(reconcilePaidCloudflareUsers).toHaveBeenCalledExactlyOnceWith(1234);
+        expect(vi.mocked(advanceStaleMigrations).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(reconcilePaidCloudflareUsers).mock.invocationCallOrder[0]!);
     });
 });

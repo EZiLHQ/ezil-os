@@ -288,7 +288,7 @@ function openV3DowngradeSheet (options) {
 /** Called only with a confirmed limit stop; a deadline alone is not proof. */
 export function openSessionEndSheet (options) {
     const { summary, reason } = options;
-    if ( reason !== 'session_max' || summary?.version !== 3 || ! summary.enabled ) return null;
+    if ( reason !== 'session_max' || summary?.version !== 3 || ! summary.enabled || summary.plan.sku !== 'free_v3' ) return null;
     const free = summary.plan.sku === 'free_v3';
     const target = free ? 'standard_monthly_v3' : summary.plan.sku === 'standard_monthly_v3' ? 'premium_monthly_v3' : null;
     const action = free ? 'checkout' : 'upgrade';
@@ -297,7 +297,7 @@ export function openSessionEndSheet (options) {
     const sheet = billingSheet(options, action, 'Your session ended');
     if ( sheet.existing ) return null;
     sheet.dialog.dataset.sheet = 'session-end';
-    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name} gives you ${offer.sessionMaxSeconds / 3600}-hour sessions — ${money(offer.priceCents)}/month.`);
+    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name}: No session time limit — ${money(offer.priceCents)}/month.`);
     offerDetails(sheet, offer);
     sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');
     sheet.button(free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {
