@@ -11,14 +11,17 @@ services:
       AWS_REGION: ap-south-1
     restart: unless-stopped
     init: true
-    expose: ['3000']
+    # Host networking: the minimal host has no iptables/nft, so dockerd runs with
+    # --bridge=none. The app binds loopback only; Caddy is the public edge.
+    network_mode: host
+    command: ["node", "node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", "3000"]
     logging: &logging
       driver: json-file
       options: {max-size: '10m', max-file: '3'}
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
-    ports: ['80:80', '443:443']
+    network_mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

@@ -8,5 +8,5 @@ os-staging.ezil.work {
     request_body {
         max_size 2MB
     }
-    reverse_proxy web:3000
+    reverse_proxy 127.0.0.1:3000
 }
