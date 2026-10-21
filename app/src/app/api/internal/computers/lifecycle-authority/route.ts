@@ -2,7 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import { db } from '@/server/db';
-import { PlacementIntegrityError, readPlacement, type PlacementState } from '@/server/lib/compute/placement';
+import { PlacementIntegrityError, readLifecyclePlacement, type PlacementState } from '@/server/lib/compute/placement';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -66,7 +66,8 @@ export async function POST(req: Request): Promise<Response> {
     const authority = parsed.data;
 
     try {
-        const { record } = await readPlacement(db, authority.computerId);
+        // Migration-aware: a computer moving to AWS is authorised for its hidden launch intent only.
+        const { record } = await readLifecyclePlacement(db, authority.computerId);
         if (!record || record.provider !== 'aws-ec2'
             || record.lifecycleJobId !== authority.jobId
             || record.lifecycleDigest !== authority.digest
