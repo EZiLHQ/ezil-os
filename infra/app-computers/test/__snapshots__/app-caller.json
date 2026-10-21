@@ -32,11 +32,6 @@
             "Statement": [
               {
                 "Action": "states:StartExecution",
-                "Condition": {
-                  "StringEquals": {
-                    "states:StateMachineQualifier": "1"
-                  }
-                },
                 "Effect": "Allow",
                 "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle"
               },
@@ -175,11 +170,6 @@
             "Statement": [
               {
                 "Action": "states:StartExecution",
-                "Condition": {
-                  "StringEquals": {
-                    "states:StateMachineQualifier": "1"
-                  }
-                },
                 "Effect": "Allow",
                 "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle"
               },

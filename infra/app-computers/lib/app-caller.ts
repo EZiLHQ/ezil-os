@@ -57,18 +57,19 @@ export const AppCallerConfigSchema = z.object({
 });
 export type AppCallerConfig = z.infer<typeof AppCallerConfigSchema>;
 
-/** `states:StartExecution` of exactly these VERSION ARNs. Step Functions authorizes a
- * version (or alias) call against the UNQUALIFIED state machine ARN, so a version ARN
- * as the resource never matches (live AccessDenied, ezil-mum 2026-10-21). The version is
- * pinned with `states:StateMachineQualifier`, which an unqualified call does not carry,
- * so the unqualified (latest revision) start stays denied. */
+/** `states:StartExecution` for these VERSION ARNs' state machines. Step Functions authorizes
+ * a version-ARN start against the UNQUALIFIED machine ARN, and (measured live, ezil-mum
+ * 2026-10-21) neither a `:N`/`:*` resource nor a `states:StateMachineQualifier` condition
+ * ever matches StartExecution, despite the docs. So IAM grants the machine; the exact
+ * version is enforced by the caller (app aws-clients.ts refuses any non-version ARN). */
 export function startVersionStatements(versionArns: string[]): iam.PolicyStatement[] {
-    return versionArns.map(v => {
-        const m = /^(arn:aws:states:[a-z0-9-]+:\d{12}:stateMachine:[A-Za-z0-9_-]{1,80}):([1-9][0-9]*)$/.exec(v);
+    const machines: string[] = [];
+    for (const v of versionArns) {
+        const m = /^(arn:aws:states:[a-z0-9-]+:\d{12}:stateMachine:[A-Za-z0-9_-]{1,80}):[1-9][0-9]*$/.exec(v);
         if (!m) throw new Error('invalid_version_arn');
-        return new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [m[1]!],
-            conditions: { StringEquals: { 'states:StateMachineQualifier': m[2]! } } });
-    });
+        if (!machines.includes(m[1]!)) machines.push(m[1]!);
+    }
+    return [new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: machines })];
 }
 
 /** The policy of the app caller, exported for exact-equality tests:
