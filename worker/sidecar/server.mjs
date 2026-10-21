@@ -41,7 +41,8 @@
  */
 
 import { createServer } from 'node:http';
-import { BrowserSurface } from './browser.mjs';
+import { pathToFileURL } from 'node:url';
+import { ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
 
@@ -57,134 +58,148 @@ const MAX_BODY_BYTES = 256 * 1024;
 /** The complete set of routes. `VERBS` keys are `"<METHOD> <path>"`. */
 export const ROUTES = Object.keys(VERBS);
 
-const surface = new BrowserSurface(CDP_URL);
-
-/**
- * Serialise, REDACT, and write. Nothing else in this process writes a body.
- *
- * The secret set is gathered here rather than being passed in, because a
- * handler that threw halfway is exactly the case where the caller most needs
- * this to still happen — `surface.allSecrets()` falls back to the values this
- * process has typed when the page can no longer be read at all.
- */
-async function respond (res, status, payload) {
-    const secrets = await surface.allSecrets();
-    const safe = redactDeep(payload, secrets);
-    const body = Buffer.from(JSON.stringify(safe), 'utf8');
-    res.writeHead(status, {
-        'content-type': 'application/json; charset=utf-8',
-        'content-length': String(body.length),
-        'cache-control': 'no-store',
-    });
-    res.end(body);
-}
-
-function errorPayload (code, message) {
-    return { ok: false, error: code, detail: message };
-}
-
-function readBody (req) {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        let size = 0;
-        req.on('data', (chunk) => {
-            size += chunk.length;
-            if (size > MAX_BODY_BYTES) {
-                reject(Object.assign(new Error('request body too large'), { httpStatus: 413, code: 'bad_request' }));
-                req.destroy();
-                return;
-            }
-            chunks.push(chunk);
+/** Construct without binding or connecting, so the HTTP boundary can be tested offline. */
+export function createSidecarServer (surface) {
+    /**
+     * Serialise, REDACT, and write. Nothing else in this process writes a body.
+     *
+     * The secret set is gathered here rather than being passed in, because a
+     * handler that threw halfway is exactly the case where the caller most needs
+     * this to still happen — `surface.allSecrets()` falls back to the values this
+     * process has typed when the page can no longer be read at all.
+     */
+    async function respond (res, status, payload) {
+        const secrets = await surface.allSecrets();
+        const safe = redactDeep(payload, secrets);
+        const body = Buffer.from(JSON.stringify(safe), 'utf8');
+        res.writeHead(status, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(body.length),
+            'cache-control': 'no-store',
         });
-        req.on('end', () => resolve(Buffer.concat(chunks)));
-        req.on('error', reject);
-    });
-}
-
-const server = createServer((req, res) => {
-    void handle(req, res).catch(async (err) => {
-        try {
-            await respond(res, 200, errorPayload('chrome_unreachable', String(err && err.message ? err.message : err)));
-        } catch { /* the socket is already gone */ }
-    });
-});
-
-async function handle (req, res) {
-    const method = (req.method || 'GET').toUpperCase();
-    // Query strings and trailing slashes are normalised away so a caller
-    // cannot reach a verb by a path the contract does not name.
-    const path = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
-    const key = `${method} ${path}`;
-
-    const handler = VERBS[key];
-    if (!handler) {
-        // A path that exists under another method is a 405, so a caller that
-        // GETs a POST verb is told what is wrong rather than that it invented
-        // the verb.
-        const otherMethod = ROUTES.some((r) => r.endsWith(` ${path}`));
-        return respond(
-            res,
-            otherMethod ? 405 : 404,
-            errorPayload('bad_request', otherMethod
-                ? `${path} is ${ROUTES.find((r) => r.endsWith(` ${path}`))}`
-                : `no such verb: ${key}. This surface is a fixed verb set (${ROUTES.join(', ')}) and has no CDP passthrough.`),
-        );
+        res.end(body);
     }
 
-    let body = {};
-    if (method !== 'GET') {
-        let raw;
-        try {
-            raw = await readBody(req);
-        } catch (err) {
-            return respond(res, err.httpStatus ?? 400, errorPayload('bad_request', err.message));
-        }
-        if (raw.length > 0) {
+    function errorPayload (code) {
+        // Return a value from the fixed contract, never an exception's own string.
+        const safeCode = ERROR_CODES.find((known) => known === code) ?? 'chrome_unreachable';
+        return { ok: false, error: safeCode, detail: 'Request failed.' };
+    }
+
+    function readBody (req) {
+        return new Promise((resolve, reject) => {
+            const chunks = [];
+            let size = 0;
+            req.on('data', (chunk) => {
+                size += chunk.length;
+                if (size > MAX_BODY_BYTES) {
+                    reject(Object.assign(new Error('request body too large'), { httpStatus: 413, code: 'bad_request' }));
+                    req.destroy();
+                    return;
+                }
+                chunks.push(chunk);
+            });
+            req.on('end', () => resolve(Buffer.concat(chunks)));
+            req.on('error', reject);
+        });
+    }
+
+    const server = createServer((req, res) => {
+        void handle(req, res).catch(async (err) => {
+            console.error('[ezil-sidecar] request failed:', err);
             try {
-                body = JSON.parse(raw.toString('utf8'));
+                await respond(res, 200, errorPayload('chrome_unreachable'));
+            } catch { /* the socket is already gone */ }
+        });
+    });
+
+    async function handle (req, res) {
+        const method = (req.method || 'GET').toUpperCase();
+        // Query strings and trailing slashes are normalised away so a caller
+        // cannot reach a verb by a path the contract does not name.
+        const path = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
+        const key = `${method} ${path}`;
+
+        const handler = VERBS[key];
+        if (!handler) {
+            // A path that exists under another method is a 405, so a caller that
+            // GETs a POST verb is told what is wrong rather than that it invented
+            // the verb.
+            const otherMethod = ROUTES.some((r) => r.endsWith(` ${path}`));
+            return respond(
+                res,
+                otherMethod ? 405 : 404,
+                errorPayload('bad_request'),
+            );
+        }
+
+        let body = {};
+        if (method !== 'GET') {
+            let raw;
+            try {
+                raw = await readBody(req);
             } catch (err) {
-                return respond(res, 200, errorPayload('bad_request', `body is not JSON: ${err.message}`));
+                console.error('[ezil-sidecar] body read failed:', err);
+                return respond(res, err?.httpStatus === 413 ? 413 : 400, errorPayload('bad_request'));
+            }
+            if (raw.length > 0) {
+                try {
+                    body = JSON.parse(raw.toString('utf8'));
+                } catch (err) {
+                    console.error('[ezil-sidecar] invalid JSON:', err);
+                    return respond(res, 200, errorPayload('bad_request'));
+                }
+            }
+            if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+                return respond(res, 200, errorPayload('bad_request'));
             }
         }
-        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-            return respond(res, 200, errorPayload('bad_request', 'body must be a JSON object'));
+
+        try {
+            const payload = await handler(surface, body);
+            return respond(res, 200, payload);
+        } catch (err) {
+            console.error('[ezil-sidecar] verb failed:', err);
+            return respond(res, 200, errorPayload(err?.code));
         }
     }
 
-    try {
-        const payload = await handler(surface, body);
-        return respond(res, 200, payload);
-    } catch (err) {
-        const code = err && err.code ? err.code : 'chrome_unreachable';
-        const detail = err && err.message ? err.message : String(err);
-        return respond(res, 200, errorPayload(code, detail));
+    return server;
+}
+
+async function startServer () {
+    const { BrowserSurface } = await import('./browser.mjs');
+    const surface = new BrowserSurface(CDP_URL);
+    const server = createSidecarServer(surface);
+    server.listen(PORT, HOST, () => {
+        console.log(`[ezil-sidecar] listening on ${HOST}:${PORT}, CDP ${CDP_URL}`);
+        console.log(`[ezil-sidecar] verbs: ${ROUTES.join(', ')}`);
+        console.log('[ezil-sidecar] no CDP passthrough verb exists; none may be added');
+        // Warm the connection so `/health` answers truthfully on the first call
+        // instead of reporting a disconnected browser that is in fact fine.
+        surface.connect().then(
+            () => console.log('[ezil-sidecar] connected to Chrome over CDP'),
+            (err) => console.log(`[ezil-sidecar] Chrome not reachable yet: ${err.message}`),
+        );
+    });
+
+    // A sidecar that cannot bind must not take the boot down with it — the
+    // launcher in start-neko.sh already treats a missing listener as a skipped
+    // phase. Log and exit, so the supervisor's picture is accurate.
+    server.on('error', (err) => {
+        console.error(`[ezil-sidecar] listen failed: ${err.message}`);
+        process.exit(1);
+    });
+
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+        process.on(signal, () => {
+            console.log(`[ezil-sidecar] ${signal} — closing`);
+            server.close(() => process.exit(0));
+            setTimeout(() => process.exit(0), 2000).unref();
+        });
     }
 }
 
-server.listen(PORT, HOST, () => {
-    console.log(`[ezil-sidecar] listening on ${HOST}:${PORT}, CDP ${CDP_URL}`);
-    console.log(`[ezil-sidecar] verbs: ${ROUTES.join(', ')}`);
-    console.log('[ezil-sidecar] no CDP passthrough verb exists; none may be added');
-    // Warm the connection so `/health` answers truthfully on the first call
-    // instead of reporting a disconnected browser that is in fact fine.
-    surface.connect().then(
-        () => console.log('[ezil-sidecar] connected to Chrome over CDP'),
-        (err) => console.log(`[ezil-sidecar] Chrome not reachable yet: ${err.message}`),
-    );
-});
-
-// A sidecar that cannot bind must not take the boot down with it — the
-// launcher in start-neko.sh already treats a missing listener as a skipped
-// phase. Log and exit, so the supervisor's picture is accurate.
-server.on('error', (err) => {
-    console.error(`[ezil-sidecar] listen failed: ${err.message}`);
-    process.exit(1);
-});
-
-for (const signal of ['SIGTERM', 'SIGINT']) {
-    process.on(signal, () => {
-        console.log(`[ezil-sidecar] ${signal} — closing`);
-        server.close(() => process.exit(0));
-        setTimeout(() => process.exit(0), 2000).unref();
-    });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+    await startServer();
 }

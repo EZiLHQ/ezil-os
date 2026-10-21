@@ -23,7 +23,7 @@
  */
 
 import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
 // shapes are only what `@cloudflare/sandbox` destructures at import time.
@@ -140,6 +140,7 @@ function fakeSandboxNamespace(options: {
    * only proves the ROUTE TABLE (auth, kill switch, response mapping).
    */
   restartResult?: Record<string, unknown>;
+  restartThrows?: unknown;
   /** Canned `resetRuntimeForAcceptance` answer (default: the reset is scheduled). */
   resetResult?: Record<string, unknown>;
   /** Make `resetRuntimeForAcceptance` throw, as an object on an older revision does. */
@@ -308,6 +309,7 @@ function fakeSandboxNamespace(options: {
       );
     },
     restartDesktopStack: async (...args: unknown[]) => {
+      if ('restartThrows' in options) throw options.restartThrows;
       const [hostname, sandboxId, explicitMode, fallbackMode] = args as [string, string, unknown, unknown];
       calls.restartDesktopStack.push({ hostname, sandboxId, explicitMode, fallbackMode });
       return (
@@ -3787,4 +3789,65 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(values.has(AI_PROXY_NONCE_STORAGE_KEY)).toBe(false);
   });
 
+});
+
+
+describe('Worker JSON error response boundary', () => {
+  it('returns internal_error for thrown messages and strings, logging details only on the server', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const thrown of [new Error('private SDK message\n    at /srv/private.ts:42'), 'private_code_shaped_secret']) {
+        const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(res.status).toBe(500);
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: 'internal_error' });
+        expect(text).not.toContain('private');
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown instanceof Error ? thrown.message : thrown);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('strips diagnostic suffixes, preserves protocol codes, and logs the original detail', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [input, output] of [
+        ['focus_switch_failed: PRIVATE_MESSAGE', 'focus_switch_failed'],
+        ['screen_upstream_418', 'screen_upstream_418'],
+        ['screen_upstream_999 PRIVATE_MESSAGE', 'internal_error'],
+        ['acceptance_fault_bad_request', 'acceptance_fault_bad_request'],
+        ['head_moved', 'head_moved'],
+      ]) {
+        const { binding } = fakeSandboxNamespace({ restartResult: { ok: false, error: input } });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(await res.json()).toMatchObject({ ok: false, error: output });
+        if (input !== output) expect(logs).toHaveBeenCalledWith('[worker] response error:', input);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('removes nested diagnostic fields while preserving trusted public error codes', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { binding } = fakeSandboxNamespace({ restartResult: {
+        ok: false, error: 'migrating', detail: 'PRIVATE_DETAIL', message: 'PRIVATE_MESSAGE', stack: 'PRIVATE_STACK',
+        steps: [{ error: new Error('PRIVATE_ERROR'), detail: 'PRIVATE_NESTED_DETAIL' }],
+      } });
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+        { Sandbox: binding },
+      );
+      expect(res.status).toBe(409);
+      const text = await res.text();
+      expect(text).not.toContain('PRIVATE');
+      expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: 'migrating', steps: [{ error: 'internal_error' }] });
+      expect(logs.mock.calls.length).toBeGreaterThan(0);
+    } finally { logs.mockRestore(); }
+  });
 });
