@@ -26,7 +26,7 @@ import { SHELL_APPS, SHELL_API_ROUTES as APP_SHELL_API_ROUTES } from '../../../a
 import { OS_ASSET_PATHS } from '../boot/os-document.ts';
 import { loadConfig, SHELL_ASSET_FILES, type LocalConfig } from '../config.ts';
 import { localUrlFor } from '../container/run-spec.ts';
-import { SHELL_API_ROUTES } from '../contract/shell-api.ts';
+import { SHELL_API_ROUTES, SHELL_API_ROUTE_KEYS } from '../contract/shell-api.ts';
 import { FakeSandboxHost, healthyFakeState, type FakeHostState } from './fake-host.ts';
 import {
     LOCAL_FOCUSABLE_APPS,
@@ -37,8 +37,14 @@ import {
 } from './routes.ts';
 import { startLocalServer, type LocalServer } from './server.ts';
 
-// Direct loopback media does not have Cloudflare TURN credentials to renew.
-const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_SHELL_API_ROUTES } = APP_SHELL_API_ROUTES;
+// Local mode has neither hosted TURN credentials nor recorded cloud machine
+// metadata. Keep the unsupported routes explicit so new app routes still fail
+// the shared-contract comparison until their local support is decided.
+const {
+    relayRefresh: HOSTED_RELAY_ROUTE,
+    system: HOSTED_SYSTEM_ROUTE,
+    ...COMMON_SHELL_API_ROUTES
+} = APP_SHELL_API_ROUTES;
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 
@@ -106,7 +112,7 @@ describe('the published endpoint map and the served paths are the same nine', ()
         // nothing of Next.js is loaded. Same technique as
         // `../contract/shell-api.test.ts`.
         expect(Object.keys(SHELL_API_ROUTES).sort()).toEqual(Object.keys(COMMON_SHELL_API_ROUTES).sort());
-        for (const key of Object.keys(COMMON_SHELL_API_ROUTES) as (keyof typeof COMMON_SHELL_API_ROUTES)[]) {
+        for (const key of SHELL_API_ROUTE_KEYS) {
             expect(SHELL_API_ROUTES[key]).toBe(COMMON_SHELL_API_ROUTES[key]);
         }
     });
@@ -133,6 +139,13 @@ describe('the published endpoint map and the served paths are the same nine', ()
         const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
         expect(body.desktopState.endpoints.relayRefresh).toBeUndefined();
         expect((await get(HOSTED_RELAY_ROUTE)).status).toBe(404);
+    });
+
+    it('does not advertise or serve hosted machine metadata', async () => {
+        const res = await post(SHELL_API_ROUTES.session, {});
+        const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
+        expect(body.desktopState.endpoints.system).toBeUndefined();
+        expect((await get(`${HOSTED_SYSTEM_ROUTE}?computerId=${computerId()}`)).status).toBe(404);
     });
 });
 
