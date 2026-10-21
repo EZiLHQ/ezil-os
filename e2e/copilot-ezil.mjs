@@ -172,9 +172,16 @@ try {
   await aux.screenshot({ path: join(OUT, 'welcome.png') }).catch(() => {});
   const brandingBoot = await visibleBranding();
   check('no visible "Copilot" / "GitHub" text anywhere in the workbench after boot', brandingBoot.length === 0, JSON.stringify(brandingBoot.slice(0, 4)));
-  const statusEntry = page.locator('.statusbar-item[id="chat.statusBarEntry"] a, .statusbar-item[id="chat.statusBarEntry"]').first();
-  const statusAria = await statusEntry.getAttribute('aria-label').catch(() => null);
-  check('status-bar chat item is labelled "EZiL Chat status"', statusAria === 'EZiL Chat status', `aria-label=${JSON.stringify(statusAria)}`);
+  // R2-D: the Copilot-entitlement status entry ("Copilot Free", "Chat messages Limited")
+  // is suppressed; the EZiL AI item (real Gateway credits/usage) replaces it.
+  const oldEntryCount = await page.locator('.statusbar-item[id="chat.statusBarEntry"]').count();
+  check('Copilot plan/quota status-bar entry is not shown', oldEntryCount === 0, `count=${oldEntryCount}`);
+  const statusEntry = page.locator('.statusbar-item[id$="ezil-models.aiStatus"]').first();
+  await statusEntry.waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
+  const statusAria = await statusEntry.locator('a').first().getAttribute('aria-label').catch(() => null)
+    ?? await statusEntry.getAttribute('aria-label').catch(() => null);
+  const aiItemText = clean(await statusEntry.innerText().catch(() => ''));
+  check('status bar shows the EZiL AI item', /EZiL AI/.test(`${aiItemText} ${statusAria ?? ''}`), `text=${JSON.stringify(aiItemText)} aria-label=${JSON.stringify(statusAria)}`);
   if (await statusEntry.count()) {
     await statusEntry.hover().catch(() => {}); await page.waitForTimeout(1500);
     const hover = clean(await page.locator('.workbench-hover, .monaco-hover').first().innerText().catch(() => ''));

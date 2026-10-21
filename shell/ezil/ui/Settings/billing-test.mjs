@@ -753,7 +753,8 @@ try {
     contains('[data-role="billing-action-error"]', errorTable.customer_conflict);
     mutation = () => { throw new Error('network down'); }; click(portal); await settle();
     contains('[data-role="billing-action-error"]', fallback);
-    assert.equal(opened.some(([url]) => url.startsWith('javascript:')), false);
+    // Allow-list, not a deny-list: only https: may ever be opened (javascript:, data:, vbscript: all refused).
+    assert.equal(opened.every(([url]) => new URL(url).protocol === 'https:'), true);
     pass('all payment banners, click-time invoice precedence, portal gating and unsafe-URL rejection');
 
     history = Array.from({ length: 14 }, (_, i) => ({ ...invoice(['subscription', 'overage', 'other'][i % 3], `2026-10-${String(i + 1).padStart(2, '0')}T12:00:00Z`, i === 13 ? 'paid' : 'open'), id: `in_${i}`, description: `Invoice ${i}`, url: `https://invoice.example.test/${i}` }));
