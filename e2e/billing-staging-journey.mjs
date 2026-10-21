@@ -447,10 +447,12 @@ async function terminalRun(page, frame, script, runId, phase) {
     await frame.locator('body').press('Control+Backquote');
   }
   await command(frame, 'Terminal: Focus Terminal', 'workbench.action.terminal.focus');
+  // Focus the terminal the way a user does (click its screen); typing then goes to the
+  // focused xterm input. Targeting the helper textarea by locator did not deliver keys.
   const terminal = frame.locator('.terminal:visible').last();
-  const input = terminal.locator('.xterm-helper-textarea').last();
-  await input.waitFor({ state: 'attached' });
-  await input.focus();
+  // Shell-integration command decorations overlay the screen; a user click still focuses it.
+  await terminal.locator('.xterm-screen').last().click({ force: true });
+  const input = { pressSequentially: (text, opts) => page.keyboard.type(text, opts), press: key => page.keyboard.press(key) };
   const begin = `E2E_BEGIN_${phase}_${runId}`, end = `E2E_END_${phase}_${runId}`;
   // The terminal renders on a canvas (no DOM text), so the output goes to an absolute
   // /tmp file that Quick Open opens; Monaco renders file lines as DOM text.
