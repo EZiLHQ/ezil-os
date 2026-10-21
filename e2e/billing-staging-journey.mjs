@@ -462,8 +462,10 @@ async function terminalRun(page, frame, script, runId, phase) {
   await input.press('Enter');
   return until(async () => {
     await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
-    await frame.locator('body').press('Control+P');
+    // Ctrl+P is not delivered through the frame; the palette (Ctrl+Shift+P) without '>' is file Quick Open.
+    await frame.locator('body').press('Control+Shift+P');
     const quick = frame.locator('.quick-input-widget input:visible').first();
+    await quick.waitFor({ state: 'visible', timeout: 5000 });
     await quick.fill(out);
     await sleep(800);
     await quick.press('Enter');
