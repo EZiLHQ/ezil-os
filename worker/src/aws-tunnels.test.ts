@@ -504,3 +504,32 @@ describe('registry protocol and the internal route', () => {
     expect(isPublicIpv4('13.200.1.2')).toBe(true);
   });
 });
+
+
+describe('AWS AI boot nonce', () => {
+  it('is random, stable under concurrent retry, rotates on boot/epoch, and refuses fenced or mismatched leases', async () => {
+    const storage = memStorage(); const { api } = fakeApi();
+    const svc = createAwsTunnelService({ storage, api, zone: ZONE });
+    const boot = '11111111-1111-4111-8111-111111111111';
+    expect(await svc.aiNonce(1, 2, boot)).toBeNull();
+    await svc.create(claims(), body());
+    expect(await svc.aiNonce(1, 2, 'container-choice')).toBeNull();
+    expect(await svc.aiNonce(2, 2, boot)).toBeNull();
+    expect(await svc.aiNonce(1, 3, boot)).toBeNull();
+    const [one, retry] = await Promise.all([svc.aiNonce(1, 2, boot), svc.aiNonce(1, 2, boot)]);
+    expect(one).toMatch(/^[0-9a-f-]{36}$/);
+    expect(one).not.toBe(boot);
+    expect(retry).toBe(one);
+    expect((await svc.get())!.aiProxyNonce).toBe(one);
+    const restarted = createAwsTunnelService({ storage, api, zone: ZONE });
+    expect(await restarted.aiNonce(1, 2, boot)).toBe(one);
+    const two = await svc.aiNonce(1, 2, '22222222-2222-4222-8222-222222222222');
+    expect(two).not.toBe(one);
+    await svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }));
+    expect(await svc.aiNonce(1, 2, boot)).toBeNull();
+    expect(await svc.get()).toBeNull();
+    await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
+    expect((await svc.get())!.aiProxyNonce).toBeUndefined();
+    expect(await svc.aiNonce(1, 3, boot)).not.toBe(one);
+  });
+});

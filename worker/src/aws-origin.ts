@@ -76,6 +76,9 @@ export interface AwsTunnelRecord {
   originVerified: boolean;
   /** Check time in milliseconds; legacy records without it must be rechecked. */
   originVerifiedAt?: number;
+  /** Worker-generated AI nonce, rotated when the trusted host reports a new boot. */
+  aiProxyNonce?: string;
+  aiBootId?: string;
 }
 
 export function isAwsOriginFresh(record: AwsTunnelRecord, nowMs: number): boolean {

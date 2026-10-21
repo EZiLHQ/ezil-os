@@ -61,8 +61,8 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
 // AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
-import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
-import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, type RegistryFor } from './aws-tunnels';
+import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
+import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
 import { awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
@@ -4599,6 +4599,18 @@ async function handlePreview(
             const zone = resolveAwsOriginZone(env);
             if (!zone) throw new RelayFailure('aws_origin_unavailable');
             return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
+              aiConfig: async (bootId) => {
+                const secret = resolveNekoDerivationSecret(env);
+                if (!secret) throw new RelayFailure('ai_proxy_not_configured');
+                const res = await registry(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.aiNonce}`, {
+                  method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId }),
+                }));
+                const { nonce } = await res.json() as { nonce: string | null };
+                if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
+                const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
+                return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
+                  proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
+              },
               neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
           },
           nowMs: Date.now,
@@ -7167,7 +7179,7 @@ async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, non
   };
 }
 
-async function handleAiProxy(request: Request, env: Env, sandboxId: string): Promise<Response> {
+async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsNonce?: string | null): Promise<Response> {
   const disabled = aiProxyDisabled(env.SANDBOX_AI_PROXY);
   let gatewayUrl: string;
   try {
@@ -7181,7 +7193,7 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string): Pro
     sandboxId,
     enabled: env.SANDBOX_AI_PROXY,
     proxySecret: resolveNekoDerivationSecret(env),
-    proxyNonce: sandbox ? await sandbox.getAiProxyNonce() : null,
+    proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
@@ -7280,7 +7292,18 @@ export default {
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
     if (url.hostname.split('.')[0]!.startsWith('aws-') && isAiProxyPath(path)) {
-      return proxyError(404, 'os_ai_unavailable');
+      const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
+      if (!route || route.port !== CODE_PREVIEW_PORT) return proxyError(404, 'os_ai_unavailable');
+      if (aiProxyDisabled(env.SANDBOX_AI_PROXY)) return handleAiProxy(request, env, route.sandboxId, null);
+      const registry = awsRegistryFor(env);
+      if (!awsRoutingEnabled(env.AWS_ROUTING_ENABLED) || !registry || !resolveAwsOriginZone(env)) {
+        return proxyError(404, 'os_ai_unavailable');
+      }
+      const record = await lookupAwsTunnel(registry, route.sandboxId);
+      // A fenced or absent epoch has no valid token. Never accept the CF boot nonce,
+      // a preview cookie, a client-supplied nonce or a token for another computer.
+      if (!record?.aiProxyNonce) return proxyError(401, 'os_proxy_unauthorized');
+      return handleAiProxy(request, env, route.sandboxId, record.aiProxyNonce);
     }
 
     // 0a) AWS computer browser hostnames (`aws-<port>-<sandboxId>.<zone>`, GW-4): fail-closed

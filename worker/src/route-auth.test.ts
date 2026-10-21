@@ -3466,7 +3466,7 @@ describe('AI credential and code-host routes', () => {
     expect(calls.startProcess).toHaveLength(0);
   });
 
-  it('owns /ai before the code cookie gate, and refuses AWS hosts irrespective of routing flag', async () => {
+  it('owns /ai before the code cookie gate, and refuses unconfigured AWS hosts', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const url = `https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/models`;
     const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET };
@@ -3485,6 +3485,70 @@ describe('AI credential and code-host routes', () => {
       expect(await res.json()).toMatchObject({ error: { code: 'os_ai_unavailable' } });
     }
     expect(calls.containerFetch).toHaveLength(0);
+  });
+
+  it('AWS code hosts share the signed credential store and enforce every proxy guard', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    let nonce: string | null = 'aws-boot-one';
+    let present = true;
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
+        Response.json({ record: present ? { sandboxId: id, aiProxyNonce: nonce } : null }) }) } };
+    const origin = `https://aws-8443-${SANDBOX_NAME}-aws.ezil.org`;
+    const auth = await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce!);
+    const req = (bearer: string | null = auth, path = '/ai/v1/models', init: RequestInit = {}, host = origin) =>
+      new Request(host + path, { ...init, headers: { ...(bearer === null ? {} : { authorization: `Bearer ${bearer}` }),
+        cookie: 'ezil_preview=not-an-ai-token', 'x-ezil-ai-nonce': 'client-chosen', ...init.headers } });
+    const realFetch = globalThis.fetch;
+    const upstream: Request[] = [];
+    globalThis.fetch = (async (request: Request) => { upstream.push(request); return Response.json({ models: [] }); }) as typeof fetch;
+    try {
+      expect((await worker.fetch(await credentialRequest('POST', token(), false), env)).status).toBe(401);
+      expect((await worker.fetch(await credentialRequest('POST', token()), env)).status).toBe(200);
+      expect((await worker.fetch(req(), env)).status).toBe(200);
+      expect(upstream[0]!.url).toBe('https://ai.ezil.work/v1/models');
+      expect(upstream[0]!.headers.get('authorization')).toBe(`Bearer ${calls.aiStored[0]!.token}`);
+      upstream.length = 0;
+      for (const bad of [null, 'f'.repeat(64), await deriveAiProxyToken(SECRET, 'guac-other-computer', nonce!),
+        await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'cloudflare-boot')]) {
+        const res = await worker.fetch(req(bad), env);
+        expect(res.status).toBe(401);
+        expect(await res.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized' } });
+      }
+      for (const path of ['/ai', '/ai/v1/admin/pending', '/ai/v1/responses']) {
+        expect((await worker.fetch(req(auth, path), env)).status).toBe(404);
+      }
+      expect((await worker.fetch(req(auth, '/ai/v1/models', { method: 'POST' }), env)).status).toBe(404);
+      for (const headers of [{}, { 'content-length': '1' }]) {
+        expect((await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: 'x'.repeat(160 * 1024 + 1), headers }), env)).status).toBe(413);
+      }
+      for (const over of [{ SANDBOX_AI_PROXY: 'off' }, { SANDBOX_AI_PROXY: 'false', EZIL_AI_GATEWAY_URL: 'invalid' }]) {
+        const off = await worker.fetch(req(null), { ...env, ...over });
+        expect(off.status).toBe(503);
+        expect(await off.json()).toEqual({ error: { code: 'os_ai_unavailable', source: 'ezil-os-proxy' } });
+      }
+      for (const over of [{ AWS_ROUTING_ENABLED: 'off' }, { AWS_ORIGIN_ZONE_ALLOWLIST: '' }, { AWS_TUNNELS: undefined }]) {
+        expect((await worker.fetch(req(), { ...env, ...over })).status).toBe(404);
+      }
+      expect((await worker.fetch(req(), { ...env, SANDBOX_HMAC_SECRET: undefined })).status).toBe(503);
+      for (const host of [origin.replace('8443', '8181'), origin.replace('.ezil.org', '.evil.org'), origin.replace('-aws.', '-code.')]) {
+        expect((await worker.fetch(req(auth, '/ai/v1/models', {}, host), env)).status).not.toBe(200);
+      }
+      nonce = 'aws-boot-two';
+      expect((await worker.fetch(req(), env)).status).toBe(401);
+      nonce = null;
+      expect((await worker.fetch(req(), env)).status).toBe(401);
+      present = false;
+      expect((await worker.fetch(req(), env)).status).toBe(401);
+      expect(upstream).toHaveLength(0);
+      present = true; nonce = 'aws-boot-one';
+      expect((await worker.fetch(await credentialRequest('DELETE'), env)).status).toBe(200);
+      expect(await (await worker.fetch(req(), env)).json()).toMatchObject({ error: { code: 'os_session_missing' } });
+      expect(calls.exec).toBe(0);
+      expect(calls.startProcess).toHaveLength(0);
+      expect(calls.containerFetch).toHaveLength(0);
+    } finally { globalThis.fetch = realFetch; }
   });
 
   it('injects boot vars even with the kill switch off; an exposed warm desktop never rotates', async () => {

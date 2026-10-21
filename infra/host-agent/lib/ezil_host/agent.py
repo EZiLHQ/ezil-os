@@ -231,7 +231,7 @@ class Agent:
                 return {"ok": False, "error": "desktop_restart_exhausted"}
             self.restart_request = True
             return {"ok": True, "state": "restart_scheduled"}
-        if desktop.read_ice_state(self.cfg) == "applied":
+        if desktop.read_ice_state(self.cfg) == "applied" and (not relay_config.get("ai") or desktop.ai_configured(self.cfg)):
             return {"ok": True, "state": "already_running"}
         self.restart_request = True
         return {"ok": True, "state": "restart_scheduled"}
@@ -242,6 +242,7 @@ class Agent:
         Never the config itself."""
         c = desktop.read_desktop_config(self.cfg, int(now * 1000))
         return {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
+                "bootId": desktop.host_boot_id(), "aiConfigured": desktop.ai_configured(self.cfg),
                 "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg),
                 "unit": self._desktop_unit(), "restartsExhausted": self._restarts_exhausted(now)}
 

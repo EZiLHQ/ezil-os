@@ -70,6 +70,8 @@ export interface AwsDesktopConfig {
   backend: AwsIceServer[];
   /** The sandbox's derived neko credentials (32 hex each). */
   neko: { user: string; admin: string };
+  /** Body-bound signed control delivery; no user JWT ever enters the host. */
+  ai?: { baseUrl: string; proxyToken: string };
 }
 
 const isTurn = (u: string) => u.startsWith('turn:') || u.startsWith('turns:');
@@ -136,6 +138,7 @@ export function desktopConfigBody(c: AwsDesktopConfig): string {
     frontend: c.frontend.map(entry),
     backend: c.backend.map(entry),
     neko: { user: c.neko.user, admin: c.neko.admin },
+    ...(c.ai ? { ai: c.ai } : {}),
   });
 }
 
@@ -178,6 +181,8 @@ export async function pushAwsDesktopConfig(
 }
 
 export interface AwsDesktopStatus {
+  bootId?: string;
+  aiConfigured?: boolean;
   /** The host holds an unexpired config for this epoch. */
   configured: boolean;
   expiresAt: number | null;
@@ -232,6 +237,7 @@ export async function readAwsDesktopStatus(
     ice: d.ice,
     unit: typeof d.unit === 'string' && UNIT_STATE.test(d.unit) ? d.unit : null,
     restartsExhausted: d.restartsExhausted === true,
+    ...(typeof d.bootId === 'string' && /^[0-9a-f-]{36}$/.test(d.bootId) ? { bootId: d.bootId, aiConfigured: d.aiConfigured === true } : {}),
   };
 }
 
@@ -338,6 +344,7 @@ export async function ensureAwsDesktop(p: {
   nowMs: () => number;
   neko: { user: string; admin: string };
   mint: RelayMint;
+  aiConfig?: (bootId: string) => Promise<NonNullable<AwsDesktopConfig['ai']>>;
   budgetMs?: number;
 }): Promise<AwsDesktopReadiness> {
   const nowS = () => Math.floor(p.nowMs() / 1000);
@@ -346,10 +353,12 @@ export async function ensureAwsDesktop(p: {
   if (!running && status.restartsExhausted) throw new RelayFailure('aws_desktop_failed', 502);
   const fresh = status.configured && status.expiresAt !== null && status.expiresAt > p.nowMs() + RELAY_MIN_AHEAD_MS;
   const stalled = !running && status.unit !== null && STALLED_DESKTOP_UNITS.includes(status.unit);
-  if ((!running && (!fresh || stalled)) || (running && status.ice !== 'applied')) {
+  const needsAi = p.aiConfig && status.bootId && !status.aiConfigured;
+  if ((!running && (!fresh || stalled)) || (running && status.ice !== 'applied') || needsAi) {
     const minted = await p.mint(AbortSignal.timeout(20_000), 'boot');
     if (!minted) throw new RelayFailure('turn_unavailable');
     const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
+    if (p.aiConfig && status.bootId) config.ai = await p.aiConfig(status.bootId);
     const res = await pushAwsDesktopConfig(p.record, p.zone, config, p.fetch, nowS());
     let body: Record<string, unknown> = {};
     try {
