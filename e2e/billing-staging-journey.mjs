@@ -339,6 +339,25 @@ async function checkout(page, upgrade, email, evidence) {
   const started = performance.now();
   // Allow Stripe's redirect/payment confirmation to finish before reloading.
   await sleep(5000);
+  await waitForPlan(page, upgrade, evidence, started);
+}
+
+// Standard → Premium on the saved card: billing-sheets.js upgrade sheet (preview, then pay).
+async function upgradeInPlace(page, upgrade, evidence) {
+  const pane = appWindow(page, 'settings').locator('[data-pane="billing"]');
+  await pane.locator('[data-action="upgrade"]').first().click();
+  const pay = page.getByRole('button', { name: /^Pay .+ and upgrade$/ });
+  await pay.waitFor({ state: 'visible', timeout: 30_000 });
+  evidence.upgradeDue = compact(await page.locator('.ezil-billing-sheet-total').first().innerText());
+  await pay.click();
+  evidence.upgradeSubmitted = true;
+  const started = performance.now();
+  await page.getByText(new RegExp(`You're on ${upgrade}`, 'i')).first().waitFor({ state: 'visible', timeout: 60_000 });
+  evidence.confirmedMs = elapsed(started);
+  await waitForPlan(page, upgrade, evidence, started);
+}
+
+async function waitForPlan(page, upgrade, evidence, started) {
   const deadline = started + 120_000;
   while (performance.now() < deadline) {
     const remaining = Math.max(1, deadline - performance.now());
@@ -585,6 +604,7 @@ export async function main(env = process.env) {
       const name = await pane.locator('[data-role="plan-card"] h4').innerText();
       evidence.upgrade = upgrade;
       if (upgrade !== 'none' && /^Free$/i.test(name.trim())) await checkout(page, upgrade, credentials.email, evidence);
+      else if (upgrade === 'premium' && /^Standard$/i.test(name.trim())) await upgradeInPlace(page, upgrade, evidence);
       else evidence.upgradeSkipped = upgrade === 'none' ? 'not_requested' : 'plan_not_free';
     }, signedIn ? null : 'sign_in_failed');
     let codeReady = false;
