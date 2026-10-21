@@ -11,7 +11,11 @@
  * placement's region (`EZIL_AWS_IDENTITY_CERTS`, public, non-secret). Any
  * certificate embedded in the message is ignored. Exactly one signer; the
  * content must be the document, byte for byte; any structure this module does
- * not understand fails closed. No dependency: a minimal strict DER reader.
+ * not understand fails closed. No dependency: a minimal strict reader of DER plus
+ * the two BER forms real IMDS output uses (measured live, ap-south-1 2026-10-21:
+ * the message begins `30 80`): indefinite lengths on constructed values, and the
+ * embedded document as a constructed OCTET STRING of primitive chunks. Signed
+ * attributes must still be definite (the signature covers their DER).
  */
 
 import { createHash, verify as cryptoVerify, X509Certificate } from 'node:crypto';
@@ -29,18 +33,34 @@ interface Tlv {
     start: number;
     /** Offset of the first value byte. */
     value: number;
-    /** Offset after the last value byte. */
+    /** Offset after the whole element (for an indefinite length, after its end-of-contents). */
     end: number;
+    /** Offset after the last content byte (before an end-of-contents marker). */
+    contentEnd: number;
+    indefinite: boolean;
 }
+
+/** Nesting bound for indefinite-length scanning (the real message nests 6 deep). */
+const MAX_DEPTH = 24;
 
 class DerError extends Error {}
 
-function readTlv(buf: Buffer, at: number, limit = buf.length): Tlv {
+function readTlv(buf: Buffer, at: number, limit = buf.length, depth = 0): Tlv {
+    if (depth > MAX_DEPTH) throw new DerError('too deep');
     if (at + 2 > limit) throw new DerError('truncated');
     const tag = buf[at]!;
     if ((tag & 0x1f) === 0x1f) throw new DerError('high tag number');
     let len = buf[at + 1]!;
     let value = at + 2;
+    if (len === 0x80) {
+        // BER indefinite length: constructed only; content runs to an end-of-contents (00 00).
+        if (!(tag & 0x20)) throw new DerError('indefinite primitive');
+        for (let p = value; ; ) {
+            if (p + 2 > limit) throw new DerError('missing end-of-contents');
+            if (buf[p] === 0 && buf[p + 1] === 0) return { tag, start: at, value, contentEnd: p, end: p + 2, indefinite: true };
+            p = readTlv(buf, p, limit, depth + 1).end;
+        }
+    }
     if (len & 0x80) {
         const n = len & 0x7f;
         // DER: no indefinite length, at most 4 length octets, minimal encoding.
@@ -52,14 +72,14 @@ function readTlv(buf: Buffer, at: number, limit = buf.length): Tlv {
     }
     const end = value + len;
     if (end > limit) throw new DerError('truncated value');
-    return { tag, start: at, value, end };
+    return { tag, start: at, value, end, contentEnd: end, indefinite: false };
 }
 
 function children(buf: Buffer, node: Tlv): Tlv[] {
     if (!(node.tag & 0x20)) throw new DerError('not constructed');
     const out: Tlv[] = [];
-    for (let at = node.value; at < node.end; ) {
-        const c = readTlv(buf, at, node.end);
+    for (let at = node.value; at < node.contentEnd; ) {
+        const c = readTlv(buf, at, node.contentEnd);
         out.push(c);
         at = c.end;
     }
@@ -90,7 +110,14 @@ function oid(buf: Buffer, node: Tlv | undefined): string {
     return [...head, ...parts].join('.');
 }
 
-const SEQ = 0x30, SET = 0x31, OCTETS = 0x04, INT = 0x02, CTX0 = 0xa0, CTX1 = 0xa1, PRIM_CTX0 = 0x80;
+const SEQ = 0x30, SET = 0x31, OCTETS = 0x04, OCTETS_CONSTRUCTED = 0x24, INT = 0x02, CTX0 = 0xa0, CTX1 = 0xa1, PRIM_CTX0 = 0x80;
+
+/** An OCTET STRING's bytes: primitive, or BER constructed from primitive chunks (one level). */
+function octetString(buf: Buffer, node: Tlv | undefined): Buffer {
+    if (node?.tag === OCTETS) return buf.subarray(node.value, node.end);
+    const parts = children(buf, expectTag(node, OCTETS_CONSTRUCTED)).map((c) => buf.subarray(expectTag(c, OCTETS).value, c.end));
+    return Buffer.concat(parts);
+}
 
 const OID = {
     signedData: '1.2.840.113549.1.7.2',
@@ -153,8 +180,7 @@ export function verifyIdentitySignature(document: string, pkcs7: string, certifi
         if (encap.length > 1) {
             // Embedded content must be the document itself (a primitive OCTET STRING).
             const inner = children(der, expectTag(encap[1], CTX0));
-            const octets = expectTag(inner[0], OCTETS);
-            if (inner.length !== 1 || !der.subarray(octets.value, octets.end).equals(content)) return { ok: false, reason: 'identity_signature_mismatch' };
+            if (inner.length !== 1 || !octetString(der, inner[0]).equals(content)) return { ok: false, reason: 'identity_signature_mismatch' };
         }
         let i = 3;
         while (parts[i] && (parts[i]!.tag === CTX0 || parts[i]!.tag === CTX1)) i++; // certificates / CRLs: never trusted
@@ -171,6 +197,8 @@ export function verifyIdentitySignature(document: string, pkcs7: string, certifi
         let signed: Buffer = content;
         if (si[k]?.tag === CTX0) {
             const attrs = si[k]!;
+            // The signature covers the attributes' DER: an indefinite (BER) encoding cannot be re-tagged.
+            if (attrs.indefinite) throw new DerError('indefinite signed attributes');
             let digestOk = false;
             let typeOk = false;
             for (const attr of children(der, attrs)) {
