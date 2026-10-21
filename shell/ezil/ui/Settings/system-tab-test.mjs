@@ -219,7 +219,10 @@ test('stream vitals render only from the desktop frame, and only as text', async
     assert.doesNotMatch(host.innerHTML, /640 × 480/, 'another window cannot report vitals');
     post(frame, { width: '<img src=x onerror=alert(1)>', height: 1, fps: '<b>9</b>', relayProtocol: '<i>' });
     assert.doesNotMatch(host.innerHTML, /<img|<b>|<i>/);
-    post(frame, { width: 1920, height: 1080, fps: 30 });
+    post(frame, { width: 1920, height: 1080, fps: 30, localCandidateType: 'relay', remoteCandidateType: 'srflx', relayProtocol: 'udp' });
     assert.match(host.innerHTML, /1920 × 1080/);
     assert.match(host.innerHTML, /30 fps/);
+    assert.match(host.innerHTML, /Relayed through TURN over UDP/, 'route fields survive cleaning');
+    post(frame, { localCandidateType: 'host', remoteCandidateType: 'srflx' });
+    assert.match(host.innerHTML, /Direct \(host → srflx\)/);
 });
