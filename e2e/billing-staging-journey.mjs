@@ -179,14 +179,11 @@ async function until(check, label, timeout = 30_000, interval = 200) {
 
 const appWindow = (page, id) => page.locator(`.window[data-app="${id}"]:not([data-closing="1"])`).last();
 const dock = (page, id) => page.locator(`.taskbar-item[data-app="${id}"]`).first();
-// A full-bleed app auto-hides the taskbar; it slides back when the pointer reaches the bottom edge.
+// A full-bleed desktop window hides the taskbar (shell UIDesktopFullpage.js; Settings/drawer-action.js),
+// leaving only its window drawer. Close it through the drawer, then use the dock.
 async function clickDock(page, id) {
   const item = dock(page, id);
-  if (!await item.isVisible()) {
-    const size = page.viewportSize() ?? { width: 1440, height: 1000 };
-    await page.mouse.move(size.width / 2, size.height - 1);
-    await item.waitFor({ state: 'visible', timeout: 10_000 });
-  }
+  if (!await item.isVisible() && id !== 'desktop' && await appWindow(page, 'desktop').count()) await closeApp(page, 'desktop');
   await item.click();
 }
 
@@ -198,7 +195,8 @@ async function closeApp(page, id) {
     for (const close of await page.locator('[data-action="close-sheet"]:visible').all()) await close.click();
   }
   // Restore before closing, as a full-bleed app may be underneath another app.
-  await clickDock(page, id);
+  // A full-bleed window hides the dock; it is already on top and closes via its drawer.
+  if (await dock(page, id).isVisible()) await dock(page, id).click();
   const close = win.getByRole('button', { name: 'Close', exact: true });
   if (!await close.first().isVisible()) {
     await win.locator('.dashboard-app-drawer-toggle').click();
