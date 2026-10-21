@@ -59,6 +59,7 @@ import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observatio
 import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
+import { requestAwsRestart } from './aws-restart';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -636,7 +637,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const { limit } = await reconcileOwn(c, p, cfg.deployments, cfg.e);
             return limit ? { ok: false, error: limit } : { ok: true };
         },
-        restart: async () => ({ ok: false, outcome: 'aws_not_supported', error: 'aws_not_supported' }),
+        restart: (ctx, c) => requestAwsRestart(deps.db, c, ctx.correlationId, env()),
         /**
          * computer.delete (§6, R11). ok only once nothing can still run: no placement
          * (never provisioned), or the placement RETIRED (instance terminated, volume

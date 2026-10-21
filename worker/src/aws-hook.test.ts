@@ -18,7 +18,7 @@ mock.module('cloudflare:workers', () => ({
 
 import vectors from './aws-gateway.vectors.json';
 import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-origin';
-import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
+import { AwsTunnelRegistry, verifyAwsTunnelOrigin, type TunnelStorage } from './aws-tunnels';
 import { deriveNekoCredentials, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 import { deriveAiProxyToken } from './ai-proxy';
 import { sha256Hex } from './aws-ice';
@@ -116,6 +116,7 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     if (url.hostname !== `c-${SID}-g1-e2.${ORIGIN_ZONE}`) h.bad.push(`host ${url.hostname}`);
     const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, method, url.pathname, Math.floor(Date.now() / 1000));
     if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
+    if (url.pathname.startsWith('/__ezil/control/restart-desktop/')) return j({ ok: true, state: 'restart_requested' });
     if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
     if (url.pathname.startsWith('/__ezil/control/ice/')) {
       if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
@@ -519,5 +520,28 @@ describe('AWS AI signed boot delivery', () => {
     expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
     expect(host.turnCalls).toBe(count);
     expect(host.bad).toEqual([]);
+  });
+});
+
+
+describe('AWS restart route registration', () => {
+  it('routes signed retries to the host and refuses unsigned, foreign and fenced requests', async () => {
+    const e = env({ AWS_ROUTING_ENABLED: '1' });
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    await verifyAwsTunnelOrigin(name => (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS.get(name), SID);
+    const host = installAwsHost();
+    const path = `/sandbox/${SID}/restart`;
+    const body = JSON.stringify({ requestId: 'a'.repeat(64) });
+    for (let i = 0; i < 2; i++) {
+      const r = await worker.fetch(await signed('POST', path, body), e);
+      expect(r.status).toBe(202);
+      expect(await r.json()).toEqual({ ok: true, outcome: 'restart_requested' });
+    }
+    expect(host.paths).toEqual(Array(2).fill(`POST /__ezil/control/restart-desktop/${'a'.repeat(64)}`));
+    expect(host.bad).toEqual([]);
+    expect((await worker.fetch(new Request(`https://api.ezil.work${path}`, { method: 'POST', body }), e)).status).toBe(401);
+    expect((await worker.fetch(await signed('POST', path, body, claims({ leaseEpoch: 99 })), e)).status).toBe(502);
+    expect((await worker.fetch(await signed('POST', path, JSON.stringify({ requestId: 'a'.repeat(64), action: 'exec' })), e)).status).toBe(400);
+    expect(host.paths).toHaveLength(2);
   });
 });

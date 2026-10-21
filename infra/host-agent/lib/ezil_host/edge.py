@@ -12,6 +12,7 @@ Routing is by the signed path only:
                                        guacamole, 3002 app preview, 8443 code-server);
   POST /__ezil/control/stop[/<warn>] -> the agent's `stop` (warn 0..900 s);
   POST /__ezil/control/fence         -> the agent's `fence`.
+  POST /__ezil/control/restart-desktop/<requestId> -> the desktop unit only.
 Anything else is 404.
 
 One request per connection (the upstream gets `Connection: close`), so a second request on
@@ -58,6 +59,7 @@ CONTROL_RE = re.compile(r"^/__ezil/control/(stop|fence)(?:/(\d{1,3}))?$")
 # so its sha256 is IN the signed path and the body must hash to it. `desktop`: status, no body.
 ICE_RE = re.compile(r"^/__ezil/control/ice/([0-9a-f]{64})$")
 DESKTOP_STATUS_PATH = "/__ezil/control/desktop"
+RESTART_RE = re.compile(r"^/__ezil/control/restart-desktop/([0-9a-f]{64})$")
 MAX_ICE_BODY = 16384
 FORWARDING_HEADERS = {"forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
                       "cf-connecting-ipv6", "cf-pseudo-ipv4", "cf-visitor"}
@@ -346,6 +348,15 @@ class Edge:
             _reply(client, 401, {"ok": False, "error": err})
             return
         self.seq.presence()
+        restart = RESTART_RE.fullmatch(path)
+        if restart:
+            # Every input is in the signed path. No query/body or arbitrary command.
+            lengths = head.get("content-length")
+            if head.method != "POST" or query or head.get("transfer-encoding") or lengths not in ([], ["0"]) or head.rest:
+                _reply(client, 400, {"ok": False, "error": "restart_unavailable"})
+                return
+            self._agent(client, "restart-desktop", requestId=restart.group(1))
+            return
         m = CONTROL_RE.match(path)
         if m:
             self._control(client, head, m)

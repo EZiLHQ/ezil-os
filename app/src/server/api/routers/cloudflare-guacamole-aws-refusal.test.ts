@@ -2,7 +2,7 @@ import { initTRPC } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BOOT_FAILURE_COPY, computeBootUiState, isRetryableBootErrorCode, type BootErrorCode } from '@/components/desktop/boot-phases';
 
-const mocks = vi.hoisted(() => ({ route: vi.fn(), ensure: vi.fn(), preview: vi.fn() }));
+const mocks = vi.hoisted(() => ({ route: vi.fn(), ensure: vi.fn(), preview: vi.fn(), restart: vi.fn() }));
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string }; db: unknown }>().create();
     return { createTRPCRouter: t.router, protectedProcedure: t.procedure };
@@ -28,8 +28,9 @@ const computerId = '22222222-2222-4222-8222-222222222222';
 beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network'); }));
     mocks.ensure.mockReset();
+    mocks.restart.mockReset();
     mocks.preview.mockReset();
-    mocks.route.mockReset().mockResolvedValue({ kind: 'aws-ec2', provider: { ensure: mocks.ensure }, instanceType: 't3a.medium' });
+    mocks.route.mockReset().mockResolvedValue({ kind: 'aws-ec2', provider: { ensure: mocks.ensure, restart: mocks.restart }, instanceType: 't3a.medium' });
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -57,5 +58,30 @@ describe.each(['previewUrl', 'codePreviewUrl', 'appPreviewUrl'] as const)('%s AW
         expect(mocks.ensure).toHaveBeenCalledTimes(1);
         expect(mocks.preview).not.toHaveBeenCalled();
         expect(fetch).not.toHaveBeenCalled();
+    });
+});
+
+
+describe('AWS desktop restart router', () => {
+    const requestId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const caller = (owned = true) => cloudflareGuacamoleRouter.createCaller({
+        user: { id: '11111111-1111-4111-8111-111111111111' },
+        db: { query: { computers: { findFirst: async () => owned ? { id: computerId } : undefined } } },
+    } as never);
+    it('returns requested without claiming completion and preserves the retry ID', async () => {
+        mocks.restart.mockResolvedValue({ ok: true, outcome: 'restart_requested' });
+        expect(await caller().restartDesktop({ computerId, requestId })).toMatchObject({ ok: true, outcome: 'restart_requested' });
+        await caller().restartDesktop({ computerId, requestId });
+        expect(mocks.restart.mock.calls.map(c => c[0])).toEqual([{ correlationId: requestId }, { correlationId: requestId }]);
+        expect(mocks.ensure).not.toHaveBeenCalled();
+        expect(fetch).not.toHaveBeenCalled();
+    });
+    it('returns an honest redacted refusal value', async () => {
+        mocks.restart.mockResolvedValue({ ok: false, outcome: 'LEAK', error: 'LEAK' });
+        expect(await caller().restartDesktop({ computerId })).toMatchObject({ ok: false, errorCode: 'restart_unavailable' });
+    });
+    it('ownership failure never dispatches restart', async () => {
+        await expect(caller(false).restartDesktop({ computerId })).rejects.toThrow();
+        expect(mocks.restart).not.toHaveBeenCalled();
     });
 });

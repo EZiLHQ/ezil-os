@@ -1313,7 +1313,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * string, not a raw message.
      */
     restartDesktop: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({ computerId: z.string().uuid(), requestId: z.string().uuid().optional() }))
         .mutation(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
@@ -1326,7 +1326,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const correlationId = newCorrelationId();
+            const correlationId = input.requestId ?? newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             const billingDeps = getBillingDeps();
@@ -1337,9 +1337,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             };
             if (routed.kind === 'aws-ec2') {
-                // No in-place desktop restart on AWS yet; a refusal the UI renders, never Cloudflare.
                 const aws = await routed.provider.restart({ correlationId }, computer);
-                return { ok: false as const, errorCode: aws.outcome ?? 'aws_not_supported', correlationId, provider: 'cloudflare-guacamole' as const };
+                return aws.ok
+                    ? { ok: true as const, outcome: 'restart_requested', correlationId, provider: 'cloudflare-guacamole' as const }
+                    : { ok: false as const, errorCode: 'restart_unavailable', correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const result = await routed.provider.restart({ correlationId }, computer);
             if (result.ok) {

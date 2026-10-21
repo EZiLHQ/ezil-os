@@ -658,7 +658,7 @@ describe('stop and status', () => {
         const { provider, placements } = setup({ placements: [stopped()] });
         expect(await provider.activity(ctx, { userId: U1, computerId: C1 }, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'placement_stopped' });
         expect(placements[0]).toMatchObject({ lease_until: null, presence_at: null });
-        expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'aws_not_supported' });
+        expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'restart_unavailable' });
     });
 });
 

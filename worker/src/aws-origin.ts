@@ -54,7 +54,7 @@ const SANDBOX_ID = /^guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}$/;
 const METHOD = /^[A-Z]{1,16}$/;
 const PATH = /^\/[\x21-\x7e]{0,2047}$/;
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const CONTROL_OPS = ['stop', 'fence'] as const;
+const CONTROL_OPS = ['stop', 'fence', 'restart-desktop'] as const;
 export type AwsControlOp = (typeof CONTROL_OPS)[number];
 
 /** The Worker's durable record of one computer's current tunnel epoch (GW-1). */
@@ -447,15 +447,20 @@ export async function sendAwsControl(
   fetchFn: FetchLike,
   nowSeconds: number,
   warnSeconds?: number,
+  requestId?: string,
 ): Promise<Response> {
   if (!(CONTROL_OPS as readonly string[]).includes(op)) throw new Error('gw_invalid_control_op');
   if (warnSeconds !== undefined && (!Number.isSafeInteger(warnSeconds) || warnSeconds < 0 || warnSeconds > 900 || op !== 'stop')) {
     throw new Error('gw_invalid_control_op');
   }
+  if (op === 'restart-desktop' ? !/^[0-9a-f]{64}$/.test(requestId ?? '') : requestId !== undefined) {
+    throw new Error('gw_invalid_control_op');
+  }
   const key = decodeControlKey(record.controlKey);
   if (!key) throw new Error('gw_invalid_binding');
-  const path = `/__ezil/control/${op}${warnSeconds === undefined ? '' : `/${warnSeconds}`}`;
+  const path = `/__ezil/control/${op}${requestId ? `/${requestId}` : warnSeconds === undefined ? '' : `/${warnSeconds}`}`;
   const host = awsOriginHostname(record.sandboxId, record.generation, record.leaseEpoch, zone);
   const header = await signGatewayHeader(key, record, 'POST', path, nowSeconds);
-  return fetchFn(`https://${host}${path}`, { method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header }, redirect: 'manual' });
+  return fetchFn(`https://${host}${path}`, { method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header }, redirect: 'manual',
+    ...(op === 'restart-desktop' ? { signal: AbortSignal.timeout(10_000) } : {}) });
 }
