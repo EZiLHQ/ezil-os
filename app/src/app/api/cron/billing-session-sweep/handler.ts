@@ -1,6 +1,7 @@
 import { reconcilePaidCloudflareUsers } from '@/server/lib/compute/provider-migrate-reconcile';
 import { advanceStaleMigrations } from '@/server/lib/compute/provider-migrate-orchestrator';
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
+import { drainAiCreditOutbox } from '@/server/billing/ai-credit-outbox';
 import { billingMeteringActive, loadComputeBillingState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import type { PolicyStopReason, StopOutcome } from '@/server/lib/compute/stop-policy';
@@ -30,7 +31,11 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
 }): Promise<BillingSessionSweepCounts> {
     const startedAt = Date.now();
     const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0 };
-    if (!billingMeteringActive(deps.config)) return counts;
+    const drain = async () => {
+        try { await drainAiCreditOutbox(deps, { limit: 25, deadlineMs: startedAt + 40_000 }); }
+        catch { console.warn('[billing.ai] outbox sweep unavailable'); }
+    };
+    if (!billingMeteringActive(deps.config)) { await drain(); return counts; }
 
     const epochs = await deps.store.openEpochsForSweep({ limit });
     counts.examined = epochs.length;
@@ -120,5 +125,6 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     }
     await advanceStaleMigrations(startedAt);
     await reconcilePaidCloudflareUsers(startedAt);
+    await drain();
     return counts;
 }

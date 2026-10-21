@@ -201,6 +201,10 @@ class MemoryStore implements BillingStore {
         this.writes.push(item.eventKey);
         return 'queued';
     }
+    async aiCreditGrantsByInvoice(userId: string, invoiceId: string) {
+        return [...this.outbox.values()].filter(item => item.userId === userId && item.kind === 'ai_grant'
+            && item.payload.protocol === 'ezil-ai-credits-v1' && item.payload.invoiceId === invoiceId);
+    }
     async latestIntervalFor(computerId: string) {
         return this.intervals.filter(row => row.computerId === computerId)
             .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())[0] ?? null;
@@ -1493,18 +1497,27 @@ describe('v3 paid invoice grants', () => {
         expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
         expect([...store.grants.values()]).toEqual([expect.objectContaining({ amount: BigInt(seconds), periodStart, periodEnd,
             subscriptionId: 'sub_local', meter: 'compute_std_seconds', kind: 'plan_period' })]);
+        const entitlementId = `ezil-os:v1:${sku}:sub_local:${periodStart.toISOString()}`;
+        expect([...store.outbox.values()]).toEqual([expect.objectContaining({ eventKey: `${entitlementId}:grant`, kind: 'ai_grant',
+            payload: expect.objectContaining({ entitlementId, credits: sku === 'standard_monthly_v3' ? 4000 : 20000,
+                action: 'grant', expiresAt: '2026-11-04T00:00:00.000Z' }) })]);
         stripe.charge.invoiceId = stripe.invoice.id;
         stripe.charge.refunded = true;
         const delivery = event('charge.refunded', { id: stripe.charge.id, refunded: true, refunds: { data: [{ id: 're_v3' }] } });
         expect(await processStripeEvent(delivery, deps)).toBe('applied');
         expect([...store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
-        expect(store.outbox.size).toBe(0);
+        expect(store.outbox.size).toBe(2);
+        expect(store.outbox.get(`${entitlementId}:revoke`)).toMatchObject({ kind: 'ai_revoke',
+            payload: { eventId: `${entitlementId}:revoke`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 4000 : 20000 } });
+        await processStripeEvent({ ...delivery, id: 'evt_refund_replayed' }, deps);
+        expect(store.outbox.size).toBe(2);
     });
     it('late Standard invoices retain Standard terms after Premium upgrade', async () => {
         const { store, stripe, deps } = v3Fixture('premium_monthly_v3');
         stripe.invoice.lines[0]!.lookupKey = 'ezil_standard_monthly_v3';
         expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
         expect([...store.grants.values()][0]!.amount).toBe(BigInt(144000));
+        expect([...store.outbox.values()][0]!.payload.credits).toBe(4000);
     });
     it.each(['open', 'manual', 'foreign', 'ambiguous'] as const)('does not grant %s invoices', async scenario => {
         const { store, stripe, deps } = v3Fixture();
@@ -1515,6 +1528,55 @@ describe('v3 paid invoice grants', () => {
         expect(await processStripeEvent(paidV2(), deps)).toBe(scenario === 'foreign' ? 'review:no_base_line'
             : scenario === 'ambiguous' ? 'review:ambiguous_base_line' : 'ignored');
         expect(store.grants.size).toBe(0);
+        expect(store.outbox.size).toBe(0);
+    });
+    it('repairs an interrupted paid outbox write and enqueues one grant under a different event replay', async () => {
+        const f = v3Fixture();
+        vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('transient'));
+        await expect(processStripeEvent(paidV2(), f.deps)).rejects.toThrow('transient');
+        expect(f.store.grants.size).toBe(1); expect(f.store.outbox.size).toBe(0);
+        await processStripeEvent(paidV2(), f.deps);
+        await processStripeEvent({ ...paidV2(), id: 'evt_another' }, f.deps);
+        expect(f.store.grants.size).toBe(1); expect(f.store.outbox.size).toBe(1);
+    });
+    it('revokes a disputed period once and a won dispute cannot grant an irrevocably revoked entitlement again', async () => {
+        const f = v3Fixture(); await processStripeEvent(paidV2(), f.deps);
+        f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        await processStripeEvent(dispute(), f.deps); await processStripeEvent(dispute(), f.deps);
+        expect([...f.store.outbox.values()].map(item => item.payload.action)).toEqual(['grant', 'revoke']);
+        await processStripeEvent(dispute(true), f.deps);
+        expect(f.store.outbox.size).toBe(2);
+    });
+    it('revokes the stored policy and account, even when the subscription and invoice adapter now report Premium', async () => {
+        const f = v3Fixture(); await processStripeEvent(paidV2(), f.deps);
+        const receipt = [...f.store.outbox.values()][0]!;
+        Object.assign(receipt.payload, { credits: 1234, accountPublicId: 'original-account', delivery: { status: 'done' } });
+        f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        f.stripe.subscription.sku = 'premium_monthly_v3';
+        f.stripe.invoice.lines[0]!.lookupKey = 'ezil_premium_monthly_v3';
+        await processStripeEvent(refund(), f.deps);
+        const revoked = [...f.store.outbox.values()][1]!;
+        expect(revoked.payload).toMatchObject({ entitlementId: receipt.payload.entitlementId,
+            credits: 1234, action: 'revoke', accountPublicId: 'original-account' });
+        expect(revoked.payload).not.toHaveProperty('delivery');
+    });
+    it('a refund between ledger and outbox writes enqueues revoke before the repaired grant', async () => {
+        const f = v3Fixture();
+        vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('interrupted'));
+        await expect(processStripeEvent(paidV2(), f.deps)).rejects.toThrow();
+        f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        await processStripeEvent(refund(), f.deps);
+        await processStripeEvent(paidV2(), f.deps);
+        expect([...f.store.outbox.values()].map(item => item.payload.action)).toEqual(['revoke', 'grant']);
+    });
+    it('does not revoke AI on partial refunds or a charge ownership mismatch', async () => {
+        const f = v3Fixture(); await processStripeEvent(paidV2(), f.deps);
+        f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        f.stripe.charge.refunded = false;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:partial_refund');
+        f.stripe.charge.refunded = true; f.store.customers.set('cus_local', 'another-user');
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:customer_mismatch');
+        expect(f.store.outbox.size).toBe(1);
     });
     it('a paid v3 upgrade grants only its prorated delta, and rejects mixed-version credit lines', async () => {
         const { store, stripe, deps } = v3Fixture('premium_monthly_v3');

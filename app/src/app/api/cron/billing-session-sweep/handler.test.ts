@@ -6,6 +6,7 @@ import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 import { handleBillingSessionSweep } from './handler';
+import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
 vi.mock('@/server/lib/compute/provider-migrate-reconcile', () => ({ reconcilePaidCloudflareUsers: vi.fn() }));
@@ -88,6 +89,20 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('billing session sweep', () => {
+    it('drains AI credits with the shared forty-second deadline even when compute metering is disabled', async () => {
+        vi.spyOn(Date, 'now').mockReturnValue(T.getTime());
+        const drain = vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockResolvedValue({ claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 });
+        const f = fixture([]); f.deps.config.enforcementEnabled = false; f.deps.config.tabEnabled = false;
+        await f.run(0);
+        expect(drain).toHaveBeenCalledExactlyOnceWith(f.deps, { limit: 25, deadlineMs: T.getTime() + 40_000 });
+    });
+    it('drains after compute work and redacts outbox failures without failing the sweep', async () => {
+        const drain = vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockRejectedValue(new Error('secret-token'));
+        const f = fixture([]); await expect(f.run(0)).resolves.toEqual(zeros);
+        expect(drain).toHaveBeenCalledTimes(1);
+        expect(console.warn).toHaveBeenCalledWith('[billing.ai] outbox sweep unavailable');
+        expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain('secret-token');
+    });
     it('is not due at 21,599 seconds and closes at exactly 21,600', async () => {
         const f = fixture();
         expect(await f.run(21599)).toEqual({ ...zeros, examined: 1 });

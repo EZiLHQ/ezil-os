@@ -221,6 +221,8 @@ export interface BillingStore {
     /** Newest sample per computer. */
     latestStorageFor(userId: string): Promise<StorageSample[]>;
     grantsBySource(sourceType: GrantSource, sourceId: string): Promise<GrantRow[]>;
+    /** Stored AI receipts retain the original policy when reversing an older invoice. */
+    aiCreditGrantsByInvoice?(userId: string, invoiceId: string): Promise<OutboxInsert[]>;
     computerOwner(computerId: string): Promise<string | null>;
 
     // writes — each idempotent
@@ -436,6 +438,7 @@ export interface ProcessorDeps {
 export interface BillingDeps {
     config: import('./config').BillingConfig;
     store: BillingStore;
+    aiCredits?: import('./ai-credit-outbox').AiCreditOutboxStore;
     /** Null unless `STRIPE_SECRET` is set. */
     stripe: StripeApi | null;
     usage: UsageBillingPort | null;
