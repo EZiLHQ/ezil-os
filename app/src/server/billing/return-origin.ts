@@ -1,8 +1,6 @@
-export const OWNED_APP_ORIGINS = [
-    'https://os.ezil.org',
-    'https://os.ezil.work',
-    'https://billing-staging.ezil.work',
-] as const;
+import { OWNED_APP_ORIGINS } from '@/utils/forwarded';
+
+export { OWNED_APP_ORIGINS };
 
 /** Stripe return URLs may use only owned apps or explicit local development ports. */
 export function billingReturnOrigin(headers?: Pick<Headers, 'get'>): string {

@@ -4,7 +4,7 @@ import { auth0Enabled, logoutUrl } from '@/server/auth/auth0';
 import { Routes } from '@/utils/constants';
 import { isLegacyAuthCookie, SECURE_AUTH_COOKIE_NAME } from '@/utils/supabase/cookie-options';
 import { createClient } from '@/utils/supabase/server';
-import { publicOrigin } from '@/utils/forwarded';
+import { ownedPublicOrigin } from '@/utils/forwarded';
 
 /**
  * The session's cookies: the `__Host-` name used on HTTPS and its chunks, or
@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
         const supabase = await createClient();
         ({ error } = await supabase.auth.signOut({ scope: 'local' }));
     } catch { error = true; }
-    const destination = auth0Enabled() ? logoutUrl(publicOrigin(request.headers, request.url)) : new URL(Routes.LOGIN, publicOrigin(request.headers, request.url));
+    const destination = auth0Enabled() ? logoutUrl(ownedPublicOrigin(request.headers, request.url)) : new URL(Routes.LOGIN, ownedPublicOrigin(request.headers, request.url));
     const response = NextResponse.redirect(destination, 303);
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Referrer-Policy', 'no-referrer');

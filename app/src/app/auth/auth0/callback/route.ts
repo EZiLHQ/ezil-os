@@ -3,7 +3,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, auth0Enabled, exchangeCode, readTransaction, verifyIdToken } from '@/server/auth/auth0';
 import { bridgeAuth0Identity } from '@/server/auth/bridge';
 import { safeReturnUrl } from '@/utils/constants';
-import { publicOrigin } from '@/utils/forwarded';
+import { ownedPublicOrigin } from '@/utils/forwarded';
 
 export async function GET(request: NextRequest) {
     let destination: string;
@@ -13,14 +13,14 @@ export async function GET(request: NextRequest) {
         const transaction = readTransaction(request.cookies.get(AUTH0_COOKIE)?.value, params.get('state'));
         const code = params.get('code');
         if (params.has('error') || !code) throw new Auth0Error('auth0_failed');
-        const token = await exchangeCode(code, { origin: publicOrigin(request.headers, request.url), codeVerifier: transaction.codeVerifier });
+        const token = await exchangeCode(code, { origin: ownedPublicOrigin(request.headers, request.url), codeVerifier: transaction.codeVerifier });
         const identity = await verifyIdToken(token, { nonce: transaction.nonce });
         await bridgeAuth0Identity(identity);
         destination = safeReturnUrl(transaction.returnUrl);
     } catch (error) {
         destination = `/login?error=${error instanceof Auth0Error ? error.code : 'auth0_failed'}`;
     }
-    const response = NextResponse.redirect(new URL(destination, publicOrigin(request.headers, request.url)));
+    const response = NextResponse.redirect(new URL(destination, ownedPublicOrigin(request.headers, request.url)));
     response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Referrer-Policy', 'no-referrer');

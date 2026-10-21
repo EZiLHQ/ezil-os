@@ -46,3 +46,19 @@ export function publicOrigin(headers: HeaderReader, fallback: string): string {
     const host = forwardedHost(headers);
     return host ? `${forwardedProto(headers) ?? 'http'}://${host}` : new URL(fallback).origin;
 }
+
+/** Public app origins this deployment may redirect to (auth callbacks, Stripe returns). */
+export const OWNED_APP_ORIGINS = [
+    'https://os.ezil.org',
+    'https://os.ezil.work',
+    'https://os-staging.ezil.work',
+] as const;
+const CANONICAL_ORIGIN = 'https://os.ezil.org';
+
+/** `publicOrigin`, but only an owned origin (or local dev outside production); otherwise the canonical one. */
+export function ownedPublicOrigin(headers: HeaderReader, fallback: string): string {
+    const origin = publicOrigin(headers, fallback);
+    if ((OWNED_APP_ORIGINS as readonly string[]).includes(origin)) return origin;
+    if (process.env.NODE_ENV !== 'production' && /^http:\/\/(?:localhost|127\.0\.0\.1)(?::[0-9]{1,5})?$/.test(origin)) return origin;
+    return CANONICAL_ORIGIN;
+}
