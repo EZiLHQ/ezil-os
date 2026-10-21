@@ -71,6 +71,13 @@ afterEach(() => {
 });
 
 describe('classifyWorkerHttpFailure — deterministic vs retryable', () => {
+    it('reads the migration fence refusal (409 migrating) as a retryable start, other 409s as bad requests', () => {
+        const code = classifyWorkerHttpFailure(409, JSON.stringify({ ok: false, error: 'migrating' }));
+        expect(code).toBe('sandbox_starting');
+        expect(isRetryablePreviewErrorCode(code)).toBe(true);
+        expect(classifyWorkerHttpFailure(409, JSON.stringify({ ok: false, error: 'head_moved' }))).not.toBe('sandbox_starting');
+        expect(classifyWorkerHttpFailure(409, 'migrating')).not.toBe('sandbox_starting');
+    });
     it('classifies the Worker\'s 400 missing_project_id as a deterministic bad request', () => {
         // The exact body worker/src/index.ts returns when projectId is absent.
         const code = classifyWorkerHttpFailure(400, '{"ok":false,"error":"missing_project_id"}');

@@ -465,12 +465,19 @@ const CUSTOM_DOMAIN_REQUIRED_RE = /CustomDomainRequiredError|Port exposure requi
  * (`setsockoptint` and `CustomDomainRequiredError`, both surfaced as the
  * Worker's catch-all 500) are deterministic and must not be retried as 5xx.
  */
+function isMigratingRefusal(body: string): boolean {
+    try { return (JSON.parse(body) as { error?: unknown })?.error === 'migrating'; } catch { return false; }
+}
+
 export function classifyWorkerHttpFailure(status: number, body: string): GuacamolePreviewErrorCode {
     if (/setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
     if (CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
     // 408/429 are the 4xx statuses that mean "later", not "never" — leave them
     // in the retryable bucket rather than treating them as a bad request.
     if (status === 408 || status === 429) return 'worker_http_error';
+    // A CF→AWS migration has fenced this computer (worker C-7 writer fence): the shell's
+    // wake loop keeps retrying until the placement flips to AWS or the fence is lifted.
+    if (status === 409 && isMigratingRefusal(body)) return 'sandbox_starting';
     if (status === 401 || status === 403) return 'unauthorized';
     if (status === 412) return 'preconditions_unmet';
     if (status >= 400 && status < 500) return 'bad_request';
