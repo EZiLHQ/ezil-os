@@ -455,16 +455,21 @@ async function terminalRun(page, frame, script, runId, phase) {
   await input.waitFor({ state: 'attached' });
   await input.focus();
   const begin = `E2E_BEGIN_${phase}_${runId}`, end = `E2E_END_${phase}_${runId}`;
-  // Clear scrollback through the terminal UI, preserving its shell/processes.
-  await input.pressSequentially(`printf '\\033[3J\\033[H\\033[2J'; printf '\\n${begin}\\n'; ${script}; rc=$?; printf '\\nE2E_RC=%s\\n${end}\\n' "$rc"`, { delay: 1 });
+  // The terminal renders on a canvas (no DOM text), so the output goes to a file that
+  // code-server opens in this window; Monaco renders file lines as DOM text.
+  const out = `.e2e-out-${phase}-${runId}.txt`;
+  await input.pressSequentially(`{ printf '${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ~/${out} 2>&1; `
+    + `(code -r ~/${out} 2>/dev/null || code-server -r ~/${out})`, { delay: 1 });
   await input.press('Enter');
   return until(async () => {
-    const tree = terminal.locator('.xterm-accessibility-tree');
-    const rows = terminal.locator('.xterm-rows');
-    const text = await (await tree.count() ? tree : rows).last().innerText({ timeout: 3000 });
+    const tab = frame.locator(`.tab[aria-label^="${out}"], .tab:has-text("${out}")`).first();
+    if (!await tab.count()) return false;
+    await tab.click();
+    const lines = frame.locator('.editor-group-container.active .monaco-editor .view-lines').first();
+    const text = (await lines.innerText({ timeout: 3000 })).replace(/\u00a0/g, ' ');
     const block = terminalBlock(text, begin, end);
     return block === null ? false : { text: block, exitCode: Number(block.match(/^E2E_RC=(\d+)$/m)?.[1] ?? -1) };
-  }, 'terminal output markers', 30_000);
+  }, 'terminal output file', 45_000);
 }
 
 async function persistence(page, runId, evidence) {
