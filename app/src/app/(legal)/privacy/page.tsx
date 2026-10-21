@@ -31,8 +31,8 @@ const sections: readonly LegalSection[] = [
     {
         id: 'billing-data', title: 'Billing information',
         content: <>
-            <p>When paid plans are offered, billing information includes your name, email, billing country and address, and records of purchases, subscriptions, payments, refunds, and disputes. Stripe holds payment method details; EZiL never sees full card numbers. We receive the transaction references, payment status, and limited payment method information needed to manage billing.</p>
-            <p>When paid plans are offered, we also associate workspace-time usage, saved-storage measurements, and AI credit grants and purchases with your account to show and administer your plan’s allowances.</p>
+            <p>Billing information includes your name, email, billing country and address, and records of purchases, subscriptions, payments, refunds, and disputes. Stripe handles payment data and holds payment method details; EZiL does not store card numbers. We receive the transaction references, payment status, and limited payment method information needed to manage billing.</p>
+            <p>We process compute usage to run and bill the Service: session start and stop times, machine size, and provider and region information (Cloudflare or AWS in Mumbai). We associate this usage and saved-storage measurements with your account to administer your Free, Standard or Premium plan and its fair-use and storage limits.</p>
         </>,
     },
     {
@@ -71,7 +71,7 @@ const sections: readonly LegalSection[] = [
                 <li><strong>Provide the Service:</strong> authenticate you, associate computers with your account, save and restore workspace files, run applications, and deliver desktop connections.</li>
                 <li><strong>Keep it working:</strong> allocate resources, manage idle sessions, troubleshoot errors, maintain security, and investigate misuse.</li>
                 <li><strong>Respond to you:</strong> handle support, account, privacy, and security requests and communicate relevant service or policy changes.</li>
-                <li><strong>Administer billing:</strong> when paid plans are offered, process payments and renewals, calculate taxes, manage subscriptions and credits, measure usage against allowances, handle refunds and disputes, and maintain tax and accounting records.</li>
+                <li><strong>Administer billing:</strong> process payments and renewals, calculate taxes, manage subscriptions, measure compute usage against fair-use limits and saved storage against allowances, handle refunds and disputes, and maintain tax and accounting records.</li>
                 <li><strong>Meet obligations:</strong> respond to valid legal requests, protect rights, and establish or defend legal claims.</li>
             </ul>
             <p>Where applicable law requires a legal basis, we rely on performance of our agreement for essential account and service functions, legitimate interests for proportionate reliability, security, and support activities, and legal obligations where processing is required by law. Where consent is required, we will ask for it and let you withdraw it. Withdrawal does not undo processing lawfully carried out beforehand.</p>
@@ -86,8 +86,9 @@ const sections: readonly LegalSection[] = [
                 <li><strong>Vercel:</strong> hosts the web application and its server routes, processing page and API requests and operational information.</li>
                 <li><strong>Supabase:</strong> provides authentication and the database for account-linked computer records and structured diagnostics.</li>
                 <li><strong>Cloudflare:</strong> provides hosted computer infrastructure, request routing, persistent workspace storage, and diagnostic storage. Cloudflare’s connection relay service is used when configured for desktop streaming.</li>
+                <li><strong>AWS:</strong> provides the Standard and Premium computers in Mumbai, processing hosted files and session data to run those computers.</li>
                 <li><strong>Google:</strong> provides Google sign-in when you choose it and processes sign-in information under its own terms and privacy policy.</li>
-                <li><strong>Stripe:</strong> when paid plans are offered, acts as a processor for payments and tax calculation, handling billing and payment method details needed for checkout, recurring charges, and refunds.</li>
+                <li><strong>Stripe:</strong> handles payments and tax calculation, including billing and payment method details needed for checkout, recurring charges, and refunds. EZiL does not store card numbers.</li>
             </ul>
             <p>Infrastructure providers process the information needed for the functions they deliver. Browser, editor, and streaming software also forms part of the Service; including open-source software does not by itself mean its authors receive your data. Separately, the services that software contacts can receive information when you use their features.</p>
         </>,
@@ -98,7 +99,7 @@ const sections: readonly LegalSection[] = [
             <p>When you visit a website, install an extension, use an external development service, or configure an AI provider, information flows to that service according to your actions and its functionality. This may include prompts, code, documents, website data, and outputs. Those providers determine their own retention and other uses under their policies.</p>
             <p>If you connect an external client to your EZiL account, the client receives the data returned for its authorized operations. For example, the optional MCP connector can return computer details and desktop, editor, or preview access links, and can manage computers with your account’s permissions. Your chosen client or AI provider may receive that information.</p>
             <p>Creating an EZiL OS account does not automatically connect it to an AI model provider. We make no general promise about an external provider’s model training, data retention, or confidentiality. Check the provider, selected account settings, and permissions before sending sensitive information. Revoking a connection does not recall data already sent to that provider.</p>
-            <p>When paid plans are offered, where EZiL OS offers a built-in AI assistant, its use is paid from AI credits. Using that assistant involves processing the prompts, context, and outputs needed to provide its responses; creating an account alone does not send workspace content to an AI provider.</p>
+            <p>AI is not included in any plan. Creating an account alone does not send workspace content to an AI provider; information is sent when you choose to connect and use an AI tool.</p>
         </>,
     },
     {
@@ -115,7 +116,7 @@ const sections: readonly LegalSection[] = [
             <p>Account and computer records and persistent workspace files can remain while needed to operate the Service and after a computer is removed from the interface. There is no automatic general erasure deadline for those records or retained workspace files. Ask us for deletion if you want retained information assessed for removal.</p>
             <p>Structured diagnostic cleanup is configured to remove individual event records older than 14 days and hourly counts linked to a user pseudonym older than 90 days. Error-type summaries can remain longer; low-volume summaries not seen for a year are eligible for cleanup. These are cleanup thresholds, not a guarantee that every copy disappears at that exact age: completion depends on maintenance jobs running successfully, and queued diagnostic batches, infrastructure logs, and backups have separate handling.</p>
             <p>For support communications, operational records, and information subject to a deletion request, we consider the purpose of the information, whether it is still needed, security and abuse-prevention needs, and any legal preservation obligation. Where a backup or retained record cannot be removed immediately, or an exception applies, we will explain relevant limits when responding to your request. We do not promise a fixed deletion period for all systems.</p>
-            <p>When paid plans are offered, billing records are retained as required for tax and accounting obligations, even after account deletion. Account deletion does not require us or Stripe to erase records that applicable law requires to be kept.</p>
+            <p>Billing records are retained as required for tax and accounting obligations, even after account deletion. Account deletion does not require us or Stripe to erase records that applicable law requires to be kept.</p>
         </>,
     },
     {
@@ -172,9 +173,9 @@ export default function PrivacyPage() {
         kind="privacy"
         title="Privacy Policy"
         introduction="What the hosted Service processes, where your work lives, and how to ask for access or deletion."
+        changeSummary="Added compute usage and AWS Mumbai processing, clarified Stripe payment data, and removed included AI."
         summary={<>
             <p>A hosted desktop processes your work on remote infrastructure. Account records, workspace files, and diagnostics have different storage and deletion behavior. Deleting a computer does not erase its stored files; contact us for an erasure or export request.</p>
-            <p>What changed: named EZiL LLC as operator and explained Stripe processing and billing-record retention when paid plans are offered.</p>
         </>}
         sections={sections}
     />;

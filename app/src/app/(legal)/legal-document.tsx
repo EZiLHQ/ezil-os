@@ -21,11 +21,12 @@ export function OperatorContact() {
 }
 
 export function LegalDocument({
-    kind, title, introduction, summary, sections,
+    kind, title, introduction, changeSummary, summary, sections,
 }: {
     kind: 'terms' | 'privacy' | 'refunds';
     title: string;
     introduction: string;
+    changeSummary: string;
     summary: ReactNode;
     sections: readonly LegalSection[];
 }) {
@@ -40,7 +41,8 @@ export function LegalDocument({
                 <p className={styles.eyebrow}>EZiL OS / Hosted service</p>
                 <h1>{title}</h1>
                 <p className={styles.description}>{introduction}</p>
-                <p className={styles.date}>Effective <time dateTime="2026-10-11">11 October 2026</time> <span aria-hidden="true">·</span> os.ezil.org</p>
+                <p className={styles.date}>Effective <time dateTime="2026-10-21">21 October 2026</time> <span aria-hidden="true">·</span> os.ezil.org</p>
+                <p className={styles.description}>What changed: {changeSummary}</p>
             </div>
             <div className={styles.documentGrid}>
                 <nav className={styles.contents} aria-labelledby="contents-title">
