@@ -46,7 +46,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
                     order by created_at, id for update skip locked limit 1
                 )
                 update ezil_billing_outbox o set attempts = least(o.attempts + 1, ${AI_CREDIT_MAX_ATTEMPTS}),
-                    payload = jsonb_set(o.payload, '{delivery}', ${JSON.stringify({ status: 'processing', nextAttemptAt: now + AI_CREDIT_LEASE_MS })}::jsonb)
+                    payload = jsonb_set(o.payload, '{delivery}', (${JSON.stringify({ status: 'processing', nextAttemptAt: now + AI_CREDIT_LEASE_MS })}::text)::jsonb)
                 from candidate c where o.id = c.id
                 returning o.id, o.event_key as "eventKey", o.user_id as "userId", o.kind, o.payload, o.attempts,
                     c.attempts >= ${AI_CREDIT_MAX_ATTEMPTS} as exhausted
@@ -65,21 +65,21 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
         },
         async pinAccount(row, account) {
             const rows = await db.execute(sql`
-                update ezil_billing_outbox set payload = jsonb_set(payload, '{accountPublicId}', ${JSON.stringify(account)}::jsonb)
+                update ezil_billing_outbox set payload = jsonb_set(payload, '{accountPublicId}', (${JSON.stringify(account)}::text)::jsonb)
                 where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
-                    and payload->'delivery' = ${JSON.stringify(row.payload.delivery)}::jsonb
+                    and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb
                     and (payload->>'accountPublicId' is null or payload->>'accountPublicId' = ${account}) returning id
             `);
             return rows.length > 0;
         },
         async finish(row, result, now) {
             await db.execute(sql`
-                update ezil_billing_outbox set payload = jsonb_set(payload, '{delivery}', ${JSON.stringify({
+                update ezil_billing_outbox set payload = jsonb_set(payload, '{delivery}', (${JSON.stringify({
                     status: result.status, nextAttemptAt: result.nextAttemptAt ?? null,
-                })}::jsonb), last_error = ${result.reason},
+                })}::text)::jsonb), last_error = ${result.reason},
                     delivered_at = ${result.status === 'done' ? new Date(now).toISOString() : null}::timestamptz
                 where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
-                    and payload->'delivery' = ${JSON.stringify(row.payload.delivery)}::jsonb
+                    and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb
             `);
         },
     };

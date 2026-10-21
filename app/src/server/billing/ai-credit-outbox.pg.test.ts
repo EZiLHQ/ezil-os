@@ -105,8 +105,10 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         const event = (type: string, object: Record<string, unknown>): StripeEventLike => ({
             id: `evt_${randomUUID()}`, type, livemode: false, created: NOW / 1000, data: { object },
         });
-        const paid = event('invoice.paid', { id: invoiceId, billing_reason: 'subscription_cycle',
-            parent: { subscription_details: { subscription: subId } }, lines: { data: [] } });
+        const unix = (d: Date) => Math.floor(d.getTime() / 1000);
+        const paid = event('invoice.paid', { id: invoiceId, customer, billing_reason: 'subscription_cycle',
+            parent: { subscription_details: { subscription: subId } },
+            lines: { data: [{ id: 'line', subscription: subId, type: 'subscription', period: { start: unix(start), end: unix(end) } }] } });
         await processStripeEvent(paid, deps); await processStripeEvent(paid, deps);
         await processStripeEvent({ ...paid, id: `evt_${randomUUID()}` }, deps);
         expect(await rows()).toHaveLength(1);
