@@ -736,7 +736,7 @@ const PUBLIC_ERROR_CODES = [
   'bad_request', 'body_too_large', 'browser_response_too_large', 'browser_sidecar_disabled',
   'browser_sidecar_unreachable', 'browser_verb_method_mismatch', 'browser_verb_missing',
   'browser_verb_not_allowed', 'chunk_unavailable', 'container_still_running_after_destroy',
-  'cpu_diag_disabled', 'cpu_diag_read_failed', 'cpu_diag_stat_failed',
+  'cpu_diag_disabled', 'cpu_diag_read_failed', 'cpu_diag_stat_failed', 'custom_domain_required',
   'desktop_stack_did_not_stop_within_grace_period', 'diag_fresh_stat_failed', 'diag_invalid_op',
   'diag_invalid_slot', 'diag_mount_failed', 'diag_stat_failed', 'diag_write_failed', 'export_failed',
   'final_checkpoint_failed', 'flag_write_failed', 'focus_app_missing_or_not_a_string', 'focus_disabled',
@@ -764,7 +764,7 @@ const PUBLIC_ERROR_CODES = [
   'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed', 'request_too_large',
   'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
   'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
-  'runtime_running', 'screen_bad_request', 'screen_login_failed_no_token', 'screen_not_a_mode',
+  'runtime_running', 'sandbox_runtime_blocked', 'screen_bad_request', 'screen_login_failed_no_token', 'screen_not_a_mode',
   'screen_starting', 'screen_timeout', 'screen_unreadable', 'screen_upstream_exception', 'stop_failed',
   'store_unavailable', 'system_auth_not_configured', 'system_checkpoint_failed', 'system_fence_failed',
   'system_head_moved', 'system_size_unknown', 'system_too_large', 'telemetry_ack_failed',
@@ -780,8 +780,26 @@ const PUBLIC_ERROR_CODES = [
 
 // Screen failures encode an HTTP status. Build the finite protocol vocabulary
 // from constants so no upstream response text becomes a public code.
-const PUBLIC_SCREEN_ERROR_CODES = ['screen_login_failed', 'screen_unsupported', 'screen_upstream']
-  .flatMap((prefix) => Array.from({ length: 500 }, (_, i) => `${prefix}_${100 + i}`));
+const PUBLIC_SCREEN_ERROR_CODES = (['screen_login_failed', 'screen_unsupported', 'screen_upstream'] as const)
+  .flatMap((prefix) => Array.from({ length: 500 }, (_, i) => `${prefix}_${100 + i}` as const));
+
+type PublicErrorCode = (typeof PUBLIC_ERROR_CODES)[number] | (typeof PUBLIC_SCREEN_ERROR_CODES)[number];
+
+/** Log diagnostics before constructing a response; return only trusted constants. */
+function publicErrorCode(err: unknown, fallback: PublicErrorCode = 'internal_error'): PublicErrorCode {
+  console.error('[worker] response error:', err);
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : undefined;
+  const code = PUBLIC_ERROR_CODES.find((known) => known === message)
+    ?? PUBLIC_SCREEN_ERROR_CODES.find((known) => known === message)
+    ?? PUBLIC_ERROR_CODES.find((known) => typeof message === 'string' && message.startsWith(`${known}:`));
+  if (code) return code;
+  if (typeof message === 'string' && /setsockoptint/i.test(message)) return 'sandbox_runtime_blocked';
+  if (typeof message === 'string' && /CustomDomainRequiredError|Port exposure requires a custom domain/i.test(message)) return 'custom_domain_required';
+  // Select even the fallback from the list, rather than returning an argument.
+  return PUBLIC_ERROR_CODES.find((known) => known === fallback)
+    ?? PUBLIC_SCREEN_ERROR_CODES.find((known) => known === fallback)
+    ?? 'internal_error';
+}
 
 function json(data: unknown, status = 200): Response {
   const body = JSON.stringify(data, (key, value: unknown) => {
@@ -1309,7 +1327,7 @@ async function ensureDesktop(
       bootLog('app_preview_expose', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      appPreviewExpose = { attempted: true, exposed: false, error: message };
+      appPreviewExpose = { attempted: true, exposed: false, error: publicErrorCode(err) };
       bootLog('app_preview_expose', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
       console.error(
         `[ensureDesktop] app-preview port expose failed (hostname=${hostname}, port=${appPreview.port}): ${message}`,
@@ -1335,7 +1353,7 @@ async function ensureDesktop(
       bootLog('code_preview_expose', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      codePreviewExpose = { attempted: true, exposed: false, error: message };
+      codePreviewExpose = { attempted: true, exposed: false, error: publicErrorCode(err) };
       bootLog('code_preview_expose', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
       console.error(
         `[ensureDesktop] code-preview port expose failed (hostname=${hostname}, port=${codePreview.port}): ${message}`,
@@ -1547,7 +1565,7 @@ async function ensureWorkspaceMount(
         mounted = true;
         break;
       }
-      mountErr = message;
+      mountErr = publicErrorCode(err);
       if (attempt < MOUNT_ATTEMPTS) {
         await new Promise((r) => setTimeout(r, 750 * attempt));
       }
@@ -1589,12 +1607,11 @@ async function ensureWorkspaceMount(
     }
   } catch (err) {
     // Seeding is best-effort; a failure here should not block the preview.
+    publicErrorCode(err);
     return {
       mounted: true,
       mountPath: config.mountPath,
-      // Same reason as `mount_failed_after_*` above — an ENOENT/EACCES from
-      // the seed check names the mount path verbatim.
-      detail: `seed_check_failed: ${sanitizeErrorMessage(err)}`,
+      detail: 'seed_check_failed',
     };
   }
 
@@ -2676,7 +2693,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         } } : {}) });
       });
       return { ok: true, ...state };
-    } catch (error) { return relayFailureResult(error); }
+    } catch (error) {
+      const code = publicErrorCode(error);
+      const failure = relayFailureResult(error);
+      return { ok: false, error: error instanceof RelayFailure ? code : 'relay_refresh_failed', status: failure.status };
+    }
   }
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
@@ -3614,7 +3635,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       try {
         return await reopenMigrationHeads(store.store, wctx.prefix, systemPrefixOf(wctx.prefix), params.expectedMigratedEtag);
       } catch (err) {
-        return { ok: false as const, reason: err instanceof MigrationRequestError ? err.reason : 'reopen_failed' };
+        const code = publicErrorCode(err);
+        return { ok: false as const, reason: err instanceof MigrationRequestError ? code : 'reopen_failed' };
       }
     });
   }
@@ -3640,10 +3662,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         return new Response(body, { headers: { ...corsHeaders, 'content-type': 'application/octet-stream',
           'content-length': String(chunk.size), 'x-ezil-chunk-sha256': chunk.sha256, 'cache-control': 'no-store' } });
       } catch (err) {
+        const code = publicErrorCode(err);
         if (layer === 'system' && err instanceof MigrationRequestError && err.reason === 'no_checkpoint') {
           return json({ ok: false, error: 'no_system_snapshot' }, 404);
         }
-        return json({ ok: false, error: err instanceof MigrationRequestError ? err.reason : 'export_failed' },
+        return json({ ok: false, error: err instanceof MigrationRequestError ? code : 'export_failed' },
           err instanceof MigrationRequestError ? err.status : 503);
       }
     });
@@ -3979,7 +4002,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (retainPreviewAuthorization) await super.stop();
       else await super.destroy();
     } catch (err) {
-      destroyError = err instanceof Error ? err.message : String(err);
+      const code = publicErrorCode(err);
+      // buildTerminateReport treats an empty diagnostic as no destroy error.
+      const message = err instanceof Error ? err.message : String(err);
+      destroyError = message.trim() ? code : undefined;
       console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
     }
 
@@ -4210,7 +4236,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         try {
           iceEnv = await resolveNekoIceEnv(this.env);
         } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
+          publicErrorCode(err);
           if (ice.policy === 'relay' || ice.policy === 'production') {
             bootLog('restart', 'end', { status: 'error', detail: 'turn_unavailable' });
             return buildRestartReport({
@@ -4218,7 +4244,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
               wasRunning,
               stopConfirmed: true,
               bootOk: false,
-              bootError: `turn_unavailable: ${detail}`,
+              bootError: 'turn_unavailable',
             });
           }
           iceEnv = null; // diagnostic policy: proceed without relay
@@ -4286,9 +4312,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           codePreviewUrl: codePreviewExpose.exposed ? (codePreviewExpose.url ?? null) : null,
         };
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
+        const code = publicErrorCode(err);
         bootLog('restart', 'end', { status: 'error', detail: 'boot_failed' });
-        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: detail });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: code });
       }
     } finally {
       this.restartInProgress = false;
@@ -4682,12 +4708,13 @@ async function handlePreview(
       try {
         iceEnv = await resolveNekoIceEnv(env);
       } catch (err) {
+        publicErrorCode(err);
         const detail = err instanceof Error ? err.message : String(err);
         if (ice.policy === 'relay' || ice.policy === 'production') {
           tl.event('preview_lifecycle', 'sandbox.preview.turn', 'error', {
             error: `turn_unavailable: ${detail}`,
           });
-          return json({ ok: false, error: `turn_unavailable: ${detail}`, mode }, 502);
+          return json({ ok: false, error: 'turn_unavailable', mode }, 502);
         }
         // diagnostic policy: proceed without relay (media stays gated).
         iceEnv = null;
@@ -4979,7 +5006,7 @@ async function handlePreview(
     tl.event('preview_lifecycle', 'sandbox.preview.failed', 'error', { error: err });
     spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetry);
     return json(
-      { ok: false, error: err instanceof Error ? err.message : String(err), mode },
+      { ok: false, error: publicErrorCode(err), mode },
       err instanceof Error && err.message === 'migrating' ? 409 : 500,
     );
   }
@@ -5092,7 +5119,7 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       {
         ok: false,
         sandboxName,
-        error: err instanceof Error ? err.message : String(err),
+        error: publicErrorCode(err),
         mode: modeResult.mode,
       },
       500,
@@ -5129,7 +5156,7 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
     return json({ sandboxName, ...report }, status);
   } catch (err) {
     return json(
-      { ok: false, sandboxName, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5390,7 +5417,7 @@ async function handleWorkspaceDiag(
   } catch (err) {
     tl.event('workspace_mount', 'sandbox.diag.failed', 'error', { error: err });
     return json(
-      { ok: false, sandboxId: sandboxName, op, slot, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, op, slot, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5527,7 +5554,7 @@ async function handleCpuDiag(
   } catch (err) {
     tl.event('workspace_mount', 'sandbox.cpu_diag.failed', 'error', { error: err });
     return json(
-      { ok: false, sandboxId: sandboxName, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5686,7 +5713,7 @@ async function handleNekoLogs(
   } catch (err) {
     tl.event('workspace_mount', 'sandbox.neko_logs.failed', 'error', { error: err });
     return json(
-      { ok: false, sandboxId: sandboxName, error: sanitizeErrorMessage(err) },
+      { ok: false, sandboxId: sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5936,7 +5963,7 @@ async function handleTwen(request: Request, env: Env, sandboxName: string): Prom
     });
   } catch (err) {
     return json(
-      { ok: false, sandboxId: sandboxName, op, operationId, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, op, operationId, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5991,7 +6018,7 @@ async function handleFocus(request: Request, env: Env, sandboxName: string): Pro
     return json({ ok: true, sandboxId: sandboxName, app });
   } catch (err) {
     return json(
-      { ok: false, sandboxId: sandboxName, app, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, app, error: publicErrorCode(err) },
       500,
     );
   }
@@ -6353,14 +6380,13 @@ async function handleScreen(request: Request, env: Env, sandboxName: string, des
       502,
     );
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    publicErrorCode(err);
     const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
     return json(
       {
         ok: false,
         sandboxId: sandboxName,
         error: timedOut ? 'screen_timeout' : `screen_upstream_exception`,
-        detail: message.slice(0, 300),
       },
       timedOut ? 504 : 502,
     );
@@ -6418,7 +6444,7 @@ async function handleActivity(request: Request, env: Env, sandboxName: string): 
     return json({ ok: true, sandboxId: sandboxName });
   } catch (err) {
     return json(
-      { ok: false, sandboxId: sandboxName, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -6470,8 +6496,9 @@ async function handleTelemetryDrain(request: Request, env: Env): Promise<Respons
       truncated: page.truncated,
     });
   } catch (err) {
+    publicErrorCode(err);
     return json(
-      { ok: false, error: `telemetry_drain_failed: ${err instanceof Error ? err.message : String(err)}` },
+      { ok: false, error: 'telemetry_drain_failed' },
       500,
     );
   }
@@ -6505,8 +6532,9 @@ async function handleTelemetryAck(request: Request, env: Env): Promise<Response>
     await bucket.delete(keys);
     return json({ ok: true, deleted: keys.length });
   } catch (err) {
+    publicErrorCode(err);
     return json(
-      { ok: false, error: `telemetry_ack_failed: ${err instanceof Error ? err.message : String(err)}` },
+      { ok: false, error: 'telemetry_ack_failed' },
       500,
     );
   }
@@ -7142,7 +7170,7 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
         terminated: false,
         stopped: false,
         outcome: 'destroy_failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: publicErrorCode(err),
       },
       500,
     );
@@ -7271,12 +7299,11 @@ async function handleBrowserSidecar(
     // `launch_browser_sidecar` skipped (no /opt/ezil-sidecar in an older
     // image, or `EZIL_BROWSER_SIDECAR=off`), or the desktop is not up. Say
     // that, rather than returning a bare 500 that reads as a Worker fault.
-    const message = err instanceof Error ? err.message : String(err);
+    publicErrorCode(err);
     return json(
       {
         ok: false,
         error: 'browser_sidecar_unreachable',
-        detail: sanitizeErrorMessage(message),
         port: BROWSER_SIDECAR_PORT,
       },
       502,
@@ -7659,7 +7686,8 @@ export default {
         await openSandbox(env,name).setAcceptanceFault(name,raw);
         return json({ok:true});
       } catch (error) {
-        return json({ok:false,error:error instanceof AcceptanceFaultError ? error.code : 'acceptance_fault_failed'},
+        const code = publicErrorCode(error);
+        return json({ok:false,error:error instanceof AcceptanceFaultError ? code : 'acceptance_fault_failed'},
           error instanceof AcceptanceFaultError ? error.status : 502);
       }
     }
@@ -7688,7 +7716,8 @@ export default {
         const result = await openSandbox(env,name).relayRefresh(name,runtimeId);
         return result.ok ? json(result) : json({ ok:false, error:result.error }, result.status);
       } catch (error) {
-        return json({ ok:false,error:error instanceof RelayFailure ? error.code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
+        const code = publicErrorCode(error);
+        return json({ ok:false,error:error instanceof RelayFailure ? code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
       }
     }
 

@@ -3789,14 +3789,64 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(values.has(AI_PROXY_NONCE_STORAGE_KEY)).toBe(false);
   });
 
+  it('preserves the teardown outcome when the SDK throws an empty diagnostic', async () => {
+    const { obj } = await object();
+    obj.ctx.container.running = false;
+    obj.cancelWorkspaceFlushLoop = async () => {};
+    const sdk = Object.getPrototypeOf(Object.getPrototypeOf(obj));
+    const destroy = spyOn(sdk, 'destroy').mockRejectedValue(new Error('  '));
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(await obj.terminateSandboxWithCheckpoint()).toMatchObject({ ok: true, outcome: 'not_running' });
+    } finally {
+      destroy.mockRestore();
+      logs.mockRestore();
+    }
+  });
+
 });
 
 
 describe('Worker JSON error response boundary', () => {
+  it('keeps explicit route error codes when an exception names a different public code', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const thrown = new Error('setsockoptint: private runtime failure');
+      const bucket = {
+        list: async () => { throw thrown; },
+        delete: async () => { throw thrown; },
+      };
+      for (const action of ['drain', 'ack']) {
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/telemetry/${action}`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${await mintToken()}` },
+            body: JSON.stringify({ keys: ['v1/a.ndjson'] }),
+          }),
+          { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+        );
+        expect(res.status).toBe(500);
+        expect(await res.json()).toEqual({ ok: false, error: `telemetry_${action}_failed` });
+      }
+      const { binding } = fakeSandboxNamespace({ containerResponse: () => { throw thrown; } });
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/browser/health`, {
+          headers: { authorization: `Bearer ${await mintToken()}` },
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({ ok: false, error: 'browser_sidecar_unreachable', port: 9223 });
+      expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
+    } finally { logs.mockRestore(); }
+  });
+
   it('returns internal_error for thrown messages and strings, logging details only on the server', async () => {
     const logs = spyOn(console, 'error').mockImplementation(() => {});
     try {
-      for (const thrown of [new Error('private SDK message\n    at /srv/private.ts:42'), 'private_code_shaped_secret']) {
+      const error = new Error('private SDK message');
+      error.stack = 'Error: private SDK message\n    at /srv/private.ts:42';
+      for (const thrown of [error, 'private_code_shaped_secret']) {
         const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
         const res = await worker.fetch(
           new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
@@ -3806,7 +3856,7 @@ describe('Worker JSON error response boundary', () => {
         const text = await res.text();
         expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: 'internal_error' });
         expect(text).not.toContain('private');
-        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown instanceof Error ? thrown.message : thrown);
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
       }
     } finally { logs.mockRestore(); }
   });
@@ -3817,15 +3867,45 @@ describe('Worker JSON error response boundary', () => {
       for (const [thrown, code] of [
         [new Error('setsockoptint: operation not permitted at /srv/private.ts:9'), 'sandbox_runtime_blocked'],
         [new Error('CustomDomainRequiredError: Port exposure requires a custom domain (private.example)'), 'custom_domain_required'],
+        ['SETSOCKOPTINT: private runtime failure', 'sandbox_runtime_blocked'],
+        ['Port exposure requires a custom domain: private.example', 'custom_domain_required'],
       ] as const) {
         const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
         const res = await worker.fetch(
           new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
           { Sandbox: binding },
         );
+        expect(res.status).toBe(500);
         const text = await res.text();
-        expect(JSON.parse(text).error).toBe(code);
+        expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: code });
         expect(text).not.toContain('private');
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('selects allowlisted constants from thrown codes and code-prefixed messages', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [thrown, code] of [
+        ['migrating', 'migrating'],
+        [new Error('focus_switch_failed: private diagnostic'), 'focus_switch_failed'],
+        ['head_moved: private diagnostic', 'head_moved'],
+        ['screen_upstream_418', 'screen_upstream_418'],
+        ['screen_upstream_999: private diagnostic', 'internal_error'],
+        ['sandbox_runtime_blocked', 'sandbox_runtime_blocked'],
+        ['custom_domain_required', 'custom_domain_required'],
+      ] as const) {
+        const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(res.status).toBe(500);
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: code });
+        expect(text).not.toContain('private');
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
       }
     } finally { logs.mockRestore(); }
   });
