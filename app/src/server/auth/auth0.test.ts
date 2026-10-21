@@ -133,7 +133,8 @@ describe('ID token verification', () => {
         ['unverified email', { email_verified: false }], ['truthy email verification', { email_verified: 'true' }],
         ['missing email', { email: undefined }], ['invalid email', { email: 'bad' }], ['missing subject', { sub: undefined }],
     ])('refuses %s', async (_name, claims) => {
-        await expect(verifyIdToken(await token(claims), { nonce: 'nonce' })).rejects.toMatchObject({ code: 'invalid_id_token' });
+        const unverified = 'email_verified' in claims;
+        await expect(verifyIdToken(await token(claims), { nonce: 'nonce' })).rejects.toMatchObject({ code: unverified ? 'email_unverified' : 'invalid_id_token' });
     });
     it.each(['HS256', 'none'])('refuses %s before consulting JWKS', async alg => {
         await expect(verifyIdToken(await token({}, { alg }), { nonce: 'nonce' })).rejects.toThrow('invalid_id_token');

@@ -26,6 +26,8 @@ export const viewport: Viewport = {
 function noticeFor(error: string | string[] | undefined): string | null {
     if (error === undefined) return null;
     if (error === 'auth_callback_failed') return 'Sign-in did not finish. Please try again.';
+    if (error === 'email_unverified') return 'Verify your email address with EZiL ID first, then sign in again.';
+    if (error === 'account_conflict') return 'This email is already linked to a different EZiL ID. Contact contact@ezil.work.';
     return 'We could not sign you in. Please try again.';
 }
 

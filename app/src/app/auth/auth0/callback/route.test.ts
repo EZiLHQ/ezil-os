@@ -69,7 +69,10 @@ describe('Auth0 callback', () => {
         stub[method].mockRejectedValue(new Error(`${secret} private-code private-id-token private@example.com`));
         const response = await GET(request());
         expect(response.headers.get('location')).toBe(`${origin}/login?error=auth0_failed`);
-        for (const log of logs) expect(log).not.toHaveBeenCalled();
+        // Only the fixed failure code may be logged; never provider text, tokens or user data.
+        expect(logs[0]).not.toHaveBeenCalled();
+        expect(logs[2]).not.toHaveBeenCalled();
+        expect(logs[1].mock.calls).toEqual([['[auth0] callback failed', { code: 'auth0_failed' }]]);
         if (method !== 'bridge') expect(stub.bridge).not.toHaveBeenCalled();
         expectCleared(response);
     });

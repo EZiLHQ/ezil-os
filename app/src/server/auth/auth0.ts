@@ -11,7 +11,7 @@ export const AUTH0_COOKIE_OPTIONS = { httpOnly: true, secure: true, sameSite: 'l
 const TEN_MINUTES = 600_000;
 
 type ErrorCode = 'auth0_disabled' | 'invalid_transaction' | 'state_mismatch' | 'token_exchange_failed'
-    | 'invalid_id_token' | 'account_conflict' | 'session_failed' | 'auth0_failed';
+    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed';
 
 export class Auth0Error extends Error {
     constructor(readonly code: ErrorCode) { super(code); }
@@ -98,7 +98,12 @@ export async function exchangeCode(code: string, { origin, codeVerifier }: { ori
                 redirect_uri: `${new URL(origin).origin}/auth/auth0/callback`, code_verifier: codeVerifier,
             }),
         });
-        if (!response.ok) throw new Error();
+        if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            // Auth0's error code and status only: never the code, secret or tokens.
+            console.warn('[auth0] token exchange refused', { status: response.status, error: typeof body?.error === 'string' ? body.error : null });
+            throw new Error();
+        }
         const data = await response.json();
         if (typeof data.id_token !== 'string' || !data.id_token) throw new Error();
         return data.id_token as string;
@@ -139,17 +144,23 @@ export async function verifyIdToken(idToken: string, { nonce }: { nonce: string 
         const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
         const now = Date.now() / 1000;
         const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-        if (claims.iss !== AUTH0_ISSUER || !audience.includes(clientId)
-            || (audience.length > 1 && claims.azp !== clientId)
-            || (claims.azp !== undefined && claims.azp !== clientId)
-            || typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now - 60
-            || typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > now + 60 || claims.iat >= claims.exp
-            || typeof claims.nonce !== 'string' || !constantTimeEqual(claims.nonce, nonce)
-            || typeof claims.sub !== 'string' || !claims.sub.trim()
-            || typeof claims.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(claims.email)
-            || claims.email_verified !== true) throw new Error();
+        const failed = claims.iss !== AUTH0_ISSUER ? 'iss'
+            : !audience.includes(clientId) || (audience.length > 1 && claims.azp !== clientId) || (claims.azp !== undefined && claims.azp !== clientId) ? 'aud'
+            : typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now - 60 ? 'exp'
+            : typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > now + 60 || claims.iat >= claims.exp ? 'iat'
+            : typeof claims.nonce !== 'string' || !constantTimeEqual(claims.nonce, nonce) ? 'nonce'
+            : typeof claims.sub !== 'string' || !claims.sub.trim() ? 'sub'
+            : typeof claims.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(claims.email) ? 'email'
+            : claims.email_verified !== true ? 'email_verified' : null;
+        if (failed) {
+            console.warn('[auth0] id token claim refused', { claim: failed });
+            throw new Auth0Error(failed === 'email_verified' ? 'email_unverified' : 'invalid_id_token');
+        }
         return { sub: claims.sub, email: claims.email };
-    } catch { throw new Auth0Error('invalid_id_token'); }
+    } catch (error) {
+        if (error instanceof Auth0Error) throw error;
+        throw new Auth0Error('invalid_id_token');
+    }
 }
 
 export function logoutUrl(origin: string): URL {

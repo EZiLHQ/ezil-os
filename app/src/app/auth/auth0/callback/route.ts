@@ -18,7 +18,9 @@ export async function GET(request: NextRequest) {
         await bridgeAuth0Identity(identity);
         destination = safeReturnUrl(transaction.returnUrl);
     } catch (error) {
-        destination = `/login?error=${error instanceof Auth0Error ? error.code : 'auth0_failed'}`;
+        const code = error instanceof Auth0Error ? error.code : 'auth0_failed';
+        console.warn('[auth0] callback failed', { code });
+        destination = `/login?error=${code}`;
     }
     const response = NextResponse.redirect(new URL(destination, ownedPublicOrigin(request.headers, request.url)));
     response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });
