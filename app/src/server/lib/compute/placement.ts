@@ -605,6 +605,8 @@ export interface FlipPlacementToAwsInput {
     computerId: string;
     ownerUserId: string;
     migrationId: string;
+    /** Keep the normal ready receipt pending until migration commit. */
+    pendingReady?: boolean;
     /** Receipt of the already admitted, restored AWS host. No new host is launched here. */
     fields: PlacementFields & { region: 'ap-south-1'; instanceId: string; volumeId: string; fsUuid: string };
 }
@@ -627,6 +629,10 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
             throw new Error('migration_aws_receipt_invalid');
         }
         const current = (await readPlacement(tx, computerId)).record;
+        if (current?.provider === 'aws-ec2' && current.ownerUserId === ownerUserId
+            && current.instanceId === input.fields.instanceId && current.volumeId === input.fields.volumeId
+            && current.fsUuid === input.fields.fsUuid && current.fenceToken === (input.fields.fenceToken ?? null)
+            && current.state === (input.pendingReady ? 'PROVISIONING' : 'RUNNING')) return current;
         if (current) {
             if (current.provider !== 'cloudflare' || current.ownerUserId !== ownerUserId) throw new Error('migration_source_mismatch');
             let retired = current;
@@ -643,9 +649,33 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
                 RETURNING computer_id`));
             if (deleted.length !== 1) throw new Error('migration_placement_conflict');
         }
-        const created = await createInTx(tx, { computerId, ownerUserId, provider: 'aws-ec2', state: 'RUNNING', fields: input.fields }, true);
+        const created = await createInTx(tx, { computerId, ownerUserId, provider: 'aws-ec2', state: input.pendingReady ? 'PROVISIONING' : 'RUNNING', fields: input.fields }, true);
         if (!created.ok) throw new Error('migration_placement_conflict');
         return created.placement;
+    });
+}
+
+/** Compensate only this migration's unpublished boot. The retained CF snapshot is authoritative. */
+export function rollbackMigrationPlacement(db: PlacementDb, m: import('./provider-migrate-store').ComputeMigration, source: Placement | null): Promise<void> {
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, m.computerId);
+        const locked = rowsOf(await tx.execute(sql`SELECT state, last_error FROM public.ezil_compute_migrations
+            WHERE id = ${m.id}::uuid AND computer_id = ${m.computerId}::uuid AND user_id = ${m.userId}::uuid FOR UPDATE`))[0];
+        if (!locked || !String(locked.last_error).startsWith('recovery:')) throw new Error('migration_not_recovering');
+        const p = (await readPlacement(tx, m.computerId)).record;
+        if (!p || p.provider === 'cloudflare') return;
+        if (p.ownerUserId !== m.userId || p.state !== 'PROVISIONING' || p.lastError !== `migration_pending:${m.id}`)
+            throw new Error('migration_rollback_conflict');
+        const removed = rowsOf(await tx.execute(sql`DELETE FROM public.ezil_computer_placements
+            WHERE computer_id = ${m.computerId}::uuid AND owner_user_id = ${m.userId}::uuid
+              AND provider = 'aws-ec2' AND state = 'PROVISIONING' AND last_error = ${p.lastError}
+              AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch} RETURNING computer_id`));
+        if (removed.length !== 1) throw new Error('migration_rollback_conflict');
+        if (source) {
+            const restored = await createInTx(tx, { computerId: m.computerId, ownerUserId: m.userId,
+                provider: 'cloudflare', state: source.state, fields: source }, true);
+            if (!restored.ok) throw new Error('migration_rollback_conflict');
+        }
     });
 }
 
@@ -1208,6 +1238,18 @@ export async function peekAdmissionCounters(
     return readCounters(db, rawInput);
 }
 
+/** The admission lock covers placement launches and migration reservations alike. */
+const CAPACITY_PLACEMENTS = sql`(
+    SELECT computer_id, owner_user_id, provider, state, region, instance_type FROM public.ezil_computer_placements
+    UNION ALL
+    SELECT m.computer_id, m.user_id, 'aws-ec2', 'PROVISIONING',
+        m.workspace_head #>> '{_awsProvision,placement,region}', m.workspace_head #>> '{_awsProvision,placement,instanceType}'
+    FROM public.ezil_compute_migrations m
+    WHERE m.workspace_head ? '_awsProvision' AND m.state <> 'committed'
+      AND COALESCE(m.workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'
+      AND NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = m.computer_id AND p.provider = 'aws-ec2')
+)`;
+
 async function readCounters(
     tx: PlacementExecutor,
     rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
@@ -1230,13 +1272,13 @@ async function readCounters(
     const runningRows = rowsOf(
         await tx.execute(sql`/* placement:count-running */ SELECT count(*)::int AS n,
                 COALESCE(SUM(${instanceVcpuSql(sql`instance_type`)}), 0)::text AS vcpu
-            FROM public.ezil_computer_placements
+            FROM ${CAPACITY_PLACEMENTS} AS capacity
             WHERE provider = 'aws-ec2' AND state IN (${running})`),
     );
     const regionRows = rowsOf(
         await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n,
                 COALESCE(SUM(${instanceVcpuSql(sql`instance_type`)}), 0)::text AS vcpu
-            FROM public.ezil_computer_placements
+            FROM ${CAPACITY_PLACEMENTS} AS capacity
             WHERE provider = 'aws-ec2' AND state IN (${running})
             GROUP BY region`),
     );
@@ -1244,7 +1286,7 @@ async function readCounters(
     // while its volume still exists.
     const userRows = rowsOf(
         await tx.execute(sql`/* placement:count-user */ SELECT count(DISTINCT p.computer_id)::int AS n
-            FROM public.ezil_computer_placements p
+            FROM ${CAPACITY_PLACEMENTS} p
             WHERE p.provider = 'aws-ec2' AND p.computer_id <> ${input.computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE'
               AND (p.owner_user_id = ${input.userId}::uuid
                 OR EXISTS (SELECT 1 FROM public.ezil_compute_usage u WHERE u.computer_id = p.computer_id AND u.user_id = ${input.userId}::uuid))`),
@@ -1315,4 +1357,9 @@ export async function readRetentionCandidates(db: PlacementExecutor): Promise<{ 
         if (!updatedAt || !oneOf(PLACEMENT_STATES, r.state)) throw new PlacementIntegrityError('invalid_row', computerId);
         return { computerId, state: r.state, updatedAt };
     });
+}
+
+/** Lifecycle authority may inspect a migration boot; user routing must keep using readPlacement. */
+export async function readLifecyclePlacement(db: PlacementExecutor, computerId: string): Promise<ResolvedPlacement> {
+    return (await import('./provider-migrate-provision')).readEnrollmentPlacement(db, computerId);
 }

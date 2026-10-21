@@ -3,6 +3,7 @@
  * balances. Re-read provider state and use the customer mapping before every
  * effect; stable ledger/outbox keys let a retry finish an interrupted delivery.
  */
+import { schedulePaidMigration } from '../lib/compute/provider-migrate-orchestrator';
 import { findPack, PRO_PLAN } from './catalog';
 import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, UsageEvent } from './ports';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
@@ -61,6 +62,10 @@ function invoiceGrantKind(invoice: StripeInvoice):
 
 async function applyAction(action: BillingAction, event: StripeEventLike, deps: ProcessorDeps): Promise<string> {
     const { store, stripe } = deps;
+    const paidGrant = async (input: Parameters<BillingStore['insertGrant']>[0], sku: string) => {
+        await store.insertGrant(input);
+        schedulePaidMigration(input.userId, sku, event.type);
+    };
     switch (action.type) {
         case 'link_customer': {
             const sessionId = event.data.object.id;
@@ -130,11 +135,11 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                     if (result === 'conflict') return 'review:customer_mismatch';
                     await store.resolvePaymentIssue(invoice.id, eventCreated);
-                    await store.insertGrant({
+                    await paidGrant({
                         userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'plan_period',
                         amount: BigInt(invoicedOffer.allowanceStdSeconds), periodStart: base.periodStart, periodEnd: base.periodEnd,
                         sourceType: 'invoice', sourceId: invoice.id,
-                    });
+                    }, invoicedOffer.sku);
                 }
                 return 'applied';
             }
@@ -156,10 +161,10 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                 if (result === 'conflict') return 'review:customer_mismatch';
                 await store.resolvePaymentIssue(invoice.id, eventCreated);
-                await store.insertGrant({
+                await paidGrant({
                     userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'upgrade_prorated',
                     amount: BigInt(amount), periodStart, periodEnd, sourceType: 'invoice', sourceId: invoice.id,
-                });
+                }, compute.lookupKey === CATALOG_V3.premium_monthly_v3.stripeLookupKey ? 'premium_monthly_v3' : 'compute_monthly_v2');
                 await store.setPlanChangeState({ userId, subscriptionId: subscription.id, kind: 'upgrade', state: 'applied', effectiveAt });
                 return 'applied';
             }

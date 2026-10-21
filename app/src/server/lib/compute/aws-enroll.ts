@@ -20,7 +20,8 @@ import { isAwsComputersEnabled, readAwsBrowserZone, type Env as AwsEnv } from '.
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
-import { consumeEnrollmentNonce, ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, finishEnrollment, readPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { readEnrollmentPlacement as readPlacement, consumeMigrationEnrollment as consumeEnrollmentNonce, finishMigrationEnrollment as finishEnrollment } from './provider-migrate-provision';
+import { ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, type Placement, type PlacementDb, type PlacementState } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */

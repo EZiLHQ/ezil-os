@@ -232,7 +232,7 @@ describe('runAdmission (transactional)', () => {
         expect(running.params).toContain('UNCONFIRMED');
         expect(running.params).not.toContain('STOPPED');
         const perRegion = statements.find((s) => /count-running-region/.test(s.sql))!;
-        expect(perRegion.sql).toMatch(/SELECT region, count\(\*\)::int AS n,\s+COALESCE\(SUM\(CASE instance_type[\s\S]*?AS vcpu\s+FROM public\.ezil_computer_placements\s+WHERE provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/);
+        expect(perRegion.sql).toMatch(/SELECT region, count\(\*\)::int AS n,\s+COALESCE\(SUM\(CASE instance_type[\s\S]*?AS vcpu\s+FROM \([\s\S]*UNION ALL[\s\S]*ezil_compute_migrations[\s\S]*\) AS capacity\s+WHERE provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/);
         expect(perRegion.params).toEqual(running.params);
         const user = statements.find((s) => /count-user/.test(s.sql))!;
         expect(user.sql).toMatch(/p\.computer_id <> \$1::uuid AND p\.state <> 'PURGE_ELIGIBLE'/);

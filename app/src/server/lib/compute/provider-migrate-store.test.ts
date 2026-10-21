@@ -113,3 +113,19 @@ describe('migration persistence', () => {
         expect(f.queries[0]!.params).not.toContain(row.restore_token_expires_at);
     });
 });
+
+describe('stale migration claims and server status', () => {
+    it.each([-1, 0, 2, 10, 99, NaN])('bounds claim %s and locks only stale nonterminal rows', async limit => {
+        const f = setup(); await f.store.claimStale(limit);
+        const q = f.queries[0]!;
+        expect(q.params).toEqual([Number.isFinite(limit) ? Math.max(0, Math.min(10, limit)) : 0]);
+        expect(q.sql).toContain("updated_at < clock_timestamp() - interval '30 seconds'");
+        expect(q.sql).toContain('FOR UPDATE SKIP LOCKED');
+        expect(q.sql).toContain("state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')");
+        expect(q.sql).toContain('UPDATE public.ezil_compute_migrations');
+    });
+    it.each(MIGRATION_STATES)('reports %s without exposing operational detail', async state => {
+        expect(await setup([[{ state }]]).store.statusFor(G)).toBe(state === 'committed' ? null : state.startsWith('failed_') ? 'failed' : 'preparing');
+    });
+    it('has no hint without a migration', async () => { expect(await setup([[]]).store.statusFor(G)).toBeNull(); });
+});
