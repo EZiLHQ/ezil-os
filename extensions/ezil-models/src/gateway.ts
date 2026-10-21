@@ -186,7 +186,9 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
                 ? 'No live AI credit grant.' : 'Not enough AI credits for this request.';
             return make(`${state}${available !== undefined ? ` Available credits: ${available / MICRO_PER_CREDIT}.` : ''}`);
         }
-        case 'os_session_missing': return make('This computer has no current OS sign-in. Reopen Code or sign in again');
+        // The OS app delivers a session only for accounts with an EZiL AI role (ai-credential.ts), so a missing
+        // session means either no AI access on this account or no delivered sign-in yet: say both.
+        case 'os_session_missing': return make('EZiL AI is not available here yet: this account has no EZiL AI access, or this computer has not received your sign-in. Reopen Code to retry');
         case 'os_session_expired': case 'access_token_expired': return make('Your OS sign-in has expired. Reopen Code or sign in again');
         case 'os_proxy_unauthorized': return make('EZiL OS refused this computer’s AI connection. Restart the computer to reconnect');
         case 'unauthorized':

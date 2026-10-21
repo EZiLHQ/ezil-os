@@ -121,7 +121,7 @@ describe('gateway transport', () => {
 describe('gateway errors and credits', () => {
     for (const [status, code, text] of [
         [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'grant'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
-        [401, 'os_session_missing', 'Reopen Code or sign in again'], [401, 'os_proxy_unauthorized', 'EZiL OS refused this computer'],
+        [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS refused this computer'],
         [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'Conversation too large — start a new chat'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],

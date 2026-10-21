@@ -11,8 +11,8 @@ import { TextPart, ToolCallPart, ToolResultPart, DataPart, ThinkingPart, EventEm
 
 const showRetryError = mock(async (_message: string, ..._actions: string[]): Promise<string | undefined> => undefined);
 const retryCommand = mock(async (_command: string) => undefined);
-fakeVscode.window = { showErrorMessage: showRetryError };
-fakeVscode.commands = { executeCommand: retryCommand };
+(fakeVscode.window as Record<string, unknown>).showErrorMessage = showRetryError;
+(fakeVscode.commands as Record<string, unknown>).executeCommand = retryCommand;
 
 mock.module('vscode', () => fakeVscode);
 
@@ -352,7 +352,7 @@ describe('EZiL gateway VS Code bridge', () => {
         showRetryError.mockClear(); retryCommand.mockClear();
         showRetryError.mockImplementationOnce(async () => 'Retry');
         let posts = 0;
-        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'os_ai_unavailable' } }, { status: 504 }); }) as typeof fetch);
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'os_ai_unavailable' } }, { status: 504 }); }) as unknown as typeof fetch);
         const provider = new EZiLModelsProvider(host);
         await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
             { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('Retry');
@@ -364,7 +364,7 @@ describe('EZiL gateway VS Code bridge', () => {
     test('gateway issuer refusal terminates without refresh polling or a retry notification', async () => {
         showRetryError.mockClear();
         let posts = 0;
-        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'unauthorized', reason: 'wrong_issuer' } }, { status: 401 }); }) as typeof fetch);
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'unauthorized', reason: 'wrong_issuer' } }, { status: 401 }); }) as unknown as typeof fetch);
         const provider = new EZiLModelsProvider(host);
         await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
             { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('this OS environment is not connected');

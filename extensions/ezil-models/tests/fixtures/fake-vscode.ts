@@ -17,4 +17,9 @@ export const fakeVscode: Record<string, unknown> = {
     LanguageModelChatMessageRole: { User: 1, Assistant: 2, System: 3 },
     LanguageModelChatToolMode: { Auto: 1, Required: 2 },
     EventEmitter,
+    // Owned here and mutated in place by tests: bun's mock.module snapshots top-level
+    // properties, so a test that REPLACED `window` would not reach a module imported
+    // under another file's earlier mock.
+    window: { showErrorMessage: async () => undefined },
+    commands: { executeCommand: async () => undefined },
 };

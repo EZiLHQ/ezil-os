@@ -46,7 +46,7 @@ describe('bounded gateway waits', () => {
     for (const status of [200, 401]) test(`stalled ${status} first body byte uses remaining connect budget`, async () => fakeClock(async advance => {
         let reply!: (response: Response) => void;
         let cancelled = false;
-        const result = drain((() => new Promise<Response>(resolve => { reply = resolve; })) as typeof fetch).catch(error => error);
+        const result = drain((() => new Promise<Response>(resolve => { reply = resolve; })) as unknown as typeof fetch).catch(error => error);
         await advance(20_000);
         reply(new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status, headers: { 'content-type': 'text/event-stream' } }));
         await advance(10_000);
@@ -60,7 +60,7 @@ describe('bounded gateway waits', () => {
                 start(c) { c.enqueue(new TextEncoder().encode(stream ? frames().slice(0, 3).join('') : '{')); },
                 cancel() { cancelled = true; },
             }), { headers: { 'content-type': stream ? 'text/event-stream' : 'application/json', 'x-ezil-request-id': 'idle-test' } });
-        }) as typeof fetch, undefined, stream).catch(error => error);
+        }) as unknown as typeof fetch, undefined, stream).catch(error => error);
         await advance(GATEWAY_IDLE_TIMEOUT_MS);
         const error = await result;
         expect(error.code).toBe('stream_idle_timeout'); expect(error.message).toContain('Retry');
@@ -69,7 +69,7 @@ describe('bounded gateway waits', () => {
     test('each arriving chunk resets stream idle budget', async () => fakeClock(async advance => {
         let push!: (text: string) => void;
         const result = drain((async () => new Response(new ReadableStream({ start(c) { push = text => c.enqueue(new TextEncoder().encode(text)); } }),
-            { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch).catch(error => error);
+            { headers: { 'content-type': 'text/event-stream' } })) as unknown as typeof fetch).catch(error => error);
         await advance(20_000); push(': heartbeat\n\n');
         await advance(20_000); push(': heartbeat\n\n');
         await advance(GATEWAY_IDLE_TIMEOUT_MS);
@@ -79,7 +79,7 @@ describe('bounded gateway waits', () => {
         const abort = new AbortController();
         let cancelled = false;
         const result = drain((async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }),
-            { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch, abort.signal);
+            { headers: { 'content-type': 'text/event-stream' } })) as unknown as typeof fetch, abort.signal);
         await advance(1); abort.abort(); await advance(0);
         await result; expect(cancelled).toBe(true);
     }));
