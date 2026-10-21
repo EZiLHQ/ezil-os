@@ -465,7 +465,8 @@ async function terminalRun(page, frame, script, runId, phase) {
     await quick.waitFor({ state: 'visible', timeout: 5000 });
     await quick.fill(out);
     await sleep(800);
-    await quick.press('Enter');
+    // The widget re-renders while it resolves the path; Enter goes to the focused input.
+    await page.keyboard.press('Enter');
     const tab = frame.locator(`.tab[aria-label^="${name}"], .tab:has-text("${name}")`).first();
     if (!await tab.waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false)) return false;
     const lines = frame.locator('.editor-group-container.active .monaco-editor .view-lines').first();
