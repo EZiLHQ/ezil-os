@@ -203,3 +203,23 @@ test('a failed read retries and refreshes slowly after recovery', async () => {
     assert.deepEqual(infoCalls.map(call => call.at), [0, 15_000, 75_000]);
     assert.match(host.innerHTML, /running-image/);
 });
+
+test('stream vitals render only from the desktop frame, and only as text', async () => {
+    const frame = { postMessage () {} };
+    const iframe = { contentWindow: frame };
+    globalThis.document = { querySelector: selector => selector === '.ezil-settings-system' ? host
+        : selector.includes('data-app="desktop"') ? iframe : null };
+    await activate();
+    const post = (source, vitals) => {
+        const ev = new Event('message');
+        Object.assign(ev, { source, data: { source: 'ezil-mobile', type: 'stream_vitals', vitals } });
+        window.dispatchEvent(ev);
+    };
+    post({}, { width: 640, height: 480, fps: 30 });
+    assert.doesNotMatch(host.innerHTML, /640 × 480/, 'another window cannot report vitals');
+    post(frame, { width: '<img src=x onerror=alert(1)>', height: 1, fps: '<b>9</b>', relayProtocol: '<i>' });
+    assert.doesNotMatch(host.innerHTML, /<img|<b>|<i>/);
+    post(frame, { width: 1920, height: 1080, fps: 30 });
+    assert.match(host.innerHTML, /1920 × 1080/);
+    assert.match(host.innerHTML, /30 fps/);
+});

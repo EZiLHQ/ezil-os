@@ -105,10 +105,34 @@ function requestVitals (on) {
     }
 }
 
+const VITALS_NUMBERS = ['width', 'height', 'fps', 'kbps', 'rttMs', 'jitterMs', 'packetsLost'];
+const VITALS_STRINGS = ['localCandidateType', 'remoteCandidateType', 'relayProtocol'];
+
+/**
+ * Keep only the fields this tab reads, as finite numbers or short strings.
+ * The payload is markup-free by construction, so nothing a sender puts in it
+ * can reach `innerHTML` (CodeQL js/xss #23).
+ */
+function cleanVitals (raw) {
+    if ( ! raw || typeof raw !== 'object' ) return null;
+    const out = {};
+    for ( const k of VITALS_NUMBERS ) {
+        if ( typeof raw[k] === 'number' && Number.isFinite(raw[k]) ) out[k] = raw[k];
+    }
+    for ( const k of VITALS_STRINGS ) {
+        if ( typeof raw[k] === 'string' && /^[a-z0-9-]{1,16}$/i.test(raw[k]) ) out[k] = raw[k];
+    }
+    return out;
+}
+
 function onMessage (ev) {
     const d = ev && ev.data;
     if ( ! d || d.source !== 'ezil-mobile' || d.type !== 'stream_vitals' ) return;
-    vitals = d.vitals || null;
+    // Only the open desktop's own frame reports vitals; any other window
+    // could post here too.
+    const frame = desktopFrame();
+    if ( ! frame || ev.source !== frame ) return;
+    vitals = cleanVitals(d.vitals);
     vitalsAt = Date.now();
     paint();
 }
@@ -250,7 +274,7 @@ function paint () {
     const stale = vitals && vitalsAge > VITALS_STALE_MS;
     const v = (! vitals || stale) ? null : vitals;
 
-    const num = (x, unit) => (typeof x === 'number' && Number.isFinite(x) ? `${x}${unit ?? ''}` : UNKNOWN);
+    const num = (x, unit) => (typeof x === 'number' && Number.isFinite(x) ? esc(`${x}${unit ?? ''}`) : UNKNOWN);
 
     if (isNative(tabCtx)) {
         const previousInput = host.querySelector('#ezil-preview-port');
@@ -316,7 +340,7 @@ function paint () {
                         ? 'The streamed client has stopped reporting.'
                         : 'Waiting for the first measurement…'}</p>`
                 : `
-        ${row('Picture', (v.width && v.height) ? `${v.width} × ${v.height}` : UNKNOWN)}
+        ${row('Picture', (v.width && v.height) ? esc(`${v.width} × ${v.height}`) : UNKNOWN)}
         ${row('Frame rate', num(v.fps, ' fps'))}
         ${row('Bitrate', num(v.kbps, ' kbit/s'), 'Measured between two samples, so it is blank on the first.')}
         ${(() => { const t = describeTransport(v, vitalsAge, systemInfo ? systemInfo.provider : null); return row('Route', esc(t.value), esc(t.hint)); })()}
