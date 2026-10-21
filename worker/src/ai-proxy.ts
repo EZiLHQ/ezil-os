@@ -7,8 +7,8 @@
 import { hmacSha256Hex, timingSafeEqualHex, TOKEN_MAX_AGE_MS } from './hmac';
 
 export const DEFAULT_AI_GATEWAY_URL = 'https://ai.ezil.work';
-export const AI_PROXY_HEADERS_TIMEOUT_MS = 185_000;
-export const AI_PROXY_IDLE_TIMEOUT_MS = 125_000;
+export const AI_PROXY_HEADERS_TIMEOUT_MS = 30_000;
+export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
 export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
 /** Error bodies are small JSON; read at most this much of one to log its `error.code`. */
@@ -404,6 +404,34 @@ function errorCodeOf(bytes: Uint8Array): string | null {
   }
 }
 
+const GATEWAY_ERROR_CODES = new Set([
+  'unauthorized', 'no_ezil_role', 'insufficient_credits', 'no_live_grant', 'not_a_member', 'role_mismatch',
+  'forbidden', 'account_suspended', 'suspended', 'input_too_large', 'body_too_large',
+  'unsupported_bedrock_converse_request', 'unsupported_parameter', 'invalid_request', 'max_output_tokens_invalid',
+  'idempotency_conflict', 'idempotency_key_required', 'idempotency_replay', 'killswitch', 'paused', 'pause',
+  'global_cap_reached', 'no_provider_route', 'model_disabled', 'model_not_found', 'upstream_timeout',
+  'rate_limited', 'concurrency_limit', 'tpm_limited', 'internal_error',
+]);
+const GATEWAY_ERROR_REASONS = new Set(['wrong_issuer', 'bad_signature', 'no_ezil_role', 'expired', 'token_expired',
+  'wrong_audience', 'missing_token', 'invalid_token', 'revoked']);
+
+function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
+  let raw: Record<string, unknown> = {};
+  try {
+    const parsed = bytes && JSON.parse(new TextDecoder().decode(bytes));
+    if (parsed?.error && typeof parsed.error === 'object' && !Array.isArray(parsed.error)) raw = parsed.error;
+  } catch { /* Never return an upstream edge page or an unrecognized body. */ }
+  const error: Record<string, unknown> = { code: typeof raw.code === 'string' && GATEWAY_ERROR_CODES.has(raw.code) ? raw.code : 'gateway_error' };
+  if (typeof raw.reason === 'string' && GATEWAY_ERROR_REASONS.has(raw.reason)) error.reason = raw.reason;
+  if (typeof raw.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(raw.request_id)) error.request_id = raw.request_id;
+  if (raw.pause === 'operations' || raw.pause === 'reconciliation') error.pause = raw.pause;
+  if (typeof raw.no_live_grant === 'boolean') error.no_live_grant = raw.no_live_grant;
+  for (const field of ['available_micro', 'hold_micro', 'input_bound_tokens', 'max_input_tokens']) {
+    if (Number.isSafeInteger(raw[field]) && (raw[field] as number) >= 0) error[field] = raw[field];
+  }
+  return error;
+}
+
 /**
  * Handle one request under `/ai` on a code bridge host. Order: route
  * allow-list (404) -> proxy token (401 `os_proxy_unauthorized`) -> stored user
@@ -499,17 +527,31 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
   }
   const requestId = upstream.headers.get('x-ezil-request-id');
 
-  if (upstream.status === 401) {
-    // The pushed token was refused (expired, revoked, missing the role claim):
-    // forget it so later calls fail fast as `os_session_missing` until the
-    // next push, instead of re-sending a dead token.
-    await deps.dropCredential(token).catch(() => undefined);
-  }
-
   if (upstream.body === null) {
     cleanup();
     log({ status: upstream.status, code: null, request_id: requestId });
     return new Response(null, { status: upstream.status, headers: outHeaders });
+  }
+
+  if (!upstream.ok) {
+    // Gateway errors are a bounded, allow-listed envelope; never echo messages or credentials.
+    try {
+      const bytes = await readLimited(passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS,
+        false, () => {}, abort, false), MAX_ERROR_BODY_BYTES);
+      const error = safeGatewayError(bytes);
+      // Configuration/membership failures do not become a misleading OS session failure on the next call.
+      if (upstream.status === 401 && (error.reason === 'expired' || error.reason === 'token_expired')) {
+        await deps.dropCredential(token).catch(() => undefined);
+      }
+      cleanup();
+      log({ status: upstream.status, code: error.code, reason: error.reason ?? null, request_id: requestId });
+      outHeaders.set('content-type', 'application/json; charset=utf-8');
+      outHeaders.set('cache-control', 'no-store');
+      return new Response(JSON.stringify({ error }), { status: upstream.status, headers: outHeaders });
+    } catch {
+      cleanup();
+      return proxyError(504, 'os_ai_unavailable', 'EZiL AI did not finish its error response. Retry the request.');
+    }
   }
 
   const isSse = (upstream.headers.get('content-type') ?? '').includes('text/event-stream');

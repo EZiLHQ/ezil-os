@@ -4,7 +4,7 @@
  * binding and the push signature. No network, no Workers runtime.
  */
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import {
   aiProxyBaseUrl,
   chooseAiCredential,
@@ -271,7 +271,7 @@ describe('forwarding', () => {
     expect(res.status).toBe(429);
     expect(res.headers.get('retry-after')).toBe('60');
     expect(res.headers.get('x-ezil-request-id')).toBe('req-9');
-    expect(await res.text()).toBe(body);
+    expect(await res.json()).toEqual({ error: { code: 'rate_limited', request_id: 'req-9' } });
     expect(d.logs.at(-1)).toMatchObject({ event: 'ai_proxy', route: 'POST /v1/messages', status: 429, code: 'rate_limited', request_id: 'req-9', idempotency_key: 'turn-0123456789' });
   });
 
@@ -304,13 +304,13 @@ describe('forwarding', () => {
     expect(res.status).toBe(504);
   });
 
-  it('drops the stored token after a gateway 401 and passes the 401 through', async () => {
+  it('retains a role-refused token and passes the Gateway reason through', async () => {
     const gw = mockGateway(() => new Response('{"error":{"code":"unauthorized","message":"m","reason":"no_ezil_role","request_id":"r"}}', { status: 401, headers: { 'content-type': 'application/json' } }));
     const d = await deps({ fetch: gw.fetch });
     const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), d);
     expect(res.status).toBe(401);
     expect(((await res.json()) as { error: { reason: string } }).error.reason).toBe('no_ezil_role');
-    expect(d.dropped).toEqual([USER_JWT]);
+    expect(d.dropped).toEqual([]);
   });
 
   it('refuses an oversized request body locally without calling upstream', async () => {
@@ -579,11 +579,82 @@ describe('v2 guards', () => {
     expect(signal?.aborted).toBe(true);
   });
 
-  it('preserves large error bodies and status without buffering them', async () => {
+  it('limits error bodies while preserving status', async () => {
     const raw = 'x'.repeat(70 * 1024);
     const gw = mockGateway(() => new Response(raw, { status: 502 }));
     const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
     expect(res.status).toBe(502);
-    expect(await res.text()).toBe(raw);
+    expect(await res.json()).toEqual({ error: { code: 'gateway_error' } });
+  });
+});
+
+describe('Gateway refusal identity', () => {
+  for (const reason of ['wrong_issuer', 'bad_signature', 'no_ezil_role', 'expired', 'token_expired']) {
+    it(`passes allow-listed ${reason} unchanged without leaking tokens or retrying`, async () => {
+      const gw = mockGateway(() => Response.json({ error: { code: 'unauthorized', reason, message: USER_JWT, token: USER_JWT } }, { status: 401 }));
+      const d = await deps({ fetch: gw.fetch });
+      const req = () => new Request(`${HOST}/ai/v1/models`, { headers: { authorization: '' } });
+      for (let i = 0; i < 2; i++) {
+        const request = req(); request.headers.set('authorization', await proxyAuth());
+        const response = await handleAiProxyRequest(request, d);
+        expect(response.status).toBe(401);
+        expect(await response.json()).toEqual({ error: { code: 'unauthorized', reason } });
+      }
+      expect(gw.calls).toHaveLength(2);
+      expect(d.dropped).toHaveLength(reason === 'expired' || reason === 'token_expired' ? 2 : 0);
+      expect(JSON.stringify(d.logs)).not.toContain(USER_JWT);
+    });
+  }
+  it('drops unrecognized code, reason and arbitrary error fields', async () => {
+    const gw = mockGateway(() => Response.json({ error: { code: USER_JWT, reason: USER_JWT, message: USER_JWT } }, { status: 403 }));
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
+    expect(await response.json()).toEqual({ error: { code: 'gateway_error' } });
+    expect(gw.calls).toHaveLength(1);
+  });
+  it('passes insufficient credits and safe numeric metadata unchanged', async () => {
+    const gw = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', available_micro: 42, no_live_grant: true } }, { status: 402 }));
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
+    expect(await response.json()).toEqual({ error: { code: 'insufficient_credits', available_micro: 42, no_live_grant: true } });
+  });
+});
+
+describe('production timeout budgets with fake timers', () => {
+  it('default header deadline aborts at 30 seconds with no retry', async () => {
+    let fire!: () => void;
+    let ready!: () => void;
+    const entered = new Promise<void>(resolve => { ready = resolve; });
+    let attempts = 0;
+    const d = await deps({ fetch: request => {
+      attempts++;
+      return new Promise<Response>((_, reject) => {
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+        ready();
+      });
+    } });
+    const request = new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } });
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms: number) => {
+      expect(ms).toBe(30_000); fire = callback; return 0;
+    }) as typeof setTimeout);
+    try {
+      const result = handleAiProxyRequest(request, d);
+      await entered; fire();
+      expect((await result).status).toBe(504); expect(attempts).toBe(1);
+    } finally { timer.mockRestore(); }
+  });
+  it('default stream idle deadline aborts at 30 seconds', async () => {
+    let cancelled = false;
+    const d = await deps({ fetch: async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }),
+      { headers: { 'content-type': 'text/event-stream' } }) });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), d);
+    let fire!: () => void;
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms: number) => {
+      expect(ms).toBe(30_000); fire = callback; return 0;
+    }) as typeof setTimeout);
+    try {
+      const result = response.body!.getReader().read().catch(error => error);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      fire();
+      expect((await result).message).toContain('idle timeout'); expect(cancelled).toBe(true);
+    } finally { timer.mockRestore(); }
   });
 });

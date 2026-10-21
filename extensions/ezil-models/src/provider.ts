@@ -2,7 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
-import { gatewayModels, withGatewayModelLimits } from './gateway';
+import { GatewayError, gatewayModels, withGatewayModelLimits } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel } from './config';
@@ -215,6 +215,12 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // to be free of key material (a gateway may echo headers or carry the key in its path).
             const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
             if (resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout'].includes(error.code ?? '')) {
+                // Do not await a notification: the failed turn must leave Thinking immediately.
+                void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
+                    if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');
+                }).catch(() => {});
+            }
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {

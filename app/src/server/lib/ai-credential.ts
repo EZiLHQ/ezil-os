@@ -95,13 +95,13 @@ export async function currentAccessToken(
 
 export type AiCredentialPushResult =
     | { ok: true; stored: boolean }
-    | { ok: false; skipped?: 'no_session' | 'no_ezil_role' | 'not_configured'; error?: string };
+    | { ok: false; skipped?: 'no_session' | 'not_configured'; error?: string };
 
 /**
  * Push `accessToken` to the Worker for `sandboxName`. Skipped (no request) when
  * the provider is unconfigured, there is no HMAC secret (the Worker refuses
- * unsigned pushes), or the token has no `app_metadata.ezil_role` (the gateway
- * would refuse it with 401 `no_ezil_role`).
+ * unsigned pushes). Push authenticated users even without an AI role so the
+ * gateway can report the actual access refusal instead of OS session missing.
  */
 export async function pushAiCredential(
     config: CloudflareGuacamoleConfig,
@@ -112,7 +112,6 @@ export async function pushAiCredential(
 ): Promise<AiCredentialPushResult> {
     if (!config.isConfigured || !hmacSecret) return { ok: false, skipped: 'not_configured' };
     if (accessToken === null) return { ok: false, skipped: 'no_session' };
-    if (readAccessTokenClaims(accessToken)?.ezilRole == null) return { ok: false, skipped: 'no_ezil_role' };
 
     const body = JSON.stringify({ accessToken });
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;

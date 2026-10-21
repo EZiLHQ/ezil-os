@@ -9,6 +9,11 @@ import { startMockOpenAI, type MockServer as OpenAIMock } from './fixtures/mock-
 
 import { TextPart, ToolCallPart, ToolResultPart, DataPart, ThinkingPart, EventEmitter, fakeVscode } from './fixtures/fake-vscode';
 
+const showRetryError = mock(async (_message: string, ..._actions: string[]): Promise<string | undefined> => undefined);
+const retryCommand = mock(async (_command: string) => undefined);
+fakeVscode.window = { showErrorMessage: showRetryError };
+fakeVscode.commands = { executeCommand: retryCommand };
+
 mock.module('vscode', () => fakeVscode);
 
 const providerModule = await import('../src/provider');
@@ -343,6 +348,28 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(bodies).toHaveLength(2); expect(gets).toBe(2);
         });
     }
+    test('recoverable gateway failure ends the turn and Retry resubmits only on user action', async () => {
+        showRetryError.mockClear(); retryCommand.mockClear();
+        showRetryError.mockImplementationOnce(async () => 'Retry');
+        let posts = 0;
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'os_ai_unavailable' } }, { status: 504 }); }) as typeof fetch);
+        const provider = new EZiLModelsProvider(host);
+        await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('Retry');
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(showRetryError).toHaveBeenCalledWith(expect.stringContaining('could not reach'), 'Retry');
+        expect(retryCommand).toHaveBeenCalledWith('workbench.action.chat.retry');
+        expect(posts).toBe(1);
+    });
+    test('gateway issuer refusal terminates without refresh polling or a retry notification', async () => {
+        showRetryError.mockClear();
+        let posts = 0;
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'unauthorized', reason: 'wrong_issuer' } }, { status: 401 }); }) as typeof fetch);
+        const provider = new EZiLModelsProvider(host);
+        await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('this OS environment is not connected');
+        expect(posts).toBe(1); expect(showRetryError).not.toHaveBeenCalled();
+    });
     test('Kimi reports JSON parts in order and never logs bodies even with logRequests enabled', async () => {
         const host = gatewayHost((async () => Response.json(messageJson(), { headers: { 'x-ezil-request-id': 'bridge-json' } })) as unknown as typeof fetch);
         const provider = new EZiLModelsProvider(host); const parts: unknown[] = [];

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
-import { creditState, describeGatewayError, forgetGatewayModels, gatewayChat, gatewayModels, isSessionRefusal, parseErrorBody, readCredits } from '../src/gateway';
+import { creditState, describeGatewayError, forgetGatewayModels, gatewayChat, gatewayModels, parseErrorBody, readCredits } from '../src/gateway';
 import { KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw } from './fixtures/gateway';
@@ -65,18 +65,15 @@ describe('gateway transport', () => {
         const replay = server((_, i) => { if (i === 0) throw new Error('transport'); return error(409, 'idempotency_replay', { request_id: 'original' }); });
         await expect(run(replay.fetch)).rejects.toThrow('already processed (request original)'); sameAttempt(replay.posts());
     });
-    test('pre-admission 401 polls and retries same bytes once when session refreshed', async () => {
-        const waits: number[] = [];
-        const s = server((c, i) => c.init.method !== 'POST' ? json(catalog) : i === 0 ? error(401, 'os_session_missing') : ok());
-        await run(s.fetch, { sleep: async ms => { waits.push(ms); } }); sameAttempt(s.posts());
-        expect(waits).toEqual([5000]); expect(s.calls[1]!.url).toEndWith('/models');
-    });
-    test('session polling budget is 65s then exactly one retry, no new key', async () => {
-        const waits: number[] = [];
-        const s = server(() => error(401, 'os_session_missing'));
-        await expect(run(s.fetch, { sleep: async ms => { waits.push(ms); } })).rejects.toThrow('Reopen Code');
-        sameAttempt(s.posts()); expect(waits.reduce((a, b) => a + b, 0)).toBe(65000);
-    });
+    for (const status of [401, 403]) for (const code of ['unauthorized', 'os_session_missing', 'os_proxy_unauthorized', 'no_ezil_role']) {
+        test(`${status} ${code} fails immediately without polling or retry`, async () => {
+            const waits: number[] = [];
+            const s = server(() => error(status, code, { reason: 'wrong_issuer' }));
+            await expect(run(s.fetch, { sleep: async ms => { waits.push(ms); } })).rejects.toThrow();
+            expect(s.calls).toHaveLength(1);
+            expect(waits).toEqual([]);
+        });
+    }
     for (const extra of [{ code: 'no_ezil_role' }, { code: 'unauthorized', reason: 'no_ezil_role' }, { code: 'os_session_missing', status: 'pending' }, { code: 'unknown_auth' }]) test(`no session retry for ${JSON.stringify(extra)}`, async () => {
         const s = server(() => error(401, extra.code, extra)); await expect(run(s.fetch)).rejects.toThrow(); expect(s.posts()).toHaveLength(1);
     });
@@ -124,7 +121,7 @@ describe('gateway transport', () => {
 describe('gateway errors and credits', () => {
     for (const [status, code, text] of [
         [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'grant'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
-        [401, 'os_session_missing', 'Reopen Code or sign in again'], [401, 'os_proxy_unauthorized', 'Reopen Code or sign in again'],
+        [401, 'os_session_missing', 'Reopen Code or sign in again'], [401, 'os_proxy_unauthorized', 'EZiL OS refused this computer'],
         [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'Conversation too large — start a new chat'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],
@@ -132,10 +129,21 @@ describe('gateway errors and credits', () => {
         const e = describeGatewayError('qwen', status, null, { code, request_id: 'body-id' }, 'header-id');
         expect(e.message).toContain(text); expect(e.message).toContain('(request body-id)');
     });
+    test('auth refusals distinguish issuer, signature, membership, missing and expired credentials', () => {
+        const messages = ['wrong_issuer', 'bad_signature', 'no_ezil_role', 'expired', 'token_expired'].map(reason =>
+            describeGatewayError('', 401, null, { code: 'unauthorized', reason }, null).message);
+        expect(messages[0]).toContain('this OS environment is not connected');
+        expect(messages[1]).toContain('signature');
+        expect(messages[2]).toContain('no AI access');
+        expect(messages[3]).toContain('expired');
+        expect(messages[4]).toContain('expired');
+        for (const text of messages.slice(0, 3)) expect(text).not.toContain('Reopen Code');
+        expect(describeGatewayError('', 401, null, { code: 'unknown' }, null).message).not.toContain('Reopen Code');
+        expect(describeGatewayError('', 401, null, { code: 'os_session_expired' }, null).message).toContain('expired');
+    });
     test('available credits and nested auth reason; raw messages never shown', () => {
         const e = describeGatewayError('qwen', 402, null, parseErrorBody('{"type":"error","error":{"code":"insufficient_credits","available_micro":1500000,"message":"secret"}}'), 'req');
         expect(e.message).toContain('Available credits: 1.5'); expect(e.message).not.toContain('secret');
-        expect(isSessionRefusal(401, { code: 'unauthorized', reason: 'no_ezil_role' })).toBe(false);
         expect(describeGatewayError('', 401, null, { code: 'unauthorized', reason: 'no_ezil_role' }, 'req').message).toContain('no AI access yet');
     });
     test('model catalog cached for five minutes and scoped by provider identity', async () => {

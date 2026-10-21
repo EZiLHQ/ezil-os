@@ -105,14 +105,24 @@ describe('pushAiCredential', () => {
         expect(headers['x-ezil-signature']).toBe(mintAiCredentialSignature(SECRET, SANDBOX, init.body as string, ts));
     });
 
-    it('skips without a request when unconfigured, unsigned, sessionless or role-less', async () => {
+    it('skips without a request when unconfigured, unsigned or sessionless', async () => {
         const fetchImpl = vi.fn();
         const f = fetchImpl as unknown as typeof fetch;
         expect(await pushAiCredential({ ...CONFIG, isConfigured: false }, SECRET, SANDBOX, builderToken(), f)).toMatchObject({ skipped: 'not_configured' });
         expect(await pushAiCredential(CONFIG, '', SANDBOX, builderToken(), f)).toMatchObject({ skipped: 'not_configured' });
         expect(await pushAiCredential(CONFIG, SECRET, SANDBOX, null, f)).toMatchObject({ skipped: 'no_session' });
-        expect(await pushAiCredential(CONFIG, SECRET, SANDBOX, jwt({ sub: USER, exp: inAnHour() }), f)).toMatchObject({ skipped: 'no_ezil_role' });
         expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it('delivers a role-less authenticated session so AWS and CF report Gateway membership refusal', async () => {
+        const token = jwt({ sub: USER, exp: inAnHour(), role: 'authenticated' });
+        const fetchImpl = vi.fn(async () => Response.json({ ok: true, stored: true }));
+        expect(await syncAiCredential({ config: CONFIG, hmacSecret: SECRET, sandboxName: SANDBOX,
+            userId: USER, headers: new Headers(), supabase: async () => session(token), fetchImpl: fetchImpl as typeof fetch,
+        })).toEqual({ ok: true, stored: true });
+        const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+        expect(url).toBe(`${CONFIG.workerUrl}/sandbox/${SANDBOX}/ai-credential`);
+        expect(JSON.parse(init.body as string)).toEqual({ accessToken: token });
     });
 
     it('reports a rejection or network failure as a value and never logs the token', async () => {

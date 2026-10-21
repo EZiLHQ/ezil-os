@@ -12,9 +12,8 @@ import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-resp
 import { emptyUsage } from './types';
 import type { ChatRequest, StreamEvent } from './types';
 
-/** How long a turn waits for EZiL OS to push a fresh session after a 401 (one activity beat is 60 s). */
-export const SESSION_WAIT_MS = 65_000;
-const SESSION_POLL_MS = 5_000;
+export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
+export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
 const MODELS_TTL_MS = 5 * 60_000;
 const SIDE_CALL_TIMEOUT_MS = 5_000;
 const MICRO_PER_CREDIT = 1_000_000;
@@ -168,15 +167,6 @@ export function parseErrorBody(text: string): ErrorBody {
     return {};
 }
 
-const SESSION_CODES = new Set(['unauthorized', 'os_session_missing', 'os_proxy_unauthorized']);
-
-/** Only a known pre-admission session refusal can be retried. Request IDs also exist before admission;
- * a hold or pending/reserved status, rather than an ID, is evidence that it has been admitted. */
-export function isSessionRefusal(status: number, body: ErrorBody, hold: string | null = null): boolean {
-    return status === 401 && hold === null && body.hold_micro === undefined && body.status === undefined
-        && body.reason !== 'no_ezil_role' && body.code !== 'no_ezil_role' && SESSION_CODES.has(body.code ?? '');
-}
-
 export function retryDelay(value: string | null, fallback = 5, now = Date.now()): number {
     const seconds = value && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : value ? (Date.parse(value) - now) / 1000 : fallback;
     return Math.min(60, Math.max(0, Number.isFinite(seconds) ? seconds : fallback));
@@ -196,7 +186,15 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
                 ? 'No live AI credit grant.' : 'Not enough AI credits for this request.';
             return make(`${state}${available !== undefined ? ` Available credits: ${available / MICRO_PER_CREDIT}.` : ''}`);
         }
-        case 'unauthorized': case 'os_session_missing': case 'os_proxy_unauthorized': return make('Reopen Code or sign in again');
+        case 'os_session_missing': return make('This computer has no current OS sign-in. Reopen Code or sign in again');
+        case 'os_session_expired': case 'access_token_expired': return make('Your OS sign-in has expired. Reopen Code or sign in again');
+        case 'os_proxy_unauthorized': return make('EZiL OS refused this computer’s AI connection. Restart the computer to reconnect');
+        case 'unauthorized':
+            if (body.reason === 'token_expired' || body.reason === 'expired') return make('Your AI sign-in has expired. Reopen Code or sign in again');
+            if (body.reason === 'wrong_issuer') return make('EZiL AI does not accept this account’s sign-in (this OS environment is not connected to EZiL AI)');
+            if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
+            return make('EZiL AI refused this account’s sign-in. Contact your administrator');
+        case 'os_ai_unavailable': return make('EZiL OS could not reach EZiL AI. Retry the request');
         case 'not_a_member': case 'role_mismatch': case 'forbidden': return make('Your EZiL account does not have AI membership');
         case 'account_suspended': case 'suspended': return make('AI access is suspended for your EZiL account');
         case 'input_too_large': case 'body_too_large': return make('Conversation too large — start a new chat');
@@ -211,7 +209,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         case 'rate_limited': return make('Too many requests; try again later');
         case 'concurrency_limit': return make('Wait for the current response to finish');
         default:
-            if (status === 401) return make('Reopen Code or sign in again');
+            if (status === 401) return make('The AI service refused authentication. Contact your administrator');
             if (status === 402) return make('No AI credits available');
             if (status === 403) return make('Your EZiL account does not have AI access');
             if (status === 413) return make('Conversation too large — start a new chat');
@@ -230,21 +228,46 @@ function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
     });
 }
 
-/** Poll the allowed /models endpoint on a monotonic budget, including time spent in fetches. */
-async function waitForSession(provider: ResolvedProvider, doFetch: typeof fetch, options: GatewayOptions): Promise<void> {
-    const sleep = options.sleep ?? defaultSleep;
-    const now = options.now ?? (() => performance.now());
-    const deadline = now() + SESSION_WAIT_MS;
-    for (let waited = 0; waited < SESSION_WAIT_MS && now() < deadline; waited += SESSION_POLL_MS) {
-        const remaining = Math.min(SESSION_POLL_MS, SESSION_WAIT_MS - waited, deadline - now());
-        await sleep(remaining, options.signal);
-        if (now() >= deadline || waited + remaining >= SESSION_WAIT_MS) break;
-        try {
-            const pollSignal = AbortSignal.any([options.signal, AbortSignal.timeout(Math.max(1, deadline - now()))]);
-            const { status } = await getJson(provider, '/models', doFetch, pollSignal);
-            if (status === 200) return;
-        } catch (error) { if (options.signal.aborted) throw error; }
-    }
+/** Race I/O as well as aborting it: even a transport that ignores abort cannot keep Thinking alive. */
+async function bounded<T>(work: Promise<T>, ms: number, abort: AbortController, error: GatewayError): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort = () => {};
+    const deadline = new Promise<never>((_, reject) => {
+        onAbort = () => reject(abort.signal.reason);
+        timer = setTimeout(() => abort.abort(error), Math.max(1, ms));
+        abort.signal.addEventListener('abort', onAbort, { once: true });
+        if (abort.signal.aborted) onAbort();
+    });
+    try { return await Promise.race([work, deadline]); }
+    finally { clearTimeout(timer); abort.signal.removeEventListener('abort', onAbort); }
+}
+
+async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController): Promise<Response> {
+    const started = performance.now();
+    const timeout = (code: string, requestId?: string) => new GatewayError(
+        `EZiL AI: ${code === 'first_byte_timeout' ? 'did not answer within 30 seconds' : 'the response stopped arriving'}. Retry the request${requestId ? ` (request ${requestId})` : ''}`,
+        undefined, code, requestId);
+    const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), GATEWAY_FIRST_BYTE_TIMEOUT_MS, abort, timeout('first_byte_timeout'));
+    if (!response.body) return response;
+    const reader = response.body.getReader();
+    const requestId = response.headers.get('x-ezil-request-id') ?? undefined;
+    let first = true;
+    const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            try {
+                const next = await bounded(reader.read(), first ? GATEWAY_FIRST_BYTE_TIMEOUT_MS - (performance.now() - started) : GATEWAY_IDLE_TIMEOUT_MS,
+                    abort, timeout(first ? 'first_byte_timeout' : 'stream_idle_timeout', requestId));
+                first = false;
+                if (next.done) controller.close();
+                else controller.enqueue(next.value);
+            } catch (error) {
+                void reader.cancel().catch(() => {});
+                controller.error(error);
+            }
+        },
+        cancel() { abort.abort(); void reader.cancel().catch(() => {}); },
+    }, { highWaterMark: 0 });
+    return new Response(body, { status: response.status, headers: response.headers });
 }
 
 /** One UUID and one serialization, at most one resend per call. No retries after generation starts. */
@@ -262,6 +285,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let errorCode: string | undefined;
     let stream = model.model !== 'us.moonshotai.kimi-k3' && model.stream !== false;
     let used = emptyUsage();
+    let attemptAbort = new AbortController();
+    const cancelAttempt = () => attemptAbort.abort(options.signal.reason);
+    options.signal.addEventListener('abort', cancelAttempt, { once: true });
     try {
         options.signal.throwIfAborted();
         const built = buildGatewayBody(model, request, log);
@@ -275,11 +301,13 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         for (;;) {
             options.signal.throwIfAborted();
             try {
-                response = await doFetch(url, { method: 'POST', headers, body: built.bytes, signal: options.signal, redirect: 'error' });
+                attemptAbort = new AbortController();
+                response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort);
             } catch (error) {
-                if (options.signal.aborted) throw error;
+                if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
+                attemptAbort.abort();
                 if (!retried) { retried = true; continue; }
-                throw new GatewayError('EZiL AI: cannot reach EZiL AI', undefined, 'os_unreachable', requestId);
+                throw new GatewayError('EZiL AI: cannot reach EZiL AI. Retry the request', undefined, 'os_unreachable', requestId);
             }
             status = response.status;
             hold = response.headers.get('x-ezil-hold-micro');
@@ -288,13 +316,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             // Body read failures happen after headers: never treat them as pre-header transport failures.
             const body = parseErrorBody(await response.text());
             requestId = body.request_id ?? requestId;
-            if (!retried && isSessionRefusal(response.status, body, hold)) {
-                retried = true;
-                await waitForSession(provider, doFetch, options);
-                continue;
-            }
             if (!retried && status === 429 && (body.code === 'rate_limited' || body.code === 'concurrency_limit')) {
                 retried = true;
+                attemptAbort.abort();
                 await (options.sleep ?? defaultSleep)(retryDelay(response.headers.get('retry-after'), body.code === 'rate_limited' ? 60 : 5, now()) * 1000, options.signal);
                 continue;
             }
@@ -318,11 +342,14 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId);
     } catch (error) {
         if (options.signal.aborted) return;
+        if (attemptAbort.signal.reason instanceof GatewayError) error = attemptAbort.signal.reason;
         errorCode = error instanceof GatewayError || error instanceof GatewayResponseError ? error.code : status === undefined ? 'invalid_request' : 'stream_interrupted';
         if (error instanceof GatewayError || error instanceof GatewayResponseError) throw error;
         if (status !== undefined) throw new GatewayResponseError(requestId);
         throw new GatewayError('Conversation too large or invalid — start a new chat', undefined, errorCode, requestId);
     } finally {
+        options.signal.removeEventListener('abort', cancelAttempt);
+        attemptAbort.abort();
         const cancelled = options.signal.aborted;
         log(JSON.stringify({ request_id: requestId ?? null, model: model.model, stream, hold, http_status: status ?? null,
             latency_ms: Math.max(0, now() - started), usage: { input: used.inputTokens, output: used.outputTokens, cache_read: used.cacheReadTokens, cache_write: used.cacheWriteTokens },
