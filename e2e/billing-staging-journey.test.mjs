@@ -64,6 +64,7 @@ test('host classification uses hostname only; Mumbai is inferred only for AWS', 
   assert.equal(classifyHost('https://example.test/nekodesktop?x=-aws.').hostClass, 'unknown');
   assert.equal(classifyHost('https://nekodesktop@unknown.example/').hostClass, 'unknown');
   assert.equal(classifyHost('https://8443-guac-61ee4784407c4a77-03f419f2908f4fe8-code.ezil.work/').hostClass, 'cloudflare');
+  assert.equal(classifyHost('https://guac-61ee-code.ezil.work/').hostClass, 'cloudflare');
   assert.equal(classifyHost('https://aws-8443-guac-61ee-03f4-aws.ezil.work/').hostClass, 'aws');
   assert.equal(classifyHost('about:blank').hostClass, 'unknown');
   assert.equal(classifyHost('not a host').hostClass, 'unknown');
@@ -98,6 +99,18 @@ test('aggregation rejects invalid durations, statuses and duplicate step ids', (
   for (const step of [{ id: 'a', status: 'OK', ms: 1 }, { id: 'a', status: 'PASS', ms: -1 },
     { id: 'a', status: 'PASS', ms: NaN }]) assert.throws(() => aggregateResults([step]));
   assert.throws(() => aggregateResults([{ id: 'a', status: 'PASS', ms: 1 }, { id: 'a', status: 'FAIL', ms: 1 }]));
+});
+
+test('desktop diagnostic failures remain results alongside later journey steps', () => {
+  const result = aggregateResults([
+    { id: 'placement', status: 'PASS', ms: 10 }, { id: 'latency', status: 'FAIL', ms: 20 },
+    { id: 'typing', status: 'FAIL', ms: 30 }, { id: 'clipboard', status: 'SKIP', reason: 'sidecar_has_no_omnibox_text_readback', ms: 40 },
+    { id: 'fonts', status: 'SKIP', reason: 'glyph_rendering_requires_visual_review', ms: 50 },
+    { id: 'persistence', status: 'PASS', ms: 60 },
+  ]);
+  assert.deepEqual(result.counts, { PASS: 2, FAIL: 2, SKIP: 2 });
+  assert.equal(result.statuses.persistence, 'PASS');
+  assert.equal(result.ms, 210);
 });
 
 test('terminal output requires complete fresh standalone markers', () => {

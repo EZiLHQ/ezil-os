@@ -29,8 +29,9 @@ import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
+import { desktopQuality, QUALITY_STEP_IDS } from './desktop-quality.mjs';
 
-const STEP_IDS = ['health', 'sign_in', 'billing', 'code', 'browser', 'chat', 'persistence'];
+const STEP_IDS = ['health', 'sign_in', 'billing', 'code', 'browser', ...QUALITY_STEP_IDS, 'chat', 'persistence'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const elapsed = start => Math.round(performance.now() - start);
 const compact = text => String(text).replace(/\s+/g, ' ').trim();
@@ -122,7 +123,7 @@ export function classifyHost(input) {
   let host = '';
   try { host = new URL(String(input).includes('://') ? input : `https://${input}`).hostname.toLowerCase(); }
   catch { return { host: '', hostClass: 'unknown', mumbai: null }; }
-  const hostClass = host.includes('-aws.') ? 'aws' : host.includes('nekodesktop') || /^\d+-guac-/.test(host) ? 'cloudflare' : 'unknown';
+  const hostClass = host.includes('-aws.') ? 'aws' : /nekodesktop|guac-/.test(host) ? 'cloudflare' : 'unknown';
   return { host, hostClass, mumbai: hostClass === 'aws' ? true : null };
 }
 
@@ -550,7 +551,7 @@ export async function main(env = process.env) {
     await mkdir(out, { recursive: true });
     await writeFile(join(out, 'results.json'), JSON.stringify(redactEvidence(report, redact), null, 2) + '\n', { mode: 0o600 });
   };
-  const shot = async (id, evidence, app = id) => {
+  const shot = async (id, evidence, app = id, frameOnly = false) => {
     if (!page) return;
     const filename = `${id}.png`;
     // App-only screenshots omit Settings/account chrome. Also mask credential
@@ -560,7 +561,8 @@ export async function main(env = process.env) {
       masks.push(frame.locator('input[type="email"], input[type="password"]'));
       for (const secret of [credentials.email, credentials.password]) masks.push(frame.getByText(secret, { exact: false }));
     }
-    await appWindow(page, app).screenshot({ path: join(out, filename), mask: masks });
+    const region = frameOnly ? appWindow(page, app).locator('iframe.window-app-iframe') : appWindow(page, app);
+    await region.screenshot({ path: join(out, filename), mask: masks });
     evidence.screenshot = filename;
   };
   const record = async (id, work, skip) => {
@@ -643,13 +645,18 @@ export async function main(env = process.env) {
       await openApp(page, 'code', evidence);
       await shot('code', evidence);
     }, signedIn ? null : 'sign_in_failed');
-    await record('browser', async evidence => {
+    const browserReady = await record('browser', async evidence => {
       await closeApp(page, 'settings');
       await openApp(page, 'desktop', evidence);
       await shot('desktop', evidence);
       // A full-size Browser window hides the dock that later steps click.
       await closeApp(page, 'desktop');
     }, signedIn ? null : 'sign_in_failed');
+    const quality = desktopQuality({ page, context, runId, codeReady, browserReady,
+      codeFrame, terminalRun, command, clickDock, openApp, closeApp, appWindow, shot });
+    for (const id of QUALITY_STEP_IDS) {
+      await record(id, quality[id], signedIn ? null : 'sign_in_failed');
+    }
     await record('chat', async evidence => {
       const outcome = await chat(page, evidence, redact);
       return outcome === 'no_ai_account' ? outcome : null;
