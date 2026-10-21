@@ -446,9 +446,6 @@ async function terminalRun(page, frame, script, runId, phase) {
   if (!await frame.locator('.terminal .xterm-helper-textarea:visible').count()) {
     await frame.locator('body').press('Control+Backquote');
   }
-  if (!await frame.locator('.xterm-accessibility-tree').count()) {
-    await command(frame, 'Toggle Screen Reader Accessibility Mode', 'editor.action.toggleScreenReaderAccessibilityMode');
-  }
   await command(frame, 'Terminal: Focus Terminal', 'workbench.action.terminal.focus');
   const terminal = frame.locator('.terminal:visible').last();
   const input = terminal.locator('.xterm-helper-textarea').last();
