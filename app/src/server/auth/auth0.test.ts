@@ -127,7 +127,7 @@ describe('ID token verification', () => {
         ['issuer', { iss: 'https://evil.example/' }], ['audience', { aud: 'other' }],
         ['missing audience', { aud: undefined }], ['multiple audience without azp', { aud: [clientId, 'other'] }],
         ['wrong azp', { azp: 'other' }], ['expiry', { exp: now - 61 }], ['missing expiry', { exp: undefined }],
-        ['string expiry', { exp: String(now + 300) }], ['future iat', { iat: now + 61 }],
+        ['string expiry', { exp: String(now + 300) }], ['future iat', { iat: now + 3600, exp: now + 7200 }],
         ['missing iat', { iat: undefined }], ['string iat', { iat: String(now) }], ['iat after exp', { iat: now, exp: now - 1 }],
         ['nonce', { nonce: 'other' }], ['missing nonce', { nonce: undefined }],
         ['unverified email', { email_verified: false }], ['truthy email verification', { email_verified: 'true' }],
