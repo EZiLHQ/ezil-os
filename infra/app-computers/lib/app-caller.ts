@@ -57,6 +57,20 @@ export const AppCallerConfigSchema = z.object({
 });
 export type AppCallerConfig = z.infer<typeof AppCallerConfigSchema>;
 
+/** `states:StartExecution` of exactly these VERSION ARNs. Step Functions authorizes a
+ * version (or alias) call against the UNQUALIFIED state machine ARN, so a version ARN
+ * as the resource never matches (live AccessDenied, ezil-mum 2026-10-21). The version is
+ * pinned with `states:StateMachineQualifier`, which an unqualified call does not carry,
+ * so the unqualified (latest revision) start stays denied. */
+export function startVersionStatements(versionArns: string[]): iam.PolicyStatement[] {
+    return versionArns.map(v => {
+        const m = /^(arn:aws:states:[a-z0-9-]+:\d{12}:stateMachine:[A-Za-z0-9_-]{1,80}):([1-9][0-9]*)$/.exec(v);
+        if (!m) throw new Error('invalid_version_arn');
+        return new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [m[1]!],
+            conditions: { StringEquals: { 'states:StateMachineQualifier': m[2]! } } });
+    });
+}
+
 /** The policy of the app caller, exported for exact-equality tests:
  * - start only the exact lifecycle VERSION(s), all in `region`;
  * - describe only the `computer-*` executions of those state machines, and decrypt
@@ -75,7 +89,7 @@ export function appCallerStatements(region: string, versionArns: string[], histo
         for (const machine of [`arn:aws:states:${m[1]}:${m[2]}:stateMachine:${m[3]}`, v]) if (!machines.includes(machine)) machines.push(machine);
     }
     return [
-        new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [...versionArns] }),
+        ...startVersionStatements(versionArns),
         new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: executions }),
         // The lifecycle machine encrypts execution data with its customer-managed history key, and
         // DescribeExecution then needs kms:Decrypt by the CALLER (Step Functions encryption-at-rest

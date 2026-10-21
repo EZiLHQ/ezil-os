@@ -7,6 +7,7 @@ import { RecoverySettingsSchema, machineArn, type RecoverySettings } from './lif
 import { recoveryDefinition } from './lifecycle/recovery-definition.js';
 import { DENIED_ACTIONS } from './computer-lifecycle.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
+import { startVersionStatements } from './app-caller.js';
 
 export class ComputerLifecycleRecovery extends Construct {
     readonly machine: states.CfnStateMachine;
@@ -69,7 +70,7 @@ export class ComputerLifecycleRecovery extends Construct {
         dispatcher.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:DescribeExecution'],
             resources: [originalMachine.replace(':stateMachine:', ':execution:') + ':computer-*'] }));
         dispatcher.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:ListExecutions'], resources: [originalMachine, d.stateMachineVersionArn] }));
-        dispatcher.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [s.recoveryVersionArn] }));
+        for (const statement of startVersionStatements([s.recoveryVersionArn])) dispatcher.addToRolePolicy(statement);
         props.sourceHistoryKey.grantDecrypt(dispatcher); key.grantEncryptDecrypt(dispatcher);
         // Every events.amazonaws.com grant names its exact rule and account.
         const names = { interrupted: `ezil-${d.namespace}-recovery-interrupted`, backstop: `ezil-${d.namespace}-recovery-backstop`,

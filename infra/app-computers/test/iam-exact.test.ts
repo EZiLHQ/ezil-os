@@ -5,7 +5,7 @@ import test from 'node:test';
 import { App, Stack, assertions } from 'aws-cdk-lib';
 import { ComputerLifecycle, controllerStatements } from '../lib/computer-lifecycle.js';
 import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
-import { AppCaller, AppCallerConfigSchema, appCallerStatements } from '../lib/app-caller.js';
+import { AppCaller, AppCallerConfigSchema, appCallerStatements, startVersionStatements } from '../lib/app-caller.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
 import { IdentityConfigSchema, boundaryStatements } from '../lib/identity.js';
@@ -115,7 +115,9 @@ const VERCEL = { name: 'vercel' as const, providerArn: `arn:aws:iam::${A}:oidc-p
     issuerHost: 'oidc.vercel.com/ezil-team', audience: 'https://vercel.com/ezil-team', subject: 'owner:ezil-team:project:ezil-os:environment:production' };
 test('item 9: app caller can only start the exact lifecycle version, read its computer executions, and describe EC2 in region', () => {
     assert.deepEqual(json(appCallerStatements(R, [VERSION], HISTORY_KEY)), [
-        { Effect: 'Allow', Action: 'states:StartExecution', Resource: VERSION },
+        // Step Functions authorizes a version start on the unqualified ARN; the qualifier pins version 1.
+        { Effect: 'Allow', Action: 'states:StartExecution', Resource: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle`,
+            Condition: { StringEquals: { 'states:StateMachineQualifier': '1' } } },
         { Effect: 'Allow', Action: 'states:DescribeExecution', Resource: `arn:aws:states:${R}:${A}:execution:ezil-pilot-lifecycle:computer-*` },
         // DescribeExecution on a CMK-encrypted machine needs the caller's kms:Decrypt (Step Functions docs).
         { Effect: 'Allow', Action: 'kms:Decrypt', Resource: HISTORY_KEY, Condition: { StringEquals: {
@@ -240,4 +242,12 @@ test('every role, key, queue and invoke policy in the synthesized stacks equals 
         }
         if (r.Type === 'AWS::Lambda::Permission' && r.Principal === 'events.amazonaws.com') assert.ok(r.SourceArn && r.SourceAccount === A, id);
     }
+});
+
+test('version start grants use the unqualified machine ARN pinned by qualifier, never the version ARN as resource', () => {
+    const [statement, ...rest] = json(startVersionStatements([VERSION]));
+    assert.equal(rest.length, 0);
+    assert.deepEqual(statement, { Effect: 'Allow', Action: 'states:StartExecution', Resource: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle`,
+        Condition: { StringEquals: { 'states:StateMachineQualifier': '1' } } });
+    assert.throws(() => startVersionStatements([`arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle`]), /invalid_version_arn/);
 });
