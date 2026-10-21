@@ -113,7 +113,7 @@ describe('Free, Standard and Premium billing disclosures', () => {
         const free = CATALOG_V3.free_v3;
         const standard = CATALOG_V3.standard_monthly_v3;
         expect(plans).toContain(`${free.vcpu} vCPU · ${free.memoryGiB} GB computer on Cloudflare`);
-        expect(plans).toContain(`sessions up to ${free.sessionMaxSeconds / 3600} hour`);
+        expect(plans).toContain(`sessions up to ${free.sessionMaxSeconds! / 3600} hour`);
         expect(plans).toContain(`Older accounts keep ${free.legacyFairUseSeconds! / 3600} standard-hours/month`);
         expect(plans).toContain(`${standard.vcpu} vCPU · ${standard.memoryGiB} GB computer on AWS in Mumbai`);
         expect(plans).toContain('choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS in Mumbai');

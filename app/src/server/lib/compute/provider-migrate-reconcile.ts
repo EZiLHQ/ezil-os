@@ -1,37 +1,12 @@
-import { sql } from 'drizzle-orm';
 import { decideAdmission } from './admission';
 import { awsTierForSize, instanceTypeForTier, readAwsAdmissionConfig, type Env } from './aws-config';
-import { readAdmissionCounters, withAdmission, type PlacementExecutor } from './placement';
+import { paidCloudflareCandidates, readAdmissionCounters, withAdmission, type PaidMigrationCandidate, type PlacementExecutor } from './placement';
 import { advanceMigration } from './provider-migrate-orchestrator';
 import { utcMonthStart } from './usage';
 
-export interface PaidMigrationCandidate {
-    userId: string;
-    computerId: string;
-    toSize: 'standard' | 'premium';
-}
+export type { PaidMigrationCandidate } from './placement';
 
-/** One computer per paid owner, including the implicit Cloudflare placement. */
-export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date, limit = 10): Promise<PaidMigrationCandidate[]> {
-    const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
-    if (!count) return [];
-    const result = await db.execute(sql`SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id,
-        c.id::text AS computer_id, s.sku
-        FROM public.ezil_billing_subscriptions s
-        JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL
-        LEFT JOIN public.ezil_computer_placements p ON p.computer_id = c.id
-        WHERE s.sku IN ('standard_monthly_v3', 'premium_monthly_v3') AND s.status = 'active'
-          AND s.current_period_start <= ${now.toISOString()}::timestamptz
-          AND s.current_period_end > ${now.toISOString()}::timestamptz
-          AND (p.computer_id IS NULL OR p.provider = 'cloudflare')
-          AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations m WHERE m.user_id = s.user_id
-            AND (m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
-              OR m.updated_at >= ${new Date(now.getTime() - 600_000).toISOString()}::timestamptz))
-        ORDER BY s.user_id, s.current_period_end DESC, s.current_period_start DESC, c.slot, c.id LIMIT ${count}`);
-    const rows: Record<string, unknown>[] = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] })?.rows) ?? [];
-    return rows.map(row => ({ userId: String(row.user_id), computerId: String(row.computer_id),
-        toSize: row.sku === 'standard_monthly_v3' ? 'standard' : 'premium' }));
-}
+export { paidCloudflareCandidates } from './placement';
 
 /** The sweep shares its launch budget with existing migration recovery. */
 export async function reconcilePaidMigrations(input: {

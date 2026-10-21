@@ -356,6 +356,23 @@ describe('billing schema and migration 0004', () => {
 const sessionColumnNames = new Set(['deadline_at', 'last_heartbeat_at']);
 const sessionCheckNames = new Set(['ezil_billing_compute_epochs_deadline_at_chk', 'ezil_billing_compute_epochs_last_heartbeat_at_chk']);
 
+const DEADLINE_CHECK = 'ezil_billing_compute_epochs_deadline_at_chk';
+const DEADLINE_CHECK_0005 = '"ezil_billing_compute_epochs"."deadline_at" is null or ("ezil_billing_compute_epochs"."deadline_at" >= "ezil_billing_compute_epochs"."ready_at" and "ezil_billing_compute_epochs"."deadline_at" <= "ezil_billing_compute_epochs"."ready_at" + interval \'21600 seconds\')';
+
+describe('billing migration 0007', () => {
+    it('replaces only the deadline check with the schema\'s uncapped form', () => {
+        const table = getTableConfig(billing.billingComputeEpochs);
+        const check = table.checks.find(c => c.name === DEADLINE_CHECK)!;
+        const value = new PgDialect().sqlToQuery(check.value).sql;
+        expect(value).not.toContain('21600');
+        const migration = readFileSync(new URL('../../../../drizzle/0007_paid_session_deadlines.sql', import.meta.url), 'utf8');
+        expect(statements(migration)).toEqual([
+            `ALTER TABLE "${table.name}" DROP CONSTRAINT "${DEADLINE_CHECK}"`,
+            `ALTER TABLE "${table.name}" ADD CONSTRAINT "${DEADLINE_CHECK}" CHECK (${value})`,
+        ]);
+    });
+});
+
 describe('billing schema and migration 0005', () => {
     it('registers 0005 and preserves every 0004 table except two columns, two checks and two indexes', () => {
         expect(journal.entries.filter((entry: { idx: number }) => entry.idx === 5)).toEqual([
@@ -376,7 +393,8 @@ describe('billing schema and migration 0005', () => {
         const checks = table.checks.filter(check => sessionCheckNames.has(check.name));
         expect(checks).toHaveLength(2);
         for (const check of checks) {
-            const value = dialect.sqlToQuery(check.value).sql;
+            // 0007 later relaxed the deadline check; 0005 itself still adds the six-hour form.
+            const value = check.name === DEADLINE_CHECK ? DEADLINE_CHECK_0005 : dialect.sqlToQuery(check.value).sql;
             epochs.checkConstraints[check.name] = { name: check.name, value };
             expected.push(`ALTER TABLE "${table.name}" ADD CONSTRAINT "${check.name}" CHECK (${value})`);
         }
