@@ -1,6 +1,6 @@
 import { after } from 'next/server';
-import { pendingRecovery, TERMINAL_MIGRATION_STATES, type MigrationEvent } from './provider-migrate';
-import { MigrationConflictError, type ComputeMigration, type createProviderMigrationStore } from './provider-migrate-store';
+import { pendingRecovery, TERMINAL_MIGRATION_STATES } from './provider-migrate';
+import { MigrationConflictError, type ComputeMigration, type createProviderMigrationStore, type MigrationFailureReason, type MigrationStoreEvent } from './provider-migrate-store';
 import type { MigrateBeginResult, MigrateCommitInput, MigrateResult } from '../cloudflare-guacamole-provider';
 import type { SnapshotHead } from './provider-migrate';
 
@@ -21,10 +21,10 @@ export interface MigrationDeps {
     stopCloudflare(m: ComputeMigration): Promise<void>;
 }
 export class MigrationStepError extends Error {
-    constructor(readonly retryable: boolean) { super('migration_step_failed'); }
+    constructor(readonly retryable: boolean, readonly reason?: MigrationFailureReason) { super('migration_step_failed'); }
 }
 function checked<T>(result: MigrateResult<T>): T {
-    if (!result.ok) throw new MigrationStepError(result.error === 'unavailable');
+    if (!result.ok) throw new MigrationStepError(result.error === 'unavailable', result.error === 'conflict' ? result.reason : undefined);
     return result.data;
 }
 
@@ -34,7 +34,7 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
         await deps.exclusive(migrationId, async () => {
             const m = await deps.store.readById(migrationId);
             if (!m || TERMINAL_MIGRATION_STATES.includes(m.state)) return;
-            const transition = async (event: MigrationEvent) => {
+            const transition = async (event: MigrationStoreEvent) => {
                 const current = await deps.store.readById(migrationId);
                 if (!current || current.state !== m.state) throw new MigrationConflictError();
                 const result = await deps.store.applyTransition(current, event);
@@ -52,7 +52,8 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
                     await transition({ type: 'reopened' });
                 } catch (error) {
                     if (error instanceof MigrationConflictError) throw error;
-                    await transition({ type: 'error', step: effect, retryable: false });
+                    await transition({ type: 'error', step: effect, retryable: false,
+                        reason: error instanceof MigrationStepError ? error.reason : undefined });
                 }
             };
             const recovery = pendingRecovery(m);
@@ -73,8 +74,10 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
                         delete workspaceHead._awsProvision;
                         const system = await deps.head(m, 'system');
                         const systemHead = !system.ok && system.error === 'not_found' ? null : checked(system);
-                        if (workspaceHead.generation !== m.generation || ((m.sourceSystemEtag === null) !== (systemHead === null)))
-                            throw new MigrationStepError(false);
+                        if (workspaceHead.generation !== m.generation)
+                            throw new MigrationStepError(false, 'generation_mismatch');
+                        if ((m.sourceSystemEtag === null) !== (systemHead === null))
+                            throw new MigrationStepError(false, 'system_head_mismatch');
                         await transition({ type: 'exported', workspaceHead, systemHead });
                         break;
                     }
@@ -103,6 +106,7 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
                 if (error instanceof MigrationConflictError) throw error;
                 // Commit uncertainty needs compensation, not a blind second commit.
                 const result = await transition({ type: 'error', step,
+                    reason: error instanceof MigrationStepError ? error.reason : undefined,
                     retryable: step !== 'commit' && error instanceof MigrationStepError && error.retryable });
                 if (result.effect === 'abort' || result.effect === 'reopen') await recover(result.effect);
             }

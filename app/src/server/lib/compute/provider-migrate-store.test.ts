@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
 import { createProviderMigrationStore, restoreTokenMatches, type ComputeMigration } from './provider-migrate-store';
-import { MIGRATION_STATES } from './provider-migrate';
+import { MIGRATION_STATES, pendingRecovery } from './provider-migrate';
 
 vi.mock('node:crypto', async original => {
     const actual = await original<typeof import('node:crypto')>();
@@ -83,6 +83,36 @@ describe('restore tokens', () => {
 });
 
 describe('migration persistence', () => {
+    it.each([
+        ['export', false, 'head_moved', 'recovery:abort:export:head_moved', 'abort'],
+        ['export', false, 'generation_mismatch', 'recovery:abort:export:generation_mismatch', 'abort'],
+        ['export', false, 'system_head_mismatch', 'recovery:abort:export:system_head_mismatch', 'abort'],
+        ['export', false, 'other', 'recovery:abort:export:other', 'abort'],
+        ['commit', false, 'head_moved', 'recovery:reopen:commit:head_moved', 'reopen'],
+        ['begin', true, 'other', 'retry:begin:other', 'retry'],
+        ['export', false, undefined, 'recovery:abort:export', 'abort'],
+    ] as const)('persists %s failure (retryable=%s, reason=%s) and keeps the recovery prefix', async (step, retryable, reason, lastError, effect) => {
+        const f = setup(), m = { ...await migration(), state: 'fenced' as const };
+        const result = await f.store.applyTransition(m, { type: 'error', step, retryable, reason });
+        expect(result.effect).toBe(effect);
+        expect(f.queries[0]!.params).toContain(lastError);
+        expect(pendingRecovery({ ...m, lastError })).toBe(effect === 'retry' ? null : effect);
+        expect(m.lastError).toBeNull();
+    });
+    it('preserves the original reason through recovery replay and successful abort', async () => {
+        const m = { ...await migration(), lastError: 'recovery:abort:export:head_moved' };
+        for (const event of [{ type: 'error', step: 'export', retryable: false, reason: 'other' }, { type: 'reopened' }] as const) {
+            const f = setup(); await f.store.applyTransition(m, event);
+            expect(f.queries[0]!.params).toContain(m.lastError);
+            expect(f.queries[0]!.params).not.toContain(`${m.lastError}:other`);
+        }
+    });
+    it.each(['abort', 'reopen'] as const)('persists the reason for failed %s compensation', async step => {
+        const m = { ...await migration(), lastError: `recovery:${step}:export:head_moved` };
+        const f = setup(); await f.store.applyTransition(m, { type: 'error', step, retryable: false, reason: 'not_migrated' });
+        expect(f.queries[0]!.params).toContain(`recovery_failed:${step}:not_migrated`);
+        expect(f.queries[0]!.params).toContain('failed_needs_operator');
+    });
     it('create or get is constrained by the partial unique index, owner and target', async () => {
         const f = setup([[], [row]]);
         expect((await f.store.createOrGetActive({ computerId: C, userId: G, toSize: 'standard' })).id).toBe(G);

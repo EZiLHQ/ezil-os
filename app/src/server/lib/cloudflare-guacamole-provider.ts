@@ -3224,7 +3224,16 @@ export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hma
 
 // Cloudflare snapshot migration uses the same v1 control signer as restart.
 export type MigrateKind = 'workspace' | 'system';
-export type MigrateResult<T> = { ok: true; data: T } | { ok: false; error: 'not_found' | 'conflict' | 'unavailable' };
+const MIGRATE_CONFLICT_REASONS = [
+    'head_moved', 'migration_not_started', 'no_checkpoint', 'previous_head_missing',
+    'generation_mismatch', 'chunk_unavailable', 'already_migrated', 'workspace_too_large',
+    'workspace_size_unknown', 'system_too_large', 'system_size_unknown', 'final_checkpoint_failed',
+    'flag_write_failed', 'stop_failed', 'migrating', 'not_migrated',
+] as const;
+export type MigrateConflictReason = typeof MIGRATE_CONFLICT_REASONS[number] | 'other';
+export type MigrateResult<T> = { ok: true; data: T }
+    | { ok: false; error: 'not_found' | 'unavailable' }
+    | { ok: false; error: 'conflict'; reason?: MigrateConflictReason };
 export interface MigrateBeginResult {
     etag: string;
     systemEtag: string | null;
@@ -3292,8 +3301,20 @@ async function migrateRequest(name: string, action: string, body?: object, gener
             cache: 'no-store', redirect: 'error',
         });
         if (!response.ok) {
+            if (response.status === 409) {
+                let reason: MigrateConflictReason = 'other';
+                try {
+                    // Read only a bounded enum payload; never persist arbitrary Worker text.
+                    const data: unknown = await boundedMigrationBody(response, 4096).json();
+                    if (data && typeof data === 'object' && !Array.isArray(data)) {
+                        const workerError = (data as Record<string, unknown>).error;
+                        reason = MIGRATE_CONFLICT_REASONS.find(value => value === workerError) ?? 'other';
+                    }
+                } catch { /* A malformed or oversized body is still a conflict. */ }
+                return { ok: false, error: 'conflict', reason };
+            }
             void response.body?.cancel().catch(() => {});
-            return { ok: false, error: response.status === 404 ? 'not_found' : response.status === 409 ? 'conflict' : 'unavailable' };
+            return { ok: false, error: response.status === 404 ? 'not_found' : 'unavailable' };
         }
         return { ok: true, data: boundedMigrationBody(response, action.includes('/chunk/') ? MIGRATE_CHUNK_LIMIT : MIGRATE_HEAD_LIMIT) };
     } catch {

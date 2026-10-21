@@ -82,8 +82,30 @@ describe('migration orchestration', () => {
         f.deps.begin = async m => { f.set({ state: 'failed_reopened' }); return original(m); };
         await f.advance(); expect(f.deps.store.applyTransition).not.toHaveBeenCalled();
     });
-    it.each([{ generation: C }, { sourceSystemEtag: 'system' }])('rejects inconsistent export %j', async patch => {
+    it.each([
+        [{ generation: C }, 'generation_mismatch'],
+        [{ sourceSystemEtag: 'system' }, 'system_head_mismatch'],
+    ] as const)('rejects inconsistent export %j with a distinct reason', async (patch, reason) => {
         const f = fixture('fenced'); f.set(patch); await f.advance(); expect(f.get().state).toBe('failed_reopened');
+        expect(f.deps.store.applyTransition).toHaveBeenCalledWith(expect.anything(),
+            { type: 'error', step: 'export', retryable: false, reason });
+    });
+    it.each(['head_moved', 'other'] as const)('passes conflict reason %s to persistence without changing the recovery step', async reason => {
+        const f = fixture('fenced');
+        vi.mocked(f.deps.head).mockResolvedValueOnce({ ok: false, error: 'conflict', reason });
+        await f.advance();
+        expect(f.deps.store.applyTransition).toHaveBeenCalledWith(expect.anything(),
+            { type: 'error', step: 'export', retryable: false, reason });
+        expect(f.deps.abort).toHaveBeenCalledOnce();
+        expect(f.get().state).toBe('failed_reopened');
+    });
+    it.each(['abort', 'reopen'] as const)('carries the reason when %s recovery fails', async effect => {
+        const f = fixture('fenced'); f.set({ lastError: `recovery:${effect}:export:head_moved` });
+        vi.mocked(f.deps[effect]).mockResolvedValueOnce({ ok: false, error: 'conflict', reason: 'not_migrated' });
+        await f.advance();
+        expect(f.deps.store.applyTransition).toHaveBeenCalledWith(expect.anything(),
+            { type: 'error', step: effect, retryable: false, reason: 'not_migrated' });
+        expect(f.get().state).toBe('failed_needs_operator');
     });
     it('strips the server namespace from exported data', async () => {
         const f = fixture('fenced'); vi.mocked(f.deps.head).mockResolvedValueOnce({ ok: true as const, data: { generation: G, _awsProvision: {} } });

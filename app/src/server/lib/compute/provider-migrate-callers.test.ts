@@ -43,7 +43,7 @@ describe('migration Worker callers', () => {
         });
         it.each([[404, 'not_found'], [409, 'conflict'], [503, 'unavailable'], [401, 'unavailable']] as const)(action + ' maps %i', async (status, error) => {
             fetcher.mockResolvedValue(new Response('private error', { status }));
-            expect(await call()).toEqual({ ok: false, error });
+            expect(await call()).toEqual({ ok: false, error, ...(status === 409 ? { reason: 'other' } : {}) });
         });
         it(action + ' rejects transport errors, malformed JSON and malformed success', async () => {
             fetcher.mockRejectedValueOnce(new Error('private'));

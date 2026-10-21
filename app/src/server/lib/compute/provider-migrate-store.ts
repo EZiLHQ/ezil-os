@@ -1,7 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import type { PlacementExecutor } from './placement';
+import type { MigrateConflictReason } from '../cloudflare-guacamole-provider';
 import { pendingRecovery, reduceMigration, type MigrationEvent, type MigrationProgress, type SnapshotHead } from './provider-migrate';
+
+export type MigrationFailureReason = MigrateConflictReason | 'system_head_mismatch';
+export type MigrationStoreEvent = MigrationEvent & { reason?: MigrationFailureReason };
 
 export interface ComputeMigration extends MigrationProgress {
     id: string;
@@ -96,10 +100,16 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
             }
             throw new MigrationConflictError();
         },
-        async applyTransition(expected: ComputeMigration, event: MigrationEvent) {
+        async applyTransition(expected: ComputeMigration, event: MigrationStoreEvent) {
             const decision = reduceMigration(expected, event);
             if (!decision.accepted) return { ...decision, migration: expected };
             const m = decision.migration;
+            // Keep the reducer's recovery prefix and step intact. An existing
+            // recovery retains its original cause until abort/reopen itself fails.
+            if (event.type === 'error' && event.reason && m.lastError
+                && (!pendingRecovery(expected) || event.step === 'abort' || event.step === 'reopen')) {
+                m.lastError += `:${event.reason}`;
+            }
             const revoke = !['exported', 'provisioning'].includes(m.state) || !!pendingRecovery(m);
             const updated = one(await db.execute(sql`UPDATE public.ezil_compute_migrations SET
                 state = ${m.state}, generation = ${m.generation}::uuid, source_etag = ${m.sourceEtag}, source_system_etag = ${m.sourceSystemEtag},
