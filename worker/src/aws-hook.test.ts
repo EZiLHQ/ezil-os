@@ -20,6 +20,7 @@ import vectors from './aws-gateway.vectors.json';
 import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-origin';
 import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
 import { deriveNekoCredentials, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { deriveAiProxyToken } from './ai-proxy';
 import { sha256Hex } from './aws-ice';
 import { relayExpiryFor } from './relay-refresh';
 
@@ -90,8 +91,9 @@ afterEach(() => { globalThis.fetch = realFetch; });
  * API) plus a fake Cloudflare Realtime TURN API. Records what the Worker sent.
  */
 interface FakeHost {
+  bootId?: string; aiConfigured?: boolean;
   configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
-  pushed?: { expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
+  pushed?: { ai?: { baseUrl: string; proxyToken: string }; expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
   turnCalls: number; bad: string[]; paths: string[];
 }
 function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
@@ -114,7 +116,7 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     if (url.hostname !== `c-${SID}-g1-e2.${ORIGIN_ZONE}`) h.bad.push(`host ${url.hostname}`);
     const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, method, url.pathname, Math.floor(Date.now() / 1000));
     if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
-    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice });
+    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
     if (url.pathname.startsWith('/__ezil/control/ice/')) {
       if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
       h.pushed = JSON.parse(body);
@@ -492,5 +494,30 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
     const res = await worker.fetch(await signed('GET', `/sandbox/${SID}/relay-refresh`, '', claims({ sandboxId: other })), e);
     expect(res.status).toBe(401);
     expect(host.paths).toEqual([]);
+  });
+});
+
+
+describe('AWS AI signed boot delivery', () => {
+  it.each(['on', 'off'])('pushes a scoped token through signed control, stable on retry and rotated after reboot (proxy %s)', async (flag) => {
+    const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_AI_PROXY: flag, SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
+    await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
+    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied', aiConfigured: false });
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(503);
+    const first = host.pushed!.ai!;
+    expect(first.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
+    const ns = (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS;
+    const rec = await (await ns.get(SID).fetch(new Request('https://aws-tunnels/get'))).json() as { record: { aiProxyNonce: string } };
+    expect(first.proxyToken).toBe(await deriveAiProxyToken(SECRET, SID, rec.record.aiProxyNonce));
+    await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(host.pushed!.ai).toEqual(first);
+    host.bootId = '22222222-2222-4222-8222-222222222222';
+    await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(host.pushed!.ai!.proxyToken).not.toBe(first.proxyToken);
+    host.aiConfigured = true;
+    const count = host.turnCalls;
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+    expect(host.turnCalls).toBe(count);
+    expect(host.bad).toEqual([]);
   });
 });

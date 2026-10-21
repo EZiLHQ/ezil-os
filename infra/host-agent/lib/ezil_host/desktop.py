@@ -69,6 +69,7 @@ STOP_RECORD = ".ezil-last-stop.json"
 # buildNekoIceEnv). Renewal later goes through neko's own admin /api/relay, in place.
 DESKTOP_CONFIG = "desktop-config.json"     # runDir: the pushed relay config
 ICE_STATE = "desktop-ice.json"             # runDir: how the running desktop was started
+AI_STATE = "desktop-ai.json"               # runDir: boolean only, no token
 STOPPING = "stopping"                      # runDir: the agent committed to stopping; no desktop may start
 RELAY_MIN_AHEAD_MS, RELAY_MAX_AHEAD_MS, CLOCK_SKEW_MS = 60_000, 1_800_000, 5_000
 MAX_ICE_SERVERS = MAX_ICE_URLS = 8
@@ -117,7 +118,8 @@ def validate_desktop_config(c, now_ms):
     Worker's buildAwsDesktopConfig and neko's /api/relay rules: authenticated TURN in both
     sets, a TURN-only backend, an expiry more than 60 s and at most 30 min ahead, and two
     distinct 32-hex derived neko values (never the image's built-in neko/admin)."""
-    if not isinstance(c, dict) or set(c) != {"v", "expiresAt", "frontend", "backend", "neko"} or c.get("v") != 1:
+    if not isinstance(c, dict) or set(c) not in ({"v", "expiresAt", "frontend", "backend", "neko"},
+                                               {"v", "expiresAt", "frontend", "backend", "neko", "ai"}) or c.get("v") != 1:
         raise ValueError("ice_config_invalid")
     exp = c["expiresAt"]
     if (not isinstance(exp, int) or isinstance(exp, bool) or exp <= now_ms + RELAY_MIN_AHEAD_MS
@@ -128,7 +130,13 @@ def validate_desktop_config(c, now_ms):
             or not all(isinstance(neko[k], str) and NEKO_VALUE_RE.match(neko[k]) for k in ("user", "admin"))
             or neko["user"] == neko["admin"]):
         raise ValueError("ice_config_invalid")
-    return {"v": 1, "expiresAt": exp, "frontend": _ice_set(c["frontend"], False),
+    ai = c.get("ai")
+    if "ai" in c and (not isinstance(ai, dict) or set(ai) != {"baseUrl", "proxyToken"}
+            or not isinstance(ai["proxyToken"], str) or not re.fullmatch(r"[0-9a-f]{64}", ai["proxyToken"])
+            or not isinstance(ai["baseUrl"], str)
+            or not re.fullmatch(r"https://aws-8443-guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}-aws\.[a-z0-9.-]+/ai/v1", ai["baseUrl"])):
+        raise ValueError("ice_config_invalid")
+    return {**({"ai": dict(ai)} if ai else {}), "v": 1, "expiresAt": exp, "frontend": _ice_set(c["frontend"], False),
             "backend": _ice_set(c["backend"], True), "neko": {"user": neko["user"], "admin": neko["admin"]}}
 
 
@@ -187,6 +195,20 @@ def read_ice_state(cfg):
         return s if s in ("applied", "missing") else "none"
     except (OSError, ValueError, AttributeError, Refused):
         return "none"
+
+
+def ai_configured(cfg):
+    try:
+        with open(_run_file(cfg, AI_STATE), encoding="utf-8") as f:
+            return json.load(f).get("configured") is True
+    except (OSError, ValueError, AttributeError, Refused):
+        return False
+
+
+def host_boot_id():
+    # Host kernel boot identity, never a value read from the desktop/container.
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+        return f.read().strip()
 
 
 def relay_env(c):
@@ -527,6 +549,11 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     ] + [f"{k}={v}" for k, v in PROFILE_ENV.items()])
     if desktop_config is not None:
         env = set_env(env, relay_env(desktop_config))
+    # Always override image defaults. Only the authenticated host control config may
+    # supply these; neither the lease nor the desktop filesystem is a token source.
+    ai = desktop_config.get("ai") if desktop_config is not None else None
+    env = set_env(env, {"EZIL_AI_BASE_URL": ai["baseUrl"] if ai else "",
+                        "EZIL_AI_PROXY_TOKEN": ai["proxyToken"] if ai else ""})
     args = (["/bin/bash", "-c", "DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh"] if mode == "desktop"
             else ["/bin/sleep", "infinity"])
     dm = cfg.dataMount
@@ -580,10 +607,10 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
             "readonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
         },
     }
-    bundle = os.path.join(cfg.runDir, "bundle")
+    bundle = _run_file(cfg, "bundle")
     os.makedirs(bundle, mode=0o700, exist_ok=True)
-    with open(os.path.join(bundle, "config.json"), "w") as f:
-        json.dump(spec, f, indent=1)
+    _write_private_atomic(os.path.join(bundle, "config.json"), json.dumps(spec, indent=1).encode())
+    _write_private_atomic(_run_file(cfg, AI_STATE), json.dumps({"configured": bool(ai)}).encode())
     return bundle
 
 
