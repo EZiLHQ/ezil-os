@@ -179,6 +179,16 @@ async function until(check, label, timeout = 30_000, interval = 200) {
 
 const appWindow = (page, id) => page.locator(`.window[data-app="${id}"]:not([data-closing="1"])`).last();
 const dock = (page, id) => page.locator(`.taskbar-item[data-app="${id}"]`).first();
+// A full-bleed app auto-hides the taskbar; it slides back when the pointer reaches the bottom edge.
+async function clickDock(page, id) {
+  const item = dock(page, id);
+  if (!await item.isVisible()) {
+    const size = page.viewportSize() ?? { width: 1440, height: 1000 };
+    await page.mouse.move(size.width / 2, size.height - 1);
+    await item.waitFor({ state: 'visible', timeout: 10_000 });
+  }
+  await item.click();
+}
 
 async function closeApp(page, id) {
   const win = appWindow(page, id);
@@ -188,7 +198,7 @@ async function closeApp(page, id) {
     for (const close of await page.locator('[data-action="close-sheet"]:visible').all()) await close.click();
   }
   // Restore before closing, as a full-bleed app may be underneath another app.
-  await dock(page, id).click();
+  await clickDock(page, id);
   const close = win.getByRole('button', { name: 'Close', exact: true });
   if (!await close.first().isVisible()) {
     await win.locator('.dashboard-app-drawer-toggle').click();
@@ -200,7 +210,7 @@ async function closeApp(page, id) {
 }
 
 async function settingsTab(page, tab) {
-  await dock(page, 'settings').click();
+  await clickDock(page, 'settings');
   const win = appWindow(page, 'settings');
   await win.locator(`[data-tab="${tab}"]`).click();
   const pane = win.locator(`[data-pane="${tab}"]`);
@@ -268,7 +278,7 @@ async function openApp(page, id, evidence) {
     } };
   }, id);
   try {
-    await dock(page, id).click();
+    await clickDock(page, id);
     await until(async () => {
       const data = await page.evaluate(() => window.__billingJourneyWatch.data);
       Object.assign(evidence, data);
@@ -393,7 +403,7 @@ async function command(frame, name, id) {
 }
 
 async function chat(page, evidence, redact) {
-  await dock(page, 'code').click();
+  await clickDock(page, 'code');
   const frame = await codeFrame(page);
   let input = frame.locator('.chat-input-container .monaco-editor:visible').first();
   if (!await input.isVisible()) {
@@ -432,7 +442,7 @@ async function chat(page, evidence, redact) {
 }
 
 async function terminalRun(page, frame, script, runId, phase) {
-  await dock(page, 'code').click();
+  await clickDock(page, 'code');
   await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
   // Requested shortcut, then inspect/focus the actual terminal input.
   if (!await frame.locator('.terminal .xterm-helper-textarea:visible').count()) {
