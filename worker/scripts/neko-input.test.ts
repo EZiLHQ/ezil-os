@@ -23,10 +23,13 @@ describe('desktop image input configuration', () => {
         expect(launch).toContain('--session.implicit_hosting=true');
         expect(launch).toContain('--desktop.input.enabled=false');
     });
-    it('enables supported server clipboard and loads the client configuration', () => {
-        expect(launch).toContain('NEKO_DESKTOP_CLIPBOARD_ENABLED="true"');
-        expect(dockerfile).toContain("grep -- '--desktop.clipboard.enabled'");
-        expect(dockerfile).toContain("grep -rl 'setClipboard' /var/www/js");
+    it('relies on the pinned client clipboard path (no v3 server flag) and loads the client helper', () => {
+        // The pinned legacy-protocol Neko has no server clipboard flag; a v3 flag here broke the image build.
+        expect(launch).not.toContain('NEKO_DESKTOP_CLIPBOARD_ENABLED');
+        expect(dockerfile).not.toContain('--desktop.clipboard.enabled');
+        expect(dockerfile).toContain("grep -rl 'clipboard_read_available' /var/www/js");
+        expect(dockerfile).toContain("grep -rl 'clipboard.readText' /var/www/js");
+        expect(dockerfile).toContain("grep -rl 'clipboard.writeText' /var/www/js");
         expect(dockerfile).toContain('COPY scripts/neko-client.js /var/www/ezil-input.js');
         expect(dockerfile).toContain('<script defer src="ezil-input.js"></script>');
     });
@@ -66,9 +69,9 @@ function clientFixture(touch = false, supportsClipboard = true) {
     return { synced, warnings, removed, overlay, input, emit, focused: () => focused, delivered: () => delivered };
 }
 
-it('enables the native clipboard sync preference without reading browser clipboard on load', () => {
-    expect(clientFixture().synced).toEqual([true]);
-    expect(clientFixture(false, false).warnings).toHaveLength(1);
+it('never writes clipboard state (the legacy setClipboard takes text) and warns about nothing on load', () => {
+    expect(clientFixture().synced).toEqual([]);
+    expect(clientFixture(false, false).warnings).toEqual([]);
 });
 
 it('keeps plain Unicode input working after IME composition and allows listener cleanup', () => {

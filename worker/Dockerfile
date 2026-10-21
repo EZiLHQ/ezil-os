@@ -258,10 +258,14 @@ RUN chmod +x /usr/bin/neko \
   && test -x /usr/bin/neko \
   && test -d /var/www \
   && test -f /etc/neko/neko.yaml
-# Fail the image build on unsupported clipboard APIs instead of shipping a
-# configuration that merely looks enabled. No browser permissions are granted.
-RUN /usr/bin/neko serve --help | grep -- '--desktop.clipboard.enabled' >/dev/null \
-  && grep -rl 'setClipboard' /var/www/js >/dev/null
+# The pinned (legacy-protocol) Neko syncs the clipboard itself over
+# control/clipboard once the browser exposes navigator.clipboard read+write to
+# its frame: the shell iframe allow= plus the app Permissions-Policy, then the
+# user's normal permission grant. It has no server clipboard flag (that is
+# Neko v3). Fail the build if a Neko swap drops this client path.
+RUN grep -rl 'clipboard_read_available' /var/www/js >/dev/null \
+  && grep -rl 'clipboard.readText' /var/www/js >/dev/null \
+  && grep -rl 'clipboard.writeText' /var/www/js >/dev/null
 
 # ── Pinned code-server + bundled Copilot Chat (EZiL Chat) ────────────────────
 # Update the release and digest together; patches are exact-count gated against

@@ -11,15 +11,9 @@
             return;
         }
 
-        // typed-vuex clients expose the clipboard preference via settings.
-        // Do not substitute another transport or request permission on load:
-        // Neko's sync uses the browser's normal clipboard permission flow.
-        var settings = client.$accessor && client.$accessor.settings;
-        if (settings && typeof settings.setClipboard === 'function') {
-            settings.setClipboard(true);
-        } else {
-            console.warn('[ezil-input] clipboard sync setting unavailable; verify this Neko client build');
-        }
+        // Clipboard is Neko's own: its client syncs once the browser exposes
+        // navigator.clipboard to this frame. Never touch clipboard state here
+        // (the legacy store's setClipboard takes clipboard TEXT, not a flag).
 
         overlay.addEventListener('pointerdown', function (event) {
             if (event.pointerType !== 'touch') overlay.focus({ preventScroll: true });

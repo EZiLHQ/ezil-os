@@ -3067,11 +3067,10 @@ else
   log "ICE: no TURN relay configured — relay-less/STUN-only (media gated)"
 fi
 cd /etc/neko 2>/dev/null || true
-# The Dockerfile verifies this setting against the pinned binary. Clipboard
-# still requires can_access_clipboard and normal browser permission.
+# Clipboard: the pinned Neko client syncs it when the browser grants
+# clipboard read/write to this frame (see the Dockerfile guard); no flag here.
 NEKO_SERVER_BIND="0.0.0.0:${NEKO_HTTP_PORT}" \
 NEKO_DESKTOP_INPUT_ENABLED="false" \
-NEKO_DESKTOP_CLIPBOARD_ENABLED="true" \
   "$NEKO_BIN" serve \
     --server.static "$NEKO_STATIC" \
     --desktop.input.enabled=false \

@@ -14,7 +14,7 @@ import { PlacementIntegrityError, PlacementOwnerError } from './placement';
 import { providerForPlacement, resolveComputeProvider, selectComputeProvider } from './select';
 import type { EntitlementRecord } from './tier';
 
-const migrationRead = vi.hoisted(() => vi.fn(async (): Promise<any> => null));
+const migrationRead = vi.hoisted(() => vi.fn(async (): Promise<Partial<Record<'userId' | 'state' | 'lastError', string>> | null> => null));
 vi.mock('./provider-migrate-store', () => ({ createProviderMigrationStore: () => ({ readByComputer: migrationRead }) }));
 
 const userId = '11111111-1111-4111-8111-111111111111';
