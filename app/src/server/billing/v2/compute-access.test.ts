@@ -69,7 +69,7 @@ function fixture(over: Partial<Input> = {}) {
             const opened = stored({ id: 'new_epoch', userId: data.userId, computerId: data.computerId, size: data.size,
                 weight: SIZES[data.size].weight, readyAt: isoSeconds(ready), endedAt: null, endReason: null,
                 overheadSeconds: data.overheadSeconds ?? 0,
-                deadlineAt: data.deadlineAt == null ? null : isoSeconds(Math.max(ready, Math.min(ready + 21600, epochSeconds(data.deadlineAt)))) });
+                deadlineAt: data.deadlineAt == null ? null : isoSeconds(Math.max(ready, Math.min(ready + (data.sessionMaxSeconds === null ? Infinity : 21600), epochSeconds(data.deadlineAt)))) });
             input.epochs = [...input.epochs, opened];
             return { status: 'opened' as const, epoch: opened };
         },
@@ -461,14 +461,14 @@ describe('v3 compute enforcement', () => {
     });
 
     it.each([
-        ['standard_monthly_v3', 'std-2', 144000, 7200],
-        ['premium_monthly_v3', 'cmp-8', 1800000, 21600],
+        ['standard_monthly_v3', 'std-2', 144000, 129600],
+        ['premium_monthly_v3', 'cmp-8', 1800000, 446400],
     ] as const)('%s uses weighted standard-seconds and its session limit', async (sku, size, allowance, maxRunSeconds) => {
         const { deps, calls } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku })], grants: [grant({ amount: BigInt(allowance) })],
             epochs: [epoch(START, '2026-10-10T01:00:00Z')], sizePreference: 'cmp-8' });
         const state = await loadComputeBillingState(deps, USER, NOW);
-        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: maxRunSeconds,
+        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: null,
             usedStdSeconds: 14400, allowanceStdSeconds: allowance, overage: null });
         const readyAt = new Date('2026-10-18T13:00:00Z');
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size, readyAt, overheadSeconds: 0 }))
@@ -480,7 +480,9 @@ describe('v3 compute enforcement', () => {
         const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }) });
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'free-cf', readyAt: NOW, overheadSeconds: 0 }))
             .toMatchObject({ decision: { admit: true, maxRunSeconds: 3600 } });
-        input.epochs = [epoch('2026-10-10T00:00:00Z', '2026-10-10T07:59:01Z')];
+        input.epochs = Array.from({ length: 8 }, (_, i) => ({ ...epoch(`2026-10-10T0${i}:00:00Z`, `2026-10-10T0${i}:59:${i === 7 ? '01' : '59'}Z`), size: 'free-cf' as const, weight: 1 as const }));
+        input.epochs[0]!.endedAt = '2026-10-10T01:00:00Z';
+        for (let i = 1; i < 7; i++) input.epochs[i]!.endedAt = `2026-10-10T0${i + 1}:00:00Z`;
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW }))
             .toEqual({ allowed: false, reason: 'fair_use_paused' });
     });

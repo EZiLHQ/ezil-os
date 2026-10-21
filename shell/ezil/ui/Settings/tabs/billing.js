@@ -199,7 +199,7 @@ function machineV3Html ({ plan, computer }) {
 export function summaryV3Html (summary) {
     const { plan, computer, fairUse, actions } = summary;
     const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
-    const hours = computer.sessionMaxSeconds / 3600;
+    const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
     const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)} — upgrade to keep working` }[fairUse.status];
     const changeAction = actions.downgrade ? actionHtml('downgrade', 'Change plan')
         : actions.upgrade ? actionHtml('upgrade', 'Change plan') : actions.checkout ? actionHtml('choose', 'Change plan', true) : '';
@@ -217,7 +217,7 @@ export function summaryV3Html (summary) {
         </section>
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
             ${machineV3Html(summary)}
-            ${paragraph(`Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
+            ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
             ${plan.sku !== 'free_v3' ? paragraph('Your own computer in Mumbai') : ''}
         </section>
         <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>

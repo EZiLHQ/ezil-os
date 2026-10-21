@@ -50,7 +50,8 @@ export interface PlanOfferV3 {
     vcpu: number;
     memoryGiB: number;
     /** Hard wall-clock bound of one session. */
-    sessionMaxSeconds: number;
+    /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
+    sessionMaxSeconds: number | null;
     opening: OpeningSpeed;
     poolPriority: PoolPriority;
     /**
@@ -86,19 +87,19 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sku: 'standard_monthly_v3', tier: 'standard', name: 'Standard', tagline: 'For regular work, every day.',
         priceCents: 2_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_standard_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: 2 * H, opening: 'standard', poolPriority: 1,
+        sessionMaxSeconds: null, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
         highlighted: false, badge: null, machineChoice: ['std-2'],
-        bullets: ['Your own 2 vCPU · 8 GB computer in Mumbai', 'Sessions up to 2 hours'],
+        bullets: ['Your own 2 vCPU · 8 GB computer in Mumbai', 'No session time limit'],
     },
     premium_monthly_v3: {
         sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For heavy builds and long sessions.',
         priceCents: 10_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 2,
+        sessionMaxSeconds: null, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
         highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'],
-        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) in Mumbai', 'Sessions up to 6 hours', 'Bigger computers use your monthly time faster'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) in Mumbai', 'No session time limit', 'Bigger computers use your monthly time faster'],
     },
 });
 
@@ -164,7 +165,8 @@ export interface BillingSummaryV3 {
         size: SizeCode;
         vcpu: number;
         memoryGiB: number;
-        sessionMaxSeconds: number;
+        /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
+    sessionMaxSeconds: number | null;
         opening: OpeningSpeed;
         /** Deadline of the running session, if any. */
         activeDeadline: string | null;
@@ -186,7 +188,8 @@ export interface PublicOfferV3 {
     priceCents: number;
     vcpu: number;
     memoryGiB: number;
-    sessionMaxSeconds: number;
+    /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
+    sessionMaxSeconds: number | null;
     opening: OpeningSpeed;
     /** Shown in the FAQ only: "Fair use: about N hours a month". */
     fairUseHours: number;

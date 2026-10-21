@@ -71,8 +71,9 @@ export function createBillingStore(db: Database): BillingStore {
             ));
             if (!owner) throw new Error('Computer does not belong to billing user');
             const readyAt = new Date(epochSeconds(input.readyAt, 'ceil') * 1000);
+            const { sessionMaxSeconds = SESSION_MAX_SECONDS, ...epochInput } = input;
             const deadlineAt = input.deadlineAt == null ? null : new Date(Math.max(readyAt.getTime(),
-                Math.min(readyAt.getTime() + SESSION_MAX_SECONDS * 1000, epochSeconds(input.deadlineAt) * 1000)));
+                Math.min(readyAt.getTime() + (sessionMaxSeconds ?? Infinity) * 1000, epochSeconds(input.deadlineAt) * 1000)));
             // A concurrent close can remove the conflicting open row between the
             // insert and select. Retry then, without changing any existing epoch.
             // Bound contention so the caller can retry instead of spinning forever.
@@ -86,7 +87,7 @@ export function createBillingStore(db: Database): BillingStore {
                     return { status: 'exists', epoch: computeEpoch(replayed) };
                 }
                 const [inserted] = await db.insert(billingComputeEpochs).values({
-                    ...input, readyAt, deadlineAt, weight: SIZES[input.size].weight,
+                    ...epochInput, readyAt, deadlineAt, weight: SIZES[input.size].weight,
                 }).onConflictDoNothing().returning();
                 if (inserted) return { status: 'opened', epoch: computeEpoch(inserted) };
                 const [existing] = await db.select().from(billingComputeEpochs).where(and(

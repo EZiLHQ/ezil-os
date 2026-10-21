@@ -260,3 +260,23 @@ describe('rating edge cases beyond the oracle', () => {
         })).toBe(1_583_998);
     });
 });
+
+describe('uncapped paid fair-use billing bound', () => {
+    it.each([['std-2', 1], ['cmp-4', 2], ['cmp-8', 4]] as const)('bounds missed open and late closed stops for %s', (size, weight) => {
+        const window = { start: '2026-10-01T00:00:00Z', end: '2026-11-01T00:00:00Z' };
+        const prior = { id: 'prior', userId: 'u', computerId: 'c', size: 'std-2' as const, weight: 1 as const,
+            readyAt: window.start, endedAt: '2026-10-01T01:00:00Z', endReason: 'user_stop' as const, overheadSeconds: 0 };
+        const open = { ...prior, id: 'open', size, weight, readyAt: '2026-10-02T00:00:00Z', endedAt: null };
+        const now = '2026-10-10T00:00:00Z';
+        for (const endedAt of [null, now]) {
+            const usage = rateWindow({ epochs: [{ ...open, endedAt }, prior], window, now,
+                sessionMaxSeconds: null, allowanceStdSeconds: 144000 });
+            expect(usage.stdSeconds).toBe(144000);
+            expect(usage.actualSecondsBySize[size]).toBe((144000 - 3600) / weight + (size === 'std-2' ? 3600 : 0));
+        }
+    });
+    it.each([undefined, Infinity, NaN, -1])('rejects unbounded allowance %s', allowanceStdSeconds => {
+        expect(() => rateWindow({ epochs: [], window: { start: '2026-10-01', end: '2026-11-01' },
+            now: '2026-10-10', sessionMaxSeconds: null, allowanceStdSeconds })).toThrow(RangeError);
+    });
+});

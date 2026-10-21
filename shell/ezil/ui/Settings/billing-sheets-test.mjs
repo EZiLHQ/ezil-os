@@ -444,14 +444,14 @@ test('v3 change and cancel use only v3 summary dates and period-end mutations', 
     h.handle.close(); await h.ready('cancel'); assert.match(h.text(), /Cancel Premium/);
     h.click('[data-action="confirm"]'); await settle(); assert.deepEqual(h.calls.at(-1).input, { cancel: true });
 });
-for ( const tier of ['free', 'standard'] ) test(`v3 ${tier} limit stop opens one session-end offer`, async h => {
+for ( const tier of ['free'] ) test(`v3 ${tier} limit stop opens one session-end offer`, async h => {
     h.summary = summaryV3(tier); const chosen = [];
     const opts = { ...h.options(), reason: 'session_max', checkout: options => chosen.push(options) };
     h.window.api.openSessionEndSheet(opts);
     assert.ok(h.q('[data-sheet="session-end"]'));
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, tier === 'free' ? 2 : 3);
-    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard gives you 2-hour sessions — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
+    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard: No session time limit — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
     h.click('[data-action="continue"]'); await settle();
     if ( tier === 'free' ) assert.equal(chosen[0].sku, 'standard_monthly_v3');
     else assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
@@ -460,7 +460,7 @@ test('v3 session-end ignores idle, disconnect, fair-use stop, disallowed actions
     h.summary = summaryV3('free');
     for ( const reason of ['idle_sleep', 'provider_stop', 'fair_use_paused', undefined] ) assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason }), null);
     h.summary.actions.checkout = false; assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason: 'session_max' }), null);
-    h.summary = summaryV3('premium'); assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason: 'session_max' }), null);
+    for (const tier of ['standard', 'premium']) { h.summary = summaryV3(tier); assert.equal(h.window.api.openSessionEndSheet({ ...h.options(), reason: 'session_max' }), null); }
     assert.equal(h.q('[role="dialog"]'), null); assert.equal(h.calls.length, 0);
 });
 test('v3 confirmed-stop event fetches summary once; failures retry and teardown removes the listener', async h => {
@@ -481,7 +481,7 @@ test('v3 session event does not take ownership of an existing billing sheet', as
     const stop = h.window.api.watchBillingSessionEnd({ win: h.window, client: { query: async () => ok(h.summary) } });
     const emit = () => h.window.dispatchEvent(new h.window.CustomEvent('ezil:session-ended', { detail: { reason: 'session_max' } }));
     emit(); await settle(); assert.ok(h.q('[data-sheet="cancel"]'));
-    h.handle.close(); emit(); await settle(); assert.ok(h.q('[data-sheet="session-end"]'));
+    h.handle.close(); h.summary = summaryV3('free'); emit(); await settle(); assert.ok(h.q('[data-sheet="session-end"]'));
     stop(); assert.equal(h.q('[role="dialog"]'), null);
 });
 let failed = 0, states = 0;

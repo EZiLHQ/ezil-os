@@ -838,7 +838,7 @@ try {
         summary = summaryV3(tier); await open();
         contains('[data-role="plan-card"]', summary.plan.name);
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
-        contains('[data-role="your-computer"]', `Sessions up to ${summary.computer.sessionMaxSeconds / 3600} hour`);
+        contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === null ? 'No session time limit' : 'Sessions up to 1 hour');
         if ( tier !== 'free' ) {
             contains('[data-role="plan-card"]', `Renews on Nov 1 for $${tier === 'standard' ? 20 : 100}`);
             contains('[data-role="your-computer"]', 'Your own computer in Mumbai');

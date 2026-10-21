@@ -262,7 +262,8 @@ export const billingComputeEpochs = pgTable(
         check('ezil_billing_compute_epochs_end_pair_chk', sql`(${table.endedAt} is null) = (${table.endReason} is null)`),
         check('ezil_billing_compute_epochs_ended_at_chk', sql`${table.endedAt} is null or ${table.endedAt} >= ${table.readyAt}`),
         check('ezil_billing_compute_epochs_overhead_seconds_chk', sql`${table.overheadSeconds} >= 0`),
-        check('ezil_billing_compute_epochs_deadline_at_chk', sql`${table.deadlineAt} is null or (${table.deadlineAt} >= ${table.readyAt} and ${table.deadlineAt} <= ${table.readyAt} + interval '21600 seconds')`),
+        // Paid plans have no session cap (0007); admission and rating bound the deadline per plan.
+        check('ezil_billing_compute_epochs_deadline_at_chk', sql`${table.deadlineAt} is null or ${table.deadlineAt} >= ${table.readyAt}`),
         check('ezil_billing_compute_epochs_last_heartbeat_at_chk', sql`${table.lastHeartbeatAt} is null or ${table.lastHeartbeatAt} >= ${table.readyAt}`),
         uniqueIndex('ezil_billing_compute_epochs_open_computer_uidx')
             .on(table.computerId)

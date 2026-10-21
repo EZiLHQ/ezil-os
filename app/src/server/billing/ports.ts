@@ -68,6 +68,8 @@ export interface StoredComputeEpoch extends ComputeEpoch {
 }
 
 export interface OpenEpochInput {
+    /** Admission policy; omitted preserves the legacy six-hour store bound. */
+    sessionMaxSeconds?: number | null;
     userId: string;
     computerId: string;
     subscriptionId: string | null;

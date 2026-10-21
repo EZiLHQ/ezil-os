@@ -62,7 +62,7 @@ describe('v3 public plans', () => {
     it('explains sessions, fair use, persistence and billing changes in five FAQs', () => {
         const faq = getPricingContent().faq.items;
         expect(faq).toHaveLength(5);
-        expect(faq[0].answer).toContain('Free sessions last up to 1 hour; Standard sessions last up to 2 hours; Premium sessions last up to 6 hours');
+        expect(faq[0].answer).toContain('Free sessions last up to 1 hour. Standard and Premium: No session time limit. Fair use still applies to every plan.');
         expect(faq[0].answer).toContain('computer stops');
         for (const offer of Object.values(CATALOG_V3)) expect(faq[1].answer).toContain(`about ${offer.fairUseSeconds / 3600} ${offer.tier === 'premium' ? 'standard-hours' : 'hours'} a month on ${offer.name}`);
         expect(faq[1].answer).toContain('does not reset fair use');
