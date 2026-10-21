@@ -799,6 +799,10 @@ function json(data: unknown, status = 200): Response {
         return code;
       }
       console.error('[worker] response error:', value);
+      // Two runtime failures are deterministic and the app must not retry them
+      // (classifyWorkerHttpFailure): name them with public codes, never the text.
+      if (typeof value === 'string' && /setsockoptint/i.test(value)) return 'sandbox_runtime_blocked';
+      if (typeof value === 'string' && /CustomDomainRequiredError|Port exposure requires a custom domain/i.test(value)) return 'custom_domain_required';
       return 'internal_error';
     }
     return value;
@@ -7845,6 +7849,10 @@ export default {
       }
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
+      const aws = await awsControlTarget(env, request, decodeURIComponent(restartMatch[1]), 'restart');
+      if (aws instanceof Response) return aws;
+      if (aws) return (await import('./aws-restart')).handleAwsRestart(
+        request, aws, resolvePreviewSecrets(env), (input, init) => fetch(input, init));
       return handleRestart(
         env,
         url,

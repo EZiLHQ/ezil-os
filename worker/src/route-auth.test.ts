@@ -3811,6 +3811,25 @@ describe('Worker JSON error response boundary', () => {
     } finally { logs.mockRestore(); }
   });
 
+  it('names the two deterministic runtime failures with public codes, never their text', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [thrown, code] of [
+        [new Error('setsockoptint: operation not permitted at /srv/private.ts:9'), 'sandbox_runtime_blocked'],
+        [new Error('CustomDomainRequiredError: Port exposure requires a custom domain (private.example)'), 'custom_domain_required'],
+      ] as const) {
+        const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        const text = await res.text();
+        expect(JSON.parse(text).error).toBe(code);
+        expect(text).not.toContain('private');
+      }
+    } finally { logs.mockRestore(); }
+  });
+
   it('strips diagnostic suffixes, preserves protocol codes, and logs the original detail', async () => {
     const logs = spyOn(console, 'error').mockImplementation(() => {});
     try {

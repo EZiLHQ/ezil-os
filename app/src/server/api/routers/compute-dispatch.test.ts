@@ -476,12 +476,13 @@ describe('routers: AWS previews use their own Worker route', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('reportActivity renews the AWS lease from the owner\'s presence; restartDesktop refuses; no Worker call', async () => {
+    it('reportActivity renews the AWS lease from the owner\'s presence; unconfigured AWS restart is restart_unavailable; no Worker call', async () => {
         const { db, fake } = routerDb([awsRow({ state: 'RUNNING', lease_until: new Date(Date.now() + 60_000) })]);
         await expect(caller(db).reportActivity({ computerId: C1, lastInputAgoMs: 5 })).resolves.toMatchObject({ ok: true });
         // Presence 5 ms ago: the lease now runs an hour from it (Codex 4275911832).
         expect(new Date(fake.placements[0]!.lease_until as string).getTime()).toBeGreaterThan(Date.now() + 3_500_000);
-        await expect(caller(db).restartDesktop({ computerId: C1 })).resolves.toMatchObject({ ok: false, errorCode: 'aws_not_supported' });
+        // AWS restart exists now (R3-L4); without a configured AWS control path it is refused honestly.
+        await expect(caller(db).restartDesktop({ computerId: C1 })).resolves.toMatchObject({ ok: false, errorCode: 'restart_unavailable' });
         expect(fetchMock).not.toHaveBeenCalled();
     });
 

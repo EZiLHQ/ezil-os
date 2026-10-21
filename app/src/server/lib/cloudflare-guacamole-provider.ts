@@ -469,9 +469,16 @@ function isMigratingRefusal(body: string): boolean {
     try { return (JSON.parse(body) as { error?: unknown })?.error === 'migrating'; } catch { return false; }
 }
 
+function workerErrorCode(body: string): string | null {
+    try { const error = (JSON.parse(body) as { error?: unknown })?.error; return typeof error === 'string' ? error : null; } catch { return null; }
+}
+
 export function classifyWorkerHttpFailure(status: number, body: string): GuacamolePreviewErrorCode {
-    if (/setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
-    if (CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
+    // The Worker names these with public codes (it never forwards exception text);
+    // the text forms are matched too, for older Workers.
+    const workerCode = workerErrorCode(body);
+    if (workerCode === 'sandbox_runtime_blocked' || /setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
+    if (workerCode === 'custom_domain_required' || CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
     // 408/429 are the 4xx statuses that mean "later", not "never" — leave them
     // in the retryable bucket rather than treating them as a bad request.
     if (status === 408 || status === 429) return 'worker_http_error';
