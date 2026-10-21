@@ -455,7 +455,7 @@ async function terminalRun(page, frame, script, runId, phase) {
   // The terminal renders on a canvas (no DOM text), so the output goes to an absolute
   // /tmp file that Quick Open opens; Monaco renders file lines as DOM text.
   const out = `/tmp/e2e-out-${phase}-${runId}.txt`, name = out.split('/').pop();
-  await input.pressSequentially(`{ printf '${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ${out} 2>&1`, { delay: 1 });
+  await input.pressSequentially(`{ printf '\\n${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ${out} 2>&1`, { delay: 1 });
   await input.press('Enter');
   return until(async () => {
     await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
