@@ -381,7 +381,9 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
         // R3: the root disk is disposable (OS + pre-pulled image); the data disk is retained.
         BlockDeviceMappings:[{DeviceName:d.storage.rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:d.storage.rootGiB,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
         TagSpecifications:[{ResourceType:'instance',Tags:tagList(i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i))},
-            {ResourceType:'volume',Tags:tagList({...i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i),'ezil:disk-kind':'root'})}]};
+            {ResourceType:'volume',Tags:tagList({...i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i),'ezil:disk-kind':'root'})},
+            // The boundary admits the primary ENI only with the compute request tags.
+            {ResourceType:'network-interface',Tags:tagList(i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i))}]};
 }
 let helper:ReturnType<typeof createLifecycleHelper>|undefined;
 export async function handler(input:unknown){

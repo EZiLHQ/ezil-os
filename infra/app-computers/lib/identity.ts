@@ -237,7 +237,9 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
             [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
         ...(c.userDataAttributeKeyVerified ? [allow(['ec2:ModifyInstanceAttribute'], [ec2('instance')],
             { StringEquals: { ...compute('Resource'), 'ec2:Attribute': 'userData' } })] : []),
-        allow(['ec2:CreateTags'], [ec2('instance'), ec2('volume')],
+        // Create-time tags only. The primary ENI RunInstances creates must carry the compute
+        // request tags (network-interface grant above), so it is tagged by the same call.
+        allow(['ec2:CreateTags'], [ec2('instance'), ec2('volume'), ec2('network-interface')],
             { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } }),
         ...commonDenies(c, true),
         deny(['iam:*', 'sts:*', 'organizations:*', 'account:*', 'aws-portal:*', 'billing:*', 'payments:*', 'tax:*', 'ce:*',

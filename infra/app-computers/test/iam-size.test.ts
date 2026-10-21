@@ -121,9 +121,11 @@ function checkStack(stack: Stack): string[] {
             case 'AWS::IAM::ManagedPolicy':
                 limit(id + '/managed', documentSize(p.PolicyDocument, resources), 6144);
                 // Billing v2 adds exactly 27 serialized characters for the two
-                // paid Compute type names; keep the rest of the headroom target.
+                // paid Compute type names, and the first live Mumbai launch fix exactly
+                // 59 for create-time ENI tags (RunInstances' primary ENI must carry the
+                // compute tags); keep the rest of the headroom target.
                 if (p.ManagedPolicyName?.endsWith('-boundary'))
-                    limit(id + '/boundary headroom', documentSize(p.PolicyDocument, resources), 5627);
+                    limit(id + '/boundary headroom', documentSize(p.PolicyDocument, resources), 5686);
                 break;
             case 'AWS::IAM::Role':
                 limit(id + '/trust', documentSize(p.AssumeRolePolicyDocument, resources), 2048);

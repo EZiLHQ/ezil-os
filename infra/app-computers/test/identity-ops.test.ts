@@ -55,7 +55,7 @@ function expectedBoundary(killSwitch: boolean, userData = false) {
             Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
         ...(userData ? [{ Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: EC2('instance'),
             Condition: { StringEquals: { ...COMPUTE('Resource'), 'ec2:Attribute': 'userData' } } }] : []),
-        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume')],
+        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume'), EC2('network-interface')],
             Condition: { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } } },
         { Effect: 'Deny', Resource: '*', Action: ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2:CreateCapacityReservation*',
             'ec2:CreateReservedInstancesListing', 'ec2:AcceptReservedInstancesExchangeQuote', 'ec2:RequestSpot*', 'ec2:CreateFleet',

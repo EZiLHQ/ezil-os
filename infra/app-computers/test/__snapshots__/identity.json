@@ -190,7 +190,8 @@
             "Effect": "Allow",
             "Resource": [
               "arn:aws:ec2:ap-south-1:123456789012:instance/*",
-              "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+              "arn:aws:ec2:ap-south-1:123456789012:volume/*",
+              "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
             ]
           },
           {

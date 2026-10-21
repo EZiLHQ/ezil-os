@@ -126,6 +126,15 @@ test('storage defaults to a 30 GiB Ubuntu root and validates the root device all
     for(const rootDeviceName of ['/dev/sda1','/dev/xvda'])assert.ok(StorageSchema.safeParse({...DEFAULT_STORAGE,rootDeviceName}).success);
     for(const rootDeviceName of ['/dev/sdf','/dev/nvme0n1','',null])assert.equal(StorageSchema.safeParse({...DEFAULT_STORAGE,rootDeviceName}).success,false);
 });
+test('RunInstances tags the primary ENI with the instance compute tags (boundary admits no untagged ENI)',async()=>{
+    const r=await run('provision');
+    assert.equal(r.error,undefined);
+    const specs=r.calls.find(c=>c.action==='runInstances')!.parameters.TagSpecifications as {ResourceType:string;Tags:{Key:string;Value:string}[]}[];
+    const eni=specs.find(t=>t.ResourceType==='network-interface'),instance=specs.find(t=>t.ResourceType==='instance');
+    assert.ok(eni,'network-interface tag specification present');
+    assert.deepEqual(eni!.Tags,instance!.Tags);
+    for(const key of ['ezil:stage','ezil:managed-by'])assert.ok(eni!.Tags.some(t=>t.Key===key),key);
+});
 for(const rootDeviceName of ['/dev/sda1','/dev/xvda'] as const)
 test(`configured ${rootDeviceName} image is accepted and its root mapping reaches RunInstances`,async()=>{
     const r=await run('provision',{fixture:lifecycleFixture('provision',{rootDeviceName})});

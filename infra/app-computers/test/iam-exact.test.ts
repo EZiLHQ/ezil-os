@@ -50,7 +50,7 @@ function expectedController(userDataOpen: boolean) {
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('volume/*'), Condition: {
             StringEquals: { ...REGION_EQ, ...REQUEST, 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
             NumericLessThanEquals: { 'ec2:VolumeSize': '30' }, ...LT } },
-        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [ec2('instance/*'), ec2('volume/*')],
+        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [ec2('instance/*'), ec2('volume/*'), ec2('network-interface/*')],
             Condition: { StringEquals: { ...REGION_EQ, 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } } },
         { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: ec2('volume/*'), Condition: { StringEquals: { ...REGION_EQ, ...MANAGED },
             'ForAllValues:StringEquals': { 'aws:TagKeys': ['ezil:generation', 'ezil:fence-token'] }, Null: { 'aws:TagKeys': 'false' } } },

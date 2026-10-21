@@ -131,7 +131,7 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
             StringEquals:{...requestTags,'ec2:VolumeType':'gp3'},Bool:{'ec2:Encrypted':'true'},
             NumericLessThanEquals:{'ec2:VolumeSize':String(d.storage.rootGiB)},...template}}),
         // Identity tags are written only by the creating call.
-        new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('instance'),arn('volume')],conditions:{
+        new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('instance'),arn('volume'),arn('network-interface')],conditions:{
             StringEquals:{...region,'ec2:CreateAction':['RunInstances','CreateVolume']}}}),
         // A managed volume's generation and fence may move; nothing else.
         new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('volume')],conditions:{...existing,
