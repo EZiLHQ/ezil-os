@@ -1,3 +1,4 @@
+import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
 import { RuntimeLifecycleMonitor } from './runtime-lifecycle';
@@ -386,7 +387,7 @@ interface Env extends SandboxEnv {
  * aborts the runtime with `Incorrect type for map entry ... is not of type
  * 'function or ExportedHandler'`. Import it directly from `./desktop-mode`.
  */
-export { resolveDesktopMode, checkIceConfig, portFor, type DesktopMode } from './desktop-mode';
+export type { DesktopMode } from './desktop-mode';
 import {
   resolveDesktopMode,
   checkIceConfig,
@@ -421,27 +422,7 @@ import {
 // workerd rejects a plain `const` among the entrypoint's top-level exports
 // (`Incorrect type for map entry … is not of type 'function or
 // ExportedHandler'`). Import from `./browser-sidecar` directly.
-export {
-  parseBridgeHost,
-  handlePreviewBootstrap,
-  handlePreviewProxy,
-  handlePreviewWsProxy,
-  handlePreviewInspectorJs,
-  buildPreviewStatus,
-  buildPackageJsonCheckCommand,
-  parseDevserverPhase,
-  parseDevserverPhaseRecord,
-  parseRestartAttempts,
-  shouldTriggerDevserverRestart,
-  effectiveDevserverPhase,
-  computeDevserverRestartBackoffS,
-  buildDevserverRestartCommand,
-  rewriteResponseHeaders,
-  injectRuntimeShim,
-  type PreviewStatus,
-  type DevserverRestartDecision,
-  type BridgeTarget,
-} from './preview-bridge';
+export type { PreviewStatus, DevserverRestartDecision, BridgeTarget } from './preview-bridge';
 import {
   parseBridgeHost,
   handlePreviewBootstrap,
@@ -466,7 +447,7 @@ import {
 // top-level export of the entrypoint module that isn't a
 // function/class/`ExportedHandler` (see the note above `DESKTOP_MODES`).
 // Import them directly from `./workspace-diag`.
-export { diagSlotFile, diagMarkerContent, parseDiagRequest, isWriteOp, diagDisabled, type DiagOp } from './workspace-diag';
+export type { DiagOp } from './workspace-diag';
 import { diagSlotFile, diagMarkerContent, parseDiagRequest, diagDisabled } from './workspace-diag';
 import {
   putProjectFile,
@@ -482,24 +463,7 @@ import {
 // Re-exported as functions only; the module's `const`s stay unexported here
 // (workerd rejects non-function top-level exports of the entrypoint — see the
 // note above `DESKTOP_MODES`).
-export {
-  extractSignedToken,
-  buildTerminateReport,
-  describeDesktopStatus,
-  validateFocusApp,
-  buildFocusAppCommand,
-  focusDisabled,
-  restartDisabled,
-  findDesktopLauncherProcess,
-  buildRestartReport,
-  type TerminateOutcome,
-  type TerminateReport,
-  type DesktopStatus,
-  type FocusApp,
-  type ProcessLike,
-  type RestartOutcome,
-  type RestartReport,
-} from './sandbox-control';
+export type { TerminateOutcome, TerminateReport, DesktopStatus, FocusApp, ProcessLike, RestartOutcome, RestartReport } from './sandbox-control';
 import {
   extractSignedToken,
   buildTerminateReport,
@@ -561,22 +525,7 @@ import {
 // rejects any top-level export of the entrypoint module that isn't a
 // function/class/`ExportedHandler` (see the note above `DESKTOP_MODES`).
 // Import them directly from `./twen`.
-export {
-  isTwenWriteOp,
-  twenDisabled,
-  twenStatusContent,
-  parseTwenRequest,
-  parseTwenBody,
-  twenRequestTooLarge,
-  twenStatMaxAttempts,
-  twenStatConverged,
-  parseTwenStatLines,
-  twenWriteCommand,
-  twenWriteConfirmed,
-  twenWriteDurable,
-  twenStaleZero,
-  type TwenOp,
-} from './twen';
+export type { TwenOp } from './twen';
 import {
   TWEN_STATUS_FILE,
   twenStatusContent,
@@ -597,15 +546,7 @@ import {
 // THE reported boot failure: `Incorrect type for map entry
 // 'CPU_DIAG_DEFAULT_MAX_LINES': the provided value is not of type 'function
 // or ExportedHandler'`. Import these directly from `./cpu-diag`.
-export {
-  cpuDiagFlagEnabled,
-  cpuDiagRouteDisabled,
-  resolveCpuDiagMaxLines,
-  cpuDiagStatCommand,
-  parseCpuDiagStatLines,
-  cpuDiagContentCommand,
-  type CpuDiagStat,
-} from './cpu-diag';
+export type { CpuDiagStat } from './cpu-diag';
 import {
   CPU_DIAG_FILE,
   CPU_DIAG_MAX_BYTES,
@@ -621,16 +562,7 @@ import {
 // `NEKO_LOG_MAX_LINES_CEILING` and `NEKO_LOG_MAX_LINE_LEN` are plain `const`s
 // and must NOT be re-exported from this entrypoint module. Import them from
 // `./neko-logs` directly.
-export {
-  nekoLogsRouteDisabled,
-  resolveNekoLogMaxLines,
-  nekoLogStatCommand,
-  parseNekoLogStatLines,
-  nekoLogContentCommand,
-  redactNekoLogContent,
-  type NekoLogStat,
-  type RedactedNekoLog,
-} from './neko-logs';
+export type { NekoLogStat, RedactedNekoLog } from './neko-logs';
 import {
   NEKO_LOG_FILE,
   NEKO_LOG_MAX_BYTES,
@@ -708,8 +640,6 @@ import {
 const DESKTOP_PORT = 8080;
 /** Preview validity window reported to the client. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
-// Lets the reset reply leave the object before `ctx.abort()` discards it.
-export const ACCEPTANCE_RESET_DELAY_MS = 100;
 /**
  * Sandbox auto-sleep when idle. BACKSTOP ONLY, not the real mechanism:
  * `EzilSandboxDO.flushWorkspaceScheduled`'s explicit idle-stop path
@@ -780,7 +710,7 @@ const DEFAULT_WORKSPACE_MOUNT_PATH = '/workspace';
  * code-server use its own launch-time default) rather than pointing at a
  * path nothing actually populated.
  */
-export function codePreviewFolderParams(
+function codePreviewFolderParams(
   workspace: { mounted: boolean; mountPath?: string },
 ): Record<string, string> | undefined {
   return workspace.mounted && workspace.mountPath ? { folder: workspace.mountPath } : undefined;
@@ -1453,7 +1383,7 @@ function resolveWorkspaceMountConfig(env: Env): WorkspaceMountConfig | null {
  */
 // Exported for `workspace-store-wiring.test.ts` (the store-selection gate /
 // prefix parity); same test-export pattern as `isIdleStopDue` etc. above.
-export async function ensureWorkspaceMount(
+async function ensureWorkspaceMount(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
@@ -1817,7 +1747,7 @@ async function ensureWorkspaceHydratedFromR2(
  *                migrated, fenced by C-7).
  */
 export type FinalSystemClass = 'clean' | 'unsaved' | 'retryable';
-export function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): FinalSystemClass {
+function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): FinalSystemClass {
   if (system.skippedReason === 'stale' || system.skippedReason === 'not_restored') return 'unsaved';
   if (system.skippedReason === 'busy' || system.skippedReason === 'failed') return 'retryable';
   return 'clean';
@@ -2157,7 +2087,7 @@ const WORKSPACE_FLUSH_SCHEDULE_STALE_AFTER_MS = 5 * 60_000;
  * Pure and exported so the ONE decision that can turn continuous persistence
  * off is unit-testable by CALLING it, exactly like `isIdleStopDue`.
  */
-export function workspaceFlushLoopIsAlive(params: {
+function workspaceFlushLoopIsAlive(params: {
   pendingSchedules: ReadonlyArray<{ time: number }>;
   nowMs: number;
 }): boolean {
@@ -2173,7 +2103,7 @@ export function workspaceFlushLoopIsAlive(params: {
  * the ONE thing that decides "has this sandbox been idle long enough" can be
  * mutation-tested by calling it, not by reading source text.
  */
-export function isIdleStopDue(params: { lastActivityAt: number; now: number }): boolean {
+function isIdleStopDue(params: { lastActivityAt: number; now: number }): boolean {
   return params.now - params.lastActivityAt >= IDLE_STOP_MS;
 }
 
@@ -2290,7 +2220,7 @@ const CONTAINER_BUSY_LOAD1 = 0.5;
  * the caller can apply the fail-safe rather than this silently inventing a
  * `0` that would authorize a stop.
  */
-export function parseLoadAvg1(stdout: string): number | null {
+function parseLoadAvg1(stdout: string): number | null {
   const first = String(stdout ?? '').trim().split(/\s+/)[0];
   if (!first) return null;
   // 🔴 Require the WHOLE token to be a plain decimal. The `Number.isFinite`
@@ -2324,7 +2254,7 @@ export function parseLoadAvg1(stdout: string): number | null {
  * what it actually saw — the only way an operator can tell "genuinely idle"
  * from "this probe has never once returned a usable number".
  */
-export function containerBusyFromProbe(
+function containerBusyFromProbe(
   probe: { exitCode: number; stdout: string } | null,
 ): { busy: boolean; load1: number | null; reason: string } {
   if (probe === null) {
@@ -2362,7 +2292,7 @@ export function containerBusyFromProbe(
  * writes a value from this same ladder) falls back to the first climb step
  * rather than throwing.
  */
-export function computeNextFlushBackoffSeconds(params: {
+function computeNextFlushBackoffSeconds(params: {
   previousIntervalSeconds: number;
   wroteSomething: boolean;
   activityAdvanced: boolean;
@@ -2397,7 +2327,7 @@ export function computeNextFlushBackoffSeconds(params: {
  * is reachable by any future caller of `EzilWorkspacePersistRpc`, not only
  * this one route.
  */
-export function computeActivityTimestamp(params: { now: number; lastInputAgoMs: number }): number {
+function computeActivityTimestamp(params: { now: number; lastInputAgoMs: number }): number {
   const agoMs = Number.isFinite(params.lastInputAgoMs) ? Math.max(0, params.lastInputAgoMs) : 0;
   return params.now - agoMs;
 }
@@ -2408,7 +2338,7 @@ export function computeActivityTimestamp(params: { now: number; lastInputAgoMs: 
  * finite, non-negative number — same "closed contract, 400 on anything else"
  * discipline as `validateFocusApp` (`./sandbox-control.ts`).
  */
-export function validateActivityBody(
+function validateActivityBody(
   raw: unknown,
 ): { ok: true; lastInputAgoMs: number } | { ok: false; error: string } {
   const value =
@@ -4513,7 +4443,7 @@ async function generateTurnCredentials(env: Env, signal: AbortSignal = AbortSign
  * set (no username/credential) when only that is configured. Returns `null`
  * when neither is configured (diagnostic/no-TURN path — behavior unchanged).
  */
-export async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
+async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
   const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
   if (cloudflare) return { ...buildNekoIceEnv(cloudflare),

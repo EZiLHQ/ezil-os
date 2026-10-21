@@ -254,7 +254,7 @@ describe('resolveNekoIceEnv: boot relay expiry', () => {
   const issuedAt = 1_800_000_000_000;
 
   async function bootEnv(ttlSeconds: number) {
-    const { resolveNekoIceEnv } = await import('./index');
+    const { resolveNekoIceEnv } = await import('./index-test-helpers.test');
     const realNow = Date.now;
     const realFetch = globalThis.fetch;
     Date.now = () => issuedAt;
@@ -1192,27 +1192,27 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
 // (e.g. dropping the `mounted` check, or hardcoding `/workspace`) fails these.
 describe('codePreviewFolderParams', () => {
   it('mints `folder` from the REAL workspace.mountPath when the workspace is mounted', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' })).toEqual({
       folder: '/workspace',
     });
   });
 
   it('never hardcodes /workspace — whatever resolveWorkspaceMountConfig resolved wins', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true, mountPath: '/some/other/root' })).toEqual({
       folder: '/some/other/root',
     });
   });
 
   it('omits folder when the workspace bucket was never mounted (container falls back to its own default root)', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: false, mountPath: '/workspace' })).toBeUndefined();
     expect(codePreviewFolderParams({ mounted: false })).toBeUndefined();
   });
 
   it('omits folder when mounted is true but mountPath is missing (defensive — should not happen)', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true })).toBeUndefined();
   });
 });
@@ -1386,14 +1386,13 @@ describe('source pin: every test that loads ./index registers the cloudflare:wor
     expect(testFiles.length).toBeGreaterThan(20);
     expect(testFiles).toContain('index.test.ts');
     expect(indexLoaders.length).toBeGreaterThanOrEqual(5);
-    // The five known at the time of writing; a sixth is welcome, a missing one
-    // means the matcher stopped seeing a real import.
+    // Known production-entrypoint loaders; private-helper tests use their own loader.
     for (const known of [
-      'desktop-release.test.ts',
-      'index.test.ts',
+      'acceptance-reset.test.ts',
+      'aws-hook.test.ts',
       'route-auth.test.ts',
       'workspace-flush-loop.test.ts',
-      'workspace-idle.test.ts',
+      'workspace-store-wiring.test.ts',
     ]) {
       expect(indexLoaders).toContain(known);
     }
