@@ -462,8 +462,13 @@ async function terminalRun(page, frame, script, runId, phase) {
 async function persistence(page, runId, evidence) {
   const frame = await codeFrame(page);
   const initial = await terminalRun(page, frame,
-    `echo e2e-${runId} > ~/e2e-persist.txt && tmux new -d -s e2e 'sleep 3600' && free -m | head -2 && nproc`, runId, 'before');
+    // PRIOR_MARKER: a marker an earlier run (e.g. on Cloudflare, before migration) left behind.
+    `printf 'PRIOR_MARKER=%s\\n' "$(cat ~/e2e-persist.txt 2>/dev/null)"; printf 'PRIOR_TMUX=%s\\n' "$(tmux ls 2>/dev/null | tr '\\n' ' ')"; printf 'HOST=%s\\n' "$(hostname)"; `
+    + `tmux kill-session -t e2e 2>/dev/null; echo e2e-${runId} > ~/e2e-persist.txt && tmux new -d -s e2e 'sleep 3600' && free -m | head -2 && nproc`, runId, 'before');
   evidence.beforeTerminal = initial.text;
+  evidence.priorMarker = initial.text.match(/^PRIOR_MARKER=(.*)$/m)?.[1]?.trim() || null;
+  evidence.priorTmux = initial.text.match(/^PRIOR_TMUX=(.*)$/m)?.[1]?.trim() || null;
+  evidence.host = initial.text.match(/^HOST=(.*)$/m)?.[1]?.trim() || null;
   evidence.resources = parseResources(initial.text);
   if (initial.exitCode !== 0) throw new Error('Persistence setup command failed (an existing tmux session named e2e also causes this)');
   if (!evidence.resources.ramMiB || !evidence.resources.vcpus) throw new Error('RAM/vCPU output was not readable');
