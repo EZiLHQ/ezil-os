@@ -61,6 +61,27 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
         WHERE computer_id = ${computerId}::uuid AND ${ACTIVE}`));
     return {
         readById, readByComputer, readActiveByComputer,
+        async claimStale(limit: number): Promise<ComputeMigration[]> {
+            const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
+            return rows(await db.execute(sql`WITH stale AS (
+                SELECT id FROM public.ezil_compute_migrations WHERE ${ACTIVE}
+                  AND updated_at < clock_timestamp() - interval '30 seconds'
+                ORDER BY updated_at, id LIMIT ${count} FOR UPDATE SKIP LOCKED
+            ) UPDATE public.ezil_compute_migrations m SET updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')
+              FROM stale WHERE m.id = stale.id RETURNING m.*, m.created_at::text AS created_at, m.updated_at::text AS updated_at`)).map(parse);
+        },
+        async statusFor(userId: string): Promise<'preparing' | 'failed' | null> {
+            const r = rows(await db.execute(sql`SELECT state FROM public.ezil_compute_migrations
+                WHERE user_id = ${userId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1`))[0];
+            return !r || r.state === 'committed' ? null : String(r.state).startsWith('failed_') ? 'failed' : 'preparing';
+        },
+        /** Non-secret provision intent; snapshot bytes and capabilities are never copied here. */
+        async saveProvision(m: ComputeMigration, provision: unknown): Promise<void> {
+            const updated = one(await db.execute(sql`UPDATE public.ezil_compute_migrations
+                SET workspace_head = jsonb_set(workspace_head, '{_awsProvision}', (${JSON.stringify(provision)}::text)::jsonb), updated_at = ${STAMP}
+                WHERE id = ${m.id}::uuid AND state = ${m.state} AND updated_at::text = ${m.updatedAt} RETURNING ${COLUMNS}`));
+            if (!updated) throw new MigrationConflictError();
+        },
         async createOrGetActive(input: { computerId: string; userId: string; toSize: 'standard' | 'premium' }): Promise<ComputeMigration> {
             // A separate read sees a concurrent creator's committed row under READ COMMITTED.
             for (let attempt = 0; attempt < 5; attempt++) {

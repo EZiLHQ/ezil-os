@@ -1,3 +1,4 @@
+import { advanceStaleMigrations } from '@/server/lib/compute/provider-migrate-orchestrator';
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
 import { billingMeteringActive, loadComputeBillingState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
 import type { ComputerRef } from '@/server/lib/compute/provider';
@@ -26,6 +27,7 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     isStillRunning: (computer: ComputerRef) => Promise<boolean>;
     limit?: number;
 }): Promise<BillingSessionSweepCounts> {
+    const startedAt = Date.now();
     const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0 };
     if (!billingMeteringActive(deps.config)) return counts;
 
@@ -110,5 +112,6 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             await tryStop(computer, epoch.endReason as SweepReason);
         }
     }
+    await advanceStaleMigrations(startedAt);
     return counts;
 }

@@ -142,6 +142,8 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         const { sql: text, params } = dialect.sqlToQuery(query);
         statements.push({ sql: text, params, tx: tx?.id ?? null });
         await tick();
+        // Existing placement-only fixtures have no migration intent; migration tests wrap this executor.
+        if (text.startsWith('SELECT') && text.includes('FROM public.ezil_compute_migrations')) return { rows: [] };
         const tag = text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
         switch (tag) {
             case 'lock-computer':

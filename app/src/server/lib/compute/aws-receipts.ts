@@ -1,3 +1,4 @@
+import { createProviderMigrationStore } from './provider-migrate-store';
 /**
  * Lifecycle receipts: the RECONCILER path (docs/AWS-COMPUTERS.md C-3).
  *
@@ -182,6 +183,13 @@ export async function startLifecycleJob(
  * provider receipt arrived AND GW-1 enrollment explicitly succeeded.
  */
 export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment): Promise<void> {
+    // Migration provision receipts restore a host, but cannot open a normal epoch before commit.
+    let migrationCommitted = false;
+    if (p0.lastError?.startsWith('migration_pending:')) {
+        const m = await createProviderMigrationStore(deps.db).readById(p0.lastError.slice('migration_pending:'.length));
+        if (!m || m.state !== 'committed' || m.computerId !== p0.computerId || m.userId !== p0.ownerUserId) return;
+        migrationCommitted = true;
+    }
     let startDate: Date | null = null;
     let stopDate: Date | null = null;
     let endReason: EpochEndReason = 'provider_stop';
@@ -197,7 +205,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
             } else {
                 const metered = await recordComputeMeter(() => deps.meter?.ready({
                     userId: p.ownerUserId, computerId: p.computerId, size, readyAt: at,
-                    overheadSeconds: startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
+                    overheadSeconds: !migrationCommitted && startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
                 }));
                 // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
                 if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
@@ -212,7 +220,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     };
     const close: UsageEffect = { kind: 'close', observedBy: USAGE_OBSERVER };
     let p: Placement | null = p0;
-    const enrolled = (x: Placement) => x.lastError === ENROLLMENT_SUCCEEDED && x.enrollNonceHash === null && x.instanceId !== null;
+    const enrolled = (x: Placement) => (x.lastError === ENROLLMENT_SUCCEEDED || (migrationCommitted && x.lastError === p0.lastError)) && x.enrollNonceHash === null && x.instanceId !== null;
     // A receipt already applied (job cleared): MOUNTING waits only for the host's enrollment.
     if (p.state === 'MOUNTING' && p.lifecycleJobId === null) {
         if (enrolled(p)) await step(p, 'RUNNING');
@@ -269,7 +277,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null,
         // A stop that found its instance already gone (`instanceLost`): STOPPED with INSTANCE_LOST,
         // so the next open is a REPLACE onto the retained volume even in start mode (aws-ec2.ts).
-        lastError: stopping ? (r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : p.lastError,
+        lastError: stopping ? (r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : migrationCommitted ? ENROLLMENT_SUCCEEDED : p.lastError,
     };
     // Fence GW-1 before a stop or retire is final: the tunnel must not outlive the instance.
     // Pending until the Worker confirms, so a failure is retried on the next look. No tunnel
@@ -292,7 +300,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     // A confirmed running instance opens its usage row, dated from the job's start (the
     // instance ran from then on: counting it is the safe direction for a cap).
     const open: UsageEffect = {
-        kind: 'open', instanceId: r.instanceId, instanceType: p.instanceType ?? 'unknown', startedAt: e.startDate ?? null, observedBy: USAGE_OBSERVER,
+        kind: 'open', instanceId: r.instanceId, instanceType: p.instanceType ?? 'unknown', startedAt: migrationCommitted ? (deps.now ?? (() => new Date()))() : e.startDate ?? null, observedBy: USAGE_OBSERVER,
     };
     if (stopping) {
         if (p.state === 'DRAINING') p = await step(p, 'STOPPING');
@@ -821,4 +829,21 @@ export async function runAwsBackgroundReconcile(
         ? { checked: 0, stopsStarted: 0, limitStops: 0 }
         : await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
     return { ok: true, deleted, fleet };
+}
+
+/** Migration boot evidence, deliberately separate from normal ready/usage writes. */
+export async function readMigrationReadyReceipt(executions: LifecycleExecutionReader, p: Placement, deployment: LifecycleDeployment): Promise<boolean> {
+    if (!p.lifecycleJobId || !p.lifecycleDigest || p.region !== 'ap-south-1') throw new Error('migration_intent_invalid');
+    const execution = await executions.describe(p.region, lifecycleExecutionArn(deployment, p.lifecycleJobId));
+    if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status) || p.lastError === 'enroll_tunnel_failed') throw new Error('migration_host_failed');
+    if (execution.status !== 'SUCCEEDED') return false;
+    const parsed = LifecycleReceiptSchema.safeParse(JSON.parse(execution.output ?? 'null'));
+    if (!parsed.success) throw new Error('migration_receipt_invalid');
+    const r = parsed.data;
+    if (r.jobId !== p.lifecycleJobId || r.digest !== p.lifecycleDigest || r.computerId !== p.computerId
+        || r.generation !== p.generation || r.leaseEpoch !== p.leaseEpoch || r.fenceToken !== p.fenceToken
+        || r.state !== 'running' || (p.instanceId !== null && r.instanceId !== p.instanceId)
+        || (p.volumeId !== null && r.volumeId !== p.volumeId)) throw new Error('migration_receipt_conflict');
+    return p.lastError === ENROLLMENT_SUCCEEDED && p.enrollNonceHash === null && p.enrollConsumedHash !== null
+        && p.instanceId === r.instanceId && p.volumeId === r.volumeId;
 }

@@ -76,3 +76,24 @@ describe('migration placement publication', () => {
         await expect(flipPlacementToAws(setup().db, { ...input, fields: { ...input.fields, ...fields } } as typeof input)).rejects.toThrow('migration_aws_receipt_invalid');
     });
 });
+
+
+describe('publication replay and the commit barrier', () => {
+    it('repeating the same restored-host publication does not replace the host', async () => {
+        const f = setup(); const first = await flipPlacementToAws(f.db, input);
+        const second = await flipPlacementToAws(f.db, input);
+        expect(second).toEqual(first); expect(f.placements).toHaveLength(1);
+        expect(f.statements.filter(q => q.sql.includes('placement:insert'))).toHaveLength(1);
+    });
+    it('keeps a migrated host provisioning until the first normal receipt after commit', async () => {
+        const f = setup(); const pending = { ...input, pendingReady: true,
+            fields: { ...input.fields, lastError: `migration_pending:${C}` } };
+        const p = await flipPlacementToAws(f.db, pending);
+        expect(p.state).toBe('PROVISIONING'); expect(p.lastError).toBe(`migration_pending:${C}`);
+        expect((await flipPlacementToAws(f.db, pending)).instanceId).toBe(p.instanceId);
+    });
+    it('rejects a different restored host during replay', async () => {
+        const f = setup(); await flipPlacementToAws(f.db, input);
+        await expect(flipPlacementToAws(f.db, { ...input, fields: { ...input.fields, instanceId: 'i-other' } })).rejects.toThrow('migration_source_mismatch');
+    });
+});

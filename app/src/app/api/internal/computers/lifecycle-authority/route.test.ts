@@ -223,7 +223,8 @@ describe('placement is the authority', () => {
     ])('refuses mismatched %s', async (_name, overrides) => {
         seed([row(overrides)]);
         await refused();
-        expect(execute).toHaveBeenCalledTimes(1);
+        // A Cloudflare row also gets the read-only active-migration lookup; never a write.
+        expect(execute).toHaveBeenCalledTimes('provider' in overrides ? 2 : 1);
     });
 
     it('refuses another computer', async () => {
