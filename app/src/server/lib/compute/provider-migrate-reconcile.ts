@@ -9,6 +9,14 @@ export type { PaidMigrationCandidate } from './placement';
 export { paidCloudflareCandidates } from './placement';
 
 /** The sweep shares its launch budget with existing migration recovery. */
+let disabledLogged = false;
+/** The sweep runs every minute; say AWS is disabled once per process, not every minute. */
+function logDisabledOnce(): void {
+    if (disabledLogged) return;
+    disabledLogged = true;
+    console.info('[compute.migration.reconcile] AWS admission disabled');
+}
+
 export async function reconcilePaidMigrations(input: {
     enabled: boolean;
     startedAt: number;
@@ -19,7 +27,7 @@ export async function reconcilePaidMigrations(input: {
     advance(id: string): Promise<void>;
 }): Promise<number> {
     if (!input.enabled) {
-        console.info('[compute.migration.reconcile] AWS admission disabled');
+        logDisabledOnce();
         return 0;
     }
     const now = input.now ?? Date.now;
@@ -45,7 +53,7 @@ export async function reconcilePaidCloudflareUsers(startedAt: number, env: Env =
     const enabled = config.enabled && !config.killSwitch;
     // Do not even import DB/runtime dependencies while disabled or out of budget.
     if (!enabled) {
-        console.info('[compute.migration.reconcile] AWS admission disabled');
+        logDisabledOnce();
         return;
     }
     if (Date.now() - startedAt >= 40_000) return;

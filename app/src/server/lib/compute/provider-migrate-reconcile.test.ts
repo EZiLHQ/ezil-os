@@ -36,7 +36,7 @@ describe('paid Cloudflare reconciliation', () => {
     it('does not query or create when AWS is disabled and logs once', async () => {
         const f = setup(); const log = vi.spyOn(console, 'info').mockImplementation(() => {});
         expect(await reconcilePaidMigrations({ ...f, enabled: false })).toBe(0);
-        expect(f.candidates).not.toHaveBeenCalled(); expect(f.create).not.toHaveBeenCalled(); expect(log).toHaveBeenCalledTimes(1);
+        expect(f.candidates).not.toHaveBeenCalled(); expect(f.create).not.toHaveBeenCalled(); expect(log.mock.calls.length).toBeLessThanOrEqual(1);
     });
     it.each(['before-query', 'after-query', 'after-admission', 'after-create', 'after-advance'])('enforces the shared 40s budget %s', async point => {
         const f = setup(); let clock = point === 'before-query' ? 40000 : 39999;
@@ -81,7 +81,7 @@ describe('paid Cloudflare reconciliation', () => {
         'production wrapper refuses disabled/kill/invalid config %j before touching storage', async patch => {
             const log = vi.spyOn(console, 'info').mockImplementation(() => {});
             await reconcilePaidCloudflareUsers(Date.now(), { ...env, ...patch });
-            expect(fake.execute).not.toHaveBeenCalled(); expect(log).toHaveBeenCalledTimes(1);
+            expect(fake.execute).not.toHaveBeenCalled(); expect(log.mock.calls.length).toBeLessThanOrEqual(1);
         });
 });
 
@@ -114,5 +114,16 @@ describe('paid candidate SQL guards', () => {
                 { userId: 's', computerId: 'c1', toSize: 'standard' }, { userId: 'p', computerId: 'c2', toSize: 'premium' }]);
             expect(dialect.sqlToQuery(execute.mock.calls[0]![0]).params.at(-1)).toBe(10);
         }
+    });
+});
+
+describe('disabled AWS logging', () => {
+    it('logs the disabled state at most once per process across sweeps', async () => {
+        vi.resetModules();
+        const { reconcilePaidCloudflareUsers } = await import('./provider-migrate-reconcile');
+        const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+        for (let i = 0; i < 3; i++) await reconcilePaidCloudflareUsers(Date.now(), { EZIL_AWS_COMPUTERS_ENABLED: '0' });
+        expect(log.mock.calls.filter(c => String(c[0]).includes('AWS admission disabled'))).toHaveLength(1);
+        log.mockRestore();
     });
 });
