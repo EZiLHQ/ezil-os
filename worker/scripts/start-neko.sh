@@ -1225,15 +1225,15 @@ phase_end xvfb ok
 # not physical scan codes. Keep a deterministic XKB baseline; do not guess an
 # X layout from navigator.language, which describes language, not keyboard.
 # Operators can select a layout/variant for physical keyboards when needed.
-setxkbmap -display "$DISPLAY" -layout "${NEKO_XKB_LAYOUT:-us}" \
-  -variant "${NEKO_XKB_VARIANT:-}" -option '' >>"$LOG" 2>&1 \
+setxkbmap -display "$DISPLAY" -layout "${NEKO_XKB_LAYOUT:-us}" -variant "${NEKO_XKB_VARIANT:-}" -option '' >>"$LOG" 2>&1 \
   || log "WARNING: could not configure XKB layout"
 # The client generates repeat. X's independent repeat timer otherwise creates
 # duplicate characters while a delayed keyup is in flight. Set a conservative
 # rate for tools that re-enable it, then leave server repeat disabled.
 xset -display "$DISPLAY" r rate 500 25 >>"$LOG" 2>&1 \
-  && xset -display "$DISPLAY" r off >>"$LOG" 2>&1 \
-  || log "WARNING: could not configure X keyboard repeat"
+  || log "WARNING: could not set the X keyboard repeat rate"
+xset -display "$DISPLAY" r off >>"$LOG" 2>&1 \
+  || log "WARNING: could not disable X server key repeat"
 
 # ── Window manager (openbox) ──────────────────────────────────────────────────
 # Prefer the EBuilder-owned Openbox config (explicit app-switch keybindings +
