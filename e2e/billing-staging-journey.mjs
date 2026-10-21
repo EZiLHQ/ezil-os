@@ -436,7 +436,7 @@ async function chat(page, evidence, redact) {
     const stop = frame.getByRole('button', { name: /^(?:Stop|Cancel)(?: generating| request| response)?(?:\s*\(.*\))?$/i });
     for (const button of await stop.all()) if (await button.isVisible()) return false;
     return /^(?:thinking|working|loading)[.…\s]*$/i.test(text) ? false : 'replied';
-  }, 'EZiL Chat reply or error', 60_000);
+  }, 'EZiL Chat reply or error', 150_000);
 }
 
 async function terminalRun(page, frame, script, runId, phase) {
@@ -455,21 +455,25 @@ async function terminalRun(page, frame, script, runId, phase) {
   await input.waitFor({ state: 'attached' });
   await input.focus();
   const begin = `E2E_BEGIN_${phase}_${runId}`, end = `E2E_END_${phase}_${runId}`;
-  // The terminal renders on a canvas (no DOM text), so the output goes to a file that
-  // code-server opens in this window; Monaco renders file lines as DOM text.
-  const out = `.e2e-out-${phase}-${runId}.txt`;
-  await input.pressSequentially(`{ printf '${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ~/${out} 2>&1; `
-    + `(code -r ~/${out} 2>/dev/null || code-server -r ~/${out})`, { delay: 1 });
+  // The terminal renders on a canvas (no DOM text), so the output goes to an absolute
+  // /tmp file that Quick Open opens; Monaco renders file lines as DOM text.
+  const out = `/tmp/e2e-out-${phase}-${runId}.txt`, name = out.split('/').pop();
+  await input.pressSequentially(`{ printf '${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ${out} 2>&1`, { delay: 1 });
   await input.press('Enter');
   return until(async () => {
-    const tab = frame.locator(`.tab[aria-label^="${out}"], .tab:has-text("${out}")`).first();
-    if (!await tab.count()) return false;
-    await tab.click();
+    await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
+    await frame.locator('body').press('Control+P');
+    const quick = frame.locator('.quick-input-widget input:visible').first();
+    await quick.fill(out);
+    await sleep(800);
+    await quick.press('Enter');
+    const tab = frame.locator(`.tab[aria-label^="${name}"], .tab:has-text("${name}")`).first();
+    if (!await tab.waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false)) return false;
     const lines = frame.locator('.editor-group-container.active .monaco-editor .view-lines').first();
     const text = (await lines.innerText({ timeout: 3000 })).replace(/\u00a0/g, ' ');
     const block = terminalBlock(text, begin, end);
     return block === null ? false : { text: block, exitCode: Number(block.match(/^E2E_RC=(\d+)$/m)?.[1] ?? -1) };
-  }, 'terminal output file', 45_000);
+  }, 'terminal output file', 60_000);
 }
 
 async function persistence(page, runId, evidence) {
@@ -541,7 +545,7 @@ export async function main(env = process.env) {
     await mkdir(out, { recursive: true });
     await writeFile(join(out, 'results.json'), JSON.stringify(redactEvidence(report, redact), null, 2) + '\n', { mode: 0o600 });
   };
-  const shot = async (id, evidence) => {
+  const shot = async (id, evidence, app = id) => {
     if (!page) return;
     const filename = `${id}.png`;
     // App-only screenshots omit Settings/account chrome. Also mask credential
@@ -551,7 +555,7 @@ export async function main(env = process.env) {
       masks.push(frame.locator('input[type="email"], input[type="password"]'));
       for (const secret of [credentials.email, credentials.password]) masks.push(frame.getByText(secret, { exact: false }));
     }
-    await appWindow(page, id).screenshot({ path: join(out, filename), mask: masks });
+    await appWindow(page, app).screenshot({ path: join(out, filename), mask: masks });
     evidence.screenshot = filename;
   };
   const record = async (id, work, skip) => {
@@ -563,7 +567,10 @@ export async function main(env = process.env) {
         const reason = await work(step.evidence);
         if (reason) { step.status = 'SKIP'; step.reason = reason; }
       }
-    } catch (error) { step.status = 'FAIL'; step.evidence.error = redact(error); }
+    } catch (error) {
+      step.status = 'FAIL'; step.evidence.error = redact(error);
+      if (id !== 'sign_in') await shot(`${id}-fail`, step.evidence, 'code').catch(() => {});
+    }
     step.ms = elapsed(start);
     report.steps.push(redactEvidence(step, redact));
     await save();
