@@ -122,7 +122,7 @@ export function classifyHost(input) {
   let host = '';
   try { host = new URL(String(input).includes('://') ? input : `https://${input}`).hostname.toLowerCase(); }
   catch { return { host: '', hostClass: 'unknown', mumbai: null }; }
-  const hostClass = host.includes('nekodesktop') ? 'cloudflare' : host.includes('-aws.') ? 'aws' : 'unknown';
+  const hostClass = host.includes('-aws.') ? 'aws' : host.includes('nekodesktop') || /^\d+-guac-/.test(host) ? 'cloudflare' : 'unknown';
   return { host, hostClass, mumbai: hostClass === 'aws' ? true : null };
 }
 
@@ -622,6 +622,8 @@ export async function main(env = process.env) {
       await closeApp(page, 'settings');
       await openApp(page, 'desktop', evidence);
       await shot('desktop', evidence);
+      // A full-size Browser window hides the dock that later steps click.
+      await closeApp(page, 'desktop');
     }, signedIn ? null : 'sign_in_failed');
     await record('chat', async evidence => {
       const outcome = await chat(page, evidence, redact);

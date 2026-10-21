@@ -63,6 +63,8 @@ test('host classification uses hostname only; Mumbai is inferred only for AWS', 
   assert.equal(classifyHost('https://AWS-BOX-AWS.EZIL.WORK').hostClass, 'aws');
   assert.equal(classifyHost('https://example.test/nekodesktop?x=-aws.').hostClass, 'unknown');
   assert.equal(classifyHost('https://nekodesktop@unknown.example/').hostClass, 'unknown');
+  assert.equal(classifyHost('https://8443-guac-61ee4784407c4a77-03f419f2908f4fe8-code.ezil.work/').hostClass, 'cloudflare');
+  assert.equal(classifyHost('https://aws-8443-guac-61ee-03f4-aws.ezil.work/').hostClass, 'aws');
   assert.equal(classifyHost('about:blank').hostClass, 'unknown');
   assert.equal(classifyHost('not a host').hostClass, 'unknown');
 });
