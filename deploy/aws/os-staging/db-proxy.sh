@@ -14,7 +14,7 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 [[ $# == 1 && $1 =~ ^(start|status|refresh|remove|nft-plan)$ ]] || fail 'Usage: db-proxy.sh start|status|refresh|remove|nft-plan'
 [[ $EUID == 0 ]] || fail 'Run as root through SSM.'
 # Guard every operation, including status, removal and the printed firewall plan.
-[[ -f /var/lib/ezil-main-preview/environment.json ]] || fail 'Preview environment marker missing; refusing.'
+[[ -f /var/lib/ezil-main-preview/foundation-ready ]] || fail 'Preview environment marker missing; refusing.'
 [[ ! -e /var/lib/ezil-main-prod && ! -L /var/lib/ezil-main-prod ]] || fail 'Production marker exists; refusing.'
 command -v ip >/dev/null
 command -v python3 >/dev/null

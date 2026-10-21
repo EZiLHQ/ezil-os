@@ -26,8 +26,11 @@ Parameters:
     Description: Existing non-production bucket reachable through the preview S3 endpoint.
   AppCallerRoleArn:
     Type: String
-    AllowedPattern: 'arn:aws:iam::452630323510:role/[A-Za-z0-9+=,.@_/-]+'
-    Description: Exact existing app-caller role; no wildcard or account root.
+    Default: ''
+    AllowedPattern: '(arn:aws:iam::452630323510:role/[A-Za-z0-9+=,.@_/-]+)?'
+    Description: Exact existing app-caller role; empty until the Mumbai lifecycle stack exists. No wildcard or account root.
+Conditions:
+  HasAppCaller: !Not [!Equals [!Ref AppCallerRoleArn, '']]
 Resources:
   AppSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -76,9 +79,12 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ezil-os/billing-staging/app-*
-              - Effect: Allow
-                Action: sts:AssumeRole
-                Resource: !Ref AppCallerRoleArn
+              - !If
+                - HasAppCaller
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: !Ref AppCallerRoleArn
+                - !Ref AWS::NoValue
       Tags:
         - {Key: 'ezil:env', Value: billing-staging}
         - {Key: 'ezil:purpose', Value: os-staging}
