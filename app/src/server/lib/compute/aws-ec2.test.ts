@@ -104,6 +104,28 @@ const stopped = (over: Record<string, unknown> = {}) =>
     });
 const startMode = (over: Record<string, string> = {}) => env({ EZIL_AWS_WAKE_MODE: 'start', EZIL_AWS_LIFECYCLE_USERDATA_NONCE: '1', ...over });
 
+describe('stopped Mumbai computer admission refusals', () => {
+    it.each([
+        ['kill_switch', { EZIL_AWS_KILL_SWITCH: '1' }],
+        ['aws_disabled', { EZIL_AWS_COMPUTERS_ENABLED: '0' }],
+        ['user_hours_cap', { EZIL_AWS_USER_MONTHLY_HOURS: '1' }],
+        ['global_hours_cap', { EZIL_AWS_GLOBAL_MONTHLY_HOURS: '1' }],
+    ] as const)('%s keeps its distinct non-retryable code, disk and stopped placement', async (code, overrides) => {
+        const row = stopped();
+        const before = structuredClone(row);
+        const s = setup({ placements: [row], usage: [{
+            computer_id: C1, user_id: U1, instance_id: 'i-1', instance_type: 't3a.medium',
+            started_at: new Date(NOW.getTime() - 2 * 3_600_000), stopped_at: NOW,
+            egress_bytes: null, observed_by: 'test', updated_at: NOW,
+        }] }, { e: startMode(overrides) });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({
+            ok: false, error: code, errorCode: code, retryable: false,
+        });
+        expect(s.placements).toEqual([before]);
+        expect(s.calls).toEqual([]);
+    });
+});
+
 describe('configuration refusals happen before any statement', () => {
     it.each([
         ['flag off', { e: { ...env(), EZIL_AWS_COMPUTERS_ENABLED: '0' } }, 'aws_disabled'],
