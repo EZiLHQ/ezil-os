@@ -134,7 +134,7 @@ test(`configured ${rootDeviceName} image is accepted and its root mapping reache
         DeviceName:rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:30,Encrypted:true,KmsKeyId:r.f.i.deployment.dataKeyArn,DeleteOnTermination:true},
     }]);
 });
-for(const mismatch of ['image root','image mapping','whole xvda image','missing mapping','duplicate mapping','oversized snapshot','template mapping'] as const)
+for(const mismatch of ['image root','image mapping','whole xvda image','missing mapping','duplicate mapping','oversized snapshot','template mapping','unknown non-EBS mapping','second EBS beside ephemerals'] as const)
 test(`Ubuntu launch refuses ${mismatch}`,async()=>{
     const f=lifecycleFixture();f.state.volumes.push(f.volume());
     const originalImage=f.deps.image,originalTemplate=f.deps.template;
@@ -145,6 +145,8 @@ test(`Ubuntu launch refuses ${mismatch}`,async()=>{
         if(mismatch==='missing mapping')image.BlockDeviceMappings=[];
         if(mismatch==='duplicate mapping')image.BlockDeviceMappings!.push({...image.BlockDeviceMappings![0]!});
         if(mismatch==='oversized snapshot')image.BlockDeviceMappings![0]!.Ebs!.VolumeSize=31;
+        if(mismatch==='unknown non-EBS mapping')image.BlockDeviceMappings!.push({DeviceName:'/dev/sdb',VirtualName:'swap0'});
+        if(mismatch==='second EBS beside ephemerals')image.BlockDeviceMappings!.push({DeviceName:'/dev/sdb',VirtualName:'ephemeral0'},{DeviceName:'/dev/sdf',Ebs:{VolumeSize:8}});
         return image;
     };
     if(mismatch==='template mapping')f.deps.template=async(id,version)=>{
@@ -152,6 +154,16 @@ test(`Ubuntu launch refuses ${mismatch}`,async()=>{
         template.LaunchTemplateData!.BlockDeviceMappings![0]!.DeviceName='/dev/xvda';return template;
     };
     await assert.rejects(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'volume'}),/lifecycle_launch_invalid/);
+});
+test('an AMI with Ubuntu instance-store placeholders (ephemeral0/1) still launches',async()=>{
+    // Same path as the mismatch cases above (an existing volume makes phase 'volume' validate the launch).
+    const f=lifecycleFixture();f.state.volumes.push(f.volume());
+    const originalImage=f.deps.image;
+    let validated=false;
+    f.deps.image=async id=>{validated=true;const image=(await originalImage(id))!;
+        image.BlockDeviceMappings!.push({DeviceName:'/dev/sdb',VirtualName:'ephemeral0'},{DeviceName:'/dev/sdc',VirtualName:'ephemeral1'});return image;};
+    await assert.doesNotReject(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'volume'}));
+    assert.ok(validated, 'the launch image was validated');
 });
 test('an observed instance with a different root device cannot start',async()=>{
     const f=lifecycleFixture('start');f.state.instances[0]!.RootDeviceName='/dev/xvda';

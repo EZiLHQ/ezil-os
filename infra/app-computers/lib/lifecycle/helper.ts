@@ -357,10 +357,14 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
     const d=i.deployment;
     const [image,template]=await Promise.all([deps.image(d.amiId),deps.template(d.launchTemplateId,d.launchTemplateVersion)]);
     const t=template?.LaunchTemplateData;
+    // Exactly one EBS mapping (the root). Instance-store placeholders (`ephemeralN`, no Ebs) carry no
+    // data and are inherited from Ubuntu parents by Image Builder AMIs; anything else is refused.
+    const imageEbs=image?.BlockDeviceMappings?.filter(m=>m.Ebs)??[];
+    const onlyEphemeralExtras=(image?.BlockDeviceMappings??[]).every(m=>m.Ebs||(/^ephemeral[0-9]+$/.test(m.VirtualName??'')&&m.NoDevice===undefined));
     if(image?.ImageId!==d.amiId||image.Architecture!=='x86_64'||image.RootDeviceType!=='ebs'||image.RootDeviceName!==d.storage.rootDeviceName
-        ||image.State!=='available'||image.VirtualizationType!=='hvm'||image.BlockDeviceMappings?.length!==1
-        ||image.BlockDeviceMappings[0]?.DeviceName!==d.storage.rootDeviceName||!image.BlockDeviceMappings[0]?.Ebs?.VolumeSize
-        ||image.BlockDeviceMappings[0].Ebs.VolumeSize>d.storage.rootGiB||!t||template?.LaunchTemplateId!==d.launchTemplateId
+        ||image.State!=='available'||image.VirtualizationType!=='hvm'||imageEbs.length!==1||!onlyEphemeralExtras
+        ||imageEbs[0]?.DeviceName!==d.storage.rootDeviceName||!imageEbs[0]?.Ebs?.VolumeSize
+        ||imageEbs[0].Ebs.VolumeSize>d.storage.rootGiB||!t||template?.LaunchTemplateId!==d.launchTemplateId
         ||String(template.VersionNumber)!==d.launchTemplateVersion)return fail('lifecycle_launch_invalid');
     const allowed=['ImageId','InstanceType','SecurityGroupIds','EbsOptimized','Monitoring','MetadataOptions','BlockDeviceMappings','TagSpecifications',
         'InstanceInitiatedShutdownBehavior','HibernationOptions'];
