@@ -320,3 +320,13 @@ test('a failed preview pin query stops immediately without exposing child diagno
     assert.equal(h.output.join('\n').includes(password), false);
     assert.ok(EXPLICIT_FILES.includes('app/drizzle/0006_compute_migrations.sql'));
 });
+
+test('aws-production accepts only the DB container namespace and needs a system-id pin', async () => {
+    const { validateDatabaseUrl } = await import('./billing-staging-schema.mjs');
+    assert.doesNotThrow(() => validateDatabaseUrl('postgres://postgres:p@127.0.0.1:5432/postgres', 'aws-production'));
+    assert.doesNotThrow(() => validateDatabaseUrl('postgres://postgres:p@localhost/postgres', 'aws-production'));
+    for (const bad of ['postgres://postgres:p@db.ezil.work:5432/postgres', 'postgres://postgres:p@10.63.20.10:5432/postgres',
+        'postgres://postgres:p@127.0.0.1:15432/postgres', 'postgres://postgres:p@db.btgqfmnzycdecmeyqubx.supabase.co:5432/postgres']) {
+        assert.throws(() => validateDatabaseUrl(bad, 'aws-production'), bad);
+    }
+});
