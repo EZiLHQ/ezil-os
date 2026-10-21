@@ -102,6 +102,12 @@ jobs:
         shell: bash
         working-directory: app
         run: bun install --frozen-lockfile
+      # The billing UI copy QA loads the shell's own jsdom through
+      # createRequire(shell/), the same locked version the shell job uses.
+      - name: Install shell test dependencies
+        shell: bash
+        working-directory: shell
+        run: bun install --frozen-lockfile
       - name: Typecheck
         shell: bash
         working-directory: app
