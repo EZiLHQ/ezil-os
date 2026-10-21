@@ -21,6 +21,21 @@ import type { ComputeProvider, SizeCode } from '../v2/contract';
 
 export const CATALOG_V3_VERSION = 3 as const;
 
+/**
+ * AI credit policy (founder 2026-10-20): the platform decides how many EZiL AI
+ * credits each plan grants; users only ever see credit numbers. Consumption per
+ * model is the AI Gateway's own pricing (credits per token), not this file.
+ * Bump the version whenever an amount changes; grants already made keep theirs.
+ */
+export const AI_CREDIT_POLICY_VERSION = 1 as const;
+
+export interface AiCreditGrantV3 {
+    /** Whole EZiL AI credits (the Gateway's credit unit). */
+    amount: number;
+    /** 'period' = every paid billing period; 'once' = a single trial grant per account. */
+    per: 'period' | 'once';
+}
+
 export type PlanSkuV3 = 'free_v3' | 'standard_monthly_v3' | 'premium_monthly_v3';
 export type SellableSkuV3 = 'standard_monthly_v3' | 'premium_monthly_v3';
 export type PlanTierV3 = 'free' | 'standard' | 'premium';
@@ -67,6 +82,8 @@ export interface PlanOfferV3 {
     badge: 'Most popular' | null;
     /** Sizes the user may choose; the first is the default. */
     machineChoice: readonly SizeCode[];
+    /** EZiL AI credits granted on the AI Gateway (plain credit numbers, never shown as money). */
+    aiCredits: AiCreditGrantV3;
     /** "Everything in X, plus:" bullets, plain language, 3–4 max. */
     bullets: readonly string[];
 }
@@ -80,7 +97,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'free-cf', provider: 'cloudflare', vcpu: 2, memoryGiB: 6,
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
-        highlighted: false, badge: null, machineChoice: ['free-cf'],
+        highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 500, per: 'once' },
         bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
     },
     standard_monthly_v3: {
@@ -89,7 +106,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
         sessionMaxSeconds: null, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
-        highlighted: false, badge: null, machineChoice: ['std-2'],
+        highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 4_000, per: 'period' },
         bullets: ['Your own 2 vCPU · 8 GB computer in Mumbai', 'No session time limit'],
     },
     premium_monthly_v3: {
@@ -98,7 +115,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
         sessionMaxSeconds: null, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
-        highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'],
+        highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 20_000, per: 'period' },
         bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) in Mumbai', 'No session time limit', 'Bigger computers use your monthly time faster'],
     },
 });
@@ -173,6 +190,13 @@ export interface BillingSummaryV3 {
         /** Sizes this plan may choose (one entry unless Premium); x86 only until ARM is verified. */
         machineChoice: readonly MachineOptionV3[];
     };
+    /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
+    ai: {
+        grant: AiCreditGrantV3;
+        /** Whole credits left on the Gateway, or null when the balance is unavailable. */
+        balance: number | null;
+        state: 'ok' | 'low' | 'exhausted' | 'unavailable';
+    };
     fairUse: { status: FairUseStatus; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
     actions: { checkout: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean };
@@ -197,6 +221,7 @@ export interface PublicOfferV3 {
     badge: 'Most popular' | null;
     /** Sizes the user may choose; the first is the default. */
     machineChoice: readonly SizeCode[];
+    aiCredits: AiCreditGrantV3;
     bullets: readonly string[];
 }
 
