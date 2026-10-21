@@ -343,6 +343,10 @@ name = "ezil-os-worker-staging"
 workers_dev = true
 
 [env.staging.vars]
+# AWS computers (paid plans) are reached through their per-host tunnel; staging only.
+AWS_ROUTING_ENABLED = "on"
+AWS_ORIGIN_ZONE = "ezil.work"
+AWS_ORIGIN_ZONE_ALLOWLIST = "ezil.work"
 SANDBOX_AI_PROXY = "on"
 EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"
 SANDBOX_NEKO_TURN_TTL_SECONDS = "300"
