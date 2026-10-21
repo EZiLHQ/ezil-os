@@ -420,7 +420,8 @@ describe.skipIf(NO_POSIX_HOST)('checkpoint module on the S3 store (real git + fa
     await run('git', ['-c', 'user.name=T', '-c', 'user.email=t@e.invalid', '-C', root, 'add', 'a.txt'], { env: gitEnv });
     await run('git', ['-c', 'user.name=T', '-c', 'user.email=t@e.invalid', '-C', root, 'commit', '-m', 'c'], { env: gitEnv });
     await writeFile(`${root}/work.txt`, 'unstaged\n');
-    expect((await flushTo(root, store)).ok).toBe(true);
+    // The whole outcome, so a CI failure prints its reason (skippedReason/error), not just false.
+    expect(await flushTo(root, store)).toMatchObject({ ok: true });
     // The head and at least one chunk landed in S3.
     expect(fake.objects.has(headKey)).toBe(true);
     const target = `${base}/restored`;
@@ -434,7 +435,8 @@ describe.skipIf(NO_POSIX_HOST)('checkpoint module on the S3 store (real git + fa
     const store = makeStore(fake);
     const { root } = await markedWorkspace();
     await writeFile(`${root}/a`, 'a');
-    expect((await flushTo(root, store)).ok).toBe(true);
+    // The whole outcome, so a CI failure prints its reason (skippedReason/error), not just false.
+    expect(await flushTo(root, store)).toMatchObject({ ok: true });
     // Simulate another writer advancing the head between read and commit.
     const original = fake.fetchImpl;
     let armed = true;
@@ -455,7 +457,8 @@ describe.skipIf(NO_POSIX_HOST)('checkpoint module on the S3 store (real git + fa
     const store = makeStore(fake);
     const { base, root } = await markedWorkspace();
     await writeFile(`${root}/a`, 'a');
-    expect((await flushTo(root, store)).ok).toBe(true);
+    // The whole outcome, so a CI failure prints its reason (skippedReason/error), not just false.
+    expect(await flushTo(root, store)).toMatchObject({ ok: true });
     const chunk = [...fake.objects.keys()].find((k) => /\/\d+$/.test(k) && k.includes('.ezil-snapshots'))!;
     fake.objects.get(chunk)!.bytes[0] ^= 1;
     const target = `${base}/target`;
