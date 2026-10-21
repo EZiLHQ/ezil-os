@@ -446,7 +446,8 @@ async function terminalRun(page, frame, script, runId, phase) {
   if (!await frame.locator('.terminal .xterm-helper-textarea:visible').count()) {
     await frame.locator('body').press('Control+Backquote');
   }
-  await command(frame, 'Terminal: Focus Terminal', 'workbench.action.terminal.focus');
+  // An already-open terminal panel is focused by the screen click below.
+  if (!await frame.locator('.terminal:visible').count()) await command(frame, 'Terminal: Focus Terminal', 'workbench.action.terminal.focus');
   // Focus the terminal the way a user does (click its screen); typing then goes to the
   // focused xterm input. Targeting the helper textarea by locator did not deliver keys.
   const terminal = frame.locator('.terminal:visible').last();
