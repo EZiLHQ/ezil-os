@@ -56,7 +56,14 @@ describe('staging Worker resources and routes', () => {
       SANDBOX_NEKO_TURN_TTL_SECONDS: '300',
       SANDBOX_AI_PROXY: 'on',
       EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work',
+      AWS_ROUTING_ENABLED: 'on',
+      AWS_ORIGIN_ZONE: 'ezil.work',
+      AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
     });
+  });
+
+  it('routes AWS computers on staging only, through its own zone', () => {
+    expect((config as { vars?: Record<string, string> }).vars?.AWS_ROUTING_ENABLED).toBeUndefined();
   });
 
   it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {
