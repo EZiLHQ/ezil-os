@@ -43,6 +43,20 @@
       "when": 1792375794210,
       "tag": "0005_billing_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1792375800210,
+      "tag": "0006_compute_migrations",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1792375801210,
+      "tag": "0007_paid_session_deadlines",
+      "breakpoints": true
     }
   ]
 }

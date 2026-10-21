@@ -40,6 +40,11 @@
       "path": "app/drizzle/0006_compute_migrations.sql",
       "sha256": "a99e2954187b58e6f5893cc9ad5adcc02da08f0d762d2f8b6ed9c9e41683b486",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0007_paid_session_deadlines.sql",
+      "sha256": "f3ae6b4957672e707b70c128995fc71fc78c03d7967316ddb2a56b5d0f131021",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

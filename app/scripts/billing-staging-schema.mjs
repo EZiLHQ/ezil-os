@@ -16,6 +16,7 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0004_billing_v2.sql',
     'app/drizzle/0005_billing_sessions.sql',
     'app/drizzle/0006_compute_migrations.sql',
+    'app/drizzle/0007_paid_session_deadlines.sql',
     'docs/aws-computers/sql/0001_compute_placement.sql.txt',
     'docs/aws-computers/sql/0002_ready_pool.sql.txt',
 ]);
