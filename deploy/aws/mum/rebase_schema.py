@@ -89,7 +89,8 @@ try:
     require(not any(s in unquote(raw).lower() for s in ('btgq','curomaa')))
     url = urlsplit(raw)
     require(url.scheme in ('postgres','postgresql') and url.hostname == '10.61.20.35' and url.port == 5432 and not url.fragment)
-    query = dict(parse_qsl(url.query, strict_parsing=True))
+    # Python 3.9 (the staging host) raises on parse_qsl('', strict_parsing=True).
+    query = dict(parse_qsl(url.query, strict_parsing=True)) if url.query else {}
     require(set(query) <= {'sslmode'} and query.get('sslmode','disable') in ('disable','require','verify-ca','verify-full'))
     require(url.username and url.password and url.path.startswith('/') and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}',unquote(url.path[1:])))
     env = {'PATH':os.defpath + ':/usr/local/bin', 'PGHOST':'10.61.20.35','PGPORT':'5432',
