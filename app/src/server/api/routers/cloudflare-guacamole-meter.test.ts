@@ -13,7 +13,9 @@ vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string }; db: unknown }>().create();
     return { createTRPCRouter: t.router, protectedProcedure: t.procedure };
 });
-vi.mock('./compute-dispatch', () => ({ routeComputer: mocks.route }));
+vi.mock('./compute-dispatch', async importOriginal => ({
+    ...await importOriginal<typeof import('./compute-dispatch')>(), routeComputer: mocks.route,
+}));
 vi.mock('./computer-store', () => ({ stampOpened: vi.fn(async () => {}) }));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', async importOriginal => ({
     ...await importOriginal<Record<string, unknown>>(),

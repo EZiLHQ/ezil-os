@@ -78,7 +78,7 @@ import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-c
 import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
-import { awsPreviewAnswer, awsStatusAnswer, routeComputer } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer } from './compute-dispatch';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -244,6 +244,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            const migrating = cloudflareMigrationAnswer(result);
+            if (migrating) return migrating;
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
                 const metered = await recordComputeMeter(() => getComputeMeter().ready({
@@ -511,6 +513,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            const migrating = cloudflareMigrationAnswer(result);
+            if (migrating) return migrating;
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
                 const metered = await recordComputeMeter(() => getComputeMeter().ready({
@@ -708,6 +712,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            const migrating = cloudflareMigrationAnswer(result);
+            if (migrating) return migrating;
             // This branch is Cloudflare-only, after admission and a provider readiness signal.
             if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
                 const metered = await recordComputeMeter(() => getComputeMeter().ready({
@@ -986,6 +992,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ...aws, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const status = await routed.provider.status({ correlationId }, computer);
+            // The fence can land after dispatch. The legacy status adapter drops
+            // non-2xx bodies, so re-read routing on conflict rather than guessing
+            // that every 409 means migration. The new read repeats owner checks.
+            if (!status.ok && (status.error === 'http_409' || status.error === 'migrating')) {
+                const current = await routeComputer(ctx.db, computer);
+                if (current.kind === 'aws-ec2') {
+                    return { ...awsStatusAnswer(await current.provider.status({ correlationId }, computer)),
+                        sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             return { ...status, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
         }),

@@ -11,8 +11,9 @@
  * (`EZIL_COMPUTE_PLACEMENT_READS` and `EZIL_AWS_COMPUTERS_ENABLED` unset — the
  * production default until the founder registers the placement SQL) this does
  * NOT touch the database and returns exactly what `selectComputeProvider`
- * returned before P3. With reads on, a computer with no placement row, or a
- * `cloudflare` row, gets that same Cloudflare adapter instance.
+ * returned before P3. With reads on, an active provider migration gets an
+ * AWS-labelled waiting adapter. Otherwise a computer with no placement row,
+ * or a `cloudflare` row, gets that same Cloudflare adapter instance.
  *
  * A placement owned by someone else is NOT_FOUND — the same anti-enumeration
  * answer `assertOwnedComputer` gives — and it is raised BEFORE any provider is
@@ -32,6 +33,7 @@ import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/se
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
+import { migrationStartingAnswer } from '@/server/lib/compute/provider-migrate-placement';
 import { plusPlanIds, resolveEntitlement, tierForEntitlement, type EntitlementReader, type EntitlementRecord } from '@/server/lib/compute/tier';
 
 export type RoutedComputer =
@@ -91,8 +93,8 @@ export async function routeComputer(
     let entitlement: Promise<EntitlementRecord | null> | undefined;
     const getEntitlement = () => entitlement ??= resolveEntitlement(computer.userId, entitlements);
     try {
-        // The shared resolver reads reservations before its own owner comparison.
-        // Gate it here with the authenticated owner, before any reservation read.
+        // Gate routing with the authenticated owner before any reservation read.
+        // The resolver repeats this check for its own fresh placement read.
         await readPlacement(db as PlacementExecutor, computer.computerId, computer.userId);
         provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, getEntitlement, aws), {
             pinCloudflare, resolveEntitlement: getEntitlement,
@@ -124,6 +126,19 @@ export function shellCodeForAwsEnsure(result: Extract<EnsureResult, { ok: false 
     return result.retryable && AWS_WAKING_CODES.has(result.errorCode) ? 'sandbox_starting' : result.errorCode;
 }
 
+/** The migration may begin after dispatch read Cloudflare. Preserve the Worker's
+ * fence refusal as an AWS-budget wait, including when placement reads are disabled.
+ * Do not classify unrelated conflicts or ordinary Cloudflare cold starts as AWS.
+ */
+export function cloudflareMigrationAnswer(result: ComputeStatus) {
+    const prefix = 'worker_http_409: ';
+    if (result.ok || !result.error?.startsWith(prefix)) return null;
+    try {
+        if (JSON.parse(result.error.slice(prefix.length))?.error !== 'migrating') return null;
+    } catch { return null; }
+    return { ...migrationStartingAnswer(), provider: 'cloudflare-guacamole' as const };
+}
+
 /**
  * The preview answer for an AWS computer. Not-ready → a VALUE (never a throw:
  * a thrown error is what TanStack retries, and the wake loop already re-asks).
@@ -136,6 +151,7 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
             ok: false as const,
             error: result.errorCode,
             errorCode: shellCodeForAwsEnsure(result),
+            retryable: result.retryable,
             provider: 'cloudflare-guacamole' as const,
             computeProvider: 'aws-ec2' as const,
         };

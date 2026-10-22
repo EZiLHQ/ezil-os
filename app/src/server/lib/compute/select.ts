@@ -18,6 +18,9 @@
  *   (`aws_disabled`) — it never falls back to Cloudflare. Reads are one-way:
  *   see `isPlacementReadEnabled`. A placement whose `owner_user_id` is not
  *   the caller throws `PlacementOwnerError` (→ NOT_FOUND).
+ *   An active CF→AWS migration overrides either published provider with a
+ *   destination-labelled wait. After commit, normal AWS receipt reconciliation
+ *   resumes on the next request; migration boot records are never user authority.
  *
  * Callers move from the first to the second in the caller-wiring PR (P3),
  * after the SQL is applied; that PR also narrows the callers to
@@ -30,6 +33,7 @@ import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, typ
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
 import { pinCloudflarePlacement, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
+import { providerForPendingMigration } from './provider-migrate-placement';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
@@ -89,11 +93,13 @@ export async function resolveComputeProvider(
     options: ResolveOptions = {},
 ): Promise<ComputeProvider> {
     if (!isPlacementReadEnabled(env)) return cloudflareComputeProvider;
-    let placement = await readPlacement(db, computer.computerId);
+    let placement = await readPlacement(db, computer.computerId, computer.userId);
     // Every provider operation is the recorded owner's only (C-2): `computer.userId` is the
     // authenticated session user; a re-keyed or re-inserted ezil_computers row changes nothing.
     assertPlacementOwner(placement, computer);
     options.onPlacement?.(placement);
+    const migrating = await providerForPendingMigration(db, computer);
+    if (migrating) return migrating;
     const entitlement = !placement.record && options.resolveEntitlement
         ? await options.resolveEntitlement()
         : options.entitlement !== undefined ? options.entitlement : aws.entitlement;

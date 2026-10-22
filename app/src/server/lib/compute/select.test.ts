@@ -15,7 +15,10 @@ import { providerForPlacement, resolveComputeProvider, selectComputeProvider } f
 import type { EntitlementRecord } from './tier';
 
 const migrationRead = vi.hoisted(() => vi.fn(async (): Promise<Partial<Record<'userId' | 'state' | 'lastError', string>> | null> => null));
-vi.mock('./provider-migrate-store', () => ({ createProviderMigrationStore: () => ({ readByComputer: migrationRead }) }));
+vi.mock('./provider-migrate-store', async importOriginal => ({
+    ...await importOriginal<typeof import('./provider-migrate-store')>(),
+    createProviderMigrationStore: () => ({ readByComputer: migrationRead, readActiveByComputer: async () => null }),
+}));
 
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';

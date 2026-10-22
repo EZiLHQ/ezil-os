@@ -65,7 +65,8 @@ const base = 'https://worker.example';
 
 describe('every lifecycle router call inherits the billing reader', () => {
     it.each([
-        ['server/api/routers/cloudflare-guacamole.ts', 6, './compute-dispatch'],
+        // Status also re-reads dispatch if a migration fence races its first read.
+        ['server/api/routers/cloudflare-guacamole.ts', 7, './compute-dispatch'],
         ['server/api/routers/computer.ts', 1, './compute-dispatch'],
         ['server/lib/compute/stop-policy.ts', 1, '@/server/api/routers/compute-dispatch'],
         ['app/api/cron/billing-session-sweep/route.ts', 1, '@/server/api/routers/compute-dispatch'],
