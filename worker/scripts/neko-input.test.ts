@@ -98,3 +98,128 @@ it('leaves the existing mobile composition repair in charge on touch devices', (
     f.emit('compositionstart');
     expect(f.removed).toEqual(['input']);
 });
+
+function hostingFixture({ connected = false, implicitHosting = true, readyState = 1,
+    touch = false, overlayPresent = true, clientPresent = true } = {}) {
+    const sockets: Array<{ readyState: number; sent: string[]; send: (text: string) => void }> = [];
+    const newSocket = (state = 1) => {
+        const socket = { readyState: state, sent: [] as string[], send(text: string) { this.sent.push(text); } };
+        sockets.push(socket);
+        return socket;
+    };
+    const uiCalls: string[] = [], nativeCalls: string[] = [], timers: Function[] = [];
+    const remote = { implicitHosting, hosting: true, controlling: true,
+        request() { uiCalls.push('request'); }, setClipboard() { uiCalls.push('clipboard'); } };
+    const client = {
+        _ws: newSocket(readyState), connected, $accessor: { remote },
+        sendMessage() { throw new Error('sendMessage requires WebRTC'); },
+        'system/init'(payload: { implicit_hosting?: boolean }) {
+            expect(this).toBe(client);
+            remote.implicitHosting = payload.implicit_hosting!;
+            nativeCalls.push('init');
+            return 'initialized';
+        },
+        CONNECTED() { expect(this).toBe(client); client.connected = true; nativeCalls.push('connected'); return 'connected'; },
+        'control/locked'() { nativeCalls.push('locked'); },
+    };
+    const overlay = { addEventListener() {}, removeEventListener() {} };
+    const window = { $client: clientPresent ? client : undefined, setTimeout(fn: Function) { timers.push(fn); } };
+    const install = () => runInNewContext(script, { window,
+        document: { querySelector: () => overlayPresent ? overlay : null },
+        navigator: { maxTouchPoints: touch ? 1 : 0 }, console: { warn() {} } });
+    install();
+    return { client, remote, uiCalls, nativeCalls, sockets, timers, window, install,
+        reconnect() { client.connected = false; client._ws = newSocket(); return client._ws; },
+        init(value: unknown) { return client['system/init']({ implicit_hosting: value as boolean }); },
+        requests: () => sockets.map(socket => socket.sent.map(text => JSON.parse(text))),
+    };
+}
+
+describe('implicit clipboard hosting', () => {
+    it('waits for server initialization despite the legacy true default, then sends before WebRTC connects', () => {
+        const f = hostingFixture();
+        expect(f.requests()).toEqual([[]]);
+        expect(f.init(true)).toBe('initialized');
+        expect(f.client.connected).toBe(false);
+        expect(f.requests()).toEqual([[{ event: 'control/request' }]]);
+        expect(f.uiCalls).toEqual([]);
+        expect(f.nativeCalls).toEqual(['init']);
+    });
+
+    it('sends once on each reconnect, ignoring duplicate init, lock replies and repeated injection', () => {
+        const f = hostingFixture();
+        const lock = f.client['control/locked'];
+        for (let index = 0; index < 3; index++) {
+            if (index) f.reconnect();
+            f.init(true); f.init(true); f.client.CONNECTED();
+            f.client['control/locked'](); f.install();
+        }
+        expect(f.requests()).toEqual(Array.from({ length: 3 }, () => [{ event: 'control/request' }]));
+        expect(f.client['control/locked']).toBe(lock);
+        expect(f.uiCalls).toEqual([]);
+        expect(f.timers).toEqual([]);
+    });
+
+    it('handles an already connected viewer and late injection between init and WebRTC completion', () => {
+        const connected = hostingFixture({ connected: true });
+        connected.install(); connected.client.CONNECTED();
+        expect(connected.requests()).toEqual([[{ event: 'control/request' }]]);
+        const connecting = hostingFixture();
+        expect(connecting.client.CONNECTED()).toBe('connected');
+        expect(connecting.requests()).toEqual([[{ event: 'control/request' }]]);
+    });
+
+    it('never requests control from an explicit host, including changed settings after reconnect', () => {
+        for (const value of [false, undefined, null, 'true', 1]) {
+            const f = hostingFixture();
+            f.init(value); f.client.CONNECTED();
+            expect(f.requests()).toEqual([[]]);
+            expect(f.uiCalls).toEqual([]);
+        }
+        const f = hostingFixture({ connected: true, implicitHosting: false });
+        expect(f.requests()).toEqual([[]]);
+        f.reconnect(); f.init(true);
+        f.reconnect(); f.init(false); f.client.CONNECTED();
+        expect(f.requests()).toEqual([[], [{ event: 'control/request' }], []]);
+    });
+
+    it('sends only on an open socket', () => {
+        for (const readyState of [0, 2, 3]) {
+            const f = hostingFixture({ connected: true, readyState });
+            f.init(true);
+            expect(f.requests()).toEqual([[]]);
+        }
+        const f = hostingFixture({ readyState: 0 });
+        f.client._ws.readyState = 1;
+        f.init(true);
+        expect(f.requests()).toEqual([[{ event: 'control/request' }]]);
+    });
+
+    it('does not retry a failed send until a new socket is initialized', () => {
+        const f = hostingFixture();
+        let sends = 0;
+        f.client._ws.send = () => { sends++; throw new Error('socket closed'); };
+        expect(() => f.init(true)).not.toThrow();
+        f.init(true); f.client['control/locked'](); f.client.CONNECTED(); f.install();
+        expect(sends).toBe(1);
+        expect(f.timers).toEqual([]);
+        f.reconnect(); f.init(true);
+        expect(f.requests()).toEqual([[], [{ event: 'control/request' }]]);
+    });
+
+    it('installs before the overlay appears and also hosts on touch devices', () => {
+        for (const options of [{ overlayPresent: false }, { touch: true }]) {
+            const f = hostingFixture(options);
+            f.init(true);
+            expect(f.requests()).toEqual([[{ event: 'control/request' }]]);
+        }
+    });
+
+    it('waits for a late client and installs only once across overlay retries', () => {
+        const f = hostingFixture({ clientPresent: false, overlayPresent: false });
+        f.window.$client = f.client;
+        f.timers.shift()!(); f.init(true);
+        f.timers.shift()!(); f.init(true);
+        expect(f.requests()).toEqual([[{ event: 'control/request' }]]);
+    });
+});

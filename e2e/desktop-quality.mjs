@@ -146,9 +146,11 @@ export function installNekoClipboardProbe() {
   'use strict'; // addInitScript serializes this function outside module strict mode.
   if (window.top === window || !/^[^.]+-nekodesktop\./i.test(location.hostname)) return;
   if (window.__desktopQualityClipboard) return;
-  const hooks = { websocket: 'unavailable', clipboardWrite: 'unavailable',
+  const hooks = { websocket: 'unavailable', websocketOnmessage: 'unavailable', clipboardWrite: 'unavailable',
     clipboardHandler: 'unavailable', clipboardSend: 'unavailable' };
   let socketsObserved = 0, testToken = null, counters, initProfile = null;
+  // Per-token resets otherwise make a connected but idle socket look blind.
+  const lifetime = { messagesReceived: 0, listenerDeliveries: 0, onmessageDeliveries: 0, controlRequests: 0 };
   const restores = [], sockets = new Set(), handlers = new WeakMap();
   const errorName = error => ['Error', 'NotAllowedError', 'SecurityError', 'AbortError', 'TypeError',
     'NotFoundError', 'InvalidStateError', 'NotSupportedError', 'DataError', 'UnknownError']
@@ -172,7 +174,7 @@ export function installNekoClipboardProbe() {
     counters = { messagesReceived: 0, nonTextMessages: 0, parseFailures: 0,
       controlClipboardEvents: 0, clipboardUpdatedEvents: 0, testTokenEvents: 0,
       handlerCalls: 0, testTokenHandlerCalls: 0, handlerErrors: 0, lastHandlerErrorName: null,
-      clipboardSends: 0, testTokenSends: 0,
+      clipboardSends: 0, testTokenSends: 0, controlRequests: 0,
       writeCalls: 0, writeResolved: 0, writeRejected: 0,
       testTokenWriteCalls: 0, testTokenWriteResolved: 0, testTokenWriteRejected: 0,
       lastRejectionName: null, testTokenRejectionName: null };
@@ -251,8 +253,13 @@ export function installNekoClipboardProbe() {
   };
   const observeSocket = socket => {
     if (!socket || sockets.has(socket)) return;
-    const listener = event => {
-      counters.messagesReceived++;
+    const seen = new WeakSet();
+    const receive = event => {
+      // A native socket delivers the same MessageEvent to both hooks. The
+      // property path also covers adapters that call only socket.onmessage.
+      if (seen.has(event)) return;
+      seen.add(event);
+      counters.messagesReceived++; lifetime.messagesReceived++;
       if (typeof event.data !== 'string') { counters.nonTextMessages++; return; }
       let message;
       try { message = JSON.parse(event.data); } catch { counters.parseFailures++; return; }
@@ -267,9 +274,43 @@ export function installNekoClipboardProbe() {
       }
       attachHandlers();
     };
+    const listener = event => { lifetime.listenerDeliveries++; receive(event); };
     socket.addEventListener('message', listener);
     sockets.add(socket); socketsObserved++; hooks.websocket = 'installed';
     restores.push(() => socket.removeEventListener('message', listener));
+    try {
+      // The pinned client assigns _ws.onmessage in neko/base.ts:74 (and again
+      // at disconnect, :96). Preserve that assignment path, including existing
+      // sockets and later replacements; do not replace it with a static copy.
+      const own = Object.getOwnPropertyDescriptor(socket, 'onmessage');
+      let owner = socket, descriptor;
+      while (owner && !descriptor) {
+        descriptor = Object.getOwnPropertyDescriptor(owner, 'onmessage');
+        owner = Object.getPrototypeOf(owner);
+      }
+      let assigned = socket.onmessage, wrapped;
+      const set = value => {
+        assigned = value;
+        wrapped = typeof value === 'function' ? function (event) {
+          lifetime.onmessageDeliveries++; receive(event);
+          return Reflect.apply(value, this, arguments);
+        } : value;
+        // Native WebSocket dispatch uses its internal event-handler slot.
+        if (descriptor?.set) descriptor.set.call(socket, wrapped);
+      };
+      const get = () => wrapped;
+      Object.defineProperty(socket, 'onmessage', { configurable: true,
+        enumerable: own?.enumerable ?? true, get, set });
+      restores.push(() => {
+        if (Object.getOwnPropertyDescriptor(socket, 'onmessage')?.get !== get) return;
+        if (own) Object.defineProperty(socket, 'onmessage', 'value' in own ? { ...own, value: assigned } : own);
+        else delete socket.onmessage;
+        if (descriptor?.set) descriptor.set.call(socket, assigned);
+        else if (!own && assigned !== undefined) socket.onmessage = assigned;
+      });
+      set(assigned);
+      hooks.websocketOnmessage = 'installed';
+    } catch { hooks.websocketOnmessage = 'installation_failed'; }
     try {
       const original = socket.send;
       if (typeof original === 'function') {
@@ -283,6 +324,7 @@ export function installNekoClipboardProbe() {
             counters.clipboardSends++;
             if (matches(message)) counters.testTokenSends++;
           }
+          if (message?.event === 'control/request') { counters.controlRequests++; lifetime.controlRequests++; }
           return returned;
         });
         hooks.clipboardSend = 'installed';
@@ -297,7 +339,7 @@ export function installNekoClipboardProbe() {
   };
   window.__desktopQualityClipboard = { reset(token) { attach(); reset(token); }, snapshot() {
     attach();
-    return { status: 'observed', hooks: { ...hooks }, socketsObserved, ...counters,
+    return { status: 'observed', hooks: { ...hooks }, socketsObserved, lifetime: { ...lifetime }, ...counters,
       controlClipboardReceived: hooks.websocket === 'installed' && socketsObserved > 0 ? counters.controlClipboardEvents > 0 : null,
       clipboardWriteRejected: hooks.clipboardWrite === 'installed' ? counters.writeRejected > 0 : null,
       profile: profile(), ...environment() };

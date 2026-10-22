@@ -308,14 +308,22 @@ test('native repeat is explicitly skipped even if an independent mixed-text chec
 
 function probeFixture({ hostname = 'box-nekodesktop.example.test', topLevel = false,
   clipboard = { writeText: async () => undefined }, user, clientProfile,
-  document = { hasFocus: () => true } } = {}) {
+  document = { hasFocus: () => true }, dispatchStyle = 'both' } = {}) {
   class Socket {
     static OPEN = 1;
     listeners = [];
     addEventListener(type, fn) { assert.equal(type, 'message'); this.listeners.push(fn); }
     removeEventListener(type, fn) { assert.equal(type, 'message'); this.listeners = this.listeners.filter(item => item !== fn); }
     send() { assert.ok(this instanceof Socket); }
-    emit(data) { for (const listener of this.listeners) listener({ data }); return this.onmessage?.({ data }); }
+    // Native WebSocket stores the property handler internally via a prototype
+    // setter; dispatch does not simply read an overridden own onmessage field.
+    get onmessage() { return this.propertyHandler ?? null; }
+    set onmessage(fn) { this.propertyHandler = fn; }
+    emit(data) {
+      const event = { data };
+      if (dispatchStyle !== 'property') for (const listener of this.listeners) listener.call(this, event);
+      if (dispatchStyle !== 'listener') return this.propertyHandler?.call(this, event);
+    }
   }
   const window = { WebSocket: Socket, $client: { $accessor: { user }, profile: clientProfile } };
   window.top = topLevel ? window : {};
@@ -360,6 +368,84 @@ test('Neko records received clipboard events and token equality without retainin
   probe.reset('next-token');
   assert.equal(snapshot().controlClipboardEvents, 0);
   assert.equal(snapshot().socketsObserved, 1);
+  assert.equal(snapshot().lifetime.messagesReceived, 6, 'token resets preserve evidence that the socket delivered messages');
+});
+
+for (const dispatchStyle of ['property', 'listener', 'both']) {
+  test(`Neko observes ${dispatchStyle} delivery on existing sockets, reassignment and reconnect`, () => {
+    const fixture = probeFixture({ dispatchStyle });
+    fixture.probe.restore();
+    const client = fixture.window.$client, socket = client._ws = new fixture.Socket();
+    const delivered = [];
+    function handler(event) {
+      assert.ok(this instanceof fixture.Socket);
+      delivered.push(JSON.parse(event.data).event);
+      return 'delivered';
+    }
+    if (dispatchStyle === 'listener') socket.addEventListener('message', handler);
+    else socket.onmessage = handler;
+    // This startup event predates installation and cannot be recovered.
+    socket.emit(JSON.stringify({ event: 'system/init' }));
+    fixture.install();
+    const probe = fixture.window.__desktopQualityClipboard;
+    assert.equal(fixture.snapshot().messagesReceived, 0);
+    probe.reset('test-token');
+    socket.emit(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+    assert.equal(fixture.snapshot().messagesReceived, 1, 'native dual delivery is counted once');
+    assert.equal(fixture.snapshot().testTokenEvents, 1);
+    if (dispatchStyle !== 'listener') {
+      socket.onmessage = null;
+      socket.onmessage = handler;
+    }
+    socket.emit(JSON.stringify({ event: 'control/locked' }));
+    assert.equal(fixture.snapshot().messagesReceived, 2);
+    probe.reset('next-token');
+    assert.equal(fixture.snapshot().messagesReceived, 0);
+    assert.equal(fixture.snapshot().lifetime.messagesReceived, 2);
+    const reconnected = client._ws = new fixture.window.WebSocket();
+    if (dispatchStyle === 'listener') reconnected.addEventListener('message', handler);
+    else reconnected.onmessage = handler;
+    reconnected.emit(JSON.stringify({ event: 'control/clipboard', text: 'next-token' }));
+    reconnected.send(JSON.stringify({ event: 'control/request' }));
+    assert.equal(fixture.snapshot().socketsObserved, 2);
+    assert.equal(fixture.snapshot().testTokenEvents, 1);
+    assert.equal(fixture.snapshot().controlRequests, 1);
+    assert.equal(fixture.snapshot().lifetime.controlRequests, 1);
+    assert.equal(fixture.snapshot().lifetime.messagesReceived, 3);
+    assert.equal(delivered.length, 4, 'upstream handlers still receive each event once');
+    assert.equal(probe.restore().restored, true);
+    assert.equal(Object.hasOwn(socket, 'onmessage'), false);
+    assert.equal(Object.hasOwn(reconnected, 'onmessage'), false);
+    if (dispatchStyle !== 'listener') assert.equal(socket.onmessage, handler);
+    socket.emit(JSON.stringify({ event: 'control/locked' }));
+    assert.equal(delivered.length, 5);
+  });
+}
+
+test('onmessage hooks preserve property-only adapters, return values, throws and later replacements', () => {
+  const fixture = probeFixture();
+  fixture.probe.restore();
+  const socket = fixture.window.$client._ws = new fixture.Socket();
+  const error = new Error('private-error');
+  Object.defineProperty(socket, 'onmessage', { configurable: true, writable: true, enumerable: false,
+    value(event) { assert.equal(this, socket); return event.data; } });
+  fixture.install();
+  const probe = fixture.window.__desktopQualityClipboard;
+  const event = { data: JSON.stringify({ event: 'system/init' }) };
+  assert.equal(socket.onmessage(event), event.data);
+  assert.equal(fixture.snapshot().messagesReceived, 1);
+  const throwing = () => { throw error; };
+  socket.onmessage = throwing;
+  assert.throws(() => socket.onmessage({ data: '{}' }), value => value === error);
+  assert.equal(fixture.snapshot().messagesReceived, 2);
+  assert.equal(probe.restore().restored, true);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(socket, 'onmessage'),
+    { configurable: true, writable: true, enumerable: false, value: throwing });
+  fixture.install();
+  const replacement = () => 'replacement';
+  Object.defineProperty(socket, 'onmessage', { value: replacement, configurable: true });
+  assert.equal(fixture.window.__desktopQualityClipboard.restore().restored, true);
+  assert.equal(socket.onmessage, replacement);
 });
 
 test('Neko writeText wrapper preserves receiver, fulfillment and rejection without leaking errors or text', async () => {
