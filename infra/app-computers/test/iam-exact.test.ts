@@ -215,7 +215,8 @@ test('every role, key, queue and invoke policy in the synthesized stacks equals 
     // the boundary explicitly names only the operations this workload uses.
     const boundary = boundaryStatements(IdentityConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R,
         githubOidcProviderArn: GITHUB.providerArn, deploySubject: 'repo:example-org@1000/ezil-os@2000:environment:aws-pilot',
-        assetBucketName: `ezil-pilot-deploy-assets-${A}` })).map(s => s.toStatementJson());
+        // This audit includes the controller's opt-in warm-pool grants.
+        assetBucketName: `ezil-pilot-deploy-assets-${A}`, poolLifecycle: true })).map(s => s.toStatementJson());
     const expanded: Record<string, string[]> = {
         'kms:ReEncrypt*': ['kms:ReEncryptFrom', 'kms:ReEncryptTo'],
         'kms:GenerateDataKey*': ['kms:GenerateDataKey', 'kms:GenerateDataKeyWithoutPlaintext'],

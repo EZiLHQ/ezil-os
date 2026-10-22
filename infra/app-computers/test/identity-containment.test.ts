@@ -108,9 +108,9 @@ function addedAfterDesignA(c: { region: string; accountId: string; namespace: st
             'kms:ViaService': `states.${c.region}.amazonaws.com` } } }] };
 }
 
-for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
-    test(`Design A: unchanged identity grants, old allow containment and attached denies ${JSON.stringify({ killSwitch, userDataAttributeKeyVerified })}`, () => {
-        const config = IdentityConfigSchema.parse({ ...before.config, killSwitch, userDataAttributeKeyVerified });
+for (const poolLifecycle of [false, true]) for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
+    test(`Design A: unchanged identity grants, old allow containment and attached denies ${JSON.stringify({ poolLifecycle, killSwitch, userDataAttributeKeyVerified })}`, () => {
+        const config = IdentityConfigSchema.parse({ ...before.config, poolLifecycle, killSwitch, userDataAttributeKeyVerified });
         const legacy = billingV2Ceiling([
             ...before.boundary.filter((s: Statement) => !(userDataAttributeKeyVerified && s.Sid === 'NoModifyInstanceAttribute')),
             ...(userDataAttributeKeyVerified ? before.userData : []),
@@ -155,9 +155,9 @@ for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified 
             assertDeniesRetained(legacy, fences);
         }
         const workload = boundaryStatements(config).map(s => s.toStatementJson());
-        const pool = [...poolCeiling(legacy, config), { Effect: 'Allow', Action: 'ec2:DescribeSnapshots', Resource: '*' }];
-        assertAllowsWithin(workload, pool);
-        assertDeniesRetained(pool, workload);
+        const ceiling = [...(poolLifecycle ? poolCeiling(legacy, config) : legacy), { Effect: 'Allow', Action: 'ec2:DescribeSnapshots', Resource: '*' }];
+        assertAllowsWithin(workload, ceiling);
+        assertDeniesRetained(ceiling, workload);
     });
 }
 

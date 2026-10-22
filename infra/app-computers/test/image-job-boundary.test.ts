@@ -17,8 +17,8 @@ const contextFor = (s: any) => Object.fromEntries(Object.entries(s.Condition ?? 
     .map(([key, v]) => [key, op === 'Null' ? 'present' : op.startsWith('For') ? v : list(v)[0]])));
 
 test('image boundary fits 6144 bytes at longest namespace/region with every feature and volume cap', () => {
-    for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
-        const c = { ...cfg, namespace: 'a'.repeat(21), region: 'ap-northeast-1', killSwitch, userDataAttributeKeyVerified, maxVolumeGiB: 16384 };
+    for (const poolLifecycle of [false, true]) for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
+        const c = { ...cfg, namespace: 'a'.repeat(21), region: 'ap-northeast-1', killSwitch, userDataAttributeKeyVerified, maxVolumeGiB: 16384, poolLifecycle };
         const deployment = JSON.parse(JSON.stringify(d).replaceAll('pilot', c.namespace).replaceAll('ap-south-1', c.region).replaceAll('aps1-az1', 'apne1-az1'));
         deployment.storage.dataMinGiB = 16384; deployment.storage.dataMaxGiB = 16384;
         const document = { Version: '2012-10-17', Statement: json(imageJobBoundaryStatements(c, deployment)) };
@@ -46,8 +46,8 @@ test('snapshot and restore grants retain conditions under the boundary, includin
     }
 });
 test('all shared global denies survive; snapshot sharing, storage destruction, tag edits and kill switch stay denied', () => {
-    for (const killSwitch of [false, true]) {
-        const c = { ...cfg, killSwitch }, ceiling = json(imageJobBoundaryStatements(c, d));
+    for (const poolLifecycle of [false, true]) for (const killSwitch of [false, true]) {
+        const c = { ...cfg, killSwitch, poolLifecycle }, ceiling = json(imageJobBoundaryStatements(c, d));
         for (const s of json(boundaryStatements(c)).filter(s => s.Effect === 'Deny')) {
             const context = contextFor(s);
             for (const key of Object.keys(s.Condition?.StringNotEquals ?? {})) context[key] = 'foreign';
@@ -90,6 +90,39 @@ test('founder policy and deployment exceptions name only preparation/recovery ro
 test('image boundary has a reviewed exact policy snapshot', () => {
     const expected = JSON.parse(readFileSync(join(__dirname, '__snapshots__/image-job-boundary.json'), 'utf8'));
     assert.deepEqual(json(imageJobBoundaryStatements(cfg, d)), expected);
+    // The shared storage denies change insertion order only; image permissions
+    // and every guardrail condition remain identical when the pool is enabled.
+    const sortActions = (statements: any[]) => statements.map(s => ({ ...s, Action: Array.isArray(s.Action) ? [...s.Action].sort() : s.Action }));
+    assert.deepEqual(sortActions(json(imageJobBoundaryStatements({ ...cfg, poolLifecycle: true }, d))), sortActions(expected));
+});
+
+test('poolLifecycle changes only the shared workload policy, preserving image and identity guardrails in the synthesized stack', () => {
+    for (const imageJobDeployment of [undefined, d]) for (const killSwitch of [false, true])
+        for (const userDataAttributeKeyVerified of [false, true]) {
+            const rest = (poolLifecycle: boolean) => {
+                const config = IdentityConfigSchema.parse({ ...cfg, imageJobDeployment, killSwitch, userDataAttributeKeyVerified, poolLifecycle });
+                const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'PoolIsolation', {
+                    config, env: { account: cfg.accountId, region: cfg.region },
+                });
+                const template = assertions.Template.fromStack(stack).toJSON();
+                for (const [id, resource] of Object.entries(template.Resources) as [string, any][]) {
+                    if (resource.Type !== 'AWS::IAM::ManagedPolicy') continue;
+                    const name = resource.Properties.ManagedPolicyName;
+                    if (name === 'ezil-pilot-boundary') { delete template.Resources[id]; continue; }
+                    const statements = resource.Properties.PolicyDocument.Statement;
+                    for (const action of ['ec2:DetachVolume', 'ec2:DeleteTags']) {
+                        assert.equal(evaluate(statements, action, '*', { 'aws:RequestedRegion': cfg.region }).denied, true, name + ':' + action);
+                        assert.equal(statements.some((s: any) => s.Effect === 'Allow' && list(s.Action).includes(action)), false);
+                    }
+                    // Image compaction merges the same denies in a different
+                    // action order; preserve every other part of the template.
+                    if (name === 'ezil-pilot-image-job-boundary')
+                        for (const s of statements) if (Array.isArray(s.Action)) s.Action.sort();
+                }
+                return template;
+            };
+            assert.deepEqual(rest(true), rest(false));
+        }
 });
 
 test('data-key role/boundary intersection rejects foreign keys, missing namespace and unscoped grants', () => {

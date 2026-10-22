@@ -23,6 +23,10 @@ export const IdentityConfigSchema = z.object({
     assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
     /** Founder-controlled §4 kill switch, enforced by the boundary and identity guardrails. */
     killSwitch: z.boolean().default(false),
+    /** Founder-approved warm-pool lifecycle: opt in to DetachVolume/DeleteTags
+     * in the shared workload boundary. Off preserves the live storage denies;
+     * identity guardrails and the image-job boundary always retain them. */
+    poolLifecycle: z.boolean().default(false),
     /** Reviewed image-job data scope; founder publishes its boundary before workflows. */
     imageJobDeployment: LifecycleDeploymentSchema.optional(),
     /** Cost cap for any bounded principal: largest EBS volume it may create. */
@@ -243,9 +247,10 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
             { StringEquals: nsTag('Resource') }),
         allow(['ec2:RunInstances'], [`arn:aws:ec2:${r}::image/*`]),
         // The boundary caps compute permissions by managed namespace. The
-        // lifecycle controller further restricts detach/untag to release and
-        // pool claims; keep this shared ceiling compact enough for IAM's 6 KiB.
-        allow(['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags', 'ec2:DetachVolume', 'ec2:DeleteTags'],
+        // explicitly enabled pool lifecycle further restricts detach/untag to
+        // release and pool claims. Keep the default live storage denies.
+        allow(['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags',
+            ...(c.poolLifecycle ? ['ec2:DetachVolume', 'ec2:DeleteTags'] : [])],
             [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
         ...(c.userDataAttributeKeyVerified ? [allow(['ec2:ModifyInstanceAttribute'], [ec2('instance')],
             { StringEquals: { ...compute('Resource'), 'ec2:Attribute': 'userData' } })] : []),
@@ -253,7 +258,7 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
         // request tags (network-interface grant above), so it is tagged by the same call.
         allow(['ec2:CreateTags'], [ec2('instance'), ec2('volume'), ec2('network-interface')],
             { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } }),
-        ...commonDenies(c, true),
+        ...commonDenies(c, c.poolLifecycle),
         deny(['iam:*', 'sts:*', 'organizations:*', 'account:*', 'aws-portal:*', 'billing:*', 'payments:*', 'tax:*', 'ce:*',
             'route53:*', 'route53domains:*', 'cloudfront:*', 'budgets:*', 'cloudwatch:*']),
     ]);

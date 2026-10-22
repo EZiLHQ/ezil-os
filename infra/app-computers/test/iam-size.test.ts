@@ -205,9 +205,9 @@ for (const killSwitch of [false, true]) for (const userDataNonce of [false, true
         });
     }
 
-test('identity policies retain headroom with the longest accepted namespace/region and largest volume cap', () => {
+for (const poolLifecycle of [false, true]) test(`identity policies retain headroom with the longest accepted namespace/region and largest volume cap (poolLifecycle=${poolLifecycle})`, () => {
     const config = IdentityConfigSchema.parse({ ...identity, namespace: 'a'.repeat(21), region: 'ap-northeast-1',
-        maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true });
+        maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true, poolLifecycle });
     const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'IdentityMaximumSize', {
         config, env: { account: config.accountId, region: config.region }, synthesizer: new BootstraplessSynthesizer(),
     });
@@ -224,11 +224,11 @@ test('preparation, launch observers and app caller stay within IAM and KMS polic
     assert.deepEqual(checkStack(stack), []);
 });
 
-test('founder image boundary and deployment-policy aggregate quotas with the longest scope', () => {
+for (const poolLifecycle of [false, true]) test(`founder image boundary and deployment-policy aggregate quotas with the longest scope (poolLifecycle=${poolLifecycle})`, () => {
     const f = preparationFixture(), namespace = 'a'.repeat(21), region = 'ap-northeast-1';
     const deployment = JSON.parse(JSON.stringify(f.settings.deployment).replaceAll('pilot', namespace).replaceAll('ap-south-1', region).replaceAll('aps1-az1', 'apne1-az1'));
     deployment.storage.dataMinGiB = 16384; deployment.storage.dataMaxGiB = 16384;
-    const config = IdentityConfigSchema.parse({ ...identity, namespace, region, imageJobDeployment: deployment, maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true });
+    const config = IdentityConfigSchema.parse({ ...identity, namespace, region, imageJobDeployment: deployment, maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true, poolLifecycle });
     const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'ImageIdentityMaximum', { config, env: { account: config.accountId, region } });
     assert.deepEqual(checkStack(stack), []);
 });
