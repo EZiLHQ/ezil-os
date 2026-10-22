@@ -29,6 +29,8 @@ import {
     consumeEnrollmentNonce, finishEnrollment, ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
 } from './placement';
 import { monthUsageFromRows } from './usage';
+import { requestAwsPreview } from './aws-preview';
+import { awsPreviewAnswer, awsStatusAnswer } from '@/server/api/routers/compute-dispatch';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -694,6 +696,55 @@ describe('failed executions', () => {
 });
 
 describe('one computer, end to end (fake AWS; real admission, provider, enrollment and receipts)', () => {
+    it.each([
+        [503, 'aws_desktop_unreachable'],
+        [502, 'aws_origin_unavailable'],
+        [409, 'relay_busy'],
+    ])('cold replacement keeps Code waking through Worker %s %s, then opens the enrolled epoch', async (status, error) => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(NOW);
+        try {
+            const s: ReturnType<typeof setup> = setup([row({
+                state: 'STOPPED', generation: 8, lease_epoch: 9, instance_id: I_OLD,
+                lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null,
+            })], () => {
+                const job = s.starts[0]!;
+                return { status: 'SUCCEEDED', output: receiptOf({ jobId: job.intent.jobId, digest: job.digest,
+                    generation: job.intent.targetGeneration, leaseEpoch: job.intent.leaseEpoch, fenceToken: job.intent.fenceToken }) };
+            });
+            let originReady = false;
+            const worker = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+                const token = new Headers(init?.headers).get('x-ezil-auth')!;
+                const claims = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString());
+                // The fake Worker trusts the tunnel created by real enrollment, not an inferred generation.
+                const tunnel = s.created[0] as { computerId: string; sandboxId: string; generation: number; leaseEpoch: number };
+                expect(claims).toMatchObject({ computerId: tunnel.computerId, sandboxId: tunnel.sandboxId,
+                    generation: tunnel.generation, leaseEpoch: tunnel.leaseEpoch });
+                if (!originReady) return Response.json({ ok: false, error }, { status });
+                const url = (port: number) => `https://aws-${port}-${claims.sandboxId}-aws.ezil.org/preview-bootstrap?token=test`;
+                return Response.json({ ok: true, provider: 'aws-ec2', mode: 'neko', sandboxId: claims.sandboxId,
+                    generation: claims.generation, leaseEpoch: claims.leaseEpoch,
+                    guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443), expiresAt: NOW.getTime() + 60_000 });
+            });
+            const preview = () => requestAwsPreview(s.db, { userId: U1, computerId: C1 }, opts,
+                { workerUrl: 'https://worker.example.test', isConfigured: true, hasHmacSecret: true }, 'test-secret', 'corr', env());
+            const open = async () => awsPreviewAnswer(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts), preview);
+            expect(await open()).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+            expect(worker).not.toHaveBeenCalled();
+            expect(s.starts[0]!.intent).toMatchObject({ operation: 'replace', previousGeneration: 8, targetGeneration: 9, leaseEpoch: 10 });
+            expect((await s.enroll()).status).toBe(200);
+            // A lifecycle receipt makes the desktop API say "up" before its origin services answer.
+            expect(awsStatusAnswer(await s.status())).toMatchObject({ guacamoleRunning: true });
+            expect(await open()).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+            expect(await open()).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+            originReady = true;
+            expect(await open()).toMatchObject({ ok: true, generation: 9, leaseEpoch: 10 });
+            expect(s.starts).toHaveLength(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('provision → enroll → RUNNING → stop → STOPPED (fenced) → wake by replace → enroll → RUNNING', async () => {
         // The scripted provider: every execution succeeds with the receipt its intent implies.
         const instanceFor = (i: LifecycleIntent) => (i.operation === 'provision' || i.operation === 'replace' ? I_NEW : i.providerInstanceId!);
