@@ -369,13 +369,21 @@ async function selectRows(db: PlacementExecutor, computerId: string): Promise<Re
     );
 }
 
-/** C-2 read rule. Throws `PlacementIntegrityError` rather than guessing. */
-export async function readPlacement(db: PlacementExecutor, rawComputerId: string): Promise<ResolvedPlacement> {
+/**
+ * C-2 read rule. Throws `PlacementIntegrityError` rather than guessing.
+ * User-facing callers supply the authenticated owner so a foreign placement
+ * is refused BEFORE querying image reservations. Ownerless background reads
+ * still fail closed on reservations.
+ */
+export async function readPlacement(db: PlacementExecutor, rawComputerId: string, expectedOwnerUserId?: string): Promise<ResolvedPlacement> {
     const computerId = canonicalId(rawComputerId);
     const rows = await selectRows(db, computerId);
     if (rows.length === 0) { await assertNoImageReservation(db, computerId); return DEFAULT_PLACEMENT; }
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     const record = parsePlacementRow(rows[0]!, computerId);
+    if (expectedOwnerUserId !== undefined && record.ownerUserId !== canonicalId(expectedOwnerUserId)) {
+        throw new PlacementOwnerError(computerId);
+    }
     await assertNoImageReservation(db, computerId);
     return { provider: record.provider, store: record.store, record };
 }
@@ -733,7 +741,7 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
 export async function pinCloudflarePlacement(db: PlacementDb, computer: { computerId: string; userId: string }): Promise<ResolvedPlacement> {
     return db.transaction(async tx => {
         await lockComputer(tx, computer.computerId);
-        const existing = await readPlacement(tx, computer.computerId);
+        const existing = await readPlacement(tx, computer.computerId, computer.userId);
         if (existing.record) return existing;
         const { createProviderMigrationStore } = await import('./provider-migrate-store');
         const m = await createProviderMigrationStore(tx).readByComputer(computer.computerId);

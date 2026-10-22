@@ -76,7 +76,8 @@ import {
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
-import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { awsPreviewAnswer, awsStatusAnswer, routeComputer } from './compute-dispatch';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
@@ -94,6 +95,16 @@ async function assertOwnedComputer(
     if (!computer) {
         // NOT_FOUND, never FORBIDDEN — mirrors computer.get's anti-enumeration contract.
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+    }
+    if (isPlacementReadEnabled(process.env)) {
+        try {
+            // A re-inserted computer row cannot disclose another owner's image job.
+            // This also gates controls and frame probes that do not use routeComputer.
+            await readPlacement(db as unknown as PlacementExecutor, computerId, userId);
+        } catch (err) {
+            if (err instanceof PlacementOwnerError) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            throw err;
+        }
     }
 }
 

@@ -28,7 +28,7 @@ import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
-import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
@@ -91,6 +91,9 @@ export async function routeComputer(
     let entitlement: Promise<EntitlementRecord | null> | undefined;
     const getEntitlement = () => entitlement ??= resolveEntitlement(computer.userId, entitlements);
     try {
+        // The shared resolver reads reservations before its own owner comparison.
+        // Gate it here with the authenticated owner, before any reservation read.
+        await readPlacement(db as PlacementExecutor, computer.computerId, computer.userId);
         provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, getEntitlement, aws), {
             pinCloudflare, resolveEntitlement: getEntitlement,
             onPlacement: placement => { instanceType = placement.record?.instanceType ?? null; },

@@ -14,7 +14,7 @@ import path from 'node:path';
 import { drizzle } from 'drizzle-orm/pg-proxy';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type * as schema from '@/server/db/schema';
 import { createFakePlacementDb, DEFAULT_OWNER as OWNER, placementRow } from './fake-placement-db.test-support';
@@ -24,6 +24,7 @@ import {
     createPlacement,
     DEFAULT_PLACEMENT,
     findDuplicatePlacements,
+    ImageJobConflictError,
     leasePlacement,
     mintAdmissionTicket,
     PLACEMENT_STATES,
@@ -33,6 +34,7 @@ import {
     placementOwnerTrpcError,
     PlacementOwnerError,
     readPlacement,
+    pinCloudflarePlacement,
     RUNNING_CLASS_STATES,
     readAdmissionCounters,
     withAdmission,
@@ -145,6 +147,69 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
         await readPlacement(db, A);
         expect(statements[0]!.sql).toMatch(/FROM public\.ezil_computer_placements\s+WHERE computer_id = \$1::uuid\s+LIMIT 2/);
         expect(statements[0]!.params).toEqual([A]);
+    });
+});
+
+describe('ownership precedes image-reservation refusal', () => {
+    const jobId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const reserved = () => createFakePlacementDb({ placements: [placementRow({
+        computer_id: A, owner_user_id: B, image_upgrade_job_id: jobId,
+    })] });
+
+    it('a foreign reader gets only the ownership refusal, with no reservation query', async () => {
+        const { db, statements } = reserved();
+        await expect(readPlacement(db, A, OWNER)).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+    });
+
+    it.each([B, B.toUpperCase(), undefined])('the owner or an ownerless reader still refuses a reservation (%s)', async owner => {
+        const { db, statements } = reserved();
+        await expect(readPlacement(db, A.toUpperCase(), owner)).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(statements.map(s => ({ sql: s.sql, params: s.params }))).toEqual([
+            { sql: expect.stringContaining('/* placement:read */'), params: [A] },
+            { sql: expect.stringContaining('/* placement:image-reservation */'), params: [A, A] },
+        ]);
+    });
+
+    it('an uppercase owner can read their unreserved placement', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, owner_user_id: B })] });
+        expect((await readPlacement(db, A, B.toUpperCase())).record?.ownerUserId).toBe(B);
+    });
+
+    it('an owner-aware read without a placement still refuses an orphan image job', async () => {
+        const execute = vi.fn<PlacementExecutor['execute']>()
+            .mockResolvedValueOnce({ rows: [] })
+            .mockResolvedValueOnce({ rows: [{ job_id: jobId }] });
+        await expect(readPlacement({ execute }, A, B)).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(execute).toHaveBeenCalledTimes(2);
+    });
+
+    it('an owner-aware read propagates reservation database errors instead of allowing access', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, owner_user_id: B })] });
+        const unavailable = new Error('reservation database unavailable');
+        const execute = vi.fn<PlacementExecutor['execute']>()
+            .mockImplementationOnce(q => db.execute(q))
+            .mockRejectedValueOnce(unavailable);
+        await expect(readPlacement({ execute }, A, B)).rejects.toBe(unavailable);
+    });
+
+    it('pinning rechecks ownership under the computer lock before reservations', async () => {
+        const { db, statements } = reserved();
+        await expect(pinCloudflarePlacement(db, { computerId: A, userId: OWNER })).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(statements.map(s => s.sql)).toEqual([
+            'BEGIN', expect.stringContaining('/* placement:lock-computer */'),
+            expect.stringContaining('/* placement:read */'), 'ROLLBACK',
+        ]);
+    });
+
+    it('ordinary admission still fails closed for the owner under its admission lock', async () => {
+        const { db, statements } = reserved();
+        await expect(withAdmission(db, (tx, lock) => readAdmissionCounters(tx, lock, {
+            computerId: A, userId: B, monthStart: new Date('2026-10-01T00:00:00Z'), now: new Date('2026-10-22T00:00:00Z'),
+        }))).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(statements.some(s => s.sql.includes('/* placement:image-reservation */'))).toBe(true);
+        expect(statements.at(-1)?.sql).toBe('ROLLBACK');
+        expect(statements.some(s => s.sql.includes('/* placement:insert */') || s.sql.includes('/* placement:cas */'))).toBe(false);
     });
 });
 

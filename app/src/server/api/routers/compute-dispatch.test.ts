@@ -50,6 +50,7 @@ import type { LifecycleStarter } from '@/server/lib/compute/aws-ec2';
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
 import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
+import { ImageJobConflictError } from '@/server/lib/compute/placement';
 
 import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
 import { appCallerRoleEnv } from '@/server/lib/compute/aws-clients';
@@ -60,6 +61,7 @@ import type { EntitlementRecord } from '@/server/lib/compute/tier';
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
 const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+const IMAGE_JOB = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
 const AWS_ENV: Record<string, string> = {
     EZIL_AWS_COMPUTERS_ENABLED: '1',
@@ -155,6 +157,26 @@ describe('routeComputer', () => {
         await expect(routeComputer(db, computer, { env: AWS_ENV })).rejects.toMatchObject({ code: 'NOT_FOUND' });
         // ...and U2 (the recorded owner) is routed to their AWS computer.
         await expect(routeComputer(db, { userId: U2, computerId: C1 }, { env: AWS_ENV })).resolves.toMatchObject({ kind: 'aws-ec2' });
+    });
+
+    it.each(['aws-ec2', 'cloudflare'] as const)('%s reservation: routing checks ownership before querying the image job', async provider => {
+        const { db, fake } = routerDb([placementRow({ computer_id: C1, owner_user_id: U2,
+            provider, workspace_store: provider === 'aws-ec2' ? 'ebs' : 'r2', image_upgrade_job_id: IMAGE_JOB })]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        const read = vi.fn(async () => null);
+        await expect(routeComputer(db, computer, { env: AWS_ENV, entitlements: { read } })).rejects.toMatchObject({
+            code: 'NOT_FOUND', message: 'Computer not found',
+        });
+        expect(fake.statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+        expect(read).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+
+        fake.statements.length = 0;
+        await expect(routeComputer(db, { userId: U2, computerId: C1 }, { env: AWS_ENV })).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(fake.statements.map(s => s.sql)).toEqual([
+            expect.stringContaining('/* placement:read */'), expect.stringContaining('/* placement:image-reservation */'),
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('a duplicate placement fails closed (never Cloudflare)', async () => {
@@ -496,8 +518,44 @@ describe('routers: AWS previews use their own Worker route', () => {
         await expect(caller(db).terminate({ computerId: C1 })).rejects.toMatchObject({ code: 'NOT_FOUND' });
         // Only placement READS happened (three, one per call); no write, no lease, no lifecycle.
         const after = fake.statements.slice(before);
-        expect(after).toHaveLength(3);
-        expect(after.every((s) => /placement:read \*\//.test(s.sql))).toBe(true);
+        expect(after.map(s => ({ sql: s.sql, params: s.params }))).toEqual(Array.from({ length: 3 }, () => ({
+            sql: expect.stringContaining('/* placement:read */'), params: [C1],
+        })));
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    const reservedCalls = {
+        previewUrl: (c: ReturnType<typeof caller>) => c.previewUrl({ computerId: C1, sessionId: C1 }),
+        appPreviewUrl: (c: ReturnType<typeof caller>) => c.appPreviewUrl({ computerId: C1 }),
+        codePreviewUrl: (c: ReturnType<typeof caller>) => c.codePreviewUrl({ computerId: C1 }),
+        status: (c: ReturnType<typeof caller>) => c.status({ computerId: C1 }),
+        terminate: (c: ReturnType<typeof caller>) => c.terminate({ computerId: C1 }),
+        reportActivity: (c: ReturnType<typeof caller>) => c.reportActivity({ computerId: C1, lastInputAgoMs: 0 }),
+        restartDesktop: (c: ReturnType<typeof caller>) => c.restartDesktop({ computerId: C1 }),
+        relayState: (c: ReturnType<typeof caller>) => c.relayState({ computerId: C1 }),
+        refreshRelay: (c: ReturnType<typeof caller>) => c.refreshRelay({ computerId: C1, runtimeId: 'a'.repeat(32) }),
+        focusApp: (c: ReturnType<typeof caller>) => c.focusApp({ computerId: C1, app: 'chromium' }),
+        getScreen: (c: ReturnType<typeof caller>) => c.getScreen({ computerId: C1 }),
+        setScreen: (c: ReturnType<typeof caller>) => c.setScreen({ computerId: C1, width: 1920, height: 1080 }),
+        confirmFrame: (c: ReturnType<typeof caller>) => c.confirmFrame({ computerId: C1, frameUrl: 'https://frame.example' }),
+        confirmDisplay: (c: ReturnType<typeof caller>) => c.confirmDisplay({ computerId: C1, frameUrl: 'https://frame.example' }),
+    };
+
+    it.each(Object.entries(reservedCalls))('%s refuses a foreign reserved computer before reservation queries or Worker calls', async (_name, call) => {
+        const { db, fake } = routerDb([awsRow({ owner_user_id: U2, image_upgrade_job_id: IMAGE_JOB })]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        await expect(call(caller(db))).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'Computer not found' });
+        expect(fake.statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each(Object.entries(reservedCalls))('%s preserves the image-job conflict for the owner', async (_name, call) => {
+        const { db, fake } = routerDb([awsRow({ image_upgrade_job_id: IMAGE_JOB })]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        await expect(call(caller(db))).rejects.toMatchObject({ message: 'image_job_conflict', cause: expect.any(ImageJobConflictError) });
+        expect(fake.statements.map(s => s.sql)).toEqual([
+            expect.stringContaining('/* placement:read */'), expect.stringContaining('/* placement:image-reservation */'),
+        ]);
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
@@ -530,6 +588,21 @@ describe('computer.delete: AWS retires or refuses — never deletes data, never 
         const caller = computerRouter.createCaller({ user: { id: U1 }, db } as never);
         await expect(caller.delete({ id: C1 })).rejects.toMatchObject({ code: 'NOT_FOUND' });
         expect(captured.softDelete).not.toHaveBeenCalled();
+    });
+
+    it('delete hides a foreign image reservation and preserves the conflict for its owner', async () => {
+        const { db, fake } = routerDb([{ ...awsRow(U2), image_upgrade_job_id: IMAGE_JOB }]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        const caller = (userId: string) => computerRouter.createCaller({ user: { id: userId }, db } as never);
+        await expect(caller(U1).delete({ id: C1 })).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'Computer not found' });
+        expect(fake.statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+        fake.statements.length = 0;
+        await expect(caller(U2).delete({ id: C1 })).rejects.toMatchObject({ message: 'image_job_conflict', cause: expect.any(ImageJobConflictError) });
+        expect(fake.statements.map(s => s.sql)).toEqual([
+            expect.stringContaining('/* placement:read */'), expect.stringContaining('/* placement:image-reservation */'),
+        ]);
+        expect(captured.softDelete).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('a Cloudflare computer still deletes through the Worker teardown, exactly as before', async () => {
