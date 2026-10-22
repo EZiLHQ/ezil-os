@@ -61,7 +61,7 @@ export class RebasePreparation extends Construct {
         const observerRole = new iam.Role(this, 'ObserverRole', { assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'), path: `/ezil/${d.namespace}/` });
         observerRole.addToPolicy(new iam.PolicyStatement({ actions: ['logs:CreateLogStream', 'logs:PutLogEvents'],
             resources: [`arn:aws:logs:${d.region}:${d.accountId}:log-group:${name}-observer:log-stream:*`] }));
-        const observer = new nodejs.NodejsFunction(this, 'Observer', { functionName: name + '-observer', role: observerRole,
+        const observer = new nodejs.NodejsFunction(this, 'Observer', { currentVersionOptions: { removalPolicy: RemovalPolicy.RETAIN }, functionName: name + '-observer', role: observerRole,
             entry: join(__dirname, 'lifecycle/preparation-helper.ts'), handler: 'handler', runtime: lambda.Runtime.NODEJS_24_X,
             timeout: Duration.seconds(55), memorySize: 256,
             ...(props.lambdaReservedConcurrency === null ? {} : { reservedConcurrentExecutions: props.lambdaReservedConcurrency ?? 2 }),

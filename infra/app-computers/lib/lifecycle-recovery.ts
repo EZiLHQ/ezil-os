@@ -30,6 +30,8 @@ export class ComputerLifecycleRecovery extends Construct {
         const log = (name: string) => new logs.LogGroup(this, name, { encryptionKey: key,
             retention: logs.RetentionDays.ONE_WEEK, removalPolicy: RemovalPolicy.RETAIN });
         const observer = new nodejs.NodejsFunction(this, 'Observer', {
+            // A published workflow version invokes this exact Lambda version; keep it for rollback.
+            currentVersionOptions: { removalPolicy: RemovalPolicy.RETAIN },
             entry: join(__dirname, 'lifecycle/recovery-helper.ts'), handler: 'handler', runtime: lambda.Runtime.NODEJS_24_X,
             timeout: Duration.seconds(55), memorySize: 256, reservedConcurrentExecutions: 2, logGroup: log('ObserverLogs'),
             depsLockFilePath: join(__dirname, '../package-lock.json'), bundling: { minify: true, sourceMap: false, externalModules: [] },

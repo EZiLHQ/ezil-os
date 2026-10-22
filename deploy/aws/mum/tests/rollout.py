@@ -261,8 +261,28 @@ class CloudFormationTests(unittest.TestCase):
         b['Resources']['ExecRole']['Properties']['RoleName']='changed'
         with self.assertRaises(ValueError):cfn.validate_templates('identity',a,b,r)
 
+    def test_role_write_tightening_is_accepted_but_widening_is_refused(self):
+        a,b,r=self.templates()
+        prefix='arn:aws:iam::452630323510:'
+        role={'Type':'AWS::IAM::Role','Properties':{'RoleName':'unchanged','Policies':[{'PolicyName':'exec','PolicyDocument':{'Statement':[
+            {'Effect':'Allow','Action':['iam:CreateRole'],'Resource':prefix+'role/ezil/mum/*','Condition':{'StringEquals':{'iam:PermissionsBoundary':prefix+'policy/ezil/identity/ezil-mum-boundary'}}}]}}]}}
+        a['Resources']['ExecRole']=role;b['Resources']['ExecRole']=json.loads(json.dumps(role))
+        narrow={'Effect':'Allow','Action':['iam:CreateRole','iam:DeleteRole'],'Resource':[prefix+'role/ezil/mum/ezil-mum-rebase-preparation',prefix+'role/ezil/mum/ezil-mum-recovery'],
+                'Condition':{'StringEquals':{'iam:PermissionsBoundary':prefix+'policy/ezil/mum/ezil-mum-image-job-boundary'}}}
+        b['Resources']['ExecRole']['Properties']['Policies'][0]['PolicyDocument']['Statement'].append(narrow)
+        b['Resources']['ExecRole']['Properties']['Policies'][0]['PolicyDocument']['Statement'].append({'Effect':'Deny','Action':['iam:CreateRole'],'NotResource':narrow['Resource']})
+        r['changes']['ExecRole']={'action':'Modify','properties':['Policies'],'attributes':[]}
+        cfn.validate_templates('identity',a,b,r)
+        for widen in ({'Resource':prefix+'role/ezil/mum/*'},{'Action':['iam:CreateRole','iam:PassRole']},{'Condition':{}}):
+            c=json.loads(json.dumps(b));c['Resources']['ExecRole']['Properties']['Policies'][0]['PolicyDocument']['Statement'][1].update(widen)
+            with self.assertRaises(ValueError):cfn.validate_templates('identity',a,c,r)
+
     def test_new_boundary_must_copy_every_shared_global_deny(self):
-        a,b,r=self.templates();b['Resources']['ImageJobBoundary']['Properties']['PolicyDocument']['Statement'].pop(0)
+        a,b,r=self.templates();stmts=b['Resources']['ImageJobBoundary']['Properties']['PolicyDocument']['Statement']
+        removed=stmts.pop(0)
+        # Removing a deny is a widening only when the boundary allows any of its actions; allow them.
+        acts=removed.get('Action') or ['*'];acts=[acts] if isinstance(acts,str) else acts
+        stmts.append({'Effect':'Allow','Action':acts,'Resource':'*'})
         with self.assertRaises(ValueError):cfn.validate_templates('identity',a,b,r)
 
 

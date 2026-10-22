@@ -37,7 +37,7 @@ export class ComputerLifecycle extends Construct {
         // Step Functions docs: an encrypted state machine with logging needs vended-log delivery to decrypt.
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal('delivery.logs.amazonaws.com')],actions:['kms:Decrypt'],resources:['*']}));
         const helperLogs=new logs.LogGroup(this,'HelperLogs',{encryptionKey:key,retention:logs.RetentionDays.ONE_WEEK,removalPolicy:RemovalPolicy.RETAIN});
-        const helper=new nodejs.NodejsFunction(this,'Observer',{entry:join(__dirname,'lifecycle/helper.ts'),handler:'handler',runtime:lambda.Runtime.NODEJS_24_X,
+        const helper=new nodejs.NodejsFunction(this,'Observer',{currentVersionOptions:{removalPolicy:RemovalPolicy.RETAIN},entry:join(__dirname,'lifecycle/helper.ts'),handler:'handler',runtime:lambda.Runtime.NODEJS_24_X,
             timeout:Duration.seconds(55),memorySize:256,...(props.lambdaReservedConcurrency===null?{}:{reservedConcurrentExecutions:props.lambdaReservedConcurrency??2}),logGroup:helperLogs,
             depsLockFilePath:join(__dirname,'../package-lock.json'),bundling:{minify:true,sourceMap:false,externalModules:[]},
             environment:{EZIL_LIFECYCLE_SETTINGS:JSON.stringify(s)}});

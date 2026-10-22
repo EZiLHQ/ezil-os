@@ -191,6 +191,113 @@ class LowerTests(unittest.TestCase):
                     LOWERS.validate(lowers, config, current, previous)
 
 
+class SharedDenyInclusionTests(unittest.TestCase):
+    """The image-job boundary must refuse everything a shared global deny refuses (A2)."""
+    def setUp(self):
+        import rebase_cloudformation
+        self.inc = rebase_cloudformation.includes_deny
+        self.backup = {"Action": "ec2:CreateTags", "Effect": "Deny", "Resource": "*",
+                       "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": ["ezil:backup"]}, "Null": {"ec2:CreateAction": "true"}}}
+        self.attr = {"Action": "ec2:DescribeInstanceAttribute", "Effect": "Deny", "Resource": "arn:aws:ec2:r:a:instance/*",
+                     "Condition": {"StringNotEquals": {"aws:ResourceTag/ezil:stage": "mum"}}}
+        self.allow_tags = {"Action": ["ec2:CreateSnapshot", "ec2:CreateTags"], "Effect": "Allow", "Resource": "*"}
+
+    def test_identical_deny(self):
+        self.assertTrue(self.inc([self.allow_tags, dict(self.backup)], self.backup))
+
+    def test_superset_tag_keys_is_broader(self):
+        wider = json.loads(json.dumps(self.backup)); wider["Condition"]["ForAnyValue:StringEquals"]["aws:TagKeys"] += ["ezil:purpose"]
+        self.assertTrue(self.inc([self.allow_tags, wider], self.backup))
+
+    def test_subset_or_changed_condition_is_refused(self):
+        narrower = json.loads(json.dumps(self.backup)); narrower["Condition"]["ForAnyValue:StringEquals"]["aws:TagKeys"] = ["ezil:purpose"]
+        self.assertFalse(self.inc([self.allow_tags, narrower], self.backup))
+        other = json.loads(json.dumps(self.backup)); other["Condition"]["Null"] = {"ec2:CreateAction": "false"}
+        self.assertFalse(self.inc([self.allow_tags, other], self.backup))
+        resource = json.loads(json.dumps(self.backup)); resource["Resource"] = "arn:aws:ec2:r::snapshot/*"
+        self.assertFalse(self.inc([self.allow_tags, resource], self.backup))
+
+    def test_never_allowed_action_is_implicitly_denied(self):
+        self.assertTrue(self.inc([self.allow_tags], self.attr))
+
+    def test_allowed_action_without_deny_is_refused(self):
+        self.assertFalse(self.inc([self.allow_tags], self.backup))
+        wildcard = {"Action": "ec2:Describe*", "Effect": "Allow", "Resource": "*"}
+        self.assertFalse(self.inc([wildcard], self.attr))
+        self.assertFalse(self.inc([{"NotAction": "iam:*", "Effect": "Allow", "Resource": "*"}], self.attr))
+
+
+class AsciiViewTests(unittest.TestCase):
+    def test_live_question_mark_equals_synthesized_section_sign(self):
+        import rebase_cloudformation as c
+        self.assertEqual(c.ascii_view({'Description': 'boundary (doc \u00a75)'}), {'Description': 'boundary (doc ?5)'})
+        self.assertNotEqual(c.ascii_view('doc ?5'), c.ascii_view('doc ?6'))
+
+
+class DependentVersionReviewTests(unittest.TestCase):
+    """CloudFormation reports a published version Modify when only its state machine changed."""
+    def docs(self, review_extra):
+        import rebase_cloudformation as c
+        machine = {'Type': 'AWS::StepFunctions::StateMachine', 'Properties': {'DefinitionString': 'a'}}
+        version = {'Type': 'AWS::StepFunctions::StateMachineVersion', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain',
+                   'Properties': {'StateMachineArn': {'Ref': 'Wf'}, 'StateMachineRevisionId': {'Fn::GetAtt': ['Wf', 'StateMachineRevisionId']}}}
+        role = lambda: {'Type': 'AWS::IAM::Role', 'Properties': {'PermissionsBoundary': 'arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary'}}
+        before = {'Resources': {'Wf': machine, 'Ver': version, 'PrepRebasePreparationRole1': role(), 'RecoveryRecoveryRole1': role()}}
+        after = json.loads(json.dumps(before)); after['Resources']['Wf']['Properties']['DefinitionString'] = 'b'
+        review = {'schemaVersion': 1, 'changes': {'Wf': {'action': 'Modify', 'properties': ['DefinitionString'], 'attributes': []}, **review_extra}}
+        return c, before, after, review
+
+    def test_dependent_version_entry_is_accepted(self):
+        c, b, a, r = self.docs({'Ver': {'action': 'Modify', 'properties': ['StateMachineRevisionId'], 'attributes': []}})
+        self.assertIn('Ver', c.validate_templates('workflows-test', b, a, r))
+
+    def test_other_extra_entries_are_refused(self):
+        c, b, a, r = self.docs({'Ver': {'action': 'Modify', 'properties': ['StateMachineArn'], 'attributes': []}})
+        with self.assertRaises(ValueError): c.validate_templates('workflows-test', b, a, r)
+        c, b, a, r = self.docs({'Ver': {'action': 'Modify', 'properties': ['StateMachineRevisionId'], 'attributes': []}})
+        a['Resources']['Wf']['Properties']['DefinitionString'] = 'a'; r['changes'].pop('Wf')
+        with self.assertRaises(ValueError): c.validate_templates('workflows-test', b, a, r)
+
+
+class RecoveryAddTypesTests(DependentVersionReviewTests):
+    def test_recovery_operational_resources_may_only_be_added(self):
+        c, b, a, r = self.docs({})
+        a['Resources']['RecoveryQueue1'] = {'Type': 'AWS::SQS::Queue', 'Properties': {}}
+        r['changes']['RecoveryQueue1'] = {'action': 'Add', 'properties': [], 'attributes': []}
+        self.assertIn('RecoveryQueue1', c.validate_templates('workflows', b, a, r))
+        b2 = json.loads(json.dumps(b)); b2['Resources']['RecoveryQueue1'] = {'Type': 'AWS::SQS::Queue', 'Properties': {'X': 1}}
+        r2 = json.loads(json.dumps(r)); r2['changes']['RecoveryQueue1'] = {'action': 'Modify', 'properties': ['X'], 'attributes': []}
+        with self.assertRaises(ValueError): c.validate_templates('workflows', b2, a, r2)
+        a3 = json.loads(json.dumps(a)); a3['Resources']['OtherQueue1'] = a3['Resources'].pop('RecoveryQueue1')
+        r3 = json.loads(json.dumps(r)); r3['changes']['OtherQueue1'] = r3['changes'].pop('RecoveryQueue1')
+        with self.assertRaises(ValueError): c.validate_templates('workflows', b, a3, r3)
+
+
+class KmsGrantWildcardTests(DependentVersionReviewTests):
+    def build(self, resource):
+        c, b, a, r = self.docs({})
+        a['Resources']['RecoveryHistoryKey1'] = {'Type': 'AWS::KMS::Key', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain',
+                                                 'Properties': {'EnableKeyRotation': True, 'Tags': [{'Key': 'ezil:namespace', 'Value': 'mum'}]}}
+        a['Resources']['RecoveryRolePolicy1'] = {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyDocument': {'Statement': [
+            {'Effect': 'Allow', 'Action': ['kms:Decrypt', 'kms:GenerateDataKey*', 'kms:ReEncrypt*'], 'Resource': resource}]}}}
+        for k in ('RecoveryHistoryKey1', 'RecoveryRolePolicy1'): r['changes'][k] = {'action': 'Add', 'properties': [], 'attributes': []}
+        return c, b, a, r
+
+    def test_cdk_key_grant_on_own_key_is_accepted(self):
+        c, b, a, r = self.build({'Fn::GetAtt': ['RecoveryHistoryKey1', 'Arn']})
+        self.assertIn('RecoveryRolePolicy1', c.validate_templates('workflows', b, a, r))
+
+    def test_other_key_additions_are_refused(self):
+        c, b, a, r = self.build({'Fn::GetAtt': ['RecoveryHistoryKey1', 'Arn']})
+        a['Resources']['RecoveryHistoryKey1']['Properties']['EnableKeyRotation'] = False
+        with self.assertRaises(ValueError): c.validate_templates('workflows', b, a, r)
+
+    def test_wildcards_on_any_other_resource_are_refused(self):
+        for resource in ('*', 'arn:aws:kms:ap-south-1:452630323510:key/other', {'Fn::GetAtt': ['Wf', 'Arn']}):
+            c, b, a, r = self.build(resource)
+            with self.assertRaises(ValueError): c.validate_templates('workflows', b, a, r)
+
+
 class TemplateTests(unittest.TestCase):
     def test_only_exact_previous_definitions_and_bindings(self):
         parts = json.loads((HERE / 'fixtures/ami-previous-bindings.json').read_text())
