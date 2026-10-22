@@ -142,7 +142,7 @@ def ami_template(old_path, candidate_path, before_path, after_path):
              {k: v for k, v in proposed.items() if k != "Properties"}, "unexpected resource attributes: " + logical)
         a, b = resource.get("Properties", {}), proposed.get("Properties", {})
         need(a.keys() == b.keys(), "unexpected property addition/removal: " + logical)
-        delta = {key for key in a if a[key] != b[key]}
+        delta = {key for key in a if ascii_view(a[key]) != ascii_view(b[key])}
         if kind in (types["Component"], types["ImageRecipe"]):
             need(a.get("Version") == previous_version, "live recipe/component version differs from local config")
             need(b.get("Version") == next_version, "synthesized recipe/component version mismatch")
@@ -156,6 +156,18 @@ def ami_template(old_path, candidate_path, before_path, after_path):
                  "configuration change is not forced by the version string: " + logical)
         changes[logical] = delta
     return old, changes
+
+
+def ascii_view(value):
+    """CloudFormation stores the live template with non-ASCII characters as '?'
+    (e.g. a description's '…'), so compare synthesized values the same way."""
+    if isinstance(value, str):
+        return value.encode("ascii", "replace").decode("ascii")
+    if isinstance(value, list):
+        return [ascii_view(v) for v in value]
+    if isinstance(value, dict):
+        return {k: ascii_view(v) for k, v in value.items()}
+    return value
 
 
 def versioned_ami_changes(cs, resources, template_changes):

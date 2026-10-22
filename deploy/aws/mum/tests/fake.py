@@ -61,6 +61,9 @@ elif tool in ("npm", "npx", "sleep"):
         resources = value["Resources"]
         for logical in ("Component", "Recipe"):
             resources[logical]["Properties"]["Version"] = config["version"]
+        if scenario.get("non_ascii_data"):
+            # Live template holds '?' where the source has '…'; synth emits the original.
+            resources["Component"]["Properties"]["Data"] = resources["Component"]["Properties"]["Data"].replace("?", "\u2026")
         if scenario.get("large_template"):
             resources["Component"]["Properties"]["Data"] += "x" * scenario["large_template"]
         if scenario.get("template_iam"):

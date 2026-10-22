@@ -34,7 +34,7 @@ save("stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", **({} if json.
 save("ami-config.json", {"namespace": "mum", "accountId": "452630323510", "region": "ap-south-1", "version": "1.0.1"})
 shutil.copyfile(root / "ami-config.json", root / "original-ami-config.json")
 save("template.json", {"TemplateBody": {"Parameters": {k: {"Type": "String"} for k in params}, "Resources": {
-    "Component": {"Type": "AWS::ImageBuilder::Component", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1", "Data": "synthetic component"}},
+    "Component": {"Type": "AWS::ImageBuilder::Component", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1", "Data": "synthetic component (config digest sha256:?)"}},
     "Recipe": {"Type": "AWS::ImageBuilder::ImageRecipe", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1"}},
     "Pipeline": {"Type": "AWS::ImageBuilder::ImagePipeline", "Properties": {"ImageRecipeArn": {"Ref": "Recipe"}}},
     "Infrastructure": {"Type": "AWS::ImageBuilder::InfrastructureConfiguration", "Properties": {"Name": "ezil-host-mum", "SubnetId": {"Ref": "SubnetId"}}},
