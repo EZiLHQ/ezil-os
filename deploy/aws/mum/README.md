@@ -6,7 +6,8 @@ identity/stack/version metadata and, for rebuild, the local Docker image. It
 prints proposed writes without logging in to ECR, pushing, uploading, changing
 the real configuration, creating a change set, or fetching the app secret.
 With `--recipe-version`, rebuild also writes a temporary candidate config and
-runs the offline AMI synth. Temporary files are removed on exit. Run locally
+runs the offline AMI synth. Promotion always synthesizes both its baseline and
+candidate, including in dry-run. Temporary files are removed on exit. Run locally
 with fake commands for an entirely offline check.
 
 ## Recipe version updates
@@ -23,15 +24,20 @@ The synth mechanism comes from `infra/app-computers/package.json`'s
 existing `EZIL_AMI_CONFIG` variable, `node --import tsx bin/ami.ts`, and a
 `BootstraplessSynthesizer`; no publish-assets or bootstrap step is needed.
 The package script disables credential-file access, metadata credentials,
-lookups and telemetry. Rebuild invokes it with an isolated assembly directory:
+lookups and telemetry. Rebuild copies `bin/`, `lib/`, and the four package/CDK/
+TypeScript metadata files to a private directory, and links the already installed
+`node_modules`. It never copies operator configs or credentials. It invokes:
 
 ```bash
-EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" \
-  run synth:ami -- ezil-mum-ami --output "$work/cdk.out"
+EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$work/ami/app-computers" \
+  run synth:ami -- ezil-mum-ami
 ```
 
-Here `$work` is the script's private temporary directory, and the final
-`--output` overrides the package script's default `cdk.out/ami`. The resulting
+Here `$work` is the script's private temporary directory. The package script pins
+`-o cdk.out/ami`; **do not add another `--output`** (CDK rejects it). npm runs with
+the private project as its working directory, so the output is
+`$work/ami/app-computers/cdk.out/ami`. The repository's `cdk.out` is never touched.
+The resulting
 `ezil-mum-ami.template.json` is compared with the live stack template before any
 uploads. Resource identities, parameters, outputs and all unrelated properties
 must remain unchanged. Component `Version`/`Data` and recipe `Version` may
@@ -77,24 +83,39 @@ Defaults:
 | Lifecycle stack | `ezil-mum-lifecycle` |
 | ECR repository | `452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6` |
 | Asset bucket | `ezil-mum-deploy-assets-452630323510` |
-| CloudFormation role | `arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec` |
+| Lifecycle CloudFormation role | `arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec` |
 | AMI config | `/root/ezil-aws-mum/config/ami.mum.json` |
 | Lifecycle config | `/root/ezil-aws-mum/config/lifecycle.mum.json` |
 | Release evidence | `/root/ezil-aws-mum/release/next/` |
 | App secret | `ezil-os/billing-staging/app` |
+| Operator lock | `/root/ezil-aws-mum/locks/operator.lock` |
+| App-secret lock | `/root/ezil-aws-mum/locks/app-secret.lock` |
 
 The role ARN follows `identityNames()` in
 `infra/app-computers/lib/identity.ts`, including `/ezil/identity/`.
+The AMI stack currently has **no RoleARN**: rebuild omits `--role-arn`, retaining
+caller-credential execution. It passes the execution role only when the AMI
+stack is already bound to that exact role; any other role is refused. Promotion
+requires the lifecycle stack and its change set to use the execution role.
 `--config` (either script) and `--release-dir` accept alternate local paths for
 isolated tests or an explicitly selected release. They do not change AWS targets.
-There are no new environment variables or secret names. Keep a single operator
-and a shared release directory; its lock serializes local applies. Also exclude
-independent lifecycle publishers and app secret writers during promotion.
+There are no new environment variables or secret names. Both scripts acquire the
+common operator `flock` before reading shared configuration, journals or synth
+inputs, for dry-run and apply. It is independent of the release directory and
+checkout, is held for the whole run, and fails immediately on contention.
+Do not unlink a lock file. Independent lifecycle publishers must also take the
+operator lock; the version recheck cannot exclude a publisher that ignores it.
+The rebuild already running from the older checkout does not use this new lock:
+wait for it to finish before using the new scripts.
 
 Rebuild resolves the source to a full commit, inspects the local image, tags its
 immutable image ID as `host-<sha12>-<UTC YYYYMMDDhhmmss>`, and pushes it. ECR's
-schema-2/OCI manifest digest pins the image; `manifest.config.digest` must equal
-the local Docker image ID. Image indexes are refused. Temporary Docker login
+schema-2/OCI manifest digest pins the image. A classic Docker store's local ID
+must match `manifest.config.digest`; a containerd store's ID may instead match
+the pushed manifest digest. A containerd index is accepted only when its digest
+matches the local ID and it contains exactly one `linux/amd64` image plus
+attestation manifests only. Multi-platform indexes are refused. Both AMI image
+parameters pin the selected child's digest for an accepted index. Temporary Docker login
 configuration is removed on exit. The archive command is:
 
 ```bash
@@ -127,8 +148,9 @@ with the live stack and use a fresh release directory for each successful update
 
    ```bash
    bash deploy/aws/mum/tests/run.sh
-   for script in deploy/aws/mum/*.sh deploy/aws/mum/tests/*.sh; do bash -n "$script"; done
+   for script in deploy/aws/mum/*.sh deploy/aws/mum/tests/*.sh; do bash -n "$script" || exit 1; done
    npm --prefix infra/app-computers ci
+   python3 deploy/aws/mum/tests/synth-contract.py
    ```
 
 2. Obtain the reviewed desktop build from the desktop lane. Choose its local
@@ -168,10 +190,30 @@ with the live stack and use a fresh release directory for each successful update
 
    Promotion obtains the maximum published version number (not the locally
    configured number) and proposes `N+1`. It saves `promotion.json` containing
-   the previous and target non-secret configs before editing the config. It
-   runs the documented `npm run synth:lifecycle`, `cdk publish-assets`, S3
-   template upload, and CloudFormation UPDATE change-set workflow through the
-   execution role. It refuses replacement/removal of durable lifecycle resources,
+   the previous and target non-secret configs. Using `bin/lifecycle.ts` via
+   `npm run synth:lifecycle`, it synthesizes baseline and candidate in separate
+   private copies under `$work/before/app-computers` and
+   `$work/target/app-computers`. Each uses its existing `cdk.out/lifecycle` default.
+   The live template must match the baseline synth, and the configs may differ
+   only in `amiId` and the predicted `stateMachineVersionArn`. The validator derives
+   the resource/property allow-list from those synths, accepts only forced
+   Lambda environment/state-machine definition differences, and refuses all
+   IAM, S3, KMS, nested-stack and other resource changes, additions, removals,
+   replacements, unrelated properties, metadata, outputs or parameters.
+   **The current CDK app requires IAM policy changes and new Lambda version
+   resources for an AMI promotion. The strict lane contract therefore blocks
+   that real promotion before publishing assets, editing the live config or
+   creating a change set.** The lead must resolve that contract/implementation
+   conflict in a separately reviewed change; do not bypass this validator.
+
+   For an admissible candidate, the script saves both synths and the live template
+   in the release evidence, edits the config, then runs `cdk publish-assets` from
+   the candidate's private copy, S3 template upload, and CloudFormation UPDATE
+   through the execution role. Every live parameter uses its previous value.
+   Before execution, it verifies CloudFormation's submitted template matches the
+   candidate, checks each change-set property against the allow-list, refuses
+   all replacements and unexplained/dynamic changes, checks parameter/resolved
+   SSM values,
    rechecks version publication before execution, and requires the deployed
    `WorkflowVersionArn` to match the predicted published version.
 
@@ -181,9 +223,26 @@ with the live stack and use a fresh release directory for each successful update
    retain their encoding type; the deployed app renderer expects the existing
    string encoding. Other regions, deployment fields and outer secret keys are
    preserved. Payloads stay in memory, go to AWS via stdin, and are never put in
-   logs, argv, journals or files. Read-back verifies the result. AWS has no
-   compare-and-swap for `PutSecretValue`; a VersionId recheck reduces but cannot
-   eliminate races with independent writers. Serialize them operationally.
+   logs, argv, journals or files. The entire read/modify/write/read-back operation
+   holds `/root/ezil-aws-mum/locks/app-secret.lock` using `flock(2)`. It re-reads
+   VersionId immediately before `put-secret-value`, then verifies both the returned
+   version and complete payload. Promotion and rollback use the same lock even
+   when run from different checkouts/releases.
+
+   **Every other writer**, including the lead's `set-staging-key.py`, must hold
+   the same lock from its first secret read through its final verification. Run
+   the complete command on this operator host through the supplied wrapper:
+
+   ```bash
+   bash deploy/aws/mum/with-app-secret-lock.sh python3 /path/to/set-staging-key.py <existing-arguments>
+   ```
+
+   Replace the example path/arguments with the lead's existing command; keep secret
+   values out of argv. Do not wrap `promote-ami.sh` or `json-tool.py secret-update`
+   in it: those acquire the lock internally. Lock order is operator then app-secret.
+   AWS has no compare-and-swap for `PutSecretValue`: writers on other hosts or
+   writers that ignore this lock remain unsafe and must be routed through this
+   host/wrapper. Installing these files does not retrofit external writers.
 
 5. Refresh the staging app so it loads the updated secret. Use the existing
    staging install procedure with its already configured
@@ -211,8 +270,8 @@ Keep `release/next/previous-ami-config.json` (the old recipe version),
 snapshots, lifecycle versions
 and referenced Lambda versions until canaries and rollback checks finish. After
 success, archive the entire release directory before starting a new promotion;
-an existing journal is deliberately not overwritten. Keep the default directory
-in place while either script holds its lock.
+an existing journal is deliberately not overwritten. Keep the common lock files
+in place permanently; archiving a release does not rotate them.
 
 A recipe update does not promote an AMI. If it fails, leave the old AMI and
 published lifecycle version in service. If CloudFormation succeeds but the
@@ -224,10 +283,8 @@ The old config backup records the previous version; it is not a command to
 recreate that immutable version. CloudFormation controls replacement cleanup
 of the old recipe/component; these scripts retain AMIs, snapshots and lifecycle
 versions and do not delete them. Use a fresh, greater recipe version for a later
-rebuild. Config and stack writers using different release directories are not
-serialized by the local release lock; exclude them operationally.
+rebuild. Different release directories and checkouts share the operator lock.
 
-The existing `promote-ami.sh --rollback` behavior is unchanged.
 Rollback restores the **previous configured/published pair**, even when that
 version was older than the maximum published version at promotion. It never
 computes rollback by subtracting one. Run:
@@ -239,16 +296,18 @@ AWS_PROFILE=ezil-admin AWS_REGION=ap-south-1 bash deploy/aws/os-staging/deploy.s
 AWS_PROFILE=ezil-admin AWS_REGION=ap-south-1 bash deploy/aws/os-staging/deploy.sh smoke
 ```
 
-Rollback deploys the prior lifecycle configuration using the same change-set
-mechanism, then restores only the two app-secret fields. CloudFormation may
-publish another version while restoring the stack; the app is deliberately
-pinned back to the retained **original previous** version. The script checks it
+Rollback validates the prior lifecycle configuration using the same strict
+allow-list and change-set mechanism, then restores only the two app-secret
+fields. Rollbacks requiring IAM changes or resource replacement are also refused.
+A verified no-op can restore the app pair without redeploying. The app is
+deliberately pinned back to the retained **original previous** version. The script checks it
 still exists. The lead must also verify its referenced Lambda versions and IAM
 permissions remain usable before enabling new admissions; version existence
 alone does not prove execution health.
 
-For promotion, a failed synth/deploy leaves the journal and the edited local
-config; the app secret remains unchanged. A failure after secret write can leave the target
+For promotion, a failed synth or template validation leaves the journal and the
+original config; the app secret remains unchanged. A later failed deploy leaves
+the journal and edited local config. A failure after secret write can leave the target
 pair active, so inspect the failure stage and use the saved journal. Rollback
 accepts the app secret already at either complete pair, refuses a mixed/drifted
 pair, and refuses unrelated local config changes. If rollback's CloudFormation
@@ -283,6 +342,16 @@ on PATH, with synthetic data under `/tmp`. It covers dry-run sequencing,
 parameter coverage, image identity, account/region guards, forbidden changes,
 immutable recipes, explicit version replacements, synth/change-set allowlists,
 inline/S3 template selection, delayed config persistence, polling outcomes,
-promotion/rollback, and secret preservation and drift. No live AWS, Docker,
+promotion/rollback, strict lifecycle template/change-set allow-lists, private
+synth directories, cross-checkout/operator locks, real concurrent app-secret
+writers, killed-wrapper lock inheritance, and secret preservation and drift.
+`tests/locking.py` uses real local processes and flock with synthetic data.
+No live AWS, Docker,
 Chromium, secret access, actual CDK synth or bake is covered by these tests;
 those remain lead checks.
+
+`python3 deploy/aws/mum/tests/synth-contract.py` is a separate optional offline
+CDK check using only the repository example config and installed dependencies.
+It synthesizes two isolated assemblies, confirms the current IAM/Lambda-version
+changes, and verifies the strict validator refuses them. This is evidence of the
+contract conflict, not a live Mumbai template validation.

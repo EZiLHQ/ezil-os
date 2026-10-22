@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Strict JSON transforms for the M5 scripts. Secret payloads stay in memory."""
 import copy
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 import re
@@ -15,6 +17,7 @@ KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
 SECRET = "ezil-os/billing-staging/app"
 ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/ezil/identity/ezil-mum-cfn-exec"
+APP_SECRET_LOCK = "/root/ezil-aws-mum/locks/app-secret.lock"
 
 
 def need(ok, message):
@@ -266,9 +269,93 @@ def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths)
                  "immutable Image Builder recipe replacement: contract needs a reviewed recipe version bump; refusing execution")
 
 
-def secret_aws(args, payload=None):
+def lifecycle_template(live_path, baseline_path, candidate_path, before_path, after_path, rollback="false"):
+    """Derive an allow-list from two synths; reject code/config drift from live.
+
+    The lane contract forbids ALL IAM changes and resource replacements, even
+    when this CDK app requires them to publish a version. Do not silently expand
+    the allow-list to make a real promotion pass.
+    """
+    before, after = read(before_path), read(after_path)
+    old_pair, new_pair = pair(before), pair(after)
+    expected = copy.deepcopy(before)
+    expected["settings"]["deployment"].update(new_pair)
+    need(expected == after, "unexpected lifecycle config change outside AMI/version pair")
+    live, baseline, candidate = template(live_path), read(baseline_path), read(candidate_path)
+    # A failed promotion can leave the stack at the rollback target already.
+    if rollback == "true" and ascii_view(live) == ascii_view(candidate):
+        return live, candidate, {}
+    need(ascii_view(live) == ascii_view(baseline), "live lifecycle template differs from baseline synth; reconcile drift separately")
+    need({k: v for k, v in baseline.items() if k != "Resources"} ==
+         {k: v for k, v in candidate.items() if k != "Resources"}, "unexpected lifecycle template parameter/output/metadata change")
+    old, new = baseline["Resources"], candidate["Resources"]
+    need(old.keys() == new.keys(), "lifecycle resource addition/removal refused (including published Lambda versions)")
+    allowed = {"AWS::Lambda::Function": {"Environment"}, "AWS::StepFunctions::StateMachine": {"DefinitionString"}}
+    changes = {}
+    for logical, resource in old.items():
+        proposed = new[logical]
+        if resource == proposed:
+            continue
+        kind = resource["Type"]
+        need(kind in allowed and proposed["Type"] == kind, "lifecycle resource change refused: " + logical + " " + kind)
+        need({k: v for k, v in resource.items() if k != "Properties"} ==
+             {k: v for k, v in proposed.items() if k != "Properties"}, "unexpected lifecycle resource attributes: " + logical)
+        a, b = resource.get("Properties", {}), proposed.get("Properties", {})
+        need(a.keys() == b.keys(), "lifecycle property addition/removal refused: " + logical)
+        delta = {key for key in a if a[key] != b[key]}
+        need(delta and delta <= allowed[kind], "unexpected lifecycle property change: " + logical)
+        for key in delta:
+            forced = copy.deepcopy(a[key])
+            for field in old_pair:
+                forced = replace_version(forced, old_pair[field], new_pair[field])
+            need(forced == b[key], "lifecycle change is not forced by AMI/version pair: " + logical)
+        changes[logical] = delta
+    return live, candidate, changes
+
+
+def lifecycle_changeset(cs_path, stack_path, *template_paths):
+    live, candidate, allowed = lifecycle_template(*template_paths)
+    cs = read(cs_path)
+    check_changeset(cs)
+    need(cs.get("RoleARN") == ROLE, "lifecycle change set must use its execution role")
+    previous = mapping(stack(stack_path).get("Parameters", []))
+    actual = mapping(cs.get("Parameters", []))
+    need(previous.keys() == actual.keys(), "lifecycle parameter coverage mismatch")
+    for key, old in previous.items():
+        value = actual[key]
+        need(value.get("ParameterValue", old.get("ParameterValue") if value.get("UsePreviousValue") else None) == old.get("ParameterValue") and
+             value.get("ResolvedValue") == old.get("ResolvedValue"), "lifecycle parameter/resolved SSM change refused")
+    seen = set()
+    for change in cs["Changes"]:
+        need(change.get("Type") == "Resource", "unexpected lifecycle non-resource change")
+        r = change["ResourceChange"]
+        logical = r["LogicalResourceId"]
+        need(logical in allowed and logical not in seen and r["Action"] == "Modify", "unexpected lifecycle resource change")
+        seen.add(logical)
+        need(r["ResourceType"] == candidate["Resources"][logical]["Type"], "lifecycle resource type mismatch")
+        need(r.get("Replacement") == "False", "lifecycle resource replacement refused")
+        need(set(r.get("Scope", [])) == {"Properties"} and r.get("Details"), "unexplained lifecycle resource change")
+        targets = set()
+        for detail in r["Details"]:
+            target = detail["Target"]
+            name = target.get("Name")
+            need(target.get("Attribute") == "Properties" and name in allowed[logical] and
+                 target.get("RequiresRecreation") == "Never" and detail.get("ChangeSource") == "DirectModification" and
+                 detail.get("Evaluation", "Static") == "Static" and not detail.get("CausingEntity"), "unexpected lifecycle property change")
+            targets.add(name)
+        need(targets == allowed[logical], "change set omits synthesized lifecycle property changes")
+        for context, expected in (("BeforeContext", live), ("AfterContext", candidate)):
+            if context in r:
+                body = json.loads(r[context])
+                need(ascii_view(body["Properties"]) == ascii_view(expected["Resources"][logical]["Properties"]), "lifecycle change-set values differ from synthesized template")
+        print(r["Action"], logical, r["ResourceType"], r["Replacement"])
+    need(seen == allowed.keys(), "change set omits synthesized lifecycle resource changes")
+
+
+def secret_aws(args, payload=None, lock_fd=None):
     command = ["aws", "--profile", "ezil-admin", "--region", REGION, "--no-cli-pager", "secretsmanager", *args]
-    result = subprocess.run(command, input=payload, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=90)
+    result = subprocess.run(command, input=payload, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=90,
+                            pass_fds=() if lock_fd is None else (lock_fd,))
     # Do not relay AWS stderr: a validation error can contain request material.
     need(result.returncode == 0, "Secrets Manager command failed (details suppressed)")
     return json.loads(result.stdout)
@@ -289,17 +376,38 @@ def edit_secret(envelope, before, after):
     return outer
 
 
+@contextmanager
+def app_secret_lock():
+    # flock(2), shared with with-app-secret-lock.sh and every external writer.
+    os.makedirs(os.path.dirname(APP_SECRET_LOCK), mode=0o700, exist_ok=True)
+    fd = os.open(APP_SECRET_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def secret_update(before_path, after_path, apply):
+    with app_secret_lock() as fd:
+        _secret_update(before_path, after_path, apply, fd)
+
+
+def _secret_update(before_path, after_path, apply, lock_fd):
+    def aws(args, payload=None):
+        return secret_aws(args, payload, lock_fd=lock_fd)
+
     before, after = pair(read(before_path)), pair(read(after_path))
-    envelope = secret_aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
+    envelope = aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
     updated = edit_secret(envelope, before, after)
     if apply:
-        check = secret_aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
-        need(check["VersionId"] == envelope["VersionId"], "secret changed during promotion; rerun after review")
         request = {"SecretId": SECRET, "SecretString": json.dumps(updated, separators=(",", ":"))}
-        secret_aws(["put-secret-value", "--cli-input-json", "file:///dev/stdin", "--output", "json"], json.dumps(request))
-        verify = secret_aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
-        need(json.loads(verify["SecretString"]) == updated, "secret verification failed")
+        payload = json.dumps(request)
+        check = aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
+        need(check["VersionId"] == envelope["VersionId"], "secret changed during promotion; rerun after review")
+        written = aws(["put-secret-value", "--cli-input-json", "file:///dev/stdin", "--output", "json"], payload)
+        verify = aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
+        need(verify["VersionId"] == written["VersionId"] and json.loads(verify["SecretString"]) == updated, "secret verification failed")
     print("App deployment fields verified" if not apply else "App deployment fields updated and verified")
 
 
@@ -402,22 +510,31 @@ def main(args):
     elif op == "published":
         need(a[1] in versions(a[0]), "expected lifecycle version not published")
     elif op == "lifecycle-changeset":
-        cs = read(a[0]); check_changeset(cs)
-        # Named stack, existing reviewed CDK source. Show resource-only summary;
-        # reject deletion/replacement of durable resources before execution.
-        durable = {"AWS::KMS::Key", "AWS::Logs::LogGroup", "AWS::SQS::Queue", "AWS::StepFunctions::StateMachine"}
-        for c in cs["Changes"]:
-            r = c["ResourceChange"]
-            need(r["ResourceType"] not in durable or (r["Action"] == "Modify" and r.get("Replacement") == "False"), "durable lifecycle resource replacement/removal refused")
-            print(r["Action"], r["LogicalResourceId"], r["ResourceType"], r.get("Replacement", ""))
+        lifecycle_changeset(*a)
+    elif op == "lifecycle-template":
+        lifecycle_template(*a)
+    elif op == "lifecycle-equal":
+        need(ascii_view(template(a[0])) == ascii_view(read(a[1])), "submitted lifecycle template mismatch")
+    elif op == "lifecycle-parameters":
+        current = stack(a[0])
+        need(current.get("RoleARN") == ROLE, "lifecycle stack must use its execution role")
+        write(a[1], [{"ParameterKey": key, "UsePreviousValue": True} for key in mapping(current.get("Parameters", []))])
     elif op == "lifecycle-noop":
         cs = read(a[0])
         reason = cs.get("StatusReason", "")
-        need(cs.get("Status") == "FAILED" and cs.get("ExecutionStatus") == "UNAVAILABLE" and not cs.get("Changes") and
+        need(not cs.get("NextToken") and cs.get("RoleARN") == ROLE and
+             cs.get("Status") == "FAILED" and cs.get("ExecutionStatus") == "UNAVAILABLE" and not cs.get("Changes") and
              ("didn't contain changes" in reason or "No updates are to be performed" in reason), "failed change set is not a verified no-op")
         print("Rollback stack already matches the previous configuration; restoring app deployment fields")
     elif op in ("secret-check", "secret-update"):
         secret_update(*a, apply=op == "secret-update")
+    elif op == "with-app-secret-lock":
+        need(bool(a), "Usage: with-app-secret-lock.sh <cmd> [args...]")
+        with app_secret_lock() as fd:
+            # The parent retains the lock until the complete command has exited.
+            # Inherit it too: killing the wrapper must not unlock a live writer.
+            result = subprocess.run(a, check=False, pass_fds=(fd,)).returncode
+            sys.exit(result if result >= 0 else 128 - result)
     else:
         raise ValueError("unknown operation")
 

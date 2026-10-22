@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Offline command doubles. All state and synthetic secrets live in the test tempdir."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 root = Path(sys.argv[0]).absolute().parent.parent
 tool = Path(sys.argv[0]).name
@@ -28,6 +30,27 @@ def save(name, value):
     (root / name).write_text(json.dumps(value))
 
 
+def lifecycle_template(config):
+    return {"Parameters": {"Keep": {"Type": "String"}}, "Resources": {
+        "Observer": {"Type": "AWS::Lambda::Function", "Properties": {
+            "Environment": {"Variables": {"EZIL_LIFECYCLE_SETTINGS": json.dumps(config["settings"], separators=(",", ":"))}},
+            "Code": {"S3Bucket": "fixed-assets", "S3Key": "fixed-code.zip"}, "MemorySize": 256}},
+        "Policy": {"Type": "AWS::IAM::Policy", "Properties": {"PolicyDocument": {"Version": "2012-10-17", "Statement": []}}},
+        "Bucket": {"Type": "AWS::S3::Bucket", "Properties": {}},
+        "Key": {"Type": "AWS::KMS::Key", "Properties": {}},
+        "Nested": {"Type": "AWS::CloudFormation::Stack", "Properties": {"TemplateURL": "fixed"}},
+    }}
+
+
+def assert_locked(name):
+    with (root / "locks" / name).open("r+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+    raise AssertionError("required common lock was not held")
+
+
 with (root / "calls.jsonl").open("a") as calls:
     calls.write(json.dumps([tool, *args]) + "\n")
 
@@ -48,10 +71,13 @@ elif tool == "docker":
     elif not any(x in args for x in ("tag", "push")):
         raise SystemExit("unexpected docker command")
 elif tool in ("npm", "npx", "sleep"):
+    if tool in ("npm", "npx"):
+        assert_locked("operator.lock")
     if scenario.get("synth_fail") and tool == "npm":
         raise SystemExit(1)
     if tool == "npm" and "synth:ami" in args:
         assert Path(flag("--prefix")).name == "app-computers"
+        assert str(Path(flag("--prefix"))).startswith("/tmp/ezil-mum.")
         assert args[2:6] == ["run", "synth:ami", "--", "ezil-mum-ami"]
         candidate = Path(os.environ["EZIL_AMI_CONFIG"])
         assert candidate != root / "ami-config.json"
@@ -82,6 +108,38 @@ elif tool in ("npm", "npx", "sleep"):
         output.mkdir(parents=True, exist_ok=True)
         (output / "ezil-mum-ami.template.json").write_text(json.dumps(value))
         save("synth-template.json", value)
+    elif tool == "npm" and "synth:lifecycle" in args:
+        project = Path(flag("--prefix"))
+        assert str(project).startswith("/tmp/ezil-mum.")
+        assert "--output" not in args
+        config = Path(os.environ["EZIL_LIFECYCLE_CONFIG"])
+        phase = config.stem
+        assert phase in ("before", "target")
+        value = lifecycle_template(json.loads(config.read_text()))
+        if scenario.get("lifecycle_template_drift"):
+            value["Resources"]["Observer"]["Properties"]["MemorySize"] = 512
+        if phase == "target":
+            mutation = scenario.get("lifecycle_template_change")
+            if mutation in ("Policy", "Bucket", "Key", "Nested"):
+                value["Resources"][mutation]["Properties"]["Unexpected"] = True
+            elif mutation == "version":
+                value["Resources"]["NewVersion"] = {"Type": "AWS::Lambda::Version", "Properties": {"FunctionName": {"Ref": "Observer"}}}
+            elif mutation == "code":
+                value["Resources"]["Observer"]["Properties"]["Code"]["S3Key"] = "different.zip"
+            elif mutation == "environment":
+                variables = value["Resources"]["Observer"]["Properties"]["Environment"]["Variables"]
+                settings = json.loads(variables["EZIL_LIFECYCLE_SETTINGS"])
+                settings["deployment"]["keep"] = [9]
+                variables["EZIL_LIFECYCLE_SETTINGS"] = json.dumps(settings, separators=(",", ":"))
+            elif mutation == "parameter":
+                value["Parameters"]["Keep"]["Default"] = "changed"
+        output = project / "cdk.out/lifecycle"
+        output.mkdir(parents=True)
+        (output / "ezil-mum-lifecycle.template.json").write_text(json.dumps(value))
+        save("synth-lifecycle-" + phase + ".json", value)
+    elif tool == "npx":
+        assert str(Path.cwd()).startswith("/tmp/ezil-mum.")
+        assert (Path.cwd() / "cdk.out/lifecycle/ezil-mum-lifecycle.template.json").exists()
 elif tool == "timeout":
     assert args[0].endswith("s") and 0 < int(args[0][:-1]) <= 5400
     if scenario.get("poll_timeout"):
@@ -124,17 +182,33 @@ elif tool == "aws":
         if operation == "describe-stacks":
             value = read("stack.json")
             if lifecycle:
+                value["Stacks"][0]["Parameters"] = [{"ParameterKey": "Keep", "ParameterValue": "unchanged", "ResolvedValue": "fixed"}]
+                if scenario.get("lifecycle_no_role"):
+                    value["Stacks"][0].pop("RoleARN", None)
                 value["Stacks"][0]["Outputs"] = [{"OutputKey": "WorkflowVersionArn", "OutputValue": read("config.json")["settings"]["deployment"]["stateMachineVersionArn"]}]
                 if scenario.get("wrong_output"):
                     value["Stacks"][0]["Outputs"][0]["OutputValue"] += "9"
             out(value)
         elif operation == "get-template":
-            value = read("template.json")
-            if scenario.get("live_version_drift"):
+            if lifecycle:
+                if "--change-set-name" in args:
+                    value = {"TemplateBody": read("synth-lifecycle-target.json")}
+                    if scenario.get("lifecycle_submitted_drift"):
+                        value["TemplateBody"]["Resources"]["Observer"]["Properties"]["MemorySize"] = 900
+                else:
+                    if scenario.get("noop_rollback") and (root / "executed").exists():
+                        save("live-lifecycle-config.json", read("original-config.json"))
+                    value = {"TemplateBody": lifecycle_template(read("live-lifecycle-config.json"))}
+            else:
+                value = read("template.json")
+            if not lifecycle and scenario.get("live_version_drift"):
                 value["TemplateBody"]["Resources"]["Recipe"]["Properties"]["Version"] = "1.0.0"
             out(value)
         elif operation == "create-change-set":
-            if not lifecycle:
+            if lifecycle:
+                assert flag("--role-arn") == "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec"
+                assert json.loads(Path(flag("--parameters").removeprefix("file://")).read_text()) == [{"ParameterKey": "Keep", "UsePreviousValue": True}]
+            else:
                 save("requested.json", json.loads(Path(flag("--parameters").removeprefix("file://")).read_text()))
                 if "--template-body" in args or "--template-url" in args:
                     assert "--use-previous-template" not in args
@@ -155,11 +229,38 @@ elif tool == "aws":
         elif operation == "describe-change-set":
             cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "Changes": []}
             if lifecycle:
-                cs["Changes"] = [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Observer", "ResourceType": "AWS::Lambda::Function", "Replacement": "False"}}]
+                cs["RoleARN"] = "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec"
+                cs["Parameters"] = [{"ParameterKey": "Keep", "ParameterValue": "unchanged", "ResolvedValue": "fixed"}]
+                cs["Changes"] = [{"Type": "Resource", "ResourceChange": {"Action": "Modify", "LogicalResourceId": "Observer", "ResourceType": "AWS::Lambda::Function", "Replacement": "False",
+                    "Scope": ["Properties"], "Details": [{"Target": {"Attribute": "Properties", "Name": "Environment", "RequiresRecreation": "Never"}, "ChangeSource": "DirectModification", "Evaluation": "Static"}]}}]
                 if scenario.get("noop_rollback") and flag("--change-set-name").startswith("rollback-"):
                     cs.update(Status="FAILED", ExecutionStatus="UNAVAILABLE", Changes=[], StatusReason="The submitted information didn't contain changes.")
                 if scenario.get("durable"):
                     cs["Changes"][0]["ResourceChange"].update(ResourceType="AWS::KMS::Key", Replacement="True")
+                mutation = scenario.get("lifecycle_change")
+                r = cs["Changes"][0]["ResourceChange"] if cs["Changes"] else {}
+                if mutation in ("Policy", "Bucket", "Key", "Nested"):
+                    cs["Changes"].append({"Type": "Resource", "ResourceChange": {"Action": "Remove", "LogicalResourceId": mutation, "ResourceType": lifecycle_template(read("config.json"))["Resources"][mutation]["Type"]}})
+                elif mutation == "replacement":
+                    r["Replacement"] = "True"
+                elif mutation == "conditional":
+                    r["Replacement"] = "Conditional"
+                elif mutation == "code":
+                    r["Details"][0]["Target"]["Name"] = "Code"
+                elif mutation == "dynamic":
+                    r["Details"][0]["Evaluation"] = "Dynamic"
+                elif mutation == "missing":
+                    r["Details"] = []
+                elif mutation == "parameter":
+                    cs["Parameters"][0]["ParameterValue"] = "changed"
+                elif mutation == "ssm":
+                    cs["Parameters"][0]["ResolvedValue"] = "changed"
+                elif mutation == "page":
+                    cs["NextToken"] = "more"
+                elif mutation == "context":
+                    props = read("synth-lifecycle-target.json")["Resources"]["Observer"]["Properties"]
+                    props["MemorySize"] = 512
+                    r["AfterContext"] = json.dumps({"Properties": props})
             else:
                 old = {p["ParameterKey"]: p for p in read("stack.json")["Stacks"][0]["Parameters"]}
                 cs["Parameters"] = [old[p["ParameterKey"]] if p.get("UsePreviousValue") else p for p in read("requested.json")]
@@ -216,6 +317,7 @@ elif tool == "aws":
         elif operation == "execute-change-set":
             if lifecycle:
                 (root / "executed").touch()
+                save("live-lifecycle-config.json", read("config.json"))
             else:
                 assert read("ami-config.json") == read("original-ami-config.json")
                 if scenario.get("execute_fail"):
@@ -245,8 +347,19 @@ elif tool == "aws":
         assert operation == "describe-images"
         out({"Images": [{"ImageId": flag("--image-ids"), "OwnerId": "452630323510", "State": "available", "Architecture": "x86_64"}]})
     elif service == "secretsmanager":
+        assert_locked("app-secret.lock")
         if operation == "get-secret-value":
             envelope = read("secret.json")
+            count = read("secret-reads.json") if (root / "secret-reads.json").exists() else 0
+            save("secret-reads.json", count + 1)
+            if scenario.get("secret_pause") and count == 1:
+                (root / "secret-recheck").touch()
+                deadline = time.monotonic() + 15
+                while not (root / "secret-continue").exists():
+                    assert time.monotonic() < deadline, "test barrier timed out"
+                    time.sleep(0.01)
+            if scenario.get("secret_verify_version") and envelope["VersionId"] == "updated":
+                envelope["VersionId"] = "unexpected-version"
             if scenario.get("secret_race"):
                 envelope["VersionId"] += "x"
                 save("secret.json", envelope)

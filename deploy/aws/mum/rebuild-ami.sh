@@ -23,6 +23,7 @@ done
 require_tools aws docker git python3 mktemp date timeout
 require_absolute_release
 init_work
+lock_operator
 if [[ -n "$recipe_version" ]]; then
     require_tools npm realpath cmp wc
     [[ -f "$config" && ! -L "$config" ]] || die 'AMI config must be a regular non-symlink file'
@@ -65,16 +66,11 @@ fi
 validation_args=()
 if [[ -n "$recipe_version" ]]; then
     # README host-AMI step (d), package.json synth:ami, and bin/ami.ts.
-    # synth:ami already pins -o cdk.out/ami (CDK rejects a second --output), so synth
-    # there and copy the template out. That script disables AWS credentials, lookups
-    # and telemetry. It runs in dry-run too, using only this temporary nonsecret config.
-    synth_out="$repo_root/infra/app-computers/cdk.out/ami"
-    rm -f "$synth_out/ezil-mum-ami.template.json"
-    show env "EZIL_AMI_CONFIG=$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami
-    EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami
-    mkdir -p "$work/cdk.out"
-    cp "$synth_out/ezil-mum-ami.template.json" "$work/cdk.out/ezil-mum-ami.template.json"
-    candidate_template=$work/cdk.out/ezil-mum-ami.template.json
+    # synth:ami already pins -o cdk.out/ami; do not pass a second --output.
+    prepare_synth ami
+    show env "EZIL_AMI_CONFIG=$work/ami.mum.json" npm --prefix "$synth_project" run synth:ami -- ezil-mum-ami
+    EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$synth_project" run synth:ami -- ezil-mum-ami
+    candidate_template=$synth_project/cdk.out/ami/ezil-mum-ami.template.json
     validation_args=("$candidate_template" "$work/previous-ami-config.json" "$work/ami.mum.json")
     json ami-template "$work/template.json" "${validation_args[@]}"
     template_bytes=$(wc -c < "$candidate_template")
@@ -90,8 +86,7 @@ fi
 
 say "Desktop tag: $repository:$tag"
 if "$apply"; then
-    require_tools flock
-    lock_release
+    mkdir -p -- "$release_dir"
     [[ ! -e "$release_dir/build-arn.txt" && ! -e "$release_dir/ami-id.txt" ]] || die 'release already contains a build; inspect/resume it or archive this release directory'
     [[ ! -e "$release_dir/ami-update-complete.txt" ]] || die 'release already contains a successful AMI stack update; inspect evidence before another bake'
     if [[ -n "$recipe_version" ]]; then

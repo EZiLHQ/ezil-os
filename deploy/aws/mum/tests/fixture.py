@@ -7,6 +7,17 @@ import sys
 root = Path(sys.argv[1])
 root.mkdir(parents=True, exist_ok=True)
 (root / "bin").mkdir()
+# Run copied scripts with fixed lock paths redirected ONLY inside this fixture.
+# Production exposes no lock override that could bypass cross-release exclusion.
+source = Path(__file__).resolve().parents[1]
+checkout = root / "checkout"
+scripts = checkout / "deploy/aws/mum"
+scripts.mkdir(parents=True)
+for item in source.iterdir():
+    if item.suffix in (".sh", ".py"):
+        (scripts / item.name).write_text(item.read_text().replace("/root/ezil-aws-mum/locks", str(root / "locks")))
+(checkout / "infra").mkdir()
+(checkout / "infra/app-computers").symlink_to(source.parents[2] / "infra/app-computers", target_is_directory=True)
 for tool in ("aws", "docker", "git", "npm", "npx", "sleep", "timeout"):
     shutil.copyfile(Path(__file__).with_name("fake.py"), root / "bin" / tool)
     (root / "bin" / tool).chmod(0o755)
@@ -50,6 +61,7 @@ d = {"accountId": "452630323510", "region": "ap-south-1", "namespace": "mum", "a
      "stateMachineVersionArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:4", "keep": [1, 2]}
 save("config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
 save("original-config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
+save("live-lifecycle-config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
 deployments = {"ap-south-1": d, "us-east-1": {"amiId": "other-region", "untouched": [3, 4]}}
 if json.loads(sys.argv[2]).get("secret_drift"):
     d["amiId"] = "ami-" + "9" * 17

@@ -12,7 +12,7 @@ fixture() {
 run() {
     local expected=$1 script=$2; shift 2
     local actual=0
-    PATH="$case_dir/bin:$PATH" bash "$here/../$script" "$@" --release-dir "$case_dir/release" > "$case_dir/output" 2>&1 || actual=$?
+    PATH="$case_dir/bin:$PATH" bash "$case_dir/checkout/deploy/aws/mum/$script" "$@" --release-dir "$case_dir/release" > "$case_dir/output" 2>&1 || actual=$?
     if [[ "$expected" == pass ]]; then [[ "$actual" == 0 ]]; else [[ "$actual" != 0 ]]; fi
 }
 check() { python3 "$here/assert.py" "$case_dir" "$1"; }
@@ -31,6 +31,14 @@ if [[ "${1:-}" == --case ]]; then
     name=$2; scenario=$3; mode=$4
     fixture "$name" "$scenario"
     case "$name" in
+        lifecycle-*)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
+            check no-secret-write
+            check "$mode"
+            if [[ "$name" == lifecycle-template-* || "$name" == lifecycle-baseline-* ]]; then
+                cmp "$case_dir/config.json" "$case_dir/original-config.json"
+                check no-lifecycle-publish
+            fi ;;
         recipe-*)
             version=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("version", "1.0.2"))' "$scenario")
             flags=(--desktop-image desktop:test --source-sha aaaaaaaa --recipe-version "$version" --config "$case_dir/ami-config.json")
@@ -76,7 +84,7 @@ if [[ "${1:-}" == --case ]]; then
         durable|version-race|wrong-output|secret-race|secret-drift|synth-fail|stack-fail)
             run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
             check no-secret-write
-            if [[ "$name" == durable ]]; then check 'refuse-durable lifecycle'; fi
+            if [[ "$name" == durable ]]; then check 'refuse-lifecycle resource type mismatch'; fi
             if [[ "$name" == version-race ]]; then check 'refuse-published versions changed'; fi ;;
         region)
             AWS_REGION=us-east-1 run fail rebuild-ami.sh --desktop-image desktop:test --source-sha aaaaaaaa --apply
@@ -153,5 +161,28 @@ test_case 'change-set execute failure leaves original config unchanged' recipe-e
 test_case 'stack update failure leaves original config unchanged' recipe-stack-fail '{"stack_fail":true}' recipe-update-failed
 test_case 'concurrent config edit after stack update prevents overwrite and bake' recipe-config-race '{"config_race":true}' recipe-config-race
 test_case 'failed bake retains successfully deployed config version and old backup' recipe-build-fail '{"build_fail":true}' recipe-build-fail
+for resource in Policy Bucket Key Nested; do
+    test_case "lifecycle $resource deletion refused" "lifecycle-delete-$resource" "{\"lifecycle_change\":\"$resource\"}" 'refuse-unexpected lifecycle resource change'
+    test_case "lifecycle $resource template modification refused" "lifecycle-template-$resource" "{\"lifecycle_template_change\":\"$resource\"}" 'refuse-lifecycle resource change refused'
+done
+test_case 'lifecycle version resource addition refused' lifecycle-template-version '{"lifecycle_template_change":"version"}' 'refuse-lifecycle resource addition/removal'
+test_case 'lifecycle Lambda code change refused' lifecycle-template-code '{"lifecycle_template_change":"code"}' 'refuse-unexpected lifecycle property'
+test_case 'lifecycle unrelated environment change refused' lifecycle-template-environment '{"lifecycle_template_change":"environment"}' 'refuse-lifecycle change is not forced'
+test_case 'lifecycle parameter definition change refused' lifecycle-template-parameter '{"lifecycle_template_change":"parameter"}' 'refuse-unexpected lifecycle template parameter'
+test_case 'lifecycle synth source drift from live refused' lifecycle-baseline-drift '{"lifecycle_template_drift":true}' 'refuse-live lifecycle template differs'
+test_case 'lifecycle missing stack execution role refused' lifecycle-role '{"lifecycle_no_role":true}' 'refuse-lifecycle stack must use its execution role'
+test_case 'lifecycle submitted template tampering refused' lifecycle-submitted '{"lifecycle_submitted_drift":true}' 'refuse-submitted lifecycle template mismatch'
+for replacement in replacement conditional; do
+    test_case "lifecycle $replacement refused" "lifecycle-$replacement" "{\"lifecycle_change\":\"$replacement\"}" 'refuse-lifecycle resource replacement refused'
+done
+for property in code dynamic; do
+    test_case "lifecycle unexplained $property change refused" "lifecycle-$property" "{\"lifecycle_change\":\"$property\"}" 'refuse-unexpected lifecycle property change'
+done
+test_case 'lifecycle missing change details refused' lifecycle-missing '{"lifecycle_change":"missing"}' 'refuse-unexplained lifecycle resource change'
+test_case 'lifecycle parameter value drift refused' lifecycle-parameter '{"lifecycle_change":"parameter"}' 'refuse-lifecycle parameter/resolved SSM change'
+test_case 'lifecycle resolved SSM value drift refused' lifecycle-ssm '{"lifecycle_change":"ssm"}' 'refuse-lifecycle parameter/resolved SSM change'
+test_case 'lifecycle incomplete change-set page refused' lifecycle-page '{"lifecycle_change":"page"}' 'refuse-incomplete change set'
+test_case 'lifecycle change-set property values checked' lifecycle-context '{"lifecycle_change":"context"}' 'refuse-lifecycle change-set values differ'
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
+python3 "$here/locking.py"

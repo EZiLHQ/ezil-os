@@ -120,7 +120,7 @@ elif mode.startswith("refuse-"):
 elif mode == "dry-promote":
     assert read("config.json") == read("original-config.json")
     assert not (root / "release").exists()
-    assert not has("npm") and not has("npx") and not has("create-change-set") and not has("secretsmanager")
+    assert has("npm", "synth:lifecycle") and not has("npx") and not has("create-change-set") and not has("secretsmanager")
     assert "lifecycle:11" in output
     sequence = ["Edit ", "synth:lifecycle", "publish-assets", "s3 cp", "create-change-set", "wait change-set-create-complete", "describe-change-set", "execute-change-set", "wait stack-update-complete", "put-secret-value"]
     positions = [output.index(p) for p in sequence]
@@ -140,6 +140,8 @@ elif mode == "rollback":
 elif mode == "no-secret-write":
     assert not has("put-secret-value")
     assert "synthetic-private-do-not-print" not in output
+elif mode == "no-lifecycle-publish":
+    assert not has("publish-assets") and not has("s3") and not has("create-change-set")
 elif mode == "available":
     assert (root / "release/ami-id.txt").read_text().strip() == "ami-" + "2" * 17
     assert has("start-image-pipeline-execution") and has("get-image")

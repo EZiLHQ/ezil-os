@@ -15,6 +15,7 @@ machine=arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../../.." && pwd)
 release_dir=/root/ezil-aws-mum/release/next
+lock_dir=/root/ezil-aws-mum/locks
 apply=false
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -41,10 +42,22 @@ init_work() {
     work=$(mktemp -d /tmp/ezil-mum.XXXXXXXX)
     trap 'rm -rf -- "$work"' EXIT
 }
-lock_release() {
-    mkdir -p -- "$release_dir"
-    exec 9>"$release_dir/.operator.lock"
-    flock -n 9 || die 'another AMI operator is using this release directory'
+lock_operator() {
+    require_tools flock
+    mkdir -p -- "$lock_dir"
+    exec 9>"$lock_dir/operator.lock"
+    flock -n 9 || die 'another AMI/lifecycle operator holds the common lock'
+}
+prepare_synth() {
+    # Copy only code and package metadata; never config/ or credential files.
+    # npm scripts pin relative cdk.out paths, so give each synth its own cwd.
+    synth_project="$work/$1/app-computers"
+    mkdir -p -- "$synth_project"
+    local item
+    for item in package.json package-lock.json cdk.json tsconfig.json bin lib; do
+        cp -R -- "$repo_root/infra/app-computers/$item" "$synth_project/"
+    done
+    ln -s -- "$repo_root/infra/app-computers/node_modules" "$synth_project/node_modules"
 }
 wait_changeset() {
     local stack=$1 change=$2 result=0
