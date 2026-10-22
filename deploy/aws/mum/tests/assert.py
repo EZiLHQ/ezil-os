@@ -89,6 +89,9 @@ elif mode == "dry-rebuild":
     positions = [output.index(p) for p in sequence]
     assert positions == sorted(positions)
     assert "host-aaaaaaaaaaaa-" in output and "immutable" in output
+elif mode == "index-child":
+    values = {p["ParameterKey"]: p.get("ParameterValue") for p in read("requested.json")}
+    assert values["DesktopImageDigest"] == values["DesktopImageId"] == "sha256:" + "e" * 64, values
 elif mode == "parameters":
     parameters = read("requested.json")
     old = read("stack.json")["Stacks"][0]["Parameters"]

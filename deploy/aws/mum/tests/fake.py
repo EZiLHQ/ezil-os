@@ -96,9 +96,19 @@ elif tool == "aws":
             out("synthetic-login")
         elif operation == "batch-get-image":
             manifest = {"schemaVersion": 2, "config": {"digest": "sha256:" + ("c" if scenario.get("image_mismatch") else "b") * 64}}
+            pushed = "sha256:" + "d" * 64
             if scenario.get("image_index"):
                 manifest["manifests"] = []
-            out({"images": [{"imageId": {"imageDigest": "sha256:" + "d" * 64}, "imageManifest": json.dumps(manifest)}], "failures": []})
+            if scenario.get("image_index_ok") or scenario.get("image_index_two"):
+                # containerd store: the local image ID is the index digest.
+                pushed = "sha256:" + "b" * 64
+                manifest = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + "e" * 64, "platform": {"architecture": "amd64", "os": "linux"}},
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + "f" * 64, "platform": {"architecture": "arm64", "os": "linux"}}
+                    if scenario.get("image_index_two") else
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + "f" * 64, "platform": {"architecture": "unknown", "os": "unknown"},
+                     "annotations": {"vnd.docker.reference.type": "attestation-manifest"}}]}
+            out({"images": [{"imageId": {"imageDigest": pushed}, "imageManifest": json.dumps(manifest)}], "failures": []})
         else:
             raise SystemExit("unexpected ECR command")
     elif service == "s3":

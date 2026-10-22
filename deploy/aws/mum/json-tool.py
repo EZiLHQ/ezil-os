@@ -295,11 +295,28 @@ def main(args):
         need(not response.get("failures") and len(response["images"]) == 1, "ECR did not return one image")
         record = response["images"][0]
         manifest = json.loads(record["imageManifest"])
-        need(manifest.get("schemaVersion") == 2 and "manifests" not in manifest, "single-platform schema-2/OCI image required")
-        digest, image_id = record["imageId"]["imageDigest"], manifest["config"]["digest"]
-        need(all(re.fullmatch(r"sha256:[0-9a-f]{64}", d) for d in (digest, image_id)), "invalid ECR digest")
-        need(image_id == a[1], "image ID mismatch between ECR and local Docker image")
-        print(digest)
+        pushed = record["imageId"]["imageDigest"]
+        need(manifest.get("schemaVersion") == 2 and re.fullmatch(r"sha256:[0-9a-f]{64}", pushed), "invalid ECR manifest")
+        if "manifests" in manifest:
+            # containerd image store: the local ID is the index digest. Accept exactly one
+            # linux/amd64 image plus attestation manifests only, and pin the AMI to that
+            # child manifest (the bake host also uses the containerd store, so its pulled
+            # image ID is the digest it pulled; the live AMI already has digest == id).
+            need(pushed == a[1], "image ID mismatch between ECR index and local Docker image")
+            images = [m for m in manifest["manifests"] if (m.get("annotations") or {}).get("vnd.docker.reference.type") != "attestation-manifest"]
+            need(len(images) == 1 and images[0].get("platform") == {"architecture": "amd64", "os": "linux"}, "index must hold exactly one linux/amd64 image")
+            need(all((m.get("annotations") or {}).get("vnd.docker.reference.type") == "attestation-manifest" for m in manifest["manifests"] if m is not images[0]), "index holds unexpected manifests")
+            child = images[0]["digest"]
+            need(re.fullmatch(r"sha256:[0-9a-f]{64}", child), "invalid child digest")
+            print(child, child)
+        else:
+            config = manifest["config"]["digest"]
+            need(re.fullmatch(r"sha256:[0-9a-f]{64}", config), "invalid ECR digest")
+            if pushed == a[1]:
+                print(pushed, pushed)  # containerd store, single manifest: ID == manifest digest
+            else:
+                need(config == a[1], "image ID mismatch between ECR and local Docker image")
+                print(pushed, config)  # classic store: ID == config digest
     elif op == "ami-changeset":
         ami_changeset(*a)
     elif op == "plan-ami":

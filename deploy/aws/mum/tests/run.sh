@@ -97,7 +97,9 @@ test_case 'wrong AWS account refused' account '{"wrong_account":true}' 'refuse-w
 test_case 'wrong AWS region refused' region '{}' region
 test_case 'non-amd64 image refused' arm '{"arm":true}' 'refuse-linux/amd64'
 test_case 'ECR image ID mismatch refused' mismatch '{"image_mismatch":true}' 'refuse-image ID mismatch'
-test_case 'multi-platform manifest refused' index '{"image_index":true}' 'refuse-schema-2'
+test_case 'index not matching the local image refused' index '{"image_index":true}' 'refuse-image ID mismatch'
+test_case 'containerd index pins its single amd64 child' index-ok '{"image_index_ok":true}' index-child
+test_case 'multi-platform index refused' index-two '{"image_index_two":true}' 'refuse-linux/amd64'
 test_case 'extra parameter change refused' extra '{"extra_parameter":true}' 'refuse-extra parameter'
 test_case 'SSM resolved parent drift refused' ssm '{"ssm_drift":true}' 'refuse-resolved SSM'
 test_case 'unexpected resource change refused' resource '{"extra_resource":true}' 'refuse-unexpected resource'

@@ -106,11 +106,12 @@ act docker tag "$image_id" "$repository:$tag"
 act docker --config "$work/docker" push "$repository:$tag"
 if "$apply"; then
     aws_read ecr batch-get-image --repository-name "${repository#*/}" --image-ids "imageTag=$tag" --output json > "$work/manifest.json"
-    digest=$(json manifest "$work/manifest.json" "$image_id")
-    json parameters "$work/stack.json" "$digest" "$image_id" "$source_uri" "$work/parameters.json"
+    read -r digest pinned_id < <(json manifest "$work/manifest.json" "$image_id")
+    [[ -n "$digest" && -n "$pinned_id" ]] || die 'could not resolve the pushed image digest'
+    json parameters "$work/stack.json" "$digest" "$pinned_id" "$source_uri" "$work/parameters.json"
 else
     show aws --profile "$profile" --region "$region" ecr batch-get-image --repository-name "${repository#*/}" --image-ids "imageTag=$tag" --output json
-    say 'Assert ECR manifest config.digest equals the inspected local Docker image ID; reject image indexes.'
+    say 'Resolve the pushed digest: classic store (config digest == local ID) or containerd store (manifest/index digest == local ID; an index must hold one linux/amd64 image plus attestations).'
 fi
 act git -C "$repo_root" archive --format=tar.gz --output "$work/$archive" "$full_sha:infra/host-agent"
 aws_act s3 cp "$work/$archive" "$source_uri"
