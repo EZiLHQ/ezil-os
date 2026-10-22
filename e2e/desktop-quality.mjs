@@ -11,8 +11,7 @@ import { isIP } from 'node:net';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const QUALITY_STEP_IDS = ['placement', 'latency', 'typing', 'clipboard', 'fonts'];
 export const EDITOR_LINES = '.editor-group-container.active .monaco-editor .view-lines:visible';
-export const EDITOR_INPUT = '.editor-group-container.active .monaco-editor textarea.inputarea:visible, '
-  + '.editor-group-container.active .monaco-editor [contenteditable="true"]:visible';
+export const EDITOR = '.editor-group-container.active .monaco-editor:visible';
 export const TYPING_TEXT = 'Az09 é ß ñ 日本語 हिन्दी / . , : - _ '.repeat(8).slice(0, 200);
 export const FONT_TEXT = '日本語 한국어 हिन्दी العربية ไทย 🙂';
 
@@ -116,13 +115,24 @@ export async function fetchTimings(realm, url, method) {
 }
 
 export async function focusEditor(frame) {
-  const input = frame.locator(EDITOR_INPUT).first();
-  await input.waitFor({ state: 'visible' });
-  // Focusing the real input avoids the oversized/scrolled rendering layer.
-  // Keep a live EditContext/contenteditable selection if it already has focus.
-  const focused = await frame.evaluate(selector => document.hasFocus() && document.activeElement?.matches(selector),
-    EDITOR_INPUT.replaceAll(':visible', ''));
-  if (!focused) await input.focus();
+  const editor = frame.locator(EDITOR).first();
+  await editor.waitFor({ state: 'visible' });
+  const focused = () => editor.evaluate(element => {
+    const doc = element.ownerDocument, active = doc.activeElement;
+    return doc.hasFocus() && element.contains(active)
+      && (active.matches('textarea.inputarea, [contenteditable="true"]') || !!active.editContext);
+  });
+  // Native EditContext need not expose a textarea/contenteditable. Preserve
+  // the command's existing editor focus and selection when either input works.
+  if (await focused()) return;
+  // Click the bounded text viewport, not the potentially huge .view-lines
+  // rendering layer. Stay below the empty-editor hint and clear of scrollbars.
+  const content = editor.locator('.monaco-scrollable-element.editor-scrollable').first();
+  const position = await content.evaluate(element => ({
+    x: Math.min(8, element.clientWidth / 2), y: Math.min(80, element.clientHeight / 2),
+  }));
+  await content.click({ position });
+  requireThat(await focused(), 'Code editor did not receive keyboard focus');
 }
 
 /** Serialized by page.addInitScript: no imports/closures, no network or logging.

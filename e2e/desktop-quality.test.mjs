@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
 import { classifyPlacement, countRepeats, desktopQuality, echoSummary, latencySummary,
   parseConnectTimes, parseIpinfo, percentile, qualityChecks,
-  QUALITY_STEP_IDS, TYPING_TEXT, EDITOR_INPUT, fetchTimings, focusEditor,
+  QUALITY_STEP_IDS, TYPING_TEXT, EDITOR, EDITOR_LINES, fetchTimings, focusEditor,
   installNekoClipboardProbe, nekoClipboardDiagnostics } from './desktop-quality.mjs';
 
 test('ipinfo keeps egress fields without inferring compute placement', () => {
@@ -176,27 +176,124 @@ test('GET timings reject HTTP errors, redirects, HTML types and disguised HTML b
   assert.equal(result.observations[9].error, 'TypeError');
 });
 
-test('editor focus targets the input and preserves an already focused input', async () => {
-  for (const [alreadyFocused, frameFocused] of [[false, true], [true, true], [true, false]]) {
-    let focusCalls = 0;
-    const frame = { locator(selector) {
-      assert.equal(selector, EDITOR_INPUT);
-      return { first() { return this; }, async waitFor() {}, async focus() { focusCalls++; } };
-    }, evaluate: (fn, selector) => runInNewContext(`(${fn.toString()})(selector)`, {
-      selector, document: { hasFocus: () => frameFocused, activeElement: { matches: actual => {
-        assert.ok(!actual.includes(':visible')); return alreadyFocused;
-      } } },
-    }) };
-    await focusEditor(frame);
-    assert.equal(focusCalls, alreadyFocused && frameFocused ? 0 : 1);
+function editorFixture({ mode = 'editContext', focused = false, frameFocused = true,
+  clickFocuses = true, width = 480, height = 240 } = {}) {
+  const clicks = [], keys = [], listeners = new Map();
+  let value = '', localText = '', selected = false, mutation;
+  const input = { editContext: mode === 'editContext' ? {} : null,
+    matches: () => mode === 'textarea' || mode === 'contenteditable' };
+  const document = { activeElement: focused ? input : {}, hasFocus: () => frameFocused,
+    addEventListener: (name, listener) => listeners.set(name, listener),
+    removeEventListener: name => listeners.delete(name) };
+  const element = { ownerDocument: document, contains: node => node === input };
+  const lines = { querySelectorAll: () => [{ textContent: value }] };
+  const globals = { document, window: {}, performance,
+    MutationObserver: class {
+      constructor(callback) { mutation = callback; }
+      observe() {} disconnect() { mutation = null; }
+    }, navigator: { clipboard: {
+      writeText: async text => { localText = text; }, readText: async () => localText,
+    } } };
+  const evaluate = (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, { ...globals, arg });
+  const content = { first() { return this; },
+    evaluate: fn => fn({ clientWidth: width, clientHeight: height }),
+    async click({ position }) {
+      assert.ok(position.x > 0 && position.x < width);
+      assert.ok(position.y > 0 && position.y < height);
+      clicks.push(position);
+      if (clickFocuses) { document.activeElement = input; frameFocused = true; }
+    } };
+  const editor = { first() { return this; }, async waitFor() {}, evaluate: fn => fn(element),
+    locator(selector) {
+      assert.equal(selector, '.monaco-scrollable-element.editor-scrollable');
+      return content;
+    } };
+  const frame = { url: () => 'https://code.example.test', evaluate, locator(selector) {
+    if (selector === EDITOR) return editor;
+    assert.equal(selector, EDITOR_LINES, 'no textarea/contenteditable locator is available');
+    return { first() { return this; }, evaluate: (fn, expected) => runInNewContext(
+      `(${fn.toString()})(element, expected)`, { ...globals, element: lines, expected }) };
+  } };
+  const requireFocus = () => {
+    assert.equal(document.activeElement, input, 'keyboard must reach the editor');
+    assert.equal(frameFocused, true, 'Code frame must own keyboard focus');
+  };
+  const page = { frames: () => [frame], evaluate, keyboard: {
+    async type(text) {
+      requireFocus(); keys.push(['type', text]);
+      for (const character of text) {
+        listeners.get('keydown')?.({ key: character });
+        // EditContext may omit DOM beforeinput timestamps; content must still round trip.
+        if (mode !== 'editContext') listeners.get('beforeinput')?.({ data: character, inputType: 'insertText' });
+        value += character; mutation?.();
+      }
+    },
+    async press(key) {
+      requireFocus(); keys.push(['press', key]);
+      if (key === 'Control+V') { value += localText; mutation?.(); }
+      else if (key === 'Control+A') selected = true;
+      else if (key === 'Control+C') { assert.equal(selected, true); localText = value; }
+      else assert.fail(`Unexpected key ${key}`);
+    },
+  } };
+  const quality = desktopQuality({ page, context: { grantPermissions: async () => { frameFocused = false; } },
+    runId: 'fixture', codeReady: true, browserReady: false, codeFrame: async () => frame,
+    clickDock: async () => {}, closeApp: async () => {},
+    command: async () => { value = ''; selected = false; } });
+  return { frame, quality, clicks, keys };
+}
+
+test('editor focus supports native EditContext, legacy textarea and contenteditable without input locators', async () => {
+  for (const mode of ['editContext', 'textarea', 'contenteditable']) {
+    for (const [focused, frameFocused] of [[false, true], [true, true], [true, false]]) {
+      const fixture = editorFixture({ mode, focused, frameFocused });
+      await focusEditor(fixture.frame);
+      assert.deepEqual(fixture.clicks, focused && frameFocused ? [] : [{ x: 8, y: 80 }]);
+    }
+  }
+});
+
+test('focus click stays inside a small editor viewport and fails if the editor does not acquire focus', async () => {
+  const small = editorFixture({ width: 12, height: 40 });
+  await focusEditor(small.frame);
+  assert.deepEqual(small.clicks, [{ x: 6, y: 20 }]);
+  await assert.rejects(focusEditor(editorFixture({ clickFocuses: false }).frame), /did not receive keyboard focus/);
+});
+
+test('typing round trips all 200 characters without a textarea and keeps native repeat skipped', async () => {
+  for (const mode of ['editContext', 'textarea']) {
+    const { quality } = editorFixture({ mode });
+    const evidence = {};
+    await quality.typing(evidence);
+    assert.equal(evidence.mixedText.evidence.observed, TYPING_TEXT);
+    assert.equal(evidence.mixedText.evidence.exactEquality, true);
+    assert.equal(evidence.mixedText.status, mode === 'editContext' ? 'SKIP' : 'PASS');
+    if (mode === 'editContext') assert.equal(evidence.mixedText.reason, 'editor_input_timestamps_unavailable');
+    assert.equal(evidence.autoRepeat.status, 'SKIP');
+    assert.equal(evidence.autoRepeat.reason, 'native_repeat_not_synthesized');
+  }
+});
+
+test('both Code clipboard directions use focused keyboard input with native EditContext and legacy textarea', async () => {
+  for (const mode of ['editContext', 'textarea']) {
+    const { quality, keys } = editorFixture({ mode });
+    const evidence = {};
+    await quality.clipboard(evidence);
+    for (const direction of ['codeLocalToRemote', 'codeRemoteToLocal']) {
+      assert.equal(evidence[direction].status, 'PASS');
+      assert.equal(evidence[direction].evidence.exactEquality, true);
+    }
+    assert.deepEqual(keys, [['press', 'Control+V'], ['type', 'code-to-local-fixture'],
+      ['press', 'Control+A'], ['press', 'Control+C']]);
+    assert.equal(evidence.permissions.length, 2);
   }
 });
 
 test('native repeat is explicitly skipped even if an independent mixed-text check fails', async () => {
   const frame = { locator: selector => ({
-    first() { return this; }, async waitFor() {}, async focus() {},
+    first() { return this; }, async waitFor() {},
     async evaluate(fn) {
-      if (selector === EDITOR_INPUT) throw new Error('Unexpected input evaluation');
+      if (selector === EDITOR) return true;
       if (fn.toString().includes('__desktopQualityEcho')) throw new Error('fixture echo observer unavailable');
       return '';
     },

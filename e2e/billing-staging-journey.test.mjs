@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { aggregateResults, classifyHost, createRedactor, guardPlaywright,
   isAIAccountError, parseResources, redactEvidence, terminalBlock, command, ensureTerminal,
-  restartPane, restartUnavailableReason } from './billing-staging-journey.mjs';
+  closeApp, restartPane, restartUnavailableReason } from './billing-staging-journey.mjs';
 
 const credentials = { email: 'qa+staging@example.test', password: 'P@ss word!"\\$?&' };
 
@@ -213,14 +213,21 @@ test('restart skips only explicit deployment/stack limitations, never missing pr
   assert.equal(restartUnavailableReason("This deployment hasn't turned on desktop restarts yet."), 'restart_not_supported_by_deployment');
   assert.equal(restartUnavailableReason('This desktop runs on an older stack that cannot be restarted in place.'), 'restart_not_supported_by_desktop_stack');
   for (const text of ['', 'Open a desktop first, then come back here.', 'Restarting…', 'Your session expired — sign in again.',
-    'Could not reach the server.', 'Something went wrong. Please try again.']) assert.equal(restartUnavailableReason(text), null);
+    "Your desktop isn't answering", 'Could not reach the server.', 'Something went wrong. Please try again.']) assert.equal(restartUnavailableReason(text), null);
 });
 
 function restartFixture({ unsupported = false, expanded = false } = {}) {
   const calls = [];
   let checks = 0;
-  const locator = selector => ({
-    last() { return this; }, locator,
+  const locator = (selector, parent = '') => ({
+    last() { return this; }, locator(child) {
+      const scope = parent + selector;
+      if (child.startsWith('.dashboard-app-drawer')) assert.equal(scope, '.window[data-app="desktop"]:not([data-closing="1"])');
+      else if (child === '[data-action="restart"]') assert.equal(scope,
+        '.window[data-app="settings"]:not([data-closing="1"])[data-pane="troubleshoot"]');
+      else assert.equal(scope, '.window[data-app="settings"]:not([data-closing="1"])');
+      return locator(child, scope);
+    },
     async count() { return 1; },
     async getAttribute(name) {
       if (selector.includes('drawer-toggle')) { assert.equal(name, 'aria-expanded'); return String(expanded); }
@@ -258,4 +265,75 @@ test('restart retains the disabled explanation when deployment support is absent
   assert.equal((await restartPane(page, evidence)).reason, 'restart_not_supported_by_deployment');
   assert.equal(evidence.enabled, false);
   assert.equal(evidence.explanation, 'Not available in this deployment yet.');
+});
+
+function windowFixture({ fullpage = true, expanded = false, codeOpen = true } = {}) {
+  const calls = [];
+  const windows = { desktop: { open: true, fullpage, expanded },
+    code: { open: codeOpen, fullpage: false }, settings: { open: true, fullpage: false } };
+  const dockVisible = () => !windows.desktop.open || !windows.desktop.fullpage;
+  const page = { locator(selector) {
+    if (selector === '[data-action="close-sheet"]:visible') return { all: async () => [] };
+    const match = selector.match(/^\.(window|taskbar-item)\[data-app="(desktop|code|settings)"\]/);
+    assert.ok(match, `Unexpected page locator ${selector}`);
+    const [, kind, id] = match, state = windows[id];
+    if (kind === 'taskbar-item') return {
+      first() { return this; }, isVisible: async () => dockVisible(), async click() {
+        assert.ok(dockVisible(), 'Browser must release the dock first'); calls.push(`dock:${id}`);
+      },
+    };
+    return {
+      last() { return this; }, count: async () => Number(state.open),
+      getAttribute: async name => { assert.equal(name, 'data-is_fullpage'); return state.fullpage ? '1' : '0'; },
+      async waitFor({ state: expected }) {
+        assert.equal(expected, 'hidden'); assert.equal(state.open, false); calls.push(`closed:${id}`);
+      },
+      locator(child) {
+        assert.ok(['.dashboard-app-drawer-toggle', '.dashboard-app-drawer-close', '.window-close-btn'].includes(child));
+        return {
+          first() { return this; },
+          async getAttribute(name) { assert.equal(name, 'aria-expanded'); return String(state.expanded); },
+          async click() {
+            if (child === '.dashboard-app-drawer-toggle') {
+              assert.equal(state.expanded, false); state.expanded = true; calls.push(`expand:${id}`); return;
+            }
+            if (child === '.dashboard-app-drawer-close') {
+              assert.equal(state.fullpage, true); assert.equal(state.expanded, true);
+            } else {
+              assert.equal(state.fullpage, false);
+              if (id === 'code') assert.ok(dockVisible(), 'Browser iframe intercepts the Code titlebar');
+            }
+            state.open = false; calls.push(`close:${id}:${child}`);
+          },
+        };
+      },
+    };
+  } };
+  return { page, calls, windows };
+}
+
+test('post-restart Code reopen uncovers its Close button through the Browser drawer first', async () => {
+  for (const expanded of [false, true]) {
+    const { page, calls } = windowFixture({ expanded });
+    await closeApp(page, 'code');
+    assert.deepEqual(calls, [...(expanded ? [] : ['expand:desktop']),
+      'close:desktop:.dashboard-app-drawer-close', 'closed:desktop', 'dock:code',
+      'close:code:.window-close-btn', 'closed:code']);
+  }
+});
+
+test('closing Settings above the full-bleed Browser preserves the restart computer identity', async () => {
+  const { page, calls, windows } = windowFixture();
+  await closeApp(page, 'settings');
+  assert.equal(windows.desktop.open, true);
+  assert.deepEqual(calls, ['close:settings:.window-close-btn', 'closed:settings']);
+});
+
+test('windowed Browser closes through its titlebar and an absent Code needs no cleanup', async () => {
+  const { page, calls } = windowFixture({ fullpage: false });
+  await closeApp(page, 'desktop');
+  assert.deepEqual(calls, ['dock:desktop', 'close:desktop:.window-close-btn', 'closed:desktop']);
+  const absent = windowFixture({ codeOpen: false });
+  await closeApp(absent.page, 'code');
+  assert.deepEqual(absent.calls, []);
 });

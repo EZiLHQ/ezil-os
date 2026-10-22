@@ -190,22 +190,30 @@ async function clickDock(page, id) {
   await item.click();
 }
 
-async function closeApp(page, id) {
+async function drawerAction(win, selector) {
+  const toggle = win.locator('.dashboard-app-drawer-toggle');
+  // A collapsed/clipped drawer button can still satisfy isVisible().
+  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
+  await win.locator(selector).click();
+}
+
+export async function closeApp(page, id) {
   const win = appWindow(page, id);
   if (!await win.count()) return;
   if (id === 'settings') {
     // A failed/cancelled checkout must not block the independent app steps.
     for (const close of await page.locator('[data-action="close-sheet"]:visible').all()) await close.click();
   }
-  // Restore before closing, as a full-bleed app may be underneath another app.
-  // A full-bleed window hides the dock; it is already on top and closes via its drawer.
-  if (await dock(page, id).isVisible()) await dock(page, id).click();
-  const close = win.getByRole('button', { name: 'Close', exact: true });
-  if (!await close.first().isVisible()) {
-    await win.locator('.dashboard-app-drawer-toggle').click();
-  }
-  for (const button of await close.all()) {
-    if (await button.isVisible()) { await button.click(); break; }
+  // Reopening Code after restart must first uncover it: a full-bleed Browser
+  // hides the dock and intercepts clicks on Code's otherwise-visible titlebar.
+  if (id === 'code') await clickDock(page, id);
+  else if (await dock(page, id).isVisible()) await dock(page, id).click();
+  // Settings may sit above the full-bleed Browser; closing it must preserve
+  // that Browser and its computer identity until the restart is acknowledged.
+  if (await win.getAttribute('data-is_fullpage') === '1') {
+    await drawerAction(win, '.dashboard-app-drawer-close');
+  } else {
+    await win.locator('.window-close-btn').first().click();
   }
   await win.waitFor({ state: 'hidden', timeout: 15_000 });
 }
@@ -522,11 +530,7 @@ export async function restartPane(page, evidence) {
     evidence.desktopHasComputerId = evidence.desktopOpen && !!await desktop.getAttribute('data-ezil-computer-id');
     return evidence.desktopHasComputerId;
   }, 'open Browser computer identity', 15_000);
-  const settings = desktop.locator('.dashboard-app-drawer-settings');
-  const toggle = desktop.locator('.dashboard-app-drawer-toggle');
-  // A clipped drawer button can still satisfy Playwright's isVisible().
-  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
-  await settings.click();
+  await drawerAction(desktop, '.dashboard-app-drawer-settings');
   const win = appWindow(page, 'settings');
   await win.locator('[data-tab="troubleshoot"]').click();
   const pane = win.locator('[data-pane="troubleshoot"]');
