@@ -334,10 +334,20 @@ async function checkout(page, upgrade, email, evidence) {
   if (await change.isVisible()) await change.click();
   await page.locator(`[data-action="checkout"][data-sku="${upgrade}_monthly_v3"]`).click();
   await page.locator('#ezil-embedded-checkout iframe').first().waitFor({ state: 'visible', timeout: 60_000 });
-  for (const frame of await stripeFrames(page)) {
-    const card = frame.getByRole('button', { name: /^(?:Pay with )?Card$/i }).first();
-    if (await card.isVisible()) { await card.click(); break; }
-  }
+  // With several payment methods enabled Stripe shows them as a radio list (Card / Cash App Pay / Bank);
+  // with fewer it shows a "Pay with Card" button. Select Card either way.
+  const card = await until(async () => {
+    for (const frame of await stripeFrames(page)) {
+      for (const locator of [frame.getByTestId('card-accordion-item-button'), frame.getByRole('radio', { name: /^Card$/i }),
+        frame.getByRole('button', { name: /^(?:Pay with )?Card$/i }), frame.getByText('Card', { exact: true })]) {
+        for (const candidate of await locator.all()) if (await candidate.isVisible()) return candidate;
+      }
+      if (await frame.getByRole('textbox', { name: /card number/i }).first().isVisible().catch(() => false)) return 'expanded';
+    }
+    return null;
+  }, 'Stripe card payment method', 20_000).catch(() => null);
+  // The accordion's own button overlays the label; a forced click lands on whichever is on top.
+  if (card && card !== 'expanded') await card.click({ timeout: 5000 }).catch(() => card.click({ force: true }));
   await (await stripeField(page, /card number/i)).fill('4242424242424242');
   await (await stripeField(page, /expiration|expiry|MM\s*\/\s*YY/i)).fill('12/34');
   await (await stripeField(page, /security code|CVC|CVV/i)).fill('123');
