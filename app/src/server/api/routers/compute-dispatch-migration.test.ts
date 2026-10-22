@@ -41,7 +41,7 @@ const M = '33333333-3333-4333-8333-333333333333';
 const FOREIGN = '44444444-4444-4444-8444-444444444444';
 const I = 'i-11111111111111111', V = 'vol-11111111111111111';
 const computer = { computerId: C, userId: U };
-const pending = { ok: false, errorCode: 'sandbox_starting', retryable: true, computeProvider: 'aws-ec2' };
+const pending = { ok: false, errorCode: 'sandbox_starting', retryable: true, computeProvider: 'aws-ec2', computeMigrating: true };
 const env = {
     EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_BROWSER_ZONE: 'preview.example',
     AWS_REGIONS: 'ap-south-1', AWS_MAX_RUNNING: '10', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '10',
@@ -124,6 +124,7 @@ describe('same-open paid migration routing', () => {
                 guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443) }));
             const answer = await call(f.caller);
             expect(answer).toMatchObject({ ok: true, computeProvider: 'aws-ec2' });
+            expect(answer).not.toHaveProperty('computeMigrating');
             if (name === 'status') expect(answer).toMatchObject({ guacamoleRunning: true, state: 'running' });
             else expect(answer).toHaveProperty('codePreviewUrl');
             expect(f.placements[0]).toMatchObject({ state: 'RUNNING', last_error: 'enroll_succeeded', lifecycle_job_id: null });
@@ -209,6 +210,7 @@ describe('Cloudflare migration fence replies', () => {
         const answer = await calls.status(f.caller);
         expect(answer).toMatchObject({ ok: false, error: 'http_409' });
         expect(answer).not.toHaveProperty('computeProvider');
+        expect(answer).not.toHaveProperty('computeMigrating');
         expect(fetcher).toHaveBeenCalledTimes(1);
     });
 
@@ -222,6 +224,7 @@ describe('Cloudflare migration fence replies', () => {
         const answer = await calls.status(f.caller);
         expect(answer).toMatchObject({ ok, error: status === 200 ? 'migrating' : 'http_500' });
         expect(answer).not.toHaveProperty('computeProvider');
+        expect(answer).not.toHaveProperty('computeMigrating');
         expect(fetcher).toHaveBeenCalledTimes(1);
     });
 

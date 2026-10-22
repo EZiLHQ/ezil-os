@@ -1057,6 +1057,7 @@ export async function openDesktopWindow (ctx = {}) {
     // sequence in which one shows a claim the other has not also made.
     const spinner = AppSpinner({
         label: `Opening ${ctx.appName || title}…`,
+        isMigrating: () => session.isComputeMigrating(computer.id),
         onRetry: () => { void start_boot(); },
     });
     el_body.appendChild(spinner.el);
@@ -1075,6 +1076,7 @@ export async function openDesktopWindow (ctx = {}) {
         last_kind = state.kind;
         progress.render(state);
         spinner.render(state);
+        if (state.kind === 'progress') show_panel();
     }
 
     // The `ready_unverified` strip. Attached up front, hidden, for the same
@@ -1094,8 +1096,10 @@ export async function openDesktopWindow (ctx = {}) {
      * function's decision (the reveal/failure code paths own it directly).
      */
     const show_panel = () => {
-        progress.el.hidden = ! show_phase_list;
-        spinner.el.hidden = show_phase_list;
+        // A migration has its own honest copy, including on the shared warm path.
+        const show_phases = show_phase_list && !session.isComputeMigrating(computer.id);
+        progress.el.hidden = ! show_phases;
+        spinner.el.hidden = show_phases;
     };
 
     /**

@@ -136,7 +136,13 @@ export function cloudflareMigrationAnswer(result: ComputeStatus) {
     try {
         if (JSON.parse(result.error.slice(prefix.length))?.error !== 'migrating') return null;
     } catch { return null; }
-    return { ...migrationStartingAnswer(), provider: 'cloudflare-guacamole' as const };
+    return { ...migrationStartingAnswer(), computeMigrating: true as const, provider: 'cloudflare-guacamole' as const };
+}
+
+/** Only MIGOPEN's waiting provider emits this error; ordinary AWS wakes do not. */
+function awsMigrationAnswer(result: ComputeStatus) {
+    return !result.ok && result.error === 'computer_migrating'
+        ? { computeMigrating: true as const } : {};
 }
 
 /**
@@ -154,6 +160,7 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
             retryable: result.retryable,
             provider: 'cloudflare-guacamole' as const,
             computeProvider: 'aws-ec2' as const,
+            ...awsMigrationAnswer(result),
         };
     }
     return {
@@ -211,5 +218,6 @@ export async function confirmAwsStop(
  */
 export function awsStatusAnswer(status: ComputeStatus) {
     const state = (status as AwsComputeStatus).state;
-    return { ...status, guacamoleRunning: status.ok === true && state === 'running', computeProvider: 'aws-ec2' as const };
+    return { ...status, guacamoleRunning: status.ok === true && state === 'running', computeProvider: 'aws-ec2' as const,
+        ...awsMigrationAnswer(status) };
 }

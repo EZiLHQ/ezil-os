@@ -231,6 +231,17 @@ const MAX_ISSUES = 40;
 // AWS pending responses return immediately, unlike Cloudflare's held wake
 // requests. Allow the full existing 215s deadline at the 1.5s polling cadence.
 const AWS_MAX_ISSUES = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
+// A paid upgrade includes host provisioning and workspace/system restore.
+// Count from the first migration answer, then allow a full ordinary AWS wake.
+export const MIGRATION_DEADLINE_MS = 8 * 60_000;
+const MIGRATION_MAX_ISSUES = Math.ceil(MIGRATION_DEADLINE_MS / WAKE_REASK_MS) + 2;
+
+// Per-request observations let a window show a warm request's progress too.
+// Concurrent opens cannot clear one another's still-active migration signal.
+const migratingRequests = new Map();
+export function isComputeMigrating (computerId) {
+    return !!computerId && [...migratingRequests.values()].includes(computerId);
+}
 
 /**
  * 🔴 THE BEAT BEFORE THE ONE AUTOMATIC RETRY — AND IT USED TO BE ZERO.
@@ -307,7 +318,8 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  *      socket for three minutes" (see `SANDBOX_WAKE_ANSWER_BUDGET_MS` in
  *      `app/src/server/lib/cloudflare-guacamole-provider.ts`). The honest
  *      response is to ask again, which is what this does, until
- *      `WAKE_DEADLINE_MS`. The caller's boot panel is on a `setInterval` of its
+ *      `WAKE_DEADLINE_MS`. A flagged migration first gets its own bounded
+ *      deadline, then a fresh wake budget when the flag drops. The caller's boot panel is on a `setInterval` of its
  *      own, so the phase list keeps running the whole time — the user sees
  *      "Waking your machine" for as long as that is the true statement, instead
  *      of a dead socket followed by "We couldn't start your computer."
@@ -329,77 +341,104 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  * @param {() => Promise<{ok: true} | {ok: false, errorCode: string, message?: string}>} issue
  *   Sends the request once. Must never throw.
  * @param {string} what For the log line only.
+ * @param {string} [computerId] Scopes migration progress to this computer.
  */
-async function withWakeAndOneRetry (issue, what) {
+async function withWakeAndOneRetry (issue, what, computerId) {
     const t0 = Date.now();
     let retried = false;
     let asks = 0;
     let maxIssues = MAX_ISSUES;
+    let deadline = t0 + WAKE_DEADLINE_MS;
+    let migrationStartedAt = null;
+    let wakeResumed = false;
+    const progressKey = Symbol();
 
-    for (;;) {
-        // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
-        // bound in this function is a CONDITION — a clock for the wake, a
-        // boolean for the retry — and a condition can be edited away. Removing
-        // the `retried = true` line was tried during review and it turned this
-        // into an unbounded, zero-delay request loop that HUNG the headless
-        // suite rather than failing it. A browser would have hammered the
-        // server for as long as the tab stayed open.
-        //
-        // `MAX_ISSUES` is far above every legitimate path (a full 215s wake at
-        // ~13.5s per ask is ~16, plus one retry) so it can never fire in normal
-        // use, and it turns any future breakage of the two real bounds into a
-        // stop rather than a spin. With it in place the same mutation now
-        // reports `attempts=40` and fails three named checks.
-        if ( asks >= maxIssues ) {
-            console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
-            telemetry.capture({
-                eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
-                durationMs: Date.now() - t0, detail: `${asks} asks`,
-            });
-            return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
-        }
-        asks++;
-        const res = await issue();
-        if ( res.ok === true ) return res;
-
-        if ( res.errorCode === 'sandbox_starting' ) {
-            if (res.computeProvider === 'aws-ec2') maxIssues = AWS_MAX_ISSUES;
-            const waited = Date.now() - t0;
-            if ( waited >= WAKE_DEADLINE_MS ) {
-                console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
+    try {
+        for (;;) {
+            // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
+            // bound in this function is a CONDITION — a clock for the wake, a
+            // boolean for the retry — and a condition can be edited away. Removing
+            // the `retried = true` line was tried during review and it turned this
+            // into an unbounded, zero-delay request loop that HUNG the headless
+            // suite rather than failing it. A browser would have hammered the
+            // server for as long as the tab stayed open.
+            //
+            // `MAX_ISSUES` is far above every legitimate path (a full 215s wake at
+            // ~13.5s per ask is ~16, plus one retry) so it can never fire in normal
+            // use, and it turns any future breakage of the two real bounds into a
+            // stop rather than a spin. With it in place the same mutation now
+            // reports `attempts=40` and fails three named checks.
+            if ( asks >= maxIssues ) {
+                console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
                 telemetry.capture({
-                    eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'sandbox_starting',
-                    durationMs: waited, detail: `gave up after ${asks} asks`,
+                    eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
+                    durationMs: Date.now() - t0, detail: `${asks} asks`,
                 });
-                // The honest code for "it never finished waking within our
-                // budget". `classifyFailure` in boot-phases.js turns it into
-                // the `timeout` copy — "it may still come up in the background
-                // — try again" — which is exactly what is true.
-                return res;
+                return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
             }
-            await new Promise(r => setTimeout(r, WAKE_REASK_MS));
-            continue;
-        }
+            asks++;
+            const res = await issue();
+            const now = Date.now();
+            const migrating = res.ok !== true && res.errorCode === 'sandbox_starting'
+                && res.computeProvider === 'aws-ec2' && res.computeMigrating === true;
+            if (migrating) {
+                if (computerId) migratingRequests.set(progressKey, computerId);
+                if (migrationStartedAt === null) {
+                    migrationStartedAt = now;
+                    deadline = migrationStartedAt + MIGRATION_DEADLINE_MS;
+                    maxIssues = asks - 1 + MIGRATION_MAX_ISSUES;
+                }
+            } else {
+                migratingRequests.delete(progressKey);
+                if (migrationStartedAt !== null && !wakeResumed) {
+                    wakeResumed = true;
+                    deadline = now + WAKE_DEADLINE_MS;
+                    maxIssues = asks - 1 + AWS_MAX_ISSUES;
+                }
+            }
+            if ( res.ok === true ) return res;
 
-        // A genuine failure. One silent re-ask if a second attempt could
-        // plausibly answer differently, then hand it to the user.
-        if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
-             && isRetryableBootErrorCode(res.errorCode) ) {
-            retried = true;
-            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
-            telemetry.capture({
-                eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
-                durationMs: Date.now() - t0,
-            });
-            // Measured: without this the second ask landed 405-1636ms after
-            // the first and returned the same answer 10 times out of 10. See
-            // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
-            // wait, so its `durationMs` still marks the first failure and the
-            // arithmetic in that comment keeps working.
-            await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-            continue;
+            if ( res.errorCode === 'sandbox_starting' ) {
+                if (res.computeProvider === 'aws-ec2' && migrationStartedAt === null) maxIssues = AWS_MAX_ISSUES;
+                const waited = now - t0;
+                if ( now >= deadline ) {
+                    console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
+                    telemetry.capture({
+                        eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'sandbox_starting',
+                        durationMs: waited, detail: `gave up after ${asks} asks`,
+                    });
+                    // The honest code for "it never finished waking within our
+                    // budget". `classifyFailure` in boot-phases.js turns it into
+                    // the `timeout` copy — "it may still come up in the background
+                    // — try again" — which is exactly what is true.
+                    return res;
+                }
+                await new Promise(r => setTimeout(r, WAKE_REASK_MS));
+                continue;
+            }
+
+            // A genuine failure. One silent re-ask if a second attempt could
+            // plausibly answer differently, then hand it to the user.
+            if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
+                 && isRetryableBootErrorCode(res.errorCode) ) {
+                retried = true;
+                console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
+                telemetry.capture({
+                    eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
+                    durationMs: Date.now() - t0,
+                });
+                // Measured: without this the second ask landed 405-1636ms after
+                // the first and returned the same answer 10 times out of 10. See
+                // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
+                // wait, so its `durationMs` still marks the first failure and the
+                // arithmetic in that comment keeps working.
+                await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                continue;
+            }
+            return res;
         }
-        return res;
+    } finally {
+        migratingRequests.delete(progressKey);
     }
 }
 
@@ -437,7 +476,7 @@ export async function openDesktop (computerId, screen) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
-    return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop');
+    return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop', computerId);
 }
 
 // Local preview routes currently only mint URLs for a running container. Code
@@ -505,6 +544,7 @@ async function openDesktopOnce (computerId, screen) {
             ok: false,
             errorCode: data.errorCode ?? 'unknown',
             computeProvider: data.computeProvider,
+            ...(data.computeMigrating === true ? { computeMigrating: true } : {}),
             message: typeof data.error === 'string' ? data.error : undefined,
         };
     }
@@ -565,18 +605,19 @@ async function openDesktopOnce (computerId, screen) {
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
 /**
- * A not-ok preview body for the wake loop. `computeProvider` must travel with it: an AWS
- * pending answer returns at once, and `withWakeAndOneRetry` widens its ask cap only for AWS.
+ * A not-ok preview body for the wake loop. Preserve the provider and explicit
+ * migration signal so fast AWS replies receive the appropriate bounded budget.
  */
 export function pendingOrRefused (data) {
-    return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider };
+    return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
+        ...(data?.computeMigrating === true ? { computeMigrating: true } : {}) };
 }
 
 export async function previewUrl (computerId) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
-    return withWakeAndOneRetry(() => previewUrlOnce(computerId), 'previewUrl');
+    return withWakeAndOneRetry(() => previewUrlOnce(computerId), 'previewUrl', computerId);
 }
 
 /** One `POST /api/shell/preview-url`. The loop that may call it more than once is above. */
@@ -1112,7 +1153,7 @@ export default {
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
-    withWakeAndOneRetry,
+    withWakeAndOneRetry, isComputeMigrating,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

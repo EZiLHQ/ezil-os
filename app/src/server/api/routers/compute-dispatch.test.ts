@@ -347,6 +347,18 @@ describe('shell-facing AWS answers', () => {
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_stopping', retryable: true })).toBe('sandbox_starting');
     });
 
+    it.each(['computer_starting', 'computer_stopping', 'capacity_unavailable'])('ordinary AWS %s does not claim migration', async errorCode => {
+        const result = { ok: false as const, error: errorCode, errorCode, retryable: true };
+        const preview = vi.fn(async () => { throw new Error('preview after refused ensure'); });
+        expect(await awsPreviewAnswer(result, preview)).not.toHaveProperty('computeMigrating');
+        expect(awsStatusAnswer(result)).not.toHaveProperty('computeMigrating');
+        expect(preview).not.toHaveBeenCalled();
+    });
+
+    it('a successful AWS status cannot claim migration from a stale error', () => {
+        expect(awsStatusAnswer({ ok: true, error: 'computer_migrating' })).not.toHaveProperty('computeMigrating');
+    });
+
     it('a deterministic refusal keeps its own code (capacity is never dressed up as waking)', async () => {
         expect(shellCodeForAwsEnsure({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false })).toBe('capacity_unavailable');
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_starting', retryable: false })).toBe('computer_starting');

@@ -128,7 +128,7 @@ async function mintCodePreviewUrl (computerId) {
     // 187505ms with `errorCode: unknown`; retry two seconds later resolved in
     // 5460ms). Re-implementing the loop here is how the two surfaces would
     // stop waiting for the same length of time — see `withWakeAndOneRetry`.
-    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl');
+    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl', computerId);
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
@@ -291,7 +291,8 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
-    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
+    const progress = AppSpinner({ label: 'Opening Code…', isMigrating: () => session.isComputeMigrating(computer.id),
+        onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
