@@ -5,6 +5,7 @@ import { KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw } from './fixtures/gateway';
 import { frames, messageJson } from './fixtures/gateway-response';
+import { localResetTime } from '../src/status-data';
 
 const catalog = { data: [{ id: gw().id, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 }] };
 const json = (value: unknown, status = 200, headers = {}) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'req-head', ...headers } });
@@ -86,6 +87,14 @@ describe('gateway transport', () => {
         await expect(run(s.fetch, { sleep: async ms => { waits.push(ms); } })).rejects.toThrow();
         sameAttempt(s.posts()); expect(waits).toEqual([60000]);
     });
+    for (const model of [gw(), gw(KIMI)]) test(`429 window_budget_reached ends ${model.id} without waiting or retrying`, async () => {
+        const waits: number[] = [];
+        const s = server(() => error(429, 'window_budget_reached', {}, { 'retry-after': '7200' }));
+        await expect(run(s.fetch, { model, sleep: async ms => { waits.push(ms); } })).rejects.toThrow(
+            `This window's EZiL AI credits are used up. Resets at ${localResetTime(new Date(7200000))}`);
+        expect(s.calls).toHaveLength(1);
+        expect(waits).toEqual([]);
+    });
     for (const [status, code] of [[409, 'idempotency_replay'], [504, 'upstream_timeout'], [500, 'internal_error'], [503, 'no_provider_route'], [429, 'tpm_limited']] as const) test(`no retry ${status} ${code}`, async () => {
         const s = server(() => error(status, code)); await expect(run(s.fetch)).rejects.toThrow(); expect(s.posts()).toHaveLength(1);
     });
@@ -119,6 +128,33 @@ describe('gateway transport', () => {
 });
 
 describe('gateway errors and credits', () => {
+    test('window exhaustion uses the full Retry-After seconds or HTTP date in local time', () => {
+        const now = Date.parse('2026-10-22T12:05:00Z');
+        const reset = new Date(now + 7200000);
+        for (const header of ['7200', reset.toUTCString()]) {
+            const error = describeGatewayError('qwen', 429, header, { code: 'window_budget_reached', request_id: 'window-id' }, null, undefined, now);
+            expect(error.message).toContain(`Resets at ${localResetTime(reset)} (local time)`);
+            expect(error.message).toContain('(request window-id)');
+            expect(error.retryAfterSeconds).toBe(7200);
+            expect(error.status).toBe(429);
+            expect(error.code).toBe('window_budget_reached');
+        }
+    });
+    test('missing or invalid window Retry-After does not invent a deadline or retry', () => {
+        for (const header of [null, 'invalid', '9'.repeat(400)]) {
+            const error = describeGatewayError('qwen', 429, header, { code: 'window_budget_reached', message: 'private body' }, null);
+            expect(error.message).toContain("This window's EZiL AI credits are used up.");
+            expect(error.message).toContain('Check EZiL AI status for the reset time.');
+            expect(error.message).not.toMatch(/Resets at|private body|retry/i);
+            expect(error.retryAfterSeconds).toBeUndefined();
+        }
+    });
+    test('zero Retry-After refers to now without imposing a default wait', () => {
+        const now = Date.parse('2026-10-22T14:05:00Z');
+        const error = describeGatewayError('qwen', 429, '0', { code: 'window_budget_reached' }, null, undefined, now);
+        expect(error.message).toContain(`Resets at ${localResetTime(new Date(now))}`);
+        expect(error.retryAfterSeconds).toBe(0);
+    });
     for (const [status, code, text] of [
         [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'grant'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
         [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS refused this computer'],

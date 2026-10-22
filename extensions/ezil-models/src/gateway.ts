@@ -10,6 +10,7 @@ import { sseEvents } from './sse';
 import { buildGatewayBody } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { emptyUsage } from './types';
+import { localResetTime } from './status-data';
 import type { ChatRequest, StreamEvent } from './types';
 
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
@@ -173,13 +174,22 @@ export function retryDelay(value: string | null, fallback = 5, now = Date.now())
 }
 
 export function describeGatewayError(alias: string, status: number, retryAfter: string | null, body: ErrorBody, headerRequestId: string | null,
-    balance?: GatewayBalance): GatewayError {
+    balance?: GatewayBalance, now = Date.now()): GatewayError {
     const requestId = body.request_id ?? headerRequestId ?? undefined;
     const ref = requestId ? ` (request ${requestId})` : '';
     const code = body.code;
     const make = (message: string) => new GatewayError(`EZiL AI: ${message}${ref}`, status, code, requestId, retryDelay(retryAfter));
     if (body.reason === 'no_ezil_role' || code === 'no_ezil_role') return make('Your EZiL account has no AI access yet');
     switch (code) {
+        case 'window_budget_reached': {
+            // This is a reset deadline, not a retry delay: never cap it to the transport's 60 seconds.
+            const delay = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : retryAfter ? (Date.parse(retryAfter) - now) / 1000 : NaN;
+            const reset = new Date(now + Math.max(0, delay) * 1000);
+            const seconds = Number.isFinite(reset.getTime()) ? Math.max(0, Math.ceil(delay)) : undefined;
+            return new GatewayError(`EZiL AI: This window's EZiL AI credits are used up. ${seconds === undefined
+                ? 'Check EZiL AI status for the reset time.' : `Resets at ${localResetTime(reset)} (local time).`}${ref}`,
+                status, code, requestId, seconds);
+        }
         case 'insufficient_credits': case 'no_live_grant': {
             const available = body.available_micro ?? balance?.available_micro;
             const state = balance ? creditState(undefined, balance, alias).text : body.no_live_grant || code === 'no_live_grant'
@@ -325,7 +335,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 continue;
             }
             if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
-            throw describeGatewayError(model.model, status, response.headers.get('retry-after'), body, requestId ?? null);
+            throw describeGatewayError(model.model, status, response.headers.get('retry-after'), body, requestId ?? null, undefined, now());
         }
         options.signal.throwIfAborted();
         if (!response.body) throw new GatewayResponseError(requestId);

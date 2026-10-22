@@ -19,6 +19,7 @@ export type ProviderHost = {
     logRequests(): boolean;
     log(line: string): void;
     recordUsage(model: ResolvedModel, usage: Usage, elapsedMs: number): void;
+    requestFinished?(model: ResolvedModel): void;
     fetch?: typeof fetch;
 };
 
@@ -225,6 +226,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
             cancellation.dispose();
+            this.host.requestFinished?.(resolved);
         }
     }
 

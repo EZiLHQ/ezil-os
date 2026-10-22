@@ -370,6 +370,38 @@ describe('EZiL gateway VS Code bridge', () => {
             { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('this OS environment is not connected');
         expect(posts).toBe(1); expect(showRetryError).not.toHaveBeenCalled();
     });
+    test('exhausted window reaches chat without retry action and refreshes status after refusal', async () => {
+        showRetryError.mockClear(); retryCommand.mockClear();
+        let posts = 0;
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'window_budget_reached' } },
+            { status: 429, headers: { 'retry-after': '7200' } }); }) as unknown as typeof fetch);
+        const requestFinished = mock((_model: ResolvedModel) => {});
+        const provider = new EZiLModelsProvider({ ...host, requestFinished });
+        await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow("This window's EZiL AI credits are used up. Resets at");
+        expect(posts).toBe(1);
+        expect(showRetryError).not.toHaveBeenCalled();
+        expect(retryCommand).not.toHaveBeenCalled();
+        expect(host.usage).toHaveLength(0);
+        expect(requestFinished).toHaveBeenCalledTimes(1);
+        expect(requestFinished.mock.calls[0]![0].provider.type).toBe('ezil-gateway');
+    });
+    for (const mode of ['stream', 'json', 'interrupted', 'cancelled'] as const) test(`refresh hook runs once after ${mode} chat finishes`, async () => {
+        const host = gatewayHost((async () => mode === 'json' ? Response.json(messageJson())
+            : new Response((mode === 'interrupted' ? frames().slice(0, -1) : frames()).join(''), { headers: { 'content-type': 'text/event-stream' } })) as unknown as typeof fetch);
+        const requestFinished = mock((_model: ResolvedModel) => {});
+        const provider = new EZiLModelsProvider({ ...host, recordUsage: (model, usage) => {
+            expect(requestFinished).not.toHaveBeenCalled(); host.recordUsage(model, usage);
+        }, requestFinished });
+        const cancel = token();
+        const send = provider.provideLanguageModelChatResponse(toInformation(host.models()[mode === 'json' ? 1 : 0]!),
+            [message(1, [new TextPart('q')])] as never, { tools: [], modelOptions: {} } as never,
+            { report: () => { expect(requestFinished).not.toHaveBeenCalled(); if (mode === 'cancelled') cancel.cancel(); } }, cancel as never);
+        if (mode === 'interrupted') await expect(send).rejects.toThrow('interrupted');
+        else await send;
+        expect(requestFinished).toHaveBeenCalledTimes(1);
+        expect(host.usage).toHaveLength(mode === 'cancelled' || mode === 'interrupted' ? 0 : 1);
+    });
     test('Kimi reports JSON parts in order and never logs bodies even with logRequests enabled', async () => {
         const host = gatewayHost((async () => Response.json(messageJson(), { headers: { 'x-ezil-request-id': 'bridge-json' } })) as unknown as typeof fetch);
         const provider = new EZiLModelsProvider(host); const parts: unknown[] = [];

@@ -201,9 +201,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         log,
         recordUsage: (model, used, elapsedMs) => {
             usage.record(model, used, elapsedMs);
-            if (model.provider.type === 'ezil-gateway') void aiStatus.refresh();
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);
         },
+        requestFinished: model => { if (model.provider.type === 'ezil-gateway') void aiStatus.refresh(); },
     });
     context.subscriptions.push(output, store, provider, aiStatus);
     context.subscriptions.push(store.onChange(() => { provider.refresh(); void aiStatus.refresh(); }));

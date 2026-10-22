@@ -409,7 +409,7 @@ const GATEWAY_ERROR_CODES = new Set([
   'forbidden', 'account_suspended', 'suspended', 'input_too_large', 'body_too_large',
   'unsupported_bedrock_converse_request', 'unsupported_parameter', 'invalid_request', 'max_output_tokens_invalid',
   'idempotency_conflict', 'idempotency_key_required', 'idempotency_replay', 'killswitch', 'paused', 'pause',
-  'global_cap_reached', 'no_provider_route', 'model_disabled', 'model_not_found', 'upstream_timeout',
+  'global_cap_reached', 'daily_budget_reached', 'window_budget_reached', 'no_provider_route', 'model_disabled', 'model_not_found', 'upstream_timeout',
   'rate_limited', 'concurrency_limit', 'tpm_limited', 'internal_error',
 ]);
 const GATEWAY_ERROR_REASONS = new Set(['wrong_issuer', 'bad_signature', 'no_ezil_role', 'expired', 'token_expired',

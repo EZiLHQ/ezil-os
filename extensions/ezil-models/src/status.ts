@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import type { ResolvedProvider } from './config';
 import { readAIStatus, statusView, type AIStatus } from './status-data';
 
-/** Gateway status is refreshed at startup, on config changes, after usage, and once a minute. */
+/** Gateway status is refreshed at startup, on config changes, after requests, and once a minute. */
 export class EZiLAIStatus implements vscode.Disposable {
     private readonly item: vscode.StatusBarItem;
     private readonly timer: ReturnType<typeof setInterval>;

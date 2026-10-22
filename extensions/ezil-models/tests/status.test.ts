@@ -1,11 +1,13 @@
 import { describe, expect, mock, spyOn, test } from 'bun:test';
 import { fakeVscode } from './fixtures/fake-vscode';
 import type { ResolvedProvider } from '../src/config';
-import { AI_NOTICE, readAIStatus, statusView } from '../src/status-data';
+import { AI_NOTICE, credits, localResetTime, readAIStatus, statusView } from '../src/status-data';
 mock.module('vscode', () => fakeVscode);
 const { EZiLAIStatus } = await import('../src/status');
 const provider = { type: 'ezil-gateway', baseUrl: 'https://computer.test/ai/v1', apiKey: 'test-only' } as ResolvedProvider;
 const balance = { available_micro: 12345678, held_micro: 1000000 };
+const creditWindow = { seconds: 7200, budget_micro: '20000000', used_micro: '7500000', remaining_micro: '12500000',
+    started_at: '2026-10-22T12:05:00Z', resets_at: '2026-10-22T14:05:00Z' };
 const row = { model: 'qwen.qwen3-coder-next', created_at: '2026-10-21T12:00:00Z', status: 'settled', cost_micro: 1500000, uncollected_micro: 250000 };
 function server(b: unknown = balance, u: unknown = { data: [row] }, status = 200) {
     const calls: { url: string; init?: RequestInit }[] = [];
@@ -24,6 +26,92 @@ function harness(doFetch: typeof fetch) {
 }
 
 describe('EZiL AI Gateway status', () => {
+    test('shows window credits and local reset time in the item, tooltip and popover', async () => {
+        const h = harness(server({ ...balance, window: creditWindow }).fetch);
+        const date = new Date(creditWindow.resets_at);
+        const reset = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+        try {
+            await h.status.show();
+            expect(localResetTime(creditWindow.resets_at)).toBe(reset);
+            expect(h.item.text).toBe(`EZiL AI · 12.5 credits left · resets ${reset}`);
+            expect(h.item.tooltip).toContain('2-hour window: 12.5 credits left of 20');
+            expect(h.item.tooltip).toContain('Window used (held + settled): 7.5 credits');
+            expect(h.item.tooltip).toContain(`Resets at ${reset} (local time)`);
+            expect(h.item.tooltip).toContain('Available credits: 12.345678');
+            expect(JSON.stringify(h.popover.mock.calls)).toContain('2-hour window');
+        } finally { h.status.dispose(); }
+    });
+    test('null window preserves the complete legacy view', async () => {
+        const old = statusView(await readAIStatus(provider, server().fetch));
+        const current = statusView(await readAIStatus(provider, server({ ...balance, window: null }).fetch));
+        expect(current).toEqual(old);
+        expect(current.text).toBe('EZiL AI · 12.345678 credits');
+    });
+    test('inactive windows show the allowance without inventing a reset time', async () => {
+        const view = statusView(await readAIStatus(provider, server({ ...balance, window: { ...creditWindow,
+            started_at: null, resets_at: null, used_micro: '0', remaining_micro: '20000000' } }).fetch));
+        expect(view.text).toBe('EZiL AI · 20 credits left');
+        expect(view.lines).toContain('Window starts with your next admitted request.');
+        expect(view.lines.join()).not.toContain('Resets at');
+    });
+    test('zero remaining and non-default window length come from the gateway', async () => {
+        const view = statusView(await readAIStatus(provider, server({ ...balance, window: { ...creditWindow,
+            seconds: 5400, remaining_micro: '0', used_micro: creditWindow.budget_micro } }).fetch));
+        expect(view.text).toStartWith('EZiL AI · 0 credits left · resets ');
+        expect(view.lines).toContain('90-minute window: 0 credits left of 20');
+    });
+    test('micro-credit strings use the same unit, grouping and six-place precision as balances', () => {
+        for (const [micro, expected] of [[0, '0'], [1, '0.000001'], [10, '0.00001'], [1000000, '1'], [12500000, '12.5'],
+            [1234567890, '1,234.56789'], [9007199254740991, '9,007,199,254.740992']] as const) {
+            // Legacy numeric balances retain their existing floating-point formatting.
+            expect(credits(micro)).toBe(expected);
+            if (micro < Number.MAX_SAFE_INTEGER) expect(credits(String(micro))).toBe(expected);
+        }
+        expect(credits('9007199254740991')).toBe('9,007,199,254.740991');
+        expect(credits('9007199254740993123456')).toBe('9,007,199,254,740,993.123456');
+    });
+    test('malformed window payloads use the existing invalid-response fallback', async () => {
+        for (const window of [false, {}, { ...creditWindow, seconds: 599 }, { ...creditWindow, seconds: 86401 },
+            { ...creditWindow, seconds: 7200.5 }, { ...creditWindow, remaining_micro: 12500000 },
+            { ...creditWindow, remaining_micro: '-1' }, { ...creditWindow, used_micro: '1.5' },
+            { ...creditWindow, budget_micro: null }, { ...creditWindow, resets_at: 'not a date' }]) {
+            expect(statusView(await readAIStatus(provider, server({ ...balance, window }).fetch)).text).toBe('EZiL AI · invalid_response');
+        }
+    });
+    test('fetch errors clear prior window values and retain the existing fallback', async () => {
+        let fail = false;
+        const h = harness((async (url, init) => {
+            if (fail) throw new Error('private detail');
+            return server({ ...balance, window: creditWindow }).fetch(url, init);
+        }) as typeof fetch);
+        try {
+            await h.status.refresh();
+            expect(h.item.text).toContain('credits left');
+            fail = true; await h.status.refresh();
+            expect(h.item.text).toBe('EZiL AI · network_error');
+            expect(h.item.tooltip).toContain('Credits unavailable (network_error)');
+            expect(h.item.tooltip).not.toMatch(/12\.5|Resets|private detail/);
+        } finally { h.status.dispose(); }
+    });
+    test('existing minute timer fetches updated window credits and is disposed', async () => {
+        let tick: () => void = () => { throw new Error('timer not registered'); };
+        const timer = { unref: mock(() => {}) };
+        const interval = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, ms: number) => {
+            expect(ms).toBe(60000); tick = callback; return timer;
+        }) as unknown as typeof setInterval);
+        const clear = spyOn(globalThis, 'clearInterval').mockImplementation(() => {});
+        let remaining_micro = '12500000';
+        const h = harness((async (url, init) => server({ ...balance, window: { ...creditWindow, remaining_micro } }).fetch(url, init)) as typeof fetch);
+        try {
+            await h.status.refresh();
+            expect(h.item.text).toContain('12.5 credits left');
+            remaining_micro = '1000000'; tick();
+            for (let i = 0; i < 20; i++) await Promise.resolve();
+            expect(h.item.text).toContain('1 credits left');
+            h.status.dispose();
+            expect(clear).toHaveBeenCalledWith(timer);
+        } finally { interval.mockRestore(); clear.mockRestore(); }
+    });
     test('renders real balance, held credits and net usage in status item and popover', async () => {
         const s = server(); const h = harness(s.fetch);
         try {

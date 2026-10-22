@@ -275,6 +275,20 @@ describe('forwarding', () => {
     expect(d.logs.at(-1)).toMatchObject({ event: 'ai_proxy', route: 'POST /v1/messages', status: 429, code: 'rate_limited', request_id: 'req-9', idempotency_key: 'turn-0123456789' });
   });
 
+  it('passes the credit-window refusal through with Retry-After, in one upstream call', async () => {
+    const body = '{"error":{"code":"window_budget_reached","message":"m","request_id":"req-w"}}';
+    const gw = mockGateway(() => new Response(body, { status: 429, headers: { 'content-type': 'application/json; charset=utf-8', 'retry-after': '7200' } }));
+    const d = await deps({ fetch: gw.fetch });
+    const res = await handleAiProxyRequest(
+      new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-window-0001' }, body: '{}' }),
+      d,
+    );
+    expect(res.status).toBe(429);
+    expect(res.headers.get('retry-after')).toBe('7200');
+    expect(await res.json()).toEqual({ error: { code: 'window_budget_reached', request_id: 'req-w' } });
+    expect(gw.calls).toHaveLength(1);
+  });
+
   it('does not retry a POST when the gateway is unreachable', async () => {
     let attempts = 0;
     const d = await deps({ fetch: async () => { attempts += 1; throw new TypeError('network down'); } });
