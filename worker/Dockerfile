@@ -106,6 +106,7 @@ ARG GUAC_VERSION=1.3.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb \
       x11vnc \
+      xclip \
       fluxbox \
       guacd \
       libguac-client-vnc0 \
@@ -248,6 +249,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # instance_type history in wrangler.toml). code-server serves the IDE over
 # plain HTTP and renders nothing into Xvfb.
 COPY --from=neko /usr/bin/neko   /usr/bin/neko
+# Neko reads and writes the X clipboard ONLY through xclip (m1k1o/neko@d74052bb
+# server/internal/desktop/clipboard.go:49,82,133). Without it every clipboard sync
+# fails with "could not get clipboard content" (seen 2026-10-22).
+RUN command -v xclip >/dev/null || { echo 'xclip is required by the Neko clipboard' >&2; exit 1; }
 COPY --from=neko /var/www        /var/www
 COPY --from=neko /etc/neko       /etc/neko
 COPY scripts/neko-client.js /var/www/ezil-input.js
