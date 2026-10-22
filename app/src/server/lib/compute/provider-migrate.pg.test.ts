@@ -38,6 +38,12 @@ describe.skipIf(!PG)('migration store on disposable PostgreSQL', () => {
         m = (await store.applyTransition(m, { type: 'fenced', etag: 'source', systemEtag: null, generation: C })).migration;
         return (await store.applyTransition(m, { type: 'exported', workspaceHead: { generation: C }, systemHead: null })).migration;
     }
+    it('readByComputer returns the newest row (ORDER BY is unambiguous with the text-cast columns)', async () => {
+        expect(await store.readByComputer(C)).toBeNull();
+        const m = await create();
+        expect((await store.readByComputer(C))?.id).toBe(m.id);
+    });
+
     it('concurrent create returns one active row', async () => {
         const results = await Promise.all(Array.from({ length: 12 }, create));
         expect(new Set(results.map(m => m.id)).size).toBe(1);

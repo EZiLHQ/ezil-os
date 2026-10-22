@@ -60,7 +60,7 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
     const now = options.now ?? (() => new Date());
     const readById = async (id: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_migrations WHERE id = ${id}::uuid`));
     const readByComputer = async (computerId: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_migrations
-        WHERE computer_id = ${computerId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1`));
+        WHERE computer_id = ${computerId}::uuid ORDER BY ezil_compute_migrations.created_at DESC, id DESC LIMIT 1`));
     const readActiveByComputer = async (computerId: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_migrations
         WHERE computer_id = ${computerId}::uuid AND ${ACTIVE}`));
     return {
