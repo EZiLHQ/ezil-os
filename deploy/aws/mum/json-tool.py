@@ -714,7 +714,8 @@ def main(args):
     elif op == "lifecycle-noop":
         cs = read(a[0])
         reason = cs.get("StatusReason", "")
-        need(not cs.get("NextToken") and cs.get("RoleARN") == ROLE and
+        # CloudFormation omits RoleARN on a FAILED (empty) change set.
+        need(not cs.get("NextToken") and cs.get("RoleARN") in (ROLE, None) and
              cs.get("Status") == "FAILED" and cs.get("ExecutionStatus") == "UNAVAILABLE" and not cs.get("Changes") and
              ("didn't contain changes" in reason or "No updates are to be performed" in reason), "failed change set is not a verified no-op")
         print("Rollback stack already matches the previous configuration; restoring app deployment fields")

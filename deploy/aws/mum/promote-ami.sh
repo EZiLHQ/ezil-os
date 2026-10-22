@@ -81,7 +81,7 @@ if "$apply"; then
 fi
 (
     cd "$synth_project"
-    act npx --no-install cdk publish-assets ezil-mum-lifecycle --app cdk.out/lifecycle --no-lookups --no-notices --profile "$profile"
+    act npx --no-install cdk publish-assets --unstable=publish-assets ezil-mum-lifecycle --app cdk.out/lifecycle --no-lookups --no-notices --profile "$profile"
     aws_act s3 cp cdk.out/lifecycle/ezil-mum-lifecycle.template.json "$template_uri"
 )
 aws_act cloudformation create-change-set --stack-name ezil-mum-lifecycle --change-set-name "$change" --change-set-type UPDATE \
