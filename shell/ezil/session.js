@@ -228,6 +228,9 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
  * `withWakeAndOneRetry`'s loop for why a ceiling and not just the conditions.
  */
 const MAX_ISSUES = 40;
+// AWS pending responses return immediately, unlike Cloudflare's held wake
+// requests. Allow the full existing 215s deadline at the 1.5s polling cadence.
+const AWS_MAX_ISSUES = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
 
 /**
  * 🔴 THE BEAT BEFORE THE ONE AUTOMATIC RETRY — AND IT USED TO BE ZERO.
@@ -331,6 +334,7 @@ async function withWakeAndOneRetry (issue, what) {
     const t0 = Date.now();
     let retried = false;
     let asks = 0;
+    let maxIssues = MAX_ISSUES;
 
     for (;;) {
         // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
@@ -346,7 +350,7 @@ async function withWakeAndOneRetry (issue, what) {
         // use, and it turns any future breakage of the two real bounds into a
         // stop rather than a spin. With it in place the same mutation now
         // reports `attempts=40` and fails three named checks.
-        if ( asks >= MAX_ISSUES ) {
+        if ( asks >= maxIssues ) {
             console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
             telemetry.capture({
                 eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
@@ -359,6 +363,7 @@ async function withWakeAndOneRetry (issue, what) {
         if ( res.ok === true ) return res;
 
         if ( res.errorCode === 'sandbox_starting' ) {
+            if (res.computeProvider === 'aws-ec2') maxIssues = AWS_MAX_ISSUES;
             const waited = Date.now() - t0;
             if ( waited >= WAKE_DEADLINE_MS ) {
                 console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
@@ -499,6 +504,7 @@ async function openDesktopOnce (computerId, screen) {
         return {
             ok: false,
             errorCode: data.errorCode ?? 'unknown',
+            computeProvider: data.computeProvider,
             message: typeof data.error === 'string' ? data.error : undefined,
         };
     }

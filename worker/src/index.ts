@@ -4366,14 +4366,12 @@ async function awsControlTarget(env: Env, request: Request, name: string, prefix
 
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
-  return async (signal, purpose = 'renewal') => {
+  return async (signal) => {
     const issuedAt = Date.now();
     const servers = await generateTurnCredentials(env, signal);
     const ttl = resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS);
-    // Apply the boot margin without changing the existing AWS renewal lifetime.
-    return servers ? { servers, expiresAt: purpose === 'boot'
-      ? relayExpiryFor(issuedAt, ttl)
-      : issuedAt + ttl * 1000 } : null;
+    // The same host lifetime validation runs at boot and at every renewal.
+    return servers ? { servers, expiresAt: relayExpiryFor(issuedAt, ttl) } : null;
   };
 }
 

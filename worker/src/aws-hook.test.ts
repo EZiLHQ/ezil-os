@@ -329,8 +329,8 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
       expect(renewed.status).toBe(200);
       const { expiresAt } = await renewed.json() as { expiresAt: number };
       expect(expiresAt).toBeGreaterThan(bootExpiry);
-      // Preserve the existing AWS renewal lifetime; only boot gains the margin.
-      expect(expiresAt).toBe(issuedAt + 1000 + ttlSeconds * 1000);
+      // Renewal keeps the clock margin too: the host refuses an expiry beyond 30 min on its own clock.
+      expect(expiresAt).toBe(relayExpiryFor(issuedAt + 1000, ttlSeconds));
       expect(host.bad).toEqual([]);
     } finally {
       now.mockRestore();

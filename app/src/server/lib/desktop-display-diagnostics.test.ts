@@ -68,6 +68,17 @@ afterEach(() => {
 });
 
 describe('AWS display diagnostics (verdicts remain observational)', () => {
+    it('an AWS list containing only the disconnected admin probe cannot refute a legacy viewer', async () => {
+        wire({ entries: [{ id: MEMBER, profile: { is_admin: true }, state: { is_connected: false, is_watching: false } }] });
+        expect(await provider.probeDesktopDisplay(URL, PASSWORD)).toEqual({ display: 'unknown', reason: 'unrecognised' });
+        expect(log()).toMatchObject({ display: 'unknown', session_count: 1, http_statuses: { bootstrap: 302, login: [200], sessions: [200] } });
+    });
+    it('an observed AWS watcher still reports live and a Cloudflare admin-only list retains its verdict', async () => {
+        wire({ entries: [member(true)] });
+        expect(await provider.probeDesktopDisplay(URL, PASSWORD)).toEqual({ display: 'live', sessions: 1, watching: 1 });
+        wire({ entries: [{ profile: { is_admin: true }, state: { is_connected: false, is_watching: false } }] });
+        expect(await provider.probeDesktopDisplay(`${ORIGIN}/`, PASSWORD)).toEqual({ display: 'blank', sessions: 1 });
+    });
     it('logs exactly the allowlisted shape, host and 8-hex SHA256 ids on blank', async () => {
         const calls = wire({ entries: [member(), { id: 'second-private-id', state: { is_watching: false } }] });
         expect(await provider.probeDesktopDisplay(URL, PASSWORD)).toEqual({ display: 'blank', sessions: 2 });

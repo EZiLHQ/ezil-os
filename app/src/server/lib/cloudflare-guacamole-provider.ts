@@ -2302,6 +2302,14 @@ export async function probeDesktopDisplay(
             if (state.is_watching) watching++;
         }
 
+        // AWS's legacy /ws viewer has been observed streaming while this API
+        // lists only the disconnected admin probe. That snapshot cannot
+        // refute the viewer's own decoded-frame evidence. Keep it unknown;
+        // the shell still requires current, scoped frame progress to go live.
+        if (bootstrap && watching === 0 && body.length === 1
+            && body[0]?.profile?.is_admin === true && body[0]?.state?.is_connected === false) {
+            return finish({ display: 'unknown', reason: 'unrecognised' });
+        }
         return finish(watching > 0
             ? { display: 'live', sessions: body.length, watching }
             : { display: 'blank', sessions: body.length });

@@ -290,7 +290,7 @@ export function awsScreenDesktop(record: AwsTunnelRecord, zone: string, fetchFn:
   };
 }
 
-/** Boot can apply its clock margin independently of the existing renewal lifetime. */
+/** Boot and renewal both use a clock-margined expiry accepted by the host. */
 export type RelayMint = (signal: AbortSignal, purpose?: 'boot' | 'renewal') => Promise<{ servers: IceServerEntry[]; expiresAt: number } | null>;
 
 /** Cloudflare's `relayRefresh`, for an AWS computer: read the relay state, or renew it in place. */
@@ -309,6 +309,9 @@ export async function awsRelayRefresh(p: {
   return relayOperation(container, p.admin, {
     runtimeId: p.runtimeId,
     budgetMs: p.budgetMs,
+    // Preserve the boot contract on every renewal, including mixed STUN/TURN
+    // entries. normalizeSet also refuses a missing authenticated TURN server.
+    backendIceServers: (servers) => normalizeSet(servers, isTurn),
     ...(p.runtimeId && mint
       ? {
           mint: async (signal: AbortSignal) => {

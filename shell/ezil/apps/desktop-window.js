@@ -1398,6 +1398,16 @@ export async function openDesktopWindow (ctx = {}) {
         viewer_attempt = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${my_attempt}-${Date.now()}-${Math.random()}`;
         viewer_origin = viewer_url.origin;
         viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
+        // AWS bootstrap redirects to `path`, discarding its outer query. The
+        // viewer reads its navigation ID from the final document URL; without
+        // it every frame report (including renewal confirmation) is rejected.
+        if (viewer_url.pathname === '/preview-bootstrap') {
+            const destination = new URL(viewer_url.searchParams.get('path') || '/', viewer_url);
+            if (destination.origin === viewer_url.origin) {
+                destination.searchParams.set('ezilAttempt', viewer_attempt);
+                viewer_url.searchParams.set('path', destination.pathname + destination.search + destination.hash);
+            }
+        }
         el_iframe.src = viewer_url.href;
         // 🔴 THE GATE STARTS HERE, NOT AFTER THE FRAME CHECK. Asking Neko
         // whether a peer is connected is independent of everything
