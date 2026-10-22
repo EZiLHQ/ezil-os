@@ -144,7 +144,11 @@ export async function focusEditor(frame) {
  */
 export function installNekoClipboardProbe() {
   'use strict'; // addInitScript serializes this function outside module strict mode.
-  if (window.top === window || !/^[^.]+-nekodesktop\./i.test(location.hostname)) return;
+  // Match the desktop service (8181) and the complete hosted domain. Code
+  // (8443), the shell, foreign suffixes and top-level pages must stay untouched.
+  const desktopHost = /^(?:8181-guac-[a-z0-9]+-[a-z0-9]+-nekodesktop|aws-8181-guac-[a-z0-9]+-[a-z0-9]+-aws)\.ezil\.work$/i;
+  if (window.top === window || location.protocol !== 'https:' || location.port
+      || !desktopHost.test(location.hostname)) return;
   if (window.__desktopQualityClipboard) return;
   const hooks = { websocket: 'unavailable', websocketOnmessage: 'unavailable', clipboardWrite: 'unavailable',
     clipboardHandler: 'unavailable', clipboardSend: 'unavailable' };
@@ -509,15 +513,7 @@ async function enterNekoClipboardTarget(page, { frame, input }) {
   return { exitScope, videoClicked: true, overlayFocused: true, windowFocusDispatched: true };
 }
 
-async function readNekoOmnibox({ frame, input }, token, timeoutMs) {
-  // Copying the unchanged paste may produce no notification: it is already
-  // the X11 clipboard. Append only a marker so a fresh matching server event
-  // proves the remote omnibox contained the pasted token, not a local echo.
-  const marker = '-readback', expected = `${token}${marker}`;
-  await nekoClipboardDiagnostics(frame, expected);
-  await input.press('End');
-  await typeNeko(input, marker);
-  await input.press('Control+a'); await input.press('Control+c');
+async function waitForNekoClipboardEvent(frame, timeoutMs) {
   const deadline = performance.now() + timeoutMs;
   let diagnostics;
   do {
@@ -525,6 +521,40 @@ async function readNekoOmnibox({ frame, input }, token, timeoutMs) {
     if (diagnostics.testTokenEvents > 0 || performance.now() >= deadline) break;
     await sleep(50);
   } while (true);
+  return diagnostics;
+}
+
+async function prepareNekoOmnibox({ frame, input }, token, timeoutMs, settleMs) {
+  // A focused overlay/control flag proves only local readiness. A copy of a
+  // freshly typed, separate token proves the guest can process our keys before
+  // the one clipboard sync under test. Retry this readiness handshake only.
+  const attempts = [];
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const expected = `${token}-${attempt}`;
+    await nekoClipboardDiagnostics(frame, expected);
+    await input.focus(); await input.press('Control+l');
+    await sleep(settleMs);
+    await typeNeko(input, expected);
+    await sleep(settleMs);
+    await input.press('Control+a'); await input.press('Control+c');
+    const diagnostics = await waitForNekoClipboardEvent(frame, timeoutMs / 3);
+    attempts.push({ exactEquality: diagnostics.testTokenEvents > 0, diagnostics });
+    if (diagnostics.testTokenEvents > 0) return { verified: true, attempts };
+  }
+  return { verified: false, attempts };
+}
+
+async function readNekoOmnibox({ frame, input }, token, timeoutMs, settleMs) {
+  // Copying the unchanged paste may produce no notification: it is already
+  // the X11 clipboard. Append only a marker so a fresh matching server event
+  // proves the remote omnibox contained the pasted token, not a local echo.
+  const marker = '-readback', expected = `${token}${marker}`;
+  await nekoClipboardDiagnostics(frame, expected);
+  await input.press('End');
+  await typeNeko(input, marker);
+  await sleep(settleMs);
+  await input.press('Control+a'); await input.press('Control+c');
+  const diagnostics = await waitForNekoClipboardEvent(frame, timeoutMs);
   const available = diagnostics.status === 'observed' && diagnostics.hooks?.websocket === 'installed'
     && diagnostics.socketsObserved > 0;
   const remoteEquals = available ? diagnostics.testTokenEvents > 0 : null;
@@ -627,7 +657,7 @@ async function typeNeko(input, value) {
 
 export function desktopQuality({ page, context, runId, codeReady, browserReady,
   codeFrame, terminalRun, command, clickDock, openApp, closeApp, appWindow, shot,
-  clipboardTimeoutMs = 5000 }) {
+  clipboardTimeoutMs = 5000, clipboardSettleMs = 250 }) {
   const terminal = async (script, phase) => terminalRun(page, await codeFrame(page), script, runId, phase);
   const newEditor = async () => {
     await clickDock(page, 'code');
@@ -800,11 +830,16 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
             return await qualityChecks(data, {
               localToRemote: async result => {
                 const token = `local-to-browser-${runId}`;
-                result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
                 result.upstreamSent = false;
                 result.pasteDispatched = false; result.exactEquality = false;
-                let stage = 'local_clipboard_write_failed';
+                result.settleMs = clipboardSettleMs;
+                let stage = 'remote_omnibox_focus_unverified';
                 try {
+                  result.focus = await prepareNekoOmnibox(target, `clipboard-focus-${runId}`,
+                    clipboardTimeoutMs, clipboardSettleMs);
+                  if (!result.focus.verified) throw clipboardFailure(stage);
+                  result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
+                  stage = 'local_clipboard_write_failed';
                   // Clipboard permissions and focus belong to the Neko frame,
                   // which is cross-origin from the OS shell.
                   await target.frame.evaluate(token => navigator.clipboard.writeText(token), token);
@@ -818,14 +853,22 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
                   if (!result.upstreamSent) throw clipboardFailure(sent.hooks?.clipboardSend === 'installed'
                     ? 'no_upstream_clipboard_send' : 'clipboard_send_observer_unavailable');
                   stage = 'remote_omnibox_paste_failed';
-                  await target.input.press('Control+l'); await target.input.press('Control+v');
+                  // send() queues a WebSocket message; guest key events take a
+                  // different transport. Do not race Ctrl+V against X11 sync.
+                  // Never resend or retry the paste: a dropped sync must fail.
+                  await sleep(clipboardSettleMs);
+                  await target.input.press('Control+l');
+                  await sleep(clipboardSettleMs);
+                  await target.input.press('Backspace');
+                  await target.input.press('Control+v');
                   result.pasteDispatched = true;
-                  await shot('clipboard-browser', result, 'desktop', true);
+                  await sleep(clipboardSettleMs);
                   result.contract = 'worker/sidecar/contract.mjs:SIDECAR_WIRE';
                   stage = 'remote_omnibox_readback_failed';
-                  result.readback = await readNekoOmnibox(target, token, clipboardTimeoutMs);
+                  result.readback = await readNekoOmnibox(target, token, clipboardTimeoutMs, clipboardSettleMs);
                   result.exactEquality = result.readback.remoteEquals === true;
-                  if (result.readback.remoteEquals === null) return result.readback.reason;
+                  // Screenshot duration must not act as paste synchronization.
+                  await shot('clipboard-browser', result, 'desktop', true);
                   if (!result.exactEquality) throw clipboardFailure(result.readback.reason);
                 } catch (error) {
                   throw error.qualityReason ? error : clipboardFailure(stage);

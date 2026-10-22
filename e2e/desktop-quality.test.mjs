@@ -306,7 +306,11 @@ test('native repeat is explicitly skipped even if an independent mixed-text chec
   assert.equal(evidence.autoRepeat.reason, 'native_repeat_not_synthesized');
 });
 
-function probeFixture({ hostname = 'box-nekodesktop.example.test', topLevel = false,
+const CF_DESKTOP_HOST = '8181-guac-user-computer-nekodesktop.ezil.work';
+const AWS_DESKTOP_HOST = 'aws-8181-guac-user-computer-aws.ezil.work';
+
+function probeFixture({ hostname = CF_DESKTOP_HOST, topLevel = false, protocol = 'https:', port = '',
+  installer = installNekoClipboardProbe.toString(),
   clipboard = { writeText: async () => undefined }, user, clientProfile,
   document = { hasFocus: () => true }, dispatchStyle = 'both' } = {}) {
   class Socket {
@@ -327,20 +331,60 @@ function probeFixture({ hostname = 'box-nekodesktop.example.test', topLevel = fa
   }
   const window = { WebSocket: Socket, $client: { $accessor: { user }, profile: clientProfile } };
   window.top = topLevel ? window : {};
-  const globals = { window, document, location: { hostname }, navigator: { clipboard } };
-  const install = () => runInNewContext(`(${installNekoClipboardProbe.toString()})()`, globals);
+  const globals = { window, document, location: { hostname, protocol, port }, navigator: { clipboard } };
+  const install = () => runInNewContext(`(${installer})()`, globals);
   install();
   return { window, globals, install, Socket, probe: window.__desktopQualityClipboard,
     snapshot: () => JSON.parse(JSON.stringify(window.__desktopQualityClipboard.snapshot())) };
 }
 
-test('Neko hooks install only in matching child frames and are idempotent', () => {
-  for (const options of [{ topLevel: true }, { hostname: 'os.example.test' },
-    { hostname: 'nekodesktop.example.test' }, { hostname: 'nekodesktop.evil.example.test' }]) {
-    const { window, Socket } = probeFixture(options);
-    assert.equal(window.__desktopQualityClipboard, undefined);
-    assert.equal(window.WebSocket, Socket);
-  }
+const selectionCases = [
+  ['CF desktop', { hostname: CF_DESKTOP_HOST }, true],
+  ['AWS desktop', { hostname: AWS_DESKTOP_HOST }, true],
+  ['uppercase desktop', { hostname: AWS_DESKTOP_HOST.toUpperCase() }, true],
+  ['CF Code 8443', { hostname: '8443-guac-user-computer-code.ezil.work' }, false],
+  ['AWS Code 8443', { hostname: 'aws-8443-guac-user-computer-aws.ezil.work' }, false],
+  ['CF wrong service', { hostname: '8443-guac-user-computer-nekodesktop.ezil.work' }, false],
+  ['foreign suffix', { hostname: `${CF_DESKTOP_HOST}.evil.test` }, false],
+  ['foreign host', { hostname: '8181-guac-user-computer-nekodesktop.example.test' }, false],
+  ['shell', { hostname: 'os-staging.ezil.work' }, false],
+  ['extra subdomain', { hostname: `foreign.${AWS_DESKTOP_HOST}` }, false],
+  ['wrong AWS family', { hostname: '8181-guac-user-computer-aws.ezil.work' }, false],
+  ['missing computer', { hostname: '8181-guac-user-nekodesktop.ezil.work' }, false],
+  ['CF top-level', { hostname: CF_DESKTOP_HOST, topLevel: true }, false],
+  ['AWS top-level', { hostname: AWS_DESKTOP_HOST, topLevel: true }, false],
+  ['HTTP', { protocol: 'http:' }, false],
+  ['non-default port', { port: '8443' }, false],
+];
+
+for (const [name, options, accepted] of selectionCases) {
+  test(`clipboard frame selection: ${name}`, () => {
+    // Execute the actual serialized init script, with no module closure, just
+    // as both page.addInitScript and the late frame.evaluate fallback do.
+    const fixture = probeFixture(options);
+    assert.equal(!!fixture.probe, accepted);
+    if (!accepted) assert.equal(fixture.window.WebSocket, fixture.Socket);
+  });
+}
+
+for (const [name, mutate] of [
+  ['CF only (original AWS bug)', source => source.replace('aws-8181-guac-', 'disabled-8181-guac-')],
+  ['AWS only', source => source.replace('(?:8181-guac-', '(?:disabled-8181-guac-')],
+  ['wrong service accepted', source => source.replaceAll('8181-guac-', '(?:8181|8443)-guac-')],
+  ['foreign suffix accepted', source => source.replace('\\.ezil\\.work$/i', '\\.ezil\\.work/i')],
+  ['top-level accepted', source => source.replace('window.top === window || ', '')],
+  ['HTTP accepted', source => source.replace("location.protocol !== 'https:' || ", '')],
+  ['port accepted', source => source.replace('location.port\n      || ', '')],
+]) {
+  test(`clipboard selection mutation killed: ${name}`, () => {
+    const source = installNekoClipboardProbe.toString(), installer = mutate(source);
+    assert.notEqual(installer, source, 'mutation must change the production selection rule');
+    const rejected = selectionCases.filter(([, options, accepted]) => !!probeFixture({ ...options, installer }).probe !== accepted);
+    assert.ok(rejected.length > 0, 'selection contract must reject this mutant');
+  });
+}
+
+test('Neko hooks are idempotent in an accepted child frame', () => {
   const fixture = probeFixture();
   const hook = fixture.window.WebSocket;
   fixture.install();
@@ -774,11 +818,14 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
   eventName = 'control/clipboard', failCopy = false, failGrant = false, delayedSend = false,
   preexistingSocket = false, hiddenSocket = false, noReceiveObserver = false,
   pasteMatches = true, readbackEvent = true, fullFrameVideo = false, failEntry = false,
-  failLocalWrite = false, wrongSendToken = false, delayedReadback = false } = {}) {
+  failLocalWrite = false, wrongSendToken = false, delayedReadback = false,
+  hostname = CF_DESKTOP_HOST, focusMisses = 0, focusCopyEvent = true,
+  guestDelayMs = 0, droppedSync = false, clipboardSettleMs = 0 } = {}) {
   let localText = '', remoteText = '', omnibox = '', selected = false;
+  let guestFocused = false, focusRequests = 0;
   let focused = false, opened = false, closed = false, copied = false, inside = true;
   const actions = [], grants = new Set(), token = 'browser-to-local-fixture';
-  const localToken = 'local-to-browser-fixture', origin = 'https://box-nekodesktop.example.test';
+  const localToken = 'local-to-browser-fixture', origin = `https://${hostname}`;
   const frameBounds = { x: 100, y: 100, width: 800, height: 600 };
   const videoBounds = fullFrameVideo ? frameBounds : { x: 140, y: 170, width: 640, height: 360 };
   const remoteClipboard = {
@@ -794,9 +841,9 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
     async readText() { assert.equal(focused, true); return localText; },
   };
   const nativeWrite = remoteClipboard.writeText;
-  const fixture = probeFixture({ clipboard: remoteClipboard, user: { member: { can_access_clipboard: true } },
+  const fixture = probeFixture({ hostname, clipboard: remoteClipboard, user: { member: { can_access_clipboard: true } },
     document: { hasFocus: () => focused, featurePolicy: { allowsFeature: () => true } } });
-  if (preexistingSocket || hiddenSocket || noReceiveObserver) fixture.probe.restore();
+  if (preexistingSocket || noReceiveObserver) fixture.probe.restore();
   const client = fixture.window.$client;
   Object.assign(client, { connected: true, _channel: { readyState: 'open' } });
   client.$accessor.remote = { hosting: true, controlling: true, locked: false, implicitHosting: true };
@@ -822,7 +869,11 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
       const send = () => {
         const text = wrongSendToken ? 'private-unrelated-token' : localText;
         socket.send(JSON.stringify({ event: 'control/clipboard', text }));
-        remoteText = text; actions.push('send');
+        if (!droppedSync) {
+          if (guestDelayMs) setTimeout(() => { remoteText = text; actions.push('guest-sync'); }, guestDelayMs);
+          else remoteText = text;
+        }
+        actions.push('send');
       };
       if (delayedSend) setTimeout(send, 10);
       else send();
@@ -838,18 +889,28 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
     async evaluate(fn) { return runInNewContext(`(${fn.toString()})()`, fixture.globals); },
     async press(key) {
       actions.push(key);
-      if (key === 'Control+l' || key === 'Control+a') selected = true;
+      if (key === 'Control+l') {
+        if (++focusRequests <= focusMisses) return;
+        const focus = () => { guestFocused = true; selected = true; };
+        if (guestDelayMs && !actions.includes('write-local')) setTimeout(focus, guestDelayMs);
+        else focus();
+      } else if (!guestFocused) return;
+      else if (key === 'Control+a') selected = true;
+      else if (key === 'Backspace') { if (selected) omnibox = ''; selected = false; }
       else if (key === 'Control+v') {
-        assert.equal(remoteText, localToken, 'send must complete before paste');
-        omnibox = pasteMatches ? remoteText : 'private-wrong-paste'; selected = false;
+        const pasted = pasteMatches ? remoteText : 'private-wrong-paste';
+        const paste = () => { omnibox = (selected ? '' : omnibox) + pasted; selected = false; actions.push('guest-paste'); };
+        if (guestDelayMs) setTimeout(paste, guestDelayMs);
+        else paste();
       } else if (key === 'End') selected = false;
       else if (key === 'Control+c') {
         const readback = omnibox.endsWith('-readback');
-        if (failCopy && !readback) throw new Error('private-copy-error');
+        const readiness = !actions.includes('write-frame-local') && !actions.includes('write-local');
+        if (failCopy && !readback && !readiness) throw new Error('private-copy-error');
         remoteText = omnibox;
-        actions.push(readback ? 'copy-readback' : 'copy-remote-to-local');
-        if (!readback) copied = true;
-        if (readback ? readbackEvent : receiveEvent) {
+        actions.push(readiness ? 'copy-focus' : readback ? 'copy-readback' : 'copy-remote-to-local');
+        if (!readback && !readiness) copied = true;
+        if (readiness ? focusCopyEvent : readback ? readbackEvent : receiveEvent) {
           const message = JSON.stringify({ event: eventName, text: remoteText });
           if (readback && delayedReadback) setTimeout(() => socket.emit(message), 10);
           else await socket.emit(message);
@@ -895,7 +956,8 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
   const quality = desktopQuality({ page, context: { grantPermissions: async (_permissions, { origin }) => {
     if (failGrant) throw new Error('permission unavailable');
     grants.add(origin); actions.push('grant');
-  } }, runId: 'fixture', codeReady: false, browserReady: true, clipboardTimeoutMs: delayedSend || delayedReadback ? 200 : 0,
+  } }, runId: 'fixture', codeReady: false, browserReady: true,
+  clipboardTimeoutMs: delayedSend || delayedReadback ? 200 : 0, clipboardSettleMs,
   openApp: async () => { opened = true; }, closeApp: async () => { closed = true; }, shot: async () => {},
   appWindow: () => ({ locator: () => ({ elementHandle: async () => ({
     contentFrame: async () => frame, dispose: async () => {},
@@ -909,12 +971,13 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
 
 test('Browser writes in the frame, leaves and re-enters video, clicks, focuses, waits for send and verifies the remote paste', async () => {
   const fixture = browserClipboardFixture({ delayedSend: true, delayedReadback: true,
-    preexistingSocket: true, hiddenSocket: true });
+    preexistingSocket: true });
   const evidence = {};
   await fixture.quality.clipboard(evidence);
   const browser = evidence.browser.evidence;
   assert.equal(browser.localToRemote.status, 'PASS');
   const local = browser.localToRemote.evidence;
+  assert.equal(local.focus.verified, true);
   assert.equal(local.upstreamSent, true); assert.equal(local.exactEquality, true);
   assert.equal(local.readback.method, 'remote_omnibox_copy_event');
   assert.equal(local.readback.remoteEquals, true);
@@ -925,10 +988,12 @@ test('Browser writes in the frame, leaves and re-enters video, clicks, focuses, 
     overlayFocused: true, windowFocusDispatched: true });
   const actions = fixture.actions;
   for (const [first, second] of [['grant', 'click'], ['write-frame-local', 'leave'], ['leave', 'mouseenter'],
-    ['mouseenter', 'video-click'], ['video-click', 'focus'], ['focus', 'window-focus'],
-    ['window-focus', 'send'], ['send', 'Control+v'], ['Control+v', 'copy-readback']]) {
+    ['mouseenter', 'video-click'], ['video-click', 'window-focus'],
+    ['copy-focus', 'write-frame-local'], ['window-focus', 'send'], ['send', 'Control+v'], ['Control+v', 'copy-readback']]) {
     assert.ok(actions.indexOf(first) < actions.indexOf(second), `${first} precedes ${second}`);
   }
+  assert.deepEqual(actions.slice(actions.indexOf('video-click'), actions.indexOf('window-focus') + 1),
+    ['video-click', 'focus', 'window-focus']);
   assert.equal(browser.smoke.writeResolved, true); assert.equal(browser.smoke.readResolved, true);
   assert.equal(browser.smoke.localEquals, true);
   const result = browser.remoteToLocal.evidence;
@@ -947,6 +1012,70 @@ test('a full-frame video exits into the shell and re-enters the correct frame ce
   await fixture.quality.clipboard(evidence);
   assert.equal(evidence.browser.evidence.localToRemote.status, 'PASS');
   assert.equal(evidence.browser.evidence.localToRemote.evidence.interaction.exitScope, 'shell_page');
+  fixture.verifyCleanup();
+});
+
+for (const hostname of [CF_DESKTOP_HOST, AWS_DESKTOP_HOST]) {
+  test(`Browser clipboard observes both directions on ${hostname}`, async () => {
+    const fixture = browserClipboardFixture({ hostname, hiddenSocket: true }), evidence = {};
+    await fixture.quality.clipboard(evidence);
+    const browser = evidence.browser.evidence;
+    assert.equal(browser.smoke.localEquals, true);
+    assert.equal(browser.localToRemote.status, 'PASS');
+    assert.equal(browser.localToRemote.evidence.exactEquality, true);
+    assert.equal(browser.remoteToLocal.status, 'PASS');
+    fixture.verifyCleanup();
+  });
+}
+
+test('first-boot focus retry precedes the only clipboard send and paste', async () => {
+  const fixture = browserClipboardFixture({ focusMisses: 1 }), evidence = {};
+  await fixture.quality.clipboard(evidence);
+  const local = evidence.browser.evidence.localToRemote.evidence;
+  assert.equal(local.focus.verified, true);
+  assert.deepEqual(local.focus.attempts.map(attempt => attempt.exactEquality), [false, true]);
+  assert.equal(local.exactEquality, true);
+  assert.equal(fixture.actions.filter(action => action === 'send').length, 1);
+  assert.equal(fixture.actions.filter(action => action === 'Control+v').length, 1);
+  fixture.verifyCleanup();
+});
+
+test('unverified guest focus fails before the clipboard token is written or pasted', async () => {
+  const fixture = browserClipboardFixture({ focusCopyEvent: false }), evidence = {};
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+  const local = evidence.browser.evidence.localToRemote;
+  assert.equal(local.status, 'FAIL'); assert.equal(local.reason, 'remote_omnibox_focus_unverified');
+  assert.equal(local.evidence.focus.attempts.length, 3);
+  assert.equal(local.evidence.exactEquality, false);
+  assert.ok(!fixture.actions.includes('write-frame-local'));
+  assert.ok(!fixture.actions.includes('send')); assert.ok(!fixture.actions.includes('Control+v'));
+  fixture.verifyCleanup();
+});
+
+test('guest focus, clipboard application and paste may lag Playwright dispatch', async () => {
+  const fixture = browserClipboardFixture({ guestDelayMs: 10, clipboardSettleMs: 30 }), evidence = {};
+  await fixture.quality.clipboard(evidence);
+  const local = evidence.browser.evidence.localToRemote.evidence;
+  assert.equal(local.focus.verified, true); assert.equal(local.exactEquality, true);
+  assert.equal(local.settleMs, 30);
+  for (const [first, second] of [['guest-sync', 'Control+v'], ['guest-paste', 'End']]) {
+    assert.ok(fixture.actions.indexOf(first) < fixture.actions.indexOf(second));
+  }
+  assert.equal(fixture.actions.filter(action => action === 'send').length, 1);
+  assert.equal(fixture.actions.filter(action => action === 'Control+v').length, 1);
+  fixture.verifyCleanup();
+});
+
+test('a dropped first sync still fails despite readiness and settling, with no resend or repaste', async () => {
+  const fixture = browserClipboardFixture({ droppedSync: true, clipboardSettleMs: 5 }), evidence = {};
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+  const local = evidence.browser.evidence.localToRemote;
+  assert.equal(local.status, 'FAIL'); assert.equal(local.reason, 'remote_omnibox_paste_mismatch');
+  assert.equal(local.evidence.focus.verified, true);
+  assert.equal(local.evidence.upstreamSent, true); assert.equal(local.evidence.pasteDispatched, true);
+  assert.equal(local.evidence.exactEquality, false);
+  assert.equal(fixture.actions.filter(action => action === 'send').length, 1);
+  assert.equal(fixture.actions.filter(action => action === 'Control+v').length, 1);
   fixture.verifyCleanup();
 });
 
@@ -992,14 +1121,16 @@ test('remote paste mismatch and absent copy events fail instead of trusting loca
   }
 });
 
-test('remote readback skips only when its receive observer is unavailable, after proving send and paste', async () => {
+test('missing receive observation fails the readiness handshake before send or paste', async () => {
   const fixture = browserClipboardFixture({ noReceiveObserver: true }), evidence = {};
   await assert.rejects(fixture.quality.clipboard(evidence), /browser/); // Independent remote-to-local observation fails.
   const local = evidence.browser.evidence.localToRemote;
-  assert.equal(local.status, 'SKIP');
-  assert.equal(local.reason, 'remote_omnibox_readback_unavailable:clipboard_event_observer_unavailable');
-  assert.equal(local.evidence.upstreamSent, true); assert.equal(local.evidence.pasteDispatched, true);
-  assert.equal(local.evidence.readback.remoteEquals, null); assert.equal(local.evidence.exactEquality, false);
+  assert.equal(local.status, 'FAIL');
+  assert.equal(local.reason, 'remote_omnibox_focus_unverified');
+  assert.equal(local.evidence.focus.verified, false);
+  assert.equal(local.evidence.upstreamSent, false); assert.equal(local.evidence.pasteDispatched, false);
+  assert.equal(local.evidence.exactEquality, false);
+  assert.ok(!fixture.actions.includes('send')); assert.ok(!fixture.actions.includes('Control+v'));
   fixture.verifyCleanup();
 });
 
