@@ -366,8 +366,15 @@ async function checkout(page, upgrade, email, evidence) {
   await submit.click();
   evidence.checkoutSubmitted = true;
   const started = performance.now();
-  // Allow Stripe's redirect/payment confirmation to finish before reloading.
-  await sleep(5000);
+  // Reloading before Stripe confirms cancels the payment (seen live 2026-10-22: a fixed 5 s
+  // wait left a fresh member on Free with no webhook). Wait for Stripe's own confirmation.
+  evidence.checkoutConfirmed = await until(async () => {
+    for (const frame of await stripeFrames(page).catch(() => [])) {
+      const text = await frame.locator('body').innerText({ timeout: 1000 }).catch(() => '');
+      if (/Thanks for subscribing|Payment successful|Subscription confirmed/i.test(text)) return true;
+    }
+    return null;
+  }, 'Stripe payment confirmation', 45_000).catch(() => false);
   await waitForPlan(page, upgrade, evidence, started);
 }
 
