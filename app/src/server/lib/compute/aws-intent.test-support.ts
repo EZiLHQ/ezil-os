@@ -1,3 +1,5 @@
+import { buildEnrollmentUserData } from './aws-enroll';
+import { buildRebasePreparation } from './aws-rebase-preparation';
 /** Deterministic lifecycle intents for the fixture contract (aws-intent.fixtures.json). */
 import type { LifecycleDeployment, LifecycleIntent } from './aws-intent';
 
@@ -48,7 +50,7 @@ export function fixtureIntent(
             instanceType,
             dataVolumeGiB: null,
             leaseEpoch: 4,
-            userData: 'ZXppbC1ub25jZQ==',
+            userData: fixtureUserData(false, 2, 4),
         };
     }
     return {
@@ -68,6 +70,61 @@ export function fixtureIntent(
         instanceType,
         dataVolumeGiB: operation === 'provision' ? 20 : null,
         leaseEpoch: operation === 'provision' ? 1 : 3,
-        userData: operation === 'provision' ? 'ZXppbC1ub25jZQ==' : null,
+        userData: operation === 'provision' ? fixtureUserData(true, 1, 1) : null,
     };
+}
+
+export function fixtureUserData(provision: boolean, generation: number, leaseEpoch: number): string {
+    return buildEnrollmentUserData({ computerId: COMPUTER, volumeId: provision ? null : 'vol-11111111111111111',
+        fsUuid: '22222222-2222-4222-8222-222222222222', generation, leaseEpoch, nonce: 'n'.repeat(43), provision,
+        enrollUrl: 'https://os.example.com/api/compute/aws/enroll' });
+}
+export function fixtureRebaseDeployments() {
+    const deployment: LifecycleDeployment = { ...fixtureDeployment('ap-south-1'),
+        storage: { ...fixtureDeployment('ap-south-1').storage, rootDeviceName: '/dev/sda1' },
+        lowerImageDigest: 'sha256:' + 'b'.repeat(64), previousLowerImageDigest: 'sha256:' + 'a'.repeat(64),
+        preparationStateMachineVersionArn: `arn:aws:states:ap-south-1:${FIXTURE_ACCOUNT}:stateMachine:ezil-pilot-rebase-preparation:1`,
+        recoveryStateMachineVersionArn: `arn:aws:states:ap-south-1:${FIXTURE_ACCOUNT}:stateMachine:ezil-pilot-recovery:1` };
+    const sourceDeployment: LifecycleDeployment = { ...deployment, amiId: 'ami-22222222222222222',
+        lowerImageDigest: deployment.previousLowerImageDigest!, previousLowerImageDigest: null,
+        stateMachineVersionArn: deployment.stateMachineVersionArn.replace(/:1$/, ':2') };
+    return { deployment, sourceDeployment };
+}
+export function fixtureRebasePreparation() {
+    const i = fixtureIntent('replace');
+    return buildRebasePreparation({ schemaVersion: 1, jobId: '11111111-1111-4111-8111-111111111111',
+        computerId: i.computerId, sourceInstanceId: i.previousInstanceId!, sourceVolumeId: i.dataVolumeId!,
+        fsUuid: '22222222-2222-4222-8222-222222222222', sourceGeneration: i.previousGeneration!, sourceLeaseEpoch: 3,
+        sourceFenceToken: i.previousFenceToken!, fromDigest: 'sha256:' + 'a'.repeat(64), toDigest: 'sha256:' + 'b'.repeat(64),
+        volumeGiB: 20, ...fixtureRebaseDeployments(), createdAt: '2026-10-22T11:00:00.000Z' });
+}
+export function fixtureRebaseIntent(restore = false): LifecycleIntent {
+    const i = fixtureIntent('replace'), p = fixtureRebasePreparation();
+    const volumeId = restore ? 'vol-22222222222222222' : i.dataVolumeId!;
+    const generation = restore ? 3 : i.targetGeneration, leaseEpoch = restore ? 5 : i.leaseEpoch;
+    const permit = { v: 1 as const, preparationJobId: p.intent.jobId, launchJobId: i.jobId, computerId: i.computerId,
+        fsUuid: p.intent.fsUuid, generation, leaseEpoch, fenceToken: i.fenceToken,
+        issuedAt: '2026-10-22T12:00:00.000Z', expiresAt: '2026-10-22T12:10:00.000Z' };
+    return { ...i, targetGeneration: generation, leaseEpoch, dataVolumeId: volumeId,
+        deployment: restore ? p.intent.sourceDeployment : p.intent.deployment,
+        userData: buildEnrollmentUserData({ computerId: i.computerId, volumeId, fsUuid: p.intent.fsUuid,
+            generation, leaseEpoch, nonce: 'n'.repeat(43), provision: false, enrollUrl: 'https://os.example.com/api/compute/aws/enroll',
+            ...(restore ? { ebsRestore: { ...permit, recoveryJobId: '33333333-3333-4333-8333-333333333333',
+                snapshotId: 'snap-11111111111111111', originalVolumeId: p.intent.sourceVolumeId, volumeId,
+                fromDigest: p.intent.fromDigest, sourceGeneration: p.intent.sourceGeneration, sourceLeaseEpoch: p.intent.sourceLeaseEpoch,
+                maintenance: true as const } } : { rebase: { snapshotId: 'snap-11111111111111111', volumeId,
+                fromDigest: p.intent.fromDigest, toDigest: p.intent.toDigest }, rebasePermit: permit }) }),
+        rebasePreparation: { v: 1, preparationJobId: p.intent.jobId, executionArn: p.executionArn, digest: p.digest } };
+}
+
+/** Local release evidence double; registry manifest hashes intentionally differ from baked lower IDs. */
+export function fixtureRebaseRelease(d: LifecycleDeployment) {
+    return { schemaVersion: 1 as const, accountId: d.accountId, region: d.region, namespace: d.namespace, amiId: d.amiId,
+        recipeVersion: '1.2.3', lowerImageDigest: d.lowerImageDigest!,
+        lowerImageRef: `${FIXTURE_ACCOUNT}.dkr.ecr.ap-south-1.amazonaws.com/desktop@sha256:${'c'.repeat(64)}`,
+        previousLowerImageDigest: d.previousLowerImageDigest!, previousLowerImageRef: d.previousLowerImageDigest === null ? null
+            : `${FIXTURE_ACCOUNT}.dkr.ecr.ap-south-1.amazonaws.com/desktop@sha256:${'d'.repeat(64)}`,
+        agentCommit: 'e'.repeat(40), stateMachineVersionArn: d.stateMachineVersionArn,
+        preparationStateMachineVersionArn: d.preparationStateMachineVersionArn!, recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn!,
+        launchTemplateId: d.launchTemplateId, launchTemplateVersion: d.launchTemplateVersion, createdAt: '2026-10-22T10:00:00.000Z' };
 }

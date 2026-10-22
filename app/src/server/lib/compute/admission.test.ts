@@ -210,7 +210,8 @@ describe('runAdmission (transactional)', () => {
     it('takes the global lock FIRST, reads after it, issues no isolation change', async () => {
         const { db, statements } = createFakePlacementDb({ placements: [awsRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: true, placement: { state: 'LEASED', leaseEpoch: 1 } });
-        const sqls = statements.map((s) => s.sql);
+        expect(statements.some(s => s.sql.includes('placement:image-reservation'))).toBe(true);
+        const sqls = statements.map((s) => s.sql).filter(s => !s.includes('placement:image-reservation'));
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\), current_setting\('transaction_isolation'\) AS isolation/);
         expect(sqls.slice(2, 10).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual([

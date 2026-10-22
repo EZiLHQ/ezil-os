@@ -28,7 +28,8 @@ describe.skipIf(!PG)('migration store on disposable PostgreSQL', () => {
         await client!.unsafe(`CREATE SCHEMA ${schema}`); created = true;
         // Same RLS setup as the repository's disposable billing DB tests.
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0006_compute_migrations.sql'), 'utf8')));
-        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../../docs/aws-computers/sql/0001_compute_placement.sql.txt'), 'utf8')));
+        for (const file of ['0001_compute_placement.sql.txt', '0002_image_rebase.sql.txt'])
+            await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../../docs/aws-computers/sql', file), 'utf8')));
     });
     beforeEach(async () => { await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_migrations, ${schema}.ezil_computer_placements`); });
     afterAll(async () => { try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); } finally { await client?.end(); } });

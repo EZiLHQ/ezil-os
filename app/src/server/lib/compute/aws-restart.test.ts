@@ -33,7 +33,7 @@ it('provider signs current owned epoch and exact body; only reads placement', as
     expect(init.redirect).toBe('error');
     expect(init.signal).toBeInstanceOf(AbortSignal);
     expect(fake.placements).toEqual(before);
-    expect(fake.statements.every(s => s.sql.includes('placement:read'))).toBe(true);
+    expect(fake.statements.every(s => s.sql.includes('placement:read') || s.sql.includes('placement:image-reservation'))).toBe(true);
 });
 it('double request keeps the same signed request ID', async () => {
     const { restart } = setup();

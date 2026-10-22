@@ -1,3 +1,4 @@
+import { replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
 import { createProviderMigrationStore } from './provider-migrate-store';
 /**
  * Lifecycle receipts: the RECONCILER path (docs/AWS-COMPUTERS.md C-3).
@@ -18,7 +19,7 @@ import { z } from 'zod';
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import type { EpochEndReason } from '@/server/billing/v2/contract';
-import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
+import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber, Ec2ReplacementDescriber } from './aws-clients';
 import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, meteredSizeForInstanceType, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
@@ -52,7 +53,7 @@ export interface LifecycleExecutionReader {
     describe(
         region: string,
         executionArn: string,
-    ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null }>;
+    ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null; input?: string; executionArn?: string; stateMachineVersionArn?: string; stateMachineAliasArn?: string; redriveCount?: number }>;
 }
 
 /** Who recorded a usage row (`observed_by`). */
@@ -115,6 +116,7 @@ export interface ReceiptDeps {
     db: PlacementDb;
     meter?: ComputeMeter;
     now?: () => Date;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber & Ec2ReplacementDescriber & Ec2ComputerResourceFinder>;
     /** Without it nothing is read and nothing changes. */
     executions?: LifecycleExecutionReader;
     /** GW-1, to fence (delete) a stopped generation's tunnel. */
@@ -226,7 +228,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (enrolled(p)) await step(p, 'RUNNING');
         return;
     }
-    const waiting: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
+    const waiting: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
     if (!deps.executions || !p.lifecycleJobId || !p.lifecycleDigest || !waiting.includes(p.state)) return;
     let e;
     try {
@@ -240,9 +242,18 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     }
     if (e.status === 'RUNNING') return;
     if (e.status !== 'SUCCEEDED') {
-        if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(e.status)) await step(p, 'UNCONFIRMED', { lastError: lifecycleFailureCode(e, p.instanceType) });
+        if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(e.status)) {
+            const work = replacementWorkFromExecution(p, deployment, e);
+            const outcome = work ? await settleReplacementGeneration(deps, p, work) : 'unconfirmed';
+            if (outcome === 'settled') return;
+            if (p.state !== 'UNCONFIRMED') await step(p, 'UNCONFIRMED', {
+                lastError: outcome === 'generation_drift' ? 'generation_drift' : lifecycleFailureCode(e, p.instanceType),
+                enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
+            });
+        }
         return;
     }
+    if (p.state === 'UNCONFIRMED') return;
     const stopping = p.state === 'DRAINING' || p.state === 'STOPPING';
     const retiring = p.state === 'RETIRING';
     let receipt: z.infer<typeof LifecycleReceiptSchema>;
@@ -356,8 +367,14 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
             }
         }
     }
+    const unresolvedReplacement = undo === 'UNCONFIRMED' && ['LEASED', 'STARTING', 'MOUNTING'].includes(p.state);
     await transitionPlacementAsReconciler(deps.db, {
-        computerId: p.computerId, expected: p, to: undo, fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: LIFECYCLE_START_FAILED },
+        computerId: p.computerId, expected: p, to: undo, fields: {
+            // Retain the failed replacement identity for a delayed execution readback.
+            // Absence cannot reconstruct its authorized source pair or justify generation-1.
+            ...(unresolvedReplacement ? {} : { lifecycleJobId: null, lifecycleDigest: null }),
+            enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null, lastError: LIFECYCLE_START_FAILED,
+        },
     });
 }
 
@@ -369,7 +386,7 @@ export interface GuestStopDeps extends ReceiptDeps {
      * `describeVolume` lets a lost instance be recovered onto its retained volume; without it a
      * lost instance is left for the next look rather than recorded without that check.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder & Ec2ReplacementDescriber>;
     /** Lower-case uuid v4. */
     newId?: () => string;
     /** Set when the pass's time budget ran out: stop before the next placement. */

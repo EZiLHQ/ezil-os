@@ -76,7 +76,7 @@ describe('AWS preview handoff', () => {
         expect(signature).toBe(createHmac('sha256', 'test-secret').update([
             'v2', NOW, 'POST', '/sandbox/preview', sandboxId, computerId, userId, 'aws-ec2', '', 7, 11, digest,
         ].join('|')).digest('hex'));
-        expect(fake.statements).toHaveLength(1);
+        expect(fake.statements).toHaveLength(2);
         expect(fake.statements[0]!.sql).toContain('placement:read');
     });
 

@@ -89,7 +89,7 @@ describe('restore lease', () => {
     const token = Buffer.alloc(32, 7).toString('base64url');
     const migration = { ...base, state: 'exported' as const, id: H, computerId: G };
     const fetchBase = restoreFetchBase('https://app.example/path', G);
-    const input = { computerId: G, volumeId: null, fsUuid: H, generation: 1, leaseEpoch: 1, nonce: token, provision: true, enrollUrl: 'https://app.example/enroll' };
+    const input = { computerId: G, volumeId: null, fsUuid: H, generation: 1, leaseEpoch: 1, nonce: token, provision: true, enrollUrl: 'https://app.example/api/compute/aws/enroll' };
     it('embeds the exact host restore shape only when explicitly supplied', () => {
         const restore = restoreLeaseFor(migration, token, fetchBase);
         expect(restore).toEqual({ kind: 'cf-snapshot', migrationId: H, generation: G, system: false, fetchBase: `https://app.example/api/compute/restore/${G}`, identityToken: token });

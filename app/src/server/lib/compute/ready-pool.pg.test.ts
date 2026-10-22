@@ -6,6 +6,7 @@ import path from 'node:path';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import type { PlacementDb, PlacementExecutor } from './placement';
 import { insertPoolHost, leasePoolHost, releasePoolHost, type PoolExecutor, type PoolInstanceType } from './ready-pool';
 
 const PG = process.env.EZIL_PG_TEST_URL;
@@ -18,17 +19,19 @@ describe.skipIf(!PG)('ready pool on disposable Postgres', () => {
     const client = PG ? postgres(PG, { max: 16, onnotice: () => {} }) : null;
     const dialect = new PgDialect();
     const localSql = (s: string) => s.replaceAll('public.', `${schema}.`);
-    const db: PoolExecutor = { execute: async query => {
+    const executor = (c: { unsafe: (q: string, params: never[]) => PromiseLike<unknown> }): PlacementExecutor => ({ execute: async query => {
         const statement = dialect.sqlToQuery(query);
-        return client!.unsafe(localSql(statement.sql), statement.params as never[]);
-    } };
+        return c.unsafe(localSql(statement.sql), statement.params as never[]);
+    } });
+    const db: PlacementDb = { execute: q => executor(client!).execute(q), transaction: async fn =>
+        client!.begin(tx => fn(executor(tx))) as Promise<Awaited<ReturnType<typeof fn>>> };
     let created = false;
     beforeAll(async () => {
         await client!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
             DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
         await client!.unsafe(`CREATE SCHEMA ${schema}`);
         created = true;
-        for (const file of ['0001_compute_placement.sql.txt', '0002_ready_pool.sql.txt']) {
+        for (const file of ['0001_compute_placement.sql.txt', '0002_ready_pool.sql.txt', '0002_image_rebase.sql.txt']) {
             await client!.unsafe(localSql(readFileSync(path.resolve(__dirname, '../../../../../docs/aws-computers/sql', file), 'utf8')));
         }
     });
@@ -38,8 +41,7 @@ describe.skipIf(!PG)('ready pool on disposable Postgres', () => {
     afterAll(async () => {
         try {
             if (created) {
-                await client!.unsafe(`DROP TABLE IF EXISTS ${tables.map(t => `${schema}.${t}`).join(', ')}`);
-                await client!.unsafe(`DROP SCHEMA ${schema}`);
+                await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`);
             }
         } finally { await client?.end(); }
     });

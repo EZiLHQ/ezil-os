@@ -19,7 +19,7 @@ const WRITER = 'app/src/server/lib/compute/placement.ts';
 const TABLES = /ezil_computer_placements|ezil_compute_usage/;
 const CODE = /\.(ts|tsx|js|mjs|cjs|sql|py|rs|go|sh|swift|json|ya?ml|toml|tf|hcl|asl)$/;
 
-const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8' })
+const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     .split('\0')
     .filter(Boolean)
     .filter((f) => CODE.test(f) && !f.startsWith('docs/') && !/\.test\.(ts|tsx|mjs|js)$/.test(f));

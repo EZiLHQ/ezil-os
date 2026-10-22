@@ -88,7 +88,7 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
 
     it('an uppercase id from a caller still matches the lowercase ::text column', async () => {
         // Postgres compares uuids by value and returns `::text` lowercase.
-        const db = { execute: async () => ({ rows: [{ ...placementRow({ computer_id: A }), generation: '1', lease_epoch: '0' }] }) };
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: '1', lease_epoch: '0' })] });
         const p = await readPlacement(db, A.toUpperCase());
         expect(p.record?.computerId).toBe(A);
     });
@@ -167,9 +167,10 @@ describe('create: per-computer advisory lock, then refuse an existing row', () =
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, hashtext\(\$2::uuid::text\)\), current_setting\('transaction_isolation'\) AS isolation/);
         expect(statements[1]!.params[1]).toBe(A);
-        expect(sqls[2]).toMatch(/placement:read/);
-        expect(sqls[3]).toMatch(/INSERT INTO public\.ezil_computer_placements/);
-        expect(sqls[4]).toBe('COMMIT');
+        expect(sqls[2]).toMatch(/placement:image-reservation/);
+        expect(sqls[3]).toMatch(/placement:read/);
+        expect(sqls[4]).toMatch(/INSERT INTO public\.ezil_computer_placements/);
+        expect(sqls[5]).toBe('COMMIT');
     });
 
     it('mixed-case creators of one computer serialise on ONE lock: exactly one row', async () => {
@@ -307,7 +308,7 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, statements } = at();
         await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
         const cas = statements.find((s) => /placement:cas/.test(s.sql))!;
-        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+\s+AND state = \$\d+\s+AND owner_user_id = \$\d+::uuid\s+RETURNING/);
+        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+\s+AND image_upgrade_job_id IS NULL\s+AND state = \$\d+\s+AND owner_user_id = \$\d+::uuid\s+RETURNING/);
         expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 });
@@ -439,7 +440,7 @@ describe('R-PL F3: AWS create and lease need the admission ticket, not just the 
 
     it('only admission.ts mints tickets: no other non-test file in the repository names the minter', () => {
         const REPO = path.resolve(__dirname, '../../../../..');
-        const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8' })
+        const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
             .split('\0')
             .filter((f) => /\.(ts|tsx|js|mjs|cjs)$/.test(f) && !f.startsWith('docs/') && !/\.test(-support)?\.(ts|tsx|mjs|js)$/.test(f));
         expect(files.length).toBeGreaterThan(300); // a real tree, not a vacuous pass

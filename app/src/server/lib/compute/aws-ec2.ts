@@ -1,3 +1,4 @@
+import { settleReplacementGeneration } from './aws-rebase-generation';
 /**
  * aws-ec2 provider (docs/AWS-COMPUTERS.md C-1, C-3).
  *
@@ -53,7 +54,7 @@ import {
     type LifecycleWork,
 } from './aws-intent';
 import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
-import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
+import type { Ec2ComputerResourceFinder, Ec2ReplacementDescriber, Ec2VolumeDescriber } from './aws-clients';
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
@@ -141,7 +142,7 @@ export interface AwsProviderDeps {
      * Read-only EC2 describe (the enrollment describer). Catches a guest-initiated idle
      * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder & Ec2ReplacementDescriber>;
     /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
     /** Backoff between StartExecution attempts whose answer was lost; tests inject an instant one. */
@@ -271,7 +272,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         const outcome = await startLifecycleJob(deps.starter!, region, work, deps.sleep);
         if (outcome === 'started') return 'started';
         if (outcome === 'refused') {
-            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
+            if (work.intent.operation === 'replace' && await settleReplacementGeneration(reconcileDeps(), p, work, true) === 'settled') return 'failed';
+            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo, fields: { enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null } });
             return 'failed';
         }
         await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, undo });

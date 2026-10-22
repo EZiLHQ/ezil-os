@@ -24,7 +24,7 @@ function fixture(state: MigrationState = 'requested') {
             calls.push('provision');
             const restore = restoreLeaseFor(current, 'a'.repeat(43), `https://app.example/api/compute/restore/${C}`);
             const data = buildAwsProvisionUserData({ computerId: C, fsUuid: G, volumeId: null, generation: 1, leaseEpoch: 1,
-                nonce: 'b'.repeat(43), provision: true, enrollUrl: 'https://app.example/api/compute/enroll', restore });
+                nonce: 'b'.repeat(43), provision: true, enrollUrl: 'https://app.example/api/compute/aws/enroll', restore });
             expect(JSON.parse(Buffer.from(data, 'base64').toString()).restore).toEqual({ kind: 'cf-snapshot', migrationId: G,
                 generation: G, system: false, identityToken: 'a'.repeat(43), fetchBase: `https://app.example/api/compute/restore/${C}` });
         }),

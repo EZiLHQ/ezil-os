@@ -146,6 +146,8 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         if (text.startsWith('SELECT') && text.includes('FROM public.ezil_compute_migrations')) return { rows: [] };
         const tag = text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
         switch (tag) {
+            case 'image-reservation':
+                return { rows: placements.filter(r => r.image_upgrade_job_id != null && r.computer_id === params[0]).map(r => ({ job_id: r.image_upgrade_job_id })) };
             case 'lock-computer':
             case 'lock-admission': {
                 if (!tx) throw new Error('fake db: pg_advisory_xact_lock outside a transaction is a no-op in Postgres');
@@ -344,6 +346,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     const col = w[1]!, v = value(w[3]!, params);
                     return (r) => w[2] === '>'
                         ? instant(r[col]) > instant(v)
+                        : w[3]!.endsWith('::timestamptz') ? instant(r[col]) === instant(v)
                         : col === 'computer_id' || col === 'owner_user_id'
                           ? uuidEq(r[col], v)
                           : r[col] !== null && r[col] !== undefined && String(r[col]) === String(v);

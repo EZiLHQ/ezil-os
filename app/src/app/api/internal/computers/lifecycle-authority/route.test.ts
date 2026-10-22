@@ -89,7 +89,7 @@ describe('lifecycle authority wire contract', () => {
         expect(response.status).toBe(200);
         expect(await response.json()).toEqual({ authorized: true, ...authority });
         expect(response.headers.get('cache-control')).toBe('no-store');
-        expect(execute).toHaveBeenCalledTimes(1);
+        expect(execute).toHaveBeenCalledTimes(2);
     });
 
     it('exports only POST and the Node.js/dynamic route configuration', () => {
@@ -224,7 +224,7 @@ describe('placement is the authority', () => {
         seed([row(overrides)]);
         await refused();
         // A Cloudflare row also gets the read-only active-migration lookup; never a write.
-        expect(execute).toHaveBeenCalledTimes('provider' in overrides ? 2 : 1);
+        expect(execute).toHaveBeenCalledTimes('provider' in overrides ? 3 : 2);
     });
 
     it('refuses another computer', async () => {

@@ -37,7 +37,7 @@ describe('billing v2 placement selection', () => {
         const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(createdAt) }] });
         expect((await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid, pinCloudflare: true })).kind).toBe('aws-ec2');
         expect(placements).toEqual([]);
-        expect(statements).toHaveLength(2); // placement and live computer reads; admission happens at ensure
+        expect(statements).toHaveLength(3); // placement, reservation and live computer reads; admission happens at ensure
     });
 
     it.each([false, true])('(a) paid + no row + created before SINCE stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
@@ -62,7 +62,7 @@ describe('billing v2 placement selection', () => {
         const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE) }] });
         expect(await resolveComputeProvider(db, computer, { ...ON, EZIL_AWS_CANARY_SINCE: since }, {}, { entitlement: paid })).toBe(cloudflareComputeProvider);
         expect(placements).toEqual([]);
-        expect(statements).toHaveLength(1);
+        expect(statements).toHaveLength(2);
     });
 
     it.each([
@@ -111,7 +111,7 @@ describe('resolveComputeProvider', () => {
     it('flag on, no row: Cloudflare', async () => {
         const { db, statements } = createFakePlacementDb();
         expect(await resolveComputeProvider(db, computer, ON)).toBe(cloudflareComputeProvider);
-        expect(statements).toHaveLength(1);
+        expect(statements).toHaveLength(2);
     });
 
     it('flag on, aws-ec2 row: the aws-ec2 provider', async () => {
@@ -156,7 +156,7 @@ describe('resolveComputeProvider', () => {
                 expect(statements).toEqual([]);
                 return;
             }
-            expect(statements).toHaveLength(1);
+            expect(statements).toHaveLength(2);
             if (row !== 'aws-ec2') {
                 expect(provider).toBe(cloudflareComputeProvider);
                 return;
@@ -166,7 +166,7 @@ describe('resolveComputeProvider', () => {
             // AWS on but no caps/regions configured: the real provider refuses before any write.
             if (aws === '1') expect(await ensure).toEqual({ ok: false, error: 'aws_config_invalid', errorCode: 'aws_config_invalid', retryable: false });
             else expect(await ensure).toEqual({ ok: false, error: 'aws_disabled', errorCode: 'aws_disabled', retryable: false });
-            expect(statements).toHaveLength(1);
+            expect(statements).toHaveLength(2);
         });
     });
 

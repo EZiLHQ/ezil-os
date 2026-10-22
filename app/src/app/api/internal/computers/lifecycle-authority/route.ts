@@ -2,7 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import { db } from '@/server/db';
-import { PlacementIntegrityError, readLifecyclePlacement, type PlacementState } from '@/server/lib/compute/placement';
+import { ImageJobConflictError, PlacementIntegrityError, readLifecyclePlacement, type PlacementState } from '@/server/lib/compute/placement';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -75,7 +75,7 @@ export async function POST(req: Request): Promise<Response> {
             || !IN_FLIGHT_STATES.has(record.state)) return refuse();
     } catch (error) {
         // Corrupt/duplicate placements are refused; a failed read is uncertain.
-        return error instanceof PlacementIntegrityError ? refuse() : unavailable();
+        return (error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError) ? refuse() : unavailable();
     }
 
     // The Lambda requires exact object equality; no additional success fields.

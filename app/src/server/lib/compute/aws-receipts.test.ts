@@ -1091,6 +1091,12 @@ describe('Codex 4277262199: settling a recorded job whose start got no answer', 
             .toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: null, lifecycle_digest: null, last_error: 'lifecycle_start_failed' });
     });
 
+    it('a replacement with no execution keeps its job reserved and never guesses the source generation', async () => {
+        expect(await settle({ state: 'LEASED', last_error: 'lifecycle_start_unknown:UNCONFIRMED' }))
+            .toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: JOB, lifecycle_digest: DIGEST,
+                generation: 2, lease_epoch: 3, enroll_nonce_hash: null, enroll_consumed_hash: null, enroll_expires_at: null });
+    });
+
     it('a start-mode wake that never ran → back to STOPPED, where a refusal would have left it', async () => {
         expect(await settle({ state: 'LEASED', last_error: 'lifecycle_start_unknown:STOPPED' }))
             .toMatchObject({ state: 'STOPPED', lifecycle_job_id: null, last_error: 'lifecycle_start_failed' });

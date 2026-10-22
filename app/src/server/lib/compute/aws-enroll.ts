@@ -1,3 +1,5 @@
+import { EnrollmentLeaseSchema, ENROLL_NONCE_TTL_SECONDS, USER_DATA_MAX, type RebasePermit, type EbsRestore, type RebaseSchema } from './aws-rebase-lease';
+export { ENROLL_NONCE_TTL_SECONDS, USER_DATA_MAX, REBASE_ENROLL_RESERVE_SECONDS, REBASE_CLOCK_SKEW_SECONDS } from './aws-rebase-lease';
 /**
  * C-6 host enrollment, app side (docs/AWS-COMPUTERS.md C-6; pinned wire
  * contract reports/2026-10-14-aws-azure-first-lead/GATEWAY-CONTRACT-v1.md).
@@ -25,7 +27,7 @@ import { ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, type Place
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
-export const ENROLL_NONCE_TTL_SECONDS = 600;
+
 
 /** Host `lease.py` NONCE_RE: base64url, 32-128 characters. 32 bytes → 43. */
 const NONCE_RE = /^[A-Za-z0-9_-]{32,128}$/;
@@ -48,10 +50,13 @@ export function issueEnrollmentNonce(now: Date, random: (n: number) => Buffer = 
 }
 
 /** The lifecycle intent's `userData` limit (base64 characters). */
-export const USER_DATA_MAX = 4096;
+
 
 export interface EnrollmentUserDataInput {
     restore?: import('./provider-migrate').RestoreLease;
+    rebase?: z.infer<typeof RebaseSchema>;
+    rebasePermit?: RebasePermit;
+    ebsRestore?: EbsRestore;
     computerId: string;
     /** null on a provision: the data volume does not exist yet when the intent is built. */
     volumeId: string | null;
@@ -80,24 +85,31 @@ export class EnrollmentUserDataError extends Error {
  */
 export function buildEnrollmentUserData(i: EnrollmentUserDataInput): string {
     if (!NONCE_RE.test(i.nonce)) throw new EnrollmentUserDataError('nonce');
-    if (!Number.isSafeInteger(i.generation) || i.generation < 1) throw new EnrollmentUserDataError('generation');
-    if (!Number.isSafeInteger(i.leaseEpoch) || i.leaseEpoch < 1) throw new EnrollmentUserDataError('leaseEpoch');
+    if (!Number.isSafeInteger(i.generation) || i.generation < 1 || i.generation > 2147483647) throw new EnrollmentUserDataError('generation');
+    if (!Number.isSafeInteger(i.leaseEpoch) || i.leaseEpoch < 1 || i.leaseEpoch > 2147483647) throw new EnrollmentUserDataError('leaseEpoch');
     if (i.provision !== (i.volumeId === null)) throw new EnrollmentUserDataError('volumeId');
     const lease = {
         v: 1,
-        computerId: i.computerId.toLowerCase(),
+        computerId: typeof i.computerId === 'string' ? i.computerId.toLowerCase() : i.computerId,
         ...(i.volumeId === null ? {} : { volumeId: i.volumeId }),
-        fsUuid: i.fsUuid.toLowerCase(),
+        fsUuid: typeof i.fsUuid === 'string' ? i.fsUuid.toLowerCase() : i.fsUuid,
         generation: i.generation,
         leaseEpoch: i.leaseEpoch,
         nonce: i.nonce,
         provision: i.provision,
         enrollUrl: i.enrollUrl,
         ...(i.restore === undefined ? {} : { restore: i.restore }),
+        ...(i.rebase === undefined ? {} : { rebase: i.rebase }),
+        ...(i.rebasePermit === undefined ? {} : { rebasePermit: i.rebasePermit }),
+        ...(i.ebsRestore === undefined ? {} : { ebsRestore: i.ebsRestore }),
     };
     const encoded = Buffer.from(JSON.stringify(lease), 'utf8').toString('base64');
     if (encoded.length > USER_DATA_MAX) throw new EnrollmentUserDataError('too_large');
-    return encoded;
+    const parsed = EnrollmentLeaseSchema.safeParse(lease);
+    if (!parsed.success) throw new EnrollmentUserDataError(parsed.error.issues[0]?.path.join('.') || 'permit_invalid');
+    const canonical = Buffer.from(JSON.stringify(parsed.data), 'utf8').toString('base64');
+    if (canonical.length > USER_DATA_MAX) throw new EnrollmentUserDataError('too_large');
+    return canonical;
 }
 
 // ── Enrollment endpoint (C-6 steps 3-5) ──────────────────────────────────
@@ -105,6 +117,7 @@ export function buildEnrollmentUserData(i: EnrollmentUserDataInput): string {
 /** What a live EC2 describe shows about the enrolling instance (C-6 step 3, last check). */
 export interface Ec2EnrollmentView {
     instanceId: string;
+    instanceType?: string;
     /** EC2 state name: only `running` enrolls. */
     state: string;
     /** Timestamp in EC2's StateTransitionReason, when the provider supplies one. */

@@ -373,10 +373,58 @@ async function selectRows(db: PlacementExecutor, computerId: string): Promise<Re
 export async function readPlacement(db: PlacementExecutor, rawComputerId: string): Promise<ResolvedPlacement> {
     const computerId = canonicalId(rawComputerId);
     const rows = await selectRows(db, computerId);
-    if (rows.length === 0) return DEFAULT_PLACEMENT;
+    if (rows.length === 0) { await assertNoImageReservation(db, computerId); return DEFAULT_PLACEMENT; }
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     const record = parsePlacementRow(rows[0]!, computerId);
+    await assertNoImageReservation(db, computerId);
     return { provider: record.provider, store: record.store, record };
+}
+
+export class ImageJobConflictError extends Error {
+    constructor() { super('image_job_conflict'); this.name = 'ImageJobConflictError'; }
+}
+
+/** Every ordinary reader/admission fails closed for reservations, including corrupt or orphan rows. */
+export async function assertNoImageReservation(db: PlacementExecutor, computerId: string): Promise<void> {
+    const rows = rowsOf(await db.execute(sql`/* placement:image-reservation */
+        SELECT job_id::text AS job_id FROM public.ezil_computer_image_jobs
+        WHERE computer_id = ${canonicalId(computerId)}::uuid AND phase NOT IN ('succeeded', 'recovered', 'cancelled')
+        UNION ALL SELECT image_upgrade_job_id::text AS job_id FROM public.ezil_computer_placements
+        WHERE computer_id = ${canonicalId(computerId)}::uuid AND image_upgrade_job_id IS NOT NULL LIMIT 2`));
+    if (rows.length) throw new ImageJobConflictError();
+}
+
+export interface ImagePlacement extends Placement {
+    lowerImageDigest: string | null;
+    lowerDigestObservedAt: Date | null;
+    imageUpgradeJobId: string | null;
+}
+
+/** Image store only, inside global admission -> computer -> row locks. */
+export async function lockImagePlacement(tx: PlacementExecutor, lock: AdmissionLock, computerId: string): Promise<ImagePlacement | null> {
+    assertAdmissionLock(tx, lock);
+    await lockComputer(tx, canonicalId(computerId));
+    const rows = rowsOf(await tx.execute(sql`/* placement:image-read */ SELECT ${SELECT_COLUMNS}, lower_image_digest,
+        lower_digest_observed_at, image_upgrade_job_id::text AS image_upgrade_job_id
+        FROM public.ezil_computer_placements WHERE computer_id = ${canonicalId(computerId)}::uuid FOR UPDATE`));
+    if (!rows.length) return null;
+    if (rows.length !== 1) throw new ImageJobConflictError();
+    const r = rows[0]!, p = parsePlacementRow(r, computerId);
+    const digest = nullableText(r.lower_image_digest), observed = timestamp(r.lower_digest_observed_at), jobId = nullableText(r.image_upgrade_job_id);
+    if (digest === undefined || observed === undefined || jobId === undefined || (digest === null) !== (observed === null)
+        || (digest !== null && !/^sha256:[0-9a-f]{64}$/.test(digest)) || (jobId !== null && !UUID.test(jobId))) throw new ImageJobConflictError();
+    return { ...p, lowerImageDigest: digest, lowerDigestObservedAt: observed, imageUpgradeJobId: jobId };
+}
+
+/** Only the image store calls this under its reservation lock; exactly one placement changes. */
+export async function setImageReservation(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, jobId: string | null): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    const rows = rowsOf(await tx.execute(sql`/* placement:image-cas */ UPDATE public.ezil_computer_placements
+        SET image_upgrade_job_id = ${jobId}::uuid, updated_at = now()
+        WHERE computer_id = ${p.computerId}::uuid AND owner_user_id = ${p.ownerUserId}::uuid
+          AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+          AND image_upgrade_job_id IS NOT DISTINCT FROM ${p.imageUpgradeJobId}::uuid RETURNING computer_id`));
+    if (rows.length !== 1) throw new ImageJobConflictError();
 }
 
 /** C-2 periodic duplicate check. Any result must alarm and closes admission. */
@@ -547,6 +595,7 @@ export type CreatePlacementResult = { ok: true; placement: Placement } | { ok: f
 async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput, computerLocked = false): Promise<CreatePlacementResult> {
     const input = { ...rawInput, computerId: canonicalId(rawInput.computerId), ownerUserId: canonicalId(rawInput.ownerUserId) };
     if (!computerLocked) await lockComputer(tx, input.computerId);
+    await assertNoImageReservation(tx, input.computerId);
     if ((await selectRows(tx, input.computerId)).length > 0) return { ok: false, reason: 'placement_exists' };
     const fields = input.fields ?? {};
     const keys = (Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[]).filter((k) => fields[k] !== undefined);
@@ -748,6 +797,8 @@ async function casInTx(
         provider?: PlacementProvider; ownerUserId?: string; enrollNonceHash?: string; enrollUnexpired?: boolean;
         states?: readonly PlacementState[]; preserveState?: boolean; availableInstanceId?: string;
         instanceId?: string | null; lastError?: string | null; nonceConsumed?: boolean;
+        confirmedGeneration?: number; lifecycleJobId?: string; lifecycleDigest?: string;
+        fenceToken?: string; volumeId?: string; updatedAt?: Date;
         /** Timestamp fields written as GREATEST(current, new): concurrent writers can never move them back. */
         monotonic?: readonly ('presenceAt' | 'leaseUntil')[];
     } = {},
@@ -756,9 +807,10 @@ async function casInTx(
     // A duplicate whose keys do not match the CAS would let this writer win
     // while every reader fails closed. Refuse first, inside the transaction.
     if ((await selectRows(tx, computerId)).length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
+    await assertNoImageReservation(tx, computerId);
     const sets: SQL[] = [
         guard.preserveState ? sql`state = state` : sql`state = ${to}`,
-        sql`generation = generation + ${bump.generation}`,
+        guard.confirmedGeneration === undefined ? sql`generation = generation + ${bump.generation}` : sql`generation = ${guard.confirmedGeneration}`,
         sql`lease_epoch = lease_epoch + ${bump.leaseEpoch}`,
         ...(Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[])
             .filter((k) => fields[k] !== undefined)
@@ -775,6 +827,7 @@ async function casInTx(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
             WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch}
+                AND image_upgrade_job_id IS NULL
                 AND ${guard.states ? sql`state IN (${sql.join(guard.states.map((s) => sql`${s}`), sql`, `)})` : sql`state = ${expected.state}`}
                 ${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}
                 ${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
@@ -784,12 +837,42 @@ async function casInTx(
                 ${guard.instanceId !== undefined ? sql` AND instance_id IS NOT DISTINCT FROM ${guard.instanceId}::text` : sql``}
                 ${guard.lastError !== undefined ? sql` AND last_error IS NOT DISTINCT FROM ${guard.lastError}::text` : sql``}
                 ${guard.nonceConsumed ? sql` AND enroll_nonce_hash IS NULL` : sql``}
+                ${guard.lifecycleJobId !== undefined ? sql` AND lifecycle_job_id = ${guard.lifecycleJobId}::uuid` : sql``}
+                ${guard.lifecycleDigest !== undefined ? sql` AND lifecycle_digest = ${guard.lifecycleDigest}` : sql``}
+                ${guard.fenceToken !== undefined ? sql` AND fence_token = ${guard.fenceToken}::uuid` : sql``}
+                ${guard.volumeId !== undefined ? sql` AND volume_id = ${guard.volumeId}` : sql``}
+                ${guard.updatedAt !== undefined ? sql` AND updated_at = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
     // Belt and braces behind the pre-read: throwing inside the transaction rolls a multi-row update back.
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     return { ok: true, placement: parsePlacementRow(rows[0]!, computerId) };
+}
+
+/** Reconciler only: settle provisional replacement authority from verified volume tags.
+ * Lease epochs never move backwards. The failed job and both nonce proofs are revoked.
+ */
+export async function reconcileReplacementGeneration(db: PlacementDb, expected: Placement,
+    confirmed: { generation: number; fenceToken: string; instanceId: string; instanceLost: boolean; instanceType?: string }): Promise<TransitionResult> {
+    if (!expected.lifecycleJobId || !expected.lifecycleDigest || !expected.volumeId || !expected.fenceToken
+        || !['LEASED', 'STARTING', 'MOUNTING', 'UNCONFIRMED'].includes(expected.state)
+        || !Number.isInteger(confirmed.generation) || confirmed.generation < 1 || confirmed.generation > expected.generation
+        || !UUID.test(confirmed.fenceToken) || !/^i-[0-9a-f]{17}$/.test(confirmed.instanceId)) return { ok: false, reason: 'cas_conflict' };
+    return withAdmission(db, async (tx) => {
+        await lockComputer(tx, expected.computerId);
+        const { record: current } = await readPlacement(tx, expected.computerId);
+        if (!current || current.ownerUserId !== expected.ownerUserId || current.provider !== 'aws-ec2') return { ok: false, reason: 'cas_conflict' };
+        const result = await casInTx(tx, expected.computerId, expected, 'STOPPED', { generation: 0, leaseEpoch: 0 }, {
+            fenceToken: confirmed.fenceToken, instanceId: confirmed.instanceId, instanceType: confirmed.instanceType,
+            lifecycleJobId: null, lifecycleDigest: null, enrollNonceHash: null, enrollConsumedHash: null,
+            enrollExpiresAt: null, leaseUntil: null, lastError: confirmed.instanceLost ? INSTANCE_LOST : LIFECYCLE_START_FAILED,
+        }, { provider: 'aws-ec2', ownerUserId: expected.ownerUserId, confirmedGeneration: confirmed.generation,
+            lifecycleJobId: expected.lifecycleJobId!, lifecycleDigest: expected.lifecycleDigest!, fenceToken: expected.fenceToken!,
+            volumeId: expected.volumeId!, updatedAt: expected.updatedAt });
+        if (result.ok) await applyUsageInTx(tx, result.placement, { kind: 'close', observedBy: 'generation-reconcile' });
+        return result;
+    });
 }
 
 /**

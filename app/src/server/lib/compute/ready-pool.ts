@@ -1,5 +1,6 @@
 /** Offline, single-use ready pool. No lifecycle caller imports this module. */
 import { sql, type SQL } from 'drizzle-orm';
+import { assertNoImageReservation, lockImagePlacement, withAdmission, type PlacementDb } from './placement';
 import { AWS_REGION_PATTERN, instanceVcpu } from './aws-config';
 
 export const POOL_INSTANCE_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
@@ -55,37 +56,41 @@ export async function insertPoolHost(db: PoolExecutor, input: {
     `);
 }
 
-/** One atomic statement, including candidate selection. No candidate means cold boot. */
-export async function leasePoolHost(db: PoolExecutor, args: {
+/** Admission lock excludes image reservations; candidate selection and host lease remain atomic. */
+export async function leasePoolHost(db: PlacementDb, args: {
     region: string; instanceType: PoolInstanceType; computerId: string; now: Date;
 }): Promise<LeasedPoolHost | null> {
     checkClass(args.region, args.instanceType);
-    const at = args.now.toISOString();
-    const rows = rowsOf(await db.execute(sql`
-        UPDATE public.ezil_compute_pool_hosts
-        SET state = 'leased', leased_computer_id = ${args.computerId}::uuid,
-            leased_generation = generation, lease_token = gen_random_uuid(),
-            leased_at = ${at}::timestamptz, generation = generation + 1, updated_at = ${at}::timestamptz
-        WHERE id = (
-            SELECT id FROM public.ezil_compute_pool_hosts
-            WHERE region = ${args.region} AND instance_type = ${args.instanceType}
-                AND state = 'ready' AND health = 'healthy' AND editor_ready_at IS NOT NULL
-                AND generation > 0 AND generation < ${Number.MAX_SAFE_INTEGER}
-                AND leased_computer_id IS NULL AND leased_generation IS NULL AND lease_token IS NULL AND leased_at IS NULL
-            ORDER BY editor_ready_at, id FOR UPDATE SKIP LOCKED LIMIT 1
-        )
-        RETURNING id, region, zone_id, instance_id, instance_type, state, generation,
-            leased_generation, leased_computer_id, lease_token, leased_at, editor_ready_at
-    `));
-    const row = rows[0];
-    if (!row) return null;
-    return {
-        id: String(row.id), region: String(row.region), zoneId: String(row.zone_id),
-        instanceId: String(row.instance_id), instanceType: row.instance_type as PoolInstanceType,
-        state: 'leased', generation: generationOf(row.generation), leasedGeneration: generationOf(row.leased_generation),
-        leasedComputerId: String(row.leased_computer_id), leaseToken: String(row.lease_token),
-        leasedAt: new Date(row.leased_at as string | Date), editorReadyAt: new Date(row.editor_ready_at as string | Date),
-    };
+    return withAdmission(db, async (tx, lock) => {
+        await lockImagePlacement(tx, lock, args.computerId);
+        await assertNoImageReservation(tx, args.computerId);
+        const at = args.now.toISOString();
+        const rows = rowsOf(await tx.execute(sql`
+            UPDATE public.ezil_compute_pool_hosts
+            SET state = 'leased', leased_computer_id = ${args.computerId}::uuid,
+                leased_generation = generation, lease_token = gen_random_uuid(),
+                leased_at = ${at}::timestamptz, generation = generation + 1, updated_at = ${at}::timestamptz
+            WHERE id = (
+                SELECT id FROM public.ezil_compute_pool_hosts
+                WHERE region = ${args.region} AND instance_type = ${args.instanceType}
+                    AND state = 'ready' AND health = 'healthy' AND editor_ready_at IS NOT NULL
+                    AND generation > 0 AND generation < ${Number.MAX_SAFE_INTEGER}
+                    AND leased_computer_id IS NULL AND leased_generation IS NULL AND lease_token IS NULL AND leased_at IS NULL
+                ORDER BY editor_ready_at, id FOR UPDATE SKIP LOCKED LIMIT 1
+            )
+            RETURNING id, region, zone_id, instance_id, instance_type, state, generation,
+                leased_generation, leased_computer_id, lease_token, leased_at, editor_ready_at
+        `));
+        const row = rows[0];
+        if (!row) return null;
+        return {
+            id: String(row.id), region: String(row.region), zoneId: String(row.zone_id),
+            instanceId: String(row.instance_id), instanceType: row.instance_type as PoolInstanceType,
+            state: 'leased', generation: generationOf(row.generation), leasedGeneration: generationOf(row.leased_generation),
+            leasedComputerId: String(row.leased_computer_id), leaseToken: String(row.lease_token),
+            leasedAt: new Date(row.leased_at as string | Date), editorReadyAt: new Date(row.editor_ready_at as string | Date),
+        };
+    });
 }
 
 /** Pass the returned host.generation (2 on first lease), not leasedGeneration (1).

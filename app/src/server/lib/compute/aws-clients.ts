@@ -259,7 +259,7 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             const { client, account } = sfnFor(region);
             if (m[1] !== region) throw new AwsClientError('aws_config', false, 'ExecutionRegionMismatch');
             if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
-            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date; stopDate?: Date };
+            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date; stopDate?: Date; input?: string; executionArn?: string; stateMachineVersionArn?: string; stateMachineAliasArn?: string; redriveCount?: number };
             try {
                 out = (await client.send(new DescribeExecutionCommand({ executionArn }))) as typeof out;
             } catch (error) {
@@ -268,7 +268,8 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             if (typeof out.status !== 'string') throw new AwsClientError('aws_error', false, 'DescribeExecutionNoStatus');
             const startDate = out.startDate instanceof Date && Number.isFinite(out.startDate.getTime()) ? out.startDate : null;
             const stopDate = out.stopDate instanceof Date && Number.isFinite(out.stopDate.getTime()) ? out.stopDate : null;
-            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate, stopDate };
+            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate, stopDate,
+                input: out.input, executionArn: out.executionArn, stateMachineVersionArn: out.stateMachineVersionArn, stateMachineAliasArn: out.stateMachineAliasArn, redriveCount: out.redriveCount };
         },
     };
 }
@@ -276,8 +277,15 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
 // ── EC2 (enrollment's live check) ────────────────────────────────────────
 
 type Ec2Tag = { Key?: string; Value?: string };
-const tagMap = (tags: readonly Ec2Tag[] | undefined): Record<string, string> =>
-    Object.fromEntries((tags ?? []).filter((t) => typeof t.Key === 'string').map((t) => [t.Key!, t.Value ?? '']));
+const tagMap = (tags: readonly Ec2Tag[] | undefined): Record<string, string> => {
+    const out: Record<string, string> = Object.create(null);
+    for (const tag of tags ?? []) {
+        if (typeof tag.Key !== 'string' || typeof tag.Value !== 'string' || Object.hasOwn(out, tag.Key))
+            throw new AwsClientError('aws_error', false, 'DescribeTagsAmbiguous');
+        out[tag.Key] = tag.Value;
+    }
+    return out;
+};
 
 /**
  * The read-only describe C-6 step 3 needs, in `region`. null when EC2 has no
@@ -293,6 +301,10 @@ export interface Ec2VolumeView {
     volumeId: string;
     /** EC2 volume state: creating | available | in-use | deleting | deleted | error. */
     state: string;
+    tags?: Readonly<Record<string, string>>;
+    attachments?: readonly { instanceId: string; state: string }[];
+    encrypted?: boolean;
+    kmsKeyId?: string;
 }
 
 export interface Ec2VolumeDescriber {
@@ -312,6 +324,11 @@ export interface Ec2ComputerResources {
     volumes: { volumeId: string; state: string }[];
 }
 
+export interface ReplacementWriter { instanceId: string; state: string; accountId: string; clientToken: string; tags: Readonly<Record<string, string>> }
+export interface Ec2ReplacementDescriber {
+    describeReplacementWriters(region: string, clientToken: string): Promise<ReplacementWriter[]>;
+}
+
 export interface Ec2ComputerResourceFinder {
     findComputerResources(region: string, computerId: string): Promise<Ec2ComputerResources>;
 }
@@ -322,7 +339,7 @@ const COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 
 export function createEc2EnrollmentDescriber(
     ec2For: (region: string) => RegionalClient,
-): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder {
+): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Ec2ReplacementDescriber {
     return {
         async describeForEnrollment(region, instanceId) {
             assertRegion(region);
@@ -330,6 +347,7 @@ export function createEc2EnrollmentDescriber(
             const { client } = ec2For(region);
             type Instance = {
                 InstanceId?: string;
+                InstanceType?: string;
                 State?: { Name?: string };
                 StateTransitionReason?: string;
                 Placement?: { AvailabilityZone?: string; AvailabilityZoneId?: string };
@@ -382,6 +400,7 @@ export function createEc2EnrollmentDescriber(
             const transitionAt = stamp ? new Date(`${stamp[1]}T${stamp[2]}Z`) : null;
             const view: Ec2EnrollmentView = {
                 instanceId,
+                ...(inst.InstanceType ? { instanceType: inst.InstanceType } : {}),
                 state: inst.State?.Name ?? 'unknown',
                 ...(transitionAt && Number.isFinite(transitionAt.getTime()) ? { stateTransitionAt: transitionAt } : {}),
                 availabilityZone: az,
@@ -402,9 +421,10 @@ export function createEc2EnrollmentDescriber(
             assertRegion(region);
             if (!VOLUME_ID.test(volumeId)) return null;
             const { client } = ec2For(region);
-            let volumes: { VolumeId?: string; State?: string }[];
+            type Volume = { VolumeId?: string; State?: string; Tags?: Ec2Tag[]; Attachments?: { InstanceId?: string; State?: string }[]; Encrypted?: boolean; KmsKeyId?: string };
+            let volumes: Volume[];
             try {
-                const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: { VolumeId?: string; State?: string }[] };
+                const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: Volume[] };
                 volumes = (out.Volumes ?? []).filter((v) => v.VolumeId === volumeId);
             } catch (error) {
                 if (nameOf(error) === 'InvalidVolume.NotFound') return null;
@@ -412,7 +432,29 @@ export function createEc2EnrollmentDescriber(
             }
             if (volumes.length === 0) return null;
             if (volumes.length !== 1) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
-            return { volumeId, state: volumes[0]!.State ?? 'unknown' };
+            const v = volumes[0]!;
+            return { volumeId, state: v.State ?? 'unknown', tags: tagMap(v.Tags), encrypted: v.Encrypted, kmsKeyId: v.KmsKeyId,
+                attachments: v.Attachments?.map((a) => ({ instanceId: a.InstanceId ?? '', state: a.State ?? 'unknown' })) };
+        },
+
+        async describeReplacementWriters(region, clientToken) {
+            assertRegion(region);
+            if (!/^[0-9a-f]{64}$/.test(clientToken)) throw new AwsClientError('aws_config', false, 'ClientTokenInvalid');
+            const { client } = ec2For(region);
+            const found: ReplacementWriter[] = [];
+            let next: string | undefined;
+            for (let page = 0; ; page++) {
+                if (page >= RESOURCE_SEARCH_MAX_PAGES) throw new AwsClientError('aws_error', false, 'DescribeInstancesTooMany');
+                const out = await client.send(new DescribeInstancesCommand({
+                    Filters: [{ Name: 'client-token', Values: [clientToken] }], MaxResults: 100, NextToken: next,
+                })) as { Reservations?: { OwnerId?: string; Instances?: { InstanceId?: string; ClientToken?: string; State?: { Name?: string }; Tags?: Ec2Tag[] }[] }[]; NextToken?: string };
+                for (const r of out.Reservations ?? []) for (const i of r.Instances ?? []) found.push({
+                    instanceId: i.InstanceId ?? '', state: i.State?.Name ?? 'unknown', accountId: r.OwnerId ?? '',
+                    clientToken: i.ClientToken ?? '', tags: tagMap(i.Tags),
+                });
+                next = out.NextToken;
+                if (!next) return found;
+            }
         },
 
         async findComputerResources(region, computerId) {
@@ -473,7 +515,7 @@ export interface AwsSdkFactories {
 export interface AwsSdkCollaborators {
     starter?: LifecycleStarter;
     executions?: LifecycleExecutionReader;
-    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder;
+    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Partial<Ec2ReplacementDescriber>;
 }
 
 /**
