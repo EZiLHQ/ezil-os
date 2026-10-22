@@ -297,3 +297,70 @@ describe('resolveComputeProvider: canary `*` (every user) with the admission fal
         expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
     });
 });
+
+describe('resolveComputeProvider: listed canary creation cutoff regression', () => {
+    const CANARY = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: userId, EZIL_AWS_CANARY_SINCE: '2026-10-15T13:12:00Z' };
+
+    it.each([
+        { name: 'founder computer stays on Cloudflare', createdAt: '2026-09-18T02:27:45Z', maxRunning: '2', kind: 'cloudflare', admission: false },
+        { name: 'one millisecond before SINCE stays on Cloudflare', createdAt: '2026-10-15T13:11:59.999Z', maxRunning: '2', kind: 'cloudflare', admission: false },
+        { name: 'exactly SINCE reaches AWS when admitted', createdAt: '2026-10-15T13:12:00Z', maxRunning: '2', kind: 'aws-ec2', admission: true },
+        { name: 'post-SINCE reaches AWS when admitted', createdAt: '2026-10-15T13:12:00.001Z', maxRunning: '2', kind: 'aws-ec2', admission: true },
+        { name: 'post-SINCE stays on Cloudflare when admission refuses', createdAt: '2026-10-15T13:12:00.001Z', maxRunning: '0', kind: 'cloudflare', admission: true },
+    ])('$name', async ({ createdAt, maxRunning, kind, admission }) => {
+        const { db, statements, placements } = createFakePlacementDb({
+            computers: [{ id: computerId, user_id: userId, created_at: new Date(createdAt) }],
+        });
+        const provider = await resolveComputeProvider(db, computer, { ...CANARY, AWS_MAX_RUNNING: maxRunning });
+        expect(provider.kind).toBe(kind);
+        if (kind === 'cloudflare') expect(provider).toBe(cloudflareComputeProvider);
+        const tags = statements.map((statement) => statement.sql.match(/\/\* placement:([a-z-]+) \*\//)?.[1]);
+        expect(tags).toEqual(admission
+            ? ['read', 'canary-computer', 'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-running-region', 'count-user', 'duplicates', 'usage-month']
+            : ['read', 'canary-computer']);
+        expect(statements.every((statement) => statement.tx === null)).toBe(true);
+        expect(placements).toEqual([]);
+    });
+});
+
+describe('resolveComputeProvider: the Cloudflare pin says why the canary did not claim the computer', () => {
+    const CANARY = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: userId, EZIL_AWS_CANARY_SINCE: '2026-10-15T13:12:00Z' };
+    const created = (at: string) => ({ computers: [{ id: computerId, user_id: userId, created_at: new Date(at) }] });
+    const pinned = (spy: ReturnType<typeof vi.spyOn>) =>
+        spy.mock.calls.filter((call: unknown[]) => call[0] === '[compute.placement] pinned').map((call: unknown[]) => call[1]);
+
+    it.each([
+        { name: 'founder computer (created before SINCE)', env: CANARY, at: '2026-09-18T02:27:45Z', canary: 'created_before_since' },
+        { name: 'AWS flag off, placement reads on', env: { EZIL_COMPUTE_PLACEMENT_READS: '1' }, at: '2026-10-16T00:00:00Z', canary: 'aws_disabled' },
+        { name: 'trailing comma empties the cohort', env: { ...CANARY, EZIL_AWS_CANARY_USER_IDS: `${userId},` }, at: '2026-10-16T00:00:00Z', canary: 'canary_malformed' },
+        { name: 'user not listed', env: { ...CANARY, EZIL_AWS_CANARY_USER_IDS: '44444444-4444-4444-8444-444444444444' }, at: '2026-10-16T00:00:00Z', canary: 'user_not_in_cohort' },
+        { name: 'admission refuses', env: { ...CANARY, AWS_MAX_RUNNING: '0' }, at: '2026-10-16T00:00:00Z', canary: 'admission_refused:' },
+    ])('$name', async ({ env, at, canary }) => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const { db, placements } = createFakePlacementDb(created(at));
+            expect(await resolveComputeProvider(db, computer, env, {}, { pinCloudflare: true })).toBe(cloudflareComputeProvider);
+            expect(placements.map((row) => row.provider)).toEqual(['cloudflare']);
+            const logs = pinned(spy);
+            expect(logs).toHaveLength(1);
+            expect(logs[0]).toMatchObject({ computerId, provider: 'cloudflare' });
+            expect(String((logs[0] as { canary: string }).canary).startsWith(canary)).toBe(true);
+            expect(JSON.stringify(spy.mock.calls)).not.toContain(userId);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('logs nothing when the caller does not pin, or when the canary claims the computer', async () => {
+        const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const read = createFakePlacementDb(created('2026-09-18T02:27:45Z'));
+            expect(await resolveComputeProvider(read.db, computer, CANARY)).toBe(cloudflareComputeProvider);
+            const claimed = createFakePlacementDb(created('2026-10-16T00:00:00Z'));
+            expect((await resolveComputeProvider(claimed.db, computer, CANARY, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+            expect(pinned(spy)).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});

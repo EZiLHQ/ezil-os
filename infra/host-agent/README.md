@@ -30,7 +30,7 @@ Records:
   `.ezil-last-stop.json`, projected to outcome/time/generation/epoch only. Refusal
   or error reports null metadata after unmount; no exception detail or stop reason.
 - `persistence`: after the overlay mount and after every desktop stop attempt, before
-  teardown. Reads only `/root/.ezil-canary-sentinel` and `/root/.bash_history` through
+  teardown. Reads `/root/.ezil-canary-sentinel` and `/root/.bash_history` through
   the merged overlay (the spec fixes HOME to `/root`). Reports sentinel SHA-256,
   physical history-line count (including an unterminated final line), and exact
   presence of the line `: EZIL-CANARY-HISTORY-v1`; never history or sentinel contents.
@@ -46,6 +46,29 @@ Missing/unreadable files produce explicit statuses and null measurements; symlin
 special files and oversized files are unreadable (64 KiB sentinel, 4 MiB history).
 Compare the shutdown hash/count/marker with the next boot probe. This observes persisted
 bytes; it does not establish that a live interactive shell flushed its history.
+
+The same boot/shutdown `persistence` record includes `toolStatus`
+(`absent`, `ok`, `unreadable`, or `refused`) and `toolSha256` (null unless `ok`).
+Prepare `/usr/local/bin/ezil-canary-tool` as a relative symlink, for example to
+`../lib/node_modules/ezil-canary-tool/probe`, with a regular public fixture of at most
+64 KiB at that target. The probe hashes the target through the merged rootfs without
+executing, creating or repairing it. Directory components use no-follow opens; only
+this one relative symlink is allowed. Absolute targets, traversal outside
+`/usr/local/lib/node_modules`, and nested symlinks are refused; missing targets,
+special files and oversized targets are unreadable. The initial `../lib` is allowed
+for npm's layout, and later `..` components must stay inside `node_modules`.
+Compare the tool hash at shutdown and the next boot to observe installed-tool bytes;
+the entire record stays within the 512-byte console limit.
+
+The sentinel proves the storage path, not a real tool. For real installs, set
+`canaryTools` (for example `["opencode"]`, at most 4 npm bin names) in the baked
+`agent.json`: each boot/shutdown then emits one `tool` record per name with `status`
+(`absent`, `ok`, `large`, `unreadable` or `refused`), `size`, `sha256` (only for a target
+of at most 64 KiB; a large binary such as opencode's is never read) and `version` from the
+package's own `package.json`. The same no-follow path rules apply. This shows the real
+`npm -g` install is present, the same size and the same version after each lifecycle
+event, without reinstalling; it does not prove the tool runs. Run
+`tools/lifecycle/probe.sh` in the computer's terminal for `command -v` and `--version`.
 
 These hooks need no enrollment or control key and preserve guard/enrollment requirements.
 Without an existing stop record, `lastStop` is null; its durable writer remains the agent.
