@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(sys.argv[1])
+root.mkdir(parents=True, exist_ok=True)
+(root / "bin").mkdir()
+for tool in ("aws", "docker", "git", "npm", "npx", "sleep", "timeout"):
+    shutil.copyfile(Path(__file__).with_name("fake.py"), root / "bin" / tool)
+    (root / "bin" / tool).chmod(0o755)
+
+
+def save(name, value):
+    (root / name).write_text(json.dumps(value))
+
+
+save("scenario.json", json.loads(sys.argv[2]))
+save("calls.jsonl", [])
+(root / "calls.jsonl").write_text("")
+params = {
+    "AssetBucketName": "ezil-mum-deploy-assets-452630323510",
+    "ApplicationImageRepositoryUri": "452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6",
+    "SubnetId": "subnet-example", "SecurityGroupId": "sg-example", "UbuntuAmiId": "/aws/example",
+    "AgentSrcS3Uri": "s3://example/old.tgz", "DesktopImageDigest": "sha256:" + "0" * 64,
+    "DesktopImageId": "sha256:" + "1" * 64, "CloudflaredVersion": "2026.10.2",
+    "CloudflaredSha256": "0" * 64, "EnrollUrl": "https://os-staging.ezil.work/api/compute/aws/enroll",
+    "FutureParameter": "must-remain",  # proves coverage is discovered, not hard-coded
+}
+save("stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", "Parameters": [
+    {"ParameterKey": k, "ParameterValue": v, **({"ResolvedValue": "ami-" + "1" * 17} if k == "UbuntuAmiId" else {})} for k, v in params.items()
+], "Outputs": [{"OutputKey": "PipelineArn", "OutputValue": "arn:aws:imagebuilder:ap-south-1:452630323510:image-pipeline/ezil-host-mum"}]}]})
+save("template.json", {"TemplateBody": {"Resources": {
+    "Recipe": {"Type": "AWS::ImageBuilder::ImageRecipe", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1"}},
+    "Pipeline": {"Type": "AWS::ImageBuilder::ImagePipeline"},
+}}})
+d = {"accountId": "452630323510", "region": "ap-south-1", "namespace": "mum", "amiId": "ami-" + "1" * 17,
+     "stateMachineVersionArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:4", "keep": [1, 2]}
+save("config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
+save("original-config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
+deployments = {"ap-south-1": d, "us-east-1": {"amiId": "other-region", "untouched": [3, 4]}}
+if json.loads(sys.argv[2]).get("secret_drift"):
+    d["amiId"] = "ami-" + "9" * 17
+raw = deployments if json.loads(sys.argv[2]).get("object_secret") else json.dumps(deployments)
+secret = {"keepSynthetic": "synthetic-private-do-not-print", "unicode": "£☺\\\n", "EZIL_AWS_LIFECYCLE_DEPLOYMENTS": raw}
+save("secret.json", {"VersionId": "initial", "SecretString": json.dumps(secret)})
+save("original-secret.json", secret)
