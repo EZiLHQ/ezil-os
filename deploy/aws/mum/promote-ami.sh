@@ -86,7 +86,7 @@ aws_act cloudformation create-change-set --stack-name ezil-mum-lifecycle --chang
 if ! "$apply"; then
     show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-lifecycle --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-lifecycle --change-set-name "$change" --include-property-values --output json
-    say 'Allow only synthesized AMI/version property differences; refuse IAM, other resources, deletions and replacements.'
+    say 'Require exact AMI/version substitutions and matching change-set details; allow only the validated Lambda Version Add/Remove pair.'
     aws_act cloudformation execute-change-set --stack-name ezil-mum-lifecycle --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation wait stack-update-complete --stack-name ezil-mum-lifecycle
     show aws --profile "$profile" --region "$region" stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json

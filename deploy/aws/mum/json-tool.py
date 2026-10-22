@@ -269,48 +269,198 @@ def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths)
                  "immutable Image Builder recipe replacement: contract needs a reviewed recipe version bump; refusing execution")
 
 
-def lifecycle_template(live_path, baseline_path, candidate_path, before_path, after_path, rollback="false"):
-    """Derive an allow-list from two synths; reject code/config drift from live.
+def same_json(a, b):
+    """JSON equality must not equate booleans and numbers as Python does."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
 
-    The lane contract forbids ALL IAM changes and resource replacements, even
-    when this CDK app requires them to publish a version. Do not silently expand
-    the allow-list to make a real promotion pass.
+
+def promotion_literal(value):
+    """Resolve only local Join/Sub strings; never query CFN or evaluate arbitrary refs."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return None
+    if set(value) == {"Fn::Join"}:
+        delimiter, parts = value["Fn::Join"]
+        strings = [promotion_literal(v) for v in parts]
+        return delimiter.join(strings) if all(isinstance(v, str) for v in strings) else None
+    if set(value) == {"Fn::Sub"}:
+        sub = value["Fn::Sub"]
+        text, variables = (sub, {}) if isinstance(sub, str) else sub
+        variables = {"AWS::Partition": "aws", "AWS::Region": REGION, "AWS::AccountId": ACCOUNT, **variables}
+        tokens = re.findall(r"\$\{([^}]+)\}", text)
+        resolved = {k: promotion_literal(variables.get(k)) for k in tokens}
+        if all(isinstance(v, str) for v in resolved.values()):
+            return re.sub(r"\$\{([^}]+)\}", lambda m: resolved[m[1]], text)
+    return None
+
+
+def promotion_substitution(value, old_pair, new_pair, version_ids=None):
+    """Replace complete identifiers recursively; qualify numeric version arguments.
+
+    A bare number is a version only inside a Join/Sub resolving to the configured
+    workflow version ARN. IAM condition values and unrelated numbers stay fixed.
+    Logical ID substitutions come only from the independently checked Version pair.
     """
+    if isinstance(value, str):
+        replacements = {old_pair[key]: new_pair[key] for key in old_pair}
+        pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(k) for k in replacements) + r")(?![A-Za-z0-9_])"
+        return re.sub(pattern, lambda match: replacements[match[0]], value)
+    if isinstance(value, list):
+        return [promotion_substitution(v, old_pair, new_pair, version_ids) for v in value]
+    if not isinstance(value, dict):
+        return value
+    result = {k: promotion_substitution(v, old_pair, new_pair, version_ids) for k, v in value.items()}
+    version_ids = version_ids or {}
+    # A paired Version's logical ID may change only as a CFN reference, never
+    # as a matching literal (for example an IAM Sid or an environment value).
+    if set(value) == {"Ref"} and value["Ref"] in version_ids:
+        result["Ref"] = version_ids[value["Ref"]]
+    if set(value) == {"Fn::GetAtt"}:
+        getatt = value["Fn::GetAtt"]
+        logical = getatt[0] if isinstance(getatt, list) else getatt.split(".")[0]
+        if logical in version_ids:
+            result["Fn::GetAtt"] = ([version_ids[logical], getatt[1]] if isinstance(getatt, list)
+                                    else version_ids[logical] + getatt[len(logical):])
+    if set(value) == {"Fn::Sub"}:
+        sub = result["Fn::Sub"]
+        text, variables = (sub, {}) if isinstance(sub, str) else sub
+
+        def reference(match):
+            token = match[1]
+            logical = token.split(".")[0]
+            if token not in variables and logical in version_ids:
+                return "${" + version_ids[logical] + token[len(logical):] + "}"
+            return match[0]
+
+        text = re.sub(r"\$\{([^}]+)\}", reference, text)
+        if isinstance(sub, str):
+            result["Fn::Sub"] = text
+        else:
+            result["Fn::Sub"][0] = text
+    old_arn, new_arn = old_pair["stateMachineVersionArn"], new_pair["stateMachineVersionArn"]
+    if promotion_literal(value) == old_arn and promotion_literal(result) != new_arn:
+        # Only the terminal version component can change, and the fully resolved
+        # expression must then equal the new ARN. Never replace every matching digit.
+        previous, target = old_arn.rsplit(":", 1)[1], new_arn.rsplit(":", 1)[1]
+        adjusted = copy.deepcopy(result)
+        if "Fn::Join" in value:
+            tail = value["Fn::Join"][1][-1]
+            if isinstance(tail, str) and tail.endswith(previous):
+                adjusted["Fn::Join"][1][-1] = tail[:-len(previous)] + target
+        elif "Fn::Sub" in value:
+            sub = value["Fn::Sub"]
+            text, variables = (sub, {}) if isinstance(sub, str) else sub
+            placeholder = re.search(r"\$\{([^}]+)\}$", text)
+            if placeholder and isinstance(variables.get(placeholder[1]), str) and variables[placeholder[1]].endswith(previous):
+                adjusted["Fn::Sub"][1][placeholder[1]] = variables[placeholder[1]][:-len(previous)] + target
+            elif text.endswith(previous):
+                text = text[:-len(previous)] + target
+                if isinstance(sub, str):
+                    adjusted["Fn::Sub"] = text
+                else:
+                    adjusted["Fn::Sub"][0] = text
+        if promotion_literal(adjusted) == new_arn:
+            result = adjusted
+    return result
+
+
+def lifecycle_version_pair(old, new, old_pair, new_pair):
+    removed, added = old.keys() - new.keys(), new.keys() - old.keys()
+    if not removed and not added:
+        return {}
+    need(len(removed) == len(added) == 1,
+         "lifecycle resource addition/removal refused: expected one Lambda Version pair")
+    previous, target = next(iter(removed)), next(iter(added))
+    a, b = old[previous], new[target]
+    need(a["Type"] == b["Type"] == "AWS::Lambda::Version",
+         "lifecycle resource addition/removal refused: only a Lambda Version pair is permitted")
+    function = a.get("Properties", {}).get("FunctionName")
+    need(function == b.get("Properties", {}).get("FunctionName") and isinstance(function, dict) and
+         set(function) == {"Ref"}, "Lambda Version pair must reference the same function")
+    logical = function["Ref"]
+    need(logical in old and logical in new and
+         old[logical]["Type"] == new[logical]["Type"] == "AWS::Lambda::Function",
+         "Lambda Version pair must reference the same existing function")
+    old_props, new_props = old[logical].get("Properties", {}), new[logical].get("Properties", {})
+    need(not same_json(old_props.get("Environment"), new_props.get("Environment")) and
+         same_json(promotion_substitution(old_props.get("Environment"), old_pair, new_pair), new_props.get("Environment")) and
+         same_json({k: v for k, v in old_props.items() if k != "Environment"},
+                   {k: v for k, v in new_props.items() if k != "Environment"}),
+         "Lambda Version pair is not forced by the substituted function environment")
+    # The pinned CDK derives the currentVersion logical ID hash from Environment.
+    # Its Version properties (including any explicit CodeSha256/Description) are
+    # unchanged; never treat those fields as an unchecked escape hatch.
+    need(same_json(promotion_substitution(a, old_pair, new_pair), b),
+         "Lambda Version pair properties/attributes are not forced by AMI/version pair")
+    return {previous: target}
+
+
+def lifecycle_template(live_path, baseline_path, candidate_path, before_path, after_path, rollback="false"):
+    """Derive exact changes from substitution, with one environment-forced Version pair."""
     before, after = read(before_path), read(after_path)
     old_pair, new_pair = pair(before), pair(after)
     expected = copy.deepcopy(before)
     expected["settings"]["deployment"].update(new_pair)
-    need(expected == after, "unexpected lifecycle config change outside AMI/version pair")
+    need(same_json(expected, after), "unexpected lifecycle config change outside AMI/version pair")
     live, baseline, candidate = template(live_path), read(baseline_path), read(candidate_path)
     # A failed promotion can leave the stack at the rollback target already.
-    if rollback == "true" and ascii_view(live) == ascii_view(candidate):
+    if rollback == "true" and same_json(ascii_view(live), ascii_view(candidate)):
         return live, candidate, {}
-    need(ascii_view(live) == ascii_view(baseline), "live lifecycle template differs from baseline synth; reconcile drift separately")
-    need({k: v for k, v in baseline.items() if k != "Resources"} ==
-         {k: v for k, v in candidate.items() if k != "Resources"}, "unexpected lifecycle template parameter/output/metadata change")
+    need(same_json(ascii_view(live), ascii_view(baseline)), "live lifecycle template differs from baseline synth; reconcile drift separately")
+    need(same_json({k: v for k, v in baseline.items() if k != "Resources"},
+                   {k: v for k, v in candidate.items() if k != "Resources"}), "unexpected lifecycle template parameter/output/metadata change")
     old, new = baseline["Resources"], candidate["Resources"]
-    need(old.keys() == new.keys(), "lifecycle resource addition/removal refused (including published Lambda versions)")
-    allowed = {"AWS::Lambda::Function": {"Environment"}, "AWS::StepFunctions::StateMachine": {"DefinitionString"}}
+    version_ids = lifecycle_version_pair(old, new, old_pair, new_pair)
     changes = {}
-    for logical, resource in old.items():
-        proposed = new[logical]
-        if resource == proposed:
+    for previous, target in version_ids.items():
+        changes[previous] = {"action": "Remove", "properties": set(), "attributes": set()}
+        changes[target] = {"action": "Add", "properties": set(), "attributes": set()}
+    for logical in sorted(old.keys() & new.keys()):
+        resource, proposed = old[logical], new[logical]
+        if same_json(resource, proposed):
             continue
-        kind = resource["Type"]
-        need(kind in allowed and proposed["Type"] == kind, "lifecycle resource change refused: " + logical + " " + kind)
-        need({k: v for k, v in resource.items() if k != "Properties"} ==
-             {k: v for k, v in proposed.items() if k != "Properties"}, "unexpected lifecycle resource attributes: " + logical)
+        need(resource["Type"] == proposed["Type"], "lifecycle resource change refused: resource type changed: " + logical)
+        need(resource.keys() == proposed.keys(), "lifecycle resource change refused: resource attribute addition/removal: " + logical)
         a, b = resource.get("Properties", {}), proposed.get("Properties", {})
-        need(a.keys() == b.keys(), "lifecycle property addition/removal refused: " + logical)
-        delta = {key for key in a if a[key] != b[key]}
-        need(delta and delta <= allowed[kind], "unexpected lifecycle property change: " + logical)
+        need(a.keys() == b.keys(), "lifecycle resource change refused: lifecycle property addition/removal: " + logical)
+        delta = {key for key in a if not same_json(a[key], b[key])}
+        attributes = {key for key in resource if key != "Properties" and not same_json(resource[key], proposed[key])}
         for key in delta:
-            forced = copy.deepcopy(a[key])
-            for field in old_pair:
-                forced = replace_version(forced, old_pair[field], new_pair[field])
-            need(forced == b[key], "lifecycle change is not forced by AMI/version pair: " + logical)
-        changes[logical] = delta
+            need(same_json(promotion_substitution(a[key], old_pair, new_pair, version_ids), b[key]),
+                 "unexpected lifecycle property change; lifecycle change is not forced by AMI/version pair: " + logical + "." + key)
+        for key in attributes:
+            forced = promotion_substitution(resource[key], old_pair, new_pair, version_ids)
+            if key == "DependsOn":
+                forced = ([version_ids.get(v, v) for v in resource[key]] if isinstance(resource[key], list)
+                          else version_ids.get(resource[key], resource[key]))
+            need(same_json(forced, proposed[key]),
+                 "unexpected lifecycle resource attributes: " + logical + "." + key)
+        changes[logical] = {"action": "Modify", "properties": delta, "attributes": attributes}
     return live, candidate, changes
+
+
+def version_references(value, source, entity):
+    """Find actual CloudFormation references, not arbitrary matching string values."""
+    if isinstance(value, list):
+        return any(version_references(v, source, entity) for v in value)
+    if not isinstance(value, dict):
+        return False
+    if source == "ResourceReference" and value.get("Ref") == entity:
+        return True
+    getatt = value.get("Fn::GetAtt")
+    if source == "ResourceAttribute" and isinstance(getatt, list) and ".".join(getatt) == entity:
+        return True
+    if source == "ResourceAttribute" and isinstance(getatt, str) and getatt == entity:
+        return True
+    sub = value.get("Fn::Sub")
+    if sub is not None:
+        text, variables = (sub, {}) if isinstance(sub, str) else sub
+        if any(token not in variables and token == entity and
+               source == ("ResourceAttribute" if "." in token else "ResourceReference")
+               for token in re.findall(r"\$\{([^}]+)\}", text)):
+            return True
+    return any(version_references(v, source, entity) for v in value.values())
 
 
 def lifecycle_changeset(cs_path, stack_path, *template_paths):
@@ -325,30 +475,61 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
         value = actual[key]
         need(value.get("ParameterValue", old.get("ParameterValue") if value.get("UsePreviousValue") else None) == old.get("ParameterValue") and
              value.get("ResolvedValue") == old.get("ResolvedValue"), "lifecycle parameter/resolved SSM change refused")
+    version_ids = {logical for logical, change in allowed.items() if change["action"] in ("Add", "Remove")}
     seen = set()
     for change in cs["Changes"]:
         need(change.get("Type") == "Resource", "unexpected lifecycle non-resource change")
         r = change["ResourceChange"]
         logical = r["LogicalResourceId"]
-        need(logical in allowed and logical not in seen and r["Action"] == "Modify", "unexpected lifecycle resource change")
+        need(logical in allowed and logical not in seen and r["Action"] == allowed[logical]["action"], "unexpected lifecycle resource change")
         seen.add(logical)
-        need(r["ResourceType"] == candidate["Resources"][logical]["Type"], "lifecycle resource type mismatch")
-        need(r.get("Replacement") == "False", "lifecycle resource replacement refused")
-        need(set(r.get("Scope", [])) == {"Properties"} and r.get("Details"), "unexplained lifecycle resource change")
-        targets = set()
-        for detail in r["Details"]:
-            target = detail["Target"]
-            name = target.get("Name")
-            need(target.get("Attribute") == "Properties" and name in allowed[logical] and
-                 target.get("RequiresRecreation") == "Never" and detail.get("ChangeSource") == "DirectModification" and
-                 detail.get("Evaluation", "Static") == "Static" and not detail.get("CausingEntity"), "unexpected lifecycle property change")
-            targets.add(name)
-        need(targets == allowed[logical], "change set omits synthesized lifecycle property changes")
-        for context, expected in (("BeforeContext", live), ("AfterContext", candidate)):
+        expected = allowed[logical]
+        resource = (live if r["Action"] == "Remove" else candidate)["Resources"][logical]
+        need(r["ResourceType"] == resource["Type"], "lifecycle resource type mismatch")
+        if r["Action"] in ("Add", "Remove"):
+            need(r.get("Replacement") in (None, "False") and not r.get("Scope") and not r.get("Details"),
+                 "unexplained Lambda Version pair change")
+        else:
+            need(r.get("Replacement") == "False", "lifecycle resource replacement refused")
+            scope = expected["attributes"] | ({"Properties"} if expected["properties"] else set())
+            need(set(r.get("Scope", [])) == scope and r.get("Details"), "unexplained lifecycle resource change")
+            targets, attributes = set(), set()
+            for detail in r["Details"]:
+                target = detail["Target"]
+                attribute, name = target.get("Attribute"), target.get("Name")
+                direct = (detail.get("ChangeSource") == "DirectModification" and
+                          detail.get("Evaluation", "Static") == "Static" and not detail.get("CausingEntity"))
+                # CFN can also describe the validated Version reference as a
+                # dynamic dependency. Only a reference present in this exact
+                # changed property may explain it; no blanket dynamic allowance.
+                entity = detail.get("CausingEntity") or ""
+                cause = entity.split(".")[0]
+                dependency = (attribute == "Properties" and cause in version_ids and
+                    detail.get("ChangeSource") in ("ResourceReference", "ResourceAttribute") and
+                    detail.get("Evaluation") in ("Static", "Dynamic") and any(
+                        version_references(t["Resources"].get(logical, {}).get("Properties", {}).get(name),
+                                           detail["ChangeSource"], entity)
+                        for t in (live, candidate)))
+                property_change = attribute == "Properties" and name in expected["properties"]
+                attribute_change = attribute in expected["attributes"] and not name
+                need((property_change or attribute_change) and target.get("RequiresRecreation") == "Never" and
+                     (direct or dependency), "unexpected lifecycle property change")
+                if property_change:
+                    targets.add(name)
+                else:
+                    attributes.add(attribute)
+            need(targets == expected["properties"] and attributes == expected["attributes"],
+                 "change set omits synthesized lifecycle property changes")
+        for context, expected_template in (("BeforeContext", live), ("AfterContext", candidate)):
             if context in r:
-                body = json.loads(r[context])
-                need(ascii_view(body["Properties"]) == ascii_view(expected["Resources"][logical]["Properties"]), "lifecycle change-set values differ from synthesized template")
-        print(r["Action"], logical, r["ResourceType"], r["Replacement"])
+                body = json.loads(r[context]) if isinstance(r[context], str) else r[context]
+                expected_resource = expected_template["Resources"].get(logical)
+                if expected_resource is None:
+                    need(not body, "unexpected context for absent Lambda Version")
+                else:
+                    need(isinstance(body, dict) and same_json(ascii_view(body.get("Properties")), ascii_view(expected_resource.get("Properties", {}))),
+                         "lifecycle change-set values differ from synthesized template")
+        print(r["Action"], logical, r["ResourceType"], r.get("Replacement", ""))
     need(seen == allowed.keys(), "change set omits synthesized lifecycle resource changes")
 
 

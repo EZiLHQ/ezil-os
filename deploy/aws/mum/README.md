@@ -195,25 +195,33 @@ with the live stack and use a fresh release directory for each successful update
    private copies under `$work/before/app-computers` and
    `$work/target/app-computers`. Each uses its existing `cdk.out/lifecycle` default.
    The live template must match the baseline synth, and the configs may differ
-   only in `amiId` and the predicted `stateMachineVersionArn`. The validator derives
-   the resource/property allow-list from those synths, accepts only forced
-   Lambda environment/state-machine definition differences, and refuses all
-   IAM, S3, KMS, nested-stack and other resource changes, additions, removals,
-   replacements, unrelated properties, metadata, outputs or parameters.
-   **The current CDK app requires IAM policy changes and new Lambda version
-   resources for an AMI promotion. The strict lane contract therefore blocks
-   that real promotion before publishing assets, editing the live config or
-   creating a change set.** The lead must resolve that contract/implementation
-   conflict in a separately reviewed change; do not bypass this validator.
+   only in `amiId` and the predicted `stateMachineVersionArn`. For every changed
+   resource property, the candidate must equal the baseline after recursively
+   substituting only the old AMI and published version with the proposed pair.
+   This includes strings inside `Fn::Join`, `Fn::Sub` and IAM `PolicyDocument`.
+   Separate numeric version arguments are changed only within an intrinsic
+   expression resolving to the configured workflow version ARN; unrelated
+   numbers and identifiers stay unchanged. An added IAM action or principal,
+   a widened resource, or any unrelated property fails validation.
+
+   Exactly one removed/added `AWS::Lambda::Version` pair is permitted, for the
+   same existing function whose only change is its substituted environment.
+   Version properties and attributes must match after substitution. The pinned
+   CDK changes the Version's logical ID hash, with identical Version properties;
+   explicit code hashes/descriptions do not receive a blanket exemption.
+   References to that validated pair may move from the old to the new logical ID.
+   All other resource additions/removals and replacements remain refused.
 
    For an admissible candidate, the script saves both synths and the live template
    in the release evidence, edits the config, then runs `cdk publish-assets` from
    the candidate's private copy, S3 template upload, and CloudFormation UPDATE
    through the execution role. Every live parameter uses its previous value.
    Before execution, it verifies CloudFormation's submitted template matches the
-   candidate, checks each change-set property against the allow-list, refuses
-   all replacements and unexplained/dynamic changes, checks parameter/resolved
-   SSM values,
+   candidate, requires the change set to describe exactly the synthesized
+   resource actions and property differences, and checks parameter/resolved
+   SSM values. The Version pair must appear as one Add and one Remove; other
+   replacements are refused. Dynamic details are accepted only for exact
+   references to that validated Version pair in the changed property. It
    rechecks version publication before execution, and requires the deployed
    `WorkflowVersionArn` to match the predicted published version.
 
@@ -352,6 +360,7 @@ those remain lead checks.
 
 `python3 deploy/aws/mum/tests/synth-contract.py` is a separate optional offline
 CDK check using only the repository example config and installed dependencies.
-It synthesizes two isolated assemblies, confirms the current IAM/Lambda-version
-changes, and verifies the strict validator refuses them. This is evidence of the
-contract conflict, not a live Mumbai template validation.
+It synthesizes two isolated assemblies, validates the real promotion and rollback
+IAM/environment/workflow/Version differences, checks exact change-set coverage,
+and rejects unauthorized template and change-set mutations. It uses synthetic
+references and does not validate the live Mumbai configuration or AWS responses.
