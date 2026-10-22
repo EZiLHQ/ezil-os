@@ -4,7 +4,7 @@ import { runInNewContext } from 'node:vm';
 import { classifyPlacement, countRepeats, desktopQuality, echoSummary, latencySummary,
   parseConnectTimes, parseIpinfo, percentile, qualityChecks,
   QUALITY_STEP_IDS, TYPING_TEXT, EDITOR, EDITOR_LINES, fetchTimings, focusEditor,
-  installNekoClipboardProbe, nekoClipboardDiagnostics } from './desktop-quality.mjs';
+  installNekoClipboardProbe, nekoClipboardDiagnostics, nekoClipboardEvidence } from './desktop-quality.mjs';
 
 test('ipinfo keeps egress fields without inferring compute placement', () => {
   assert.deepEqual(parseIpinfo('{"ip":"203.0.113.8","org":"AS64500 Example","city":"Singapore","region":"Central","country":"SG"}'),
@@ -307,16 +307,19 @@ test('native repeat is explicitly skipped even if an independent mixed-text chec
 });
 
 function probeFixture({ hostname = 'box-nekodesktop.example.test', topLevel = false,
-  clipboard = { writeText: async () => undefined }, user, clientProfile } = {}) {
+  clipboard = { writeText: async () => undefined }, user, clientProfile,
+  document = { hasFocus: () => true } } = {}) {
   class Socket {
     static OPEN = 1;
     listeners = [];
     addEventListener(type, fn) { assert.equal(type, 'message'); this.listeners.push(fn); }
-    emit(data) { for (const listener of this.listeners) listener({ data }); }
+    removeEventListener(type, fn) { assert.equal(type, 'message'); this.listeners = this.listeners.filter(item => item !== fn); }
+    send() { assert.ok(this instanceof Socket); }
+    emit(data) { for (const listener of this.listeners) listener({ data }); return this.onmessage?.({ data }); }
   }
   const window = { WebSocket: Socket, $client: { $accessor: { user }, profile: clientProfile } };
   window.top = topLevel ? window : {};
-  const globals = { window, location: { hostname }, navigator: { clipboard } };
+  const globals = { window, document, location: { hostname }, navigator: { clipboard } };
   const install = () => runInNewContext(`(${installNekoClipboardProbe.toString()})()`, globals);
   install();
   return { window, globals, install, Socket, probe: window.__desktopQualityClipboard,
@@ -432,53 +435,361 @@ test('unavailable clipboard hooks and lost frames produce explicit diagnostic ga
   assert.equal((await nekoClipboardDiagnostics(missing)).reason, 'neko_probe_not_installed');
 });
 
-test('Browser clipboard still requires exact equality and saves Neko diagnostics on both PASS and FAIL', async () => {
-  for (const allowWrite of [true, false]) {
-    let localText = '', closed = false;
-    const token = 'browser-to-local-fixture';
-    const remoteClipboard = { async writeText(value) {
-      if (!allowWrite) throw Object.assign(new Error('fixture denial'), { name: 'NotAllowedError' });
-      localText = value;
-    } };
-    const fixture = probeFixture({ clipboard: remoteClipboard, user: { member: { can_access_clipboard: true } } });
-    const socket = new fixture.window.WebSocket();
-    const input = {
-      first() { return this; }, async waitFor() {}, async click() {}, async evaluate() { return true; },
-      async press(key) {
-        if (key === 'Control+c') {
-          socket.emit(JSON.stringify({ event: 'control/clipboard', text: token }));
-          // The pinned Neko client logs rejected writes and leaves local state unchanged.
-          await remoteClipboard.writeText(token).catch(() => {});
-        }
+test('Neko counts legacy and v3 events independently from actual handler execution', async () => {
+  const fixture = probeFixture();
+  const { window, probe, snapshot } = fixture;
+  const socket = new window.WebSocket(), client = window.$client;
+  for (const event of ['control/clipboard', 'clipboard/updated']) client[event] = function (payload) {
+    assert.equal(this, client); assert.equal(payload.text, 'test-token'); return 'handled';
+  };
+  probe.reset('test-token');
+  socket.emit(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  socket.emit(JSON.stringify({ event: 'clipboard/updated', text: 'test-token' }));
+  assert.equal(snapshot().controlClipboardEvents, 1);
+  assert.equal(snapshot().clipboardUpdatedEvents, 1);
+  assert.equal(snapshot().testTokenEvents, 2);
+  assert.equal(snapshot().handlerCalls, 0, 'raw receipt is not execution');
+  assert.equal(client['control/clipboard']({ text: 'test-token' }), 'handled');
+  assert.equal(client['clipboard/updated']({ text: 'test-token' }), 'handled');
+  assert.equal(snapshot().handlerCalls, 2); assert.equal(snapshot().testTokenHandlerCalls, 2);
+  socket.emit(JSON.stringify({ event: 'clipboard/updated', data: 'private-unknown-format' }));
+  assert.equal(snapshot().clipboardUpdatedEvents, 2); assert.equal(snapshot().testTokenEvents, 2);
+  assert.ok(!JSON.stringify(snapshot()).includes('private'));
+});
+
+test('handler errors retain names and preserve thrown/rejected values and phase isolation', async () => {
+  const { window, probe, snapshot } = probeFixture();
+  const error = Object.assign(new Error('private-handler-error'), { name: 'TypeError' });
+  window.$client['control/clipboard'] = () => { throw error; };
+  probe.reset('test-token');
+  assert.throws(() => window.$client['control/clipboard']({ text: 'test-token' }), value => value === error);
+  assert.equal(snapshot().handlerErrors, 1); assert.equal(snapshot().lastHandlerErrorName, 'TypeError');
+  let reject;
+  window.$client['control/clipboard'] = () => new Promise((_resolve, fail) => { reject = fail; });
+  probe.reset('test-token');
+  const pending = window.$client['control/clipboard']({ text: 'test-token' });
+  probe.reset('next-token'); reject(error);
+  await assert.rejects(pending, value => value === error);
+  assert.equal(snapshot().handlerErrors, 0);
+  assert.ok(!JSON.stringify(snapshot()).includes('private'));
+});
+
+test('write success is attributed to the matching token and does not mask a rejected token', async () => {
+  const clipboard = { writeText: async text => {
+    if (text === 'test-token') throw Object.assign(new Error('private'), { name: 'NotAllowedError' });
+  } };
+  const { probe, snapshot } = probeFixture({ clipboard });
+  probe.reset('test-token');
+  await assert.rejects(clipboard.writeText('test-token'));
+  await clipboard.writeText('unrelated-value');
+  assert.equal(snapshot().writeResolved, 1); assert.equal(snapshot().testTokenWriteResolved, 0);
+  assert.equal(snapshot().testTokenRejectionName, 'NotAllowedError');
+  probe.reset('unrelated-value');
+  await clipboard.writeText('unrelated-value');
+  assert.equal(snapshot().testTokenWriteResolved, 1);
+});
+
+test('Neko records effective policy, current focus and only exposed control booleans', () => {
+  let focused = false;
+  const fixture = probeFixture({ document: { hasFocus: () => focused,
+    featurePolicy: { allowsFeature: feature => feature === 'clipboard-write' } } });
+  Object.assign(fixture.window.$client, { connected: true, _channel: { readyState: 'open' },
+    $accessor: { remote: { hosting: true, controlling: false, implicitHosting: true,
+      locked: false, clipboard: 'private-text', id: 'private-id' } },
+    $vue: { $store: { state: { remote: { hosting: 'private', implicitHosting: true, id: 'private-host' } } } } });
+  const data = fixture.snapshot();
+  assert.equal(data.focused, false);
+  assert.deepEqual(data.policy, { available: true, clipboardRead: false, clipboardWrite: true, errorName: null });
+  assert.deepEqual(data.control.client, { connected: true, hosting: null, controlling: null, channelOpen: true });
+  assert.equal(data.control.accessorRemote.hosting, true); assert.equal(data.control.accessorRemote.controlling, false);
+  assert.equal(data.control.storeRemotePresent, true); assert.equal(data.control.storeRemote.hosting, null);
+  assert.ok(!JSON.stringify(data).includes('private'));
+  focused = true;
+  assert.equal(fixture.snapshot().focused, true);
+  assert.deepEqual(probeFixture().snapshot().policy,
+    { available: false, clipboardRead: null, clipboardWrite: null, errorName: null });
+});
+
+test('policy errors are names only and iframe smoke failures do not fabricate successful writes', async () => {
+  const error = Object.assign(new Error('private-policy-error'), { name: 'SecurityError' });
+  const clipboard = { writeText: async () => { throw error; }, readText: async () => { throw error; } };
+  const fixture = probeFixture({ clipboard,
+    document: { hasFocus: () => false, featurePolicy: { allowsFeature() { throw error; } } } });
+  assert.equal(fixture.snapshot().policy.errorName, 'SecurityError');
+  const smoke = JSON.parse(JSON.stringify(await fixture.probe.smoke('private-smoke-token')));
+  assert.deepEqual(smoke, { writeResolved: false, readResolved: false, localEquals: null,
+    writeErrorName: 'SecurityError', readErrorName: 'SecurityError' });
+  assert.ok(!JSON.stringify(smoke).includes('private'));
+});
+
+test('existing sockets, reconnects and late client handlers are observed and fully restored', () => {
+  const fixture = probeFixture();
+  fixture.probe.restore();
+  const client = fixture.window.$client, socket = client._ws = new fixture.Socket();
+  const original = Object.getOwnPropertyDescriptor(fixture.globals.navigator.clipboard, 'writeText');
+  const nativeHandler = () => 'handled';
+  const prototype = { 'control/clipboard': nativeHandler };
+  Object.setPrototypeOf(client, prototype);
+  fixture.install();
+  const probe = fixture.window.__desktopQualityClipboard;
+  assert.equal(fixture.snapshot().socketsObserved, 1);
+  assert.notEqual(client['control/clipboard'], nativeHandler);
+  probe.reset('test-token');
+  socket.emit(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  socket.send(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  client._ws = new fixture.window.WebSocket();
+  fixture.snapshot(); fixture.snapshot();
+  assert.equal(fixture.snapshot().socketsObserved, 2, 'no duplicate listener when snapshot reattaches');
+  assert.equal(fixture.snapshot().testTokenSends, 1);
+  assert.equal(probe.restore().restored, true);
+  assert.equal(fixture.window.WebSocket, fixture.Socket);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(fixture.globals.navigator.clipboard, 'writeText'), original);
+  assert.equal(client['control/clipboard'], nativeHandler);
+  assert.equal(Object.hasOwn(client, 'control/clipboard'), false);
+  assert.equal(socket.listeners.length, 0); assert.equal(client._ws.listeners.length, 0);
+  assert.equal(Object.hasOwn(socket, 'send'), false);
+  assert.equal(fixture.window.__desktopQualityClipboard, undefined);
+});
+
+test('failed WebSocket sends are not counted and cleanup preserves later third-party replacements', () => {
+  const fixture = probeFixture();
+  fixture.probe.restore();
+  const socket = fixture.window.$client._ws = new fixture.Socket();
+  const error = new Error('private-send-error');
+  socket.send = () => { throw error; };
+  fixture.install();
+  const probe = fixture.window.__desktopQualityClipboard;
+  probe.reset('test-token');
+  assert.throws(() => socket.send(JSON.stringify({ event: 'control/clipboard', text: 'test-token' })), value => value === error);
+  assert.equal(fixture.snapshot().testTokenSends, 0);
+  const newerWrite = () => {};
+  fixture.globals.navigator.clipboard.writeText = newerWrite;
+  assert.equal(probe.restore().restored, true);
+  assert.equal(fixture.globals.navigator.clipboard.writeText, newerWrite);
+});
+
+test('clipboard evidence identifies each missing stage without deriving success from equality alone', () => {
+  const complete = { status: 'observed', socketsObserved: 1,
+    hooks: { websocket: 'installed', clipboardHandler: 'installed', clipboardWrite: 'installed' },
+    controlClipboardEvents: 1, clipboardUpdatedEvents: 0, testTokenEvents: 1, testTokenHandlerCalls: 1,
+    testTokenWriteCalls: 1, testTokenWriteResolved: 1, testTokenWriteRejected: 0, testTokenRejectionName: null };
+  const passed = nekoClipboardEvidence(complete, { localEquals: true });
+  for (const stage of ['remoteCopied', 'eventReceived', 'handlerRan', 'writeResolved', 'localEquals']) assert.equal(passed[stage], true);
+  assert.equal(passed.verdict, 'PASS'); assert.equal(passed.reason, null);
+  const cases = [
+    [{ status: 'unavailable' }, 'clipboard_event_observer_unavailable'],
+    [{ socketsObserved: 0 }, 'clipboard_event_observer_unavailable'],
+    [{ controlClipboardEvents: 0, testTokenEvents: 0 }, 'no_clipboard_event'],
+    [{ testTokenEvents: 0 }, 'clipboard_event_token_unverified'],
+    [{ hooks: { ...complete.hooks, clipboardHandler: 'unavailable' } }, 'clipboard_handler_observer_unavailable'],
+    [{ testTokenHandlerCalls: 0 }, 'clipboard_handler_not_run'],
+    [{ hooks: { ...complete.hooks, clipboardWrite: 'installation_failed' } }, 'clipboard_write_observer_unavailable'],
+    [{ testTokenWriteResolved: 0, testTokenWriteRejected: 1, testTokenRejectionName: 'NotAllowedError' }, 'write_rejected:NotAllowedError'],
+    [{ testTokenWriteResolved: 0, testTokenWriteCalls: 0 }, 'clipboard_write_not_called'],
+    [{ testTokenWriteResolved: 0 }, 'clipboard_write_unresolved'],
+  ];
+  for (const [change, reason] of cases) {
+    const result = nekoClipboardEvidence({ ...complete, ...change }, { localEquals: true });
+    assert.equal(result.verdict, 'FAIL', reason); assert.equal(result.reason, reason);
+  }
+  assert.equal(nekoClipboardEvidence(complete, { localEquals: false }).reason, 'local_clipboard_mismatch');
+  assert.equal(nekoClipboardEvidence(complete, { readErrorName: 'SecurityError' }).reason, 'local_read_rejected:SecurityError');
+  assert.equal(nekoClipboardEvidence({ ...complete, testTokenEvents: 0 }).remoteCopied, null);
+  assert.equal(nekoClipboardEvidence(complete, { localEquals: true }).remoteCopyVerification, 'matching_incoming_clipboard_event');
+});
+
+function browserClipboardFixture({ receiveEvent = true, runHandler = true, allowWrite = true,
+  callWrite = true, localMatches = true, readAllowed = true, sendUpstream = true,
+  eventName = 'control/clipboard', failCopy = false, failGrant = false, delayedSend = false } = {}) {
+  let localText = '', remoteText = '', focused = false, opened = false, closed = false, copied = false;
+  const actions = [], grants = new Set(), token = 'browser-to-local-fixture';
+  const origin = 'https://box-nekodesktop.example.test';
+  const remoteClipboard = {
+    async writeText(value) {
+      assert.equal(focused, true, 'frame write happens after focus');
+      assert.ok(grants.has(origin));
+      if (!allowWrite) throw Object.assign(new Error('private-write-error'), { name: 'NotAllowedError' });
+      localText = localMatches || value !== token ? value : 'private-mismatch';
+    },
+    async readText() { assert.equal(focused, true); return localText; },
+  };
+  const nativeWrite = remoteClipboard.writeText;
+  const fixture = probeFixture({ clipboard: remoteClipboard, user: { member: { can_access_clipboard: true } },
+    document: { hasFocus: () => focused, featurePolicy: { allowsFeature: () => true } } });
+  const client = fixture.window.$client;
+  Object.assign(client, { connected: true, _channel: { readyState: 'open' } });
+  client.$accessor.remote = { hosting: true, controlling: true, locked: false, implicitHosting: true };
+  client[eventName] = async function ({ text }) {
+    assert.equal(this, client);
+    if (callWrite) await remoteClipboard.writeText(text).catch(() => {});
+  };
+  const nativeHandler = client[eventName];
+  const socket = client._ws = new fixture.window.WebSocket();
+  socket.onmessage = async ({ data }) => {
+    const message = JSON.parse(data);
+    if (runHandler) await client[message.event]?.({ text: message.text });
+  };
+  const input = {
+    first() { return this; }, async waitFor() {},
+    async click() { assert.ok(grants.has(origin), 'permissions precede the first overlay entry'); focused = true; actions.push('click'); },
+    async focus() { focused = true; actions.push('focus'); },
+    async dispatchEvent(event) {
+      assert.equal(event, 'mouseenter'); assert.equal(focused, true);
+      assert.equal(localText, 'local-to-browser-fixture', 'entry sync reads the freshly written clipboard');
+      actions.push('mouseenter');
+      if (sendUpstream) {
+        const send = () => {
+          socket.send(JSON.stringify({ event: 'control/clipboard', text: localText }));
+          remoteText = localText; actions.push('send');
+        };
+        if (delayedSend) setTimeout(send, 10);
+        else send();
+      }
+    },
+    async evaluate(fn) { return runInNewContext(`(${fn.toString()})()`, fixture.globals); },
+    async press(key) {
+      actions.push(key);
+      if (key === 'Control+v') assert.equal(remoteText, 'local-to-browser-fixture', 'send must complete before paste');
+      if (key === 'Control+c') {
+        if (failCopy) throw new Error('private-copy-error');
+        remoteText = token; copied = true;
+        if (receiveEvent) await socket.emit(JSON.stringify({ event: eventName, text: token }));
+      }
+    },
+  };
+  const frame = { url: () => `${origin}/`, locator: () => input,
+    evaluate: async (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, { ...fixture.globals, arg }) };
+  const page = { frames: () => opened ? [frame] : [], evaluate: (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, {
+    arg, navigator: { clipboard: {
+      writeText: async value => { localText = value; actions.push('write-local'); },
+      readText: async () => {
+        if (!readAllowed && copied) throw Object.assign(new Error('private-read-error'), { name: 'SecurityError' });
+        return localText;
       },
-    };
-    const frame = { url: () => 'https://box-nekodesktop.example.test/', locator: () => input,
-      evaluate: (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, { ...fixture.globals, arg }) };
-    const page = { frames: () => [frame], evaluate: (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, {
-      arg, navigator: { clipboard: {
-        writeText: async value => { localText = value; }, readText: async () => localText,
-      } },
-    }) };
-    const quality = desktopQuality({ page, context: { grantPermissions: async () => {} },
-      runId: 'fixture', codeReady: false, browserReady: true, openApp: async () => {},
-      closeApp: async () => { closed = true; }, shot: async () => {},
-      appWindow: () => ({ locator: () => ({ elementHandle: async () => ({
-        contentFrame: async () => frame, dispose: async () => {},
-      }) }) }),
-    });
-    const evidence = {};
-    if (allowWrite) await quality.clipboard(evidence);
-    else await assert.rejects(quality.clipboard(evidence), /browser/);
-    const browser = evidence.browser.evidence;
-    assert.equal(browser.localToRemote.status, 'SKIP');
-    assert.equal(browser.localToRemote.reason, 'sidecar_has_no_omnibox_text_readback');
-    assert.equal(browser.remoteToLocal.status, allowWrite ? 'PASS' : 'FAIL');
-    assert.equal(browser.remoteToLocal.evidence.exactEquality, allowWrite);
-    const observed = browser.remoteToLocal.evidence.diagnosticsAfter;
-    assert.equal(observed.controlClipboardReceived, true);
-    assert.equal(observed.testTokenEvents, 1);
-    assert.equal(observed.clipboardWriteRejected, !allowWrite);
-    assert.equal(observed.profile.can_access_clipboard, true);
-    assert.equal(closed, true);
+    } },
+  }) };
+  const quality = desktopQuality({ page, context: { grantPermissions: async (_permissions, { origin }) => {
+    if (failGrant) throw new Error('permission unavailable');
+    grants.add(origin); actions.push('grant');
+  } }, runId: 'fixture', codeReady: false, browserReady: true, clipboardTimeoutMs: delayedSend ? 100 : 0,
+  openApp: async () => { opened = true; }, closeApp: async () => { closed = true; }, shot: async () => {},
+  appWindow: () => ({ locator: () => ({ elementHandle: async () => ({
+    contentFrame: async () => frame, dispose: async () => {},
+  }) }) }) });
+  return { quality, actions, fixture, socket, verifyCleanup() {
+    assert.equal(closed, true); assert.equal(fixture.window.__desktopQualityClipboard, undefined);
+    assert.equal(fixture.window.WebSocket, fixture.Socket); assert.equal(remoteClipboard.writeText, nativeWrite);
+    assert.equal(client[eventName], nativeHandler); assert.equal(socket.listeners.length, 0);
+  } };
+}
+
+test('Browser grants before overlay entry and waits for the new upstream send before pasting', async () => {
+  const fixture = browserClipboardFixture({ delayedSend: true });
+  const evidence = {};
+  await fixture.quality.clipboard(evidence);
+  const browser = evidence.browser.evidence;
+  assert.equal(browser.localToRemote.status, 'SKIP');
+  assert.equal(browser.localToRemote.reason, 'sidecar_has_no_omnibox_text_readback');
+  assert.equal(browser.localToRemote.evidence.upstreamSent, true);
+  const actions = fixture.actions;
+  for (const [first, second] of [['grant', 'click'], ['write-local', 'focus'], ['focus', 'mouseenter'],
+    ['mouseenter', 'send'], ['send', 'Control+v']]) assert.ok(actions.indexOf(first) < actions.indexOf(second));
+  assert.equal(browser.smoke.writeResolved, true); assert.equal(browser.smoke.readResolved, true);
+  assert.equal(browser.smoke.localEquals, true);
+  const result = browser.remoteToLocal.evidence;
+  for (const stage of ['remoteCopied', 'eventReceived', 'handlerRan', 'writeResolved', 'localEquals']) assert.equal(result[stage], true);
+  assert.equal(result.verdict, 'PASS'); assert.equal(browser.remoteToLocal.status, 'PASS');
+  assert.equal(result.diagnosticsBefore.writeCalls, 0, 'smoke and upstream writes are excluded from copy-stage counts');
+  assert.equal(result.diagnosticsAfter.testTokenWriteResolved, 1);
+  assert.equal(result.diagnosticsAfter.profile.can_access_clipboard, true);
+  assert.equal(browser.instrumentationCleanup.restored, true);
+  assert.ok(!/private|browser-to-local-fixture|local-to-browser-fixture/.test(JSON.stringify(evidence)));
+  fixture.verifyCleanup();
+});
+
+test('late clipboard notifications during cleanup do not overwrite the failed verdict snapshot', async () => {
+  const fixture = browserClipboardFixture({ receiveEvent: false }), evidence = {};
+  const snapshot = fixture.fixture.probe.snapshot;
+  let copySnapshots = 0;
+  fixture.fixture.probe.snapshot = function () {
+    // Wait until the first post-copy poll has decided failure, then simulate
+    // a notification just before the next (cleanup) snapshot.
+    if (fixture.actions.includes('Control+c')) {
+      if (++copySnapshots === 2) fixture.socket.emit(JSON.stringify({ event: 'control/clipboard', text: 'browser-to-local-fixture' }));
+    }
+    return snapshot();
+  };
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+  const remote = evidence.browser.evidence.remoteToLocal;
+  assert.equal(remote.reason, 'no_clipboard_event'); assert.equal(remote.evidence.eventReceived, false);
+  assert.equal(remote.evidence.diagnosticsAfter.controlClipboardEvents, 0);
+  assert.equal(evidence.browser.evidence.diagnostics.controlClipboardEvents, 1);
+  fixture.verifyCleanup();
+});
+
+test('Browser no-event evidence keeps remote copy unverified and local equality false', async () => {
+  const fixture = browserClipboardFixture({ receiveEvent: false });
+  const evidence = {};
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+  const remote = evidence.browser.evidence.remoteToLocal;
+  assert.equal(remote.reason, 'no_clipboard_event');
+  assert.deepEqual(Object.fromEntries(['remoteCopied', 'eventReceived', 'handlerRan', 'writeResolved', 'localEquals']
+    .map(key => [key, remote.evidence[key]])),
+  { remoteCopied: null, eventReceived: false, handlerRan: false, writeResolved: false, localEquals: false });
+  assert.equal(remote.evidence.copyDispatched, true);
+  assert.equal(remote.evidence.remoteCopyVerification, 'remote_copy_unverified');
+  fixture.verifyCleanup();
+});
+
+test('Browser failures distinguish missing handlers, writes, rejected writes, mismatches and read errors', async () => {
+  for (const [options, reason] of [
+    [{ runHandler: false }, 'clipboard_handler_not_run'],
+    [{ callWrite: false }, 'clipboard_write_not_called'],
+    [{ allowWrite: false }, 'write_rejected:NotAllowedError'],
+    [{ localMatches: false }, 'local_clipboard_mismatch'],
+    [{ readAllowed: false }, 'local_read_rejected:SecurityError'],
+  ]) {
+    const fixture = browserClipboardFixture(options), evidence = {};
+    await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+    const remote = evidence.browser.evidence.remoteToLocal;
+    assert.equal(remote.status, 'FAIL'); assert.equal(remote.reason, reason);
+    assert.equal(remote.evidence.verdict, 'FAIL'); assert.equal(remote.evidence.reason, reason);
+    assert.equal(remote.evidence.remoteCopied, true); assert.equal(remote.evidence.eventReceived, true);
+    assert.ok(!JSON.stringify(evidence).includes('private'));
+    fixture.verifyCleanup();
+  }
+});
+
+test('v3 clipboard/updated receipts and handlers appear in Browser evidence', async () => {
+  const fixture = browserClipboardFixture({ eventName: 'clipboard/updated' }), evidence = {};
+  await fixture.quality.clipboard(evidence);
+  const remote = evidence.browser.evidence.remoteToLocal;
+  assert.equal(remote.status, 'PASS'); assert.equal(remote.evidence.eventReceived, true);
+  assert.equal(remote.evidence.diagnosticsAfter.controlClipboardEvents, 0);
+  assert.equal(remote.evidence.diagnosticsAfter.clipboardUpdatedEvents, 1);
+  fixture.verifyCleanup();
+});
+
+test('missing upstream send prevents paste while preserving the independent remote-copy check', async () => {
+  const fixture = browserClipboardFixture({ sendUpstream: false }), evidence = {};
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+  const browser = evidence.browser.evidence;
+  assert.equal(browser.localToRemote.status, 'FAIL'); assert.equal(browser.localToRemote.reason, 'no_upstream_clipboard_send');
+  assert.equal(browser.localToRemote.evidence.upstreamSent, false);
+  assert.ok(!fixture.actions.includes('Control+v'));
+  assert.equal(browser.remoteToLocal.status, 'PASS');
+  fixture.verifyCleanup();
+});
+
+test('copy-input and pre-entry permission errors still restore all installed instrumentation', async () => {
+  for (const options of [{ failCopy: true }, { failGrant: true }]) {
+    const fixture = browserClipboardFixture(options), evidence = {};
+    await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+    if (options.failCopy) {
+      const result = evidence.browser.evidence.remoteToLocal.evidence;
+      assert.equal(result.copyDispatched, false); assert.equal(result.reason, 'clipboard_copy_observation_failed');
+      assert.equal(result.verdict, 'FAIL'); assert.ok(!JSON.stringify(evidence).includes('private'));
+    } else assert.ok(!fixture.actions.includes('click'));
+    fixture.verifyCleanup();
   }
 });

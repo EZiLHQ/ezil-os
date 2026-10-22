@@ -84,7 +84,10 @@ export async function qualityChecks(evidence, checks) {
     try {
       const reason = await work(result.evidence);
       if (reason) { result.status = 'SKIP'; result.reason = reason; }
-    } catch (error) { result.status = 'FAIL'; result.evidence.error = String(error.message ?? error); }
+    } catch (error) {
+      result.status = 'FAIL'; result.evidence.error = String(error.message ?? error);
+      if (error.qualityReason) result.reason = error.qualityReason;
+    }
   }
   const failed = Object.keys(checks).filter(name => evidence[name].status === 'FAIL');
   if (failed.length) throw new Error(`Desktop checks failed: ${failed.join(', ')}`);
@@ -136,21 +139,43 @@ export async function focusEditor(frame) {
 }
 
 /** Serialized by page.addInitScript: no imports/closures, no network or logging.
- * Keep only counters, test-token equality, and one allowlisted profile flag.
+ * Keep only counters, test-token equality, allowlisted state and error names.
  * Never retain socket URLs, clipboard contents, member ids, or error messages.
  */
 export function installNekoClipboardProbe() {
   'use strict'; // addInitScript serializes this function outside module strict mode.
   if (window.top === window || !/^[^.]+-nekodesktop\./i.test(location.hostname)) return;
   if (window.__desktopQualityClipboard) return;
-  const hooks = { websocket: 'unavailable', clipboardWrite: 'unavailable' };
+  const hooks = { websocket: 'unavailable', clipboardWrite: 'unavailable',
+    clipboardHandler: 'unavailable', clipboardSend: 'unavailable' };
   let socketsObserved = 0, testToken = null, counters, initProfile = null;
+  const restores = [], sockets = new Set(), handlers = new WeakMap();
+  const errorName = error => ['Error', 'NotAllowedError', 'SecurityError', 'AbortError', 'TypeError',
+    'NotFoundError', 'InvalidStateError', 'NotSupportedError', 'DataError', 'UnknownError']
+    .includes(error?.name) ? error.name : 'OtherError';
+  const isClipboard = message => ['control/clipboard', 'clipboard/updated'].includes(message?.event);
+  // The pinned legacy protocol uses text. Unknown v3 payload formats are still
+  // counted as events, but cannot establish test-token equality.
+  const matches = message => testToken !== null && message?.text === testToken;
+  const replace = (owner, key, wrapped) => {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+    owner[key] = wrapped;
+    if (owner[key] !== wrapped) throw new TypeError('Hook unavailable');
+    restores.push(() => {
+      if (owner[key] !== wrapped) return;
+      if (descriptor) Object.defineProperty(owner, key, descriptor);
+      else delete owner[key];
+    });
+  };
   const reset = token => {
     testToken = typeof token === 'string' ? token : null;
     counters = { messagesReceived: 0, nonTextMessages: 0, parseFailures: 0,
-      controlClipboardEvents: 0, testTokenEvents: 0,
+      controlClipboardEvents: 0, clipboardUpdatedEvents: 0, testTokenEvents: 0,
+      handlerCalls: 0, testTokenHandlerCalls: 0, handlerErrors: 0, lastHandlerErrorName: null,
+      clipboardSends: 0, testTokenSends: 0,
       writeCalls: 0, writeResolved: 0, writeRejected: 0,
-      testTokenWriteCalls: 0, testTokenWriteRejected: 0, lastRejectionName: null };
+      testTokenWriteCalls: 0, testTokenWriteResolved: 0, testTokenWriteRejected: 0,
+      lastRejectionName: null, testTokenRejectionName: null };
   };
   reset(null);
   const profile = () => {
@@ -172,62 +197,167 @@ export function installNekoClipboardProbe() {
       return { can_access_clipboard: null, source: null, reason: 'logged_in_profile_unreadable' };
     }
   };
-  window.__desktopQualityClipboard = { reset, snapshot: () => ({
-    status: 'observed', hooks: { ...hooks }, socketsObserved, ...counters,
-    controlClipboardReceived: hooks.websocket === 'installed' && socketsObserved > 0 ? counters.controlClipboardEvents > 0 : null,
-    clipboardWriteRejected: hooks.clipboardWrite === 'installed' ? counters.writeRejected > 0 : null,
-    profile: profile(),
-  }) };
+  const environment = () => {
+    let focused = null, focusErrorName = null;
+    const policy = { available: false, clipboardRead: null, clipboardWrite: null, errorName: null };
+    try { focused = document.hasFocus(); } catch (error) { focusErrorName = errorName(error); }
+    try {
+      const effective = document.featurePolicy;
+      policy.available = typeof effective?.allowsFeature === 'function';
+      if (policy.available) {
+        policy.clipboardRead = effective.allowsFeature('clipboard-read');
+        policy.clipboardWrite = effective.allowsFeature('clipboard-write');
+      }
+    } catch (error) { policy.errorName = errorName(error); }
+    const control = { clientPresent: false, accessorRemotePresent: false, storeRemotePresent: false,
+      client: {}, accessorRemote: {}, storeRemote: {}, errorName: null };
+    const flags = (value, keys) => Object.fromEntries(keys.map(key =>
+      [key, typeof value?.[key] === 'boolean' ? value[key] : null]));
+    try {
+      const client = window.$client, remote = client?.$accessor?.remote;
+      const store = client?.$store?.state?.remote || client?.$vue?.$store?.state?.remote;
+      control.clientPresent = !!client; control.accessorRemotePresent = !!remote; control.storeRemotePresent = !!store;
+      control.client = flags(client, ['connected', 'hosting', 'controlling']);
+      control.client.channelOpen = client?._channel ? client._channel.readyState === 'open' : null;
+      const keys = ['hosting', 'controlling', 'hosted', 'locked', 'implicitHosting'];
+      control.accessorRemote = flags(remote, keys); control.storeRemote = flags(store, keys);
+    } catch (error) { control.errorName = errorName(error); }
+    return { focused, focusErrorName, policy, control };
+  };
+  const attachHandlers = () => {
+    const client = window.$client;
+    if (!client) return;
+    for (const event of ['control/clipboard', 'clipboard/updated']) {
+      try {
+        const original = client[event];
+        if (typeof original !== 'function') continue;
+        if (handlers.get(original)) continue;
+        const wrapped = function (...args) {
+          const observation = counters;
+          observation.handlerCalls++;
+          if (matches(args[0])) observation.testTokenHandlerCalls++;
+          const failed = error => {
+            observation.handlerErrors++; observation.lastHandlerErrorName = errorName(error); throw error;
+          };
+          try {
+            const returned = Reflect.apply(original, this, args);
+            return returned?.then ? returned.then(value => value, failed) : returned;
+          } catch (error) { return failed(error); }
+        };
+        replace(client, event, wrapped); handlers.set(wrapped, true);
+        hooks.clipboardHandler = 'installed';
+      } catch { hooks.clipboardHandler = 'installation_failed'; }
+    }
+  };
+  const observeSocket = socket => {
+    if (!socket || sockets.has(socket)) return;
+    const listener = event => {
+      counters.messagesReceived++;
+      if (typeof event.data !== 'string') { counters.nonTextMessages++; return; }
+      let message;
+      try { message = JSON.parse(event.data); } catch { counters.parseFailures++; return; }
+      if (message?.event === 'system/init') {
+        initProfile = typeof message.profile?.can_access_clipboard === 'boolean'
+          ? { can_access_clipboard: message.profile.can_access_clipboard, source: 'system/init.profile', reason: null } : null;
+      }
+      if (isClipboard(message)) {
+        if (message.event === 'control/clipboard') counters.controlClipboardEvents++;
+        else counters.clipboardUpdatedEvents++;
+        if (matches(message)) counters.testTokenEvents++;
+      }
+      attachHandlers();
+    };
+    socket.addEventListener('message', listener);
+    sockets.add(socket); socketsObserved++; hooks.websocket = 'installed';
+    restores.push(() => socket.removeEventListener('message', listener));
+    try {
+      const original = socket.send;
+      if (typeof original === 'function') {
+        replace(socket, 'send', function (...args) {
+          // A returned send proves the client handed the message to WebSocket,
+          // not that the server applied it. Do not count throws as sends.
+          const returned = Reflect.apply(original, this, args);
+          let message;
+          try { message = JSON.parse(args[0]); } catch { return returned; }
+          if (message?.event === 'control/clipboard') {
+            counters.clipboardSends++;
+            if (matches(message)) counters.testTokenSends++;
+          }
+          return returned;
+        });
+        hooks.clipboardSend = 'installed';
+      }
+    } catch { hooks.clipboardSend = 'installation_failed'; }
+  };
+  const attach = () => {
+    attachHandlers();
+    // Also support an already connected legacy client if addInitScript was
+    // missed, and a socket replaced by a reconnect during the diagnostic.
+    try { observeSocket(window.$client?._ws); } catch { hooks.websocket = 'installation_failed'; }
+  };
+  window.__desktopQualityClipboard = { reset(token) { attach(); reset(token); }, snapshot() {
+    attach();
+    return { status: 'observed', hooks: { ...hooks }, socketsObserved, ...counters,
+      controlClipboardReceived: hooks.websocket === 'installed' && socketsObserved > 0 ? counters.controlClipboardEvents > 0 : null,
+      clipboardWriteRejected: hooks.clipboardWrite === 'installed' ? counters.writeRejected > 0 : null,
+      profile: profile(), ...environment() };
+  }, async smoke(token) {
+    const result = { writeResolved: false, readResolved: false, localEquals: null,
+      writeErrorName: null, readErrorName: null };
+    try { await navigator.clipboard.writeText(token); result.writeResolved = true; }
+    catch (error) { result.writeErrorName = errorName(error); }
+    try { result.localEquals = await navigator.clipboard.readText() === token; result.readResolved = true; }
+    catch (error) { result.readErrorName = errorName(error); }
+    return result;
+  }, restore() {
+    const result = { restored: true, errors: 0, errorName: null };
+    for (const restore of restores.reverse()) {
+      try { restore(); } catch (error) { result.restored = false; result.errors++; result.errorName = errorName(error); }
+    }
+    reset(null); sockets.clear(); delete window.__desktopQualityClipboard;
+    return result;
+  } };
   try {
     const NativeWebSocket = window.WebSocket;
     if (typeof NativeWebSocket === 'function') {
-      window.WebSocket = new Proxy(NativeWebSocket, {
+      replace(window, 'WebSocket', new Proxy(NativeWebSocket, {
         construct(target, args, newTarget) {
           const socket = Reflect.construct(target, args, newTarget);
-          socketsObserved++;
-          socket.addEventListener('message', event => {
-            counters.messagesReceived++;
-            if (typeof event.data !== 'string') { counters.nonTextMessages++; return; }
-            let message;
-            try { message = JSON.parse(event.data); } catch { counters.parseFailures++; return; }
-            // system/init describes this logged-in session, unlike member/list.
-            // Some clients receive this flag but do not retain it in their store.
-            if (message?.event === 'system/init') {
-              initProfile = typeof message.profile?.can_access_clipboard === 'boolean'
-                ? { can_access_clipboard: message.profile.can_access_clipboard, source: 'system/init.profile', reason: null } : null;
-            }
-            if (message?.event === 'control/clipboard') {
-              counters.controlClipboardEvents++;
-              if (testToken !== null && message.text === testToken) counters.testTokenEvents++;
-            }
-          });
+          observeSocket(socket);
           return socket;
         },
-      });
+      }));
       hooks.websocket = 'installed';
     }
   } catch { hooks.websocket = 'installation_failed'; }
   try {
     const clipboard = navigator.clipboard, original = clipboard?.writeText;
     if (typeof original === 'function') {
-      clipboard.writeText = function (...args) {
+      replace(clipboard, 'writeText', function (...args) {
         const observation = counters, matches = testToken !== null && args[0] === testToken;
         observation.writeCalls++;
         if (matches) observation.testTokenWriteCalls++;
         const rejected = error => {
           observation.writeRejected++;
-          if (matches) observation.testTokenWriteRejected++;
-          observation.lastRejectionName = ['NotAllowedError', 'SecurityError', 'AbortError', 'TypeError', 'NotFoundError']
-            .includes(error?.name) ? error.name : 'OtherError';
+          if (matches) {
+            observation.testTokenWriteRejected++;
+            observation.testTokenRejectionName = errorName(error);
+          }
+          observation.lastRejectionName = errorName(error);
           throw error;
         };
         let pending;
         try { pending = Reflect.apply(original, this, args); } catch (error) { return rejected(error); }
-        return pending.then(value => { observation.writeResolved++; return value; }, rejected);
-      };
+        return Promise.resolve(pending).then(value => {
+          observation.writeResolved++;
+          if (matches) observation.testTokenWriteResolved++;
+          return value;
+        }, rejected);
+      });
       hooks.clipboardWrite = 'installed';
     }
   } catch { hooks.clipboardWrite = 'installation_failed'; }
+  attach();
 }
 
 export async function nekoClipboardDiagnostics(frame, token) {
@@ -239,6 +369,69 @@ export async function nekoClipboardDiagnostics(frame, token) {
       return probe.snapshot();
     }, token);
   } catch { return { status: 'unavailable', reason: 'neko_frame_unavailable_for_diagnostics' }; }
+}
+
+/** A matching server notification confirms remote copy indirectly. With no
+ * notification there is no independent remote clipboard reader in this harness;
+ * keep remoteCopied unknown, even when Ctrl+C was successfully dispatched.
+ */
+export function nekoClipboardEvidence(diagnostics, { localEquals = null, readErrorName = null } = {}) {
+  const observed = diagnostics?.status === 'observed';
+  const eventObserved = observed && diagnostics.hooks.websocket === 'installed' && diagnostics.socketsObserved > 0;
+  const handlerObserved = observed && diagnostics.hooks.clipboardHandler === 'installed';
+  const writeObserved = observed && diagnostics.hooks.clipboardWrite === 'installed';
+  const remoteCopied = observed && diagnostics.testTokenEvents > 0 ? true : null;
+  const eventReceived = eventObserved ? diagnostics.controlClipboardEvents + diagnostics.clipboardUpdatedEvents > 0 : null;
+  const handlerRan = handlerObserved ? diagnostics.testTokenHandlerCalls > 0 : null;
+  const writeResolved = writeObserved ? diagnostics.testTokenWriteResolved > 0 : null;
+  const reason = !eventObserved ? 'clipboard_event_observer_unavailable'
+    : !eventReceived ? 'no_clipboard_event'
+    : !remoteCopied ? 'clipboard_event_token_unverified'
+    : !handlerObserved ? 'clipboard_handler_observer_unavailable'
+    : !handlerRan ? 'clipboard_handler_not_run'
+    : !writeObserved ? 'clipboard_write_observer_unavailable'
+    : writeResolved !== true && diagnostics.testTokenWriteRejected > 0 ? `write_rejected:${diagnostics.testTokenRejectionName}`
+    : diagnostics.testTokenWriteCalls === 0 ? 'clipboard_write_not_called'
+    : !writeResolved ? 'clipboard_write_unresolved'
+    : readErrorName ? `local_read_rejected:${readErrorName}`
+    : localEquals !== true ? 'local_clipboard_mismatch' : null;
+  return { remoteCopied, eventReceived, handlerRan, writeResolved, localEquals,
+    remoteCopyVerification: remoteCopied ? 'matching_incoming_clipboard_event' : 'remote_copy_unverified',
+    readErrorName, exactEquality: localEquals === true, verdict: reason ? 'FAIL' : 'PASS', reason };
+}
+
+const clipboardFailure = reason => Object.assign(new Error(reason), { qualityReason: reason });
+
+async function waitForClipboardSend(frame, timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  let diagnostics;
+  do {
+    diagnostics = await nekoClipboardDiagnostics(frame);
+    if (diagnostics.testTokenSends > 0) break;
+    if (performance.now() >= deadline) break;
+    await sleep(50);
+  } while (true);
+  return diagnostics;
+}
+
+async function observeNekoCopy(page, frame, token, timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  let evidence, diagnostics;
+  do {
+    const localRead = await page.evaluate(async token => {
+      try { return { localEquals: await navigator.clipboard.readText() === token, readErrorName: null }; }
+      catch (error) {
+        return { localEquals: null, readErrorName: ['Error', 'NotAllowedError', 'SecurityError', 'AbortError',
+          'TypeError', 'NotFoundError', 'InvalidStateError', 'NotSupportedError', 'DataError', 'UnknownError']
+          .includes(error?.name) ? error.name : 'OtherError' };
+      }
+    }, token);
+    diagnostics = await nekoClipboardDiagnostics(frame);
+    evidence = nekoClipboardEvidence(diagnostics, localRead);
+    if (evidence.verdict === 'PASS' || performance.now() >= deadline) break;
+    await sleep(50);
+  } while (true);
+  return { ...evidence, diagnosticsAfter: diagnostics };
 }
 
 async function readEditor(frame) {
@@ -312,7 +505,8 @@ async function typeNeko(input, value) {
 }
 
 export function desktopQuality({ page, context, runId, codeReady, browserReady,
-  codeFrame, terminalRun, command, clickDock, openApp, closeApp, appWindow, shot }) {
+  codeFrame, terminalRun, command, clickDock, openApp, closeApp, appWindow, shot,
+  clipboardTimeoutMs = 5000 }) {
   const terminal = async (script, phase) => terminalRun(page, await codeFrame(page), script, runId, phase);
   const newEditor = async () => {
     await clickDock(page, 'code');
@@ -323,7 +517,7 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
     requireThat(['', ' '].includes(await readEditor(frame)), 'New untitled editor is not empty');
     return frame;
   };
-  const browserTarget = async evidence => {
+  const browserTarget = async (evidence, beforeEntry = async () => {}) => {
     if (!browserReady) return null;
     await openApp(page, 'desktop', evidence);
     const element = await appWindow(page, 'desktop').locator('iframe.window-app-iframe').elementHandle();
@@ -332,6 +526,7 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
     if (!frame) return null;
     const input = frame.locator('textarea.overlay:visible').first();
     if (!await input.waitFor({ state: 'visible', timeout: 15_000 }).then(() => true, () => false)) return null;
+    await beforeEntry(frame);
     await input.click();
     evidence.origin = new URL(frame.url()).origin;
     const deadline = performance.now() + 10_000;
@@ -463,48 +658,89 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
           requireThat(data.exactEquality, 'Code clipboard did not reach the local browser');
         },
         browser: async data => {
-          let target;
+          let target, diagnosticFrame;
           try {
-            target = await browserTarget(data);
+            if (browserReady) await grant();
+            target = await browserTarget(data, async frame => {
+              diagnosticFrame = frame;
+              await frame.evaluate(installNekoClipboardProbe);
+              data.diagnostics = await nekoClipboardDiagnostics(frame);
+              // Include newly opened frame origins before the first overlay
+              // entry can invoke syncClipboard/readText.
+              await grant();
+            });
             if (!target) {
               data.localToRemote = data.remoteToLocal = { status: 'SKIP', reason: 'neko_focusable_target_unavailable' };
               return 'neko_focusable_target_unavailable';
             }
             data.diagnostics = await nekoClipboardDiagnostics(target.frame);
-            await grant();
+            data.smoke = await target.frame.evaluate(token => window.__desktopQualityClipboard?.smoke(token)
+              ?? { reason: 'neko_probe_not_installed' }, `clipboard-smoke-${runId}`);
             // The sidecar's snapshot.url is the committed page URL, not the
             // editable omnibox. Never substitute local overlay.value or OCR.
             return await qualityChecks(data, {
               localToRemote: async result => {
                 const token = `local-to-browser-${runId}`;
                 result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
+                result.upstreamSent = false;
                 try {
                   await page.evaluate(token => navigator.clipboard.writeText(token), token);
-                  await target.input.click(); await target.input.press('Control+l');
-                  await target.input.press('Control+v'); await sleep(500);
+                  // A stationary pointer does not produce another mouseenter
+                  // on click. Focus first, then run the client's actual entry
+                  // listener after writing the new clipboard value.
+                  await target.input.focus();
+                  await target.input.dispatchEvent('mouseenter');
+                  const sent = await waitForClipboardSend(target.frame, clipboardTimeoutMs);
+                  result.upstreamSent = sent.testTokenSends > 0;
+                  if (!result.upstreamSent) throw clipboardFailure(sent.hooks?.clipboardSend === 'installed'
+                    ? 'no_upstream_clipboard_send' : 'clipboard_send_observer_unavailable');
+                  await target.input.press('Control+l'); await target.input.press('Control+v');
                   await shot('clipboard-browser', result, 'desktop', true);
                   result.contract = 'worker/sidecar/contract.mjs:SIDECAR_WIRE';
                   await target.input.press('Escape');
                   return 'sidecar_has_no_omnibox_text_readback';
+                } catch (error) {
+                  throw error.qualityReason ? error : clipboardFailure('clipboard_upstream_observation_failed');
                 } finally { result.diagnosticsAfter = await nekoClipboardDiagnostics(target.frame); }
               },
               remoteToLocal: async result => {
                 const token = `browser-to-local-${runId}`;
                 result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
+                Object.assign(result, nekoClipboardEvidence(result.diagnosticsBefore));
+                result.copyDispatched = false;
                 try {
                   await page.evaluate(token => navigator.clipboard.writeText(`sentinel-${token}`), token);
                   await target.input.click(); await target.input.press('Control+l');
                   await typeNeko(target.input, token);
                   await target.input.press('Control+a'); await target.input.press('Control+c');
-                  result.exactEquality = await waitForText(() => page.evaluate(() => navigator.clipboard.readText()), token) === token;
-                  await target.input.press('Escape');
-                  requireThat(result.exactEquality, 'Browser clipboard did not reach the local browser');
-                } finally { result.diagnosticsAfter = await nekoClipboardDiagnostics(target.frame); }
+                  result.copyDispatched = true;
+                  Object.assign(result, await observeNekoCopy(page, target.frame, token, clipboardTimeoutMs));
+                  if (result.reason) throw clipboardFailure(result.reason);
+                } catch (error) {
+                  if (!error.qualityReason) {
+                    // Playwright errors may contain evaluated values. Retain
+                    // only a fixed stage reason rather than its message.
+                    result.verdict = 'FAIL'; result.reason = 'clipboard_copy_observation_failed';
+                    throw clipboardFailure(result.reason);
+                  }
+                  throw error;
+                } finally {
+                  // Keep the verdict's cutoff snapshot. A later notification
+                  // during cleanup must not contradict the recorded stages.
+                  result.diagnosticsAfter ??= await nekoClipboardDiagnostics(target.frame);
+                  await target.input.press('Escape').catch(() => {});
+                }
               },
             });
           } finally {
-            if (target) data.diagnostics = await nekoClipboardDiagnostics(target.frame);
-            await closeApp(page, 'desktop');
+            try {
+              if (diagnosticFrame) {
+                data.diagnostics = await nekoClipboardDiagnostics(diagnosticFrame);
+                data.instrumentationCleanup = await diagnosticFrame.evaluate(() =>
+                  window.__desktopQualityClipboard?.restore() ?? { restored: true, errors: 0, errorName: null })
+                  .catch(() => ({ restored: false, errors: 1, errorName: 'FrameUnavailable' }));
+              }
+            } finally { await closeApp(page, 'desktop'); }
           }
         },
       });
