@@ -58,6 +58,10 @@ prepare_synth() {
         cp -R -- "$repo_root/infra/app-computers/$item" "$synth_project/"
     done
     ln -s -- "$repo_root/infra/app-computers/node_modules" "$synth_project/node_modules"
+    if [[ "$1" == ami ]]; then
+        mkdir -p -- "$work/ami/host-agent/ami"
+        cp -- "$repo_root/infra/host-agent/ami/imagebuilder-component.yaml" "$work/ami/host-agent/ami/"
+    fi
 }
 wait_changeset() {
     local stack=$1 change=$2 result=0

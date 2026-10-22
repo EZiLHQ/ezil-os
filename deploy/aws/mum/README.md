@@ -409,3 +409,99 @@ It synthesizes two isolated assemblies, validates the real promotion and rollbac
 IAM/environment/workflow/Version differences, checks exact change-set coverage,
 and rejects unauthorized template and change-set mutations. It uses synthetic
 references and does not validate the live Mumbai configuration or AWS responses.
+
+## Rebase release tooling (contract v1, lane E increment)
+
+The bake accepts a paired `--previous-desktop-image-ref` and
+`--previous-desktop-image-id`. Supply the retained **promoted** source manifest
+with `--previous-release` (default: `previous-rebase-release.json` in the release
+directory). The source manifest must match the current app deployment tuple,
+checked under the existing app-secret lock. A previous AMI build is insufficient.
+A new component/recipe version is required to introduce the previous parameters.
+Omitting the pair explicitly produces a bake without N−1; it does not inherit the
+last build's previous parameters.
+
+```bash
+bash deploy/aws/mum/rebuild-ami.sh \
+  --desktop-image "$NEW_DESKTOP_IMAGE" --source-sha "$REVIEWED_SHA" \
+  --recipe-version "$NEW_RECIPE_VERSION" \
+  --previous-desktop-image-ref "$PREVIOUS_DESKTOP_REF" \
+  --previous-desktop-image-id "$PREVIOUS_LOWER_ID" \
+  --previous-release "$PREVIOUS_RELEASE_MANIFEST" \
+  --release-dir "$REBASE_RELEASE_DIR"
+```
+
+Review the dry run, then repeat with `--apply`. `bake-inputs.json` records the
+resolved baked lower IDs, registry references, recipe version and full source
+commit. In particular, a containerd index's selected child ID is recorded rather
+than the original local index ID. The AMI validates distinct lower directories,
+stored IDs, image configuration and installed package metadata. Equal IDs refuse
+before extraction. The builder retains `previous-lower-image-digest` as bake
+metadata; it never updates a computer's data-volume marker.
+
+`rebase-release.schema.json` is the exact §10 JSON Schema. The companion Python
+validator adds strict JSON parsing, calendar/time checks, namespace exclusions,
+repository/workflow identity checks and semantic pair constraints. Both registry
+manifest IDs and classic Docker config IDs are supported without assuming they
+are equal.
+
+The `plan` and `finalize` release operations are implemented. **The
+`apply-schema`, `apply-identity`, `apply-workflows`, `apply-app` and
+`promote-canary` operations currently refuse execution, including with `--apply`.**
+They require a follow-up implementation before the contract's complete rollout
+can run. The legacy `promote-ami.sh --ami` also refuses an existing rebase tuple;
+it must not change an AMI while retaining stale digest evidence. The low-level
+secret/journal tools preserve the complete tuple for promotion and rollback,
+but this is not a complete rebase promotion interface.
+
+To prepare a plan after the bake, supply a reviewed desired lifecycle config
+whose complete deployment tuple matches the candidate bake, and the reviewed
+identity config. The authority origin must be exactly
+`https://os-staging.ezil.work`. The exact SQL draft must exist at
+`docs/aws-computers/sql/0002_image_rebase.sql.txt` in the integrated checkout.
+Planning stores hashes of those files and bake/source-release evidence; it
+refuses missing inputs. It does not invent AMI IDs or workflow versions.
+
+```bash
+bash deploy/aws/mum/rebase-release.sh plan --release-dir "$REBASE_RELEASE_DIR" \
+  --config "$REVIEWED_LIFECYCLE_CONFIG" --identity-config "$REVIEWED_IDENTITY_CONFIG"
+# After the lead has deployed and independently reviewed the required artifacts:
+bash deploy/aws/mum/rebase-release.sh finalize --plan "$REBASE_RELEASE_DIR/rebase-plan.json"
+bash deploy/aws/mum/rebase-release.sh finalize --plan "$REBASE_RELEASE_DIR/rebase-plan.json" --apply
+```
+
+Finalization reads Image Builder recipe/bindings, the available private AMI,
+the pinned launch-template version, and all three published Standard workflow
+versions. It writes `rebase-release.json` only after all checks pass. Repeating
+finalize preserves the original manifest and timestamp; changed inputs or
+readbacks refuse. Files are private and written with file and directory fsync.
+Finalization proves those artifact readbacks; it does not prove schema, IAM,
+compatible app deployment or canary acceptance.
+
+The computer interface uses the existing
+`EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET` environment value in memory, signs the exact
+§3 path/body with the existing HMAC scheme, and never reads credential files.
+AWS account/region and the HTTPS staging origin are fixed; other origins,
+including btgq/curomaa, refuse. `plan` and `verify` are read/reconcile operations.
+`prepare`, `launch` and `recover` print a dry run unless `--apply` is present.
+
+```bash
+bash deploy/aws/mum/rebase-computer.sh plan --computer "$CANARY_COMPUTER_ID"
+bash deploy/aws/mum/rebase-computer.sh prepare --computer "$CANARY_COMPUTER_ID"
+bash deploy/aws/mum/rebase-computer.sh prepare --computer "$CANARY_COMPUTER_ID" --apply
+bash deploy/aws/mum/rebase-computer.sh launch --computer "$CANARY_COMPUTER_ID"
+bash deploy/aws/mum/rebase-computer.sh launch --computer "$CANARY_COMPUTER_ID" --apply
+bash deploy/aws/mum/rebase-computer.sh verify --computer "$CANARY_COMPUTER_ID"
+# Only after reconciling failed-writer/marker/access history:
+bash deploy/aws/mum/rebase-computer.sh recover --job "$FAILED_REBASE_JOB_ID"
+bash deploy/aws/mum/rebase-computer.sh recover --job "$FAILED_REBASE_JOB_ID" --apply
+```
+
+Journals default to `/root/ezil-aws-mum/rebase-computers/<computer-or-job>.json`;
+`--journal` selects another absolute private artifact path. Keep that journal
+across retries. The pending request is durably written before mutation, and a
+lost unbound prepare result requires a successful server plan reconciliation
+before another prepare can be sent. Repeated work uses the recorded job ID.
+Launch needs the preparation journal or an explicit `--job`; recover always
+needs the failed job. Terminal journals never silently create a new image job.
+No command automatically rebases a fleet or restores a volume.

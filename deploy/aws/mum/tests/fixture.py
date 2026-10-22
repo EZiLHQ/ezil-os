@@ -14,10 +14,11 @@ checkout = root / "checkout"
 scripts = checkout / "deploy/aws/mum"
 scripts.mkdir(parents=True)
 for item in source.iterdir():
-    if item.suffix in (".sh", ".py"):
+    if item.suffix in (".sh", ".py", ".json"):
         (scripts / item.name).write_text(item.read_text().replace("/root/ezil-aws-mum/locks", str(root / "locks")))
 (checkout / "infra").mkdir()
 (checkout / "infra/app-computers").symlink_to(source.parents[2] / "infra/app-computers", target_is_directory=True)
+(checkout / "infra/host-agent").symlink_to(source.parents[2] / "infra/host-agent", target_is_directory=True)
 for tool in ("aws", "docker", "git", "npm", "npx", "sleep", "timeout"):
     shutil.copyfile(Path(__file__).with_name("fake.py"), root / "bin" / tool)
     (root / "bin" / tool).chmod(0o755)
@@ -27,6 +28,7 @@ def save(name, value):
     (root / name).write_text(json.dumps(value))
 
 
+shutil.copyfile(Path(__file__).parent / "fixtures/ami-previous-bindings.json", root / "ami-previous-bindings.json")
 save("scenario.json", json.loads(sys.argv[2]))
 save("calls.jsonl", [])
 (root / "calls.jsonl").write_text("")
@@ -46,7 +48,7 @@ save("ami-config.json", {"namespace": "mum", "accountId": "452630323510", "regio
 shutil.copyfile(root / "ami-config.json", root / "original-ami-config.json")
 save("template.json", {"TemplateBody": {"Parameters": {k: {"Type": "String"} for k in params}, "Resources": {
     "Component": {"Type": "AWS::ImageBuilder::Component", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1", "Data": "synthetic component (config digest sha256:?)"}},
-    "Recipe": {"Type": "AWS::ImageBuilder::ImageRecipe", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1"}},
+    "Recipe": {"Type": "AWS::ImageBuilder::ImageRecipe", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1", "Components": [{"ComponentArn": {"Ref": "Component"}, "Parameters": []}]}},
     "Pipeline": {"Type": "AWS::ImageBuilder::ImagePipeline", "Properties": {"ImageRecipeArn": {"Ref": "Recipe"}}},
     "Infrastructure": {"Type": "AWS::ImageBuilder::InfrastructureConfiguration", "Properties": {"Name": "ezil-host-mum", "SubnetId": {"Ref": "SubnetId"}}},
     "Distribution": {"Type": "AWS::ImageBuilder::DistributionConfiguration", "Properties": {"Name": "ezil-host-mum"}},

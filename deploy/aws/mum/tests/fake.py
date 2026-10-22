@@ -85,6 +85,10 @@ elif tool in ("npm", "npx", "sleep"):
         save("synth-config.json", config)
         value = read("template.json")["TemplateBody"]
         resources = value["Resources"]
+        parts = read("ami-previous-bindings.json")
+        for section in ("Parameters", "Conditions", "Rules"):
+            value.setdefault(section, {}).update(parts[section])
+        resources["Recipe"]["Properties"]["Components"][0]["Parameters"].extend(parts["Bindings"])
         for logical in ("Component", "Recipe"):
             resources[logical]["Properties"]["Version"] = config["version"]
         if scenario.get("non_ascii_data"):
@@ -150,6 +154,20 @@ elif tool == "aws":
     assert flag("--region") == "ap-south-1"
     start = args.index("--no-cli-pager") + 1
     service, operation = args[start:start + 2]
+    if (root / "rebase-readbacks.json").exists() and service != "sts":
+        evidence = read("rebase-readbacks.json")
+        if (service, operation) == ("imagebuilder", "get-image"):
+            out(evidence["build"])
+        elif (service, operation) == ("ec2", "describe-images"):
+            out(evidence["image"])
+        elif (service, operation) == ("ec2", "describe-launch-template-versions"):
+            out(evidence["template"])
+        elif service == "stepfunctions":
+            key = next(k for k, v in evidence['versions'].items() if v['stateMachineVersions'][0]['stateMachineVersionArn'].rsplit(':', 1)[0] == flag('--state-machine-arn').rsplit(':', 1)[0] or v['stateMachineVersions'][0]['stateMachineVersionArn'].rsplit(':', 1)[0] == flag('--state-machine-arn'))
+            out(evidence['versions' if operation == 'list-state-machine-versions' else 'workflows'][key])
+        else:
+            raise SystemExit('unexpected rebase readback')
+        raise SystemExit(0)
     if (service, operation) == ("sts", "get-caller-identity"):
         out("000000000000" if scenario.get("wrong_account") else "452630323510")
     elif service == "ecr":

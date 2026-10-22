@@ -55,9 +55,11 @@ if mode.startswith("recipe-"):
             assert "Image Builder FAILED" in output
         old = {p["ParameterKey"] for p in read("stack.json")["Stacks"][0]["Parameters"]}
         requested = read("requested.json")
-        assert {p["ParameterKey"] for p in requested} == old
+        assert {p["ParameterKey"] for p in requested} == old | {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
         for p in requested:
-            if p["ParameterKey"] not in {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}:
+            if p["ParameterKey"] in {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}:
+                assert p["ParameterValue"] == ""
+            elif p["ParameterKey"] not in {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}:
                 assert p == {"ParameterKey": p["ParameterKey"], "UsePreviousValue": True}
         if read("scenario.json").get("large_template"):
             assert has("create-change-set", "--template-url")

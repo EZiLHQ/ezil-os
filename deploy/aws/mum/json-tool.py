@@ -10,12 +10,17 @@ import subprocess
 import sys
 import tempfile
 
+import rebase_manifest as release
+
 ACCOUNT = "452630323510"
 REGION = "ap-south-1"
 MACHINE = f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-mum-lifecycle"
 KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
 SECRET = "ezil-os/billing-staging/app"
-ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
+BASE_ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
+PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
+ALLOWED = BASE_ALLOWED | PREVIOUS
+REPOSITORY = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6"
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/ezil/identity/ezil-mum-cfn-exec"
 LAUNCH_TEMPLATE = "lt-06f691fc1e4dfe3cc"
 APP_SECRET_LOCK = "/root/ezil-aws-mum/locks/app-secret.lock"
@@ -27,8 +32,7 @@ def need(ok, message):
 
 
 def read(path):
-    with open(path, encoding="utf-8") as source:
-        return json.load(source)
+    return release.read(path)
 
 
 def write(path, value):
@@ -39,7 +43,14 @@ def write(path, value):
         with os.fdopen(fd, "w", encoding="utf-8") as out:
             json.dump(value, out, indent=2)
             out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
         os.replace(temp, path)
+        directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
@@ -71,7 +82,10 @@ def pair(config):
     need(re.fullmatch(r"ami-[0-9a-f]{17}", d["amiId"]), "invalid AMI")
     need(re.fullmatch(re.escape(MACHINE) + r":[1-9][0-9]*", d["stateMachineVersionArn"]), "invalid lifecycle version")
     need(isinstance(d.get("launchTemplateVersion"), str) and re.fullmatch(r"[1-9][0-9]{0,9}", d["launchTemplateVersion"]), "invalid launch-template version")
-    return {k: d[k] for k in ("amiId", "stateMachineVersionArn", "launchTemplateVersion")}
+    release.deployment_tuple(d)
+    if "recoveryVersionArn" in config:
+        need(config["recoveryVersionArn"] == d.get("recoveryStateMachineVersionArn"), "recovery version config mismatch")
+    return {k: d[k] for k in ("amiId", "stateMachineVersionArn", "launchTemplateVersion", *release.TUPLE) if k in d}
 
 
 def versions(path):
@@ -215,6 +229,53 @@ def replace_version(value, before, after):
     return value
 
 
+def previous_bindings():
+    return [
+        {"Name": "PreviousDesktopImageRef", "Value": [{"Fn::If": ["HasPreviousDesktopImage",
+            {"Fn::Sub": ["${RepositoryUri}@${Digest}", {"RepositoryUri": {"Ref": "ApplicationImageRepositoryUri"},
+                "Digest": {"Ref": "PreviousDesktopImageDigest"}}]}, ""]}]},
+        {"Name": "PreviousDesktopImageId", "Value": [{"Ref": "PreviousDesktopImageId"}]},
+    ]
+
+
+def normalize_previous_template(value):
+    value = copy.deepcopy(value)
+    parameters = value.get("Parameters", {})
+    present = PREVIOUS & parameters.keys()
+    if not present:
+        return value
+    need(present == PREVIOUS, "partial previous parameter definitions")
+    for key in PREVIOUS:
+        need(parameters.pop(key) == {"Type": "String", "Default": "", "AllowedPattern": "^(sha256:[0-9a-f]{64})?$"},
+             "unexpected template parameter definition")
+    condition = {"Fn::Not": [{"Fn::Equals": [{"Ref": "PreviousDesktopImageDigest"}, ""]}]}
+    rule = {"Assertions": [
+        {"Assert": {"Fn::Or": [
+            {"Fn::And": [{"Fn::Equals": [{"Ref": "PreviousDesktopImageDigest"}, ""]},
+                         {"Fn::Equals": [{"Ref": "PreviousDesktopImageId"}, ""]}]},
+            {"Fn::And": [{"Fn::Not": [{"Fn::Equals": [{"Ref": "PreviousDesktopImageDigest"}, ""]}]},
+                         {"Fn::Not": [{"Fn::Equals": [{"Ref": "PreviousDesktopImageId"}, ""]}]}]}]},
+         "AssertDescription": "Previous desktop digest and ID must be supplied together"},
+        {"Assert": {"Fn::Or": [{"Fn::Equals": [{"Ref": "PreviousDesktopImageId"}, ""]},
+            {"Fn::Not": [{"Fn::Equals": [{"Ref": "PreviousDesktopImageId"}, {"Ref": "DesktopImageId"}]}]}]},
+         "AssertDescription": "Previous and current lower IDs must differ"}]}
+    for section, key, expected in (("Conditions", "HasPreviousDesktopImage", condition), ("Rules", "PreviousDesktopImagePair", rule)):
+        need(value.get(section, {}).pop(key, None) == expected, "unexpected previous parameter rule/condition")
+        if not value[section]:
+            value.pop(section)
+    return value
+
+
+def normalize_components(value):
+    result = copy.deepcopy(value)
+    need(isinstance(result, list) and len(result) == 1, "expected one recipe component")
+    params = result[0].get("Parameters", [])
+    if any(p.get("Name", "").startswith("PreviousDesktop") for p in params):
+        need(params[-2:] == previous_bindings(), "unexpected previous component bindings")
+        result[0]["Parameters"] = params[:-2]
+    return result
+
+
 def ami_template(old_path, candidate_path, before_path, after_path):
     """Prove the synthesized template contains only the authorized version update.
 
@@ -223,8 +284,10 @@ def ami_template(old_path, candidate_path, before_path, after_path):
     """
     previous_version, next_version = version_pair(before_path, after_path)
     previous, candidate = template(old_path), read(candidate_path)
-    need({k: v for k, v in previous.items() if k != "Resources"} ==
-         {k: v for k, v in candidate.items() if k != "Resources"}, "unexpected template parameter/output/metadata change")
+    normalized_old, normalized_new = normalize_previous_template(previous), normalize_previous_template(candidate)
+    need(not (PREVIOUS & previous.get("Parameters", {}).keys()) or PREVIOUS <= candidate.get("Parameters", {}).keys(), "previous parameter removal refused")
+    need({k: v for k, v in normalized_old.items() if k != "Resources"} ==
+         {k: v for k, v in normalized_new.items() if k != "Resources"}, "unexpected template parameter/output/metadata change")
     old, new = previous["Resources"], candidate["Resources"]
     need(old.keys() == new.keys(), "unexpected template resource addition/removal")
     types = {name: "AWS::ImageBuilder::" + name for name in (
@@ -247,7 +310,11 @@ def ami_template(old_path, candidate_path, before_path, after_path):
         if kind in (types["Component"], types["ImageRecipe"]):
             need(a.get("Version") == previous_version, "live recipe/component version differs from local config")
             need(b.get("Version") == next_version, "synthesized recipe/component version mismatch")
-            permitted = {"Version", "Data"} if kind == types["Component"] else {"Version"}
+            permitted = {"Version", "Data"} if kind == types["Component"] else {"Version", "Components"}
+            if "Components" in delta:
+                need(normalize_components(a["Components"]) == normalize_components(b["Components"]) and
+                     PREVIOUS <= candidate.get("Parameters", {}).keys(), "unexpected recipe component change")
+                need(b["Components"][0]["Parameters"][-2:] == previous_bindings(), "previous component binding removal refused")
             need(delta <= permitted, "unexpected component/recipe property change")
         elif delta:
             # Today's CDK source does not put the version into these resources.
@@ -329,8 +396,10 @@ def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths)
     cs = read(cs_path)
     check_changeset(cs)
     actual = mapping(cs["Parameters"])
-    need(old.keys() == wanted.keys() == actual.keys(), "parameter coverage mismatch")
-    for key in old:
+    additions = wanted.keys() - old.keys()
+    need(old.keys() <= wanted.keys() == actual.keys() and additions <= PREVIOUS, "parameter coverage mismatch")
+    need(not additions or version_paths and PREVIOUS <= read(version_paths[0]).get("Parameters", {}).keys(), "new parameters require reviewed template")
+    for key in wanted:
         if key in ALLOWED:
             need(actual[key].get("ParameterValue") == wanted[key]["ParameterValue"], "unexpected allowed parameter value")
         else:
@@ -409,12 +478,19 @@ def promotion_substitution(value, old_pair, new_pair, version_ids=None):
         if isinstance(settings, dict) and isinstance(settings.get("deployment"), dict) and all(
                 settings["deployment"].get(k) == v for k, v in old_pair.items()):
             expected = copy.deepcopy(settings)
-            expected["deployment"]["launchTemplateVersion"] = new_pair["launchTemplateVersion"]
-            adjusted = re.sub(r'("launchTemplateVersion"\s*:\s*)"' + re.escape(old_pair["launchTemplateVersion"]) + r'"',
-                              lambda m: m[1] + json.dumps(new_pair["launchTemplateVersion"]), value)
-            if same_json(json.loads(adjusted), expected):
-                value = adjusted
-        replacements = {old_pair[key]: new_pair[key] for key in ("amiId", "stateMachineVersionArn")}
+            for key in release.PROMOTION:
+                if key not in new_pair:
+                    expected["deployment"].pop(key, None)
+            expected["deployment"].update(new_pair)
+            match = re.search(r'"deployment"\s*:\s*', value)
+            if match:
+                _, length = json.JSONDecoder().raw_decode(value[match.end():])
+                original = value[match.end():match.end() + length]
+                separators = (", ", ": ") if '": ' in original else (",", ":")
+                adjusted = value[:match.end()] + json.dumps(expected["deployment"], separators=separators) + value[match.end() + length:]
+                if same_json(json.loads(adjusted), expected):
+                    value = adjusted
+        replacements = {old_pair[key]: new_pair[key] for key in ("amiId", "stateMachineVersionArn", "preparationStateMachineVersionArn", "recoveryStateMachineVersionArn") if key in old_pair and key in new_pair}
         pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(k) for k in replacements) + r")(?![A-Za-z0-9_])"
         return re.sub(pattern, lambda match: replacements[match[0]], value)
     if isinstance(value, list):
@@ -512,6 +588,9 @@ def lifecycle_template(live_path, baseline_path, candidate_path, before_path, af
     before, after = read(before_path), read(after_path)
     old_pair, new_pair = pair(before), pair(after)
     expected = copy.deepcopy(before)
+    for key in release.PROMOTION:
+        if key not in new_pair:
+            expected["settings"]["deployment"].pop(key, None)
     expected["settings"]["deployment"].update(new_pair)
     need(same_json(expected, after), "unexpected lifecycle config change outside AMI/version pair")
     live, baseline, candidate = template(live_path), read(baseline_path), read(candidate_path)
@@ -744,15 +823,18 @@ def secret_aws(args, payload=None, lock_fd=None):
 
 
 def edit_secret(envelope, before, after):
-    outer = json.loads(envelope["SecretString"])
+    outer = release.loads(envelope["SecretString"])
     need(isinstance(outer, dict), "app secret must be an object")
     raw = outer[KEY]
-    deployments = json.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
+    deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     need(isinstance(deployments, dict) and isinstance(deployments.get(REGION), dict), "regional deployments missing")
     d = deployments[REGION]
-    # All three fields must match together: never accept a half-applied deployment.
-    current = {k: d.get(k) for k in before}
+    release.deployment_tuple(d)
+    keys = set(before) | set(after) | set(release.TUPLE)
+    current = {k: d[k] for k in keys if k in d}
     need(current in (before, after), "secret deployment drift; refusing overwrite")
+    for key in keys:
+        d.pop(key, None)
     d.update(after)
     outer[KEY] = json.dumps(deployments, separators=(",", ":")) if isinstance(raw, str) else deployments
     return outer
@@ -798,11 +880,56 @@ def main(args):
     if op == "parameters":
         current = stack(a[0])
         old = mapping(current["Parameters"])
-        need(ALLOWED <= old.keys(), "required AMI parameters missing")
+        need(BASE_ALLOWED <= old.keys(), "required AMI parameters missing")
         need(old["AssetBucketName"]["ParameterValue"] == "ezil-mum-deploy-assets-452630323510", "asset bucket mismatch")
         need(old["ApplicationImageRepositoryUri"]["ParameterValue"] == f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6", "ECR repository mismatch")
         values = dict(zip(("DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"), a[1:4]))
-        write(a[4], [{"ParameterKey": key, **({"ParameterValue": values[key]} if key in ALLOWED else {"UsePreviousValue": True})} for key in old])
+        if len(a) > 5:
+            need(len(a) == 7, "previous parameters require both values")
+            previous_ref, previous_id = a[5:7]
+            need(bool(previous_ref) == bool(previous_id), "previous reference/ID must be paired")
+            previous_digest = ""
+            if previous_ref:
+                _, previous_digest = release.image_ref(previous_ref, ACCOUNT, REGION, REPOSITORY)
+                need(release.matches(release.DIGEST, previous_id) and previous_id != a[2], "invalid/equal previous lower ID")
+            values.update(PreviousDesktopImageDigest=previous_digest, PreviousDesktopImageId=previous_id)
+        elif PREVIOUS & old.keys():
+            # Omission explicitly removes N-1; never inherit a previous build's pair.
+            values.update(PreviousDesktopImageDigest="", PreviousDesktopImageId="")
+        keys = list(old) + sorted(values.keys() - old.keys())
+        write(a[4], [{"ParameterKey": key, **({"ParameterValue": values[key]} if key in values else {"UsePreviousValue": True})} for key in keys])
+    elif op == "previous-parameters":
+        need(PREVIOUS <= mapping(stack(a[0])["Parameters"]).keys(), "previous pair requires a recipe version bump")
+    elif op in ("previous-release", "secret-predecessor"):
+        manifest = release.load(a[0], repository=REPOSITORY)
+        need(manifest["accountId"] == ACCOUNT and manifest["region"] == REGION and manifest["namespace"] == "mum", "previous release identity mismatch")
+        if op == "previous-release":
+            need((manifest["lowerImageRef"], manifest["lowerImageDigest"]) == tuple(a[1:3]), "previous release lower mismatch")
+        else:
+            with app_secret_lock() as fd:
+                envelope = secret_aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"], lock_fd=fd)
+                outer = release.loads(envelope["SecretString"])
+                deployments = release.loads(outer[KEY]) if isinstance(outer[KEY], str) else outer[KEY]
+                d = deployments[REGION]
+                release.deployment_tuple(d)
+                need(all(d.get(k) == manifest[k] for k in (*release.PROMOTION, "accountId", "region", "namespace", "launchTemplateId")),
+                     "previous release is not the promoted app tuple")
+    elif op == "bake-inputs":
+        params = mapping(read(a[0]))
+        def value(key):
+            return params.get(key, {}).get("ParameterValue", "")
+        version = a[2]
+        if not version:
+            recipes = [r["Properties"]["Version"] for r in template(a[3])["Resources"].values() if r["Type"] == "AWS::ImageBuilder::ImageRecipe"]
+            need(len(recipes) == 1, "recipe version evidence missing")
+            version = recipes[0]
+        recipe_version(version)
+        write(a[4], {"schemaVersion": 1, "accountId": ACCOUNT, "region": REGION, "namespace": "mum",
+            "recipeVersion": version, "lowerImageDigest": value("DesktopImageId"),
+            "lowerImageRef": REPOSITORY + "@" + value("DesktopImageDigest"),
+            "previousLowerImageDigest": value("PreviousDesktopImageId") or None,
+            "previousLowerImageRef": REPOSITORY + "@" + value("PreviousDesktopImageDigest") if value("PreviousDesktopImageDigest") else None,
+            "agentCommit": a[1]})
     elif op == "manifest":
         response = read(a[0])
         need(not response.get("failures") and len(response["images"]) == 1, "ECR did not return one image")
@@ -868,6 +995,7 @@ def main(args):
         need(i["ImageId"] == a[1] and i["OwnerId"] == ACCOUNT and i["State"] == "available" and i["Architecture"] == "x86_64", "AMI identity/state/architecture mismatch")
     elif op == "plan-promotion":
         config = read(a[0]); previous = pair(config)
+        need(not (set(release.TUPLE) & previous.keys()), "rebase deployment requires manifest promotion")
         published = versions(a[1])
         need(previous["stateMachineVersionArn"] in published, "configured lifecycle version is not published")
         need(previous["amiId"] != a[2], "AMI already configured")

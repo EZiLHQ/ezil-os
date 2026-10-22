@@ -7,7 +7,7 @@
 # Required inputs (environment):
 #   AGENT_SRC                 checkout of infra/host-agent at the reviewed commit
 #   DESKTOP_IMAGE_REF         desktop image by DIGEST: <registry>/<repo>@sha256:<manifest>
-#   DESKTOP_IMAGE_ID          expected image ID (config digest, sha256:…) = lowerImageDigest
+#   DESKTOP_IMAGE_ID          exact bake/marker image ID (sha256:…) = lowerImageDigest
 #   CLOUDFLARED_VERSION       pinned release, e.g. 2025.x.y (reviewed)
 #   CLOUDFLARED_SHA256        sha256 of cloudflared-linux-amd64 for that release, copied
 #                             from the reviewed release notes. NO DEFAULT: the build fails
@@ -19,7 +19,8 @@ set -euo pipefail
 : "${AGENT_SRC:?}" "${DESKTOP_IMAGE_REF:?}" "${DESKTOP_IMAGE_ID:?}" "${CLOUDFLARED_VERSION:?}" "${ENROLL_URL:?}"
 CLOUDFLARED_SHA256="${CLOUDFLARED_SHA256:?CLOUDFLARED_SHA256 is required (no default; copy it from the reviewed release)}"
 [[ "$CLOUDFLARED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "CLOUDFLARED_SHA256 must be 64 hex chars" >&2; exit 1; }
-[[ "$DESKTOP_IMAGE_REF" == *@sha256:* ]] || { echo "DESKTOP_IMAGE_REF must pin a digest" >&2; exit 1; }
+source "$AGENT_SRC/ami/lower-inputs.sh"
+validate_lower_inputs || { echo 'invalid current/previous immutable lower pair' >&2; exit 1; }
 [[ "$ENROLL_URL" == https://* ]] || { echo "ENROLL_URL must be https" >&2; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 
@@ -56,6 +57,7 @@ rm -rf "$tmp"
 
 # 3. agent, security profiles, units, config template (no secrets)
 install -d -m 0755 /opt/ezil-host /etc/ezil-host
+install -m 0644 "$AGENT_SRC/ami/validate-lowers.py" /opt/ezil-host/validate-lowers.py
 cp -a "$AGENT_SRC/bin" "$AGENT_SRC/lib" /opt/ezil-host/
 find /opt/ezil-host -name __pycache__ -prune -exec rm -rf {} +
 install -m 0644 "$AGENT_SRC/security/seccomp.json" /etc/ezil-host/seccomp.json
@@ -81,15 +83,21 @@ extract() { # extract <ref@digest> <expected image id>
   local id; id="$(docker image inspect --format '{{.Id}}' "$1")"
   [ "$id" = "$2" ] || { echo "image id $id != expected $2" >&2; exit 1; }
   local dir="/var/lib/ezil/lowers/${2#sha256:}" c; c="$(docker create "$1" /bin/true)"
+  [ ! -e "$dir" ] && [ ! -L "$dir" ] || { echo 'lower directory already exists; refusing extraction' >&2; exit 1; }
   install -d -m 0755 "$dir"
   docker export "$c" | tar -C "$dir" --numeric-owner --xattrs --xattrs-include='*' -xpf -
   docker rm "$c" >/dev/null
   docker image inspect "$1" | jq '{Env: .[0].Config.Env, WorkingDir: .[0].Config.WorkingDir}' > "$dir.image-config.json"
+  printf '%s\n' "$id" > "$dir.image-id"
 }
 extract "$DESKTOP_IMAGE_REF" "$DESKTOP_IMAGE_ID"
 echo "$DESKTOP_IMAGE_ID" > /etc/ezil-host/lower-image-digest
 cp "/var/lib/ezil/lowers/${DESKTOP_IMAGE_ID#sha256:}.image-config.json" /etc/ezil-host/image-config.json
-if [ -n "${PREVIOUS_DESKTOP_IMAGE_REF:-}" ]; then extract "$PREVIOUS_DESKTOP_IMAGE_REF" "${PREVIOUS_DESKTOP_IMAGE_ID:?}"; fi
+if [ -n "${PREVIOUS_DESKTOP_IMAGE_REF:-}" ]; then
+  extract "$PREVIOUS_DESKTOP_IMAGE_REF" "$PREVIOUS_DESKTOP_IMAGE_ID"
+  printf '%s\n' "$PREVIOUS_DESKTOP_IMAGE_ID" > /etc/ezil-host/previous-lower-image-digest
+fi
+python3 /opt/ezil-host/validate-lowers.py --current "$DESKTOP_IMAGE_ID" --previous "${PREVIOUS_DESKTOP_IMAGE_ID:-}"
 apt-get purge -y -q docker.io amazon-ecr-credential-helper
 rm -rf /var/lib/docker /var/lib/containerd "$DOCKER_CONFIG"
 trap - EXIT

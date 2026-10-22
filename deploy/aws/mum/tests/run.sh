@@ -221,3 +221,4 @@ test_case 'lifecycle change-set property values checked' lifecycle-context '{"li
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
 python3 "$here/locking.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rebase.py"

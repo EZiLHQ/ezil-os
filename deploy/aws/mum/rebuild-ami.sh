@@ -3,15 +3,18 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 usage() {
-    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--apply] [--config <path>] [--release-dir <path>]'
+    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--apply] [--config <path>] [--release-dir <path>]'
 }
-desktop_image= source_sha= recipe_version=
+desktop_image= source_sha= recipe_version= previous_ref= previous_id= previous_release=
 config=/root/ezil-aws-mum/config/ami.mum.json
 while (($#)); do
     case "$1" in
         --desktop-image) (($# >= 2)) || die 'missing desktop image'; desktop_image=$2; shift 2 ;;
         --source-sha) (($# >= 2)) || die 'missing source SHA'; source_sha=$2; shift 2 ;;
         --recipe-version) (($# >= 2)) && [[ -n "$2" ]] || die 'missing recipe version'; recipe_version=$2; shift 2 ;;
+        --previous-desktop-image-ref) (($# >= 2)) && [[ -n "$2" ]] || die 'missing previous image reference'; previous_ref=$2; shift 2 ;;
+        --previous-desktop-image-id) (($# >= 2)) && [[ -n "$2" ]] || die 'missing previous image ID'; previous_id=$2; shift 2 ;;
+        --previous-release) (($# >= 2)) || die 'missing previous release manifest'; previous_release=$2; shift 2 ;;
         --config) (($# >= 2)) || die 'missing config path'; config=$2; shift 2 ;;
         --release-dir) (($# >= 2)) || die 'missing release directory'; release_dir=$2; shift 2 ;;
         --apply) apply=true; shift ;;
@@ -20,6 +23,8 @@ while (($#)); do
     esac
 done
 [[ -n "$desktop_image" && "$desktop_image" != -* && "$source_sha" =~ ^[0-9a-f]{7,40}$ ]] || { usage; die 'local image and hexadecimal commit SHA are required'; }
+[[ -n "$previous_ref" && -n "$previous_id" || -z "$previous_ref" && -z "$previous_id" ]] || die 'previous reference and ID must be supplied together'
+[[ -z "$previous_release" || -n "$previous_ref" ]] || die 'previous release requires previous image pair'
 require_tools aws docker git python3 mktemp date timeout
 require_absolute_release
 init_work
@@ -32,6 +37,16 @@ if [[ -n "$recipe_version" ]]; then
     json plan-ami "$work/previous-ami-config.json" "$recipe_version" "$work/ami.mum.json"
 fi
 assert_identity
+previous_args=()
+if [[ -n "$recipe_version" ]]; then previous_args=("" ""); fi
+if [[ -n "$previous_ref" ]]; then
+    previous_release=${previous_release:-$release_dir/previous-rebase-release.json}
+    [[ -f "$previous_release" && ! -L "$previous_release" ]] || die 'previous promoted release manifest required (--previous-release)'
+    json previous-release "$previous_release" "$previous_ref" "$previous_id"
+    cp -- "$previous_release" "$work/previous-rebase-release.json"
+    json secret-predecessor "$work/previous-rebase-release.json"
+    previous_args=("$previous_ref" "$previous_id")
+fi
 show git -C "$repo_root" rev-parse --verify "$source_sha^{commit}"
 full_sha=$(git -C "$repo_root" rev-parse --verify "$source_sha^{commit}")
 [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || die 'source SHA did not resolve to a full commit'
@@ -49,9 +64,12 @@ archive=host-agent-$full_sha.tgz
 source_uri=s3://$bucket/ami/$archive
 aws_read cloudformation describe-stacks --stack-name ezil-mum-ami --output json > "$work/stack.json"
 aws_read cloudformation get-template --stack-name ezil-mum-ami --template-stage Original --output json > "$work/template.json"
+if [[ -n "$previous_ref" && -z "$recipe_version" ]]; then
+    json previous-parameters "$work/stack.json"
+fi
 # A placeholder is used only in the printed dry-run plan. Apply always reads ECR.
 digest='<ECR-manifest-digest>'
-json parameters "$work/stack.json" "$digest" "$image_id" "$source_uri" "$work/parameters.json"
+json parameters "$work/stack.json" "$digest" "$image_id" "$source_uri" "$work/parameters.json" "${previous_args[@]}"
 template_args=(--use-previous-template)
 template_uri=
 # Follow the stack's own deployment role: ezil-mum-ami was created with caller
@@ -112,14 +130,14 @@ if "$apply"; then
     aws_read ecr batch-get-image --repository-name "${repository#*/}" --image-ids "imageTag=$tag" --output json > "$work/manifest.json"
     read -r digest pinned_id < <(json manifest "$work/manifest.json" "$image_id")
     [[ -n "$digest" && -n "$pinned_id" ]] || die 'could not resolve the pushed image digest'
-    json parameters "$work/stack.json" "$digest" "$pinned_id" "$source_uri" "$work/parameters.json"
+    json parameters "$work/stack.json" "$digest" "$pinned_id" "$source_uri" "$work/parameters.json" "${previous_args[@]}"
 else
     show aws --profile "$profile" --region "$region" ecr batch-get-image --repository-name "${repository#*/}" --image-ids "imageTag=$tag" --output json
     say 'Resolve the pushed digest: classic store (config digest == local ID) or containerd store (manifest/index digest == local ID; an index must hold one linux/amd64 image plus attestations).'
 fi
 act git -C "$repo_root" archive --format=tar.gz --output "$work/$archive" "$full_sha:infra/host-agent"
 aws_act s3 cp "$work/$archive" "$source_uri"
-say 'Exact parameter request (only the three allowed values change):'
+say 'Exact parameter request (only approved current/previous image and source values change):'
 cat "$work/parameters.json"
 if [[ -n "${template_uri:-}" ]]; then aws_act s3 cp "$candidate_template" "$template_uri"; fi
 aws_act cloudformation create-change-set --stack-name ezil-mum-ami --change-set-name "$change" --change-set-type UPDATE \
@@ -145,9 +163,14 @@ fi
 cp "$work/stack.json" "$release_dir/previous-ami-stack.json"
 cp "$work/template.json" "$release_dir/ami-template.json"
 cp "$work/parameters.json" "$release_dir/ami-parameters.json"
+if [[ -n "$previous_ref" ]]; then
+    cp "$work/previous-rebase-release.json" "$release_dir/previous-rebase-release.json"
+fi
+json bake-inputs "$work/parameters.json" "$full_sha" "$recipe_version" "$work/template.json" "$release_dir/bake-inputs.json"
+
 printf '%s\n' "$change" > "$release_dir/ami-changeset.txt"
-printf 'ApplicationImageRepositoryUri=%s\nDesktopImageDigest=%s\nDesktopImageId=%s\nDesktopTag=%s\nSourceImage=%s\nSourceSha=%s\nAgentSrcS3Uri=%s\n' \
-    "$repository" "$digest" "$image_id" "$tag" "$desktop_image" "$full_sha" "$source_uri" > "$release_dir/desktop.txt"
+printf 'ApplicationImageRepositoryUri=%s\nDesktopImageDigest=%s\nDesktopImageId=%s\nPreviousDesktopImageRef=%s\nPreviousDesktopImageId=%s\nDesktopTag=%s\nSourceImage=%s\nSourceSha=%s\nAgentSrcS3Uri=%s\n' \
+    "$repository" "$digest" "$pinned_id" "$previous_ref" "$previous_id" "$tag" "$desktop_image" "$full_sha" "$source_uri" > "$release_dir/desktop.txt"
 wait_changeset ezil-mum-ami "$change"
 cp "$work/changeset.json" "$release_dir/ami-changeset.json"
 json ami-changeset "$work/stack.json" "$work/parameters.json" "$work/changeset.json" "$work/template.json" "${validation_args[@]}"
