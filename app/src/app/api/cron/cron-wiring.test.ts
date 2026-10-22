@@ -11,7 +11,7 @@
  * schedule to the route, or the route to the drain.
  *
  * So this file tests the seams rather than the parts:
- *   1. `vercel.json` declares at most two crons, and every declared path is a
+ *   1. `vercel.json` declares the three required crons, and every declared path is a
  *      real route module that exports `GET` and an explicit `maxDuration`.
  *   2. Driving the REAL `/api/cron/telemetry-maintenance` handler with a real
  *      `Request` and the right bearer actually issues the Worker drain call —
@@ -42,12 +42,14 @@ function vercelCrons(): CronEntry[] {
 }
 
 describe('vercel.json cron manifest', () => {
-    it('🔴 declares at most TWO crons — the plan ceiling that silently dropped the third', () => {
-        // The third entry (`/api/cron/telemetry-drain`, `43 3 * * *`) was
-        // registered here and never invoked: zero hour-03 Worker requests from
-        // it since 2026-08-09, while the other two kept firing. The drain now
-        // rides along with `telemetry-maintenance`, which is proven to fire.
-        expect(vercelCrons().length).toBeLessThanOrEqual(2);
+    it('declares the existing maintenance jobs and the minute-by-minute billing session sweep', () => {
+        // Billing enforcement requires a plan that supports this frequency and
+        // three schedules. The standalone drain still rides with maintenance.
+        expect(vercelCrons()).toEqual([
+            { path: '/api/cron/telemetry-maintenance', schedule: '17 3 * * *' },
+            { path: '/api/cron/sandbox-reap', schedule: '8 4 * * *' },
+            { path: '/api/cron/billing-session-sweep', schedule: '* * * * *' },
+        ]);
     });
 
     it('points every declared schedule at a route that exists and declares its own maxDuration', () => {

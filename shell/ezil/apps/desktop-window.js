@@ -595,6 +595,13 @@ export async function openDesktopWindow (ctx = {}) {
     document.addEventListener('visibilitychange',on_relay_return);
     window.addEventListener('online',on_relay_online);
     const el_iframe = el_window.querySelector('.window-app-iframe');
+    // Scope delegation to this desktop's src origin. The app response also
+    // delegates these features; neither layer bypasses browser permission.
+    el_iframe.setAttribute('allow', 'autoplay; fullscreen; clipboard-read; clipboard-write');
+    el_iframe.setAttribute('tabindex', '0');
+    // Cross-origin autofocus is browser-restricted; there is no iframe
+    // allow-autofocus token. The Neko overlay takes focus on a pointer click.
+    el_iframe.removeAttribute('autofocus');
 
     // ── the desktop's ACTUAL size, and the live-resize path ────────────────
     // ADDED BY EZIL 2026-08-19. See `./desktop-screen.js` and the header block
@@ -1050,6 +1057,7 @@ export async function openDesktopWindow (ctx = {}) {
     // sequence in which one shows a claim the other has not also made.
     const spinner = AppSpinner({
         label: `Opening ${ctx.appName || title}…`,
+        isMigrating: () => session.isComputeMigrating(computer.id),
         onRetry: () => { void start_boot(); },
     });
     el_body.appendChild(spinner.el);
@@ -1068,6 +1076,7 @@ export async function openDesktopWindow (ctx = {}) {
         last_kind = state.kind;
         progress.render(state);
         spinner.render(state);
+        if (state.kind === 'progress') show_panel();
     }
 
     // The `ready_unverified` strip. Attached up front, hidden, for the same
@@ -1087,8 +1096,10 @@ export async function openDesktopWindow (ctx = {}) {
      * function's decision (the reveal/failure code paths own it directly).
      */
     const show_panel = () => {
-        progress.el.hidden = ! show_phase_list;
-        spinner.el.hidden = show_phase_list;
+        // A migration has its own honest copy, including on the shared warm path.
+        const show_phases = show_phase_list && !session.isComputeMigrating(computer.id);
+        progress.el.hidden = ! show_phases;
+        spinner.el.hidden = show_phases;
     };
 
     /**
@@ -1391,6 +1402,16 @@ export async function openDesktopWindow (ctx = {}) {
         viewer_attempt = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${my_attempt}-${Date.now()}-${Math.random()}`;
         viewer_origin = viewer_url.origin;
         viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
+        // AWS bootstrap redirects to `path`, discarding its outer query. The
+        // viewer reads its navigation ID from the final document URL; without
+        // it every frame report (including renewal confirmation) is rejected.
+        if (viewer_url.pathname === '/preview-bootstrap') {
+            const destination = new URL(viewer_url.searchParams.get('path') || '/', viewer_url);
+            if (destination.origin === viewer_url.origin) {
+                destination.searchParams.set('ezilAttempt', viewer_attempt);
+                viewer_url.searchParams.set('path', destination.pathname + destination.search + destination.hash);
+            }
+        }
         el_iframe.src = viewer_url.href;
         // 🔴 THE GATE STARTS HERE, NOT AFTER THE FRAME CHECK. Asking Neko
         // whether a peer is connected is independent of everything

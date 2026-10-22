@@ -1,10 +1,12 @@
+import { matchesLifecycleDeployment } from './preparation-evidence.js';
+import { createImageRecoveryHelper } from './image-recovery-helper.js';
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
 import { EnvelopeSchema, LAUNCH_ACTIONS, equal, tagsFor, token } from './contract.js';
 import { toLambdaError } from './errors.js';
 import { parseLifecycleWork } from './intent.js';
 import { tagged } from './helper.js';
-import { RecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
+import { CleanupRecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
     type RecoverySettings, type RecoveryReceipt } from './recovery-contract.js';
 import { recoveryDependencies, type RecoveryDependencies } from './recovery-aws.js';
 
@@ -16,6 +18,7 @@ const terminal = ['FAILED', 'ABORTED', 'TIMED_OUT'];
  * no launch, attach, retag, detach, modify, delete or current-authority capability. */
 export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryDependencies) {
     return async (input: unknown): Promise<Record<string, unknown>> => {
+        if (input && typeof input === 'object' && 'mode' in input) return createImageRecoveryHelper(settings, deps)(input);
         const e = Event.parse(input), d = settings.lifecycle.deployment;
         const recoveryMachine = machineArn(settings.recoveryVersionArn), sourceMachine = machineArn(d.stateMachineVersionArn);
         if (!e.executionArn.startsWith(recoveryMachine.replace(':stateMachine:', ':execution:') + ':cleanup-computer-')) return fail();
@@ -26,7 +29,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || Buffer.byteLength(execution.input) > 1024) return fail();
         const began = execution.startDate.getTime();
         if (!Number.isFinite(began) || began > now || now - began >= 600000) return fail();
-        const { sourceExecutionArn } = RecoveryInputSchema.parse(JSON.parse(execution.input));
+        const { sourceExecutionArn } = CleanupRecoveryInputSchema.parse(JSON.parse(execution.input));
         if (!sourceExecutionArn.startsWith(sourceMachine.replace(':stateMachine:', ':execution:') + ':computer-')) return fail();
         const source = await deps.execution(sourceExecutionArn);
         if (source.executionArn !== sourceExecutionArn || source.stateMachineArn !== sourceMachine
@@ -37,7 +40,10 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || now - source.startDate.getTime() > 86400000) return fail();
         const envelope = EnvelopeSchema.parse(JSON.parse(source.input));
         const i = parseLifecycleWork({ ...envelope, createdAt: source.startDate });
-        if (!equal(i.deployment, d)
+        // The historical cleanup graph cannot prove a pool claim or perform
+        // release's detach sequence. Leave its reservation unconfirmed.
+        if (['pool-provision', 'adopt', 'release'].includes(i.operation)) return fail();
+        if (!await matchesLifecycleDeployment(i, d, deps)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
             || execution.name !== `cleanup-computer-${i.jobId}`
             || e.executionArn !== recoveryMachine.replace(':stateMachine:', ':execution:') + ':' + execution.name) return fail();

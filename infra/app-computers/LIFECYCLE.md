@@ -23,7 +23,7 @@ Neither are stop, termination or attachment. Status reads cannot wake compute.
 
 Provisioning creates an encrypted gp3 data disk of the intent's size (inside
 the configured range) in the configured ZoneId. It starts one instance of the
-intent's allowlisted type (`t3a.medium`, `t3.medium`, `m6i.large` or `c6i.xlarge`; T types with
+intent's allowlisted type (`t3a.medium`, `t3.medium`, `m6i.large`, `c6i.xlarge`, `m6i.xlarge` or `m6i.2xlarge`; T types with
 standard CPU credits) using a numeric
 launch-template version, the approved Linux/amd64 AMI and an encrypted
 disposable root disk of the configured size (default 30 GiB). The AMI must have a
@@ -51,6 +51,51 @@ Retirement terminates compute while retaining the detached volume. The database
 writer is changed only by #122's independent provider-observation transaction.
 A successful workflow output is a provider receipt, not a mounted-disk,
 loaded-supervisor or installed-application receipt.
+
+## Warm pool intents
+
+The pool contract uses the same v1 envelope and deployment pins. Its shorthand
+`generation`, `instanceId`, `volumeId` and `createVolume.sizeGiB` map to the existing
+`targetGeneration`, `providerInstanceId`, `dataVolumeId` and `dataVolumeGiB` fields.
+All previous-generation fields are null. These operations accept `m6i.large`
+and `m6i.xlarge`; `m6i.2xlarge` remains in the IAM ceiling only for pool work.
+Legacy v2 operations retain their existing size allowlist.
+
+- `pool-provision`: add `poolHostId` and `poolGeneration`. For the authority
+  envelope, `computerId=poolHostId` and `targetGeneration=poolGeneration`;
+  provider/data IDs, data size and `userData` are null. The helper generates
+  base64 JSON `{kind:"pool",poolHostId,poolGeneration}`. The authority request
+  also includes `operation`, `poolHostId`, and `poolGeneration`, so the app can
+  authorize the pool reservation. RunInstances uses the intent ClientToken,
+  only the pinned root disk, and pool/namespace tags. Its running receipt has
+  `volumeId:null`, `poolHostId` and `poolGeneration`; it does not certify readiness.
+- `adopt`: add `poolHostId`, supply the computer's new generation, lease epoch,
+  fence and instance ID. Supply either the existing `dataVolumeId` with null
+  size, or null ID with bounded `dataVolumeGiB`. `userData` is null. The helper
+  verifies a running pool host and owned volume in the pinned zone, advances
+  the free volume's generation/fence, attaches at `/dev/sdf`, confirms retention,
+  writes `ezil:computer`, `ezil:generation`, `ezil:fence` on the host, and removes
+  only `ezil:pool`. Exact completed claims can replay; foreign/stale claims fail.
+- `release`: supply the computer's generation, fence, lease epoch, instance ID
+  and retained data-volume ID, with null size/user data and no pool fields.
+  The graph uses OS shutdown with `Force=false`, `SkipOsShutdown=false`, waits
+  for stopped, detaches with `Force=false`, waits for the free volume and absent
+  data mapping, then terminates. The receipt is `retired`. The data volume and
+  its backup tag remain; the host never returns to the pool.
+
+Every mutation uses the existing authority recheck and deadline. Attach,
+detach, claim and pool-tag deletion have separate observation phases and no
+blind retries. IAM scopes pool attachment/claim to `ezil:pool=1`, release to
+`ezil:computer`, and pool instance actions to the deployment's allowed M6i
+types. Volume ownership comparisons remain in the trusted helper (a shared
+controller role has no per-job principal tag). The shared workload boundary
+allows the two new EC2 actions only on managed namespace resources; the
+controller restricts tag deletion to `ezil:pool`. Deploy/exec and historical
+recovery roles retain their detach/tag-deletion denies.
+
+The historical recovery workflow explicitly refuses pool intents: it cannot
+prove a claim or perform release's detach sequence. Failed pool work remains
+unconfirmed, retaining its reservation for control-plane reconciliation.
 
 ## Failure and activation boundary
 

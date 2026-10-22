@@ -250,7 +250,7 @@ const en = {
         phone_enter_valid: 'Please enter a valid phone number.',
         phone_invalid_code: 'Invalid verification code.',
         phone_could_not_send: 'Could not send a code to that number.',
-        phone_error_reference: 'If this keeps happening, email support@ezil.org and include this code: {{id}}',
+        phone_error_reference: 'If this keeps happening, email contact@ezil.work and include this code: {{id}}',
         phone_could_not_verify: 'Could not verify code.',
         phone_search_countries: 'Search countries',
         phone_no_matches: 'No matches',
@@ -535,8 +535,8 @@ const en = {
         'auth_error_generic': 'Authentication failed. Please try again.',
         'account_suspended_message': 'This account is suspended.',
         'signup_blocked_message': 'Your account could not be created.',
-        'contact_support': 'Please contact support@ezil.org.',
-        'contact_support_with_code': 'Please contact support@ezil.org and include this code: {{id}}.',
+        'contact_support': 'Please contact contact@ezil.work.',
+        'contact_support_with_code': 'Please contact contact@ezil.work and include this code: {{id}}.',
 
         // Welcome Window
         'welcome': 'Welcome',

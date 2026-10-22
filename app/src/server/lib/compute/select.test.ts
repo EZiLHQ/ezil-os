@@ -6,11 +6,19 @@
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
 
+import * as awsFactories from './aws-ec2';
 import { AwsProviderNotImplementedError, createAwsEc2StubProvider } from './aws-ec2';
 import { cloudflareComputeProvider } from './cloudflare';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { PlacementIntegrityError, PlacementOwnerError } from './placement';
 import { providerForPlacement, resolveComputeProvider, selectComputeProvider } from './select';
+import type { EntitlementRecord } from './tier';
+
+const migrationRead = vi.hoisted(() => vi.fn(async (): Promise<Partial<Record<'userId' | 'state' | 'lastError', string>> | null> => null));
+vi.mock('./provider-migrate-store', async importOriginal => ({
+    ...await importOriginal<typeof import('./provider-migrate-store')>(),
+    createProviderMigrationStore: () => ({ readByComputer: migrationRead, readActiveByComputer: async () => null }),
+}));
 
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
@@ -22,6 +30,80 @@ const ADMIT = {
     AWS_REGIONS: 'us-east-1', EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
 };
 
+describe('billing v2 placement selection', () => {
+    const paid: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', provider: 'aws', size: 'cmp-8', paymentIssue: false };
+    const free: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'free_v1_legacy', provider: 'cloudflare', size: 'free-cf', paymentIssue: false };
+    const SINCE = '2026-10-14T00:00:00Z';
+    const DIRECT = { ...ON, EZIL_AWS_CANARY_SINCE: SINCE };
+
+    it.each([SINCE, '2026-10-14T00:00:00.001Z'])('(c) paid + no row + created at/after SINCE (%s) selects AWS without a canary list or Cloudflare pin', async createdAt => {
+        const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(createdAt) }] });
+        expect((await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid, pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(placements).toEqual([]);
+        expect(statements).toHaveLength(3); // placement, reservation and live computer reads; admission happens at ensure
+    });
+
+    it.each([false, true])('(a) paid + no row + created before SINCE stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date('2026-10-13T23:59:59.999Z') }] });
+        const provider = await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid, pinCloudflare });
+        expect(provider.kind).toBe('cloudflare');
+        expect(provider).toBe(cloudflareComputeProvider);
+        if (pinCloudflare) expect(placements).toMatchObject([{ provider: 'cloudflare', workspace_store: 'r2', state: 'STOPPED' }]);
+        else expect(placements).toEqual([]);
+    });
+
+    it.each([false, true])('(b) paid + no row + SINCE unset stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE) }] });
+        const provider = await resolveComputeProvider(db, computer, ON, {}, { entitlement: paid, pinCloudflare });
+        expect(provider.kind).toBe('cloudflare');
+        expect(provider).toBe(cloudflareComputeProvider);
+        if (pinCloudflare) expect(placements).toMatchObject([{ provider: 'cloudflare', workspace_store: 'r2', state: 'STOPPED' }]);
+        else expect(placements).toEqual([]);
+    });
+
+    it.each(['', '2026-10-14', '2026-10-14T00:00:00', 'yesterday', '2026-13-40T00:00:00Z'])('paid + no row + malformed SINCE %j stays Cloudflare', async since => {
+        const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE) }] });
+        expect(await resolveComputeProvider(db, computer, { ...ON, EZIL_AWS_CANARY_SINCE: since }, {}, { entitlement: paid })).toBe(cloudflareComputeProvider);
+        expect(placements).toEqual([]);
+        expect(statements).toHaveLength(2);
+    });
+
+    it.each([
+        { computers: [] },
+        { computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE), deleted_at: new Date(SINCE) }] },
+        { computers: [{ id: computerId, user_id: '33333333-3333-4333-8333-333333333333', created_at: new Date(SINCE) }] },
+    ])('paid route requires a live computer owned by the caller (%j)', async ({ computers }) => {
+        const { db } = createFakePlacementDb({ computers });
+        expect(await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid })).toBe(cloudflareComputeProvider);
+    });
+
+    it('AWS disabled preserves the Cloudflare pin behavior even for a paid user', async () => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId }] });
+        expect(await resolveComputeProvider(db, computer, { EZIL_COMPUTE_PLACEMENT_READS: '1' }, {}, { entitlement: paid, pinCloudflare: true })).toBe(cloudflareComputeProvider);
+        expect(placements).toMatchObject([{ provider: 'cloudflare', workspace_store: 'r2' }]);
+    });
+
+    it.each([
+        ['cloudflare', 'r2', paid], ['aws-ec2', 'ebs', free],
+    ] as const)('an existing %s row keeps its provider despite entitlement', async (provider, workspace_store, entitlement) => {
+        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, provider, workspace_store })] });
+        expect((await resolveComputeProvider(db, computer, ON, {}, { entitlement, pinCloudflare: true })).kind).toBe(provider);
+        expect(placements).toHaveLength(1);
+        expect(placements[0]!.provider).toBe(provider);
+    });
+
+    it('a payment issue does not grant the paid route', async () => {
+        const { db } = createFakePlacementDb();
+        expect(await resolveComputeProvider(db, computer, ON, {}, { entitlement: { ...paid, paymentIssue: true } })).toBe(cloudflareComputeProvider);
+    });
+
+    it.each([free, { ...free, status: 'past_due', paymentIssue: true }])('Free/delinquent records still follow the existing canary rule (%j)', async entitlement => {
+        const { db } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date('2026-10-15T00:00:00Z') }] });
+        const env = { ...ON, ...ADMIT, EZIL_AWS_CANARY_USER_IDS: '*', EZIL_AWS_CANARY_SINCE: '2026-10-14T00:00:00Z' };
+        expect((await resolveComputeProvider(db, computer, env, {}, { entitlement })).kind).toBe('aws-ec2');
+    });
+});
+
 describe('resolveComputeProvider', () => {
     it.each([{}, { EZIL_AWS_COMPUTERS_ENABLED: '0' }, { EZIL_AWS_COMPUTERS_ENABLED: 'true' }])('flag off (%j): Cloudflare with ZERO statements', async (env) => {
         const { db, statements } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId })] });
@@ -32,7 +114,7 @@ describe('resolveComputeProvider', () => {
     it('flag on, no row: Cloudflare', async () => {
         const { db, statements } = createFakePlacementDb();
         expect(await resolveComputeProvider(db, computer, ON)).toBe(cloudflareComputeProvider);
-        expect(statements).toHaveLength(1);
+        expect(statements).toHaveLength(2);
     });
 
     it('flag on, aws-ec2 row: the aws-ec2 provider', async () => {
@@ -77,7 +159,7 @@ describe('resolveComputeProvider', () => {
                 expect(statements).toEqual([]);
                 return;
             }
-            expect(statements).toHaveLength(1);
+            expect(statements).toHaveLength(2);
             if (row !== 'aws-ec2') {
                 expect(provider).toBe(cloudflareComputeProvider);
                 return;
@@ -87,7 +169,7 @@ describe('resolveComputeProvider', () => {
             // AWS on but no caps/regions configured: the real provider refuses before any write.
             if (aws === '1') expect(await ensure).toEqual({ ok: false, error: 'aws_config_invalid', errorCode: 'aws_config_invalid', retryable: false });
             else expect(await ensure).toEqual({ ok: false, error: 'aws_disabled', errorCode: 'aws_disabled', retryable: false });
-            expect(statements).toHaveLength(1);
+            expect(statements).toHaveLength(2);
         });
     });
 
@@ -296,4 +378,34 @@ describe('resolveComputeProvider: canary `*` (every user) with the admission fal
         const { db } = createFakePlacementDb({ computers: [{ ...mine, created_at: new Date('2026-10-13T00:00:00Z') }] });
         expect(await resolveComputeProvider(db, computer, EVERYONE)).toBe(cloudflareComputeProvider);
     });
+});
+
+describe('fresh provision routing', () => {
+    it.each([{ EZIL_AWS_COMPUTERS_ENABLED: '1' }, { EZIL_COMPUTE_PLACEMENT_READS: '1' },
+        { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '1' }])('never re-pins a proven-empty old computer with %j', async env => {
+        migrationRead.mockResolvedValueOnce({ userId, state: 'committed', lastError: 'fresh_provision' });
+        const f = createFakePlacementDb();
+        expect((await resolveComputeProvider(f.db, computer, env, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(f.placements).toEqual([]);
+    });
+    it('does not use another owner’s fresh-provision outcome', async () => {
+        migrationRead.mockResolvedValueOnce({ userId: computerId, state: 'committed', lastError: 'fresh_provision' });
+        const f = createFakePlacementDb();
+        expect((await resolveComputeProvider(f.db, computer, ON)).kind).toBe('cloudflare');
+    });
+});
+
+it('rechecks fresh-provision completion while acquiring the Cloudflare pin lock', async () => {
+    migrationRead.mockResolvedValueOnce(null).mockResolvedValueOnce({ userId, state: 'committed', lastError: 'fresh_provision' });
+    const f = createFakePlacementDb();
+    expect((await resolveComputeProvider(f.db, computer, ON, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+    expect(f.placements).toEqual([]);
+});
+
+it('confines a fresh paid cutover to Mumbai even when other regions have capacity', async () => {
+    migrationRead.mockResolvedValueOnce({ userId, state: 'committed', lastError: 'fresh_provision' });
+    const factory = vi.spyOn(awsFactories, 'createAwsEc2Provider');
+    await resolveComputeProvider(createFakePlacementDb().db, computer, { ...ON, AWS_REGIONS: 'us-east-1,ap-south-1' });
+    expect(factory.mock.calls.at(-1)?.[0].env?.().AWS_REGIONS).toBe('ap-south-1');
+    factory.mockRestore();
 });

@@ -1,0 +1,48 @@
+import assert from 'node:assert/strict';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import test from 'node:test';
+import { App, Stack, assertions } from 'aws-cdk-lib';
+import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
+
+const account = '123456789012';
+const roleArn = `arn:aws:iam::${account}:role/ezil-os-staging-host`;
+const provider = { name: 'vercel' as const, providerArn: `arn:aws:iam::${account}:oidc-provider/oidc.vercel.com/ezil-team`,
+    issuerHost: 'oidc.vercel.com/ezil-team', audience: 'https://vercel.com/ezil-team',
+    subject: 'owner:ezil-team:project:ezil-os:environment:production' };
+function template(ec2CallerRoleArns?: string[], directProp = false) {
+    const stack = new Stack(new App(), 'Caller', { env: { account, region: 'ap-south-1' } });
+    new AppCaller(stack, 'AppCaller', {
+        config: AppCallerConfigSchema.parse({ enabled: true, providers: [provider], ...(!directProp && ec2CallerRoleArns ? { ec2CallerRoleArns } : {}) }),
+        ...(directProp ? { ec2CallerRoleArns } : {}),
+        region: 'ap-south-1', versionArns: [`arn:aws:states:ap-south-1:${account}:stateMachine:ezil-pilot-lifecycle:1`],
+        historyKeyArn: `arn:aws:kms:ap-south-1:${account}:key/33333333-3333-4333-8333-333333333333`,
+    });
+    return assertions.Template.fromStack(stack).toJSON();
+}
+function trust(t: any) {
+    return (Object.values(t.Resources) as any[]).find(r => r.Type === 'AWS::IAM::Role').Properties.AssumeRolePolicyDocument.Statement;
+}
+test('EC2 callers are optional, exact and tag conditioned; OIDC and permissions remain unchanged', () => {
+    const absent = template(), empty = template([]), enabled = template([roleArn]);
+    assert.deepEqual(absent, empty);
+    assert.deepEqual(template([roleArn], true), enabled);
+    assert.equal(trust(absent).length, 1);
+    assert.equal(trust(absent)[0].Action, 'sts:AssumeRoleWithWebIdentity');
+    assert.deepEqual(trust(enabled), [...trust(absent), {
+        Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { AWS: roleArn },
+        Condition: { StringEquals: { 'aws:PrincipalTag/ezil:env': 'billing-staging' } },
+    }]);
+    const multiple = trust(template([roleArn, `${roleArn}-second`]));
+    assert.deepEqual([multiple[1].Principal.AWS, multiple[2].Principal.AWS].flat(), [roleArn, `${roleArn}-second`]);
+    const actual = { oidcOnly: absent, withEc2Caller: enabled };
+    const file = join(__dirname, '__snapshots__', 'app-caller.json');
+    if (process.env.UPDATE_APP_CALLER_SNAPSHOT === '1') writeFileSync(file, JSON.stringify(actual, null, 2) + '\n');
+    assert.deepEqual(actual, JSON.parse(readFileSync(file, 'utf8')));
+});
+test('EC2 trust refuses wildcard, root, STS session, malformed and duplicate role ARNs', () => {
+    for (const arns of [['*'], [`${roleArn}*`], [`${roleArn}?`], [`arn:aws:iam::${account}:root`],
+        [`arn:aws:sts::${account}:assumed-role/staging/session`], ['role/staging'], [`${roleArn}/`], [`arn:aws:iam::${account}:role/`], [roleArn, roleArn]]) {
+        assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [provider], ec2CallerRoleArns: arns }).success, false);
+    }
+});

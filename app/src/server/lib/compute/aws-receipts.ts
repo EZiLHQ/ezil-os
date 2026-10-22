@@ -1,3 +1,5 @@
+import { replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
+import { createProviderMigrationStore } from './provider-migrate-store';
 /**
  * Lifecycle receipts: the RECONCILER path (docs/AWS-COMPUTERS.md C-3).
  *
@@ -14,8 +16,11 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
-import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
-import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
+import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
+import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
+import type { EpochEndReason } from '@/server/billing/v2/contract';
+import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber, Ec2ReplacementDescriber } from './aws-clients';
+import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, meteredSizeForInstanceType, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
@@ -30,6 +35,7 @@ import {
     claimAwsPlacementsPendingRetire,
     claimAwsPlacementsToReconcile,
     PlacementIntegrityError,
+    ImageJobConflictError,
     readCanaryComputer,
     RELEASED_NO_RESOURCES,
     readMonthUsage,
@@ -48,7 +54,7 @@ export interface LifecycleExecutionReader {
     describe(
         region: string,
         executionArn: string,
-    ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null }>;
+    ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null; input?: string; executionArn?: string; stateMachineVersionArn?: string; stateMachineAliasArn?: string; redriveCount?: number }>;
 }
 
 /** Who recorded a usage row (`observed_by`). */
@@ -109,6 +115,9 @@ export function nextInstanceTypeAfterCapacity(tier: AwsTier, failedType: string)
 
 export interface ReceiptDeps {
     db: PlacementDb;
+    meter?: ComputeMeter;
+    now?: () => Date;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber & Ec2ReplacementDescriber & Ec2ComputerResourceFinder>;
     /** Without it nothing is read and nothing changes. */
     executions?: LifecycleExecutionReader;
     /** GW-1, to fence (delete) a stopped generation's tunnel. */
@@ -177,19 +186,50 @@ export async function startLifecycleJob(
  * provider receipt arrived AND GW-1 enrollment explicitly succeeded.
  */
 export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment): Promise<void> {
+    // Migration provision receipts restore a host, but cannot open a normal epoch before commit.
+    let migrationCommitted = false;
+    if (p0.lastError?.startsWith('migration_pending:')) {
+        const m = await createProviderMigrationStore(deps.db).readById(p0.lastError.slice('migration_pending:'.length));
+        if (!m || m.state !== 'committed' || m.computerId !== p0.computerId || m.userId !== p0.ownerUserId) return;
+        migrationCommitted = true;
+    }
+    let startDate: Date | null = null;
+    let stopDate: Date | null = null;
+    let endReason: EpochEndReason = 'provider_stop';
     const step = async (p: Placement, to: PlacementState, fields: PlacementFields = {}, usage?: UsageEffect): Promise<Placement | null> => {
+        const at = (deps.now ?? deps.clock ?? (() => new Date()))();
         const r = await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: p, to, fields, usage });
+        // Billing tables are not installed in production: deliberately write epochs AFTER
+        // the placement transaction commits, never in that transaction. Metering cannot roll it back.
+        if (r.ok && to === 'RUNNING') {
+            const size = meteredSizeForInstanceType(p.instanceType);
+            if (size === null) {
+                console.error('[billing.meter] unknown instance type, epoch not opened', { computerId: p.computerId });
+            } else {
+                const metered = await recordComputeMeter(() => deps.meter?.ready({
+                    userId: p.ownerUserId, computerId: p.computerId, size, readyAt: at,
+                    overheadSeconds: !migrationCommitted && startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
+                }));
+                // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
+                if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
+                    userId: p.ownerUserId, computerId: p.computerId,
+                });
+            }
+        }
+        if (r.ok && usage?.kind === 'close') await recordComputeMeter(() => deps.meter?.stopped({
+            userId: p.ownerUserId, computerId: p.computerId, endedAt: stopDate ?? at, reason: endReason,
+        }));
         return r.ok ? r.placement : null;
     };
     const close: UsageEffect = { kind: 'close', observedBy: USAGE_OBSERVER };
     let p: Placement | null = p0;
-    const enrolled = (x: Placement) => x.lastError === ENROLLMENT_SUCCEEDED && x.enrollNonceHash === null && x.instanceId !== null;
+    const enrolled = (x: Placement) => (x.lastError === ENROLLMENT_SUCCEEDED || (migrationCommitted && x.lastError === p0.lastError)) && x.enrollNonceHash === null && x.instanceId !== null;
     // A receipt already applied (job cleared): MOUNTING waits only for the host's enrollment.
     if (p.state === 'MOUNTING' && p.lifecycleJobId === null) {
         if (enrolled(p)) await step(p, 'RUNNING');
         return;
     }
-    const waiting: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
+    const waiting: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
     if (!deps.executions || !p.lifecycleJobId || !p.lifecycleDigest || !waiting.includes(p.state)) return;
     let e;
     try {
@@ -203,9 +243,18 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     }
     if (e.status === 'RUNNING') return;
     if (e.status !== 'SUCCEEDED') {
-        if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(e.status)) await step(p, 'UNCONFIRMED', { lastError: lifecycleFailureCode(e, p.instanceType) });
+        if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(e.status)) {
+            const work = replacementWorkFromExecution(p, deployment, e);
+            const outcome = work ? await settleReplacementGeneration(deps, p, work) : 'unconfirmed';
+            if (outcome === 'settled') return;
+            if (p.state !== 'UNCONFIRMED') await step(p, 'UNCONFIRMED', {
+                lastError: outcome === 'generation_drift' ? 'generation_drift' : lifecycleFailureCode(e, p.instanceType),
+                enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
+            });
+        }
         return;
     }
+    if (p.state === 'UNCONFIRMED') return;
     const stopping = p.state === 'DRAINING' || p.state === 'STOPPING';
     const retiring = p.state === 'RETIRING';
     let receipt: z.infer<typeof LifecycleReceiptSchema>;
@@ -229,11 +278,18 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         await step(p, 'UNCONFIRMED', { lastError: 'receipt_conflict' });
         return;
     }
+    startDate = e.startDate ?? null;
+    stopDate = e.stopDate ?? null;
+    // Session limits keep their reason in lastError. An unknown StartExecution
+    // overwrites it, so those ambiguous stops conservatively use provider_stop too.
+    const providerStop = ['lease_expired', 'user_hours_cap', 'global_hours_cap'].includes(p.lastError ?? '')
+        || lifecycleStartUnknownUndo(p) !== null;
+    endReason = r.instanceLost ? 'platform_failure' : stopping && !providerStop ? 'user_stop' : 'provider_stop';
     const done: PlacementFields = {
         instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null,
         // A stop that found its instance already gone (`instanceLost`): STOPPED with INSTANCE_LOST,
         // so the next open is a REPLACE onto the retained volume even in start mode (aws-ec2.ts).
-        lastError: stopping ? (r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : p.lastError,
+        lastError: stopping ? (r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : migrationCommitted ? ENROLLMENT_SUCCEEDED : p.lastError,
     };
     // Fence GW-1 before a stop or retire is final: the tunnel must not outlive the instance.
     // Pending until the Worker confirms, so a failure is retried on the next look. No tunnel
@@ -256,7 +312,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     // A confirmed running instance opens its usage row, dated from the job's start (the
     // instance ran from then on: counting it is the safe direction for a cap).
     const open: UsageEffect = {
-        kind: 'open', instanceId: r.instanceId, instanceType: p.instanceType ?? 'unknown', startedAt: e.startDate ?? null, observedBy: USAGE_OBSERVER,
+        kind: 'open', instanceId: r.instanceId, instanceType: p.instanceType ?? 'unknown', startedAt: migrationCommitted ? (deps.now ?? (() => new Date()))() : e.startDate ?? null, observedBy: USAGE_OBSERVER,
     };
     if (stopping) {
         if (p.state === 'DRAINING') p = await step(p, 'STOPPING');
@@ -312,8 +368,14 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
             }
         }
     }
+    const unresolvedReplacement = undo === 'UNCONFIRMED' && ['LEASED', 'STARTING', 'MOUNTING'].includes(p.state);
     await transitionPlacementAsReconciler(deps.db, {
-        computerId: p.computerId, expected: p, to: undo, fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: LIFECYCLE_START_FAILED },
+        computerId: p.computerId, expected: p, to: undo, fields: {
+            // Retain the failed replacement identity for a delayed execution readback.
+            // Absence cannot reconstruct its authorized source pair or justify generation-1.
+            ...(unresolvedReplacement ? {} : { lifecycleJobId: null, lifecycleDigest: null }),
+            enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null, lastError: LIFECYCLE_START_FAILED,
+        },
     });
 }
 
@@ -325,7 +387,7 @@ export interface GuestStopDeps extends ReceiptDeps {
      * `describeVolume` lets a lost instance be recovered onto its retained volume; without it a
      * lost instance is left for the next look rather than recorded without that check.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder & Ec2ReplacementDescriber>;
     /** Lower-case uuid v4. */
     newId?: () => string;
     /** Set when the pass's time budget ran out: stop before the next placement. */
@@ -352,9 +414,16 @@ export async function reconcileGuestStop(deps: GuestStopDeps, p: Placement, depl
     } catch {
         return false; // Unknown: leave it, try again on the next look.
     }
-    if (!view || LOST_INSTANCE_STATES.has(view.state)) return recoverLostInstance(deps, p);
+    if (!view || LOST_INSTANCE_STATES.has(view.state)) return recoverLostInstance(deps, p, view?.stateTransitionAt);
     if (view.state !== 'stopping' && view.state !== 'stopped') return false;
-    return startStopAsReconciler(deps, p, deployment, null);
+    const endedAt = view.stateTransitionAt ?? (deps.now ?? deps.clock ?? (() => new Date()))();
+    const started = await startStopAsReconciler(deps, p, deployment, null);
+    // EC2 has already observed the guest shutdown. Close after the placement work
+    // commits; the later stop receipt is idempotent and cannot replace idle_sleep.
+    if (started) await recordComputeMeter(() => deps.meter?.stopped({
+        userId: p.ownerUserId, computerId: p.computerId, endedAt, reason: 'idle_sleep',
+    }));
+    return started;
 }
 
 /** EC2 states of an instance that is gone for good (terminate is not reversible). */
@@ -375,7 +444,7 @@ const LOST_INSTANCE_STATES: ReadonlySet<string> = new Set(['shutting-down', 'ter
  *     UNCONFIRMED with `INSTANCE_LOST_VOLUME_MISSING`: there is nothing to boot onto.
  * Returns true when the placement was moved.
  */
-async function recoverLostInstance(deps: GuestStopDeps, p: Placement): Promise<boolean> {
+async function recoverLostInstance(deps: GuestStopDeps, p: Placement, stateTransitionAt?: Date | null): Promise<boolean> {
     if (!deps.describer?.describeVolume || !p.region || !p.volumeId) return false;
     let volume;
     try {
@@ -398,6 +467,10 @@ async function recoverLostInstance(deps: GuestStopDeps, p: Placement): Promise<b
         fields: { ...cleared, lastError: usable ? INSTANCE_LOST : INSTANCE_LOST_VOLUME_MISSING },
         usage: { kind: 'close', observedBy: 'reconcile:instance_lost' },
     });
+    if (r.ok) await recordComputeMeter(() => deps.meter?.stopped({
+        userId: p.ownerUserId, computerId: p.computerId,
+        endedAt: stateTransitionAt ?? (deps.now ?? deps.clock ?? (() => new Date()))(), reason: 'platform_failure',
+    }));
     return r.ok;
 }
 
@@ -465,8 +538,8 @@ export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage:
     if (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime()) return 'lease_expired';
     if (policy.caps && usage) {
         const totals = usageFor(usage, p.ownerUserId);
-        if (totals.user.hours >= policy.caps.userMonthlyHours) return 'user_hours_cap';
-        if (totals.global.hours >= policy.caps.globalMonthlyHours) return 'global_hours_cap';
+        if (totals.user.weightedSeconds >= policy.caps.userMonthlyHours * 3_600) return 'user_hours_cap';
+        if (totals.global.weightedSeconds >= policy.caps.globalMonthlyHours * 3_600) return 'global_hours_cap';
     }
     return null;
 }
@@ -535,7 +608,7 @@ export async function reconcileAwsFleet(
             }
             if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage }))) limitStops += 1;
         } catch (error) {
-            if (!(error instanceof PlacementIntegrityError)) throw error;
+            if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
     }
     return { checked, stopsStarted, limitStops };
@@ -688,6 +761,10 @@ async function releaseWithoutResources(deps: GuestStopDeps, p: Placement): Promi
         usage: { kind: 'close', observedBy: 'reconcile:released' },
     });
     if (!retired.ok) return false;
+    await recordComputeMeter(() => deps.meter?.stopped({
+        userId: p.ownerUserId, computerId: p.computerId,
+        endedAt: (deps.now ?? deps.clock ?? (() => new Date()))(), reason: 'platform_failure',
+    }));
     await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: retired.placement, to: 'PURGE_ELIGIBLE' });
     return true;
 }
@@ -744,7 +821,7 @@ export async function reconcileDeletedAwsComputers(
                 else if (outcome === 'stuck') stuck += 1;
             } else if (await startRetireAsReconciler(deps, now, deployment)) retiresStarted += 1;
         } catch (error) {
-            if (!(error instanceof PlacementIntegrityError)) throw error;
+            if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
     }
     return { checked, retiresStarted, retired, stuck };
@@ -770,4 +847,21 @@ export async function runAwsBackgroundReconcile(
         ? { checked: 0, stopsStarted: 0, limitStops: 0 }
         : await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
     return { ok: true, deleted, fleet };
+}
+
+/** Migration boot evidence, deliberately separate from normal ready/usage writes. */
+export async function readMigrationReadyReceipt(executions: LifecycleExecutionReader, p: Placement, deployment: LifecycleDeployment): Promise<boolean> {
+    if (!p.lifecycleJobId || !p.lifecycleDigest || p.region !== 'ap-south-1') throw new Error('migration_intent_invalid');
+    const execution = await executions.describe(p.region, lifecycleExecutionArn(deployment, p.lifecycleJobId));
+    if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status) || p.lastError === 'enroll_tunnel_failed') throw new Error('migration_host_failed');
+    if (execution.status !== 'SUCCEEDED') return false;
+    const parsed = LifecycleReceiptSchema.safeParse(JSON.parse(execution.output ?? 'null'));
+    if (!parsed.success) throw new Error('migration_receipt_invalid');
+    const r = parsed.data;
+    if (r.jobId !== p.lifecycleJobId || r.digest !== p.lifecycleDigest || r.computerId !== p.computerId
+        || r.generation !== p.generation || r.leaseEpoch !== p.leaseEpoch || r.fenceToken !== p.fenceToken
+        || r.state !== 'running' || (p.instanceId !== null && r.instanceId !== p.instanceId)
+        || (p.volumeId !== null && r.volumeId !== p.volumeId)) throw new Error('migration_receipt_conflict');
+    return p.lastError === ENROLLMENT_SUCCEEDED && p.enrollNonceHash === null && p.enrollConsumedHash !== null
+        && p.instanceId === r.instanceId && p.volumeId === r.volumeId;
 }

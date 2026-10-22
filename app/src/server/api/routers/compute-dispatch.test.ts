@@ -17,7 +17,9 @@ import path from 'node:path';
 import { initTRPC, TRPCError } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const captured = vi.hoisted(() => ({ softDelete: vi.fn() }));
+const captured = vi.hoisted(() => ({ softDelete: vi.fn(), billingDeps: vi.fn() }));
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: captured.billingDeps }));
 
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string } | null; db: unknown }>().create();
@@ -48,13 +50,18 @@ import type { LifecycleStarter } from '@/server/lib/compute/aws-ec2';
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
 import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
+import { ImageJobConflictError } from '@/server/lib/compute/placement';
 
 import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
 import { appCallerRoleEnv } from '@/server/lib/compute/aws-clients';
+import { readBillingConfig } from '@/server/billing/config';
+import type { BillingDeps, BillingStore } from '@/server/billing/ports';
+import type { EntitlementRecord } from '@/server/lib/compute/tier';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
 const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+const IMAGE_JOB = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
 const AWS_ENV: Record<string, string> = {
     EZIL_AWS_COMPUTERS_ENABLED: '1',
@@ -94,6 +101,7 @@ function routerDb(placements: Record<string, unknown>[], computerOwner = U1) {
 
 let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
+    captured.billingDeps.mockReset().mockReturnValue({ config: readBillingConfig({}), store: {}, stripe: null, usage: null, now: () => new Date() });
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_WORKER_URL', 'https://worker.example');
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'router-secret');
     fetchMock = vi.fn(async () => Response.json({ ok: true }));
@@ -105,6 +113,7 @@ beforeEach(() => {
     });
 });
 afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -117,6 +126,7 @@ describe('routeComputer', () => {
         expect(routed.provider).toBe(cloudflareComputeProvider);
         expect(untouchableDb.execute).not.toHaveBeenCalled();
         expect(untouchableDb.transaction).not.toHaveBeenCalled();
+        expect(captured.billingDeps).not.toHaveBeenCalled();
     });
 
     it('reads ON, no placement row → the same Cloudflare adapter', async () => {
@@ -149,6 +159,26 @@ describe('routeComputer', () => {
         await expect(routeComputer(db, { userId: U2, computerId: C1 }, { env: AWS_ENV })).resolves.toMatchObject({ kind: 'aws-ec2' });
     });
 
+    it.each(['aws-ec2', 'cloudflare'] as const)('%s reservation: routing checks ownership before querying the image job', async provider => {
+        const { db, fake } = routerDb([placementRow({ computer_id: C1, owner_user_id: U2,
+            provider, workspace_store: provider === 'aws-ec2' ? 'ebs' : 'r2', image_upgrade_job_id: IMAGE_JOB })]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        const read = vi.fn(async () => null);
+        await expect(routeComputer(db, computer, { env: AWS_ENV, entitlements: { read } })).rejects.toMatchObject({
+            code: 'NOT_FOUND', message: 'Computer not found',
+        });
+        expect(fake.statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+        expect(read).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+
+        fake.statements.length = 0;
+        await expect(routeComputer(db, { userId: U2, computerId: C1 }, { env: AWS_ENV })).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(fake.statements.map(s => s.sql)).toEqual([
+            expect.stringContaining('/* placement:read */'), expect.stringContaining('/* placement:image-reservation */'),
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it('a duplicate placement fails closed (never Cloudflare)', async () => {
         const { db } = routerDb([placementRow({ computer_id: C1 }), placementRow({ computer_id: C1 })]);
         await expect(routeComputer(db, computer, { env: AWS_ENV })).rejects.toThrow();
@@ -156,13 +186,11 @@ describe('routeComputer', () => {
 
     it('the tier the AWS provider gets: free without an entitlement, plus only for an active listed plan', async () => {
         const env = { ...AWS_ENV, EZIL_AWS_PLUS_PLAN_IDS: 'os-plus' };
-        const seen: string[] = [];
-        const paid = { read: async (u: string) => { seen.push(u); return { status: 'active', planId: 'os-plus' }; } };
-        const cancelled = { read: async () => ({ status: 'cancelled', planId: 'os-plus' }) };
-        await expect(awsDepsFor(env, paid).tierFor(U1)).resolves.toBe('plus');
-        expect(seen).toEqual([U1]);
-        await expect(awsDepsFor(env, cancelled).tierFor(U1)).resolves.toBe('free');
-        await expect(awsDepsFor(env, undefined).tierFor(U1)).resolves.toBe('free');
+        const paid = { status: 'active', planId: 'os-plus' };
+        const cancelled = { status: 'cancelled', planId: 'os-plus' };
+        await expect(awsDepsFor(env, paid).tierFor()).resolves.toBe('plus');
+        await expect(awsDepsFor(env, cancelled).tierFor()).resolves.toBe('free');
+        await expect(awsDepsFor(env, undefined).tierFor()).resolves.toBe('free');
         // The collaborators pass through untouched.
         const starter: LifecycleStarter = { start: async () => {} };
         expect(awsDepsFor(env, undefined, { starter }).starter).toBe(starter);
@@ -176,6 +204,115 @@ describe('routeComputer', () => {
         expect(routed.kind).toBe('aws-ec2');
         await expect(routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).resolves.toEqual({ ok: true });
         expect(calls).toEqual([]);
+    });
+});
+
+describe('billing v2 dispatch wiring', () => {
+    const paid: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false };
+    const provisionEnv = {
+        ...AWS_ENV, EZIL_AWS_ENROLL_URL: 'https://app.example.test/api/compute/aws/enroll',
+        EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+        // A NEW paid computer (created after the cutoff) provisions directly; older ones migrate (select.test.ts).
+        EZIL_AWS_CANARY_SINCE: '2020-01-01T00:00:00Z',
+        [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({
+            'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']),
+            'us-east-1': fixtureDeployment('us-east-1', [...TYPES, 'm6i.2xlarge']),
+        }),
+    };
+
+    it('placement reads off never calls even an explicitly supplied reader', async () => {
+        const read = vi.fn(async () => paid);
+        expect((await routeComputer(untouchableDb, computer, { env: {}, entitlements: { read } })).kind).toBe('cloudflare');
+        expect(read).not.toHaveBeenCalled();
+    });
+
+    it('the default reader provisions the paid size from billing exactly once', async () => {
+        const now = new Date('2026-10-18T12:00:00Z');
+        const store = {
+            subscriptionsFor: vi.fn(async () => [{ stripeSubscriptionId: 'sub_a', sku: 'compute_monthly_v2', status: 'active',
+                currentPeriodStart: new Date('2026-10-01T00:00:00Z'), currentPeriodEnd: new Date('2026-11-01T00:00:00Z'), cancelAtPeriodEnd: false }]),
+            userCreatedAt: vi.fn(async () => null), openPlanChanges: vi.fn(async () => []), epochsFor: vi.fn(async () => []),
+            grantsForPeriod: vi.fn(async () => []), latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
+            sizePreference: vi.fn(async () => 'cmp-8' as const),
+        };
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }), store: store as unknown as BillingStore,
+            stripe: null, usage: null, now: () => now } satisfies BillingDeps);
+        const { db, fake } = routerDb([]);
+        const start = vi.fn(async () => {});
+        const routed = await routeComputer(db, computer, { env: provisionEnv, aws: { starter: { start }, now: () => now }, pinCloudflare: true });
+        expect(routed.kind).toBe('aws-ec2');
+        expect(fake.placements).toEqual([]);
+        expect(await routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).toMatchObject({ errorCode: 'computer_starting' });
+        expect(fake.placements).toMatchObject([{ provider: 'aws-ec2', instance_type: 'm6i.2xlarge' }]);
+        expect(captured.billingDeps).toHaveBeenCalledTimes(1);
+        expect(store.subscriptionsFor).toHaveBeenCalledExactlyOnceWith(U1);
+        expect(store.sizePreference).toHaveBeenCalledExactlyOnceWith(U1);
+        expect(start).toHaveBeenCalledTimes(1);
+    });
+
+    it('billing flags off with placement reads on makes ZERO store accesses', async () => {
+        const access = vi.fn(() => { throw new Error('billing store touched while off'); });
+        const store = new Proxy({} as BillingStore, { get: access });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}), store, stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
+        const { db } = routerDb([]);
+        expect((await routeComputer(db, computer, { env: AWS_ENV, aws: {} })).kind).toBe('cloudflare');
+        expect(access).not.toHaveBeenCalled();
+    });
+
+    it.each(['status', 'terminate'] as const)('%s on a row-backed computer makes zero billing-store calls with metering on', async method => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const access = vi.fn(() => { throw new Error('Unexpected billing store call'); });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
+        await caller[method]({ computerId: C1 });
+        expect(access).not.toHaveBeenCalled();
+        expect(captured.billingDeps).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('reportActivity on a row-backed Cloudflare computer only touches its heartbeat when metering is %s', async metering => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const at = new Date('2026-10-18T12:00:00Z');
+        const touchEpoch = vi.fn<BillingStore['touchEpoch']>().mockResolvedValue('touched');
+        // Any routing/state read (including loadComputeBillingState) fails this assertion,
+        // even if the meter catches the error. With metering off, even touch is forbidden.
+        const access = vi.fn((_target: BillingStore, key: string | symbol) => {
+            if (metering && key === 'touchEpoch') return touchEpoch;
+            throw new Error(`Unexpected billing store access: ${String(key)}`);
+        });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig(metering ? { BILLING_TAB_ENABLED: '1' } : {}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => at } satisfies BillingDeps);
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U1 }, db } as never);
+        await caller.reportActivity({ computerId: C1, lastInputAgoMs: 5 });
+        expect(access.mock.calls.map(([, key]) => key)).toEqual(metering ? ['touchEpoch'] : []);
+        if (metering) expect(touchEpoch).toHaveBeenCalledExactlyOnceWith(C1, expect.any(Date));
+        else expect(touchEpoch).not.toHaveBeenCalled();
+    });
+
+    it('a paid computer at capacity stays unplaced and returns the existing refusal', async () => {
+        const { db, fake } = routerDb([]);
+        const read = vi.fn(async () => paid);
+        const start = vi.fn(async () => {});
+        const routed = await routeComputer(db, computer, { env: { ...provisionEnv,
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '0',
+        }, entitlements: { read }, aws: { starter: { start } }, pinCloudflare: true });
+        expect(routed.kind).toBe('aws-ec2');
+        expect(await routed.provider.ensure(ctxOpts, computer, { sessionId: 's', desktopMode: 'neko' })).toMatchObject({ error: 'region_capacity', errorCode: 'capacity_unavailable' });
+        expect(fake.placements).toEqual([]);
+        expect(read).toHaveBeenCalledExactlyOnceWith(U1);
+        expect(start).not.toHaveBeenCalled();
+    });
+
+    it('billing failures log and keep the existing no-entitlement route', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const { db } = routerDb([]);
+        const routed = await routeComputer(db, computer, { env: AWS_ENV, aws: {}, entitlements: {
+            read: async () => { throw new Error('billing unavailable'); },
+        } });
+        expect(routed.kind).toBe('cloudflare');
+        expect(warn).toHaveBeenCalledTimes(1);
     });
 });
 
@@ -199,6 +336,8 @@ describe('defaultAwsCollaborators: the real AWS clients, gated', () => {
         expect(typeof all.executions?.describe).toBe('function');
         // Codex #6: the EC2 describe that catches a guest-initiated idle stop reaches the provider.
         expect(typeof all.describer?.describeForEnrollment).toBe('function');
+        expect(typeof all.meter?.ready).toBe('function');
+        expect(awsDepsFor(AWS_ENV, undefined, all).meter).toBe(all.meter);
     });
 });
 
@@ -206,6 +345,18 @@ describe('shell-facing AWS answers', () => {
     it('a waking AWS computer is the shell\'s existing `sandbox_starting` (its wake loop re-asks)', () => {
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_starting', retryable: true })).toBe('sandbox_starting');
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_stopping', retryable: true })).toBe('sandbox_starting');
+    });
+
+    it.each(['computer_starting', 'computer_stopping', 'capacity_unavailable'])('ordinary AWS %s does not claim migration', async errorCode => {
+        const result = { ok: false as const, error: errorCode, errorCode, retryable: true };
+        const preview = vi.fn(async () => { throw new Error('preview after refused ensure'); });
+        expect(await awsPreviewAnswer(result, preview)).not.toHaveProperty('computeMigrating');
+        expect(awsStatusAnswer(result)).not.toHaveProperty('computeMigrating');
+        expect(preview).not.toHaveBeenCalled();
+    });
+
+    it('a successful AWS status cannot claim migration from a stale error', () => {
+        expect(awsStatusAnswer({ ok: true, error: 'computer_migrating' })).not.toHaveProperty('computeMigrating');
     });
 
     it('a deterministic refusal keeps its own code (capacity is never dressed up as waking)', async () => {
@@ -243,6 +394,48 @@ describe('routers: AWS previews use their own Worker route', () => {
 
     beforeEach(() => {
         for (const [k, v] of Object.entries(AWS_ENV)) vi.stubEnv(k, v);
+    });
+
+    it.each(['previewUrl', 'appPreviewUrl', 'codePreviewUrl', 'restartDesktop'] as const)('%s returns a terminal billing refusal before any provider call', async surface => {
+        const now = new Date('2026-10-18T12:00:00Z');
+        const store = {
+            openEpochFor: vi.fn(async () => null),
+            subscriptionsFor: vi.fn(async () => [{ stripeSubscriptionId: 'sub_a', sku: 'standard_monthly_v2', status: 'active',
+                currentPeriodStart: new Date('2026-10-01T00:00:00Z'), currentPeriodEnd: new Date('2026-11-01T00:00:00Z'), cancelAtPeriodEnd: false }]),
+            userCreatedAt: vi.fn(async () => null), openPlanChanges: vi.fn(async () => []), epochsFor: vi.fn(async () => []),
+            grantsForPeriod: vi.fn(async () => []), latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
+            sizePreference: vi.fn(async () => null),
+        };
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
+            store: store as unknown as BillingStore, stripe: null, usage: null, now: () => now } satisfies BillingDeps);
+        const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure');
+        const restart = vi.spyOn(cloudflareComputeProvider, 'restart');
+        const { db } = routerDb([placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })]);
+        const result = surface === 'previewUrl'
+            ? await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })
+            : await caller(db)[surface]({ computerId: C1 });
+        expect(result).toMatchObject({ ok: false, error: 'billing_allowance_exhausted', errorCode: 'billing_allowance_exhausted',
+            billingRefusal: 'allowance_exhausted', provider: 'cloudflare-guacamole' });
+        expect(ensure).not.toHaveBeenCalled();
+        expect(restart).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('flags-off previewUrl preserves the provider result with zero billing-store calls (placement %s)', async hasPlacement => {
+        const access = vi.fn(() => { throw new Error('billing store accessed while flags off'); });
+        captured.billingDeps.mockReturnValue({ config: readBillingConfig({}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => new Date() } satisfies BillingDeps);
+        const ensure = vi.spyOn(cloudflareComputeProvider, 'ensure').mockResolvedValue({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', retryable: true,
+        });
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const { db } = routerDb(hasPlacement
+            ? [placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })] : []);
+        expect(await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })).toEqual({
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole',
+        });
+        expect(ensure).toHaveBeenCalledTimes(1);
+        expect(access).not.toHaveBeenCalled();
     });
 
     it('previewUrl / appPreviewUrl / codePreviewUrl answer a VALUE from the AWS provider, no Worker call', async () => {
@@ -299,7 +492,10 @@ describe('routers: AWS previews use their own Worker route', () => {
             });
         }
         // Reads only: the placement, and the month's usage for the hour caps (Codex 4275911832). No write.
-        expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month'))).toBe(true);
+        expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month')
+            // The image-job reservation check (rebase contract §8) is a read too.
+            || s.sql.includes('placement:image-reservation')
+            || (s.sql.startsWith('SELECT') && s.sql.includes('FROM public.ezil_compute_migrations')))).toBe(true);
     });
 
     it('status reports the AWS lifecycle state, no Worker call', async () => {
@@ -317,12 +513,13 @@ describe('routers: AWS previews use their own Worker route', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('reportActivity renews the AWS lease from the owner\'s presence; restartDesktop refuses; no Worker call', async () => {
+    it('reportActivity renews the AWS lease from the owner\'s presence; unconfigured AWS restart is restart_unavailable; no Worker call', async () => {
         const { db, fake } = routerDb([awsRow({ state: 'RUNNING', lease_until: new Date(Date.now() + 60_000) })]);
         await expect(caller(db).reportActivity({ computerId: C1, lastInputAgoMs: 5 })).resolves.toMatchObject({ ok: true });
         // Presence 5 ms ago: the lease now runs an hour from it (Codex 4275911832).
         expect(new Date(fake.placements[0]!.lease_until as string).getTime()).toBeGreaterThan(Date.now() + 3_500_000);
-        await expect(caller(db).restartDesktop({ computerId: C1 })).resolves.toMatchObject({ ok: false, errorCode: 'aws_not_supported' });
+        // AWS restart exists now (R3-L4); without a configured AWS control path it is refused honestly.
+        await expect(caller(db).restartDesktop({ computerId: C1 })).resolves.toMatchObject({ ok: false, errorCode: 'restart_unavailable' });
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
@@ -334,8 +531,44 @@ describe('routers: AWS previews use their own Worker route', () => {
         await expect(caller(db).terminate({ computerId: C1 })).rejects.toMatchObject({ code: 'NOT_FOUND' });
         // Only placement READS happened (three, one per call); no write, no lease, no lifecycle.
         const after = fake.statements.slice(before);
-        expect(after).toHaveLength(3);
-        expect(after.every((s) => /placement:read \*\//.test(s.sql))).toBe(true);
+        expect(after.map(s => ({ sql: s.sql, params: s.params }))).toEqual(Array.from({ length: 3 }, () => ({
+            sql: expect.stringContaining('/* placement:read */'), params: [C1],
+        })));
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    const reservedCalls = {
+        previewUrl: (c: ReturnType<typeof caller>) => c.previewUrl({ computerId: C1, sessionId: C1 }),
+        appPreviewUrl: (c: ReturnType<typeof caller>) => c.appPreviewUrl({ computerId: C1 }),
+        codePreviewUrl: (c: ReturnType<typeof caller>) => c.codePreviewUrl({ computerId: C1 }),
+        status: (c: ReturnType<typeof caller>) => c.status({ computerId: C1 }),
+        terminate: (c: ReturnType<typeof caller>) => c.terminate({ computerId: C1 }),
+        reportActivity: (c: ReturnType<typeof caller>) => c.reportActivity({ computerId: C1, lastInputAgoMs: 0 }),
+        restartDesktop: (c: ReturnType<typeof caller>) => c.restartDesktop({ computerId: C1 }),
+        relayState: (c: ReturnType<typeof caller>) => c.relayState({ computerId: C1 }),
+        refreshRelay: (c: ReturnType<typeof caller>) => c.refreshRelay({ computerId: C1, runtimeId: 'a'.repeat(32) }),
+        focusApp: (c: ReturnType<typeof caller>) => c.focusApp({ computerId: C1, app: 'chromium' }),
+        getScreen: (c: ReturnType<typeof caller>) => c.getScreen({ computerId: C1 }),
+        setScreen: (c: ReturnType<typeof caller>) => c.setScreen({ computerId: C1, width: 1920, height: 1080 }),
+        confirmFrame: (c: ReturnType<typeof caller>) => c.confirmFrame({ computerId: C1, frameUrl: 'https://frame.example' }),
+        confirmDisplay: (c: ReturnType<typeof caller>) => c.confirmDisplay({ computerId: C1, frameUrl: 'https://frame.example' }),
+    };
+
+    it.each(Object.entries(reservedCalls))('%s refuses a foreign reserved computer before reservation queries or Worker calls', async (_name, call) => {
+        const { db, fake } = routerDb([awsRow({ owner_user_id: U2, image_upgrade_job_id: IMAGE_JOB })]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        await expect(call(caller(db))).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'Computer not found' });
+        expect(fake.statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each(Object.entries(reservedCalls))('%s preserves the image-job conflict for the owner', async (_name, call) => {
+        const { db, fake } = routerDb([awsRow({ image_upgrade_job_id: IMAGE_JOB })]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        await expect(call(caller(db))).rejects.toMatchObject({ message: 'image_job_conflict', cause: expect.any(ImageJobConflictError) });
+        expect(fake.statements.map(s => s.sql)).toEqual([
+            expect.stringContaining('/* placement:read */'), expect.stringContaining('/* placement:image-reservation */'),
+        ]);
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
@@ -368,6 +601,21 @@ describe('computer.delete: AWS retires or refuses — never deletes data, never 
         const caller = computerRouter.createCaller({ user: { id: U1 }, db } as never);
         await expect(caller.delete({ id: C1 })).rejects.toMatchObject({ code: 'NOT_FOUND' });
         expect(captured.softDelete).not.toHaveBeenCalled();
+    });
+
+    it('delete hides a foreign image reservation and preserves the conflict for its owner', async () => {
+        const { db, fake } = routerDb([{ ...awsRow(U2), image_upgrade_job_id: IMAGE_JOB }]);
+        fake.imageJobs.push({ computer_id: C1, job_id: IMAGE_JOB, phase: 'requested' });
+        const caller = (userId: string) => computerRouter.createCaller({ user: { id: userId }, db } as never);
+        await expect(caller(U1).delete({ id: C1 })).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'Computer not found' });
+        expect(fake.statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+        fake.statements.length = 0;
+        await expect(caller(U2).delete({ id: C1 })).rejects.toMatchObject({ message: 'image_job_conflict', cause: expect.any(ImageJobConflictError) });
+        expect(fake.statements.map(s => s.sql)).toEqual([
+            expect.stringContaining('/* placement:read */'), expect.stringContaining('/* placement:image-reservation */'),
+        ]);
+        expect(captured.softDelete).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('a Cloudflare computer still deletes through the Worker teardown, exactly as before', async () => {

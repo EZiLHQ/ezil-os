@@ -18,6 +18,9 @@
  *   (`aws_disabled`) — it never falls back to Cloudflare. Reads are one-way:
  *   see `isPlacementReadEnabled`. A placement whose `owner_user_id` is not
  *   the caller throws `PlacementOwnerError` (→ NOT_FOUND).
+ *   An active CF→AWS migration overrides either published provider with a
+ *   destination-labelled wait. After commit, normal AWS receipt reconciliation
+ *   resumes on the next request; migration boot records are never user authority.
  *
  * Callers move from the first to the second in the caller-wiring PR (P3),
  * after the SQL is applied; that PR also narrows the callers to
@@ -25,11 +28,13 @@
  */
 
 import { precheckAdmission } from './admission';
-import { awsCanaryConfig, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
+import { awsCanaryConfig, awsDirectSince, inAwsCanary, isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
-import { createPlacement, PlacementIntegrityError, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { pinCloudflarePlacement, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
+import { providerForPendingMigration } from './provider-migrate-placement';
+import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
     void computer; // Placement-aware callers use `resolveComputeProvider`.
@@ -65,10 +70,16 @@ function isPlacementDb(db: PlacementExecutor): db is PlacementDb {
 }
 
 export interface ResolveOptions {
+    /** Resolved once by the caller and shared with the AWS provision path. */
+    entitlement?: EntitlementRecord | null;
+    /** Read only for a computer without placement; the caller may memoize it. */
+    resolveEntitlement?: () => Promise<EntitlementRecord | null>;
+    /** Share the ownership-checked placement with routing without another read. */
+    onPlacement?: (placement: ResolvedPlacement) => void;
     /**
      * The caller is about to START a sandbox (open, app/code preview, desktop restart).
-     * A no-row computer the canary does not claim is then PINNED to Cloudflare first
-     * (`pinCloudflare`), so it can never later be reassigned to AWS. Reads and stops
+     * A no-row computer neither billing nor the canary claims is PINNED to Cloudflare first
+     * (`pinCloudflare`), so moving it to AWS requires workspace migration. Reads and stops
      * never pin: a computer that never ran stays eligible.
      */
     pinCloudflare?: boolean;
@@ -82,17 +93,51 @@ export async function resolveComputeProvider(
     options: ResolveOptions = {},
 ): Promise<ComputeProvider> {
     if (!isPlacementReadEnabled(env)) return cloudflareComputeProvider;
-    let placement = await readPlacement(db, computer.computerId);
+    let placement = await readPlacement(db, computer.computerId, computer.userId);
     // Every provider operation is the recorded owner's only (C-2): `computer.userId` is the
     // authenticated session user; a re-keyed or re-inserted ezil_computers row changes nothing.
     assertPlacementOwner(placement, computer);
-    const deps = isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined;
+    options.onPlacement?.(placement);
+    const migrating = await providerForPendingMigration(db, computer);
+    if (migrating) return migrating;
+    const entitlement = !placement.record && options.resolveEntitlement
+        ? await options.resolveEntitlement()
+        : options.entitlement !== undefined ? options.entitlement : aws.entitlement;
+    const deps = isPlacementDb(db) ? { ...aws, entitlement, db, env: () => env } : undefined;
+    const freshAwsProvider = () => {
+        // Fresh paid cutovers have the same Mumbai contract as restored ones.
+        // Admission must refuse absent/full Mumbai capacity, never spill elsewhere.
+        const mumbaiEnv = { ...env, AWS_REGIONS: 'ap-south-1' };
+        return providerForPlacement({ provider: 'aws-ec2' }, mumbaiEnv, deps ? { ...deps, env: () => mumbaiEnv } : undefined);
+    };
     if (!placement.record) {
+        const { createProviderMigrationStore } = await import('./provider-migrate-store');
+        const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId);
+        // A proven-empty predecessor is eligible regardless of its creation date.
+        // Keep AWS routing even when AWS is paused, so a reopen cannot re-pin CF.
+        if (migration?.userId === computer.userId.toLowerCase() && migration.state === 'committed'
+            && migration.lastError === 'fresh_provision') return freshAwsProvider();
+        // Only new paid computers may provision directly: older computers can have an
+        // R2 workspace without a placement row and must migrate through Cloudflare.
+        // Eligible paid computers bypass the canary's capacity fallback; ensure() admits or refuses.
+        if (isAwsComputersEnabled(env) && entitlement?.source === 'billing_v2'
+            && tierForEntitlement(entitlement, plusPlanIds(env)) !== 'free') {
+            const since = awsDirectSince(env);
+            if (since) {
+                const row = await readCanaryComputer(db, computer.computerId);
+                if (row && !row.deleted && row.userId === computer.userId.toLowerCase()
+                    && row.createdAt.getTime() >= since.getTime()) {
+                    return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
+                }
+            }
+        }
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
         if (await isAwsCanary(db, computer, env)) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
         if (options.pinCloudflare && isPlacementDb(db)) {
             placement = await pinCloudflare(db, computer);
             assertPlacementOwner(placement, computer);
+            options.onPlacement?.(placement);
+            if (!placement.record && placement.provider === 'aws-ec2') return freshAwsProvider();
         }
     }
     return providerForPlacement(placement, env, deps);
@@ -114,13 +159,7 @@ function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRe
  * A concurrent writer's row wins (`placement_exists` → re-read), whatever its provider.
  */
 async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<ResolvedPlacement> {
-    const created = await createPlacement(db, {
-        computerId: computer.computerId, ownerUserId: computer.userId, provider: 'cloudflare', state: 'STOPPED',
-    });
-    if (created.ok) return { provider: 'cloudflare', store: created.placement.store, record: created.placement };
-    const existing = await readPlacement(db, computer.computerId);
-    if (!existing.record) throw new PlacementIntegrityError('invalid_row', computer.computerId.toLowerCase());
-    return existing;
+    return pinCloudflarePlacement(db, computer);
 }
 
 /**

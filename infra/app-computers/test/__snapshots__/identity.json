@@ -47,6 +47,7 @@
               "ec2:DescribeInstances",
               "ec2:DescribeVolumes",
               "ec2:DescribeImages",
+              "ec2:DescribeSnapshots",
               "ec2:DescribeLaunchTemplateVersions",
               "ec2:DescribeAvailabilityZones",
               "logs:DescribeLogGroups",
@@ -95,7 +96,9 @@
                   "t3a.medium",
                   "t3.medium",
                   "m6i.large",
-                  "c6i.xlarge"
+                  "c6i.xlarge",
+                  "m6i.xlarge",
+                  "m6i.2xlarge"
                 ]
               }
             },
@@ -186,7 +189,8 @@
             "Effect": "Allow",
             "Resource": [
               "arn:aws:ec2:ap-south-1:123456789012:instance/*",
-              "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+              "arn:aws:ec2:ap-south-1:123456789012:volume/*",
+              "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
             ]
           },
           {

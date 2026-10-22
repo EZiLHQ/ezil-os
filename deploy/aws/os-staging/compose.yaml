@@ -1,0 +1,33 @@
+name: ezil-os-staging
+services:
+  web:
+    image: ezil-os-staging:${OS_STAGING_TAG:?Set OS_STAGING_TAG}
+    platform: linux/amd64
+    pull_policy: never
+    env_file:
+      - path: /etc/ezil-os-staging/app.env
+        format: raw
+    environment:
+      AWS_REGION: ap-south-1
+    restart: unless-stopped
+    init: true
+    # Host networking: the minimal host has no iptables/nft, so dockerd runs with
+    # --bridge=none. The app binds loopback only; Caddy is the public edge.
+    network_mode: host
+    command: ["node", "node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", "3000"]
+    logging: &logging
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [web]
+    logging: *logging
+volumes:
+  caddy_data:
+  caddy_config:

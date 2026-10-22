@@ -1,0 +1,3 @@
+*.vsix
+test-results.log
+mutation-results.log

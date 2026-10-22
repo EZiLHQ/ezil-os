@@ -56,11 +56,14 @@ export async function runAsl(graph: any, opts: { input: any; executionArn: strin
             cause: s.Cause ?? (s.CausePath ? evaluate(s.CausePath, data, opts.executionArn) : undefined), data, visited };
         if (s.Type === 'Pass') {
             if (s.End) return { output: s.InputPath ? walk(s.InputPath, data, opts.executionArn) : data, data, visited };
-            const value = s.Parameters ? resolve(s.Parameters, data, opts.executionArn) : s.Result;
+            const value = s.Parameters ? resolve(s.Parameters, data, opts.executionArn) : s.InputPath ? walk(s.InputPath, data, opts.executionArn) : s.Result;
             data = place(data, s.ResultPath, structuredClone(value)); next = s.Next; continue;
         }
         if (s.Type === 'Choice') {
-            next = s.Choices.find((c: any) => { try { return walk(c.Variable, data, opts.executionArn) === c.StringEquals; } catch { return false; } })?.Next ?? s.Default;
+            next = s.Choices.find((c: any) => { try { const value = walk(c.Variable, data, opts.executionArn);
+                if ('IsPresent' in c) return c.IsPresent === true;
+                if ('NumericEquals' in c) return typeof value === 'number' && value === c.NumericEquals;
+                return value === c.StringEquals; } catch { return c.IsPresent === false; } })?.Next ?? s.Default;
             assert.ok(next, 'Choice without match or default'); continue;
         }
         if (s.Type === 'Wait') {

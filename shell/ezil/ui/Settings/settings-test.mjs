@@ -151,6 +151,8 @@ const click = (el) => el?.dispatchEvent(new window.MouseEvent('click', { bubbles
 // non-empty array. That is the exact input that silently deleted Settings
 // from every boot in round 1.
 const REAL_PAYLOAD = {
+    // No features key: billing's default-off contract preserves these six
+    // tabs. billing-test.mjs pairs this with an enabled, seven-tab boot.
     // `toShellBootUser`'s shape. `<b>` in the name proves the Account tab
     // escapes it rather than rendering markup a user put in their profile.
     user: {
@@ -239,6 +241,9 @@ push('no upstream Dashboard tab survived',
     ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'security'].includes(id)));
 push('Settings still opens on Computers',
     q('.window[data-app="settings"] .ezil-settings-pane[data-pane="computers"]')?.classList.contains('active'));
+push('flag-off Settings still loads Computers without requesting billing',
+    calls.some(c => c.url.includes('/api/trpc/computer.list'))
+    && ! calls.some(c => c.url.includes('/api/trpc/billing.')));
 
 // ── Computers tab ──────────────────────────────────────────────────────────
 const rows = qa('.window[data-app="settings"] .ezil-settings-row');
@@ -441,6 +446,8 @@ push('🔴 …and flips to ENABLED the moment the route is published — no code
 // Click it: confirm, then a stubbed 500 (this harness's `fetch` stub has no
 // `/api/shell/restart` case, so it falls through to the generic 500 at the
 // bottom of the stub) must render as `failed`, never as a claimed success.
+const restartEvents = [];
+window.addEventListener('ezil:desktop-restarted', e => restartEvents.push(e.detail));
 click(restartBtn);
 await settle(2);
 const restartConfirmBtn = Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart');
@@ -451,6 +458,36 @@ push('🔴 a failed restart is reported as failed, never as a claimed success',
     /something went wrong|couldn.t reach|expired|too long/i.test(
         q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? '',
     ));
+push('a failed restart tells no window it restarted', restartEvents.length === 0, `${restartEvents.length}`);
+{
+    // A successful restart tells the windows of THAT computer (Code re-mints: on AWS code-server restarts too).
+    const restartedId = q('.window[data-app="desktop"]')?.getAttribute('data-ezil-computer-id');
+    const realFetch = window.fetch;
+    let completeRestart;
+    let restartRequests = 0;
+    window.fetch = async (url, opts) => {
+        if ( ! String(url).includes('/api/shell/restart') ) return realFetch(url, opts);
+        restartRequests++;
+        return new Promise(resolve => { completeRestart = resolve; });
+    };
+    click(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]'));
+    await settle(2);
+    click(Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart'));
+    await settle(6);
+    push('a pending AWS restart shows Restarting and sends no completion event',
+        restartRequests === 1 && restartEvents.length === 0
+        && /Restarting/.test(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? ''));
+    const pendingButton = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
+    click(pendingButton);
+    await settle(2);
+    push('restart stays disabled while waiting for the replacement runtime', pendingButton?.disabled && restartRequests === 1);
+    completeRestart?.({ ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{"ok":true}' });
+    await settle(6);
+    window.fetch = realFetch;
+    push('🔴 a successful restart notifies the windows of that computer once',
+        restartEvents.length === 1 && !! restartedId && restartEvents[0]?.computerId === restartedId,
+        JSON.stringify({ restartEvents, restartedId }));
+}
 // ── Troubleshoot tab (diagnostic log) ────────────────────────────────────────
 // `shell/ezil/log.js` has kept a 200-entry ring of every debug/info/warn/error
 // call since it was written, explicitly so a support conversation would not

@@ -102,7 +102,16 @@ def app(sock, d, cert, key):
                     exp = json.load(f)
             except ValueError:
                 return self._send(400, {"error": "bad_json"})
-            if set(b) != {"computerId", "generation", "leaseEpoch", "nonce", "identityDocument", "signature"}:
+            with open(os.path.join(d, "user-data")) as f:
+                delivered = json.load(f)
+            maintenance = delivered.get("ebsRestore")
+            keys = {"computerId", "generation", "leaseEpoch", "nonce", "identityDocument", "signature", "lowerImageDigest"}
+            if maintenance is not None:
+                keys.add("ebsRestore")
+                receipt = {k: maintenance[k] for k in ("v", "recoveryJobId", "snapshotId", "originalVolumeId", "volumeId", "fsUuid")}
+                if b.get("ebsRestore") != receipt or b.get("lowerImageDigest") != maintenance["fromDigest"]:
+                    return self._send(403, {"error": "maintenance_mismatch"})
+            if set(b) != keys:
                 return self._send(400, {"error": "fields"})
             for k in ("computerId", "generation", "leaseEpoch"):
                 if b[k] != exp[k]:

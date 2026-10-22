@@ -128,7 +128,7 @@ async function mintCodePreviewUrl (computerId) {
     // 187505ms with `errorCode: unknown`; retry two seconds later resolved in
     // 5460ms). Re-implementing the loop here is how the two surfaces would
     // stop waiting for the same length of time — see `withWakeAndOneRetry`.
-    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl');
+    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl', computerId);
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
@@ -187,9 +187,7 @@ async function mintCodePreviewUrlOnce (computerId) {
         return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.' };
     }
 
-    if ( data?.ok !== true ) {
-        return { ok: false, errorCode: data?.errorCode ?? 'unknown' };
-    }
+    if ( data?.ok !== true ) return session.pendingOrRefused(data);
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // `session.js`'s `previewUrl()` follows for `appPreviewUrl`.
@@ -293,7 +291,8 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
-    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
+    const progress = AppSpinner({ label: 'Opening Code…', isMigrating: () => session.isComputeMigrating(computer.id),
+        onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -583,9 +582,14 @@ export async function openCodeWindow (ctx = {}) {
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
+    // Restart desktop (Settings → Troubleshoot) restarts code-server too on an AWS host, and the
+    // open frame then shows "Cannot reconnect". Re-mint for the same computer (live 2026-10-22).
+    const on_restarted = (e) => { if ( ! disposed && e?.detail?.computerId === computer.id ) void start_boot(); };
+
     const dispose = () => {
         if (disposed) return;
         disposed = true;
+        window.removeEventListener('ezil:desktop-restarted', on_restarted);
         nativeSurface?.dispose();
         stop_timers();
         stop_runtime_recheck?.();
@@ -610,6 +614,7 @@ export async function openCodeWindow (ctx = {}) {
         return true;
     };
     window.addEventListener('ezil:teardown', dispose);
+    window.addEventListener('ezil:desktop-restarted', on_restarted);
 
     void start_boot();
     return el_window;

@@ -1,3 +1,4 @@
+import { reopenMigrationHeads } from './workspace-migration-export';
 /**
  * C-7 migration fence (plan P4c): the terminal `migrated` head, the late
  * Cloudflare flush it must refuse, GC suspension while an export runs, and the
@@ -84,6 +85,20 @@ async function committed() {
 }
 
 describe.skipIf(NO_POSIX_HOST)('terminal migrated head (C-7)', () => {
+  it('restores the exact previous head and allows a real container checkpoint after reopening', async () => {
+    const { root, bucket, etag } = await committed();
+    const previous = JSON.parse(bucket.headBytes());
+    expect((await writeMigratedHead({ bucket, realPrefix: prefix, targetProvider: 'aws-ec2', expectedEtag: etag })).ok).toBe(true);
+    expect((await flush(root, bucket)).skippedReason).toBe('migrated');
+    await bucket.put(`${prefix}/${MIGRATING_FLAG}`, '{}');
+    await reopenMigrationHeads(bucket, prefix, null, bucket.data.get(headKey)!.etag);
+    expect(JSON.parse(bucket.headBytes())).toEqual(previous);
+    expect(bucket.data.has(`${prefix}/${MIGRATING_FLAG}`)).toBe(false);
+    await writeFile(`${root}/a.txt`, 'after rollback');
+    expect((await flush(root, bucket)).ok).toBe(true);
+    expect(parseSnapshot(bucket.headBytes()).generation).not.toBe(previous.generation);
+  });
+
   it('is written by CAS over the exported head and keeps it addressable', async () => {
     const { bucket, etag } = await committed();
     const exported = parseSnapshot(bucket.headBytes());

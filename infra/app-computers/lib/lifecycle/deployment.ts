@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DIGEST } from './strict-json.js';
 
 /** R10: closed allowlist. A deployment may narrow this list but never extend it.
  * - t3a.medium / t3.medium (2 vCPU / 4 GiB): the free tier. The founder decided
@@ -7,8 +8,9 @@ import { z } from 'zod';
  *   credits (`BURSTABLE_CREDITS`), so a free computer is throttled to its
  *   baseline instead of billing surplus credits.
  * - m6i.large (2 vCPU / 8 GiB): the upgraded tier.
- * - c6i.xlarge (4 vCPU / 8 GiB): benchmarks only. */
-export const INSTANCE_TYPES = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'] as const;
+ * - c6i.xlarge (4 vCPU / 8 GiB): benchmarks only.
+ * - m6i.xlarge / m6i.2xlarge (4 / 8 vCPU): paid Compute sizes cmp-4 / cmp-8, billing v2. */
+export const INSTANCE_TYPES = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'] as const;
 export const InstanceTypeSchema = z.enum(INSTANCE_TYPES);
 export type InstanceType = z.infer<typeof InstanceTypeSchema>;
 /** Burstable (T-family) types. T3/T3a launch with UNLIMITED credits by
@@ -17,19 +19,23 @@ export const isBurstable = (type: string): boolean => /^t\d[a-z]*\./.test(type);
 export const BURSTABLE_CREDITS = { CpuCredits: 'standard' } as const;
 /** Tier -> instance types in preference order (the first type with capacity
  * wins). Every type must be in INSTANCE_TYPES. */
-export const COMPUTER_TIERS = ['free', 'plus'] as const;
+export const COMPUTER_TIERS = ['free', 'plus', 'compute4', 'compute8'] as const;
 export const TierSchema = z.enum(COMPUTER_TIERS);
 export type ComputerTier = z.infer<typeof TierSchema>;
 export const TierMapSchema = z.object({
     free: z.array(InstanceTypeSchema).min(1),
     plus: z.array(InstanceTypeSchema).min(1),
+    compute4: z.array(InstanceTypeSchema).min(1),
+    compute8: z.array(InstanceTypeSchema).min(1),
 }).strict().superRefine((m, ctx) => {
     for (const tier of COMPUTER_TIERS) if (new Set(m[tier]).size !== m[tier].length)
         ctx.addIssue({ code: 'custom', path: [tier], message: 'duplicate_instance_type' });
 });
 export type TierMap = z.infer<typeof TierMapSchema>;
-/** free = 2 vCPU / 4 GiB (burstable, standard credits); plus = 2 vCPU / 8 GiB. */
-export const TIER_INSTANCE_TYPES: TierMap = TierMapSchema.parse({ free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'] });
+/** free = 2 vCPU / 4 GiB (burstable); plus = 2 / 8; compute4 = 4 / 16; compute8 = 8 / 32. */
+export const TIER_INSTANCE_TYPES: TierMap = TierMapSchema.parse({
+    free: ['t3a.medium', 't3.medium'], plus: ['m6i.large'], compute4: ['m6i.xlarge'], compute8: ['m6i.2xlarge'],
+});
 
 /** R1: one commercial region per deployment, configured. */
 export const REGION_PATTERN = /^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$/;
@@ -83,8 +89,21 @@ export const LifecycleDeploymentSchema = z.object({
     amiId: z.string().regex(/^ami-[a-f0-9]{17}$/), namespace: NamespaceSchema,
     instanceTypes: z.array(InstanceTypeSchema).min(1).max(INSTANCE_TYPES.length),
     storage: StorageSchema,
-    dataKeyArn: z.string(), stateMachineVersionArn: z.string(),
+    dataKeyArn: z.string(), stateMachineVersionArn: z.string().max(300),
+    lowerImageDigest: DIGEST.optional(), previousLowerImageDigest: DIGEST.nullable().optional(),
+    preparationStateMachineVersionArn: z.string().max(300).optional(),
+    recoveryStateMachineVersionArn: z.string().max(300).optional(),
 }).strict().superRefine((d, ctx) => {
+    const tuple = [d.lowerImageDigest, d.previousLowerImageDigest, d.preparationStateMachineVersionArn, d.recoveryStateMachineVersionArn];
+    if (tuple.some(v => v !== undefined)) {
+        if (tuple.some(v => v === undefined) || d.lowerImageDigest === d.previousLowerImageDigest)
+            ctx.addIssue({ code: 'custom', message: 'invalid_release_tuple' });
+        for (const [field, name] of [['preparationStateMachineVersionArn', 'rebase-preparation'], ['recoveryStateMachineVersionArn', 'recovery']] as const) {
+            if (!new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:[1-9][0-9]*$`).test(d[field] ?? '')
+                || machineName(d[field] ?? '') === machineName(d.stateMachineVersionArn))
+                ctx.addIssue({ code: 'custom', path: [field], message: 'invalid_release_workflow' });
+        }
+    }
     if (!zoneIdMatchesRegion(d.zoneId, d.region)) ctx.addIssue({ code: 'custom', path: ['zoneId'], message: 'zone_not_in_region' });
     // Exec-role IAM scopes state machines to ezil-<ns>-* names.
     if (!machineName(d.stateMachineVersionArn).startsWith(`ezil-${d.namespace}-`))
@@ -99,3 +118,35 @@ export const LifecycleDeploymentSchema = z.object({
     }
 });
 export type LifecycleDeployment = z.infer<typeof LifecycleDeploymentSchema>;
+
+/** Historical source metadata never authorizes a target launch. Keep the same
+ * field order as the app: null workflow pins are part of the hashed document. */
+export const SourceLifecycleDeploymentSchema = LifecycleDeploymentSchema.innerType().extend({
+    lowerImageDigest: DIGEST,
+    previousLowerImageDigest: DIGEST.nullable(),
+    preparationStateMachineVersionArn: z.string().max(300).nullable(),
+    recoveryStateMachineVersionArn: z.string().max(300).nullable(),
+}).superRefine((d, ctx) => {
+    const { lowerImageDigest, previousLowerImageDigest, preparationStateMachineVersionArn, recoveryStateMachineVersionArn, ...base } = d;
+    if (!LifecycleDeploymentSchema.safeParse(base).success || lowerImageDigest === previousLowerImageDigest
+        || (preparationStateMachineVersionArn !== null && recoveryStateMachineVersionArn !== null && !LifecycleDeploymentSchema.safeParse(d).success))
+        ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    for (const [arn, name] of [[preparationStateMachineVersionArn, 'rebase-preparation'], [recoveryStateMachineVersionArn, 'recovery']] as const) {
+        if (arn !== null && !new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:[1-9][0-9]*$`).test(arn))
+            ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    }
+});
+export type SourceLifecycleDeployment = z.infer<typeof SourceLifecycleDeploymentSchema>;
+
+/** A legacy AMI uses the verified preparation's current workflows for rollback.
+ * Preserve every source resource pin; never weaken the target deployment schema. */
+export function recoveryDeploymentFor(source: SourceLifecycleDeployment, target: LifecycleDeployment): LifecycleDeployment {
+    const s = SourceLifecycleDeploymentSchema.parse(source), d = LifecycleDeploymentSchema.parse(target);
+    if (s.preparationStateMachineVersionArn !== null && s.recoveryStateMachineVersionArn !== null)
+        return LifecycleDeploymentSchema.parse(s);
+    if ((['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'] as const).some(k => s[k] !== d[k])
+        || d.previousLowerImageDigest !== s.lowerImageDigest) throw new Error('restore_lineage_mismatch');
+    return LifecycleDeploymentSchema.parse({ ...s, stateMachineVersionArn: d.stateMachineVersionArn,
+        preparationStateMachineVersionArn: d.preparationStateMachineVersionArn,
+        recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn });
+}

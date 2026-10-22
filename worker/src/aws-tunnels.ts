@@ -327,6 +327,17 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
   }
 
   return {
+    // Internal Worker RPC only. Serialize against fencing and concurrent desktop opens;
+    // retries for one host boot must deliver the same token to the running container.
+    aiNonce: (generation: number, leaseEpoch: number, bootId: string): Promise<string | null> => serial(async () => {
+      if (!/^[0-9a-f-]{36}$/.test(bootId)) return null;
+      const rec = await liveRecord();
+      if (!rec || rec.generation !== generation || rec.leaseEpoch !== leaseEpoch) return null;
+      if (rec.aiBootId === bootId && rec.aiProxyNonce) return rec.aiProxyNonce;
+      const nonce = crypto.randomUUID();
+      await deps.storage.put(RECORD_KEY, { ...rec, aiBootId: bootId, aiProxyNonce: nonce });
+      return nonce;
+    }),
     // Browser forwarding uses this lookup, so it must never return a stale verified record.
     get: (): Promise<AwsTunnelRecord | null> => serial(async () => {
       const rec = await liveRecord();
@@ -444,7 +455,7 @@ export interface AwsTunnelEnv {
 }
 
 /** Internal protocol between the Worker and its registry object (never exposed to clients). */
-export const REGISTRY_PATHS = { create: '/create', remove: '/remove', get: '/get', verifyOrigin: '/verify-origin' } as const;
+export const REGISTRY_PATHS = { create: '/create', remove: '/remove', get: '/get', verifyOrigin: '/verify-origin', aiNonce: '/ai-nonce' } as const;
 
 /**
  * One per sandbox (`idFromName(sandboxId)`). Classic Durable Object `fetch` interface, so
@@ -476,6 +487,11 @@ export class AwsTunnelRegistry {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const reply = (r: TunnelResult) => new Response(JSON.stringify(r.body), { status: r.status, headers: { 'content-type': 'application/json' } });
+    if (request.method === 'POST' && path === REGISTRY_PATHS.aiNonce) {
+      const b = await request.json() as { generation: number; leaseEpoch: number; bootId: string };
+      const nonce = await this.service.aiNonce(b.generation, b.leaseEpoch, b.bootId);
+      return reply({ status: nonce ? 200 : 409, body: { nonce } });
+    }
     if (request.method === 'GET' && path === REGISTRY_PATHS.get) {
       return new Response(JSON.stringify({ record: await this.service.get() }), { headers: { 'content-type': 'application/json' } });
     }

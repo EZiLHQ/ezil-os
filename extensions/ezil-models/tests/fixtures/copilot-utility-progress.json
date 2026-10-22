@@ -1,0 +1,48 @@
+{
+  "time": "2026-09-29T11:56:32.864Z",
+  "method": "POST",
+  "path": "/v2/chat",
+  "headers": {
+    "host": "127.0.0.1:18790",
+    "connection": "keep-alive",
+    "content-type": "application/json",
+    "accept": "*/*",
+    "accept-language": "*",
+    "sec-fetch-mode": "cors",
+    "user-agent": "node",
+    "accept-encoding": "gzip, deflate",
+    "content-length": "1535"
+  },
+  "body": {
+    "model": "ezil-probe-tools",
+    "options": {
+      "toolMode": 1,
+      "modelOptions": {
+        "_capturingTokenCorrelationId": "a938ad49-80a6-4477-94c9-9e966ee27688",
+        "_otelTraceContext": null
+      },
+      "requestInitiator": "github.copilot-chat"
+    },
+    "tools": [],
+    "messages": [
+      {
+        "role": "system",
+        "parts": [
+          {
+            "type": "text",
+            "value": "You are an expert in writing short, catchy, and encouraging progress messages for a coding assistant.\nThe messages are shown to users while they wait for an AI to generating new code from scratch based on a user request.\n\nFollow Microsoft content policies.\nAvoid content that violates copyrights.\nIf you are asked to generate content that is harmful, hateful, racist, sexist, lewd, or violent, only respond with \"Sorry, I can't assist with that.\"\nKeep your answers short and impersonal.\n\nGuidelines for the messages:\n- Each message should be 2-4 words\n- Be encouraging and slightly playful\n- Reference coding/programming themes\n- Avoid technical jargon that would confuse beginners\n- Do not use emojis\n- Do not use punctuation at the end\n- Each message should be unique and different from the others\n- Return messages as a JSON array of strings, nothing else\n\nExamples of good progress messages:\n- Warming up the algorithms\n- Brewing some fresh code\n- Crafting your solution\n- Thinking through the logic\n- Almost there, hang tight\n"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "value": "Please generate exactly 10 unique progress messages for the \"generate code\" scenario.\nReturn only a JSON array of strings, no other text."
+          }
+        ]
+      }
+    ]
+  }
+}

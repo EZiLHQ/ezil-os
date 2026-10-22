@@ -1,6 +1,6 @@
 [Unit]
 Description=EZiL AWS computer host (I4)
-Wants=ezil-agent.service ezil-edge.service ezil-cloudflared.service ezil-desktop.service
-After=ezil-agent.service ezil-edge.service ezil-cloudflared.service ezil-desktop.service
+Wants=ezil-maintenance-enroll.service ezil-agent.service ezil-edge.service ezil-cloudflared.service ezil-desktop.service
+After=ezil-maintenance-enroll.service ezil-agent.service ezil-edge.service ezil-cloudflared.service ezil-desktop.service
 [Install]
 WantedBy=multi-user.target

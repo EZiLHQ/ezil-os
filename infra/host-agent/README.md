@@ -10,6 +10,63 @@ C-4, C-6, and §3a. The S1 spike (`feat/aws-s1-runtime-spike`) holds the runtime
 The runtime agent uses Python 3 standard library only and makes no AWS API calls.
 The AMI build uses its temporary instance role to pull the desktop image from ECR.
 
+## Pool mode
+
+A lease `{kind:"pool", poolHostId, poolGeneration, appOrigin?}` (optional `v:1`)
+skips disk discovery at boot. `appOrigin` must be an HTTPS origin; when omitted,
+the origin of the existing baked `enrollUrl` is used. No new environment settings
+are required. The guard unit enrolls the pool host and starts a disposable desktop
+using `stateDir/pool-desktop` for its writable overlay, workspace and profiles.
+It has no user disk, tunnel or control key. Readiness requires both Neko on 8181
+and code-server's `/healthz` on 8443 to answer inside the running container.
+
+The pool client's wire format is:
+
+- `POST /api/compute/aws/pool/enroll`: `{poolHostId, poolGeneration,
+  identityDocument, signature}`; `signature` is the IMDS PKCS7, as in C-6.
+- `POST /api/compute/aws/pool/ready`: `{poolHostId,
+  health:{ok:true, desktop:true, editor:true}}`.
+- `GET /api/compute/aws/pool/claim`: no body. All three requests carry
+  `X-Ezil-Pool-Host-Id`, `X-Ezil-Pool-Generation`, `X-Ezil-Identity-Document`
+  (base64 of the exact document bytes), and `X-Ezil-Identity-Signature`
+  (PKCS7 base64 without whitespace). Identity material never goes into a URL.
+
+A 204 is an empty poll; polls are spaced by one second. Transport failures, 429,
+and the existing enrollment retryable responses use exponential backoff from 1
+to 30 seconds, bounded by `enrollRetrySeconds`. Other refusals and malformed
+claims stop adoption. Idle hosts refresh enrollment and readiness every five
+minutes to remain inside the contract's ten-minute enrollment window.
+
+On a claim, the host checks `ezil:fence` through IMDS tags when available. Only a
+404 on the tag collection enables the launch template's tags-disabled fallback:
+trust the fence in the identity-authenticated claim delivered over verified TLS.
+The contract specifies no independent claim-signature format. A host-only,
+fsynced `stateDir/pool-epoch.json` reserves the claim before disk access; replayed
+or lower epochs refuse, and even a later epoch cannot reuse this single-use host.
+A crash after reservation requires retirement/replacement, never pool re-entry.
+
+The volume is selected solely through its EBS serial under `/dev/disk/by-id`;
+root backing devices are excluded regardless of their NVMe names. Existing disks
+can supply their filesystem UUID via `blkid`; the regular read-only marker checks
+still verify computer, volume, UUID, generation, digest and a strictly increasing
+epoch. After enrollment, the disposable desktop stops and its scratch data is
+deleted. The existing clean/overlay/desktop chain starts the user's `/root`,
+workspace and profiles on the data disk. This switches the container/home by
+restarting the desktop; live in-process home migration is not implemented.
+
+**App-lane integration:** the minimal pinned claim omits two pieces the cold path
+uses. An optional `nonce` in the claim uses the existing C-6 enrollment unchanged.
+Without it, the host sends `{poolHostId, poolGeneration, fence}` instead of `nonce`
+to `/api/compute/aws/enroll`; the app must validate that proof against the adopted
+placement. The current cold-only endpoint needs that app-lane extension or a
+claim-provided nonce. For an unformatted new disk, the claim must additionally
+carry `provision:true` and the placement's `fsUuid`; the host refuses to invent
+either. L4c must implement the header and health shapes above. Live IMDS, runc,
+serial mounting and application interoperability still require the lead's EC2 test.
+
+Offline behavior tests:
+`python3 -m unittest discover -s infra/host-agent/test -p 'test_pool.py'`.
+
 ## Canary serial diagnostics (default off)
 
 Set `canaryConsole: true` in the baked `/etc/ezil-host/agent.json` for a canary.
@@ -273,21 +330,101 @@ The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
 
 ## Rebase job (R4, §3a.8)
 
-An image upgrade is a per-computer job.
-1. The control plane snapshots the volume.
-2. It writes a **snapshot receipt** into that epoch's user data:
-   `rebase: {snapshotId, volumeId, fromDigest, toDigest}`.
-3. The guard rebases only if all of these hold:
-   - the receipt's `fromDigest` equals the marker's digest;
-   - its `toDigest` equals this host's lower;
-   - its volume equals the lease's;
-   - the old lower is present on the AMI.
-   Without a receipt the guard refuses.
-4. It writes `in_progress` durably, runs the rebase as a subprocess, and on any non-zero
-   exit or crash records `rebase_failed`.
-   - That state blocks every later boot until the control plane restores the snapshot
-     named in the receipt; a restored volume has no state file.
-   - The desktop never starts on a half-rebased upper.
+An image upgrade is a per-computer, snapshot-gated replacement. The control plane
+fences the old writer and verifies a completed snapshot before issuing the nonce.
+Hosts have no EC2 role and cannot verify snapshot completion themselves.
+
+The lease carries both closed objects, in this serialization order:
+
+```text
+rebase: snapshotId, volumeId, fromDigest, toDigest
+rebasePermit: v, preparationJobId, launchJobId, computerId, fsUuid,
+              generation, leaseEpoch, fenceToken, issuedAt, expiresAt
+```
+
+`rebase` retains its four fields; permit `v` is integer 1. The permit binds the
+computer, filesystem and counters to the enclosing lease. UUIDs are lowercase,
+counters are integers 1..2147483647, and timestamps are canonical UTC milliseconds.
+The lifetime is exactly 600 seconds. Rebase requires `provision:false`, an existing
+volume ID and nonce, and excludes Cloudflare restore and EBS rebind. Unknown fields,
+duplicate JSON keys, nonfinite numbers, null authorizations and mismatches refuse.
+IMDS returns decoded user data: the host bounds it to 3072 UTF-8 bytes before parsing
+(the workflow wire remains standard base64, at most 4096 characters).
+
+Before remounting writable, the guard verifies marker identity/counters, the receipt
+volume and digest pair, and the previous lower's presence. It refuses future issue
+times beyond 30 seconds and requires **more than 120 seconds** until expiry. The
+subprocess gets the remaining time minus that reserve, with a monotonic deadline
+rechecked after preflight. Timeout kills and reaps the subprocess. Enrollment requests
+and retries are capped by the original expiry. Completed same-instance, same-generation,
+same-epoch reboots reuse the committed state and ignore the old permit's expiry.
+
+The worker writes `.ezil-rebase-state.json` durably before mutation and leaves it in
+place on success. The guard alone performs the commit sequence:
+
+1. Complete rebase and layout checks.
+2. Write the marker with temp write, file fsync, rename and directory fsync.
+3. Unlink the state file and fsync its directory.
+4. Publish `guard-ok`, bound to the entire committed marker tuple.
+
+A crash before cleanup remains sticky even if the marker already names the new
+lower; reboot never auto-clears that state. All downstream steps check the stamp,
+mounted volume, marker and absence of sticky state. Regular files count as identical
+to the old image only when bytes, mode, UID, GID, **ACLs and all xattrs** agree.
+Unreadable metadata is preserved. The private report is retained on the data root as
+`.ezil-rebase-report.json`, with a boot-local copy in `runDir`; user paths in it must
+not be forwarded to public logs.
+
+Enrollment appends `lowerImageDigest` after `signature`. It reads that digest from
+the committed marker via fd-relative no-follow access and checks it against the baked
+digest and guard stamp. A requested target digest is not host evidence.
+
+### EBS maintenance recovery
+
+EBS recovery is separate from Cloudflare `lease.restore`. The control plane restores
+the checkpoint to a **different volume ID**, quarantines the failed source, then
+supplies the contract v1 `ebsRestore` object:
+
+```text
+v, preparationJobId, recoveryJobId, launchJobId, snapshotId, originalVolumeId,
+volumeId, computerId, fsUuid, fromDigest, sourceGeneration, sourceLeaseEpoch,
+generation, leaseEpoch, fenceToken, issuedAt, expiresAt, maintenance
+```
+
+`maintenance` must be true, target counters must exceed the snapshot bounds, and the
+lease cannot provision or carry another restore/rebase mode. The maintenance AMI's
+baked lower must equal `fromDigest`. The guard mounts only the clone with ext4
+`ro,noload,nosuid,nodev` and inspects the original marker without following links.
+Sticky rebase state, wrong lineage, missing marker or counters above the snapshot
+bounds refuse. No formatting, profile cleanup or overlay layout work runs.
+
+After inspection the agent unmounts and mounts the clone writable, dropping `noload`
+so ext4 can recover its journal safely; it validates the marker again before the
+durable rebind. The lower digest and all upper/workspace/profile bytes are preserved.
+Only an already committed **exact** target tuple (including instance ID) may resume.
+It creates `maintenance-ok`, never `guard-ok`. Direct clean/overlay/desktop/edge/
+cloudflared/agent steps refuse this lease on every boot.
+
+`ezil-maintenance-enroll.service` depends only on the guard and reports through the
+existing enrollment URL. It appends `ebsRestore:{v,recoveryJobId,snapshotId,
+originalVolumeId,volumeId,fsUuid}` after the digest. Only
+`{maintenance:true,accepted:true}` is accepted; the durable host receipt is
+`stateDir/maintenance-enrolled.json`. No tunnel token or control key is stored.
+The receipt is durable before nonce retirement and supports an exact same-instance
+reboot. The ordinary enrollment service still requires the overlay; it cannot grant
+desktop access during maintenance. `boot-chain` routes maintenance directly to its
+receipt step after the guard.
+
+The control plane must fence the maintenance writer and take a **new** completed
+snapshot of the rebound volume before issuing a new linked rebase job. The host
+cannot verify the failed writer's epoch or snapshot/provider lineage beyond the
+locally delivered fields; app/workflow authority checks remain required.
+
+`test/test-rebase.sh` exercises real ext4 clone IDs, repeated maintenance completion,
+crashes immediately before/after marker commit, expired permits and exhausted blocks/
+inodes. It needs a disposable privileged Linux host and the reviewed local Docker
+image. Existing test-only `EZIL_REBASE_FAULT_AFTER` accepts entry counts or
+`before-marker` / `after-marker` (exit 99); production units never set it.
 
 ## AMI (`ami/`)
 
@@ -454,7 +591,7 @@ profile block. It fails against the pre-change script.
   names the check; the volume is left unmounted.
   - `epoch_not_increasing` or `generation_ahead`: a stale or duplicate lease. Recover
     through the lifecycle workflow; never hand-edit the marker.
-  - `rebase_failed`: restore the snapshot in the state file's receipt to a new volume,
+  - `rebase_failed`: restore the snapshot in the state file's receipt to a new volume and run maintenance rebind,
     then re-run the upgrade with a new receipt.
 - **Tunnel down.** Check `journalctl -u ezil-cloudflared`. A fence exit is final for that
   epoch; a new lease brings a new token.

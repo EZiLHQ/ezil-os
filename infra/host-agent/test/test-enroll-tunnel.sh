@@ -33,8 +33,8 @@ check "enroll succeeds over verified TLS (test CA, SNI app.ezil.test)" agent e e
 check "...after re-sending the same nonce through a 'retryable' 503 and a platform 502" \
     bash -c "[ \$(wc -l < '$H/stub/enroll-requests.jsonl') -eq 3 ] && [ \$(jq -r .nonce '$H/stub/enroll-requests.jsonl' | sort -u | wc -l) -eq 1 ]"
 REQ="$(tail -n 1 "$H/stub/enroll-requests.jsonl")"
-check "request = {computerId, generation, leaseEpoch, nonce, identityDocument, signature}" \
-    jq -e --arg c "$CID_COMPUTER" '(keys == ["computerId","generation","identityDocument","leaseEpoch","nonce","signature"]) and .computerId==$c and .generation==1 and .leaseEpoch==2 and (.identityDocument|fromjson|.instanceId=="i-0abc") and (.signature|startswith("MIAG"))' <<<"$REQ"
+check "request = {computerId, generation, leaseEpoch, nonce, identityDocument, signature, lowerImageDigest}" \
+    jq -e --arg c "$CID_COMPUTER" '(keys == ["computerId","generation","identityDocument","leaseEpoch","lowerImageDigest","nonce","signature"]) and .computerId==$c and .generation==1 and .leaseEpoch==2 and (.identityDocument|fromjson|.instanceId=="i-0abc") and (.signature|startswith("MIAG")) and (.lowerImageDigest|test("^sha256:[0-9a-f]{64}$"))' <<<"$REQ"
 TOKEN="$(jq -r .tunnelToken "$H/stub/issue.json")"
 check "token stored host-only: state dir 0700, file 0600, bound to (gen 1, epoch 2)" bash -c "[ \$(stat -c %a '$H/state') = 700 ] && [ \$(stat -c %a '$H/state/tunnel.json') = 600 ] && jq -e '.generation==1 and .leaseEpoch==2' '$H/state/tunnel.json'"
 check "token appears nowhere on the data volume" bash -c "! grep -rqs -- '$TOKEN' '$D'"

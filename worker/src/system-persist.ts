@@ -11,7 +11,7 @@
  */
 import { base64ToBytes, bytesToBase64 } from './project-files';
 import {
-  chunkKey, parseSnapshot, readBounded, readHead, requireSdkSuccess, sha256, validPrefix, WorkspaceMigratedError,
+  migrationFenceState, chunkKey, parseSnapshot, readBounded, readHead, requireSdkSuccess, sha256, validPrefix, WorkspaceMigratedError,
   SNAPSHOT_CHUNK_BYTES, SNAPSHOT_HEAD,
   type FlushContainerLike, type FlushR2BucketLike, type HydrateContainerLike, type HydrateR2BucketLike, type Snapshot,
 } from './workspace-persist';
@@ -50,7 +50,7 @@ export interface SystemFlushOutcome {
   checkpoint?: string;
   skippedReason?: 'no_computer' | 'not_restored' | 'stale' | 'no_baseline' | 'no_manifest' | 'busy' | 'too_large' | 'failed'
     /** The system head is the terminal migrated marker (C-7): never replaced from Cloudflare. */
-    | 'migrated';
+    | 'migrated' | 'migrating';
 }
 
 export interface SystemHydrateOutcome {
@@ -114,8 +114,13 @@ export async function flushSystemLayer(deps: {
   if (!prefix || !validPrefix(prefix)) return { ...outcome, skippedReason: 'no_computer' };
   const generation = crypto.randomUUID();
   const work = `/tmp/ezil-system-${generation}`;
+  let captureStarted = false;
   try {
+    if (await migrationFenceState(bucket, deps.realPrefix, log) === 'fresh'
+      || await migrationFenceState(bucket, prefix, log) === 'fresh') return { ...outcome, skippedReason: 'migrating' };
+
     const previous = await readHead(bucket, prefix);
+    captureStarted = true;
     const captured = JSON.parse(await run(container, { op: 'sys-capture', work })) as Record<string, unknown>;
     if (captured.skipped === 'not_restored') {
       log('[system-persist] system layer was not restored on this container; not checkpointing over it');
@@ -175,7 +180,7 @@ export async function flushSystemLayer(deps: {
     log(`[system-persist] system checkpoint failed: ${err instanceof Error ? err.message : 'unknown'}`);
     return { ...outcome, skippedReason: 'failed' };
   } finally {
-    try { await run(container, { op: 'sys-cleanup', work }, 60_000); } catch { log('[system-persist] staging cleanup failed'); }
+    try { if (captureStarted) await run(container, { op: 'sys-cleanup', work }, 60_000); } catch { log('[system-persist] staging cleanup failed'); }
   }
 }
 

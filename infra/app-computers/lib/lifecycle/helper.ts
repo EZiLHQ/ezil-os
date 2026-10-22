@@ -1,11 +1,15 @@
 import type { Instance, Volume, Tag, RunInstancesRequest } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
-import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFor, tagList, initialVolumeTags,
+import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFor, tagList, initialVolumeTags, poolTagsFor, claimTagsFor, poolLease,
     type Phase, type Action, type Settings } from './contract.js';
 import { MAX_THROTTLE_RETRIES, NO_ERROR, RecordedErrorSchema, classifyProviderError, throttleDelaySeconds, toLambdaError } from './errors.js';
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
 import { awsDependencies, type Dependencies } from './aws.js';
-import { BURSTABLE_CREDITS, isBurstable } from './deployment.js';
+import { BURSTABLE_CREDITS, isBurstable, type SourceLifecycleDeployment } from './deployment.js';
+import { assertPermitTime, parseLease } from './lease.js';
+import { matchesLifecycleDeployment, verifyPreparation } from './preparation-evidence.js';
+import { verifyMaintenance } from './maintenance-evidence.js';
+import { strictJson } from './strict-json.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases),
     lastError:RecordedErrorSchema.default(NO_ERROR),throttles:z.number().int().min(0).max(100).default(0)}).strict();
 export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
@@ -31,14 +35,31 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(execution.executionArn!==event.executionArn||execution.stateMachineArn!==machine||execution.stateMachineVersionArn!==version
             ||execution.stateMachineAliasArn||execution.redriveCount!==0||execution.status!=='RUNNING'||!execution.input
             ||Buffer.byteLength(execution.input)>20000||!execution.startDate)return fail();
-        const envelope=EnvelopeSchema.parse(JSON.parse(execution.input));
+        const envelope=EnvelopeSchema.parse(strictJson(execution.input,20000));
         const work={...envelope,createdAt:execution.startDate},i=parseLifecycleWork(work);
-        if(!equal(i.deployment,d)||execution.name!==`computer-${i.jobId}`
+        if(!await matchesLifecycleDeployment(i,d,deps)||execution.name!==`computer-${i.jobId}`
             ||event.executionArn!==machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`)return fail('lifecycle_invalid');
         const now=deps.now(),started=execution.startDate.getTime();
         if(!Number.isFinite(started)||started>now+30000||now-started>900000)return fail('lifecycle_expired');
         if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
+        const maintenance = i.rebasePreparation && parseLease(i.userData!).ebsRestore;
         const action=async(name:Action,parameters:object)=>{
+            if (maintenance) {
+                const current = await deps.volumes([i.dataVolumeId!]);
+                if (current.length !== 1) return fail('restore_lineage_mismatch');
+                await verifyMaintenance(i, current[0]!, deps, name === 'runInstances' || name === 'runBurstableInstances');
+            }
+            if (i.rebasePreparation && !maintenance && (name === 'runInstances' || name === 'runBurstableInstances')) {
+                const lease = parseLease(i.userData!);
+                const verified = await verifyPreparation(i.rebasePreparation, d.preparationStateMachineVersionArn!, deps);
+                const p = verified.document, receipt = verified.receipt;
+                if (!equal(p.deployment, d) || p.computerId !== i.computerId || p.sourceVolumeId !== i.dataVolumeId
+                    || p.sourceInstanceId !== i.previousInstanceId || p.sourceGeneration !== i.previousGeneration
+                    || p.sourceFenceToken !== i.previousFenceToken || p.fsUuid !== lease.fsUuid || p.sourceLeaseEpoch >= i.leaseEpoch
+                    || lease.rebase?.snapshotId !== receipt.snapshotId || lease.rebase.fromDigest !== p.fromDigest || lease.rebase.toDigest !== p.toDigest
+                    || Date.parse(lease.rebasePermit!.issuedAt) < verified.stoppedAt) return fail('snapshot_identity_mismatch');
+                assertPermitTime(lease, deps.now());
+            }
             // Reads can consume time. Recheck authority immediately before
             // returning a mutation and leave its 30-second task window intact.
             if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
@@ -55,6 +76,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             return {decision:'backoff',phase:'initial',delaySeconds:throttleDelaySeconds(event.throttles)};
         }
         if(previous.kind==='failed')return {decision:'rejected',code:previous.code};
+        if(['pool-provision','adopt','release'].includes(i.operation))return observePool(i,envelope.digest,event.phase,deps,action);
         const tags=tagsFor(i),phase=event.phase,newInstance=['provision','replace'].includes(i.operation);
         const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(envelope.digest,'volume')});
         if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
@@ -71,8 +93,17 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(!tagged(v.Tags,tags)&&!(i.operation==='replace'&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
+        // Bind historical source identity to its retained deployment, including
+        // a different approved subnet in the same AZ. Maintenance also proves
+        // custody of the failed original volume before using its clone.
+        const preparation = i.rebasePreparation ? (maintenance ? await verifyMaintenance(i, v, deps)
+            : await verifyPreparation(i.rebasePreparation, d.preparationStateMachineVersionArn!, deps)) : undefined;
+        if (preparation && (preparation.document.sourceInstanceId !== i.previousInstanceId
+            || preparation.document.sourceGeneration !== i.previousGeneration || preparation.document.sourceFenceToken !== i.previousFenceToken))
+            return fail('source_identity_mismatch');
+        const sourceIntent = preparation ? { ...i, deployment: preparation.document.sourceDeployment } : i;
         const sourceId=i.previousInstanceId??i.providerInstanceId;
-        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,['replace','retire','stop'].includes(i.operation)):undefined;
+        const source=sourceId?await getInstance(sourceId,previousTags,sourceIntent,deps,['replace','retire','stop'].includes(i.operation)):undefined;
         // A replace whose previous instance EC2 no longer knows (the app's instance_lost recovery)
         // has nothing to stop or terminate. The volume must not claim an attachment to it; the
         // launch below still requires the volume `available` and unattached, and its tags were
@@ -93,6 +124,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
             return lostStop(i,envelope.digest,sourceId,v.VolumeId);
         }
+        if (maintenance && source && source.State?.Name !== 'terminated') return fail('writer_not_fenced');
         if(source&&['stop','retire','replace'].includes(i.operation)){
             const status=source.State?.Name;
             if(status==='terminated'){
@@ -155,6 +187,9 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
                 if(!tagged(v.Tags,{...tags,...{'ezil:generation':String(i.previousGeneration),'ezil:fence-token':i.previousFenceToken!}}))return fail('lifecycle_volume_invalid');
                 return action('createTags',{Resources:[v.VolumeId],Tags:tagList(retagsFor(i))});
             }
+            // §9: this branch is reached only after DescribeVolumes above has
+            // observed BOTH target tag values. A CreateTags API response or
+            // phase='tagged' alone can never authorize a target receipt.
             if(v.State==='available'&&v.Attachments.length===0){
                 if(phase==='attached')return wait(phase);
                 if(target.State?.Name!=='running')return wait(phase);
@@ -187,18 +222,146 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         return action('startInstances',{InstanceIds:[targetId]});
     };
 }
-function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string,state:LifecycleReceipt['state']){
+function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string|null,state:LifecycleReceipt['state']){
     return {decision:'success',receipt:{schemaVersion:1,jobId:i.jobId,digest,computerId:i.computerId,
         generation:i.targetGeneration,leaseEpoch:i.leaseEpoch,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
+}
+type Dispatch = (name:Action,parameters:object)=>Promise<Record<string,unknown>>;
+/** Pool steps share the execution/authority/error gates above. Only the graph
+ * mutates EC2; a lost non-idempotent reply is observed until the deadline. */
+async function observePool(i:LifecycleIntent,digest:string,phase:Phase,deps:Dependencies,action:Dispatch):Promise<Record<string,unknown>>{
+    const d=i.deployment,claim=claimTagsFor(i);
+    const rows=await deps.instances(i.operation==='pool-provision'?{token:token(digest,'instance')}:[i.providerInstanceId!]);
+    if(rows.length>1)return fail('lifecycle_instance_ambiguous');
+    const host=rows[0]?.instance;
+    if(host){
+        if(rows[0]?.owner!==d.accountId || (i.providerInstanceId!==null&&host.InstanceId!==i.providerInstanceId))return fail('lifecycle_instance_invalid');
+        assertEffectiveInstance(host,i);
+        if(!instanceId(host.InstanceId)||host.Placement?.AvailabilityZoneId!==d.zoneId)return fail('lifecycle_instance_invalid');
+    }
+    if(i.operation==='pool-provision'){
+        if(!host)return action('runInstances',await launchParameters(i,digest,deps));
+        if(host.ClientToken!==token(digest,'instance')||!tagged(host.Tags,poolTagsFor(i))
+            ||host.Tags?.some(t=>['ezil:computer','ezil:computer-id','ezil:fence'].includes(t.Key??'')))return fail('lifecycle_instance_invalid');
+        if(host.State?.Name==='pending')return wait(phase);
+        if(host.State?.Name!=='running')return fail('lifecycle_instance_invalid');
+        assertPoolDisks(host,d);
+        const done=success(i,digest,host.InstanceId!,null,'running');
+        return {...done,receipt:{...done.receipt,poolHostId:i.poolHostId!,poolGeneration:i.poolGeneration!}};
+    }
+    if(i.operation==='adopt'){
+        if(!host||host.State?.Name!=='running')return fail('lifecycle_instance_invalid');
+        const base=poolTagsFor(i),{['ezil:pool']:ignored,...identity}=base;
+        if(!tagged(host.Tags,identity))return fail('lifecycle_instance_invalid');
+        // A completed claim is the only acceptable replay of a non-pool host.
+        const claimed=tagged(host.Tags,claim),hasClaim=host.Tags?.some(t=>['ezil:computer','ezil:generation','ezil:fence','ezil:computer-id'].includes(t.Key??''));
+        if((hasClaim&&!claimed)||(!claimed&&!tagged(host.Tags,{'ezil:pool':'1'})))return fail('lifecycle_instance_invalid');
+        if(host.Tags?.some(t=>t.Key==='ezil:pool')&&!tagged(host.Tags,{'ezil:pool':'1'}))return fail('lifecycle_instance_invalid');
+    }else if(host){
+        if(!tagged(host.Tags,{'ezil:managed-by':'app-computer-platform','ezil:stage':d.namespace,'ezil:namespace':d.namespace,...claim})
+            ||host.Tags?.some(t=>t.Key==='ezil:pool'))return fail('lifecycle_instance_invalid');
+    }
+    const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(digest,'volume')});
+    if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
+    const v=volumes[0];
+    if(!v){
+        if(i.operation!=='adopt'||i.dataVolumeId!==null||!['initial','volume'].includes(phase))return fail('lifecycle_volume_invalid');
+        assertPoolDisks(host!,d);
+        return action('createVolume',{AvailabilityZoneId:d.zoneId,Size:i.dataVolumeGiB,VolumeType:'gp3',Iops:3000,Throughput:125,
+            Encrypted:true,KmsKeyId:d.dataKeyArn,ClientToken:token(digest,'volume'),
+            TagSpecifications:[{ResourceType:'volume',Tags:tagList({...initialVolumeTags(i,digest),...claim})}]});
+    }
+    if(!volumeId(v.VolumeId)||(i.dataVolumeId!==null&&v.VolumeId!==i.dataVolumeId)||v.VolumeType!=='gp3'||!dataSizeValid(v.Size,d)
+        ||v.Encrypted!==true||v.KmsKeyId!==d.dataKeyArn||v.AvailabilityZoneId!==d.zoneId||v.MultiAttachEnabled!==false||!Array.isArray(v.Attachments))return fail('lifecycle_volume_invalid');
+    const ownership={'ezil:managed-by':'app-computer-platform','ezil:stage':d.namespace,'ezil:computer-id':i.computerId};
+    if(!tagged(v.Tags,ownership))return fail('lifecycle_volume_invalid');
+    if(i.operation==='adopt'){
+        if(v.Tags?.some(t=>t.Key==='ezil:computer')&&!tagged(v.Tags,{'ezil:computer':i.computerId}))return fail('lifecycle_volume_invalid');
+        if(i.dataVolumeId===null&&!tagged(v.Tags,{...initialVolumeTags(i,digest),...claim}))return fail('lifecycle_volume_invalid');
+        // An old generation may move forward only on a free, owned volume.
+        // Equal generations must already have this fence; newer ones never move back.
+        const generation=v.Tags?.filter(t=>t.Key==='ezil:generation'),fence=v.Tags?.filter(t=>t.Key==='ezil:fence-token');
+        const g=generation?.[0]?.Value;
+        if(generation?.length!==1||!g||!/^\d+$/.test(g)||Number(g)<1||Number(g)>i.targetGeneration||fence?.length!==1
+            ||!fence[0]?.Value||!/^[a-f0-9-]{36}$/.test(fence[0].Value)
+            ||(Number(g)===i.targetGeneration&&fence[0].Value!==i.fenceToken))return fail('lifecycle_volume_invalid');
+        assertPoolDisks(host!,d,v.VolumeId);
+        if(v.State==='creating')return wait(phase);
+        if(!tagged(v.Tags,{...tagsFor(i),...claim})){
+            if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
+            if(phase==='tagged')return wait(phase);
+            return action('createTags',{Resources:[v.VolumeId],Tags:tagList({...retagsFor(i),...claim})});
+        }
+        if(v.State==='available'&&v.Attachments.length===0){
+            // A claimed host must not reacquire a disk after it was released.
+            if(tagged(host!.Tags,claim))return fail('lifecycle_attachment_invalid');
+            if(phase==='attached')return wait(phase);
+            return action('attachVolume',{Device:DATA_DEVICE,InstanceId:host!.InstanceId,VolumeId:v.VolumeId});
+        }
+        if(v.Attachments.length!==1||v.Attachments[0]?.InstanceId!==host!.InstanceId||v.Attachments[0]?.VolumeId!==v.VolumeId)return fail('lifecycle_attachment_invalid');
+        if(v.Attachments[0]?.State==='attaching'||!host!.BlockDeviceMappings?.some(m=>m.Ebs?.VolumeId===v.VolumeId))return wait(phase);
+        assertAttached(host!,v,host!.InstanceId!);
+        if(!tagged(host!.Tags,claim)){
+            if(phase==='claimed')return wait(phase);
+            return action('claimInstance',{Resources:[host!.InstanceId],Tags:tagList(claim)});
+        }
+        if(host!.Tags?.some(t=>t.Key==='ezil:pool')){
+            if(phase==='unpooled')return wait(phase);
+            return action('deleteTags',{Resources:[host!.InstanceId],Tags:[{Key:'ezil:pool',Value:'1'}]});
+        }
+        return success(i,digest,host!.InstanceId!,v.VolumeId,'running');
+    }
+    if(!tagged(v.Tags,{...tagsFor(i),...claim}))return fail('lifecycle_volume_invalid');
+    const free=v.State==='available'&&v.Attachments.length===0;
+    if(!host||host.State?.Name==='terminated'){
+        if(!free)return fail('lifecycle_attachment_invalid');
+        return success(i,digest,i.providerInstanceId!,v.VolumeId,'retired');
+    }
+    assertPoolDisks(host,d,v.VolumeId);
+    const status=host.State?.Name;
+    if(status==='shutting-down'){
+        if(!free)return fail('lifecycle_attachment_invalid');
+        return wait(phase);
+    }
+    if(status==='stopping')return wait(phase);
+    if(status==='running'){
+        assertAttached(host,v,host.InstanceId!);
+        if(phase!=='initial')return wait(phase);
+        return action('stopInstances',{InstanceIds:[host.InstanceId],Force:false,Hibernate:false,SkipOsShutdown:false});
+    }
+    if(status!=='stopped')return fail('lifecycle_instance_invalid');
+    if(free){
+        if(host.BlockDeviceMappings?.some(m=>m.DeviceName===DATA_DEVICE))return wait(phase);
+        if(!['initial','stopped','detached'].includes(phase))return wait(phase);
+        return action('terminateInstances',{InstanceIds:[host.InstanceId]});
+    }
+    if(v.Attachments.length!==1||v.Attachments[0]?.InstanceId!==host.InstanceId||v.Attachments[0]?.VolumeId!==v.VolumeId)return fail('lifecycle_attachment_invalid');
+    if(v.Attachments[0]?.State==='detaching')return wait(phase);
+    assertAttached(host,v,host.InstanceId!);
+    if(!['initial','stopped'].includes(phase))return wait(phase);
+    return action('detachVolume',{Device:DATA_DEVICE,InstanceId:host.InstanceId,VolumeId:v.VolumeId,Force:false});
+}
+/** Pool hosts are root-only until adoption; never terminate unexpected disks. */
+function assertPoolDisks(host:Instance,d:Settings['deployment'],dataVolumeId?:string){
+    const maps=host.BlockDeviceMappings,root=maps?.filter(m=>m.DeviceName===d.storage.rootDeviceName);
+    if(!Array.isArray(maps)||root?.length!==1||!volumeId(root[0]?.Ebs?.VolumeId)||root[0]?.Ebs?.DeleteOnTermination!==true
+        ||root[0]?.Ebs?.Status!=='attached'||maps.some(m=>m.DeviceName!==d.storage.rootDeviceName
+            &&!(dataVolumeId&&m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===dataVolumeId)))return fail('lifecycle_unexpected_disk');
 }
 /** A stop whose instance is gone: a `stopped` receipt marked `instanceLost`. */
 function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string){
     const done=success(i,digest,instanceId,volumeId,'stopped');
     return {...done,receipt:{...done.receipt,instanceLost:true as const} satisfies LifecycleReceipt};
 }
-function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
+type InstanceIdentity = { deployment: Pick<SourceLifecycleDeployment, 'accountId' | 'subnetId' | 'zoneId'> };
+function assertIdentity(instance:Instance,tags:Record<string,string>,i:InstanceIdentity){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
-    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)||instance.SubnetId!==i.deployment.subnetId
+    // EC2 clears SubnetId on a terminating (shutting-down) or terminated instance but keeps its id
+    // and tags, so such a source is identified by those; a subnet that IS reported must still be
+    // the configured one. Seen live: shutting-down with no SubnetId (2026-10-22 11:55Z).
+    const terminated=instance.State?.Name==='terminated'||instance.State?.Name==='shutting-down';
+    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)
+        ||(terminated?instance.SubnetId!==undefined&&instance.SubnetId!==i.deployment.subnetId:instance.SubnetId!==i.deployment.subnetId)
         ||(instance.Placement?.AvailabilityZoneId!==undefined&&instance.Placement.AvailabilityZoneId!==i.deployment.zoneId))return fail('lifecycle_instance_invalid');
 }
 /** Terminate guard: an instance carrying anything beyond its root disk and
@@ -211,13 +374,13 @@ export function assertOnlyExpectedDisks(instance:Instance,v:Volume,rootDeviceNam
 }
 /** `allowAbsent` (replace and retire only): EC2 no longer knowing the instance at all is an answer,
  * not a failure. Nothing else is relaxed: an instance that exists must still be exactly this one. */
-async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies,allowAbsent=false){
+async function getInstance(id:string,tags:Record<string,string>,i:InstanceIdentity,deps:Dependencies,allowAbsent=false){
     const rows=await deps.instances([id]);
     if(rows.length===0&&allowAbsent)return undefined;
     if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
     assertIdentity(rows[0].instance,tags,i);return rows[0].instance;
 }
-function assertAttached(instance:Instance,v:Volume,id:string){
+export function assertAttached(instance:Instance,v:Volume,id:string){
     const m=instance.BlockDeviceMappings?.filter(m=>m.Ebs?.VolumeId===v.VolumeId),a=v.Attachments?.[0];
     if(v.State!=='in-use'||m?.length!==1||m[0]?.DeviceName!==DATA_DEVICE||m[0]?.Ebs?.Status!=='attached'||m[0]?.Ebs?.DeleteOnTermination!==false
         ||v.Attachments?.length!==1||a?.InstanceId!==id||a.VolumeId!==v.VolumeId||a.State!=='attached'||a.Device!==DATA_DEVICE||a.DeleteOnTermination!==false)return fail('lifecycle_attachment_invalid');
@@ -230,14 +393,18 @@ function assertEffectiveInstance(v:Instance,i:LifecycleIntent){
         ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1
         ||v.MetadataOptions.InstanceMetadataTags!=='disabled'||v.HibernationOptions?.Configured===true)return fail('lifecycle_instance_invalid');
 }
-async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
+export async function launchParameters(i:LifecycleIntent,digest:string,deps:Pick<Dependencies, 'image' | 'template'>):Promise<RunInstancesRequest>{
     const d=i.deployment;
     const [image,template]=await Promise.all([deps.image(d.amiId),deps.template(d.launchTemplateId,d.launchTemplateVersion)]);
     const t=template?.LaunchTemplateData;
+    // Exactly one EBS mapping (the root). Instance-store placeholders (`ephemeralN`, no Ebs) carry no
+    // data and are inherited from Ubuntu parents by Image Builder AMIs; anything else is refused.
+    const imageEbs=image?.BlockDeviceMappings?.filter(m=>m.Ebs)??[];
+    const onlyEphemeralExtras=(image?.BlockDeviceMappings??[]).every(m=>m.Ebs||(/^ephemeral[0-9]+$/.test(m.VirtualName??'')&&m.NoDevice===undefined));
     if(image?.ImageId!==d.amiId||image.Architecture!=='x86_64'||image.RootDeviceType!=='ebs'||image.RootDeviceName!==d.storage.rootDeviceName
-        ||image.State!=='available'||image.VirtualizationType!=='hvm'||image.BlockDeviceMappings?.length!==1
-        ||image.BlockDeviceMappings[0]?.DeviceName!==d.storage.rootDeviceName||!image.BlockDeviceMappings[0]?.Ebs?.VolumeSize
-        ||image.BlockDeviceMappings[0].Ebs.VolumeSize>d.storage.rootGiB||!t||template?.LaunchTemplateId!==d.launchTemplateId
+        ||image.State!=='available'||image.VirtualizationType!=='hvm'||imageEbs.length!==1||!onlyEphemeralExtras
+        ||imageEbs[0]?.DeviceName!==d.storage.rootDeviceName||!imageEbs[0]?.Ebs?.VolumeSize
+        ||imageEbs[0].Ebs.VolumeSize>d.storage.rootGiB||!t||template?.LaunchTemplateId!==d.launchTemplateId
         ||String(template.VersionNumber)!==d.launchTemplateVersion)return fail('lifecycle_launch_invalid');
     const allowed=['ImageId','InstanceType','SecurityGroupIds','EbsOptimized','Monitoring','MetadataOptions','BlockDeviceMappings','TagSpecifications',
         'InstanceInitiatedShutdownBehavior','HibernationOptions'];
@@ -246,14 +413,17 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
         ||!equal(t.SecurityGroupIds,[d.securityGroupId])
         ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!==d.storage.rootDeviceName)return fail('lifecycle_launch_invalid');
     return {LaunchTemplate:{LaunchTemplateId:d.launchTemplateId,Version:d.launchTemplateVersion},ImageId:d.amiId,
-        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),UserData:i.userData!,
+        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),UserData:i.operation==='pool-provision'?poolLease(i):i.userData!,
         SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],
         MetadataOptions:{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'},
         HibernationOptions:{Configured:false},
         EbsOptimized:true,Monitoring:{Enabled:false},
         // R3: the root disk is disposable (OS + pre-pulled image); the data disk is retained.
         BlockDeviceMappings:[{DeviceName:d.storage.rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:d.storage.rootGiB,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
-        TagSpecifications:[{ResourceType:'instance',Tags:tagList(tagsFor(i))},{ResourceType:'volume',Tags:tagList({...tagsFor(i),'ezil:disk-kind':'root'})}]};
+        TagSpecifications:[{ResourceType:'instance',Tags:tagList(i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i))},
+            {ResourceType:'volume',Tags:tagList({...i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i),'ezil:disk-kind':'root'})},
+            // The boundary admits the primary ENI only with the compute request tags.
+            {ResourceType:'network-interface',Tags:tagList(i.operation==='pool-provision'?poolTagsFor(i):tagsFor(i))}]};
 }
 let helper:ReturnType<typeof createLifecycleHelper>|undefined;
 export async function handler(input:unknown){

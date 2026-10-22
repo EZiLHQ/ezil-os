@@ -7,6 +7,7 @@ import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-prov
 import { AWS_BROWSER_ROUTE_TOKEN, requestAwsPreview } from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { EnsureOptions } from './provider';
+import { ENROLLMENT_FAILED, ENROLLMENT_PENDING } from './placement';
 
 const NOW = Date.parse('2026-10-14T12:00:00Z');
 const userId = '11111111-1111-4111-8111-111111111111';
@@ -15,6 +16,7 @@ const sandboxId = deriveGuacamoleSandboxId(userId, computerId);
 const config = { workerUrl: 'https://worker.preview.example/', isConfigured: true, hasHmacSecret: true };
 const options = { sessionId: 'session', desktopMode: 'neko' as const };
 const failure = { ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable' };
+const waking = { ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting' };
 const row = (over: Record<string, unknown> = {}) => placementRow({
     computer_id: computerId, owner_user_id: userId, state: 'RUNNING', generation: 7, lease_epoch: 11, ...over,
 });
@@ -43,6 +45,7 @@ beforeEach(() => {
     vi.stubEnv('EZIL_AWS_BROWSER_ZONE', 'preview.example');
     fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json(ready()));
     vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => {
     vi.useRealTimers();
@@ -76,7 +79,7 @@ describe('AWS preview handoff', () => {
         expect(signature).toBe(createHmac('sha256', 'test-secret').update([
             'v2', NOW, 'POST', '/sandbox/preview', sandboxId, computerId, userId, 'aws-ec2', '', 7, 11, digest,
         ].join('|')).digest('hex'));
-        expect(fake.statements).toHaveLength(1);
+        expect(fake.statements).toHaveLength(4);
         expect(fake.statements[0]!.sql).toContain('placement:read');
     });
 
@@ -114,12 +117,48 @@ describe('AWS preview handoff', () => {
         ['foreign', [row({ owner_user_id: '22222222-2222-4222-8222-222222222222' })]],
         ['cloudflare', [row({ provider: 'cloudflare', workspace_store: 'r2' })]],
         ['stopping', [row({ state: 'STOPPING' })]],
+        ['stopped', [row({ state: 'STOPPED' })]],
+        ['unconfirmed', [row({ state: 'UNCONFIRMED' })]],
+        ['retired', [row({ state: 'RETIRED' })]],
+        ['failed enrollment', [row({ last_error: ENROLLMENT_FAILED })]],
         ['zero generation', [row({ generation: 0 })]],
         ['zero lease', [row({ lease_epoch: 0 })]],
         ['duplicate', [row(), row()]],
     ] as const)('refuses a %s placement before fetch', async (_name, placements) => {
         await expect(setup([...placements]).open()).resolves.toEqual(failure);
         expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'])('keeps an owned %s placement waking without signing', async (state) => {
+        const { fake, open } = setup([row({ state })]);
+        await expect(open()).resolves.toEqual(waking);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(fake.placements[0]).toMatchObject({ state, generation: 7, lease_epoch: 11 });
+    });
+
+    it.each([
+        { enroll_nonce_hash: 'pending-nonce' }, { last_error: ENROLLMENT_PENDING },
+        { lifecycle_job_id: computerId }, { lifecycle_digest: 'a'.repeat(64) },
+    ])('waits for enrollment and receipt settlement before signing: %j', async (over) => {
+        await expect(setup([row(over)]).open()).resolves.toEqual(waking);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('checks ownership before reservations, without leaking the reservation or owner', async () => {
+        const { fake, open } = setup([row({ owner_user_id: '22222222-2222-4222-8222-222222222222' })]);
+        await expect(open()).resolves.toEqual(failure);
+        expect(fake.statements).toHaveLength(1);
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-preview] unavailable reason=placement_foreign');
+    });
+
+    it('refuses an image reservation without guessing or advancing its target generation', async () => {
+        const { fake, open } = setup();
+        fake.placements[0]!.image_upgrade_job_id = computerId;
+        fake.imageJobs.push({ computer_id: computerId, job_id: computerId, phase: 'verifying', target_generation: 8 });
+        await expect(open()).resolves.toEqual(failure);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(fake.placements[0]).toMatchObject({ generation: 7, lease_epoch: 11 });
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-preview] unavailable reason=placement_reserved');
     });
 
     it('reads the current epoch on every handoff', async () => {
@@ -140,7 +179,7 @@ describe('AWS preview handoff', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it.each(['aws_desktop_starting', 'aws_origin_starting'])('maps only HTTP 503 %s to waking', async (error) => {
+    it.each(['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'])('maps only HTTP 503 %s to waking', async (error) => {
         fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status: 503 }));
         await expect(setup().open()).resolves.toEqual({
             ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
@@ -149,7 +188,62 @@ describe('AWS preview handoff', () => {
         await expect(setup().open()).resolves.toEqual(failure);
     });
 
-    it.each([201, 401, 403, 404, 500, 502, 503])('refuses HTTP %s even with a success-shaped body', async (status) => {
+    it.each([
+        [502, 'aws_origin_unavailable'], [409, 'relay_busy'], [409, 'relay_runtime_changed'],
+        [409, 'relay_negotiation_busy'], [504, 'relay_timeout'],
+    ])('retries the documented Worker transient %s %s', async (status, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status }));
+        await expect(setup().open()).resolves.toEqual(waking);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+        [502, 'tunnel_origin_mismatch'], [502, 'aws_desktop_failed'], [502, 'aws_desktop_config_refused'],
+        [401, 'aws_preview_auth_required'], [403, 'aws_origin_starting'], [409, 'unknown_conflict'],
+        [503, 'unknown_starting'], [409, 'aws_desktop_unreachable'],
+    ])('keeps the invalid Worker state %s %s unavailable', async (status, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status }));
+        await expect(setup().open()).resolves.toEqual(failure);
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith(`[aws-preview] unavailable reason=worker_status_${status}`);
+    });
+
+    it.each(['success', 'epoch refusal'] as const)('discards a %s for an epoch replaced during the Worker request and signs the current pair next time', async (answer) => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            fake.placements[0]!.generation = 8;
+            fake.placements[0]!.lease_epoch = 12;
+            return answer === 'success' ? Response.json(ready())
+                : Response.json({ ok: false, error: 'aws_origin_unavailable' }, { status: 502 });
+        });
+        await expect(open()).resolves.toEqual(waking);
+        fetchMock.mockResolvedValue(Response.json({ ...ready(), generation: 8, leaseEpoch: 12 }));
+        await expect(open()).resolves.toMatchObject({ ok: true, generation: 8, leaseEpoch: 12 });
+        const token = new Headers(fetchMock.mock.calls[1]![1]!.headers).get('x-ezil-auth')!;
+        expect(JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString())).toMatchObject({ generation: 8, leaseEpoch: 12 });
+    });
+
+    it.each([
+        ['STARTING', waking], ['MOUNTING', waking], ['STOPPING', failure], ['UNCONFIRMED', failure],
+    ])('rechecks a concurrent %s transition before returning URLs', async (state, result) => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            fake.placements[0]!.state = state;
+            return Response.json(ready());
+        });
+        await expect(open()).resolves.toEqual(result);
+    });
+
+    it.each(['owner', 'reservation'])('refuses a concurrent %s change before returning URLs', async (change) => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            if (change === 'owner') fake.placements[0]!.owner_user_id = '22222222-2222-4222-8222-222222222222';
+            else fake.placements[0]!.image_upgrade_job_id = computerId;
+            return Response.json(ready());
+        });
+        await expect(open()).resolves.toEqual(failure);
+    });
+
+    it.each([201, 401, 403, 404, 409, 500, 502, 503, 504])('refuses HTTP %s even with a success-shaped body', async (status) => {
         fetchMock.mockResolvedValue(Response.json({ ...ready(), error: 'LEAK' }, { status }));
         await expect(setup().open()).resolves.toEqual(failure);
     });
@@ -188,7 +282,11 @@ describe('AWS preview handoff', () => {
         else if (kind === 'fetch') fetchMock.mockRejectedValue(new Error('LEAK'));
         else if (kind === 'timeout') fetchMock.mockRejectedValue(new DOMException('LEAK', 'TimeoutError'));
         else fetchMock.mockResolvedValue(kind === 'json' ? new Response('LEAK') : Response.json(kind === 'null' ? null : []));
-        await expect(open()).resolves.toEqual(failure);
+        const transport = kind === 'fetch' || kind === 'timeout';
+        await expect(open()).resolves.toEqual(transport ? waking : failure);
+        if (!transport) expect(console.warn).toHaveBeenCalledExactlyOnceWith(
+            `[aws-preview] unavailable reason=${kind === 'database' ? 'placement_read_failed' : 'parse_failed'}`,
+        );
     });
 });
 

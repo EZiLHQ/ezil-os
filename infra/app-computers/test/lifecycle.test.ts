@@ -11,7 +11,7 @@ import { toLambdaError, MAX_THROTTLE_RETRIES } from '../lib/lifecycle/errors.js'
 import { LifecycleIntentSchema, validateLifecycleReceipt } from '../lib/lifecycle/intent.js';
 import { authorityFor } from '../lib/lifecycle/contract.js';
 
-type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;
+type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;shuttingDownReads?:number;
     fail?:{action:string;times:number;error:Error};applyBeforeFail?:boolean;extraDisk?:boolean;fixture?:ReturnType<typeof lifecycleFixture>};
 async function run(operation:LifecycleIntent['operation'],options:Options={}){
     const f=options.fixture??lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper',f.settings.features);
@@ -19,7 +19,13 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
     if(options.deleteDisk)f.state.instances[0]!.BlockDeviceMappings!.find(m=>m.DeviceName==='/dev/sdf')!.Ebs!.DeleteOnTermination=true;
     if(options.extraDisk)f.state.instances[0]!.BlockDeviceMappings!.push({DeviceName:'/dev/sdg',Ebs:{VolumeId:'vol-99999999999999999',Status:'attached',DeleteOnTermination:false}});
     if(options.staleOldAfterLaunch){const original=f.deps.instances;let stale=true;f.deps.instances=async selector=>{
-        const rows=await original(selector);if(Array.isArray(selector)&&f.state.instances.length===2&&stale){stale=false;rows[0]!.instance.State={Name:'stopped'};}return rows;};}
+        const rows=await original(selector);if(Array.isArray(selector)&&f.state.instances.length===2&&stale){stale=false;rows[0]!.instance.State={Name:'stopped'};rows[0]!.instance.SubnetId=f.i.deployment.subnetId;}return rows;};}
+    // Real EC2 reports `shutting-down`, network placement already cleared, before `terminated` (seen live 2026-10-22 11:55Z).
+    let shutting=0;
+    if(options.shuttingDownReads){const original=f.deps.instances;f.deps.instances=async selector=>{
+        const rows=await original(selector);
+        for(const r of rows)if(r.instance.State?.Name==='shutting-down'&&shutting--<=0)r.instance.State={Name:'terminated'};
+        return rows;};}
     const calls:{action:string;parameters:any}[]=[];let lost=false,failures=0;
     for(const s of Object.values(graph.States) as any[])if(s.Type==='Task'&&s.Resource!=='helper')assert.equal(s.Retry,undefined,'EC2 tasks never retry automatically');
     const result=await runAsl(graph,{input:f.envelope,executionArn:f.executionArn,sleep:seconds=>{f.state.now+=seconds*1000;},
@@ -33,8 +39,10 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
                 if(action==='runInstances')f.state.instances.push(f.instance('i-33333333333333333'));
                 if(action==='startInstances')target!.State={Name:'running'};
                 if(action==='stopInstances')target!.State={Name:'stopped'};
-                if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:'terminated'};
-                    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];}
+                if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:options.shuttingDownReads?'shutting-down':'terminated'};shutting=options.shuttingDownReads??0;
+                    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];
+                    // Real EC2 clears network placement on a terminated instance (seen live 2026-10-22).
+                    delete target!.SubnetId;delete target!.VpcId;target!.SecurityGroups=[];target!.NetworkInterfaces=[];}
                 if(action==='createTags'){const v=f.state.volumes[0]!;v.Tags=[...v.Tags!.filter(t=>!parameters.Tags.some((n:any)=>n.Key===t.Key)),...parameters.Tags];}
                 if(action==='attachVolume')f.attach(f.state.volumes[0]!,target!);
                 if(action==='modifyInstanceAttribute')assert.equal(target!.State?.Name,'stopped');
@@ -71,6 +79,16 @@ for(const [operation,action]of [['provision','createVolume'],['provision','runIn
     test(`lost ${action} reply is observed with no duplicate mutation`,async()=>{const r=await run(operation,{lose:action});assert.equal(r.error,undefined);assert.equal(r.calls.filter(c=>c.action===action).length,1);});
 for(const [operation,action]of [['start','startInstances'],['stop','stopInstances'],['retire','terminateInstances']] as const)
     test(`uncertain ${action} never retries or frees the lifecycle reservation`,async()=>{const r=await run(operation,{lose:action,noEffect:action});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.receipt,undefined);assert.equal(r.calls.filter(c=>c.action===action).length,1);});
+test('replacement cannot report the target generation until DescribeVolumes confirms both retagged values', async () => {
+    const absent = await run('replace', { noEffect: 'createTags' });
+    assert.equal(absent.error, 'LifecycleUnconfirmed'); assert.equal(absent.receipt, undefined);
+    assert.equal(absent.calls.some(c => c.action === 'attachVolume'), false);
+    assert.equal(absent.f.state.volumes[0]!.Tags!.find(t => t.Key === 'ezil:generation')!.Value, String(absent.f.i.previousGeneration));
+    const landed = await run('replace', { lose: 'createTags' });
+    assert.equal(landed.error, undefined); assert.equal(landed.receipt.generation, landed.f.i.targetGeneration);
+    assert.equal(landed.calls.filter(c => c.action === 'createTags').length, 1);
+    assert.equal(landed.f.state.volumes[0]!.Tags!.find(t => t.Key === 'ezil:fence-token')!.Value, landed.f.i.fenceToken);
+});
 test('revocation after allocation never starts compute or reports completion',async()=>{const r=await run('provision',{revokeAfter:'createVolume'});assert.equal(r.error,'LifecycleUnconfirmed');assert.deepEqual(r.calls.map(c=>c.action),['createVolume']);assert.equal(r.f.state.volumes.length,1);});
 test('cross-tenant or deletable disk prevents stop/terminate',async()=>{for(const options of [{foreignDisk:true},{deleteDisk:true}]){const r=await run('replace',options);assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);}});
 test('helper failure codes are recorded on the terminal state, not discarded',async()=>{
@@ -126,6 +144,15 @@ test('storage defaults to a 30 GiB Ubuntu root and validates the root device all
     for(const rootDeviceName of ['/dev/sda1','/dev/xvda'])assert.ok(StorageSchema.safeParse({...DEFAULT_STORAGE,rootDeviceName}).success);
     for(const rootDeviceName of ['/dev/sdf','/dev/nvme0n1','',null])assert.equal(StorageSchema.safeParse({...DEFAULT_STORAGE,rootDeviceName}).success,false);
 });
+test('RunInstances tags the primary ENI with the instance compute tags (boundary admits no untagged ENI)',async()=>{
+    const r=await run('provision');
+    assert.equal(r.error,undefined);
+    const specs=r.calls.find(c=>c.action==='runInstances')!.parameters.TagSpecifications as {ResourceType:string;Tags:{Key:string;Value:string}[]}[];
+    const eni=specs.find(t=>t.ResourceType==='network-interface'),instance=specs.find(t=>t.ResourceType==='instance');
+    assert.ok(eni,'network-interface tag specification present');
+    assert.deepEqual(eni!.Tags,instance!.Tags);
+    for(const key of ['ezil:stage','ezil:managed-by'])assert.ok(eni!.Tags.some(t=>t.Key===key),key);
+});
 for(const rootDeviceName of ['/dev/sda1','/dev/xvda'] as const)
 test(`configured ${rootDeviceName} image is accepted and its root mapping reaches RunInstances`,async()=>{
     const r=await run('provision',{fixture:lifecycleFixture('provision',{rootDeviceName})});
@@ -134,7 +161,7 @@ test(`configured ${rootDeviceName} image is accepted and its root mapping reache
         DeviceName:rootDeviceName,Ebs:{VolumeType:'gp3',VolumeSize:30,Encrypted:true,KmsKeyId:r.f.i.deployment.dataKeyArn,DeleteOnTermination:true},
     }]);
 });
-for(const mismatch of ['image root','image mapping','whole xvda image','missing mapping','duplicate mapping','oversized snapshot','template mapping'] as const)
+for(const mismatch of ['image root','image mapping','whole xvda image','missing mapping','duplicate mapping','oversized snapshot','template mapping','unknown non-EBS mapping','second EBS beside ephemerals'] as const)
 test(`Ubuntu launch refuses ${mismatch}`,async()=>{
     const f=lifecycleFixture();f.state.volumes.push(f.volume());
     const originalImage=f.deps.image,originalTemplate=f.deps.template;
@@ -145,6 +172,8 @@ test(`Ubuntu launch refuses ${mismatch}`,async()=>{
         if(mismatch==='missing mapping')image.BlockDeviceMappings=[];
         if(mismatch==='duplicate mapping')image.BlockDeviceMappings!.push({...image.BlockDeviceMappings![0]!});
         if(mismatch==='oversized snapshot')image.BlockDeviceMappings![0]!.Ebs!.VolumeSize=31;
+        if(mismatch==='unknown non-EBS mapping')image.BlockDeviceMappings!.push({DeviceName:'/dev/sdb',VirtualName:'swap0'});
+        if(mismatch==='second EBS beside ephemerals')image.BlockDeviceMappings!.push({DeviceName:'/dev/sdb',VirtualName:'ephemeral0'},{DeviceName:'/dev/sdf',Ebs:{VolumeSize:8}});
         return image;
     };
     if(mismatch==='template mapping')f.deps.template=async(id,version)=>{
@@ -152,6 +181,16 @@ test(`Ubuntu launch refuses ${mismatch}`,async()=>{
         template.LaunchTemplateData!.BlockDeviceMappings![0]!.DeviceName='/dev/xvda';return template;
     };
     await assert.rejects(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'volume'}),/lifecycle_launch_invalid/);
+});
+test('an AMI with Ubuntu instance-store placeholders (ephemeral0/1) still launches',async()=>{
+    // Same path as the mismatch cases above (an existing volume makes phase 'volume' validate the launch).
+    const f=lifecycleFixture();f.state.volumes.push(f.volume());
+    const originalImage=f.deps.image;
+    let validated=false;
+    f.deps.image=async id=>{validated=true;const image=(await originalImage(id))!;
+        image.BlockDeviceMappings!.push({DeviceName:'/dev/sdb',VirtualName:'ephemeral0'},{DeviceName:'/dev/sdc',VirtualName:'ephemeral1'});return image;};
+    await assert.doesNotReject(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'volume'}));
+    assert.ok(validated, 'the launch image was validated');
 });
 test('an observed instance with a different root device cannot start',async()=>{
     const f=lifecycleFixture('start');f.state.instances[0]!.RootDeviceName='/dev/xvda';
@@ -163,6 +202,12 @@ for(const operation of ['replace','retire'] as const)test(`${operation}: a diffe
     assert.match(r.cause!,/lifecycle_unexpected_disk/);assert.ok(!r.calls.some(c=>c.action==='terminateInstances'));
 });
 
+test('replace: a source observed shutting-down (network already cleared) waits, then relaunches',async()=>{
+    const r=await run('replace',{shuttingDownReads:2});
+    assert.equal(r.error,undefined,r.cause);assert.ok(r.receipt);
+    assert.equal(r.calls.filter(c=>c.action==='terminateInstances').length,1);
+    assert.equal(r.calls.filter(c=>c.action==='runInstances').length,1);
+});
 test('a stale old-writer observation after launching replacement never repeats stop or termination',async()=>{
     const r=await run('replace',{staleOldAfterLaunch:true});assert.equal(r.error,undefined);
     assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,1);assert.equal(r.calls.filter(c=>c.action==='terminateInstances').length,1);
@@ -218,7 +263,7 @@ test('premium type and size from the allowlist provision end to end',async()=>{
     assert.equal(r.calls.find(c=>c.action==='createVolume')!.parameters.Size,50);
 });
 // ── Tiers (founder 2026-10-14): free = t3a/t3.medium with standard credits; plus = m6i.large ──
-const TIERED=['t3a.medium','t3.medium','m6i.large'] as const;
+const TIERED=['t3a.medium','t3.medium','m6i.large','m6i.xlarge','m6i.2xlarge'] as const;
 for(const [instanceType,operation] of [['t3a.medium','provision'],['t3.medium','provision'],['t3a.medium','replace']] as const)
     test(`free tier ${instanceType} ${operation}: RunInstances carries exactly CpuCredits=standard through the burstable state`,async()=>{
         const r=await run(operation,{fixture:lifecycleFixture(operation,{instanceType,instanceTypes:[...TIERED]})});
@@ -227,10 +272,11 @@ for(const [instanceType,operation] of [['t3a.medium','provision'],['t3.medium','
         assert.deepEqual(launches[0]!.parameters.CreditSpecification,{CpuCredits:'standard'});
         assert.ok(r.visited.includes('runBurstableInstances'));assert.ok(!r.visited.includes('runInstances'));
     });
-test('upgraded tier m6i.large: RunInstances carries no CreditSpecification',async()=>{
-    const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType:'m6i.large',instanceTypes:[...TIERED]})});
+for(const instanceType of ['m6i.large','m6i.xlarge','m6i.2xlarge'] as const)
+test(`paid tier ${instanceType}: RunInstances carries no CreditSpecification`,async()=>{
+    const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType,instanceTypes:[...TIERED]})});
     assert.equal(r.error,undefined);const launch=r.calls.find(c=>c.action==='runInstances')!;
-    assert.equal(launch.parameters.InstanceType,'m6i.large');assert.ok(!('CreditSpecification' in launch.parameters));
+    assert.equal(launch.parameters.InstanceType,instanceType);assert.ok(!('CreditSpecification' in launch.parameters));
     assert.ok(r.visited.includes('runInstances'));assert.ok(!r.visited.includes('runBurstableInstances'));
 });
 test('graph: only the burstable state forwards CreditSpecification, and both states call EC2 RunInstances',()=>{
@@ -241,13 +287,14 @@ test('graph: only the burstable state forwards CreditSpecification, and both sta
     assert.ok(!Object.keys(plain.Parameters).includes('CreditSpecification.$'));
     assert.equal(burst.Next,'After-runBurstableInstances');assert.equal(g.States['After-runBurstableInstances'].Next,'Observe-instance');
 });
-test('tier map: free = t3a.medium then t3.medium (burstable), plus = m6i.large; all allowlisted; schema refuses bad maps',()=>{
-    assert.deepEqual(TIER_INSTANCE_TYPES,{free:['t3a.medium','t3.medium'],plus:['m6i.large']});
+test('tier map: free = t3a.medium then t3.medium (burstable), plus / compute4 / compute8 are non-burstable; all allowlisted; schema refuses bad maps',()=>{
+    assert.deepEqual(TIER_INSTANCE_TYPES,{free:['t3a.medium','t3.medium'],plus:['m6i.large'],compute4:['m6i.xlarge'],compute8:['m6i.2xlarge']});
     for(const tier of COMPUTER_TIERS)for(const t of TIER_INSTANCE_TYPES[tier])assert.ok((INSTANCE_TYPES as readonly string[]).includes(t),t);
     assert.deepEqual(INSTANCE_TYPES.filter(isBurstable),['t3a.medium','t3.medium']);
-    assert.ok(TIER_INSTANCE_TYPES.free.every(isBurstable));assert.ok(!TIER_INSTANCE_TYPES.plus.some(isBurstable));
-    for(const bad of [{free:['t3a.large'],plus:['m6i.large']},{free:['t3a.medium','t3a.medium'],plus:['m6i.large']},{free:[],plus:['m6i.large']},
-        {free:['t3a.medium']},{free:['t3a.medium'],plus:['m6i.large'],pro:['c6i.xlarge']}])
+    assert.ok(TIER_INSTANCE_TYPES.free.every(isBurstable));for(const tier of ['plus','compute4','compute8'] as const)assert.ok(!TIER_INSTANCE_TYPES[tier].some(isBurstable));
+    for(const bad of [{...TIER_INSTANCE_TYPES,free:['t3a.large']},{...TIER_INSTANCE_TYPES,free:['t3a.medium','t3a.medium']},
+        {...TIER_INSTANCE_TYPES,free:[]},{...TIER_INSTANCE_TYPES,compute4:[]},{...TIER_INSTANCE_TYPES,compute8:undefined},
+        {...TIER_INSTANCE_TYPES,pro:['c6i.xlarge']}])
         assert.equal(TierMapSchema.safeParse(bad).success,false,JSON.stringify(bad));
     assert.deepEqual(BURSTABLE_CREDITS,{CpuCredits:'standard'});
 });
@@ -309,7 +356,7 @@ test('start-in-place writes the epoch nonce as userData while stopped, then star
     const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});
     const r=await run('start',{fixture:f});assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
     assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','startInstances']);
-    assert.deepEqual(r.calls[0]!.parameters,{InstanceId:f.state.instances[0]!.InstanceId,UserData:{Value:'bm9uY2UtZTM='}});
+    assert.deepEqual(r.calls[0]!.parameters,{InstanceId:f.state.instances[0]!.InstanceId,UserData:{Value:f.i.userData}});
 });
 // C-6 (PR #200 review 4277908738): an uncertain ModifyInstanceAttribute may never have reached EC2;
 // starting then would boot the previous epoch's nonce. Start only after a DEFINITE write.
@@ -319,7 +366,7 @@ for(const [why,noEffect] of [['did not land',true],['landed',false]] as const)
         const r=await run('start',{fixture:f,lose:'modifyInstanceAttribute',...(noEffect?{noEffect:'modifyInstanceAttribute'}:{})});
         assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
         assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','modifyInstanceAttribute','startInstances']);
-        for(const c of r.calls.filter(c=>c.action==='modifyInstanceAttribute'))assert.deepEqual(c.parameters.UserData,{Value:'bm9uY2UtZTM='});
+        for(const c of r.calls.filter(c=>c.action==='modifyInstanceAttribute'))assert.deepEqual(c.parameters.UserData,{Value:f.i.userData});
     });
 test('start-in-place: a userData write that never gets a definite answer never starts the instance',async()=>{
     const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});

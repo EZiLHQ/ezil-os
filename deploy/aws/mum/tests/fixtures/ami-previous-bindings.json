@@ -1,0 +1,152 @@
+{
+  "Parameters": {
+    "PreviousDesktopImageDigest": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^(sha256:[0-9a-f]{64})?$"
+    },
+    "PreviousDesktopImageId": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^(sha256:[0-9a-f]{64})?$"
+    }
+  },
+  "Conditions": {
+    "HasPreviousDesktopImage": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "PreviousDesktopImageDigest"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Rules": {
+    "PreviousDesktopImagePair": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Or": [
+              {
+                "Fn::And": [
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "PreviousDesktopImageDigest"
+                      },
+                      ""
+                    ]
+                  },
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "PreviousDesktopImageId"
+                      },
+                      ""
+                    ]
+                  }
+                ]
+              },
+              {
+                "Fn::And": [
+                  {
+                    "Fn::Not": [
+                      {
+                        "Fn::Equals": [
+                          {
+                            "Ref": "PreviousDesktopImageDigest"
+                          },
+                          ""
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "Fn::Not": [
+                      {
+                        "Fn::Equals": [
+                          {
+                            "Ref": "PreviousDesktopImageId"
+                          },
+                          ""
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "Previous desktop digest and ID must be supplied together"
+        },
+        {
+          "Assert": {
+            "Fn::Or": [
+              {
+                "Fn::Equals": [
+                  {
+                    "Ref": "PreviousDesktopImageId"
+                  },
+                  ""
+                ]
+              },
+              {
+                "Fn::Not": [
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "PreviousDesktopImageId"
+                      },
+                      {
+                        "Ref": "DesktopImageId"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "Previous and current lower IDs must differ"
+        }
+      ]
+    }
+  },
+  "Bindings": [
+    {
+      "Name": "PreviousDesktopImageRef",
+      "Value": [
+        {
+          "Fn::If": [
+            "HasPreviousDesktopImage",
+            {
+              "Fn::Sub": [
+                "${RepositoryUri}@${Digest}",
+                {
+                  "RepositoryUri": {
+                    "Ref": "ApplicationImageRepositoryUri"
+                  },
+                  "Digest": {
+                    "Ref": "PreviousDesktopImageDigest"
+                  }
+                }
+              ]
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    {
+      "Name": "PreviousDesktopImageId",
+      "Value": [
+        {
+          "Ref": "PreviousDesktopImageId"
+        }
+      ]
+    }
+  ]
+}

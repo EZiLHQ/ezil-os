@@ -89,7 +89,7 @@ describe('lifecycle authority wire contract', () => {
         expect(response.status).toBe(200);
         expect(await response.json()).toEqual({ authorized: true, ...authority });
         expect(response.headers.get('cache-control')).toBe('no-store');
-        expect(execute).toHaveBeenCalledTimes(1);
+        expect(execute).toHaveBeenCalledTimes(2);
     });
 
     it('exports only POST and the Node.js/dynamic route configuration', () => {
@@ -168,7 +168,7 @@ describe('authentication fails closed before reading placement', () => {
 
     it('refuses an unreadable request body', async () => {
         const req = request();
-        vi.spyOn(req, 'arrayBuffer').mockRejectedValue(new Error('read failed'));
+        Object.defineProperty(req, 'body', { value: new ReadableStream({ start(controller) { controller.error(new Error('read failed')); } }) });
         await refused(req);
         expect(execute).not.toHaveBeenCalled();
     });
@@ -223,7 +223,8 @@ describe('placement is the authority', () => {
     ])('refuses mismatched %s', async (_name, overrides) => {
         seed([row(overrides)]);
         await refused();
-        expect(execute).toHaveBeenCalledTimes(1);
+        // A Cloudflare row also gets the read-only active-migration lookup; never a write.
+        expect(execute).toHaveBeenCalledTimes('provider' in overrides ? 3 : 2);
     });
 
     it('refuses another computer', async () => {

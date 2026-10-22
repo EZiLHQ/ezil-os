@@ -14,7 +14,9 @@
         "t3a.medium",
         "t3.medium",
         "m6i.large",
-        "c6i.xlarge"
+        "c6i.xlarge",
+        "m6i.xlarge",
+        "m6i.2xlarge"
       ],
       "storage": {
         "rootDeviceName": "/dev/sda1",
@@ -34,6 +36,7 @@
   "recoveryEnabled": false,
   "appCaller": {
     "enabled": false,
+    "ec2CallerRoleArns": [],
     "providers": [
       {
         "name": "github",

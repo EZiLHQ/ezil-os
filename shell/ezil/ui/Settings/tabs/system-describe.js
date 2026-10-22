@@ -157,3 +157,19 @@ export function describeScreenError (code, message) {
     if ( typeof code === 'string' && code ) return code.toLowerCase().replace(/_/g, ' ');
     return 'unavailable';
 }
+
+/** Actual placement and plan entitlement are independent claims. */
+export function describeRunningOn (info, reason) {
+    const provider = describeProvider(info, reason);
+    const m = info && info.machine;
+    const size = m && Number.isFinite(m.vcpu) && Number.isFinite(m.memoryMiB)
+        ? ` (${m.vcpu} vCPU / ${m.memoryMiB / 1024} GiB)` : '';
+    return { value: provider.value + size, hint: provider.hint };
+}
+
+export function describePlan (info) {
+    const p = info && info.plan;
+    if ( ! p ) return { value: 'Not reported', hint: 'Plan entitlement is not available.' };
+    const status = { preparing: 'being prepared', blocked: 'paused', failed: 'preparation failed', ready: 'ready' }[p.status] || 'status unknown';
+    return { value: `${p.vcpu} vCPU / ${p.memoryGB} GB in Mumbai — ${status}`, hint: p.reason || '' };
+}

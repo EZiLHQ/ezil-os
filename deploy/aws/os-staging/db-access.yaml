@@ -1,0 +1,32 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Removable OS billing staging ingress on the preview DB security group; owns no database or security group.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    ref: [INFRASTRUCTURE.md]
+Parameters:
+  DbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Verify this belongs only to preview host i-097aa7c356e91c78f; no default.
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: AppSecurityGroupId output of the OS staging app-host stack.
+Resources:
+  AppToPostgres:
+    Type: AWS::EC2::SecurityGroupIngress
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Withdraw app access by deleting only this rule stack.
+        must: [Preview DB SG only, Source is the dedicated staging app SG, Never modify production]
+    # This CloudFormation resource has no Tags property. Tag the stack with
+    # ezil:env=billing-staging and ezil:purpose=os-staging.
+    Properties:
+      GroupId: !Ref DbSecurityGroupId
+      SourceSecurityGroupId: !Ref AppSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      Description: OS billing staging to preview PostgreSQL proxy

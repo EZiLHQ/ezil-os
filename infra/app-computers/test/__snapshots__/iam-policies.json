@@ -6,7 +6,7 @@
         {
           "Action": "states:StartExecution",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle"
         },
         {
           "Action": "states:DescribeExecution",
@@ -136,6 +136,10 @@
               "aws:RequestedRegion": "ap-south-1",
               "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
               "ec2:ResourceTag/ezil:stage": "pilot"
+            },
+            "Null": {
+              "aws:ResourceTag/ezil:computer-id": "false",
+              "aws:ResourceTag/ezil:pool": "true"
             }
           },
           "Effect": "Allow",
@@ -149,6 +153,10 @@
               "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
               "ec2:ResourceTag/ezil:stage": "pilot",
               "ec2:AvailabilityZoneId": "aps1-az1"
+            },
+            "Null": {
+              "aws:ResourceTag/ezil:computer-id": "false",
+              "aws:ResourceTag/ezil:pool": "true"
             }
           },
           "Effect": "Allow",
@@ -156,6 +164,64 @@
             "arn:aws:ec2:ap-south-1:123456789012:instance/*",
             "arn:aws:ec2:ap-south-1:123456789012:volume/*"
           ]
+        },
+        {
+          "Action": "ec2:AttachVolume",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "aws:ResourceTag/ezil:pool": "1",
+              "ec2:AvailabilityZoneId": "aps1-az1",
+              "ec2:InstanceType": [
+                "m6i.large",
+                "m6i.xlarge",
+                "m6i.2xlarge"
+              ]
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": [
+            "ec2:StopInstances",
+            "ec2:TerminateInstances"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "ec2:InstanceType": [
+                "m6i.large",
+                "m6i.xlarge",
+                "m6i.2xlarge"
+              ]
+            },
+            "Null": {
+              "aws:ResourceTag/ezil:computer": "false"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": "ec2:DetachVolume",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "ec2:AvailabilityZoneId": "aps1-az1"
+            },
+            "Null": {
+              "aws:ResourceTag/ezil:computer": "false"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*"
         },
         {
           "Action": "ec2:CreateVolume",
@@ -211,7 +277,9 @@
               "aws:RequestTag/ezil:stage": "pilot",
               "ec2:InstanceType": [
                 "m6i.large",
-                "c6i.xlarge"
+                "c6i.xlarge",
+                "m6i.xlarge",
+                "m6i.2xlarge"
               ],
               "ec2:MetadataHttpTokens": "required",
               "ec2:InstanceMetadataTags": "disabled",
@@ -266,7 +334,8 @@
           "Effect": "Allow",
           "Resource": [
             "arn:aws:ec2:ap-south-1:123456789012:instance/*",
-            "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+            "arn:aws:ec2:ap-south-1:123456789012:volume/*",
+            "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
           ]
         },
         {
@@ -293,6 +362,86 @@
         {
           "Action": "ec2:CreateTags",
           "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "aws:RequestTag/ezil:computer": "${aws:ResourceTag/ezil:computer-id}"
+            },
+            "ForAllValues:StringEquals": {
+              "aws:TagKeys": [
+                "ezil:computer",
+                "ezil:generation",
+                "ezil:fence",
+                "ezil:fence-token"
+              ]
+            },
+            "Null": {
+              "aws:TagKeys": "false",
+              "aws:ResourceTag/ezil:computer-id": "false"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+        },
+        {
+          "Action": "ec2:CreateTags",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "aws:ResourceTag/ezil:pool": "1",
+              "ec2:InstanceType": [
+                "m6i.large",
+                "m6i.xlarge",
+                "m6i.2xlarge"
+              ]
+            },
+            "ForAllValues:StringEquals": {
+              "aws:TagKeys": [
+                "ezil:computer",
+                "ezil:generation",
+                "ezil:fence"
+              ]
+            },
+            "Null": {
+              "aws:TagKeys": "false"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": "ec2:DeleteTags",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "aws:ResourceTag/ezil:pool": "1",
+              "ec2:InstanceType": [
+                "m6i.large",
+                "m6i.xlarge",
+                "m6i.2xlarge"
+              ]
+            },
+            "ForAllValues:StringEquals": {
+              "aws:TagKeys": [
+                "ezil:pool"
+              ]
+            },
+            "Null": {
+              "aws:TagKeys": "false",
+              "aws:ResourceTag/ezil:computer": "false"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": "ec2:CreateTags",
+          "Condition": {
             "ForAnyValue:StringEquals": {
               "aws:TagKeys": [
                 "ezil:computer-id",
@@ -312,10 +461,8 @@
           "Action": [
             "ec2:DeleteVolume",
             "ec2:DeleteSnapshot",
-            "ec2:DetachVolume",
             "ec2:ModifyInstanceAttribute",
             "ec2:ModifyInstanceMetadataOptions",
-            "ec2:DeleteTags",
             "iam:PassRole"
           ],
           "Effect": "Deny",
@@ -886,7 +1033,7 @@
         {
           "Action": "states:StartExecution",
           "Effect": "Allow",
-          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1"
+          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery"
         },
         {
           "Action": "kms:Decrypt",
@@ -990,11 +1137,11 @@
           "Action": [
             "ec2:DeleteVolume",
             "ec2:DeleteSnapshot",
-            "ec2:DetachVolume",
             "ec2:ModifyInstanceAttribute",
             "ec2:ModifyInstanceMetadataOptions",
-            "ec2:DeleteTags",
-            "iam:PassRole"
+            "iam:PassRole",
+            "ec2:DetachVolume",
+            "ec2:DeleteTags"
           ],
           "Effect": "Deny",
           "Resource": "*"

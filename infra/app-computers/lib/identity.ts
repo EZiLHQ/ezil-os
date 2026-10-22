@@ -1,7 +1,9 @@
 import { CfnOutput, Duration, RemovalPolicy, Stack, type StackProps, aws_iam as iam, aws_s3 as s3 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import { z } from 'zod';
-import { DEFAULT_STORAGE, INSTANCE_TYPES, NamespaceSchema, REGION_PATTERN } from './lifecycle/deployment.js';
+import { DEFAULT_STORAGE, INSTANCE_TYPES, NamespaceSchema, REGION_PATTERN, LifecycleDeploymentSchema } from './lifecycle/deployment.js';
+
+import { ImageJobBoundary, imageJobBoundaryArn, imageJobRoleArns, imageJobRoleNameArns } from './image-job-boundary.js';
 
 /** I5 deploy identity. Created ONCE by the founder with their own admin
  * identity (README "Founder bootstrap"); never deployed by CI. No CDK
@@ -21,6 +23,12 @@ export const IdentityConfigSchema = z.object({
     assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
     /** Founder-controlled §4 kill switch, enforced by the boundary and identity guardrails. */
     killSwitch: z.boolean().default(false),
+    /** Founder-approved warm-pool lifecycle: opt in to DetachVolume/DeleteTags
+     * in the shared workload boundary. Off preserves the live storage denies;
+     * identity guardrails and the image-job boundary always retain them. */
+    poolLifecycle: z.boolean().default(false),
+    /** Reviewed image-job data scope; founder publishes its boundary before workflows. */
+    imageJobDeployment: LifecycleDeploymentSchema.optional(),
     /** Cost cap for any bounded principal: largest EBS volume it may create. */
     maxVolumeGiB: z.number().int().min(8).max(16384).default(DEFAULT_STORAGE.dataMaxGiB),
     /** C-6 userData nonce delivery. Off (default): the boundary denies
@@ -31,6 +39,10 @@ export const IdentityConfigSchema = z.object({
      * compute-tagged instances, denied for any other or missing attribute. */
     userDataAttributeKeyVerified: z.boolean().default(false),
 }).strict().superRefine((c, ctx) => {
+    if (c.imageJobDeployment && (['namespace', 'accountId', 'region'] as const).some(k => c.imageJobDeployment![k] !== c[k]))
+        ctx.addIssue({ code: 'custom', message: 'image_job_boundary_scope_mismatch' });
+    if (c.imageJobDeployment && c.imageJobDeployment.storage.dataMaxGiB > c.maxVolumeGiB)
+        ctx.addIssue({ code: 'custom', message: 'image_job_boundary_size_cap' });
     if (c.githubOidcProviderArn !== `arn:aws:iam::${c.accountId}:oidc-provider/token.actions.githubusercontent.com`)
         ctx.addIssue({ code: 'custom', path: ['githubOidcProviderArn'], message: 'must be this account\'s GitHub OIDC provider' });
 });
@@ -118,6 +130,7 @@ const PURCHASES = ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2
  * Keep actions explicit: no deployment, IAM, KMS administration or EC2 Describe*
  * in the workload allowlist. */
 export const WORKLOAD_UNSCOPABLE = ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeImages',
+    'ec2:DescribeSnapshots',
     'ec2:DescribeLaunchTemplateVersions', 'ec2:DescribeAvailabilityZones', 'logs:DescribeLogGroups',
     'logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery', 'logs:DeleteLogDelivery',
     'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies'] as const;
@@ -136,7 +149,7 @@ const deny = (actions: readonly string[], extra: Partial<iam.PolicyStatementProp
 /** Merge only statements with identical effect, resources and conditions.
  * Never combine resource lists across distinct actions (that creates grants).
  * NotAction statements remain separate. Sids are intentionally omitted. */
-function compactStatements(statements: iam.PolicyStatement[]): iam.PolicyStatement[] {
+export function compactStatements(statements: iam.PolicyStatement[]): iam.PolicyStatement[] {
     const groups = new Map<string, iam.PolicyStatement>();
     const result: iam.PolicyStatement[] = [];
     for (const statement of statements) {
@@ -151,13 +164,13 @@ function compactStatements(statements: iam.PolicyStatement[]): iam.PolicyStateme
 }
 
 /** These fences apply to workload roles AND the founder-created identities. */
-function commonDenies(c: IdentityConfig): iam.PolicyStatement[] {
+function commonDenies(c: IdentityConfig, poolLifecycle = false): iam.PolicyStatement[] {
     const r = c.region, a = c.accountId;
     return [
         deny(PURCHASES),
         deny([], { actions: undefined, notActions: [...GLOBAL_SERVICES],
             conditions: { StringNotEquals: { 'aws:RequestedRegion': c.region } } }),
-        deny(['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume', 'ec2:DeleteTags']),
+        deny(['ec2:DeleteVolume', 'ec2:DeleteSnapshot', ...(poolLifecycle ? [] : ['ec2:DetachVolume', 'ec2:DeleteTags'])]),
         deny(['ec2:CreateTags'], { conditions: {
             'ForAnyValue:StringEquals': { 'aws:TagKeys': ['ezil:backup'] }, Null: { 'ec2:CreateAction': 'true' } } }),
         deny(['ec2:DescribeInstanceAttribute'], { resources: [`arn:aws:ec2:${r}:${a}:instance/*`],
@@ -182,7 +195,10 @@ export function identityGuardrailStatements(c: IdentityConfig): iam.PolicyStatem
     return compactStatements([
         ...commonDenies(c),
         deny(IDENTITY_PRINCIPAL_WRITES),
-        deny(BOUNDARY_KEYED, { conditions: { StringNotEquals: { 'iam:PermissionsBoundary': n.boundaryArn } } }),
+        deny(BOUNDARY_KEYED, { conditions: { StringNotEquals: { 'iam:PermissionsBoundary': c.imageJobDeployment
+            ? [n.boundaryArn, imageJobBoundaryArn(c.accountId, c.namespace)] : n.boundaryArn } } }),
+        ...(c.imageJobDeployment ? [deny(BOUNDARY_KEYED, { resources: undefined, notResources: imageJobRoleArns(c.accountId, c.namespace),
+            conditions: { StringEquals: { 'iam:PermissionsBoundary': imageJobBoundaryArn(c.accountId, c.namespace) } } })] : []),
         deny(['iam:AttachRolePolicy', 'iam:DetachRolePolicy'],
             { conditions: { ArnNotEquals: { 'iam:PolicyARN': LAMBDA_BASIC_EXECUTION } } }),
         deny(IAM_WRITES_ANYWHERE, { resources: undefined, notResources: [n.workloadRoles] }),
@@ -230,13 +246,19 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
         allow(['ec2:RunInstances'], [ec2('subnet'), ec2('security-group'), ec2('launch-template')],
             { StringEquals: nsTag('Resource') }),
         allow(['ec2:RunInstances'], [`arn:aws:ec2:${r}::image/*`]),
-        allow(['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags'],
+        // The boundary caps compute permissions by managed namespace. The
+        // explicitly enabled pool lifecycle further restricts detach/untag to
+        // release and pool claims. Keep the default live storage denies.
+        allow(['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags',
+            ...(c.poolLifecycle ? ['ec2:DetachVolume', 'ec2:DeleteTags'] : [])],
             [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
         ...(c.userDataAttributeKeyVerified ? [allow(['ec2:ModifyInstanceAttribute'], [ec2('instance')],
             { StringEquals: { ...compute('Resource'), 'ec2:Attribute': 'userData' } })] : []),
-        allow(['ec2:CreateTags'], [ec2('instance'), ec2('volume')],
+        // Create-time tags only. The primary ENI RunInstances creates must carry the compute
+        // request tags (network-interface grant above), so it is tagged by the same call.
+        allow(['ec2:CreateTags'], [ec2('instance'), ec2('volume'), ec2('network-interface')],
             { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } }),
-        ...commonDenies(c),
+        ...commonDenies(c, c.poolLifecycle),
         deny(['iam:*', 'sts:*', 'organizations:*', 'account:*', 'aws-portal:*', 'billing:*', 'payments:*', 'tax:*', 'ce:*',
             'route53:*', 'route53domains:*', 'cloudfront:*', 'budgets:*', 'cloudwatch:*']),
     ]);
@@ -293,6 +315,11 @@ export function execStatements(c: IdentityConfig): iam.PolicyStatement[] {
         new iam.PolicyStatement({ actions: ['iam:CreateRole', 'iam:PutRolePermissionsBoundary', 'iam:PutRolePolicy', 'iam:DeleteRolePolicy',
             'iam:UpdateAssumeRolePolicy', 'iam:UpdateRole', 'iam:DeleteRole'], resources: [n.workloadRoles],
             conditions: { StringEquals: { 'iam:PermissionsBoundary': n.boundaryArn } } }),
+        ...(c.imageJobDeployment ? [new iam.PolicyStatement({ actions: ['iam:CreateRole', 'iam:PutRolePermissionsBoundary', 'iam:PutRolePolicy',
+            'iam:DeleteRolePolicy', 'iam:UpdateAssumeRolePolicy', 'iam:UpdateRole', 'iam:DeleteRole'],
+            resources: imageJobRoleArns(c.accountId, c.namespace),
+            conditions: { StringEquals: { 'iam:PermissionsBoundary': imageJobBoundaryArn(c.accountId, c.namespace) } } }),
+            new iam.PolicyStatement({ actions: ['iam:GetRole'], resources: imageJobRoleNameArns(c.accountId, c.namespace) })] : []),
         new iam.PolicyStatement({ actions: ['iam:AttachRolePolicy', 'iam:DetachRolePolicy'], resources: [n.workloadRoles],
             conditions: { StringEquals: { 'iam:PermissionsBoundary': n.boundaryArn }, ArnEquals: { 'iam:PolicyARN': LAMBDA_BASIC_EXECUTION } } }),
         new iam.PolicyStatement({ actions: ['iam:GetRole', 'iam:GetRolePolicy', 'iam:ListRolePolicies', 'iam:ListAttachedRolePolicies',
@@ -333,6 +360,7 @@ export class DeployIdentityStack extends Stack {
         if (props.env?.region !== c.region || props.env?.account !== c.accountId) throw new Error('stack env must equal the identity config');
         const boundary = new iam.ManagedPolicy(this, 'Boundary', { managedPolicyName: n.boundaryName, path: n.identityPath,
             description: 'EZiL workload permission boundary (AWS-COMPUTERS.md §5)', document: new iam.PolicyDocument({ statements: boundaryStatements(c) }) });
+        if (c.imageJobDeployment) new ImageJobBoundary(this, c, c.imageJobDeployment);
         const guardrails = new iam.ManagedPolicy(this, 'IdentityGuardrails', {
             managedPolicyName: `ezil-${c.namespace}-identity-guardrails`, path: n.identityPath,
             description: 'Historical boundary denies for founder-created deployment identities; grants nothing',

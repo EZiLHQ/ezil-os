@@ -7,7 +7,8 @@ const fields:Record<Exclude<Action,'modifyInstanceAttribute'>,string[]>={
     runInstances:RUN_FIELDS,
     // T-family launches: the same API plus the (standard) credit option.
     runBurstableInstances:[...RUN_FIELDS,'CreditSpecification'],
-    attachVolume:['Device','InstanceId','VolumeId'],createTags:['Resources','Tags'],
+    attachVolume:['Device','InstanceId','VolumeId'],detachVolume:['Device','InstanceId','VolumeId','Force'],
+    createTags:['Resources','Tags'],claimInstance:['Resources','Tags'],deleteTags:['Resources','Tags'],
     startInstances:['InstanceIds'],stopInstances:['InstanceIds','Force','Hibernate','SkipOsShutdown'],terminateInstances:['InstanceIds'],
 };
 /** Observation is read-only, so transient helper failures retry. Only the

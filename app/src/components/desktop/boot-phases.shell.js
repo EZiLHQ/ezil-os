@@ -248,7 +248,7 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  * request cannot fail this way. See `applyDisplayEvidence`.
  *
  * @typedef {'worker_unreachable' | 'sandbox_crashed' | 'desktop_unreachable'
- *   | 'display_not_streaming' | 'timeout' | 'unknown'} BootFailureReason
+ *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap' | 'unknown'} BootFailureReason
  */
 
 /**
@@ -290,8 +290,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  */
 
 /**
- * The error codes `requestGuacamolePreview` can genuinely produce, plus
- * `timeout`. Kept in lockstep with `GuacamolePreviewErrorCode` — including
+ * AWS admission refusals and the codes `requestGuacamolePreview` can produce,
+ * plus `timeout`. The Worker subset mirrors `GuacamolePreviewErrorCode`, including
  * the four DETERMINISTIC codes, which have no honest specific copy of their
  * own (see `classifyFailure`) but must still be representable, or this union
  * silently stops mirroring the thing it claims to mirror.
@@ -300,7 +300,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  *   | 'custom_domain_required' | 'connection_refused' | 'fetch_failed'
  *   | 'sandbox_runtime_blocked' | 'sandbox_start_failed' | 'sandbox_starting'
  *   | 'worker_http_error' | 'desktop_unreachable' | 'timeout'
- *   | 'unknown'} BootErrorCode
+ *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'region_capacity'
+ *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'unknown'} BootErrorCode
  */
 
 /**
@@ -325,6 +326,18 @@ const DETERMINISTIC_BOOT_ERROR_CODES = [
     'sandbox_runtime_blocked',
 ];
 
+// AWS admission refusals need an operations, capacity or monthly-limit change.
+// Keep these separate from the Worker's deterministic preview codes above.
+const AWS_REFUSAL_ERROR_CODES = [
+    'kill_switch',
+    'aws_disabled',
+    'capacity_unavailable',
+    'region_capacity',
+    'max_running',
+    'user_hours_cap',
+    'global_hours_cap',
+];
+
 /**
  * True when re-sending the identical request could plausibly change the answer.
  *
@@ -336,7 +349,7 @@ const DETERMINISTIC_BOOT_ERROR_CODES = [
  */
 export function isRetryableBootErrorCode(code) {
     if (!code) return true;
-    return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code);
+    return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code) && !AWS_REFUSAL_ERROR_CODES.includes(code);
 }
 
 /**
@@ -373,6 +386,16 @@ export function isRetryableBootErrorCode(code) {
  */
 function classifyFailure(errorCode) {
     switch (errorCode) {
+        case 'kill_switch':
+        case 'aws_disabled':
+            return 'operations_paused';
+        case 'capacity_unavailable':
+        case 'region_capacity':
+        case 'max_running':
+            return 'capacity_unavailable';
+        case 'user_hours_cap':
+        case 'global_hours_cap':
+            return errorCode;
         case 'connection_refused':
         case 'fetch_failed':
             return 'worker_unreachable';
@@ -598,6 +621,22 @@ export const BOOT_PROGRESS_LONG_SUBTEXT =
 
 /** @type {Record<BootFailureReason, BootFailureCopy>} */
 export const BOOT_FAILURE_COPY = {
+    operations_paused: {
+        title: 'Your Mumbai computer is paused by operations',
+        body: 'Your files are kept. Only operations can resume this computer. Try again only checks whether the pause has been lifted.',
+    },
+    capacity_unavailable: {
+        title: 'No Mumbai capacity right now',
+        body: 'Your files are kept. This computer can start when Mumbai capacity is available. Try again checks availability.',
+    },
+    user_hours_cap: {
+        title: "This month's computer hours are used up",
+        body: 'Your files are kept. Your monthly computer hours renew next month. Try again only checks whether the limit has changed.',
+    },
+    global_hours_cap: {
+        title: "This month's computer hours are used up",
+        body: "The service has reached its monthly computer hours limit. Your files are kept. Try again only checks whether the limit has changed.",
+    },
     worker_unreachable: {
         title: "Can't reach your computer",
         body: "The service that runs your computer isn't responding right now. This is usually temporary — try again in a moment.",

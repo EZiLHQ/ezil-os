@@ -45,7 +45,7 @@ mock.module('cloudflare:workers', () => ({
 
 describe('release-on-close: the shell number and the Worker threshold must agree', () => {
   it('a release reported by the shell makes the sandbox idle-stop-due immediately', async () => {
-    const { computeActivityTimestamp, isIdleStopDue, validateActivityBody } = await import('./index');
+    const { computeActivityTimestamp, isIdleStopDue, validateActivityBody } = await import('./index-test-helpers.test');
     // The REAL shell constant, from the REAL shell module.
     const { ACTIVITY_FRESH_MS } = await import('../../shell/ezil/activity-heartbeat.js');
 
@@ -66,7 +66,7 @@ describe('release-on-close: the shell number and the Worker threshold must agree
   });
 
   it('an ordinary heartbeat over the same wire still does NOT stop anything', async () => {
-    const { computeActivityTimestamp, isIdleStopDue } = await import('./index');
+    const { computeActivityTimestamp, isIdleStopDue } = await import('./index-test-helpers.test');
     const { HEARTBEAT_INTERVAL_MS } = await import('../../shell/ezil/activity-heartbeat.js');
 
     const now = 1_800_000_000_000;

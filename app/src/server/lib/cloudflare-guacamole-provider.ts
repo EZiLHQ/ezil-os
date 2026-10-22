@@ -29,7 +29,7 @@
  *     no Azure/ACA desktop path to switch away from; Neko is the only mode.
  */
 
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
 import { cookieHeaderFor, getFollowingSameOriginCookies, storeSetCookies, type ProbeCookieJar } from './compute/aws-preview-cookies';
@@ -465,12 +465,26 @@ const CUSTOM_DOMAIN_REQUIRED_RE = /CustomDomainRequiredError|Port exposure requi
  * (`setsockoptint` and `CustomDomainRequiredError`, both surfaced as the
  * Worker's catch-all 500) are deterministic and must not be retried as 5xx.
  */
+function isMigratingRefusal(body: string): boolean {
+    try { return (JSON.parse(body) as { error?: unknown })?.error === 'migrating'; } catch { return false; }
+}
+
+function workerErrorCode(body: string): string | null {
+    try { const error = (JSON.parse(body) as { error?: unknown })?.error; return typeof error === 'string' ? error : null; } catch { return null; }
+}
+
 export function classifyWorkerHttpFailure(status: number, body: string): GuacamolePreviewErrorCode {
-    if (/setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
-    if (CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
+    // The Worker names these with public codes (it never forwards exception text);
+    // the text forms are matched too, for older Workers.
+    const workerCode = workerErrorCode(body);
+    if (workerCode === 'sandbox_runtime_blocked' || /setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
+    if (workerCode === 'custom_domain_required' || CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
     // 408/429 are the 4xx statuses that mean "later", not "never" — leave them
     // in the retryable bucket rather than treating them as a bad request.
     if (status === 408 || status === 429) return 'worker_http_error';
+    // A CF→AWS migration has fenced this computer (worker C-7 writer fence): the shell's
+    // wake loop keeps retrying until the placement flips to AWS or the fence is lifted.
+    if (status === 409 && isMigratingRefusal(body)) return 'sandbox_starting';
     if (status === 401 || status === 403) return 'unauthorized';
     if (status === 412) return 'preconditions_unmet';
     if (status >= 400 && status < 500) return 'bad_request';
@@ -2054,6 +2068,47 @@ export function resetNekoAdminTokenCacheForTests(): void {
     nekoAdminTokens.clear();
 }
 
+// Diagnostics are process-local, like the token cache. Keep only origins that
+// have warned within the last 30s; a busy polling gate must not flood the logs.
+const displayProbeWarnings = new Map<string, number>();
+type DisplayProbeDiagnostics = {
+    login_is_admin: boolean | null;
+    entries: unknown[] | null;
+    http_statuses: { bootstrap: number | null; login: number[]; sessions: number[] };
+};
+
+/** Only the display probe calls this. No response bodies or credentials escape. */
+function warnAwsDisplayProbe(bootstrap: URL, display: 'blank' | 'unknown', diagnostics: DisplayProbeDiagnostics): void {
+    const now = Date.now();
+    const previous = displayProbeWarnings.get(bootstrap.origin);
+    if (previous !== undefined && now - previous < 30_000) return;
+    for (const [origin, at] of displayProbeWarnings) {
+        if (now - at >= 30_000) displayProbeWarnings.delete(origin);
+    }
+    displayProbeWarnings.set(bootstrap.origin, now);
+    const record = (value: unknown): Record<string, unknown> =>
+        value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const boolean = (value: unknown): boolean | null => typeof value === 'boolean' ? value : null;
+    console.warn('[display-probe]', JSON.stringify({
+        origin: bootstrap.hostname,
+        display,
+        login_is_admin: diagnostics.login_is_admin,
+        session_count: diagnostics.entries?.length ?? null,
+        sessions: diagnostics.entries?.map((value) => {
+            const entry = record(value);
+            const state = record(entry.state);
+            const profile = record(entry.profile);
+            return {
+                is_watching: boolean(state.is_watching),
+                ...('is_connected' in state ? { connected: boolean(state.is_connected) } : {}),
+                ...('is_admin' in profile ? { is_admin: boolean(profile.is_admin) } : {}),
+                id: typeof entry.id === 'string' ? createHash('sha256').update(entry.id).digest('hex').slice(0, 8) : null,
+            };
+        }) ?? [],
+        http_statuses: diagnostics.http_statuses,
+    }));
+}
+
 /**
  * Is anything actually being decoded at the other end of that desktop URL?
  *
@@ -2123,6 +2178,19 @@ export async function probeDesktopDisplay(
 
     const deadline = AbortSignal.timeout(timeoutMs);
 
+    const diagnostics: DisplayProbeDiagnostics = {
+        login_is_admin: null,
+        entries: null,
+        http_statuses: { bootstrap: null, login: [], sessions: [] },
+    };
+    const finish = (result: DesktopDisplayProbe): DesktopDisplayProbe => {
+        if (bootstrap && result.display !== 'live') {
+            // Diagnostic failures must never change a verdict or reject a probe.
+            try { warnAwsDisplayProbe(bootstrap, result.display, diagnostics); } catch { /* best effort */ }
+        }
+        return result;
+    };
+
     // A bootstrap URL (AWS) gates its whole origin behind the cookie the
     // bootstrap sets: take it first, exactly as the browser's iframe did, and
     // send it to that origin only (compute/aws-preview-cookies.ts).
@@ -2133,12 +2201,13 @@ export async function probeDesktopDisplay(
             const res = await fetch(`${bootstrap.origin}${bootstrap.pathname}${bootstrap.search}`, {
                 method: 'GET', headers: { Accept: 'text/html,*/*' }, redirect: 'manual', cache: 'no-store', signal: deadline,
             });
+            diagnostics.http_statuses.bootstrap = res.status;
             storeSetCookies(jar, bootstrap, res.headers);
             await res.body?.cancel().catch(() => undefined);
             cookie = cookieHeaderFor(jar, bootstrap);
-            if (!cookie) return { display: 'unknown', reason: 'login_failed', status: res.status };
+            if (!cookie) return finish({ display: 'unknown', reason: 'login_failed', status: res.status });
         } catch {
-            return { display: 'unknown', reason: 'unreachable' };
+            return finish({ display: 'unknown', reason: 'unreachable' });
         }
     }
     const withCookie = (headers: Record<string, string>) => (cookie ? { ...headers, Cookie: cookie } : headers);
@@ -2158,8 +2227,10 @@ export async function probeDesktopDisplay(
             cache: 'no-store',
             signal: deadline,
         });
+        diagnostics.http_statuses.login.push(loginRes.status);
         if (!loginRes.ok) return { status: loginRes.status };
-        const body = (await loginRes.json()) as { token?: unknown };
+        const body = (await loginRes.json()) as { token?: unknown; profile?: { is_admin?: unknown } | null };
+        diagnostics.login_is_admin = typeof body?.profile?.is_admin === 'boolean' ? body.profile.is_admin : null;
         if (typeof body.token !== 'string' || body.token.length === 0) return {};
         cacheNekoAdminToken(origin, adminPassword, body.token, cookie);
         return { token: body.token };
@@ -2176,7 +2247,7 @@ export async function probeDesktopDisplay(
         if (token === null) {
             const fresh = await login();
             if (!('token' in fresh)) {
-                return { display: 'unknown', reason: 'login_failed', status: fresh.status };
+                return finish({ display: 'unknown', reason: 'login_failed', status: fresh.status });
             }
             token = fresh.token;
         }
@@ -2187,6 +2258,7 @@ export async function probeDesktopDisplay(
             cache: 'no-store',
             signal: deadline,
         });
+        diagnostics.http_statuses.sessions.push(listRes.status);
 
         // The far end stopped honouring a token we were reusing — the container
         // restarted, or Neko did. That is not an observation of the display, so
@@ -2196,7 +2268,7 @@ export async function probeDesktopDisplay(
             reused = false;
             const fresh = await login();
             if (!('token' in fresh)) {
-                return { display: 'unknown', reason: 'login_failed', status: fresh.status };
+                return finish({ display: 'unknown', reason: 'login_failed', status: fresh.status });
             }
             token = fresh.token;
             listRes = await fetch(`${origin}/api/sessions`, {
@@ -2205,17 +2277,19 @@ export async function probeDesktopDisplay(
                 cache: 'no-store',
                 signal: deadline,
             });
+            diagnostics.http_statuses.sessions.push(listRes.status);
         }
 
-        if (!listRes.ok) return { display: 'unknown', reason: 'http_error', status: listRes.status };
+        if (!listRes.ok) return finish({ display: 'unknown', reason: 'http_error', status: listRes.status });
 
         let body: unknown;
         try {
             body = await listRes.json();
         } catch {
-            return { display: 'unknown', reason: 'unrecognised' };
+            return finish({ display: 'unknown', reason: 'unrecognised' });
         }
-        if (!Array.isArray(body)) return { display: 'unknown', reason: 'unrecognised' };
+        if (!Array.isArray(body)) return finish({ display: 'unknown', reason: 'unrecognised' });
+        diagnostics.entries = body;
 
         let watching = 0;
         for (const entry of body) {
@@ -2223,18 +2297,26 @@ export async function probeDesktopDisplay(
             if (typeof state?.is_watching !== 'boolean') {
                 // One entry we cannot read makes the whole count untrustworthy:
                 // the unreadable one could be the watcher.
-                return { display: 'unknown', reason: 'unrecognised' };
+                return finish({ display: 'unknown', reason: 'unrecognised' });
             }
             if (state.is_watching) watching++;
         }
 
-        return watching > 0
+        // AWS's legacy /ws viewer has been observed streaming while this API
+        // lists only the disconnected admin probe. That snapshot cannot
+        // refute the viewer's own decoded-frame evidence. Keep it unknown;
+        // the shell still requires current, scoped frame progress to go live.
+        if (bootstrap && watching === 0 && body.length === 1
+            && body[0]?.profile?.is_admin === true && body[0]?.state?.is_connected === false) {
+            return finish({ display: 'unknown', reason: 'unrecognised' });
+        }
+        return finish(watching > 0
             ? { display: 'live', sessions: body.length, watching }
-            : { display: 'blank', sessions: body.length };
+            : { display: 'blank', sessions: body.length });
     } catch {
         // Timeout, transport failure, non-JSON login body. None of them is an
         // observation of the user's screen, and none may be dressed up as one.
-        return { display: 'unknown', reason: 'unreachable' };
+        return finish({ display: 'unknown', reason: 'unreachable' });
     }
     // 🔴 NO `finally { logout }` ANY MORE, and that is the point. The token
     // belongs to `nekoAdminTokens` now; logging it out here would guarantee the
@@ -3220,4 +3302,140 @@ export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hma
         if (typeof data.runtimeId !== 'string' || !/^[a-f0-9]{32}$/.test(data.runtimeId) || typeof data.expiresAt !== 'number' || !Number.isSafeInteger(data.expiresAt)) return { ok: false, error: 'relay_metadata_invalid' };
         return { ok: true, runtimeId: data.runtimeId, expiresAt: data.expiresAt };
     } catch { return { ok: false, error: 'relay_refresh_unavailable' }; }
+}
+
+// Cloudflare snapshot migration uses the same v1 control signer as restart.
+export type MigrateKind = 'workspace' | 'system';
+const MIGRATE_CONFLICT_REASONS = [
+    'head_moved', 'migration_not_started', 'no_checkpoint', 'no_context', 'no_workspace', 'previous_head_missing',
+    'generation_mismatch', 'chunk_unavailable', 'already_migrated', 'workspace_too_large',
+    'workspace_size_unknown', 'system_too_large', 'system_size_unknown', 'final_checkpoint_failed',
+    'flag_write_failed', 'stop_failed', 'migrating', 'not_migrated',
+] as const;
+export type MigrateConflictReason = typeof MIGRATE_CONFLICT_REASONS[number] | 'other';
+export type MigrateResult<T> = { ok: true; data: T }
+    | { ok: false; error: 'not_found' | 'unavailable' }
+    | { ok: false; error: 'conflict'; reason?: MigrateConflictReason };
+export interface MigrateBeginResult {
+    etag: string;
+    systemEtag: string | null;
+    generation: string;
+    chunkCount: number;
+    totalBytes: number;
+    sha256: string;
+}
+export interface MigrateCommitInput {
+    targetProvider: 'aws-ec2' | 'cloudflare';
+    expectedEtag: string;
+    expectedSystemEtag: string | null;
+}
+export const MIGRATE_HEAD_LIMIT = 1024 * 1024;
+export const MIGRATE_CHUNK_LIMIT = 1024 * 1024 + 1024;
+
+/** Limits bytes even without Content-Length; cancellation propagates upstream. */
+function boundedMigrationBody(response: Response, limit: number): Response {
+    const length = response.headers.get('content-length');
+    if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) {
+        void response.body?.cancel().catch(() => {});
+        throw new Error('migration_response_size');
+    }
+    if (!response.body) throw new Error('migration_response_empty');
+    const reader = response.body.getReader();
+    let bytes = 0;
+    return new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            try {
+                const next = await reader.read();
+                if (next.done) { controller.close(); return; }
+                bytes += next.value.byteLength;
+                if (bytes > limit) {
+                    void reader.cancel().catch(() => {});
+                    controller.error(new Error('migration_response_size'));
+                    return;
+                }
+                controller.enqueue(next.value);
+            } catch {
+                controller.error(new Error('migration_response_unavailable'));
+            }
+        },
+        cancel(reason) { return reader.cancel(reason); },
+    }), { status: response.status, headers: response.headers });
+}
+
+async function migrateRequest(name: string, action: string, body?: object, generation?: string): Promise<MigrateResult<Response>> {
+    const config = resolveCloudflareGuacamoleConfig();
+    const secret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+    if (!config.isConfigured || !secret) return { ok: false, error: 'unavailable' };
+    try {
+        const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(name)}/migrate/${action}`
+            + (generation === undefined ? '' : `?generation=${encodeURIComponent(generation)}`);
+        const method = body === undefined ? 'GET' : 'POST';
+        const payload = body === undefined ? '' : JSON.stringify(body);
+        const response = await fetch(endpoint, {
+            method,
+            headers: {
+                ...controlAuthHeaders(secret, { kind: 'v1' }, method, endpoint, payload),
+                'Content-Type': 'application/json', 'Accept-Encoding': 'identity',
+                [CORRELATION_HEADER]: newCorrelationId(),
+            },
+            ...(body === undefined ? {} : { body: payload }),
+            signal: AbortSignal.timeout(action === 'begin' ? 120_000 : 30_000),
+            cache: 'no-store', redirect: 'error',
+        });
+        if (!response.ok) {
+            if (response.status === 409) {
+                let reason: MigrateConflictReason = 'other';
+                try {
+                    // Read only a bounded enum payload; never persist arbitrary Worker text.
+                    const data: unknown = await boundedMigrationBody(response, 4096).json();
+                    if (data && typeof data === 'object' && !Array.isArray(data)) {
+                        const workerError = (data as Record<string, unknown>).error;
+                        reason = MIGRATE_CONFLICT_REASONS.find(value => value === workerError) ?? 'other';
+                    }
+                } catch { /* A malformed or oversized body is still a conflict. */ }
+                return { ok: false, error: 'conflict', reason };
+            }
+            void response.body?.cancel().catch(() => {});
+            return { ok: false, error: response.status === 404 ? 'not_found' : 'unavailable' };
+        }
+        return { ok: true, data: boundedMigrationBody(response, action.includes('/chunk/') ? MIGRATE_CHUNK_LIMIT : MIGRATE_HEAD_LIMIT) };
+    } catch {
+        // Do not propagate upstream messages or credentials into errors/logs.
+        return { ok: false, error: 'unavailable' };
+    }
+}
+
+async function migrateJson<T>(request: Promise<MigrateResult<Response>>, valid: (value: Record<string, unknown>) => boolean): Promise<MigrateResult<T>> {
+    const result = await request;
+    if (!result.ok) return result;
+    try {
+        const data: unknown = await result.data.json();
+        if (!data || typeof data !== 'object' || Array.isArray(data) || !valid(data as Record<string, unknown>))
+            return { ok: false, error: 'unavailable' };
+        return { ok: true, data: data as T };
+    } catch { return { ok: false, error: 'unavailable' }; }
+}
+
+export function migrateBegin(name: string): Promise<MigrateResult<MigrateBeginResult>> {
+    return migrateJson(migrateRequest(name, 'begin', {}), d => typeof d.etag === 'string'
+        && (d.systemEtag === null || typeof d.systemEtag === 'string') && typeof d.generation === 'string'
+        && Number.isSafeInteger(d.chunkCount) && Number.isSafeInteger(d.totalBytes) && typeof d.sha256 === 'string');
+}
+export function migrateCommit(name: string, input: MigrateCommitInput): Promise<MigrateResult<{ ok: true; systemFenced: boolean }>> {
+    return migrateJson(migrateRequest(name, 'commit', input), d => d.ok === true && typeof d.systemFenced === 'boolean');
+}
+export function migrateAbort(name: string): Promise<MigrateResult<{ ok: true }>> {
+    return migrateJson(migrateRequest(name, 'abort', {}), d => d.ok === true);
+}
+export function migrateReopen(name: string, input: { expectedMigratedEtag: string }): Promise<MigrateResult<{ ok: true }>> {
+    return migrateJson(migrateRequest(name, 'reopen', input), d => d.ok === true);
+}
+export function migrateExportHead(name: string, kind: MigrateKind): Promise<MigrateResult<import('./compute/provider-migrate').SnapshotHead>> {
+    return migrateJson(migrateExport(name, kind), d => typeof d.generation === 'string');
+}
+/** Streaming export for the host proxy; generation fences both head and chunk reads. */
+export function migrateExport(name: string, kind: MigrateKind, generation?: string, index?: number): Promise<MigrateResult<Response>> {
+    if (!['workspace', 'system'].includes(kind) || (index !== undefined && (!Number.isInteger(index) || index < 0 || index > 511)))
+        return Promise.resolve({ ok: false, error: 'unavailable' });
+    return migrateRequest(name, `export/${kind === 'system' ? 'system/' : ''}${index === undefined ? 'head' : `chunk/${index}`}`, undefined, generation);
 }

@@ -6,7 +6,7 @@ import sys
 import threading
 import signal
 
-from . import agent as agentmod, canary, config, desktop, enroll as enrollmod, guard, rebase, tunnel
+from . import agent as agentmod, canary, config, desktop, enroll as enrollmod, guard, pool, rebase, tunnel
 from .fsops import Refused
 
 
@@ -44,6 +44,9 @@ def enroll_or_reuse(cfg, lease):
     and its tunnel token and control key are still on the host root volume (a fence wipes
     them), reuse them: wipe the local nonce copies and restore the edge's routing. Any other
     case enrolls normally."""
+    if "ebsRestore" in lease:
+        from . import maintenance
+        return maintenance.enroll_or_reuse(cfg, lease)
     iid = _current_instance_id(cfg)
     rec = None
     try:
@@ -84,10 +87,18 @@ def refuse_while_stopping(cfg, name):
 def step(cfg, name, detach=False):
     if name == "lease":
         l = enrollmod.fetch_lease(cfg)
+        if l.get("kind") == "pool":
+            return f"pool lease generation={l['poolGeneration']}"
         return f"lease generation={l['generation']} leaseEpoch={l['leaseEpoch']}"
     lease = _lease(cfg)
     if name == "guard":
+        if lease.get("kind") == "pool":
+            return pool.run(cfg, lease)
         return "guard " + guard.run_guard(cfg, lease, rebase_runner=rebase.run_job)
+    if name == "maintenance-enroll":
+        return enroll_or_reuse(cfg, lease) if "ebsRestore" in lease else "ordinary boot"
+    if name == "enroll" and "ebsRestore" in lease:
+        return enroll_or_reuse(cfg, lease)
     guard.require_stamp(cfg, lease)
     if name == "clean":
         return "clean " + json.dumps(desktop.host_clean(cfg))
@@ -153,6 +164,9 @@ def main(argv=None):
             until = argv[1] if len(argv) > 1 else order[-1]
             for s in order[: order.index(until) + 1]:
                 print(f"[{s}] " + step(cfg, s, detach=True), flush=True)
+                if s == "guard" and "ebsRestore" in _lease(cfg):
+                    print("[maintenance-enroll] " + step(cfg, "maintenance-enroll"), flush=True)
+                    return 0
             return 0
         if cmd == "desktop-stop":
             desktop.stop(cfg)

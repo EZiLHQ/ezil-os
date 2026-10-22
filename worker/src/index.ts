@@ -1,3 +1,4 @@
+import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
 import { RuntimeLifecycleMonitor } from './runtime-lifecycle';
@@ -61,8 +62,8 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
 // AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
-import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
-import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, type RegistryFor } from './aws-tunnels';
+import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
+import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
 import { awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
@@ -368,6 +369,10 @@ interface Env extends SandboxEnv {
   SANDBOX_NEKO_TURN_API_TOKEN?: string;
   /** Optional ephemeral TURN credential TTL in seconds (clamped to [300, 1800]). */
   SANDBOX_NEKO_TURN_TTL_SECONDS?: string;
+  /** AI gateway origin; the user JWT stays in this Worker's DO. */
+  EZIL_AI_GATEWAY_URL?: string;
+  /** `off` returns 503 for AI requests. Boot env and credential deletion stay available. */
+  SANDBOX_AI_PROXY?: string;
 }
 
 /**
@@ -382,7 +387,7 @@ interface Env extends SandboxEnv {
  * aborts the runtime with `Incorrect type for map entry ... is not of type
  * 'function or ExportedHandler'`. Import it directly from `./desktop-mode`.
  */
-export { resolveDesktopMode, checkIceConfig, portFor, type DesktopMode } from './desktop-mode';
+export type { DesktopMode } from './desktop-mode';
 import {
   resolveDesktopMode,
   checkIceConfig,
@@ -417,27 +422,7 @@ import {
 // workerd rejects a plain `const` among the entrypoint's top-level exports
 // (`Incorrect type for map entry … is not of type 'function or
 // ExportedHandler'`). Import from `./browser-sidecar` directly.
-export {
-  parseBridgeHost,
-  handlePreviewBootstrap,
-  handlePreviewProxy,
-  handlePreviewWsProxy,
-  handlePreviewInspectorJs,
-  buildPreviewStatus,
-  buildPackageJsonCheckCommand,
-  parseDevserverPhase,
-  parseDevserverPhaseRecord,
-  parseRestartAttempts,
-  shouldTriggerDevserverRestart,
-  effectiveDevserverPhase,
-  computeDevserverRestartBackoffS,
-  buildDevserverRestartCommand,
-  rewriteResponseHeaders,
-  injectRuntimeShim,
-  type PreviewStatus,
-  type DevserverRestartDecision,
-  type BridgeTarget,
-} from './preview-bridge';
+export type { PreviewStatus, DevserverRestartDecision, BridgeTarget } from './preview-bridge';
 import {
   parseBridgeHost,
   handlePreviewBootstrap,
@@ -462,7 +447,7 @@ import {
 // top-level export of the entrypoint module that isn't a
 // function/class/`ExportedHandler` (see the note above `DESKTOP_MODES`).
 // Import them directly from `./workspace-diag`.
-export { diagSlotFile, diagMarkerContent, parseDiagRequest, isWriteOp, diagDisabled, type DiagOp } from './workspace-diag';
+export type { DiagOp } from './workspace-diag';
 import { diagSlotFile, diagMarkerContent, parseDiagRequest, diagDisabled } from './workspace-diag';
 import {
   putProjectFile,
@@ -478,24 +463,7 @@ import {
 // Re-exported as functions only; the module's `const`s stay unexported here
 // (workerd rejects non-function top-level exports of the entrypoint — see the
 // note above `DESKTOP_MODES`).
-export {
-  extractSignedToken,
-  buildTerminateReport,
-  describeDesktopStatus,
-  validateFocusApp,
-  buildFocusAppCommand,
-  focusDisabled,
-  restartDisabled,
-  findDesktopLauncherProcess,
-  buildRestartReport,
-  type TerminateOutcome,
-  type TerminateReport,
-  type DesktopStatus,
-  type FocusApp,
-  type ProcessLike,
-  type RestartOutcome,
-  type RestartReport,
-} from './sandbox-control';
+export type { TerminateOutcome, TerminateReport, DesktopStatus, FocusApp, ProcessLike, RestartOutcome, RestartReport } from './sandbox-control';
 import {
   extractSignedToken,
   buildTerminateReport,
@@ -535,11 +503,13 @@ import {
   isOwnMigratedHead,
   WorkspaceMigratedError,
   MIGRATING_FLAG,
+  migrationFenceState,
   MIGRATION_TARGETS,
   type MigrationTarget,
   type FlushR2BucketLike,
   type GcR2BucketLike,
 } from './workspace-persist';
+import { exportedSnapshot, exportedChunk, reopenMigrationHeads, MigrationRequestError } from './workspace-migration-export';
 import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
@@ -555,22 +525,7 @@ import {
 // rejects any top-level export of the entrypoint module that isn't a
 // function/class/`ExportedHandler` (see the note above `DESKTOP_MODES`).
 // Import them directly from `./twen`.
-export {
-  isTwenWriteOp,
-  twenDisabled,
-  twenStatusContent,
-  parseTwenRequest,
-  parseTwenBody,
-  twenRequestTooLarge,
-  twenStatMaxAttempts,
-  twenStatConverged,
-  parseTwenStatLines,
-  twenWriteCommand,
-  twenWriteConfirmed,
-  twenWriteDurable,
-  twenStaleZero,
-  type TwenOp,
-} from './twen';
+export type { TwenOp } from './twen';
 import {
   TWEN_STATUS_FILE,
   twenStatusContent,
@@ -591,15 +546,7 @@ import {
 // THE reported boot failure: `Incorrect type for map entry
 // 'CPU_DIAG_DEFAULT_MAX_LINES': the provided value is not of type 'function
 // or ExportedHandler'`. Import these directly from `./cpu-diag`.
-export {
-  cpuDiagFlagEnabled,
-  cpuDiagRouteDisabled,
-  resolveCpuDiagMaxLines,
-  cpuDiagStatCommand,
-  parseCpuDiagStatLines,
-  cpuDiagContentCommand,
-  type CpuDiagStat,
-} from './cpu-diag';
+export type { CpuDiagStat } from './cpu-diag';
 import {
   CPU_DIAG_FILE,
   CPU_DIAG_MAX_BYTES,
@@ -615,16 +562,7 @@ import {
 // `NEKO_LOG_MAX_LINES_CEILING` and `NEKO_LOG_MAX_LINE_LEN` are plain `const`s
 // and must NOT be re-exported from this entrypoint module. Import them from
 // `./neko-logs` directly.
-export {
-  nekoLogsRouteDisabled,
-  resolveNekoLogMaxLines,
-  nekoLogStatCommand,
-  parseNekoLogStatLines,
-  nekoLogContentCommand,
-  redactNekoLogContent,
-  type NekoLogStat,
-  type RedactedNekoLog,
-} from './neko-logs';
+export type { NekoLogStat, RedactedNekoLog } from './neko-logs';
 import {
   NEKO_LOG_FILE,
   NEKO_LOG_MAX_BYTES,
@@ -659,6 +597,26 @@ import {
   type LogEvent,
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
+import {
+  aiProxyBaseUrl,
+  aiProxyDisabled,
+  chooseAiCredential,
+  deriveAiProxyToken,
+  handleAiProxyRequest,
+  isAiProxyPath,
+  parsePushedAccessToken,
+  proxyError,
+  resolveGatewayUrl,
+  usableAiCredential,
+  verifyAiCredentialSignature,
+  DEFAULT_AI_GATEWAY_URL,
+  AI_CREDENTIAL_STORAGE_KEY,
+  AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
+  AI_PROXY_NONCE_STORAGE_KEY,
+  readLimited,
+  type StoredAiCredential,
+} from './ai-proxy';
+
 import { captureEditorState } from './editor-state';
 import {
   selectTelemetryWorthy,
@@ -682,8 +640,6 @@ import {
 const DESKTOP_PORT = 8080;
 /** Preview validity window reported to the client. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
-// Lets the reset reply leave the object before `ctx.abort()` discards it.
-export const ACCEPTANCE_RESET_DELAY_MS = 100;
 /**
  * Sandbox auto-sleep when idle. BACKSTOP ONLY, not the real mechanism:
  * `EzilSandboxDO.flushWorkspaceScheduled`'s explicit idle-stop path
@@ -754,7 +710,7 @@ const DEFAULT_WORKSPACE_MOUNT_PATH = '/workspace';
  * code-server use its own launch-time default) rather than pointing at a
  * path nothing actually populated.
  */
-export function codePreviewFolderParams(
+function codePreviewFolderParams(
   workspace: { mounted: boolean; mountPath?: string },
 ): Record<string, string> | undefined {
   return workspace.mounted && workspace.mountPath ? { folder: workspace.mountPath } : undefined;
@@ -766,8 +722,110 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
+// Only these public protocol codes may leave the shared error-response boundary.
+// A code-shaped exception message is still private unless it is in this list.
+const PUBLIC_ERROR_CODES = [
+  'acceptance_auth_not_configured', 'acceptance_fault_bad_request', 'acceptance_fault_failed',
+  'acceptance_faults_disabled', 'acceptance_reset_failed', 'acceptance_reset_unsupported',
+  'acceptance_stop_failed', 'access_token_expired', 'access_token_malformed',
+  'access_token_not_authenticated', 'access_token_wrong_user', 'activity_disabled',
+  'ai_credential_signature_expired', 'ai_credential_signature_mismatch', 'ai_credential_signature_missing',
+  'ai_credential_storage_failed', 'ai_proxy_not_configured', 'already_exists', 'already_migrated',
+  'aws_desktop_config_refused', 'aws_desktop_failed', 'aws_desktop_starting', 'aws_desktop_unreachable',
+  'aws_origin_starting', 'aws_origin_unavailable', 'aws_preview_auth_required', 'aws_routing_disabled',
+  'bad_request', 'body_too_large', 'browser_response_too_large', 'browser_sidecar_disabled',
+  'browser_sidecar_unreachable', 'browser_verb_method_mismatch', 'browser_verb_missing',
+  'browser_verb_not_allowed', 'chunk_unavailable', 'container_still_running_after_destroy',
+  'cpu_diag_disabled', 'cpu_diag_read_failed', 'cpu_diag_stat_failed', 'custom_domain_required',
+  'desktop_stack_did_not_stop_within_grace_period', 'diag_fresh_stat_failed', 'diag_invalid_op',
+  'diag_invalid_slot', 'diag_mount_failed', 'diag_stat_failed', 'diag_write_failed', 'export_failed',
+  'final_checkpoint_failed', 'flag_write_failed', 'focus_app_missing_or_not_a_string', 'focus_disabled',
+  'focus_switch_failed', 'focus_unsupported', 'focus_upstream_exception', 'generation_mismatch',
+  'gw_bad_mac', 'gw_invalid_request', 'gw_stale', 'head_moved', 'head_unreadable', 'hmac_malformed_token',
+  'hmac_required', 'hmac_secret_not_configured', 'hmac_signature_mismatch', 'hmac_token_expired',
+  'hmac_v1_token_retired', 'hmac_v2_body_unreadable', 'hmac_v2_identity_mismatch',
+  'hmac_v2_invalid_claims', 'hmac_v2_invalid_request', 'hmac_v2_malformed_token',
+  'hmac_v2_query_not_allowed', 'hmac_v2_required', 'hmac_v2_sandbox_mismatch', 'hmac_v2_scope_mismatch',
+  'hmac_v2_token_misplaced', 'hmac_v2_token_missing', 'hmac_v2_unverified', 'internal_error', 'invalid',
+  'invalid_body', 'invalid_body_base64', 'invalid_chunk_index', 'invalid_code_port',
+  'invalid_content_type', 'invalid_continuation_token', 'invalid_desktop_mode', 'invalid_focus_app',
+  'invalid_if_match_version', 'invalid_json_body', 'invalid_key', 'invalid_max_results', 'invalid_prefix',
+  'invalid_preview_zone_root', 'invalid_redirect', 'key_has_control_chars', 'key_too_long',
+  'method_not_allowed', 'migrating', 'migration_failed', 'migration_not_started', 'missing_project_id',
+  'neko_credentials_unavailable', 'neko_logs_disabled', 'neko_logs_read_failed', 'neko_logs_stat_failed',
+  'no_checkpoint', 'no_context', 'no_head', 'no_system_snapshot', 'no_workspace', 'not_found',
+  'not_migrated', 'preview_bootstrap_token_expired', 'preview_bootstrap_token_malformed',
+  'preview_bootstrap_token_missing', 'preview_bootstrap_token_signature_mismatch',
+  'preview_cookie_missing_or_invalid', 'preview_hostname_outside_zone', 'preview_status_unavailable',
+  'previous_head_missing', 'project_files_bucket_not_configured', 'project_files_proxy_disabled',
+  'provider_not_routable', 'relay_auth_not_configured', 'relay_bad_request', 'relay_busy',
+  'relay_login_failed', 'relay_logout_failed', 'relay_metadata_invalid', 'relay_negotiation_busy',
+  'relay_refresh_failed', 'relay_refresh_unconfirmed', 'relay_runtime_changed',
+  'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed', 'request_too_large',
+  'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
+  'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
+  'runtime_running', 'sandbox_runtime_blocked', 'screen_bad_request', 'screen_login_failed_no_token', 'screen_not_a_mode',
+  'screen_starting', 'screen_timeout', 'screen_unreadable', 'screen_upstream_exception', 'stop_failed',
+  'store_unavailable', 'system_auth_not_configured', 'system_checkpoint_failed', 'system_fence_failed',
+  'system_head_moved', 'system_size_unknown', 'system_too_large', 'telemetry_ack_failed',
+  'telemetry_bucket_not_configured', 'telemetry_drain_disabled', 'telemetry_drain_failed',
+  'tunnel_claims_mismatch', 'tunnel_origin_mismatch', 'turn_required', 'turn_unavailable', 'twen_disabled',
+  'twen_fresh_stat_failed', 'twen_invalid_body', 'twen_invalid_op', 'twen_invalid_operation_id',
+  'twen_mount_failed', 'twen_request_too_large', 'twen_stat_failed', 'twen_unknown_field',
+  'twen_write_failed', 'version_mismatch', 'workspace_checkpoint_failed',
+  'workspace_checkpoint_unavailable', 'workspace_diag_disabled', 'workspace_git_checkpoint_authoritative',
+  'workspace_persistence_unavailable', 'workspace_size_unknown', 'workspace_snapshot_reserved',
+  'workspace_too_large', 'workspace_unavailable',
+] as const;
+
+// Screen failures encode an HTTP status. Build the finite protocol vocabulary
+// from constants so no upstream response text becomes a public code.
+const PUBLIC_SCREEN_ERROR_CODES = (['screen_login_failed', 'screen_unsupported', 'screen_upstream'] as const)
+  .flatMap((prefix) => Array.from({ length: 500 }, (_, i) => `${prefix}_${100 + i}` as const));
+
+type PublicErrorCode = (typeof PUBLIC_ERROR_CODES)[number] | (typeof PUBLIC_SCREEN_ERROR_CODES)[number];
+
+/** Log diagnostics before constructing a response; return only trusted constants. */
+function publicErrorCode(err: unknown, fallback: PublicErrorCode = 'internal_error'): PublicErrorCode {
+  console.error('[worker] response error:', err);
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : undefined;
+  const code = PUBLIC_ERROR_CODES.find((known) => known === message)
+    ?? PUBLIC_SCREEN_ERROR_CODES.find((known) => known === message)
+    ?? PUBLIC_ERROR_CODES.find((known) => typeof message === 'string' && message.startsWith(`${known}:`));
+  if (code) return code;
+  if (typeof message === 'string' && /setsockoptint/i.test(message)) return 'sandbox_runtime_blocked';
+  if (typeof message === 'string' && /CustomDomainRequiredError|Port exposure requires a custom domain/i.test(message)) return 'custom_domain_required';
+  // Select even the fallback from the list, rather than returning an argument.
+  return PUBLIC_ERROR_CODES.find((known) => known === fallback)
+    ?? PUBLIC_SCREEN_ERROR_CODES.find((known) => known === fallback)
+    ?? 'internal_error';
+}
+
 function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
+  const body = JSON.stringify(data, (key, value: unknown) => {
+    if (key === 'stack' || key === 'message' || key === 'detail') {
+      if (value !== undefined) console.error('[worker] response diagnostic:', key, value);
+      return undefined;
+    }
+    if (key === 'error' && value != null) {
+      // Select the trusted constant itself; never forward the input string.
+      const code = PUBLIC_ERROR_CODES.find((known) => known === value)
+        ?? PUBLIC_SCREEN_ERROR_CODES.find((known) => known === value)
+        ?? PUBLIC_ERROR_CODES.find((known) => typeof value === 'string' && value.startsWith(`${known}:`));
+      if (code) {
+        if (code !== value) console.error('[worker] response error:', value);
+        return code;
+      }
+      console.error('[worker] response error:', value);
+      // Two runtime failures are deterministic and the app must not retry them
+      // (classifyWorkerHttpFailure): name them with public codes, never the text.
+      if (typeof value === 'string' && /setsockoptint/i.test(value)) return 'sandbox_runtime_blocked';
+      if (typeof value === 'string' && /CustomDomainRequiredError|Port exposure requires a custom domain/i.test(value)) return 'custom_domain_required';
+      return 'internal_error';
+    }
+    return value;
+  });
+  return new Response(body, {
     status,
     headers: { 'Content-Type': 'application/json', ...corsHeaders },
   });
@@ -827,6 +885,11 @@ interface EzilWorkspacePersistRpc {
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
+  beginMigrationExport: EzilSandboxDO['beginMigrationExport'];
+  commitMigration: EzilSandboxDO['commitMigration'];
+  abortMigrationExport: EzilSandboxDO['abortMigrationExport'];
+  reopenMigration: EzilSandboxDO['reopenMigration'];
+  exportMigration: EzilSandboxDO['exportMigration'];
   flushWorkspaceNow(): Promise<FlushOutcome>;
   /**
    * The `POST /sandbox/:name/activity` implementation's DO-side write. See
@@ -838,6 +901,11 @@ interface EzilWorkspacePersistRpc {
    * alive.
    */
   recordActivity(lastInputAgoMs: number): Promise<void>;
+  startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
+  getAiProxyNonce(): Promise<string | null>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }>;
+  getAiCredential(): Promise<string | null>;
+  dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
    * what actually happened. Runs entirely inside the DO because only there is
@@ -1081,6 +1149,7 @@ async function ensureDesktop(
    * ignore it entirely when telemetry is unconfigured).
    */
   onBootTelemetry?: (tail: ContainerTelemetryTail) => void,
+  aiStart?: (command: string, env: Record<string, string>) => Promise<string>,
 ): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
@@ -1150,9 +1219,13 @@ async function ensureDesktop(
   // argv), consistent with every other opt-in toggle above.
   const cpuDiagEnv: Record<string, string> =
     mode === 'neko' && cpuDiagFlagEnabled(cpuDiagFlag) ? { EZIL_NEKO_CPU_DIAG_ENABLED: '1' } : {};
-  const proc = await sandbox.startProcess(`DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`, {
-    env: { DESKTOP_MODE: mode, ...(iceEnv ?? {}), ...startupEnv, ...workspaceRootEnv, ...cpuDiagEnv },
-  });
+  const command = `DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`;
+  const launchEnv = { DESKTOP_MODE: mode, ...(iceEnv ?? {}), ...startupEnv, ...workspaceRootEnv, ...cpuDiagEnv };
+  // AI nonce rotation and process creation share the DO's lifecycle lock.
+  const proc = aiStart
+    ? await sandbox.getProcess(await aiStart(command, launchEnv))
+    : await sandbox.startProcess(command, { env: launchEnv });
+  if (!proc) throw new Error('desktop_launcher_missing');
   bootLog('container_start', 'end', {
     status: 'ok',
     phaseMs: Date.now() - bootT0,
@@ -1254,7 +1327,7 @@ async function ensureDesktop(
       bootLog('app_preview_expose', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      appPreviewExpose = { attempted: true, exposed: false, error: message };
+      appPreviewExpose = { attempted: true, exposed: false, error: publicErrorCode(err) };
       bootLog('app_preview_expose', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
       console.error(
         `[ensureDesktop] app-preview port expose failed (hostname=${hostname}, port=${appPreview.port}): ${message}`,
@@ -1280,7 +1353,7 @@ async function ensureDesktop(
       bootLog('code_preview_expose', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      codePreviewExpose = { attempted: true, exposed: false, error: message };
+      codePreviewExpose = { attempted: true, exposed: false, error: publicErrorCode(err) };
       bootLog('code_preview_expose', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
       console.error(
         `[ensureDesktop] code-preview port expose failed (hostname=${hostname}, port=${codePreview.port}): ${message}`,
@@ -1412,7 +1485,7 @@ function resolveWorkspaceMountConfig(env: Env): WorkspaceMountConfig | null {
  */
 // Exported for `workspace-store-wiring.test.ts` (the store-selection gate /
 // prefix parity); same test-export pattern as `isIdleStopDue` etc. above.
-export async function ensureWorkspaceMount(
+async function ensureWorkspaceMount(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
@@ -1492,7 +1565,7 @@ export async function ensureWorkspaceMount(
         mounted = true;
         break;
       }
-      mountErr = message;
+      mountErr = publicErrorCode(err);
       if (attempt < MOUNT_ATTEMPTS) {
         await new Promise((r) => setTimeout(r, 750 * attempt));
       }
@@ -1534,12 +1607,11 @@ export async function ensureWorkspaceMount(
     }
   } catch (err) {
     // Seeding is best-effort; a failure here should not block the preview.
+    publicErrorCode(err);
     return {
       mounted: true,
       mountPath: config.mountPath,
-      // Same reason as `mount_failed_after_*` above — an ENOENT/EACCES from
-      // the seed check names the mount path verbatim.
-      detail: `seed_check_failed: ${sanitizeErrorMessage(err)}`,
+      detail: 'seed_check_failed',
     };
   }
 
@@ -1776,7 +1848,7 @@ async function ensureWorkspaceHydratedFromR2(
  *                migrated, fenced by C-7).
  */
 export type FinalSystemClass = 'clean' | 'unsaved' | 'retryable';
-export function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): FinalSystemClass {
+function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): FinalSystemClass {
   if (system.skippedReason === 'stale' || system.skippedReason === 'not_restored') return 'unsaved';
   if (system.skippedReason === 'busy' || system.skippedReason === 'failed') return 'retryable';
   return 'clean';
@@ -2116,7 +2188,7 @@ const WORKSPACE_FLUSH_SCHEDULE_STALE_AFTER_MS = 5 * 60_000;
  * Pure and exported so the ONE decision that can turn continuous persistence
  * off is unit-testable by CALLING it, exactly like `isIdleStopDue`.
  */
-export function workspaceFlushLoopIsAlive(params: {
+function workspaceFlushLoopIsAlive(params: {
   pendingSchedules: ReadonlyArray<{ time: number }>;
   nowMs: number;
 }): boolean {
@@ -2132,7 +2204,7 @@ export function workspaceFlushLoopIsAlive(params: {
  * the ONE thing that decides "has this sandbox been idle long enough" can be
  * mutation-tested by calling it, not by reading source text.
  */
-export function isIdleStopDue(params: { lastActivityAt: number; now: number }): boolean {
+function isIdleStopDue(params: { lastActivityAt: number; now: number }): boolean {
   return params.now - params.lastActivityAt >= IDLE_STOP_MS;
 }
 
@@ -2249,7 +2321,7 @@ const CONTAINER_BUSY_LOAD1 = 0.5;
  * the caller can apply the fail-safe rather than this silently inventing a
  * `0` that would authorize a stop.
  */
-export function parseLoadAvg1(stdout: string): number | null {
+function parseLoadAvg1(stdout: string): number | null {
   const first = String(stdout ?? '').trim().split(/\s+/)[0];
   if (!first) return null;
   // 🔴 Require the WHOLE token to be a plain decimal. The `Number.isFinite`
@@ -2283,7 +2355,7 @@ export function parseLoadAvg1(stdout: string): number | null {
  * what it actually saw — the only way an operator can tell "genuinely idle"
  * from "this probe has never once returned a usable number".
  */
-export function containerBusyFromProbe(
+function containerBusyFromProbe(
   probe: { exitCode: number; stdout: string } | null,
 ): { busy: boolean; load1: number | null; reason: string } {
   if (probe === null) {
@@ -2321,7 +2393,7 @@ export function containerBusyFromProbe(
  * writes a value from this same ladder) falls back to the first climb step
  * rather than throwing.
  */
-export function computeNextFlushBackoffSeconds(params: {
+function computeNextFlushBackoffSeconds(params: {
   previousIntervalSeconds: number;
   wroteSomething: boolean;
   activityAdvanced: boolean;
@@ -2356,7 +2428,7 @@ export function computeNextFlushBackoffSeconds(params: {
  * is reachable by any future caller of `EzilWorkspacePersistRpc`, not only
  * this one route.
  */
-export function computeActivityTimestamp(params: { now: number; lastInputAgoMs: number }): number {
+function computeActivityTimestamp(params: { now: number; lastInputAgoMs: number }): number {
   const agoMs = Number.isFinite(params.lastInputAgoMs) ? Math.max(0, params.lastInputAgoMs) : 0;
   return params.now - agoMs;
 }
@@ -2367,7 +2439,7 @@ export function computeActivityTimestamp(params: { now: number; lastInputAgoMs: 
  * finite, non-negative number — same "closed contract, 400 on anything else"
  * discipline as `validateFocusApp` (`./sandbox-control.ts`).
  */
-export function validateActivityBody(
+function validateActivityBody(
   raw: unknown,
 ): { ok: true; lastInputAgoMs: number } | { ok: false; error: string } {
   const value =
@@ -2448,6 +2520,37 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         detail: `monitor,reason=${exit.reason},exitCode=${exit.exitCode ?? 'unknown'}`,
       });
     });
+  }
+  // Start operations and publishing the export fence share one queue. A start
+  // already in flight finishes before begin publishes the flag and stops it.
+  private migrationStartTail: Promise<unknown> = Promise.resolve();
+  private withMigrationStart<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.migrationStartTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.migrationStartTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  private async migrationStartBlocked(): Promise<boolean> {
+    const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+    if (!wctx) return false;
+    const store = await this.selectWorkspaceStore();
+    if (!store.ok || !store.store) return false;
+    return await migrationFenceState(store.store, wctx.prefix) === 'fresh';
+  }
+  override async start(...args: Parameters<CFSandboxClass<Env>['start']>): Promise<void> {
+    return this.withMigrationStart(async () => {
+      if (await this.migrationStartBlocked()) throw new Error('migrating');
+      return super.start(...args);
+    });
+  }
+  override async startAndWaitForPorts(...args: Parameters<CFSandboxClass<Env>['startAndWaitForPorts']>): Promise<void> {
+    return this.withMigrationStart(async () => {
+      if (await this.migrationStartBlocked()) throw new Error('migrating');
+      return super.startAndWaitForPorts(...args);
+    });
+  }
+  override async containerFetch(...args: Parameters<CFSandboxClass<Env>['containerFetch']>): Promise<Response> {
+    if (await this.migrationStartBlocked()) return json({ ok: false, error: 'migrating' }, 409);
+    return super.containerFetch(...args);
   }
   override async onStart(): Promise<void> {
     // A replacement container may run a different image; wait for its own codec result.
@@ -2590,7 +2693,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         } } : {}) });
       });
       return { ok: true, ...state };
-    } catch (error) { return relayFailureResult(error); }
+    } catch (error) {
+      const code = publicErrorCode(error);
+      const failure = relayFailureResult(error);
+      return { ok: false, error: error instanceof RelayFailure ? code : 'relay_refresh_failed', status: failure.status };
+    }
   }
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
@@ -2671,6 +2778,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         if (claim !== undefined && !isWorkspaceStoreKind(claim)) return { mounted: false, detail: 'workspace_store_claim_mismatch' };
         const store = await this.selectWorkspaceStore(claim);
         if (!store.ok) return { mounted: false, detail: store.detail };
+        if (store.store && await migrationFenceState(store.store, realR2KeyPrefix(params.prefix)) === 'fresh') {
+          return { mounted: false, detail: 'migrating' };
+        }
         // An S3-pinned computer committed its head to S3. A missing S3 head is
         // an anomaly, not an empty workspace: never seed over it.
         if (store.pinned && store.kind === 's3'
@@ -2726,6 +2836,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   private async runWorkspaceFlush(trigger: 'alarm' | 'explicit', options?: { allowDefer?: boolean }): Promise<FlushOutcome> {
     const t0 = Date.now();
     bootLog('workspace_flush', 'start', { detail: `trigger=${trigger}` });
+    let migrating: boolean;
+    try { migrating = await this.migrationStartBlocked(); } catch {
+      console.error('[migration-fence] flag read failed; checkpoint refused');
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+        failed: [], manifest: {}, heartbeatWritten: false, skippedReason: 'flush_threw' };
+    }
+    if (migrating) {
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+        failed: [], manifest: {}, heartbeatWritten: false, skippedReason: 'migrating' };
+    }
     if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
       return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
         failed: [], manifest: {}, heartbeatWritten: false };
@@ -3199,6 +3319,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // does because the absence of a reschedule (below) is the only thing
         // marking this loop retired.
         try {
+          await this.forgetAiCredentialBestEffort('idle_stop');
           await this.withRuntimeTransition(() => this.stop());
         } catch (err) {
           console.error(
@@ -3319,22 +3440,58 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return { systemChangesNotSaved: (await this.ctx.storage.get<{ reason: string; at: number }>(SYSTEM_CHANGES_NOT_SAVED_KEY)) ?? null };
   }
 
-  // ── Migration export (C-7). Operator tooling (M1) drives these; no route yet. ──
+  // ── Migration export (C-7), driven by signed control routes. ──
 
   /**
    * Start exporting this computer: take a final checkpoint of a running
    * container, REFUSE when the workspace or system layer is over the caps
    * (the committed head would be stale: exporting it would truncate), then
-   * raise the migrating flag (suspends GC on both prefixes) and return the
+   * raise the migrating flag, stop the Cloudflare writer, and return the
    * heads the export must copy and later commit against.
    */
   async beginMigrationExport(): Promise<
-    | { ok: true; store: WorkspaceStoreKind; prefix: string; head: { generation: string; chunkGeneration: string; sha256: string; entries: number; chunks: number; etag: string }; systemEtag: string | null }
+    | { ok: true; store: WorkspaceStoreKind; prefix: string; head: { generation: string; chunkGeneration: string; sha256: string; entries: number; chunks: number; totalBytes: number; etag: string }; systemEtag: string | null }
     | { ok: false; reason: string }
   > {
     return this.withWorkspacePersistence(async () => {
-      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
-      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext & { freshProvision?: boolean }>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      // A missing DO context is not evidence that its R2 workspace is empty.
+      // The SDK persists the name; its computer UUID prefix conservatively covers
+      // every matching computer, including all branches, system heads and loose files.
+      const emptyWorkspace = async (): Promise<boolean> => this.withMigrationStart(async () => {
+        if (this.containerIsRunning() || this.env.SANDBOX_WORKSPACE_S3_PREFIX?.trim()) return false;
+        const selected = await this.selectWorkspaceStore();
+        if (!selected.ok || selected.kind !== 'r2' || !selected.store) return false;
+        const name = await this.ctx.storage.get<string>('sandboxName');
+        const match = /^guac-[a-f0-9]{16}-([a-f0-9]{16})$/.exec(name ?? '');
+        if (!match) return false;
+        const id = match[1];
+        const prefixes = [`${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}`, `${name}/`];
+        const fencePrefix = wctx?.prefix ?? `${name}/branches/main`;
+        const fenceKey = `${fencePrefix}/${MIGRATING_FLAG}`;
+        if (wctx && !(wctx.freshProvision && wctx.prefix === `${name}/branches/main`)) {
+          const root = /^([a-f0-9-]{36})\/branches\/[^/]+$/.exec(wctx.prefix)?.[1];
+          if (!root || !root.startsWith(prefixes[0])) return false;
+        }
+        try {
+          for (const prefix of prefixes) {
+            const listed = await selected.store.list({ prefix, limit: 2 });
+            if (listed.truncated || listed.objects.some(object => !(wctx?.freshProvision && object.key === fenceKey))) return false;
+          }
+          if (this.containerIsRunning()) return false;
+          // Reuse the existing start fence. For a never-started DO the opaque
+          // sandbox namespace is only a control marker, never a user workspace.
+          // Publish it before releasing the start queue so an in-flight CF open
+          // cannot create a workspace between this proof and the placement CAS.
+          if (!await selected.store.put(fenceKey, new TextEncoder().encode(JSON.stringify({
+            startedAt: new Date().toISOString(), freshProvision: true,
+          })))) return false;
+          await this.ctx.storage.put(WORKSPACE_FLUSH_CONTEXT_KEY, { prefix: fencePrefix,
+            mountPath: wctx?.mountPath ?? '/workspace', freshProvision: true });
+          return true;
+        } catch { return false; }
+      });
+      if (!wctx || wctx.freshProvision) return { ok: false as const, reason: await emptyWorkspace() ? 'no_workspace' : 'no_context' };
       const store = await this.selectWorkspaceStore();
       if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
       const bucket = store.store as unknown as FlushR2BucketLike;
@@ -3359,18 +3516,44 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       } catch (err) {
         return { ok: false as const, reason: err instanceof WorkspaceMigratedError ? 'already_migrated' : 'head_unreadable' };
       }
-      if (!head) return { ok: false as const, reason: 'no_checkpoint' };
+      if (!head) return { ok: false as const, reason: await emptyWorkspace() ? 'no_workspace' : 'no_checkpoint' };
       // An oversized system delta may never have committed a head at all: refuse on the flag alone.
       const systemTooLarge = await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY);
       if (systemTooLarge === true) return { ok: false as const, reason: 'system_too_large' };
       if (systemHead && systemTooLarge !== false) return { ok: false as const, reason: 'system_size_unknown' };
-      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag }));
-      if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
+      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag,
+        systemHeadEtag: systemHead?.etag ?? null }));
+      const fenced = await this.withMigrationStart(async () => {
+        if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return 'flag_write_failed';
+        try {
+          if (this.containerIsRunning()) await this.withRuntimeTransition(async () => {
+            await this.stop();
+            // The SDK stop sends SIGTERM; it can return before the runtime exits.
+            if (this.containerIsRunning()) {
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([
+                  this.ctx.container!.monitor().catch(() => undefined),
+                  new Promise<void>((_, reject) => { timer = setTimeout(() => reject(new Error('stop_failed')), 10_000); }),
+                ]);
+              } finally { if (timer !== undefined) clearTimeout(timer); }
+            }
+            if (this.containerIsRunning()) throw new Error('stop_failed');
+          });
+          this.lastOkCheckpoint = null;
+          return null;
+        } catch {
+          console.error('[migration-fence] container stop failed; removing flag');
+          await store.store!.delete([`${wctx.prefix}/${MIGRATING_FLAG}`]);
+          return 'stop_failed';
+        }
+      });
+      if (fenced) return { ok: false as const, reason: fenced };
       const s = head.snapshot;
       return {
         ok: true as const, store: store.kind, prefix: wctx.prefix, systemEtag: systemHead?.etag ?? null,
         head: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation, sha256: s.sha256,
-          entries: s.entries, chunks: s.chunks.length, etag: head.etag },
+          entries: s.entries, chunks: s.chunks.length, totalBytes: s.chunks.reduce((sum, chunk) => sum + chunk.size, 0), etag: head.etag },
       };
     });
   }
@@ -3443,6 +3626,52 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
   }
 
+  async reopenMigration(params: { expectedMigratedEtag: string }): Promise<{ ok: true } | { ok: false; reason: string }> {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
+      try {
+        return await reopenMigrationHeads(store.store, wctx.prefix, systemPrefixOf(wctx.prefix), params.expectedMigratedEtag);
+      } catch (err) {
+        const code = publicErrorCode(err);
+        return { ok: false as const, reason: err instanceof MigrationRequestError ? code : 'reopen_failed' };
+      }
+    });
+  }
+
+  async exportMigration(index?: number, generation?: string, layer: 'workspace' | 'system' = 'workspace'): Promise<Response> {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return json({ ok: false, error: 'no_context' }, 409);
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return json({ ok: false, error: 'store_unavailable' }, 503);
+      const prefix = layer === 'system' ? systemPrefixOf(wctx.prefix) : wctx.prefix;
+      if (!prefix) return json({ ok: false, error: 'no_system_snapshot' }, 404);
+      try {
+        if (index === undefined) {
+          const head = await exportedSnapshot(store.store, prefix, wctx.prefix);
+          const response = json(head.snapshot);
+          // Identifies this layer's current head; rollback uses the workspace marker etag.
+          response.headers.set('etag', `"${head.etag}"`);
+          response.headers.set('cache-control', 'no-store');
+          return response;
+        }
+        const { body, chunk } = await exportedChunk(store.store, prefix, index, generation, wctx.prefix);
+        return new Response(body, { headers: { ...corsHeaders, 'content-type': 'application/octet-stream',
+          'content-length': String(chunk.size), 'x-ezil-chunk-sha256': chunk.sha256, 'cache-control': 'no-store' } });
+      } catch (err) {
+        const code = publicErrorCode(err);
+        if (layer === 'system' && err instanceof MigrationRequestError && err.reason === 'no_checkpoint') {
+          return json({ ok: false, error: 'no_system_snapshot' }, 404);
+        }
+        return json({ ok: false, error: err instanceof MigrationRequestError ? code : 'export_failed' },
+          err instanceof MigrationRequestError ? err.status : 503);
+      }
+    });
+  }
+
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
   async flushWorkspaceNow(): Promise<FlushOutcome> {
     // Concurrent opens (desktop, code and app windows, each re-asking while the
@@ -3482,6 +3711,85 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     // not hold the computer up past the bound.
     const retry = await this.ctx.storage.get<{ firstAt: number; attempts: number }>(SYSTEM_FINAL_RETRY_KEY);
     if (retry && lastActivityAt > retry.firstAt) await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
+  }
+
+  /** Concurrent preview opens share a launcher and its nonce; teardown/restart use this same lock. */
+  async startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
+    return this.withRuntimeMutation(() => this.startAiDesktopUnlocked(hostname, sandboxId, command, env));
+  }
+
+  /** Restart already owns the lifecycle lock. Only RPC-safe process ids cross it. */
+  private async startAiDesktopUnlocked(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
+    if (await this.migrationStartBlocked()) throw new Error('migrating');
+    if (this.containerIsRunning()) {
+      const processes = await this.listProcesses();
+      // ensureDesktop includes DESKTOP_MODE in this exact command. A different
+      // mode follows the original startProcess path, without stopping its stack.
+      const launcher = findDesktopLauncherProcess(Array.isArray(processes) ? processes.filter((p) => p.command === command) : []);
+      if (launcher) return launcher.id;
+    }
+    const aiEnv = await this.aiProxyBootEnv(hostname, sandboxId);
+    const process = await this.startProcess(command, { env: { ...env, ...aiEnv } });
+    return process.id;
+  }
+
+  /** Rotate only on the launch path, including restart; warm previews never call this. */
+  async aiProxyBootEnv(hostname: string, sandboxId: string): Promise<Record<string, string>> {
+    const nonce = crypto.randomUUID();
+    await this.ctx.storage.put(AI_PROXY_NONCE_STORAGE_KEY, nonce);
+    return aiProxyBootEnv(this.env, hostname, sandboxId, nonce);
+  }
+
+  async getAiProxyNonce(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) ?? null;
+  }
+
+  /** Order pushes against logout and each other atomically. No container access. */
+  async putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
+      const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+      if (revokedAt !== undefined && signedAt <= revokedAt) {
+        return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
+      }
+      const { keep, stored } = chooseAiCredential(current, { ...credential, signedAt });
+      if (stored && keep !== current) await txn.put(AI_CREDENTIAL_STORAGE_KEY, keep);
+      return { stored, expiresAt: keep.expiresAt };
+    });
+  }
+
+  async getAiCredential(): Promise<string | null> {
+    return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
+  }
+
+  /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
+  async dropAiCredential(token?: string, signedAt?: number): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
+      if (signedAt !== undefined) {
+        const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+        if (revokedAt !== undefined && signedAt <= revokedAt) return;
+        await txn.put(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, signedAt);
+        // A delayed logout cannot remove a credential pushed after it. A
+        // timestamp tie belongs to logout so a same-millisecond replay fails.
+        if (current?.signedAt !== undefined && current.signedAt > signedAt) return;
+      }
+      if (token === undefined || current?.token === token) await txn.delete(AI_CREDENTIAL_STORAGE_KEY);
+    });
+  }
+
+  /**
+   * Stop and teardown forget the AI credential and proxy nonce, but cleanup
+   * must never be the reason a computer keeps running: a storage failure is
+   * logged and the stop goes ahead. The next launch rotates the nonce anyway.
+   */
+  private async forgetAiCredentialBestEffort(phase: 'idle_stop' | 'teardown'): Promise<void> {
+    try {
+      await this.dropAiCredential();
+      await this.ctx.storage.delete(AI_PROXY_NONCE_STORAGE_KEY);
+    } catch {
+      console.error(`[ezil-ai] phase=${phase} event=credential_forget_failed`);
+    }
   }
 
   /** True when a container is actually alive under this DO right now. */
@@ -3684,6 +3992,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     await this.cancelWorkspaceFlushLoop();
+    await this.forgetAiCredentialBestEffort('teardown');
 
     let destroyError: string | undefined;
     try {
@@ -3693,7 +4002,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (retainPreviewAuthorization) await super.stop();
       else await super.destroy();
     } catch (err) {
-      destroyError = err instanceof Error ? err.message : String(err);
+      const code = publicErrorCode(err);
+      // buildTerminateReport treats an empty diagnostic as no destroy error.
+      const message = err instanceof Error ? err.message : String(err);
+      destroyError = message.trim() ? code : undefined;
       console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
     }
 
@@ -3791,6 +4103,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     explicitMode: DesktopMode | undefined,
     fallbackMode: DesktopMode,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }> {
+    if (await this.migrationStartBlocked()) {
+      return { ok: false, mode: explicitMode ?? fallbackMode, outcome: 'boot_failed',
+        wasRunning: this.containerIsRunning(), stopConfirmed: false, bootOk: false, error: 'migrating' };
+    }
     if (this.restartInProgress) {
       return {
         ok: false,
@@ -3920,7 +4236,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         try {
           iceEnv = await resolveNekoIceEnv(this.env);
         } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
+          publicErrorCode(err);
           if (ice.policy === 'relay' || ice.policy === 'production') {
             bootLog('restart', 'end', { status: 'error', detail: 'turn_unavailable' });
             return buildRestartReport({
@@ -3928,7 +4244,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
               wasRunning,
               stopConfirmed: true,
               bootOk: false,
-              bootError: `turn_unavailable: ${detail}`,
+              bootError: 'turn_unavailable',
             });
           }
           iceEnv = null; // diagnostic policy: proceed without relay
@@ -3984,6 +4300,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           null,
           workspaceRoot,
           this.env.EZIL_NEKO_CPU_DIAG_ENABLED,
+          undefined,
+          (command, env) => this.startAiDesktopUnlocked(hostname, sandboxId, command, env),
         );
         bootLog('restart', 'end', { status: 'ok' });
         const report = buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: true });
@@ -3994,9 +4312,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           codePreviewUrl: codePreviewExpose.exposed ? (codePreviewExpose.url ?? null) : null,
         };
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
+        const code = publicErrorCode(err);
         bootLog('restart', 'end', { status: 'error', detail: 'boot_failed' });
-        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: detail });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: code });
       }
     } finally {
       this.restartInProgress = false;
@@ -4046,16 +4364,31 @@ async function awsControlTarget(env: Env, request: Request, name: string, prefix
   return { record, zone };
 }
 
+/** Same boot-bound Chat identity for preview bootstrap and an in-place restart. */
+function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
+  const registry = awsRegistryFor(env);
+  return async (bootId: string) => {
+    const secret = resolveNekoDerivationSecret(env);
+    if (!secret) throw new RelayFailure('ai_proxy_not_configured');
+    const res = await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.aiNonce}`, {
+      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId }),
+    }));
+    const { nonce } = await res.json() as { nonce: string | null };
+    if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
+    const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
+    return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
+      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
+  };
+}
+
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
-  return async (signal, purpose = 'renewal') => {
+  return async (signal) => {
     const issuedAt = Date.now();
     const servers = await generateTurnCredentials(env, signal);
     const ttl = resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS);
-    // Apply the boot margin without changing the existing AWS renewal lifetime.
-    return servers ? { servers, expiresAt: purpose === 'boot'
-      ? relayExpiryFor(issuedAt, ttl)
-      : issuedAt + ttl * 1000 } : null;
+    // The same host lifetime validation runs at boot and at every renewal.
+    return servers ? { servers, expiresAt: relayExpiryFor(issuedAt, ttl) } : null;
   };
 }
 
@@ -4235,7 +4568,7 @@ async function generateTurnCredentials(env: Env, signal: AbortSignal = AbortSign
  * set (no username/credential) when only that is configured. Returns `null`
  * when neither is configured (diagnostic/no-TURN path — behavior unchanged).
  */
-export async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
+async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
   const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
   if (cloudflare) return { ...buildNekoIceEnv(cloudflare),
@@ -4390,12 +4723,13 @@ async function handlePreview(
       try {
         iceEnv = await resolveNekoIceEnv(env);
       } catch (err) {
+        publicErrorCode(err);
         const detail = err instanceof Error ? err.message : String(err);
         if (ice.policy === 'relay' || ice.policy === 'production') {
           tl.event('preview_lifecycle', 'sandbox.preview.turn', 'error', {
             error: `turn_unavailable: ${detail}`,
           });
-          return json({ ok: false, error: `turn_unavailable: ${detail}`, mode }, 502);
+          return json({ ok: false, error: 'turn_unavailable', mode }, 502);
         }
         // diagnostic policy: proceed without relay (media stays gated).
         iceEnv = null;
@@ -4432,6 +4766,7 @@ async function handlePreview(
             const zone = resolveAwsOriginZone(env);
             if (!zone) throw new RelayFailure('aws_origin_unavailable');
             return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
+              aiConfig: awsDesktopAiConfig(env, record),
               neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
           },
           nowMs: Date.now,
@@ -4529,6 +4864,7 @@ async function handlePreview(
     );
 
     if (!workspace.mounted) {
+      if (workspace.detail === 'migrating') return json({ ok: false, error: 'migrating', workspace }, 409);
       return json({ ok: false, error: 'workspace_persistence_unavailable', workspace }, 503);
     }
 
@@ -4544,6 +4880,9 @@ async function handlePreview(
       (tail) => {
         containerTelemetry = tail;
       },
+      mode === 'neko' ? (command, launchEnv) => sandbox.startAiDesktop(
+        normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT), sandboxId, command, launchEnv,
+      ) : undefined,
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
     desktopDone('ok');
@@ -4671,8 +5010,8 @@ async function handlePreview(
     tl.event('preview_lifecycle', 'sandbox.preview.failed', 'error', { error: err });
     spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetry);
     return json(
-      { ok: false, error: err instanceof Error ? err.message : String(err), mode },
-      500,
+      { ok: false, error: publicErrorCode(err), mode },
+      err instanceof Error && err.message === 'migrating' ? 409 : 500,
     );
   }
 }
@@ -4784,7 +5123,7 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
       {
         ok: false,
         sandboxName,
-        error: err instanceof Error ? err.message : String(err),
+        error: publicErrorCode(err),
         mode: modeResult.mode,
       },
       500,
@@ -4817,11 +5156,11 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
       explicitMode,
       modeResult.mode,
     );
-    const status = report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
+    const status = report.error === 'migrating' ? 409 : report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
     return json({ sandboxName, ...report }, status);
   } catch (err) {
     return json(
-      { ok: false, sandboxName, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5082,7 +5421,7 @@ async function handleWorkspaceDiag(
   } catch (err) {
     tl.event('workspace_mount', 'sandbox.diag.failed', 'error', { error: err });
     return json(
-      { ok: false, sandboxId: sandboxName, op, slot, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, op, slot, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5219,7 +5558,7 @@ async function handleCpuDiag(
   } catch (err) {
     tl.event('workspace_mount', 'sandbox.cpu_diag.failed', 'error', { error: err });
     return json(
-      { ok: false, sandboxId: sandboxName, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5378,7 +5717,7 @@ async function handleNekoLogs(
   } catch (err) {
     tl.event('workspace_mount', 'sandbox.neko_logs.failed', 'error', { error: err });
     return json(
-      { ok: false, sandboxId: sandboxName, error: sanitizeErrorMessage(err) },
+      { ok: false, sandboxId: sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5628,7 +5967,7 @@ async function handleTwen(request: Request, env: Env, sandboxName: string): Prom
     });
   } catch (err) {
     return json(
-      { ok: false, sandboxId: sandboxName, op, operationId, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, op, operationId, error: publicErrorCode(err) },
       500,
     );
   }
@@ -5683,7 +6022,7 @@ async function handleFocus(request: Request, env: Env, sandboxName: string): Pro
     return json({ ok: true, sandboxId: sandboxName, app });
   } catch (err) {
     return json(
-      { ok: false, sandboxId: sandboxName, app, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, app, error: publicErrorCode(err) },
       500,
     );
   }
@@ -6045,14 +6384,13 @@ async function handleScreen(request: Request, env: Env, sandboxName: string, des
       502,
     );
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    publicErrorCode(err);
     const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
     return json(
       {
         ok: false,
         sandboxId: sandboxName,
         error: timedOut ? 'screen_timeout' : `screen_upstream_exception`,
-        detail: message.slice(0, 300),
       },
       timedOut ? 504 : 502,
     );
@@ -6110,7 +6448,7 @@ async function handleActivity(request: Request, env: Env, sandboxName: string): 
     return json({ ok: true, sandboxId: sandboxName });
   } catch (err) {
     return json(
-      { ok: false, sandboxId: sandboxName, error: err instanceof Error ? err.message : String(err) },
+      { ok: false, sandboxId: sandboxName, error: publicErrorCode(err) },
       500,
     );
   }
@@ -6162,8 +6500,9 @@ async function handleTelemetryDrain(request: Request, env: Env): Promise<Respons
       truncated: page.truncated,
     });
   } catch (err) {
+    publicErrorCode(err);
     return json(
-      { ok: false, error: `telemetry_drain_failed: ${err instanceof Error ? err.message : String(err)}` },
+      { ok: false, error: 'telemetry_drain_failed' },
       500,
     );
   }
@@ -6197,8 +6536,9 @@ async function handleTelemetryAck(request: Request, env: Env): Promise<Response>
     await bucket.delete(keys);
     return json({ ok: true, deleted: keys.length });
   } catch (err) {
+    publicErrorCode(err);
     return json(
-      { ok: false, error: `telemetry_ack_failed: ${err instanceof Error ? err.message : String(err)}` },
+      { ok: false, error: 'telemetry_ack_failed' },
       500,
     );
   }
@@ -6410,6 +6750,8 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     const cookieSecret = resolveNekoDerivationSecret(env) ?? undefined;
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
+
+  if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
 
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
 
@@ -6832,7 +7174,7 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
         terminated: false,
         stopped: false,
         outcome: 'destroy_failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: publicErrorCode(err),
       },
       500,
     );
@@ -6961,15 +7303,106 @@ async function handleBrowserSidecar(
     // `launch_browser_sidecar` skipped (no /opt/ezil-sidecar in an older
     // image, or `EZIL_BROWSER_SIDECAR=off`), or the desktop is not up. Say
     // that, rather than returning a bare 500 that reads as a Worker fault.
-    const message = err instanceof Error ? err.message : String(err);
+    publicErrorCode(err);
     return json(
       {
         ok: false,
         error: 'browser_sidecar_unreachable',
-        detail: sanitizeErrorMessage(message),
         port: BROWSER_SIDECAR_PORT,
       },
       502,
+    );
+  }
+}
+
+// ── EZiL AI proxy (code bridge host `/ai/v1/*` + credential push) ────────────
+//
+// See `./ai-proxy.ts` for the contract. Two halves:
+//   - `POST /sandbox/:name/ai-credential  { accessToken }` (Worker API host):
+//     the Next server pushes the signed-in user's Supabase access token, signed
+//     with `x-ezil-signature` over sandbox id + body hash. Stored in the DO only.
+//   - `/ai/v1/*` on `<8443>-<id>-code.<zone>`: the container's chat extension,
+//     authenticated by the per-sandbox proxy token injected at boot
+//     (`EZIL_AI_PROXY_TOKEN`), forwarded to the gateway with the stored token.
+
+/** Boot env for the chat extension: where the proxy is and the sandbox's proxy token. Never the user's token. */
+async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, nonce: string): Promise<Record<string, string>> {
+  const secret = resolveNekoDerivationSecret(env);
+  const code = codePortFor('neko');
+  if (!code) return {};
+  return {
+    EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
+    EZIL_AI_PROXY_TOKEN: secret ? await deriveAiProxyToken(secret, sandboxId, nonce) : '',
+  };
+}
+
+async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsNonce?: string | null): Promise<Response> {
+  const disabled = aiProxyDisabled(env.SANDBOX_AI_PROXY);
+  let gatewayUrl: string;
+  try {
+    gatewayUrl = disabled ? DEFAULT_AI_GATEWAY_URL : resolveGatewayUrl(env.EZIL_AI_GATEWAY_URL);
+  } catch {
+    return proxyError(503, 'os_ai_unavailable', 'EZiL AI is not configured for this computer.');
+  }
+  const sandbox = disabled ? null : openSandbox(env, sandboxId);
+  return handleAiProxyRequest(request, {
+    gatewayUrl,
+    sandboxId,
+    enabled: env.SANDBOX_AI_PROXY,
+    proxySecret: resolveNekoDerivationSecret(env),
+    proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
+    credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
+    dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
+    fetch: (upstream) => fetch(upstream),
+    log: (fields) => console.log(JSON.stringify(fields)),
+  });
+}
+
+const AI_CREDENTIAL_MAX_BODY_BYTES = 32 * 1024;
+
+async function handleAiCredential(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  if (Number(request.headers.get('content-length') ?? 0) > AI_CREDENTIAL_MAX_BODY_BYTES) {
+    return json({ ok: false, error: 'body_too_large' }, 413);
+  }
+  const raw = await readLimited(request.body, AI_CREDENTIAL_MAX_BODY_BYTES);
+  if (raw === null) return json({ ok: false, error: 'body_too_large' }, 413);
+  const auth = await verifyAiCredentialSignature(
+    request.headers.get('x-ezil-signature'),
+    resolvePreviewSecrets(env),
+    sandboxName,
+    raw,
+    Date.now(),
+    request.method as 'POST' | 'DELETE',
+  );
+  if (!auth.ok) return json({ ok: false, error: auth.error }, auth.error === 'ai_proxy_not_configured' ? 503 : 401);
+
+  if (request.method === 'DELETE') {
+    try {
+      await openSandbox(env, sandboxName).dropAiCredential(undefined, auth.timestamp);
+      return json({ ok: true });
+    } catch {
+      return json({ ok: false, error: 'ai_credential_storage_failed' }, 500);
+    }
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+  const accessToken = (body as { accessToken?: unknown } | null)?.accessToken;
+  const parsed = parsePushedAccessToken(accessToken, sandboxName);
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp);
+    return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
+  } catch {
+    return json(
+      { ok: false, sandboxId: sandboxName, error: 'ai_credential_storage_failed' },
+      500,
     );
   }
 }
@@ -7015,6 +7448,21 @@ export default {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
+    if (url.hostname.split('.')[0]!.startsWith('aws-') && isAiProxyPath(path)) {
+      const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
+      if (!route || route.port !== CODE_PREVIEW_PORT) return proxyError(404, 'os_ai_unavailable');
+      if (aiProxyDisabled(env.SANDBOX_AI_PROXY)) return handleAiProxy(request, env, route.sandboxId, null);
+      const registry = awsRegistryFor(env);
+      if (!awsRoutingEnabled(env.AWS_ROUTING_ENABLED) || !registry || !resolveAwsOriginZone(env)) {
+        return proxyError(404, 'os_ai_unavailable');
+      }
+      const record = await lookupAwsTunnel(registry, route.sandboxId);
+      // A fenced or absent epoch has no valid token. Never accept the CF boot nonce,
+      // a preview cookie, a client-supplied nonce or a token for another computer.
+      if (!record?.aiProxyNonce) return proxyError(401, 'os_proxy_unauthorized');
+      return handleAiProxy(request, env, route.sandboxId, record.aiProxyNonce);
+    }
+
     // 0a) AWS computer browser hostnames (`aws-<port>-<sandboxId>.<zone>`, GW-4): fail-closed
     //     cookie gate, then a gw1-signed forward through the computer's tunnel. Returns null
     //     for every other hostname, so the Cloudflare dispatch below is unchanged.
@@ -7242,7 +7690,8 @@ export default {
         await openSandbox(env,name).setAcceptanceFault(name,raw);
         return json({ok:true});
       } catch (error) {
-        return json({ok:false,error:error instanceof AcceptanceFaultError ? error.code : 'acceptance_fault_failed'},
+        const code = publicErrorCode(error);
+        return json({ok:false,error:error instanceof AcceptanceFaultError ? code : 'acceptance_fault_failed'},
           error instanceof AcceptanceFaultError ? error.status : 502);
       }
     }
@@ -7271,7 +7720,8 @@ export default {
         const result = await openSandbox(env,name).relayRefresh(name,runtimeId);
         return result.ok ? json(result) : json({ ok:false, error:result.error }, result.status);
       } catch (error) {
-        return json({ ok:false,error:error instanceof RelayFailure ? error.code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
+        const code = publicErrorCode(error);
+        return json({ ok:false,error:error instanceof RelayFailure ? code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
       }
     }
 
@@ -7373,6 +7823,54 @@ export default {
       return handleTelemetryAck(request, env);
     }
 
+    const migrationMatch = path.match(/^\/sandbox\/([^/]+)\/migrate\/(begin|commit|abort|reopen|export\/(?:system\/)?(?:head|chunk\/([^/]+)))$/);
+    if (migrationMatch && ((method === 'POST' && !migrationMatch[2].startsWith('export/'))
+      || (method === 'GET' && migrationMatch[2].startsWith('export/')))) {
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      const action = migrationMatch[2];
+      let body: Record<string, unknown> = {};
+      const validEtag = (value: unknown): value is string => typeof value === 'string' && value.length > 0
+        && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
+      if (action === 'commit' || action === 'reopen') {
+        try {
+          const parsed: unknown = await request.json();
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+          body = parsed as Record<string, unknown>;
+        } catch { return json({ ok: false, error: 'invalid_body' }, 400); }
+        if (action === 'commit' && (!(MIGRATION_TARGETS as readonly unknown[]).includes(body.targetProvider)
+          || !validEtag(body.expectedEtag) || !(body.expectedSystemEtag === null || validEtag(body.expectedSystemEtag)))) {
+          return json({ ok: false, error: 'invalid_body' }, 400);
+        }
+        if (action === 'reopen' && !validEtag(body.expectedMigratedEtag)) return json({ ok: false, error: 'invalid_body' }, 400);
+      }
+      const index = migrationMatch[3] === undefined ? undefined : Number(migrationMatch[3]);
+      if (migrationMatch[3] !== undefined && (!/^(0|[1-9][0-9]*)$/.test(migrationMatch[3]) || !Number.isSafeInteger(index))) {
+        return json({ ok: false, error: 'invalid_chunk_index' }, 400);
+      }
+      try {
+        const sandbox = openSandbox(env, decodeURIComponent(migrationMatch[1]));
+        if (action.startsWith('export/')) return await sandbox.exportMigration(index, url.searchParams.get('generation') ?? undefined,
+          action.startsWith('export/system/') ? 'system' : 'workspace');
+        if (action === 'begin') {
+          const result = await sandbox.beginMigrationExport();
+          if (!result.ok) return json({ ok: false, error: result.reason }, 409);
+          return json({ etag: result.head.etag, systemEtag: result.systemEtag, generation: result.head.generation,
+            chunkCount: result.head.chunks, totalBytes: result.head.totalBytes, sha256: result.head.sha256 });
+        }
+        const result = action === 'commit'
+          ? await sandbox.commitMigration(body as { targetProvider: MigrationTarget; expectedEtag: string; expectedSystemEtag: string | null })
+          : action === 'reopen' ? await sandbox.reopenMigration(body as { expectedMigratedEtag: string })
+          : await sandbox.abortMigrationExport();
+        if (!result.ok) return json({ ok: false, error: 'reason' in result ? result.reason : 'migration_failed' }, 409);
+        return json(result);
+      } catch { return json({ ok: false, error: 'migration_failed' }, 503); }
+    }
+    const aiCredentialMatch = path.match(/^\/sandbox\/([^/]+)\/ai-credential$/);
+    if ((method === 'POST' || method === 'DELETE') && aiCredentialMatch) {
+      return handleAiCredential(request, env, decodeURIComponent(aiCredentialMatch[1]));
+    }
+
     const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);
     if (method === 'POST' && restartMatch) {
       // Restart the desktop stack inside a LIVE container ("someone closed
@@ -7384,6 +7882,13 @@ export default {
       }
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
+      const aws = await awsControlTarget(env, request, decodeURIComponent(restartMatch[1]), 'restart');
+      if (aws instanceof Response) return aws;
+      if (aws) return (await import('./aws-restart')).handleAwsRestart(
+        request, aws, resolvePreviewSecrets(env), (input, init) => fetch(input, init), {
+          mint: awsRelayMint(env), neko: () => deriveNekoCredentials(env, aws.record.sandboxId),
+          aiConfig: awsDesktopAiConfig(env, aws.record),
+        });
       return handleRestart(
         env,
         url,

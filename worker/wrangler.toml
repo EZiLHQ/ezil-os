@@ -133,6 +133,8 @@ local_protocol = "http"
 # Cloudflare Realtime TURN relay minted per-session from
 # SANDBOX_NEKO_TURN_KEY_ID + SANDBOX_NEKO_TURN_API_TOKEN (secrets, by name).
 [vars]
+SANDBOX_AI_PROXY = "off"
+EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"
 # ── The default desktop mode ─────────────────────────────────────────────────
 #
 # 🔴 SET BECAUSE IT WAS NOT, and the omission broke the troubleshoot restart in
@@ -341,6 +343,12 @@ name = "ezil-os-worker-staging"
 workers_dev = true
 
 [env.staging.vars]
+# AWS computers (paid plans) are reached through their per-host tunnel; staging only.
+AWS_ROUTING_ENABLED = "on"
+AWS_ORIGIN_ZONE = "ezil.work"
+AWS_ORIGIN_ZONE_ALLOWLIST = "ezil.work"
+SANDBOX_AI_PROXY = "on"
+EZIL_AI_GATEWAY_URL = "https://ai-staging.ezil.work"
 SANDBOX_NEKO_TURN_TTL_SECONDS = "300"
 SANDBOX_PREVIEW_ZONE_ROOT = "ezil.work"
 SANDBOX_DEFAULT_DESKTOP_MODE = "neko"

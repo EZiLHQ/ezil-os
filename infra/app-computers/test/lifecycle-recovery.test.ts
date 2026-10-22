@@ -80,6 +80,10 @@ async function run(f = fixture(), options: { lose?: string; noEffect?: string; s
     return { error: result.error, cause: result.cause, receipt: result.output, calls, f };
 }
 
+for (const operation of ['pool-provision', 'adopt', 'release'] as const) test(`historical recovery refuses ${operation} without mutation or a false fencing receipt`, async () => {
+    const result = await run(fixture(operation));
+    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined); assert.deepEqual(result.calls, []);
+});
 for (const operation of ['provision', 'start', 'stop', 'replace', 'retire'] as const) test(`recovery fences ${operation} writers and retains their data disk`, async () => {
     const f = fixture(operation);
     const result = await run(f); assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced');

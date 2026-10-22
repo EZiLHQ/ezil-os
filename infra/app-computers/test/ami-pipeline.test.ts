@@ -10,7 +10,9 @@ import { FoundationConfigSchema } from '../lib/foundation.js';
 const config: AmiConfig = { namespace: 'pilot', accountId: '123456789012', region: 'ap-south-1', version: '1.0.0' };
 const tags = { 'ezil:namespace': 'pilot' };
 function template() {
-    return assertions.Template.fromStack(new AmiPipelineStack(new App(), 'ezil-pilot-ami', {
+    return assertions.Template.fromStack(new AmiPipelineStack(new App({ context: {
+        '@aws-cdk/core:validateAgainstDefaultRules': true,
+    } }), 'ezil-pilot-ami', {
         config, env: { account: config.accountId, region: config.region },
         synthesizer: new BootstraplessSynthesizer(), terminationProtection: true,
     }));
@@ -91,7 +93,11 @@ test('AMI component embeds the checked-in YAML; recipe resolves Ubuntu via SSM a
             Parameters: [...inputs.map(Name => ({ Name, Value: [{ Ref: Name }] })),
                 { Name: 'DesktopImageRef', Value: [{ 'Fn::Sub': ['${RepositoryUri}@${Digest}', {
                     RepositoryUri: { Ref: 'ApplicationImageRepositoryUri' }, Digest: { Ref: 'DesktopImageDigest' },
-                }] }] }] }],
+                }] }] },
+                { Name: 'PreviousDesktopImageRef', Value: [{ 'Fn::If': ['HasPreviousDesktopImage',
+                    { 'Fn::Sub': ['${RepositoryUri}@${Digest}', { RepositoryUri: { Ref: 'ApplicationImageRepositoryUri' },
+                        Digest: { Ref: 'PreviousDesktopImageDigest' } }] }, ''] }] },
+                { Name: 'PreviousDesktopImageId', Value: [{ Ref: 'PreviousDesktopImageId' }] }] }],
         BlockDeviceMappings: [{ DeviceName: '/dev/sda1',
             Ebs: { VolumeType: 'gp3', VolumeSize: 30, Encrypted: true, DeleteOnTermination: true } }],
     });
@@ -164,4 +170,35 @@ test('AMI config requires matching explicit account/region and a bounded immutab
     for (const env of [{ account: '210987654321', region: config.region }, { account: config.accountId, region: 'eu-west-2' }]) {
         assert.throws(() => new AmiPipelineStack(new App(), 'WrongEnv', { config, env }), /env must equal/);
     }
+});
+
+
+test('previous lower inputs are paired, optional, distinct and use the approved repository', () => {
+    const t = template().toJSON();
+    for (const name of ['PreviousDesktopImageDigest', 'PreviousDesktopImageId']) {
+        assert.deepEqual(t.Parameters[name], { Type: 'String', Default: '', AllowedPattern: '^(sha256:[0-9a-f]{64})?$' });
+        for (const bad of ['latest', 'sha256:short', `sha256:${'A'.repeat(64)}`, "'; echo bad"]) {
+            assert.equal(new RegExp(t.Parameters[name].AllowedPattern).test(bad), false);
+        }
+    }
+    assert.deepEqual(t.Conditions.HasPreviousDesktopImage, { 'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'PreviousDesktopImageDigest' }, ''] }] });
+    const parts = JSON.parse(readFileSync(join(__dirname, '../../../deploy/aws/mum/tests/fixtures/ami-previous-bindings.json'), 'utf8'));
+    assert.deepEqual(t.Rules, parts.Rules);
+    assert.deepEqual(t.Conditions, parts.Conditions);
+    assert.deepEqual(t.Resources.Recipe.Properties.Components[0].Parameters.slice(-2), parts.Bindings);
+    const assertions = t.Rules.PreviousDesktopImagePair.Assertions;
+    assert.deepEqual(assertions[0].Assert, { 'Fn::Or': [
+        { 'Fn::And': [
+            { 'Fn::Equals': [{ Ref: 'PreviousDesktopImageDigest' }, ''] },
+            { 'Fn::Equals': [{ Ref: 'PreviousDesktopImageId' }, ''] },
+        ] },
+        { 'Fn::And': [
+            { 'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'PreviousDesktopImageDigest' }, ''] }] },
+            { 'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'PreviousDesktopImageId' }, ''] }] },
+        ] },
+    ] });
+    assert.deepEqual(assertions[1].Assert, { 'Fn::Or': [
+        { 'Fn::Equals': [{ Ref: 'PreviousDesktopImageId' }, ''] },
+        { 'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'PreviousDesktopImageId' }, { Ref: 'DesktopImageId' }] }] },
+    ] });
 });

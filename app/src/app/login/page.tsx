@@ -1,6 +1,8 @@
 import Link from 'next/link';
 import type { Viewport } from 'next';
 
+import { auth0Enabled } from '@/server/auth/auth0';
+import { readBillingConfig } from '@/server/billing/config';
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
 import { LoginForm } from './login-form';
@@ -24,6 +26,8 @@ export const viewport: Viewport = {
 function noticeFor(error: string | string[] | undefined): string | null {
     if (error === undefined) return null;
     if (error === 'auth_callback_failed') return 'Sign-in did not finish. Please try again.';
+    if (error === 'email_unverified') return 'Verify your email address with EZiL ID first, then sign in again.';
+    if (error === 'account_conflict') return 'This email is already linked to a different EZiL ID. Contact contact@ezil.work.';
     return 'We could not sign you in. Please try again.';
 }
 
@@ -65,6 +69,7 @@ export default async function LoginPage({
     // origin. See `safeReturnUrl`.
     const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM]);
     const notice = noticeFor(params.error);
+    const useAuth0 = auth0Enabled();
 
     return (
         <main className="ezil-lock">
@@ -90,13 +95,19 @@ export default async function LoginPage({
                     Your computer awaits.
                 </h1>
                 <p className="mt-1.5 text-center text-small text-white/65">
-                    Sign in or get started with Google.
+                    {useAuth0 ? 'Sign in with your EZiL ID.' : 'Sign in or get started with Google.'}
                 </p>
 
                 {notice && (
                     <p role="alert" className="ezil-lock-error">
                         {notice}
                     </p>
+                )}
+
+                {useAuth0 && (
+                    <a className="ezil-lock-google" href={`/auth/auth0/login?${new URLSearchParams({ returnUrl })}`}>
+                        Continue with EZiL ID
+                    </a>
                 )}
 
                 <LoginForm returnUrl={returnUrl} startWithEmail={params[METHOD_PARAM] === 'email'} />
@@ -118,6 +129,12 @@ export default async function LoginPage({
                     Privacy Policy
                 </Link>
                 .
+                {readBillingConfig().pricingPageEnabled && (
+                    <>
+                        {' '}
+                        <a href="/pricing" className="underline decoration-white/30 underline-offset-2 transition-colors hover:text-white">Plans</a>
+                    </>
+                )}
             </footer>
         </main>
     );

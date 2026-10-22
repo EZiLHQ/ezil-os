@@ -46,6 +46,8 @@ export function readRelayState(raw: unknown): RelayState {
 export async function relayOperation(container: RelayContainer, admin: string, params: {
   runtimeId?: string; mint?: (signal: AbortSignal) => Promise<{ servers: IceServerEntry[]; expiresAt: number }>;
   budgetMs?: number;
+  /** Provider-specific backend candidate policy; Cloudflare keeps the default set. */
+  backendIceServers?: (servers: IceServerEntry[]) => IceServerEntry[];
 }): Promise<RelayState> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new RelayFailure('relay_timeout', 504)), params.budgetMs ?? 24_000);
@@ -74,7 +76,9 @@ export async function relayOperation(container: RelayContainer, admin: string, p
   const refreshed = await request('/api/relay', { method: 'POST', headers, body: JSON.stringify({
     runtimeId: current.runtimeId, expiresAt: minted.expiresAt,
     frontend: JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_FRONTEND!),
-    backend: JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_BACKEND!),
+    backend: params.backendIceServers
+      ? params.backendIceServers(minted.servers)
+      : JSON.parse(configuration.NEKO_WEBRTC_ICESERVERS_BACKEND!),
   }) });
   // The desktop's status is the only clue to which of its checks refused (400 lifetime or
   // servers, 500 renegotiation); without it every refusal reads as relay_refresh_failed.

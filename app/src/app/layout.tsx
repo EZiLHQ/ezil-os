@@ -63,8 +63,9 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col">
         <TRPCReactProvider>{children}</TRPCReactProvider>
         <Toaster theme="dark" richColors />
-        <Analytics />
-        <SpeedInsights />
+        {/* Vercel serves these scripts; self-hosted deployments would only get 404s. */}
+        {process.env.VERCEL === '1' && <Analytics />}
+        {process.env.VERCEL === '1' && <SpeedInsights />}
       </body>
     </html>
   );

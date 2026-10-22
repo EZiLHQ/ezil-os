@@ -20,6 +20,31 @@
       "path": "app/drizzle/0002_os_access.sql",
       "sha256": "4c98ec14cc82f82851905cb133218a458836b97bbaa44fc65c4fcba02f0ad397",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0003_billing.sql",
+      "sha256": "6ee4818b61db34fd88297d02535074043f238f5966b7d29ab402d87202acf9c7",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0004_billing_v2.sql",
+      "sha256": "59ce7eaa28344a831c3b8f4fe47d5a9a92bed394e19054958d30ca586cc27400",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0005_billing_sessions.sql",
+      "sha256": "cf155c3d4f71f6414b6ce6097c929b8120da6c408b69c8f54e574c1cebec8413",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0006_compute_migrations.sql",
+      "sha256": "a99e2954187b58e6f5893cc9ad5adcc02da08f0d762d2f8b6ed9c9e41683b486",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0007_paid_session_deadlines.sql",
+      "sha256": "f3ae6b4957672e707b70c128995fc71fc78c03d7967316ddb2a56b5d0f131021",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

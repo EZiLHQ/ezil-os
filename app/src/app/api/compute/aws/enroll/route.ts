@@ -1,3 +1,4 @@
+import { parseRebaseJson } from '@/server/lib/compute/aws-rebase-json';
 import { NextResponse } from 'next/server';
 
 import { db } from '@/server/db';
@@ -23,7 +24,7 @@ const NO_STORE = { 'cache-control': 'no-store' };
 export async function POST(req: Request): Promise<Response> {
     let body: unknown;
     try {
-        body = await req.json();
+        body = parseRebaseJson(await req.text(), 32768);
     } catch {
         return NextResponse.json({ error: 'enroll_request_invalid' }, { status: 400, headers: NO_STORE });
     }

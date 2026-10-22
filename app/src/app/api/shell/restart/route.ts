@@ -24,6 +24,9 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  * default (docs/PLATFORM-NOTES.md §13) would kill this handler in the middle of
  * a restart that was going to succeed, and the user would be told it failed
  * while their desktop quietly came back.
+ * AWS also needs this budget: its Worker only queues the host restart (202).
+ * requestAwsRestart waits up to 180s for the new Neko runtime, whose startup
+ * gate includes code-server readiness, before this route returns success.
  *
  * Like every other `/api/shell/*` handler this is a TRANSPORT only. Ownership
  * is checked exactly once, inside the procedure; the sandbox id is derived

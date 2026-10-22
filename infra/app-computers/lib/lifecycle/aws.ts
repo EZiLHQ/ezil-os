@@ -1,6 +1,6 @@
 import { createHash, createHmac } from 'node:crypto';
 import { EC2Client, DescribeInstancesCommand, DescribeVolumesCommand, DescribeImagesCommand, DescribeLaunchTemplateVersionsCommand,
-    type EC2ClientConfig, type Instance, type Volume, type Image, type LaunchTemplateVersion } from '@aws-sdk/client-ec2';
+    DescribeSnapshotsCommand, type Snapshot, type EC2ClientConfig, type Instance, type Volume, type Image, type LaunchTemplateVersion } from '@aws-sdk/client-ec2';
 import { SFNClient, DescribeExecutionCommand, type DescribeExecutionOutput } from '@aws-sdk/client-sfn';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { AUTHORITY_PATH, authorityFor, canonical, equal, token, type Settings } from './contract.js';
@@ -13,7 +13,14 @@ export interface Dependencies {
     volumes(ids:string[]|{token:string}):Promise<Volume[]>;
     image(id:string):Promise<Image|undefined>;
     template(id:string,version:string):Promise<LaunchTemplateVersion|undefined>;
+    snapshots?(selector: string[] | { tags: Record<string, string> }): Promise<Snapshot[]>;
+    restoredVolumes?(tags: Record<string, string>): Promise<Volume[]>;
+    imageAuthority?(request: ImageAuthorityRequest): Promise<boolean>;
     now():number;
+}
+export interface ImageAuthorityRequest {
+    schemaVersion: number; computerId: string; jobId: string; leaseEpoch: number; digest: string;
+    imageJobId: string; imageJobPhase: 'preparation' | 'launch' | 'recovery' | 'rebind';
 }
 /** Mutating SDK calls deliberately do not exist here. Standard owns them. */
 export function awsDependencies(settings:Settings,test?:{requestHandler:EC2ClientConfig['requestHandler'];credentials:EC2ClientConfig['credentials'];fetcher:typeof fetch}):Dependencies {
@@ -24,7 +31,23 @@ export function awsDependencies(settings:Settings,test?:{requestHandler:EC2Clien
     const sfn=new SFNClient({...opts,endpoint:`https://states.${region}.amazonaws.com`});
     const secrets=new SecretsManagerClient({...opts,endpoint:`https://secretsmanager.${region}.amazonaws.com`});
     const request=()=>({abortSignal:AbortSignal.timeout(6000)});
-    return {now:Date.now,
+    const authorize = async (authority: object): Promise<boolean> => {
+        const secret=await secrets.send(new GetSecretValueCommand({SecretId:settings.authoritySecretArn,VersionStage:'AWSCURRENT'}),request());
+        if(secret.ARN!==settings.authoritySecretArn||secret.SecretBinary||!secret.SecretString||!secret.VersionStages?.includes('AWSCURRENT')
+            ||!/^[a-f0-9]{64}$/.test(secret.SecretString))throw new Error('authority_unavailable');
+        const body=canonical(authority),timestamp=String(Math.floor(Date.now()/1000));
+        const signature=createHmac('sha256',Buffer.from(secret.SecretString,'hex')).update([
+            'ezil-lifecycle-authority-v1','POST',AUTHORITY_PATH,timestamp,createHash('sha256').update(body).digest('hex')].join('\n')).digest('hex');
+        const r=await(test?.fetcher??fetch)(settings.authorityOrigin+AUTHORITY_PATH,{method:'POST',redirect:'error',signal:AbortSignal.timeout(6000),
+            headers:{'content-type':'application/json','x-ezil-workflow-timestamp':timestamp,'x-ezil-workflow-signature':signature},body});
+        const reader=r.body?.getReader();if(!reader)throw new Error('authority_unavailable');
+        try {let bytes=0;const parts:Uint8Array[]=[];
+            for(;;){const p=await reader.read();if(p.done)break;bytes+=p.value.length;if(bytes>4096)throw new Error();parts.push(p.value);}
+            if(r.status===403)return false;if(r.status!==200)throw new Error();
+            return equal(JSON.parse(Buffer.concat(parts).toString()),{authorized:true,...authority});
+        }catch{throw new Error('authority_unavailable')}finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
+    };
+    return {now:Date.now, imageAuthority: authorize,
         execution:arn=>sfn.send(new DescribeExecutionCommand({executionArn:arn}),request()),
         instances:async selector=>{
             let result;
@@ -48,22 +71,31 @@ export function awsDependencies(settings:Settings,test?:{requestHandler:EC2Clien
         image:async id=>{const r=await ec2.send(new DescribeImagesCommand({ImageIds:[id]}),request());if(r.NextToken||r.Images?.length!==1)return undefined;return r.Images[0];},
         template:async(id,version)=>{const r=await ec2.send(new DescribeLaunchTemplateVersionsCommand({LaunchTemplateId:id,Versions:[version]}),request());
             if(r.NextToken||r.LaunchTemplateVersions?.length!==1)return undefined;return r.LaunchTemplateVersions[0];},
-        authority:async(i,digest)=>{
-            const secret=await secrets.send(new GetSecretValueCommand({SecretId:settings.authoritySecretArn,VersionStage:'AWSCURRENT'}),request());
-            if(secret.ARN!==settings.authoritySecretArn||secret.SecretBinary||!secret.SecretString||!secret.VersionStages?.includes('AWSCURRENT')
-                ||!/^[a-f0-9]{64}$/.test(secret.SecretString))throw new Error('authority_unavailable');
-            const body=canonical(authorityFor(i,digest)),timestamp=String(Math.floor(Date.now()/1000));
-            const signature=createHmac('sha256',Buffer.from(secret.SecretString,'hex')).update([
-                'ezil-lifecycle-authority-v1','POST',AUTHORITY_PATH,timestamp,createHash('sha256').update(body).digest('hex')].join('\n')).digest('hex');
-            const r=await(test?.fetcher??fetch)(settings.authorityOrigin+AUTHORITY_PATH,{method:'POST',redirect:'error',signal:AbortSignal.timeout(6000),
-                headers:{'content-type':'application/json','x-ezil-workflow-timestamp':timestamp,'x-ezil-workflow-signature':signature},body});
-            const reader=r.body?.getReader();if(!reader)throw new Error('authority_unavailable');
-            try {let bytes=0;const parts:Uint8Array[]=[];
-                for(;;){const p=await reader.read();if(p.done)break;bytes+=p.value.length;if(bytes>4096)throw new Error();parts.push(p.value);}
-                if(r.status===403)return false;if(r.status!==200)throw new Error();
-                return equal(JSON.parse(Buffer.concat(parts).toString()),{authorized:true,...authorityFor(i,digest)});
-            }catch{throw new Error('authority_unavailable')}finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
+        snapshots: async selector => {
+            const rows: Snapshot[] = [], seen = new Set<string>(); let next: string | undefined;
+            do {
+                const result = await ec2.send(new DescribeSnapshotsCommand({
+                    ...(Array.isArray(selector) ? { SnapshotIds: selector } : { OwnerIds: [settings.deployment.accountId],
+                        Filters: Object.entries(selector.tags).map(([key, value]) => ({ Name: 'tag:' + key, Values: [value] })) }), NextToken: next,
+                }), request());
+                rows.push(...result.Snapshots ?? []); next = result.NextToken;
+                if (next && seen.has(next)) throw new Error('snapshot_create_unconfirmed');
+                if (next) seen.add(next);
+            } while (next);
+            return rows;
         },
+        restoredVolumes: async tags => {
+            const volumes: Volume[] = [], seen = new Set<string>(); let next: string | undefined;
+            do {
+                const result = await ec2.send(new DescribeVolumesCommand({ Filters: Object.entries(tags).map(([key, value]) =>
+                    ({ Name: 'tag:' + key, Values: [value] })), NextToken: next }), request());
+                volumes.push(...result.Volumes ?? []); next = result.NextToken;
+                if (next && seen.has(next)) throw new Error('restore_lineage_mismatch');
+                if (next) seen.add(next);
+            } while (next);
+            return volumes;
+        },
+        authority: (i, digest) => authorize(authorityFor(i, digest)),
     };
 }
 export const allocationToken=token;

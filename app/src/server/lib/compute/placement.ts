@@ -45,6 +45,7 @@ import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
+import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
 
 // ── Enums ────────────────────────────────────────────────────────────────
 
@@ -289,6 +290,13 @@ export type PlacementFields = Partial<{
     [K in keyof typeof MUTABLE_COLUMNS]: (typeof MUTABLE_COLUMNS)[K][1] extends 'timestamptz' ? Date | null : string | null;
 }>;
 
+// Placement.updatedAt is a JavaScript Date and the generation CAS uses exact
+// SQL equality. Every placement updated_at writer must therefore store whole
+// milliseconds. Advance at least 1 ms on updates, even within one transaction
+// (now() is fixed there), so a same-state write always invalidates old snapshots.
+const PLACEMENT_INSERT_TIME = sql`date_trunc('milliseconds', now())`;
+const PLACEMENT_UPDATE_TIME = sql`GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')`;
+
 const SELECT_COLUMNS = sql.raw(
     [
         'computer_id::text AS computer_id', 'owner_user_id::text AS owner_user_id', 'provider', 'workspace_store', 'generation::text AS generation',
@@ -368,17 +376,101 @@ async function selectRows(db: PlacementExecutor, computerId: string): Promise<Re
     );
 }
 
-/** C-2 read rule. Throws `PlacementIntegrityError` rather than guessing. */
-export async function readPlacement(db: PlacementExecutor, rawComputerId: string): Promise<ResolvedPlacement> {
+/**
+ * C-2 read rule. Throws `PlacementIntegrityError` rather than guessing.
+ * User-facing callers supply the authenticated owner so a foreign placement
+ * is refused BEFORE querying image reservations. Ownerless background reads
+ * still fail closed on reservations.
+ */
+export async function readPlacement(db: PlacementExecutor, rawComputerId: string, expectedOwnerUserId?: string): Promise<ResolvedPlacement> {
     const computerId = canonicalId(rawComputerId);
     const rows = await selectRows(db, computerId);
-    if (rows.length === 0) return DEFAULT_PLACEMENT;
+    if (rows.length === 0) { await assertNoImageReservation(db, computerId); return DEFAULT_PLACEMENT; }
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     const record = parsePlacementRow(rows[0]!, computerId);
+    if (expectedOwnerUserId !== undefined && record.ownerUserId !== canonicalId(expectedOwnerUserId)) {
+        throw new PlacementOwnerError(computerId);
+    }
+    await assertNoImageReservation(db, computerId);
     return { provider: record.provider, store: record.store, record };
 }
 
+export class ImageJobConflictError extends Error {
+    constructor() { super('image_job_conflict'); this.name = 'ImageJobConflictError'; }
+}
+
+/** Every ordinary reader/admission fails closed for reservations, including corrupt or orphan rows. */
+export async function assertNoImageReservation(db: PlacementExecutor, computerId: string): Promise<void> {
+    const rows = rowsOf(await db.execute(sql`/* placement:image-reservation */
+        SELECT job_id::text AS job_id FROM public.ezil_computer_image_jobs
+        WHERE computer_id = ${canonicalId(computerId)}::uuid AND phase NOT IN ('succeeded', 'recovered', 'cancelled')
+        UNION ALL SELECT image_upgrade_job_id::text AS job_id FROM public.ezil_computer_placements
+        WHERE computer_id = ${canonicalId(computerId)}::uuid AND image_upgrade_job_id IS NOT NULL LIMIT 2`));
+    if (rows.length) throw new ImageJobConflictError();
+}
+
+export interface ImagePlacement extends Placement {
+    lowerImageDigest: string | null;
+    lowerDigestObservedAt: Date | null;
+    imageUpgradeJobId: string | null;
+}
+
+/** Image store only, inside global admission -> computer -> row locks. */
+export async function lockImagePlacement(tx: PlacementExecutor, lock: AdmissionLock, computerId: string): Promise<ImagePlacement | null> {
+    assertAdmissionLock(tx, lock);
+    await lockComputer(tx, canonicalId(computerId));
+    const rows = rowsOf(await tx.execute(sql`/* placement:image-read */ SELECT ${SELECT_COLUMNS}, lower_image_digest,
+        lower_digest_observed_at, image_upgrade_job_id::text AS image_upgrade_job_id
+        FROM public.ezil_computer_placements WHERE computer_id = ${canonicalId(computerId)}::uuid FOR UPDATE`));
+    if (!rows.length) return null;
+    if (rows.length !== 1) throw new ImageJobConflictError();
+    const r = rows[0]!, p = parsePlacementRow(r, computerId);
+    const digest = nullableText(r.lower_image_digest), observed = timestamp(r.lower_digest_observed_at), jobId = nullableText(r.image_upgrade_job_id);
+    if (digest === undefined || observed === undefined || jobId === undefined || (digest === null) !== (observed === null)
+        || (digest !== null && !/^sha256:[0-9a-f]{64}$/.test(digest)) || (jobId !== null && !UUID.test(jobId))) throw new ImageJobConflictError();
+    return { ...p, lowerImageDigest: digest, lowerDigestObservedAt: observed, imageUpgradeJobId: jobId };
+}
+
+/** Only the image store calls this under its reservation lock; exactly one placement changes. */
+export async function setImageReservation(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, jobId: string | null): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    const rows = rowsOf(await tx.execute(sql`/* placement:image-cas */ UPDATE public.ezil_computer_placements
+        SET image_upgrade_job_id = ${jobId}::uuid, updated_at = ${PLACEMENT_UPDATE_TIME}
+        WHERE computer_id = ${p.computerId}::uuid AND owner_user_id = ${p.ownerUserId}::uuid
+          AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+          AND image_upgrade_job_id IS NOT DISTINCT FROM ${p.imageUpgradeJobId}::uuid RETURNING computer_id`));
+    if (rows.length !== 1) throw new ImageJobConflictError();
+}
+
 /** C-2 periodic duplicate check. Any result must alarm and closes admission. */
+export type ImagePlacementFields = Partial<Pick<ImagePlacement, 'state' | 'generation' | 'leaseEpoch' | 'fenceToken' | 'instanceId' | 'volumeId'
+    | 'lifecycleJobId' | 'lifecycleDigest' | 'enrollNonceHash' | 'enrollConsumedHash' | 'enrollExpiresAt' | 'lastError'
+    | 'lowerImageDigest' | 'lowerDigestObservedAt' | 'imageUpgradeJobId' | 'leaseUntil' | 'presenceAt'>>;
+/** Image store only: the caller has validated the job and owner under these same locks. */
+export async function writeImagePlacement(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, fields: ImagePlacementFields): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    const types: Record<keyof ImagePlacementFields, string> = { state: 'text', generation: 'bigint', leaseEpoch: 'bigint', fenceToken: 'uuid',
+        instanceId: 'text', volumeId: 'text', lifecycleJobId: 'uuid', lifecycleDigest: 'text', enrollNonceHash: 'text', enrollConsumedHash: 'text',
+        enrollExpiresAt: 'timestamptz', lastError: 'text', lowerImageDigest: 'text', lowerDigestObservedAt: 'timestamptz', imageUpgradeJobId: 'uuid', leaseUntil: 'timestamptz', presenceAt: 'timestamptz' };
+    const assignments = Object.entries(fields).map(([key, value]) => {
+        const type = types[key as keyof ImagePlacementFields];
+        if (!type) throw new ImageJobConflictError();
+        // Drizzle's postgres-js timestamp serializer passes values through;
+        // postgres-js Bind expects text, not a Date object.
+        const param = value instanceof Date ? value.toISOString() : value;
+        return sql`${sql.raw(key.replace(/[A-Z]/g, c => '_' + c.toLowerCase()))} = ${param}::${sql.raw(type)}`;
+    });
+    if (fields.leaseEpoch !== undefined && fields.leaseEpoch < p.leaseEpoch) throw new ImageJobConflictError();
+    const rows = rowsOf(await tx.execute(sql`/* placement:image-write */ UPDATE public.ezil_computer_placements
+        SET ${sql.join(assignments, sql`, `)}, updated_at = ${PLACEMENT_UPDATE_TIME}
+        WHERE computer_id = ${p.computerId}::uuid AND owner_user_id = ${p.ownerUserId}::uuid
+          AND provider = 'aws-ec2' AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+          AND fence_token IS NOT DISTINCT FROM ${p.fenceToken}::uuid
+          AND lifecycle_job_id IS NOT DISTINCT FROM ${p.lifecycleJobId}::uuid
+          AND image_upgrade_job_id IS NOT DISTINCT FROM ${p.imageUpgradeJobId}::uuid RETURNING computer_id`));
+    if (rows.length !== 1) throw new ImageJobConflictError();
+}
+
 export async function findDuplicatePlacements(db: PlacementExecutor): Promise<{ computerId: string; rows: number }[]> {
     const rows = rowsOf(
         await db.execute(sql`/* placement:duplicates */ SELECT computer_id::text AS computer_id, count(*)::int AS rows
@@ -543,9 +635,10 @@ export interface CreatePlacementInput {
 
 export type CreatePlacementResult = { ok: true; placement: Placement } | { ok: false; reason: 'placement_exists' };
 
-async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput): Promise<CreatePlacementResult> {
+async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput, computerLocked = false): Promise<CreatePlacementResult> {
     const input = { ...rawInput, computerId: canonicalId(rawInput.computerId), ownerUserId: canonicalId(rawInput.ownerUserId) };
-    await lockComputer(tx, input.computerId);
+    if (!computerLocked) await lockComputer(tx, input.computerId);
+    await assertNoImageReservation(tx, input.computerId);
     if ((await selectRows(tx, input.computerId)).length > 0) return { ok: false, reason: 'placement_exists' };
     const fields = input.fields ?? {};
     const keys = (Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[]).filter((k) => fields[k] !== undefined);
@@ -558,7 +651,7 @@ async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput)
         sql`1`,
         sql.raw(String(INITIAL_LEASE_EPOCH[input.provider])),
         sql`${input.state}`,
-        sql`now()`,
+        PLACEMENT_INSERT_TIME,
         ...keys.map((k) => valueSql(k, fields[k] ?? null)),
     ];
     const rows = rowsOf(
@@ -600,6 +693,130 @@ export async function createAwsPlacement(
     return createInTx(tx, { computerId: input.computerId, ownerUserId: input.ownerUserId, provider: 'aws-ec2', state: 'PROVISIONING', fields: input.fields });
 }
 
+export interface FlipPlacementToAwsInput {
+    computerId: string;
+    ownerUserId: string;
+    migrationId: string;
+    /** Keep the normal ready receipt pending until migration commit. */
+    pendingReady?: boolean;
+    /** Receipt of the already admitted, restored AWS host. No new host is launched here. */
+    fields: PlacementFields & { region: 'ap-south-1'; instanceId: string; volumeId: string; fsUuid: string };
+}
+
+/** Retire/remove the old immutable row and publish the restored host atomically.
+ * The migration row lock also serializes this against migration state transitions.
+ * Admission for the actual launch belongs to the migration orchestrator; this is
+ * a publication of that existing host, under the global then computer lock order.
+ */
+export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInput): Promise<Placement> {
+    const computerId = canonicalId(input.computerId), ownerUserId = canonicalId(input.ownerUserId);
+    return withAdmission(db, async (tx) => {
+        await lockComputer(tx, computerId);
+        const migration = rowsOf(await tx.execute(sql`SELECT state, user_id::text, computer_id::text, to_provider, last_error
+            FROM public.ezil_compute_migrations WHERE id = ${input.migrationId}::uuid FOR UPDATE`))[0];
+        if (!migration || migration.state !== 'restored' || migration.user_id !== ownerUserId
+            || migration.computer_id !== computerId || migration.to_provider !== 'aws-ec2'
+            || String(migration.last_error ?? '').startsWith('recovery:')) throw new Error('migration_not_restored');
+        if (input.fields.region !== 'ap-south-1' || !input.fields.instanceId || !input.fields.volumeId || !input.fields.fsUuid) {
+            throw new Error('migration_aws_receipt_invalid');
+        }
+        const current = (await readPlacement(tx, computerId)).record;
+        if (current?.provider === 'aws-ec2' && current.ownerUserId === ownerUserId
+            && current.instanceId === input.fields.instanceId && current.volumeId === input.fields.volumeId
+            && current.fsUuid === input.fields.fsUuid && current.fenceToken === (input.fields.fenceToken ?? null)
+            && current.state === (input.pendingReady ? 'PROVISIONING' : 'RUNNING')) return current;
+        if (current) {
+            if (current.provider !== 'cloudflare' || current.ownerUserId !== ownerUserId) throw new Error('migration_source_mismatch');
+            let retired = current;
+            for (const to of ['RETIRING', 'RETIRED'] as const) {
+                if (retired.state === 'RETIRED' || retired.state === to) continue;
+                if (!PLACEMENT_TRANSITIONS[retired.state].includes(to)) throw new Error('migration_source_not_retirable');
+                const result = await casInTx(tx, computerId, retired, to, { generation: 0, leaseEpoch: 0 }, {}, { ownerUserId, provider: 'cloudflare' });
+                if (!result.ok) throw new Error('migration_placement_conflict');
+                retired = result.placement;
+            }
+            const deleted = rowsOf(await tx.execute(sql`/* placement:migration-remove */ DELETE FROM public.ezil_computer_placements
+                WHERE computer_id = ${computerId}::uuid AND owner_user_id = ${ownerUserId}::uuid
+                    AND provider = 'cloudflare' AND state = 'RETIRED' AND generation = ${retired.generation} AND lease_epoch = ${retired.leaseEpoch}
+                RETURNING computer_id`));
+            if (deleted.length !== 1) throw new Error('migration_placement_conflict');
+        }
+        const created = await createInTx(tx, { computerId, ownerUserId, provider: 'aws-ec2', state: input.pendingReady ? 'PROVISIONING' : 'RUNNING', fields: input.fields }, true);
+        if (!created.ok) throw new Error('migration_placement_conflict');
+        return created.placement;
+    });
+}
+
+/** A concurrent first open cannot re-pin CF after empty-workspace cutover. */
+export async function pinCloudflarePlacement(db: PlacementDb, computer: { computerId: string; userId: string }): Promise<ResolvedPlacement> {
+    return db.transaction(async tx => {
+        await lockComputer(tx, computer.computerId);
+        const existing = await readPlacement(tx, computer.computerId, computer.userId);
+        if (existing.record) return existing;
+        const { createProviderMigrationStore } = await import('./provider-migrate-store');
+        const m = await createProviderMigrationStore(tx).readByComputer(computer.computerId);
+        if (m?.userId === computer.userId.toLowerCase() && m.state === 'committed' && m.lastError === 'fresh_provision')
+            return { provider: 'aws-ec2', store: 'ebs', record: null };
+        const created = await createInTx(tx, { computerId: computer.computerId, ownerUserId: computer.userId,
+            provider: 'cloudflare', state: 'STOPPED' }, true);
+        if (!created.ok) throw new PlacementIntegrityError('invalid_row', computer.computerId);
+        return { provider: 'cloudflare', store: created.placement.store, record: created.placement };
+    });
+}
+
+/** Retire an empty CF pin and finish its migration atomically under the computer lock.
+ * Recheck emptiness inside the lock; a STOPPED pin alone says nothing about R2.
+ */
+export async function finishFreshProvision(db: PlacementDb, m: import('./provider-migrate-store').ComputeMigration,
+    proveEmpty: () => Promise<boolean>): Promise<void> {
+    const { createProviderMigrationStore, MigrationConflictError } = await import('./provider-migrate-store');
+    await withAdmission(db, async tx => {
+        await lockComputer(tx, m.computerId);
+        const store = createProviderMigrationStore(tx);
+        const current = await store.readById(m.id);
+        if (!current || current.userId !== m.userId || current.computerId !== m.computerId
+            || current.state !== 'requested' || current.updatedAt !== m.updatedAt) throw new MigrationConflictError();
+        const p = (await readPlacement(tx, m.computerId)).record;
+        if (p && (p.provider !== 'cloudflare' || p.ownerUserId !== m.userId || p.state !== 'STOPPED'))
+            throw new MigrationConflictError();
+        if (!await proveEmpty()) throw new MigrationConflictError();
+        if (p) {
+            const deleted = rowsOf(await tx.execute(sql`/* placement:fresh-remove */ DELETE FROM public.ezil_computer_placements
+                WHERE computer_id = ${m.computerId}::uuid AND owner_user_id = ${m.userId}::uuid
+                  AND provider = 'cloudflare' AND state = 'STOPPED'
+                  AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+                RETURNING computer_id`));
+            if (deleted.length !== 1) throw new MigrationConflictError();
+        }
+        const result = await store.applyTransition(current, { type: 'fresh_provision' });
+        if (!result.accepted) throw new MigrationConflictError();
+    });
+}
+
+/** Compensate only this migration's unpublished boot. The retained CF snapshot is authoritative. */
+export function rollbackMigrationPlacement(db: PlacementDb, m: import('./provider-migrate-store').ComputeMigration, source: Placement | null): Promise<void> {
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, m.computerId);
+        const locked = rowsOf(await tx.execute(sql`SELECT state, last_error FROM public.ezil_compute_migrations
+            WHERE id = ${m.id}::uuid AND computer_id = ${m.computerId}::uuid AND user_id = ${m.userId}::uuid FOR UPDATE`))[0];
+        if (!locked || !String(locked.last_error).startsWith('recovery:')) throw new Error('migration_not_recovering');
+        const p = (await readPlacement(tx, m.computerId)).record;
+        if (!p || p.provider === 'cloudflare') return;
+        if (p.ownerUserId !== m.userId || p.state !== 'PROVISIONING' || p.lastError !== `migration_pending:${m.id}`)
+            throw new Error('migration_rollback_conflict');
+        const removed = rowsOf(await tx.execute(sql`DELETE FROM public.ezil_computer_placements
+            WHERE computer_id = ${m.computerId}::uuid AND owner_user_id = ${m.userId}::uuid
+              AND provider = 'aws-ec2' AND state = 'PROVISIONING' AND last_error = ${p.lastError}
+              AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch} RETURNING computer_id`));
+        if (removed.length !== 1) throw new Error('migration_rollback_conflict');
+        if (source) {
+            const restored = await createInTx(tx, { computerId: m.computerId, ownerUserId: m.userId,
+                provider: 'cloudflare', state: source.state, fields: source }, true);
+            if (!restored.ok) throw new Error('migration_rollback_conflict');
+        }
+    });
+}
+
 // ── Transitions (CAS) ────────────────────────────────────────────────────
 
 export interface CasExpectation {
@@ -623,6 +840,8 @@ async function casInTx(
         provider?: PlacementProvider; ownerUserId?: string; enrollNonceHash?: string; enrollUnexpired?: boolean;
         states?: readonly PlacementState[]; preserveState?: boolean; availableInstanceId?: string;
         instanceId?: string | null; lastError?: string | null; nonceConsumed?: boolean;
+        confirmedGeneration?: number; lifecycleJobId?: string; lifecycleDigest?: string;
+        fenceToken?: string; volumeId?: string; updatedAt?: Date;
         /** Timestamp fields written as GREATEST(current, new): concurrent writers can never move them back. */
         monotonic?: readonly ('presenceAt' | 'leaseUntil')[];
     } = {},
@@ -631,9 +850,10 @@ async function casInTx(
     // A duplicate whose keys do not match the CAS would let this writer win
     // while every reader fails closed. Refuse first, inside the transaction.
     if ((await selectRows(tx, computerId)).length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
+    await assertNoImageReservation(tx, computerId);
     const sets: SQL[] = [
         guard.preserveState ? sql`state = state` : sql`state = ${to}`,
-        sql`generation = generation + ${bump.generation}`,
+        guard.confirmedGeneration === undefined ? sql`generation = generation + ${bump.generation}` : sql`generation = ${guard.confirmedGeneration}`,
         sql`lease_epoch = lease_epoch + ${bump.leaseEpoch}`,
         ...(Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[])
             .filter((k) => fields[k] !== undefined)
@@ -644,12 +864,13 @@ async function casInTx(
                     ? sql`${col} = GREATEST(${col}, ${valueSql(k, fields[k] ?? null)})`
                     : sql`${col} = ${valueSql(k, fields[k] ?? null)}`;
             }),
-        sql`updated_at = now()`,
+        sql`updated_at = ${PLACEMENT_UPDATE_TIME}`,
     ];
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
             WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch}
+                AND image_upgrade_job_id IS NULL
                 AND ${guard.states ? sql`state IN (${sql.join(guard.states.map((s) => sql`${s}`), sql`, `)})` : sql`state = ${expected.state}`}
                 ${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}
                 ${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
@@ -659,12 +880,42 @@ async function casInTx(
                 ${guard.instanceId !== undefined ? sql` AND instance_id IS NOT DISTINCT FROM ${guard.instanceId}::text` : sql``}
                 ${guard.lastError !== undefined ? sql` AND last_error IS NOT DISTINCT FROM ${guard.lastError}::text` : sql``}
                 ${guard.nonceConsumed ? sql` AND enroll_nonce_hash IS NULL` : sql``}
+                ${guard.lifecycleJobId !== undefined ? sql` AND lifecycle_job_id = ${guard.lifecycleJobId}::uuid` : sql``}
+                ${guard.lifecycleDigest !== undefined ? sql` AND lifecycle_digest = ${guard.lifecycleDigest}` : sql``}
+                ${guard.fenceToken !== undefined ? sql` AND fence_token = ${guard.fenceToken}::uuid` : sql``}
+                ${guard.volumeId !== undefined ? sql` AND volume_id = ${guard.volumeId}` : sql``}
+                ${guard.updatedAt !== undefined ? sql` AND updated_at = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
     // Belt and braces behind the pre-read: throwing inside the transaction rolls a multi-row update back.
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     return { ok: true, placement: parsePlacementRow(rows[0]!, computerId) };
+}
+
+/** Reconciler only: settle provisional replacement authority from verified volume tags.
+ * Lease epochs never move backwards. The failed job and both nonce proofs are revoked.
+ */
+export async function reconcileReplacementGeneration(db: PlacementDb, expected: Placement,
+    confirmed: { generation: number; fenceToken: string; instanceId: string; instanceLost: boolean; instanceType?: string }): Promise<TransitionResult> {
+    if (!expected.lifecycleJobId || !expected.lifecycleDigest || !expected.volumeId || !expected.fenceToken
+        || !['LEASED', 'STARTING', 'MOUNTING', 'UNCONFIRMED'].includes(expected.state)
+        || !Number.isInteger(confirmed.generation) || confirmed.generation < 1 || confirmed.generation > expected.generation
+        || !UUID.test(confirmed.fenceToken) || !/^i-[0-9a-f]{17}$/.test(confirmed.instanceId)) return { ok: false, reason: 'cas_conflict' };
+    return withAdmission(db, async (tx) => {
+        await lockComputer(tx, expected.computerId);
+        const { record: current } = await readPlacement(tx, expected.computerId);
+        if (!current || current.ownerUserId !== expected.ownerUserId || current.provider !== 'aws-ec2') return { ok: false, reason: 'cas_conflict' };
+        const result = await casInTx(tx, expected.computerId, expected, 'STOPPED', { generation: 0, leaseEpoch: 0 }, {
+            fenceToken: confirmed.fenceToken, instanceId: confirmed.instanceId, instanceType: confirmed.instanceType,
+            lifecycleJobId: null, lifecycleDigest: null, enrollNonceHash: null, enrollConsumedHash: null,
+            enrollExpiresAt: null, leaseUntil: null, lastError: confirmed.instanceLost ? INSTANCE_LOST : LIFECYCLE_START_FAILED,
+        }, { provider: 'aws-ec2', ownerUserId: expected.ownerUserId, confirmedGeneration: confirmed.generation,
+            lifecycleJobId: expected.lifecycleJobId!, lifecycleDigest: expected.lifecycleDigest!, fenceToken: expected.fenceToken!,
+            volumeId: expected.volumeId!, updatedAt: expected.updatedAt });
+        if (result.ok) await applyUsageInTx(tx, result.placement, { kind: 'close', observedBy: 'generation-reconcile' });
+        return result;
+    });
 }
 
 /**
@@ -815,6 +1066,12 @@ async function applyUsageInTx(tx: PlacementExecutor, p: Placement, effect: Usage
             WHERE computer_id = ${computerId}::uuid AND instance_id = ${effect.instanceId} AND stopped_at IS NULL)`);
 }
 
+/** Image custody uses the same usage writer while holding admission and placement locks. */
+export async function recordImageUsage(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, effect: UsageEffect): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    await applyUsageInTx(tx, p, effect);
+}
+
 /**
  * Reconciler input (aws-receipts.ts `reconcileAwsFleet`): aws-ec2 placements that may
  * hold running capacity — RUNNING (a guest may have stopped its instance, or its lease
@@ -911,10 +1168,10 @@ export function noNonCloudflarePlacement(computerId: SQL): SQL {
 }
 
 /** States `claimAwsPlacementsToReconcile` claims: RUNNING plus every state waiting on a receipt. */
-export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
+export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
 
 /**
- * `STOPPED → LEASED`, reserving `lease_epoch + 1` (and `generation + 1` for a
+ * `STOPPED → LEASED` (also RUNNING for a resize), reserving `lease_epoch + 1` (and `generation + 1` for a
  * replace or recovery, C-3). Only inside the admission transaction, with that
  * admission's ticket.
  */
@@ -928,6 +1185,8 @@ export async function leasePlacement(
         expected: { generation: number; leaseEpoch: number };
         leaseUntil: Date;
         replace?: boolean;
+        /** Admission's selected type, written with the new generation and lease. */
+        resizeInstanceType?: string;
         /** Written in the SAME compare-and-swap as the lease: the job, fence and enrollment nonce hash of this boot. */
         fields?: PlacementFields;
     },
@@ -935,15 +1194,22 @@ export async function leasePlacement(
     assertAdmissionLock(tx, lock);
     consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'lease' });
     const { record: current } = await readPlacement(tx, input.computerId);
+    if (input.resizeInstanceType !== undefined && (!input.replace || !input.resizeInstanceType || input.resizeInstanceType === current?.instanceType)) {
+        return { ok: false, reason: 'illegal_transition' };
+    }
     // A failed enrollment still owns a live instance. Only a fresh replace may lease it.
     const recover = input.replace && current?.state === 'UNCONFIRMED' && current.lastError === ENROLLMENT_FAILED;
     return casInTx(
         tx,
         input.computerId,
-        { ...input.expected, state: recover ? 'UNCONFIRMED' : 'STOPPED' },
+        { ...input.expected, state: recover ? 'UNCONFIRMED' : input.resizeInstanceType && current?.state === 'RUNNING' ? 'RUNNING' : 'STOPPED' },
         'LEASED',
         { generation: input.replace ? 1 : 0, leaseEpoch: 1 },
-        { ...input.fields, ...(input.replace ? { instanceId: null } : {}), leaseUntil: input.leaseUntil, lastError: null },
+        {
+            ...input.fields, ...(input.replace ? { instanceId: null } : {}), leaseUntil: input.leaseUntil, lastError: null,
+            // A caller's miscellaneous fields cannot bypass the type/region admission checked.
+            instanceType: input.resizeInstanceType ?? current?.instanceType, region: current?.region,
+        },
         // Only the recorded owner's aws-ec2 row matches: a Cloudflare row is never leased under
         // AWS caps, and a re-keyed or re-inserted ezil_computers row cannot claim a placement.
         { provider: 'aws-ec2', ownerUserId: input.ownerUserId, lastError: recover ? ENROLLMENT_FAILED : undefined },
@@ -973,12 +1239,12 @@ export const ENROLLMENT_FAILED = 'enroll_tunnel_failed';
  */
 export async function consumeEnrollmentNonce(
     db: PlacementDb,
-    input: { computerId: string; expected: CasExpectation; nonceHash: string; fields: { instanceId: string; volumeId: string } },
+    input: { computerId: string; expected: CasExpectation; nonceHash: string; fields: { instanceId: string; volumeId: string }; lowerImageDigest?: string; observedAt?: Date },
 ): Promise<TransitionResult> {
     if (!ENROLLABLE_STATES.includes(input.expected.state)) return { ok: false, reason: 'illegal_transition' };
     if (!/^[a-f0-9]{64}$/.test(input.nonceHash)) return { ok: false, reason: 'cas_conflict' };
-    return db.transaction((tx) =>
-        casInTx(
+    return db.transaction(async (tx) => {
+        const result = await casInTx(
             tx,
             input.computerId,
             input.expected,
@@ -990,8 +1256,25 @@ export async function consumeEnrollmentNonce(
                 provider: 'aws-ec2', enrollNonceHash: input.nonceHash, enrollUnexpired: true,
                 states: ENROLLABLE_STATES, preserveState: true, availableInstanceId: input.fields.instanceId,
             },
-        ),
-    );
+        );
+        if (result.ok && input.lowerImageDigest !== undefined) {
+            if (!/^sha256:[0-9a-f]{64}$/.test(input.lowerImageDigest) || !input.observedAt || !Number.isFinite(input.observedAt.getTime())) throw new ImageJobConflictError();
+            const rows = rowsOf(await tx.execute(sql`/* placement:enroll-digest */ UPDATE public.ezil_computer_placements
+                SET lower_image_digest = ${input.lowerImageDigest}, lower_digest_observed_at = ${input.observedAt.toISOString()}::timestamptz
+                WHERE computer_id = ${input.computerId}::uuid AND generation = ${result.placement.generation} AND lease_epoch = ${result.placement.leaseEpoch}
+                  AND enroll_consumed_hash = ${input.nonceHash} AND image_upgrade_job_id IS NULL RETURNING computer_id`));
+            if (rows.length !== 1) throw new ImageJobConflictError();
+        }
+        return result;
+    });
+}
+
+/** Replays may never replace the digest accepted with this nonce. */
+export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement, digest: string): Promise<boolean> {
+    const rows = rowsOf(await db.execute(sql`SELECT lower_image_digest FROM public.ezil_computer_placements
+        WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+          AND enroll_consumed_hash = ${p.enrollConsumedHash} AND image_upgrade_job_id IS NULL LIMIT 2`));
+    return rows.length === 1 && rows[0]!.lower_image_digest === digest;
 }
 
 /** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
@@ -1016,6 +1299,7 @@ export async function finishEnrollment(
 export interface UsageRow {
     computerId: string;
     userId: string;
+    instanceType: string | null;
     startedAt: Date;
     stoppedAt: Date | null;
     egressBytes: number | null;
@@ -1032,6 +1316,7 @@ export interface AdmissionCounters {
     targetForeignUsage: number;
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
+    runningVcpu: number;
     /**
      * The same running-class rows, per region (only regions that have any). A
      * region absent here has none. Rows without a region are `runningUnplaced`
@@ -1039,6 +1324,8 @@ export interface AdmissionCounters {
      */
     runningByRegion: Readonly<Record<string, number>>;
     runningUnplaced: number;
+    runningVcpuByRegion: Readonly<Record<string, number>>;
+    runningVcpuUnplaced: number;
     /**
      * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE: counted by
      * `owner_user_id` (or usage metered to the user), never through
@@ -1074,12 +1361,18 @@ export async function readCanaryComputer(
     return { userId: canonicalId(row!.user_id), deleted: row!.deleted, createdAt };
 }
 
+/** Same closed, fail-closed vCPU mapping as the pure accounting helpers. */
+function instanceVcpuSql(column: SQL): SQL {
+    return sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU).map(([type, vcpu]) => sql`WHEN ${type} THEN ${vcpu}::int`), sql` `)} ELSE ${instanceVcpu(null)}::int END`;
+}
+
 /**
  * This month's usage, TOTALLED IN THE DATABASE: one row per user with usage overlapping
  * the UTC month that contains `now`, never the ledger's rows. The arithmetic is usage.ts's,
  * exactly (`monthUsageFromRows` is the reference): a run counts from max(started_at,
  * monthStart) to min(stopped_at ?? now, now, nextMonth), an open run until now, and its
- * whole egress counts in every month it overlaps (NULL = 0). Admission reads it under its
+ * whole egress counts in every month it overlaps (NULL = 0). Weighted seconds floor
+ * each clipped row duration before multiplying by vCPU / 2. Admission reads it under its
  * lock, so its size is bounded by users, not by how often computers stop and wake.
  * Session-limit enforcement (aws-receipts.ts `enforceSessionLimits`) reads it without one:
  * a cap is checked again by the next pass.
@@ -1092,6 +1385,8 @@ export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStar
             SELECT u.user_id::text AS user_id,
                 COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(u.stopped_at, w.now_at), w.now_at, w.next_month)
                     - GREATEST(u.started_at, w.month_start))), 0)), 0)::text AS seconds,
+                COALESCE(SUM(FLOOR(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(u.stopped_at, w.now_at), w.now_at, w.next_month)
+                    - GREATEST(u.started_at, w.month_start))), 0)) * (${instanceVcpuSql(sql`u.instance_type`)} / 2)), 0)::text AS weighted_seconds,
                 COALESCE(SUM(u.egress_bytes), 0)::text AS egress_bytes
             FROM public.ezil_compute_usage u CROSS JOIN w
             WHERE u.started_at < LEAST(w.now_at, w.next_month)
@@ -1103,10 +1398,12 @@ export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStar
         const userId = typeof r.user_id === 'string' ? canonicalId(r.user_id) : '';
         const seconds = typeof r.seconds === 'string' && /^\d+(\.\d+)?$/.test(r.seconds) ? Number(r.seconds) : NaN;
         const egress = counter(r.egress_bytes);
+        const weightedSeconds = counter(r.weighted_seconds);
         if (!UUID.test(userId) || byUser.has(userId)) throw new Error('usage aggregate has an invalid user_id');
         if (!Number.isFinite(seconds)) throw new Error('usage aggregate has invalid seconds');
+        if (weightedSeconds === null) throw new Error('usage aggregate has invalid weighted_seconds');
         if (egress === null) throw new Error('usage aggregate has an invalid egress_bytes');
-        byUser.set(userId, { hours: seconds / 3_600, egressBytes: egress });
+        byUser.set(userId, { hours: seconds / 3_600, weightedSeconds, egressBytes: egress });
     }
     return { global: totalsOf(byUser.values()), byUser };
 }
@@ -1124,6 +1421,12 @@ export async function readAdmissionCounters(
     return counters;
 }
 
+/** Image admission supplies the already locked reserved placement; all capacity reads are shared. */
+export async function readImageAdmissionCounters(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, now: Date): Promise<AdmissionCounters> {
+    assertAdmissionLock(tx, lock);
+    return readCounters(tx, { userId: p.ownerUserId, computerId: p.computerId, now, monthStart: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)) }, p);
+}
+
 /**
  * The same admission inputs, read WITHOUT the admission lock and minting nothing:
  * a point-in-time view for a routing pre-check (select.ts canary fallback). It can be
@@ -1136,9 +1439,22 @@ export async function peekAdmissionCounters(
     return readCounters(db, rawInput);
 }
 
+/** The admission lock covers placement launches and migration reservations alike. */
+const CAPACITY_PLACEMENTS = sql`(
+    SELECT computer_id, owner_user_id, provider, state, region, instance_type FROM public.ezil_computer_placements
+    UNION ALL
+    SELECT m.computer_id, m.user_id, 'aws-ec2', 'PROVISIONING',
+        m.workspace_head #>> '{_awsProvision,placement,region}', m.workspace_head #>> '{_awsProvision,placement,instanceType}'
+    FROM public.ezil_compute_migrations m
+    WHERE m.workspace_head ? '_awsProvision' AND m.state <> 'committed'
+      AND COALESCE(m.workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'
+      AND NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = m.computer_id AND p.provider = 'aws-ec2')
+)`;
+
 async function readCounters(
     tx: PlacementExecutor,
     rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
+    image?: ImagePlacement,
 ): Promise<AdmissionCounters> {
     const input = { ...rawInput, userId: canonicalId(rawInput.userId), computerId: canonicalId(rawInput.computerId) };
     // ezil_computers is user-writable (id, deleted_at, chosen ids on insert): it is a
@@ -1148,7 +1464,7 @@ async function readCounters(
             FROM public.ezil_computers c
             WHERE c.id = ${input.computerId}::uuid`),
     );
-    const target = await readPlacement(tx, input.computerId);
+    const target = image ? { record: image } : await readPlacement(tx, input.computerId);
     const foreignRows = rowsOf(
         await tx.execute(sql`/* placement:usage-foreign */ SELECT count(*)::int AS n
             FROM public.ezil_compute_usage
@@ -1156,13 +1472,15 @@ async function readCounters(
     );
     const running = sql.join(RUNNING_CLASS_STATES.map((s) => sql`${s}`), sql`, `);
     const runningRows = rowsOf(
-        await tx.execute(sql`/* placement:count-running */ SELECT count(*)::int AS n
-            FROM public.ezil_computer_placements
+        await tx.execute(sql`/* placement:count-running */ SELECT count(*)::int AS n,
+                COALESCE(SUM(${instanceVcpuSql(sql`instance_type`)}), 0)::text AS vcpu
+            FROM ${CAPACITY_PLACEMENTS} AS capacity
             WHERE provider = 'aws-ec2' AND state IN (${running})`),
     );
     const regionRows = rowsOf(
-        await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n
-            FROM public.ezil_computer_placements
+        await tx.execute(sql`/* placement:count-running-region */ SELECT region, count(*)::int AS n,
+                COALESCE(SUM(${instanceVcpuSql(sql`instance_type`)}), 0)::text AS vcpu
+            FROM ${CAPACITY_PLACEMENTS} AS capacity
             WHERE provider = 'aws-ec2' AND state IN (${running})
             GROUP BY region`),
     );
@@ -1170,7 +1488,7 @@ async function readCounters(
     // while its volume still exists.
     const userRows = rowsOf(
         await tx.execute(sql`/* placement:count-user */ SELECT count(DISTINCT p.computer_id)::int AS n
-            FROM public.ezil_computer_placements p
+            FROM ${CAPACITY_PLACEMENTS} p
             WHERE p.provider = 'aws-ec2' AND p.computer_id <> ${input.computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE'
               AND (p.owner_user_id = ${input.userId}::uuid
                 OR EXISTS (SELECT 1 FROM public.ezil_compute_usage u WHERE u.computer_id = p.computer_id AND u.user_id = ${input.userId}::uuid))`),
@@ -1183,12 +1501,23 @@ async function readCounters(
         return n;
     };
     const runningByRegion: Record<string, number> = {};
+    const runningVcpuByRegion: Record<string, number> = {};
     let runningUnplaced = 0;
+    let runningVcpuUnplaced = 0;
+    const runningVcpu = counter(runningRows[0]?.vcpu);
+    if (runningVcpu === null) throw new Error('admission counter query returned no vcpu');
     for (const r of regionRows) {
         const n = counter(r.n);
         if (n === null) throw new Error('admission region counter returned no count');
-        if (r.region === null || r.region === undefined) runningUnplaced += n;
-        else if (typeof r.region === 'string' && !Object.prototype.hasOwnProperty.call(runningByRegion, r.region)) runningByRegion[r.region] = n;
+        const vcpu = counter(r.vcpu);
+        if (vcpu === null) throw new Error('admission region counter returned no vcpu');
+        if (r.region === null || r.region === undefined) {
+            runningUnplaced += n;
+            runningVcpuUnplaced += vcpu;
+        } else if (typeof r.region === 'string' && !Object.prototype.hasOwnProperty.call(runningByRegion, r.region)) {
+            runningByRegion[r.region] = n;
+            runningVcpuByRegion[r.region] = vcpu;
+        }
         else throw new Error('admission region counter returned a duplicate or invalid region');
     }
     const owner = ownerRows[0];
@@ -1198,8 +1527,11 @@ async function readCounters(
         targetDeleted: owner?.deleted === true,
         targetForeignUsage: count(foreignRows),
         runningCount: count(runningRows),
+        runningVcpu,
         runningByRegion,
         runningUnplaced,
+        runningVcpuByRegion,
+        runningVcpuUnplaced,
         userOtherAwsComputers: count(userRows),
         duplicates,
         usage,
@@ -1227,4 +1559,39 @@ export async function readRetentionCandidates(db: PlacementExecutor): Promise<{ 
         if (!updatedAt || !oneOf(PLACEMENT_STATES, r.state)) throw new PlacementIntegrityError('invalid_row', computerId);
         return { computerId, state: r.state, updatedAt };
     });
+}
+
+/** Lifecycle authority may inspect a migration boot; user routing must keep using readPlacement. */
+export async function readLifecyclePlacement(db: PlacementExecutor, computerId: string): Promise<ResolvedPlacement> {
+    return (await import('./provider-migrate-provision')).readEnrollmentPlacement(db, computerId);
+}
+
+export interface PaidMigrationCandidate {
+    userId: string;
+    computerId: string;
+    toSize: 'standard' | 'premium';
+}
+
+/** One computer per paid owner, including the implicit Cloudflare placement. */
+export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date, limit = 10): Promise<PaidMigrationCandidate[]> {
+    const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
+    if (!count) return [];
+    const result = await db.execute(sql`SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id,
+        c.id::text AS computer_id, s.sku
+        FROM public.ezil_billing_subscriptions s
+        JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL
+        LEFT JOIN public.ezil_computer_placements p ON p.computer_id = c.id
+        WHERE s.sku IN ('standard_monthly_v3', 'premium_monthly_v3') AND s.status = 'active'
+          AND s.current_period_start <= ${now.toISOString()}::timestamptz
+          AND s.current_period_end > ${now.toISOString()}::timestamptz
+          AND (p.computer_id IS NULL OR p.provider = 'cloudflare')
+          AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations done WHERE done.computer_id = c.id
+            AND done.state = 'committed' AND done.last_error = 'fresh_provision')
+          AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations m WHERE m.user_id = s.user_id
+            AND (m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
+              OR m.updated_at >= ${new Date(now.getTime() - 600_000).toISOString()}::timestamptz))
+        ORDER BY s.user_id, s.current_period_end DESC, s.current_period_start DESC, c.slot, c.id LIMIT ${count}`);
+    const rows: Record<string, unknown>[] = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] })?.rows) ?? [];
+    return rows.map(row => ({ userId: String(row.user_id), computerId: String(row.computer_id),
+        toSize: row.sku === 'standard_monthly_v3' ? 'standard' : 'premium' }));
 }

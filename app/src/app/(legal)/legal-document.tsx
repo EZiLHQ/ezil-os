@@ -12,20 +12,21 @@ export interface LegalSection {
 export function OperatorContact() {
     return (
         <address>
-            EZIL Private Limited<br />
-            BHIVE Workspace, Brigade Metropolis<br />
-            Bengaluru, Karnataka 560048, India<br />
+            EZiL LLC<br />
+            30 N Gould St STE R<br />
+            Sheridan, WY 82801, USA<br />
             <a href="mailto:contact@ezil.work">contact@ezil.work</a>
         </address>
     );
 }
 
 export function LegalDocument({
-    kind, title, introduction, summary, sections,
+    kind, title, introduction, changeSummary, summary, sections,
 }: {
-    kind: 'terms' | 'privacy';
+    kind: 'terms' | 'privacy' | 'refunds';
     title: string;
     introduction: string;
+    changeSummary: string;
     summary: ReactNode;
     sections: readonly LegalSection[];
 }) {
@@ -35,11 +36,13 @@ export function LegalDocument({
                 <nav className={styles.tabs} aria-label="Legal documents">
                     <Link href="/terms" prefetch={false} aria-current={kind === 'terms' ? 'page' : undefined}>Terms and Conditions</Link>
                     <Link href="/privacy" prefetch={false} aria-current={kind === 'privacy' ? 'page' : undefined}>Privacy Policy</Link>
+                    <Link href="/refunds" prefetch={false} aria-current={kind === 'refunds' ? 'page' : undefined}>Refunds</Link>
                 </nav>
                 <p className={styles.eyebrow}>EZiL OS / Hosted service</p>
                 <h1>{title}</h1>
                 <p className={styles.description}>{introduction}</p>
-                <p className={styles.date}>Effective <time dateTime="2026-10-02">2 October 2026</time> <span aria-hidden="true">·</span> os.ezil.org</p>
+                <p className={styles.date}>Effective <time dateTime="2026-10-21">21 October 2026</time> <span aria-hidden="true">·</span> os.ezil.org</p>
+                <p className={styles.description}>What changed: {changeSummary}</p>
             </div>
             <div className={styles.documentGrid}>
                 <nav className={styles.contents} aria-labelledby="contents-title">

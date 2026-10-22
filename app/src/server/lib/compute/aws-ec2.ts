@@ -1,3 +1,4 @@
+import { settleReplacementGeneration } from './aws-rebase-generation';
 /**
  * aws-ec2 provider (docs/AWS-COMPUTERS.md C-1, C-3).
  *
@@ -26,6 +27,9 @@
 
 import { randomBytes as nodeRandomBytes, randomUUID } from 'node:crypto';
 
+// Migration provisions use the same lease builder, with its optional restore input.
+export { buildEnrollmentUserData as buildAwsProvisionUserData } from './aws-enroll';
+
 import { runAdmission, type AdmissionRefusal } from './admission';
 import {
     AWS_TIER_DATA_GIB,
@@ -50,9 +54,13 @@ import {
     type LifecycleWork,
 } from './aws-intent';
 import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
-import type { Ec2ComputerResourceFinder, Ec2VolumeDescriber } from './aws-clients';
+import type { Ec2ComputerResourceFinder, Ec2ReplacementDescriber, Ec2VolumeDescriber } from './aws-clients';
+import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
+import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
+import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
+import { requestAwsRestart } from './aws-restart';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -114,12 +122,15 @@ export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RET
 
 export interface AwsProviderDeps {
     db: PlacementDb;
+    meter?: ComputeMeter;
     env?: () => Env;
     now?: () => Date;
     /** Lower-case uuid v4. */
     newId?: () => string;
     starter?: LifecycleStarter;
-    /** The user's entitlement (free / plus). Never defaulted. */
+    /** The caller's resolved record; null means the read found no entitlement. */
+    entitlement?: EntitlementRecord | null;
+    /** Legacy tier source for callers that do not supply a resolved record. */
     tierFor?: (userId: string) => Promise<AwsTier>;
     /** Source of the enrollment nonce's 32 bytes (tests make it deterministic). */
     randomBytes?: (n: number) => Buffer;
@@ -131,7 +142,7 @@ export interface AwsProviderDeps {
      * Read-only EC2 describe (the enrollment describer). Catches a guest-initiated idle
      * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder & Ec2ReplacementDescriber>;
     /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
     /** Backoff between StartExecution attempts whose answer was lost; tests inject an instant one. */
@@ -208,7 +219,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     ): LifecycleIntent => currentGenerationIntent(p, operation, deployment, { jobId: newId(), ...extra });
 
     /**
-     * Wake by REPLACE (C-3): a new instance of the placement's type boots on the
+     * Wake or resize by REPLACE (C-3): a new instance of the requested type boots on the
      * retained data volume as generation + 1, with a fresh fence token. The old
      * generation's instance, generation and fence are handed on as `previous*`;
      * the helper stops and terminates it, never the volume. Its launch user data
@@ -217,7 +228,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const replaceIntent = (
         p: Placement,
         deployment: LifecycleDeployment,
-        next: { fenceToken: string; leaseEpoch: number; userData: string },
+        next: { fenceToken: string; leaseEpoch: number; userData: string; instanceType: string },
     ): LifecycleIntent => ({
         schemaVersion: 1,
         jobId: newId(),
@@ -232,7 +243,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         previousInstanceId: p.instanceId,
         previousFenceToken: p.fenceToken,
         deployment,
-        instanceType: p.instanceType ?? '',
+        instanceType: next.instanceType,
         dataVolumeGiB: null,
         leaseEpoch: next.leaseEpoch,
         userData: next.userData,
@@ -261,7 +272,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         const outcome = await startLifecycleJob(deps.starter!, region, work, deps.sleep);
         if (outcome === 'started') return 'started';
         if (outcome === 'refused') {
-            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
+            if (work.intent.operation === 'replace' && await settleReplacementGeneration(reconcileDeps(), p, work, true) === 'settled') return 'failed';
+            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo, fields: { enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null } });
             return 'failed';
         }
         await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, undo });
@@ -271,7 +283,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
-    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, sleep: deps.sleep });
+    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter });
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
@@ -399,12 +411,14 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             }
 
             if (!placement) {
-                if (!deps.tierFor) return notReady('aws_tier_unavailable');
+                if (deps.entitlement === undefined && !deps.tierFor) return notReady('aws_tier_unavailable');
                 const enrollUrl = cfg.enrollUrl;
                 if (!enrollUrl) return notReady('aws_enrollment_unavailable');
                 let tier: AwsTier;
                 try {
-                    tier = await deps.tierFor(c.userId);
+                    tier = deps.entitlement !== undefined
+                        ? tierForEntitlement(deps.entitlement, plusPlanIds(cfg.e))
+                        : await deps.tierFor!(c.userId);
                 } catch {
                     return notReady('aws_tier_unavailable');
                 }
@@ -469,9 +483,26 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             }
 
             if (placement.provider !== 'aws-ec2') return notReady('provider_mismatch');
+            let resizeTo: Exclude<AwsTier, 'free'> | undefined;
+            if (placement.state === 'RUNNING' || placement.state === 'STOPPED' ||
+                (placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED)) {
+                // Resolve the current paid plan on every open, including legacy callers
+                // whose tier source is lazy. Missing/free entitlements do not resize AWS.
+                try {
+                    const tier = deps.entitlement !== undefined
+                        ? tierForEntitlement(deps.entitlement, plusPlanIds(cfg.e))
+                        : await deps.tierFor?.(c.userId);
+                    if (tier && tier !== 'free' && instanceTypeForTier(tier) !== placement.instanceType) resizeTo = tier;
+                } catch {
+                    return notReady('aws_tier_unavailable');
+                }
+            }
             switch (placement.state) {
                 case 'RUNNING':
-                    return { ok: true };
+                    if (!resizeTo) return { ok: true };
+                    // The replace workflow gracefully stops the old running instance.
+                    // Admission below credits its slot and reserves the new type atomically.
+                    // falls through
                 case 'UNCONFIRMED':
                 case 'STOPPED': {
                     if (placement.state === 'UNCONFIRMED' && placement.lastError !== ENROLLMENT_FAILED) {
@@ -487,7 +518,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
                     // A lost instance (INSTANCE_LOST: EC2 terminated it) can only come back as a REPLACE onto its volume.
-                    const replace = placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace';
+                    const replace = resizeTo !== undefined || placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace';
+                    const instanceType = resizeTo ? instanceTypeForTier(resizeTo) : placement.instanceType;
                     // The lease's compare-and-swap moves the epoch (and, for a replace, the
                     // generation) by exactly one, so this boot's intent is fully known BEFORE
                     // the lease and its job, digest, fence and nonce hash are written by that
@@ -504,7 +536,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         });
                         work = buildLifecycleWork(
                             replace
-                                ? replaceIntent(placement, deployment, { fenceToken, leaseEpoch, userData })
+                                ? replaceIntent(placement, deployment, { fenceToken, leaseEpoch, userData, instanceType })
                                 : sameGenerationIntent(placement, 'start', deployment, { userData, leaseEpoch }),
                         );
                     } catch (error) {
@@ -520,6 +552,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                             expected: { generation: placement.generation, leaseEpoch: placement.leaseEpoch },
                             leaseUntil: new Date(now().getTime() + leaseSeconds * 1000),
                             replace,
+                            resizeTo,
                             fields: {
                                 fenceToken,
                                 enrollNonceHash: nonce.nonceHash,
@@ -532,17 +565,22 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         },
                         { env: cfg.e, now },
                     );
-                    if (!leased.admitted) return leased.reason === 'cas_conflict' ? notReady('computer_starting', true) : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
+                    if (!leased.admitted) return leased.reason === 'cas_conflict'
+                        ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
+                        : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
                     const p = leased.placement;
                     // A replace cannot be undone by compare-and-swap (the generation already moved):
                     // a refused StartExecution leaves it for recovery (UNCONFIRMED). A start-in-place
                     // only moved the epoch, which a later wake simply raises again: back to STOPPED.
                     const undo: PlacementState = replace ? 'UNCONFIRMED' : 'STOPPED';
-                    if (p.generation !== generation || p.leaseEpoch !== leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
+                    if (p.generation !== generation || p.leaseEpoch !== leaseEpoch || p.lifecycleJobId !== work.intent.jobId || p.instanceType !== instanceType) {
                         await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
                         return notReady('aws_intent_invalid');
                     }
                     const r = await launch(c.userId, p, work, undo);
+                    if (resizeTo && (r === 'started' || r === 'pending')) await recordComputeMeter(() => deps.meter?.stopped({
+                        userId: p.ownerUserId, computerId: p.computerId, endedAt: now(), reason: 'resize',
+                    }));
                     // Pending: the boot may be running; it stays LEASED with its job for the receipt path.
                     if (r === 'pending') return notReady('computer_starting', true);
                     if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
@@ -601,7 +639,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const { limit } = await reconcileOwn(c, p, cfg.deployments, cfg.e);
             return limit ? { ok: false, error: limit } : { ok: true };
         },
-        restart: async () => ({ ok: false, outcome: 'aws_not_supported', error: 'aws_not_supported' }),
+        restart: (ctx, c) => requestAwsRestart(deps.db, c, ctx.correlationId, env()),
         /**
          * computer.delete (§6, R11). ok only once nothing can still run: no placement
          * (never provisioned), or the placement RETIRED (instance terminated, volume

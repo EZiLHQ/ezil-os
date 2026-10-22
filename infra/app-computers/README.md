@@ -40,10 +40,10 @@ The example files in `config/` hold public placeholders only.
 
 | Field | Type | Rule |
 |---|---|---|
-| `stage` | `pilot` \| `production` | |
+| `stage` | shared workload namespace (for example `pilot`, `production`, `mum`) | Must match identity/keys/ops; only `production` enables termination protection. |
 | `region` | string | commercial region, e.g. `ap-south-1` |
 | `zoneIds` | string[1..3] | each matches `^[a-z]{2,4}\d-az\d+$` and belongs to `region` (e.g. `aps1-az1`). One subnet per ZoneId. |
-| `instanceType` | `t3a.medium` \| `t3.medium` \| `m6i.large` \| `c6i.xlarge` | launch-template default; the workflow sets the per-computer type (and, for T types, the credit option) |
+| `instanceType` | `t3a.medium` \| `t3.medium` \| `m6i.large` \| `c6i.xlarge` \| `m6i.xlarge` \| `m6i.2xlarge` | launch-template default; the workflow sets the per-computer type (and, for T types, the credit option) |
 | `rootDeviceName` | `/dev/sda1` or `/dev/xvda` | default `/dev/sda1`; must match lifecycle storage |
 | `rootVolumeGiB` | int 8..64 | default 30 |
 
@@ -65,7 +65,7 @@ app copy fails that test.
 |---|---|
 | `region`, `zoneId` | same rules as the foundation; one ZoneId per lifecycle deployment |
 | `subnetId` | the foundation subnet for that ZoneId |
-| `instanceTypes` | a non-empty subset of the closed allowlist `{t3a.medium, t3.medium, m6i.large, c6i.xlarge}`. A deployment can narrow it, never extend it. To serve the free tier it must list `t3a.medium` (and `t3.medium` as the fallback); `config/lifecycle.example.json` lists both tiers' types plus the benchmark type. |
+| `instanceTypes` | a non-empty subset of the closed allowlist `{t3a.medium, t3.medium, m6i.large, c6i.xlarge, m6i.xlarge, m6i.2xlarge}`. A deployment can narrow it, never extend it. To serve the free tier it must list `t3a.medium` (and `t3.medium` as the fallback); `config/lifecycle.example.json` lists all tiers' types plus the benchmark type. |
 | `storage.rootDeviceName` | `/dev/sda1` (default) or `/dev/xvda`; must match the AMI and launch template |
 | `storage.rootGiB` | root disk size (default 30); must be at least the AMI root snapshot size |
 | `storage.dataMinGiB`, `storage.dataMaxGiB` | allowed data-volume range (defaults 20 and 100) |
@@ -80,7 +80,9 @@ The data-volume size is chosen **per computer** in the intent (`dataVolumeGiB`, 
 | Tier | Size | Types, in preference order | Credits |
 |---|---|---|---|
 | `free` | 2 vCPU / 4 GiB | `t3a.medium`, then `t3.medium` | standard: throttled to the T3 baseline (20% per vCPU) once earned credits run out; never billed for surplus |
-| `plus` (upgraded) | 2 vCPU / 8 GiB | `m6i.large` | not burstable |
+| `plus` (std-2) | 2 vCPU / 8 GiB | `m6i.large` | not burstable |
+| `compute4` (cmp-4) | 4 vCPU / 16 GiB | `m6i.xlarge` | not burstable |
+| `compute8` (cmp-8) | 8 vCPU / 32 GiB | `m6i.2xlarge` | not burstable |
 
 `c6i.xlarge` stays allowlisted for benchmarks only. This reverses the earlier R10 note "no burstable
 types": free computers must be cheap. The cost of that choice is the T3 baseline: a long Chrome or
@@ -449,7 +451,7 @@ proves, for all kill-switch/userData combinations:
 The proof checks policy structure, not live IAM evaluation. The existing staging caveats
 still apply, particularly whether `cloudwatch:AlarmActions` covers OK and INSUFFICIENT_DATA
 lists for the execution role. Workloads now have an unconditional CloudWatch deny.
-`iam-size.test.ts` enforces 5,600 characters for the workload boundary, 6,144 for each managed
+`iam-size.test.ts` enforces 5,627 characters for the workload boundary (the previous 5,600 target plus 27 for billing v2's two Compute types), 6,144 for each managed
 policy, 10,240 for each role's aggregate inline policies, and at most ten managed-policy
 attachments. Each identity currently has one managed-policy attachment.
 
@@ -457,7 +459,7 @@ Non-whitespace policy-document sizes for `identity.example.json`:
 
 | Policy | Default flags | Kill switch + userData enabled | Limit |
 |---|---:|---:|---:|
-| Workload boundary (managed) | 4,583 | 5,287 | 5,600 test target; 6,144 AWS |
+| Workload boundary (managed) | 4,583 | 5,287 | 5,627 test target; 6,144 AWS |
 | Identity guardrails (managed, shared by exec/deploy) | 3,882 | 4,315 | 6,144 |
 | Exec (inline) | 7,161 | 7,161 | 10,240 aggregate per role |
 | Deploy (inline) | 1,298 | 1,298 | 10,240 aggregate per role |

@@ -1,5 +1,9 @@
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('server-only', () => ({}));
+beforeEach(() => { vi.stubEnv('AUTH0_CLIENT_ID', ''); vi.stubEnv('AUTH0_SECRET_ID', ''); });
+afterEach(() => vi.unstubAllEnvs());
 
 // Rendering login must not need a session, database, or OAuth request.
 vi.mock('./actions', () => ({ signInWithGoogle: vi.fn(), signInWithPassword: vi.fn() }));
@@ -51,4 +55,25 @@ describe('lock screen entry', () => {
             for (const value of [error].flat()) expect(html).not.toContain(value);
         },
     );
+});
+
+describe('EZiL ID entry', () => {
+    it('offers the Auth0 document link only when both settings are present', async () => {
+        expect(await render()).not.toContain('Continue with EZiL ID');
+        vi.stubEnv('AUTH0_CLIENT_ID', 'client');
+        expect(await render()).not.toContain('Continue with EZiL ID');
+        vi.stubEnv('AUTH0_SECRET_ID', 'private-test-secret');
+        const html = await render({ returnUrl: '/os?computer=one' });
+        expect(html).toContain('Continue with EZiL ID');
+        expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done"');
+        expect(html).toContain('Continue with Google');
+        expect(html).toContain('id="email-sign-in"');
+        expect(html).not.toContain('private-test-secret');
+    });
+    it('sanitises the Auth0 link destination', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'client'); vi.stubEnv('AUTH0_SECRET_ID', 'secret');
+        const html = await render({ returnUrl: '//evil.example' });
+        expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fcomputers"');
+        expect(html).not.toContain('evil.example');
+    });
 });
