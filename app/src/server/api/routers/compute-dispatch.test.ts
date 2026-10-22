@@ -458,7 +458,9 @@ describe('routers: AWS previews use their own Worker route', () => {
             });
         }
         // Reads only: the placement, and the month's usage for the hour caps (Codex 4275911832). No write.
-        expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month'))).toBe(true);
+        expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month')
+            // The image-job reservation check (rebase contract §8) is a read too.
+            || s.sql.includes('placement:image-reservation'))).toBe(true);
     });
 
     it('status reports the AWS lifecycle state, no Worker call', async () => {
