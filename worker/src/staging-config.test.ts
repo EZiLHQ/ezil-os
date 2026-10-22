@@ -55,7 +55,8 @@ describe('staging Worker resources and routes', () => {
       SANDBOX_NEKO_ICE_POLICY: 'relay',
       SANDBOX_NEKO_TURN_TTL_SECONDS: '300',
       SANDBOX_AI_PROXY: 'on',
-      EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work',
+      // os-staging's own Gateway (isolated issuer and store); production stays ai.ezil.work.
+      EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work',
       AWS_ROUTING_ENABLED: 'on',
       AWS_ORIGIN_ZONE: 'ezil.work',
       AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
