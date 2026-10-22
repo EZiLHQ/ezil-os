@@ -701,7 +701,10 @@ def main(args):
             need(current.read() == backup.read(), "AMI config changed after stack update; reconcile saved config and stack before baking")
         write(a[0], ami_config(a[2]))
     elif op == "output":
-        outputs = [o["OutputValue"] for o in stack(a[0]).get("Outputs", []) if o["OutputKey"] == a[1]]
+        # CDK appends a hash to output keys (e.g. LifecycleWorkflowVersionArn1FFCF530):
+        # match the exact key or <name><8 hex>, and still require exactly one.
+        outputs = [o["OutputValue"] for o in stack(a[0]).get("Outputs") or []
+                   if o["OutputKey"] == a[1] or re.fullmatch(r"(?:\w*)" + re.escape(a[1]) + r"[0-9A-F]{8}", o["OutputKey"])]
         need(len(outputs) == 1, "missing/duplicate stack output")
         print(outputs[0])
     elif op == "build":
