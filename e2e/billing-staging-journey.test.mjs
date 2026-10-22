@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { aggregateResults, classifyHost, createRedactor, guardPlaywright,
-  isAIAccountError, parseResources, redactEvidence, terminalBlock } from './billing-staging-journey.mjs';
+  isAIAccountError, parseResources, redactEvidence, terminalBlock, command, ensureTerminal,
+  restartPane, restartUnavailableReason } from './billing-staging-journey.mjs';
 
 const credentials = { email: 'qa+staging@example.test', password: 'P@ss word!"\\$?&' };
 
@@ -123,4 +124,138 @@ test('AI account notices skip while generic service failures remain failures', (
   for (const message of ['no_ai_account', 'No AI account connected', 'AI account is required',
     'Sign in to use GitHub Copilot', 'Invalid API key']) assert.equal(isAIAccountError(message), true, message);
   for (const message of ['OK', 'Network timeout', 'Rate limit exceeded', 'Internal server error']) assert.equal(isAIAccountError(message), false, message);
+});
+
+const timeoutError = () => Object.assign(new Error('Timed out'), { name: 'TimeoutError' });
+
+function terminalFixture({ open = false, shortcutOpens = true, idFound = true, clickError = false,
+  clickOpens = true, lookupOpens = false, lookupError = null } = {}) {
+  const calls = [];
+  let palette = false;
+  const locator = name => ({
+    first() { return this; }, last() { return this; }, filter() { return this; },
+    locator: child => locator(child),
+    async isVisible() { return name.includes('terminal') ? open : palette; },
+    async fill() {},
+    async press(key) {
+      calls.push(key);
+      if (key === 'Control+Shift+P') palette = true;
+      if (key === 'Escape') palette = false;
+    },
+    async waitFor({ state }) {
+      calls.push(`wait:${name}:${state}`);
+      if (name === '.terminal:visible') {
+        if (shortcutOpens) { open = true; return; }
+        throw timeoutError();
+      }
+      if (name.includes('data-quick-input-id')) {
+        if (lookupOpens) open = true;
+        if (lookupError) throw lookupError;
+        if (!idFound) throw timeoutError();
+      }
+      if (name.includes('quick-input-widget') && state === 'hidden') assert.equal(palette, false);
+      if (name.includes('xterm')) assert.equal(open, true, 'xterm readiness waits for an open panel');
+    },
+    async click() {
+      calls.push(`click:${name}`);
+      if (name.includes('quick-input-list')) {
+        if (clickOpens) { open = true; palette = false; }
+        if (clickError) throw timeoutError();
+      }
+    },
+  });
+  return { frame: { locator }, calls, ready: async () => open };
+}
+
+test('terminal waits for the shortcut to open its panel and input before using any palette', async () => {
+  const { frame, calls } = terminalFixture();
+  await ensureTerminal(frame);
+  assert.deepEqual(calls, ['Control+Backquote', 'wait:.terminal:visible:visible',
+    'wait:.xterm-screen:visible', 'wait:.xterm-helper-textarea:attached']);
+});
+
+test('already open terminal waits for xterm readiness without toggling or dispatching', async () => {
+  const { frame, calls } = terminalFixture({ open: true });
+  await ensureTerminal(frame);
+  assert.deepEqual(calls, ['wait:.xterm-screen:visible', 'wait:.xterm-helper-textarea:attached']);
+});
+
+test('terminal palette fallback runs once only after the shortcut readiness timeout', async () => {
+  const { frame, calls } = terminalFixture({ shortcutOpens: false, idFound: false });
+  await ensureTerminal(guardPlaywright(frame, createRedactor()));
+  assert.ok(calls.indexOf('Control+Shift+P') > calls.indexOf('wait:.terminal:visible:visible'));
+  assert.equal(calls.filter(call => call.startsWith('click:.quick-input-list')).length, 1);
+});
+
+test('terminal appearing during palette lookup dismisses the palette without dispatch', async () => {
+  const { frame, calls } = terminalFixture({ shortcutOpens: false, idFound: false, lookupOpens: true });
+  await ensureTerminal(frame);
+  assert.ok(calls.includes('Escape'));
+  assert.equal(calls.filter(call => call.startsWith('click:.quick-input-list')).length, 0);
+});
+
+test('a command click that dispatched before a timeout never triggers a second click', async () => {
+  const { frame, calls, ready } = terminalFixture({ clickError: true });
+  await command(frame, 'Terminal: Focus Terminal', 'terminal.focus', ready);
+  assert.equal(calls.filter(call => call.startsWith('click:.quick-input-list')).length, 1);
+});
+
+test('failed command click and non-timeout lookup errors propagate without another dispatch', async () => {
+  for (const options of [{ clickError: true, clickOpens: false }, { lookupError: new Error('Frame detached') }]) {
+    const { frame, calls } = terminalFixture(options);
+    await assert.rejects(command(frame, 'Some Command', 'command.id'));
+    assert.ok(calls.filter(call => call.startsWith('click:.quick-input-list')).length <= 1);
+  }
+});
+
+test('restart skips only explicit deployment/stack limitations, never missing prerequisites or failures', () => {
+  assert.equal(restartUnavailableReason('Not available in this deployment yet.'), 'restart_not_supported_by_deployment');
+  assert.equal(restartUnavailableReason("This deployment hasn't turned on desktop restarts yet."), 'restart_not_supported_by_deployment');
+  assert.equal(restartUnavailableReason('This desktop runs on an older stack that cannot be restarted in place.'), 'restart_not_supported_by_desktop_stack');
+  for (const text of ['', 'Open a desktop first, then come back here.', 'Restarting…', 'Your session expired — sign in again.',
+    'Could not reach the server.', 'Something went wrong. Please try again.']) assert.equal(restartUnavailableReason(text), null);
+});
+
+function restartFixture({ unsupported = false, expanded = false } = {}) {
+  const calls = [];
+  let checks = 0;
+  const locator = selector => ({
+    last() { return this; }, locator,
+    async count() { return 1; },
+    async getAttribute(name) {
+      if (selector.includes('drawer-toggle')) { assert.equal(name, 'aria-expanded'); return String(expanded); }
+      assert.equal(name, 'data-ezil-computer-id'); return 'fixture-computer';
+    },
+    async isVisible() { return true; },
+    async isEnabled() { return !unsupported && ++checks >= 2; },
+    async click() { calls.push(selector); },
+    async waitFor() {},
+    async evaluate(callback) {
+      const hr = { tagName: 'HR' };
+      return callback({ nextElementSibling: { tagName: 'P', matches: () => true,
+        textContent: unsupported ? 'Not available in this deployment yet.' : '', nextElementSibling: hr } });
+    },
+  });
+  return { page: { locator }, calls };
+}
+
+test('restart uses the open Browser drawer and waits for the control to enable', async () => {
+  for (const expanded of [false, true]) {
+    const { page, calls } = restartFixture({ expanded });
+    const evidence = {};
+    assert.equal((await restartPane(page, evidence)).reason, null);
+    assert.deepEqual(calls, [...(expanded ? [] : ['.dashboard-app-drawer-toggle']),
+      '.dashboard-app-drawer-settings', '[data-tab="troubleshoot"]']);
+    assert.equal(evidence.desktopHasComputerId, true);
+    assert.equal(evidence.enabled, true);
+    assert.ok(!JSON.stringify(evidence).includes('fixture-computer'));
+  }
+});
+
+test('restart retains the disabled explanation when deployment support is absent', async () => {
+  const { page } = restartFixture({ unsupported: true });
+  const evidence = {};
+  assert.equal((await restartPane(page, evidence)).reason, 'restart_not_supported_by_deployment');
+  assert.equal(evidence.enabled, false);
+  assert.equal(evidence.explanation, 'Not available in this deployment yet.');
 });

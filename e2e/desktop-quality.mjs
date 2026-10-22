@@ -11,6 +11,8 @@ import { isIP } from 'node:net';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const QUALITY_STEP_IDS = ['placement', 'latency', 'typing', 'clipboard', 'fonts'];
 export const EDITOR_LINES = '.editor-group-container.active .monaco-editor .view-lines:visible';
+export const EDITOR_INPUT = '.editor-group-container.active .monaco-editor textarea.inputarea:visible, '
+  + '.editor-group-container.active .monaco-editor [contenteditable="true"]:visible';
 export const TYPING_TEXT = 'Az09 é ß ñ 日本語 हिन्दी / . , : - _ '.repeat(8).slice(0, 200);
 export const FONT_TEXT = '日本語 한국어 हिन्दी العربية ไทย 🙂';
 
@@ -92,7 +94,7 @@ export async function qualityChecks(evidence, checks) {
 }
 
 // Execute in the user's browser (top page or Code frame), never from Node.
-async function fetchTimings(realm, url, method) {
+export async function fetchTimings(realm, url, method) {
   const observations = await realm.evaluate(async ({ url, method }) => {
     const observations = [];
     for (let i = 0; i < 10; i++) {
@@ -100,15 +102,133 @@ async function fetchTimings(realm, url, method) {
       try {
         const response = await fetch(url, { method, cache: 'no-store', credentials: 'same-origin',
           redirect: 'error', signal: AbortSignal.timeout(5000) });
-        await response.arrayBuffer();
+        const body = await response.text();
         const contentType = response.headers.get('content-type') || '';
+        const htmlFallback = /(?:text\/html|application\/xhtml\+xml)/i.test(contentType)
+          || /^\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(body);
         observations.push({ ms: performance.now() - started, httpStatus: response.status,
-          ok: response.ok && (method !== 'HEAD' || !/text\/html/i.test(contentType)) });
+          htmlFallback, ok: response.ok && !htmlFallback });
       } catch (error) { observations.push({ ms: performance.now() - started, ok: false, error: error.name }); }
     }
     return observations;
   }, { url, method });
   return { ...latencySummary(observations.filter(item => item.ok).map(item => item.ms)), observations };
+}
+
+export async function focusEditor(frame) {
+  const input = frame.locator(EDITOR_INPUT).first();
+  await input.waitFor({ state: 'visible' });
+  // Focusing the real input avoids the oversized/scrolled rendering layer.
+  // Keep a live EditContext/contenteditable selection if it already has focus.
+  const focused = await frame.evaluate(selector => document.hasFocus() && document.activeElement?.matches(selector),
+    EDITOR_INPUT.replaceAll(':visible', ''));
+  if (!focused) await input.focus();
+}
+
+/** Serialized by page.addInitScript: no imports/closures, no network or logging.
+ * Keep only counters, test-token equality, and one allowlisted profile flag.
+ * Never retain socket URLs, clipboard contents, member ids, or error messages.
+ */
+export function installNekoClipboardProbe() {
+  'use strict'; // addInitScript serializes this function outside module strict mode.
+  if (window.top === window || !/^[^.]+-nekodesktop\./i.test(location.hostname)) return;
+  if (window.__desktopQualityClipboard) return;
+  const hooks = { websocket: 'unavailable', clipboardWrite: 'unavailable' };
+  let socketsObserved = 0, testToken = null, counters, initProfile = null;
+  const reset = token => {
+    testToken = typeof token === 'string' ? token : null;
+    counters = { messagesReceived: 0, nonTextMessages: 0, parseFailures: 0,
+      controlClipboardEvents: 0, testTokenEvents: 0,
+      writeCalls: 0, writeResolved: 0, writeRejected: 0,
+      testTokenWriteCalls: 0, testTokenWriteRejected: 0, lastRejectionName: null };
+  };
+  reset(null);
+  const profile = () => {
+    try {
+      const client = window.$client, user = client?.$accessor?.user;
+      // The pinned legacy client exposes user.member; newer clients may expose
+      // profile directly. Do not scan all members or mistake the host for self.
+      const candidates = [
+        ['user.profile', user?.profile], ['user.member.profile', user?.member?.profile],
+        ['user.member', user?.member], ['user.self.profile', user?.self?.profile],
+        ['user.self', user?.self], ['user.members[self].profile', user?.id ? user.members?.[user.id]?.profile : null],
+        ['user.members[self]', user?.id ? user.members?.[user.id] : null], ['client.profile', client?.profile],
+      ];
+      for (const [source, value] of candidates) if (typeof value?.can_access_clipboard === 'boolean') {
+        return { can_access_clipboard: value.can_access_clipboard, source, reason: null };
+      }
+      return initProfile || { can_access_clipboard: null, source: null, reason: 'logged_in_profile_flag_not_exposed' };
+    } catch {
+      return { can_access_clipboard: null, source: null, reason: 'logged_in_profile_unreadable' };
+    }
+  };
+  window.__desktopQualityClipboard = { reset, snapshot: () => ({
+    status: 'observed', hooks: { ...hooks }, socketsObserved, ...counters,
+    controlClipboardReceived: hooks.websocket === 'installed' && socketsObserved > 0 ? counters.controlClipboardEvents > 0 : null,
+    clipboardWriteRejected: hooks.clipboardWrite === 'installed' ? counters.writeRejected > 0 : null,
+    profile: profile(),
+  }) };
+  try {
+    const NativeWebSocket = window.WebSocket;
+    if (typeof NativeWebSocket === 'function') {
+      window.WebSocket = new Proxy(NativeWebSocket, {
+        construct(target, args, newTarget) {
+          const socket = Reflect.construct(target, args, newTarget);
+          socketsObserved++;
+          socket.addEventListener('message', event => {
+            counters.messagesReceived++;
+            if (typeof event.data !== 'string') { counters.nonTextMessages++; return; }
+            let message;
+            try { message = JSON.parse(event.data); } catch { counters.parseFailures++; return; }
+            // system/init describes this logged-in session, unlike member/list.
+            // Some clients receive this flag but do not retain it in their store.
+            if (message?.event === 'system/init') {
+              initProfile = typeof message.profile?.can_access_clipboard === 'boolean'
+                ? { can_access_clipboard: message.profile.can_access_clipboard, source: 'system/init.profile', reason: null } : null;
+            }
+            if (message?.event === 'control/clipboard') {
+              counters.controlClipboardEvents++;
+              if (testToken !== null && message.text === testToken) counters.testTokenEvents++;
+            }
+          });
+          return socket;
+        },
+      });
+      hooks.websocket = 'installed';
+    }
+  } catch { hooks.websocket = 'installation_failed'; }
+  try {
+    const clipboard = navigator.clipboard, original = clipboard?.writeText;
+    if (typeof original === 'function') {
+      clipboard.writeText = function (...args) {
+        const observation = counters, matches = testToken !== null && args[0] === testToken;
+        observation.writeCalls++;
+        if (matches) observation.testTokenWriteCalls++;
+        const rejected = error => {
+          observation.writeRejected++;
+          if (matches) observation.testTokenWriteRejected++;
+          observation.lastRejectionName = ['NotAllowedError', 'SecurityError', 'AbortError', 'TypeError', 'NotFoundError']
+            .includes(error?.name) ? error.name : 'OtherError';
+          throw error;
+        };
+        let pending;
+        try { pending = Reflect.apply(original, this, args); } catch (error) { return rejected(error); }
+        return pending.then(value => { observation.writeResolved++; return value; }, rejected);
+      };
+      hooks.clipboardWrite = 'installed';
+    }
+  } catch { hooks.clipboardWrite = 'installation_failed'; }
+}
+
+export async function nekoClipboardDiagnostics(frame, token) {
+  try {
+    return await frame.evaluate(token => {
+      const probe = window.__desktopQualityClipboard;
+      if (!probe) return { status: 'unavailable', reason: 'neko_probe_not_installed' };
+      if (typeof token === 'string') probe.reset(token);
+      return probe.snapshot();
+    }, token);
+  } catch { return { status: 'unavailable', reason: 'neko_frame_unavailable_for_diagnostics' }; }
 }
 
 async function readEditor(frame) {
@@ -188,12 +308,11 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
     await clickDock(page, 'code');
     const frame = await codeFrame(page);
     await command(frame, 'File: New Untitled Text File', 'workbench.action.files.newUntitledFile');
-    await frame.locator(EDITOR_LINES).first().click();
+    await focusEditor(frame);
     // An empty Monaco line may render one NBSP as its caret-height placeholder.
     requireThat(['', ' '].includes(await readEditor(frame)), 'New untitled editor is not empty');
     return frame;
   };
-  const clearEditor = async () => { await page.keyboard.press('Control+A'); await page.keyboard.press('Backspace'); };
   const browserTarget = async evidence => {
     if (!browserReady) return null;
     await openApp(page, 'desktop', evidence);
@@ -249,8 +368,8 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
           const asset = await frame.evaluate(() => [...document.querySelectorAll('script[src], link[rel="stylesheet"][href]')]
             .map(element => element.src || element.href).find(value => new URL(value).origin === location.origin));
           if (!asset) return 'same_origin_static_asset_unavailable';
-          Object.assign(data, { origin: new URL(frame.url()).origin, assetPath: new URL(asset).pathname, method: 'HEAD',
-            executionRealm: 'Code frame in user browser' }, await fetchTimings(frame, asset, 'HEAD'));
+          Object.assign(data, { origin: new URL(frame.url()).origin, assetPath: new URL(asset).pathname, method: 'GET',
+            executionRealm: 'Code frame in user browser' }, await fetchTimings(frame, asset, 'GET'));
           requireThat(data.samplesMs.length === 10, 'Code asset did not return 10 successful timing samples');
         },
         guestAiConnect: async data => {
@@ -287,17 +406,8 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
           return data.echo.lastCharacterEchoMs === null ? 'editor_input_timestamps_unavailable' : null;
         },
         autoRepeat: async data => {
-          await frame.locator(EDITOR_LINES).first().click();
-          await clearEditor();
-          data.key = 'q'; data.holdMs = 600;
-          data.automationNote = 'A single Playwright keydown may not synthesize native OS repeat; no extra keydowns injected.';
-          await page.keyboard.down(data.key);
-          try { await sleep(data.holdMs); } finally { await page.keyboard.up(data.key); }
-          await sleep(250);
-          data.observed = await readEditor(frame);
-          data.repeatCount = countRepeats(data.observed, data.key);
-          requireThat(data.repeatCount > 1 && data.repeatCount < 60 && data.observed === data.key.repeat(data.repeatCount),
-            'Expected between 2 and 59 repeated characters');
+          data.automationNote = 'Playwright does not synthesize timed native key repeats. Code DOM input also bypasses Neko/XKB.';
+          return 'native_repeat_not_synthesized';
         },
       });
     },
@@ -325,7 +435,7 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
           const frame = await newEditor(); await grant();
           const token = `local-to-code-${runId}`;
           await page.evaluate(token => navigator.clipboard.writeText(token), token);
-          await frame.locator(EDITOR_LINES).first().click();
+          await focusEditor(frame);
           await page.keyboard.press('Control+V');
           data.exactEquality = await waitForText(() => readEditor(frame), token) === token;
           requireThat(data.exactEquality, 'Local clipboard did not reach Code');
@@ -335,7 +445,7 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
           const frame = await newEditor(); await grant();
           const token = `code-to-local-${runId}`;
           await page.evaluate(token => navigator.clipboard.writeText(`sentinel-${token}`), token);
-          await frame.locator(EDITOR_LINES).first().click();
+          await focusEditor(frame);
           await page.keyboard.type(token, { delay: 15 });
           requireThat(await waitForText(() => readEditor(frame), token) === token, 'Code copy source was not rendered');
           await page.keyboard.press('Control+A'); await page.keyboard.press('Control+C');
@@ -343,38 +453,49 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
           requireThat(data.exactEquality, 'Code clipboard did not reach the local browser');
         },
         browser: async data => {
+          let target;
           try {
-            const target = await browserTarget(data);
+            target = await browserTarget(data);
             if (!target) {
               data.localToRemote = data.remoteToLocal = { status: 'SKIP', reason: 'neko_focusable_target_unavailable' };
               return 'neko_focusable_target_unavailable';
             }
+            data.diagnostics = await nekoClipboardDiagnostics(target.frame);
             await grant();
             // The sidecar's snapshot.url is the committed page URL, not the
             // editable omnibox. Never substitute local overlay.value or OCR.
             return await qualityChecks(data, {
               localToRemote: async result => {
                 const token = `local-to-browser-${runId}`;
-                await page.evaluate(token => navigator.clipboard.writeText(token), token);
-                await target.input.click(); await target.input.press('Control+l');
-                await target.input.press('Control+v'); await sleep(500);
-                await shot('clipboard-browser', result, 'desktop', true);
-                result.contract = 'worker/sidecar/contract.mjs:SIDECAR_WIRE';
-                await target.input.press('Escape');
-                return 'sidecar_has_no_omnibox_text_readback';
+                result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
+                try {
+                  await page.evaluate(token => navigator.clipboard.writeText(token), token);
+                  await target.input.click(); await target.input.press('Control+l');
+                  await target.input.press('Control+v'); await sleep(500);
+                  await shot('clipboard-browser', result, 'desktop', true);
+                  result.contract = 'worker/sidecar/contract.mjs:SIDECAR_WIRE';
+                  await target.input.press('Escape');
+                  return 'sidecar_has_no_omnibox_text_readback';
+                } finally { result.diagnosticsAfter = await nekoClipboardDiagnostics(target.frame); }
               },
               remoteToLocal: async result => {
                 const token = `browser-to-local-${runId}`;
-                await page.evaluate(token => navigator.clipboard.writeText(`sentinel-${token}`), token);
-                await target.input.click(); await target.input.press('Control+l');
-                await typeNeko(target.input, token);
-                await target.input.press('Control+a'); await target.input.press('Control+c');
-                result.exactEquality = await waitForText(() => page.evaluate(() => navigator.clipboard.readText()), token) === token;
-                await target.input.press('Escape');
-                requireThat(result.exactEquality, 'Browser clipboard did not reach the local browser');
+                result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
+                try {
+                  await page.evaluate(token => navigator.clipboard.writeText(`sentinel-${token}`), token);
+                  await target.input.click(); await target.input.press('Control+l');
+                  await typeNeko(target.input, token);
+                  await target.input.press('Control+a'); await target.input.press('Control+c');
+                  result.exactEquality = await waitForText(() => page.evaluate(() => navigator.clipboard.readText()), token) === token;
+                  await target.input.press('Escape');
+                  requireThat(result.exactEquality, 'Browser clipboard did not reach the local browser');
+                } finally { result.diagnosticsAfter = await nekoClipboardDiagnostics(target.frame); }
               },
             });
-          } finally { await closeApp(page, 'desktop'); }
+          } finally {
+            if (target) data.diagnostics = await nekoClipboardDiagnostics(target.frame);
+            await closeApp(page, 'desktop');
+          }
         },
       });
     },

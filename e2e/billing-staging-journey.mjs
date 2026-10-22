@@ -29,7 +29,7 @@ import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { desktopQuality, QUALITY_STEP_IDS } from './desktop-quality.mjs';
+import { desktopQuality, installNekoClipboardProbe, QUALITY_STEP_IDS } from './desktop-quality.mjs';
 
 const STEP_IDS = ['health', 'sign_in', 'billing', 'code', 'browser', ...QUALITY_STEP_IDS, 'chat', 'persistence'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -80,7 +80,9 @@ export function guardPlaywright(root, redact) {
   const wrapped = new WeakMap(), originals = new WeakMap();
   const safeError = error => {
     const safe = new Error(redact(error));
-    safe.name = 'JourneyError';
+    // Keep only this allowlisted type so readiness timeouts can fall back while
+    // detached frames and other operational failures still propagate.
+    safe.name = error?.name === 'TimeoutError' ? 'TimeoutError' : 'JourneyError';
     safe.stack = redact(safe.stack);
     return safe;
   };
@@ -385,20 +387,49 @@ async function waitForPlan(page, upgrade, evidence, started) {
   throw new Error('Purchased plan did not become Active within 120 seconds');
 }
 
-async function command(frame, name, id) {
+export async function command(frame, name, id, ready = async () => false) {
+  if (await ready()) return;
   await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
   await frame.locator('body').press('Control+Shift+P');
   const input = frame.locator('.quick-input-widget input:visible').first();
   await input.fill(`>${name}`);
   // Command ids survived the EZiL branding patches. Match them when exposed.
   const row = frame.locator(`.quick-input-list [data-quick-input-id="${id}"]:visible`).first();
-  try { await row.waitFor({ state: 'visible', timeout: 3000 }); await row.click(); }
-  catch {
-    const fallback = frame.locator('.quick-input-list .monaco-list-row:visible')
-      .filter({ hasText: new RegExp(escapeRegex(name), 'i') }).first();
-    await fallback.click();
+  const found = await row.waitFor({ state: 'visible', timeout: 3000 }).then(() => true, error => {
+    if (error.name !== 'TimeoutError') throw error;
+    return false;
+  });
+  // The shortcut can finish opening the target while the palette is resolving.
+  if (await ready()) {
+    if (await input.isVisible()) await input.press('Escape');
+    return;
   }
+  const choice = found ? row : frame.locator('.quick-input-list .monaco-list-row:visible')
+    .filter({ hasText: new RegExp(escapeRegex(name), 'i') }).first();
+  // Never retry a click: it may already have dispatched before Playwright reports
+  // a timeout. Only the non-mutating row lookup above permits a text fallback.
+  try { await choice.click(); }
+  catch (error) { if (!await ready()) throw error; }
   await input.waitFor({ state: 'hidden' });
+}
+
+export async function ensureTerminal(frame, timeout = 5000) {
+  const terminal = frame.locator('.terminal:visible').last();
+  const screen = terminal.locator('.xterm-screen').last();
+  if (!await terminal.isVisible()) {
+    await frame.locator('body').press('Control+Backquote');
+    const opened = await terminal.waitFor({ state: 'visible', timeout }).then(() => true, error => {
+      if (error.name !== 'TimeoutError') throw error;
+      return false;
+    });
+    if (!opened && !await terminal.isVisible()) {
+      await command(frame, 'Terminal: Focus Terminal', 'workbench.action.terminal.focus', () => terminal.isVisible());
+    }
+  }
+  // A visible panel can still be creating xterm. Wait without toggling it again.
+  await screen.waitFor({ state: 'visible', timeout: 15_000 });
+  await terminal.locator('.xterm-helper-textarea').last().waitFor({ state: 'attached', timeout: 15_000 });
+  return terminal;
 }
 
 async function chat(page, evidence, redact) {
@@ -443,15 +474,9 @@ async function chat(page, evidence, redact) {
 async function terminalRun(page, frame, script, runId, phase) {
   await clickDock(page, 'code');
   await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
-  // Requested shortcut, then inspect/focus the actual terminal input.
-  if (!await frame.locator('.terminal .xterm-helper-textarea:visible').count()) {
-    await frame.locator('body').press('Control+Backquote');
-  }
-  // An already-open terminal panel is focused by the screen click below.
-  if (!await frame.locator('.terminal:visible').count()) await command(frame, 'Terminal: Focus Terminal', 'workbench.action.terminal.focus');
+  const terminal = await ensureTerminal(frame);
   // Focus the terminal the way a user does (click its screen); typing then goes to the
   // focused xterm input. Targeting the helper textarea by locator did not deliver keys.
-  const terminal = frame.locator('.terminal:visible').last();
   // Shell-integration command decorations overlay the screen; a user click still focuses it.
   await terminal.locator('.xterm-screen').last().click({ force: true });
   const input = { pressSequentially: (text, opts) => page.keyboard.type(text, opts), press: key => page.keyboard.press(key) };
@@ -480,6 +505,50 @@ async function terminalRun(page, frame, script, runId, phase) {
   }, 'terminal output file', 60_000);
 }
 
+export function restartUnavailableReason(text) {
+  if (/Not available in this deployment yet\.|This deployment hasn't turned on desktop restarts yet\./i.test(text)) {
+    return 'restart_not_supported_by_deployment';
+  }
+  if (/This desktop runs on an older stack that cannot be restarted in place\./i.test(text)) {
+    return 'restart_not_supported_by_desktop_stack';
+  }
+  return null;
+}
+
+export async function restartPane(page, evidence) {
+  const desktop = appWindow(page, 'desktop');
+  await until(async () => {
+    evidence.desktopOpen = await desktop.count() > 0;
+    evidence.desktopHasComputerId = evidence.desktopOpen && !!await desktop.getAttribute('data-ezil-computer-id');
+    return evidence.desktopHasComputerId;
+  }, 'open Browser computer identity', 15_000);
+  const settings = desktop.locator('.dashboard-app-drawer-settings');
+  const toggle = desktop.locator('.dashboard-app-drawer-toggle');
+  // A clipped drawer button can still satisfy Playwright's isVisible().
+  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
+  await settings.click();
+  const win = appWindow(page, 'settings');
+  await win.locator('[data-tab="troubleshoot"]').click();
+  const pane = win.locator('[data-pane="troubleshoot"]');
+  await pane.waitFor({ state: 'visible' });
+  const restart = pane.locator('[data-action="restart"]');
+  await until(async () => {
+    evidence.visible = await restart.isVisible();
+    evidence.enabled = evidence.visible && await restart.isEnabled();
+    // Only the restart section; diagnostic logs below it can contain user data.
+    evidence.explanation = evidence.visible ? compact(await restart.evaluate(button => {
+      const lines = [];
+      for (let node = button.nextElementSibling; node && node.tagName !== 'HR'; node = node.nextElementSibling) {
+        if (node.matches('.ezil-settings-muted, .ezil-settings-error')) lines.push(node.textContent);
+      }
+      return lines.join(' ');
+    })) : '';
+    evidence.unavailableReason = !evidence.enabled ? restartUnavailableReason(evidence.explanation) : null;
+    return evidence.enabled || evidence.unavailableReason;
+  }, 'restart control enabled or explicitly unsupported', 15_000);
+  return { pane, restart, reason: evidence.unavailableReason };
+}
+
 async function persistence(page, runId, evidence) {
   const frame = await codeFrame(page);
   const initial = await terminalRun(page, frame,
@@ -495,24 +564,29 @@ async function persistence(page, runId, evidence) {
   evidence.resources = parseResources(initial.text);
   if (initial.exitCode !== 0) throw new Error('Persistence setup command failed (an existing tmux session named e2e also causes this)');
   if (!evidence.resources.ramMiB || !evidence.resources.vcpus) throw new Error('RAM/vCPU output was not readable');
-  const win = await settingsTab(page, 'troubleshoot').catch(async error => {
-    if (!await appWindow(page, 'settings').locator('[data-tab="troubleshoot"]').count()) return null;
-    throw error;
-  });
-  if (!win) return 'restart_control_missing';
-  const restart = win.locator('[data-action="restart"]');
-  if (!await restart.count() || !await restart.isVisible()) return 'restart_control_missing';
-  if (!await restart.isEnabled()) return 'restart_unavailable';
-  evidence.restartControl = 'Settings → Troubleshoot → Restart desktop';
+  // Troubleshoot requires an open Browser with a computer id. Its drawer opens
+  // Settings without clickDock's full-bleed cleanup closing that prerequisite.
+  await closeApp(page, 'settings');
+  evidence.desktopBeforeRestart = {};
+  await openApp(page, 'desktop', evidence.desktopBeforeRestart);
+  evidence.restartControl = { path: 'Browser drawer → Settings → Troubleshoot → Restart desktop' };
+  const { pane: win, restart, reason } = await restartPane(page, evidence.restartControl);
+  if (reason) return reason;
   await restart.click();
   await page.getByRole('button', { name: 'Restart', exact: true }).click();
   const started = performance.now();
-  await until(async () => {
+  const restartOutcome = await until(async () => {
     const error = win.locator('.ezil-settings-error');
-    if (await error.count()) throw new Error(`Restart failed: ${await error.innerText()}`);
-    return (await win.innerText()).includes('Restart requested.');
+    if (await error.count()) {
+      evidence.restartControl.explanation = compact(await error.innerText());
+      const reason = restartUnavailableReason(evidence.restartControl.explanation);
+      if (reason) return reason;
+      throw new Error(`Restart failed: ${evidence.restartControl.explanation}`);
+    }
+    return (await win.innerText()).includes('Restart requested.') ? 'restarted' : false;
   }, 'restart acknowledgement', 120_000);
   evidence.restartMs = elapsed(started);
+  if (restartOutcome !== 'restarted') return restartOutcome;
   await closeApp(page, 'settings');
   evidence.desktopAfterRestart = {};
   await openApp(page, 'desktop', evidence.desktopAfterRestart);
@@ -618,6 +692,9 @@ export async function main(env = process.env) {
     browser = await playwright.chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     page = await context.newPage();
+    // Register before any navigation so the Neko socket and clipboard wrappers
+    // are present before its client starts. The function scopes itself to Neko.
+    await page.addInitScript(installNekoClipboardProbe);
     page.setDefaultTimeout(15_000);
     page.setDefaultNavigationTimeout(60_000);
     const signedIn = await record('sign_in', async evidence => {
