@@ -131,7 +131,7 @@ elif mode == "promote":
     assert a["ap-south-1"]["stateMachineVersionArn"].endswith(":11")
     assert read("config.json")["preserve"] == {"nested": True}
     assert has("npm", "synth:lifecycle") and has("npx", "publish-assets")
-    assert has("put-secret-value", "file:///dev/stdin")
+    assert any("put-secret-value" in c and any(str(x).startswith("file://") and "ezil-secret." in str(x) for x in c) for c in calls)
     assert read("release/promotion.json")["previous"] == read("original-config.json")
 elif mode == "rollback":
     b, a = preserved()

@@ -590,9 +590,25 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
 
 
 def secret_aws(args, payload=None, lock_fd=None):
+    # AWS CLI v2 does not read --cli-input-json file:///dev/stdin from a pipe ("Invalid
+    # JSON received"), so the payload goes through a private 0600 file, removed at once.
+    tmpdir = path = None
+    if payload is not None and "file:///dev/stdin" in args:
+        tmpdir = tempfile.mkdtemp(prefix="ezil-secret.")
+        path = os.path.join(tmpdir, "request.json")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(payload)
+        args = ["file://" + path if a == "file:///dev/stdin" else a for a in args]
+        payload = None
     command = ["aws", "--profile", "ezil-admin", "--region", REGION, "--no-cli-pager", "secretsmanager", *args]
-    result = subprocess.run(command, input=payload, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=90,
-                            pass_fds=() if lock_fd is None else (lock_fd,))
+    try:
+        result = subprocess.run(command, input=payload, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=90,
+                                pass_fds=() if lock_fd is None else (lock_fd,))
+    finally:
+        if path:
+            os.unlink(path)
+            os.rmdir(tmpdir)
     # Do not relay AWS stderr: a validation error can contain request material.
     need(result.returncode == 0, "Secrets Manager command failed (details suppressed)")
     return json.loads(result.stdout)

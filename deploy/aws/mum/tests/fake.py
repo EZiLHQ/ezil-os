@@ -369,8 +369,12 @@ elif tool == "aws":
                 save("secret.json", envelope)
             out(envelope)
         elif operation == "put-secret-value":
-            assert flag("--cli-input-json") == "file:///dev/stdin"
-            request = json.load(sys.stdin)
+            source = flag("--cli-input-json")
+            # The payload arrives through a private 0600 file, never argv or a pipe.
+            assert source.startswith("file://") and "ezil-secret." in source, source
+            request_path = Path(source[len("file://"):])
+            assert (request_path.stat().st_mode & 0o777) == 0o600
+            request = json.loads(request_path.read_text())
             assert request["SecretId"] == "ezil-os/billing-staging/app"
             save("secret.json", {"VersionId": "updated", "SecretString": request["SecretString"]})
             out({"VersionId": "updated"})
