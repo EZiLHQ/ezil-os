@@ -198,6 +198,10 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             } catch { /* A lost evidence CAS leaves custody with the newer row. */ }
         }
         if (code) return reply(input.operation === 'plan' || input.operation === 'verify' ? 200 : 409, false, code);
+        // An uncoded failure is otherwise invisible to the operator (seen live 2026-10-22: prepare
+        // answered 503 with no job and no log). Error class and a short message only; no request body.
+        console.error('[image-rebase] unexpected failure', { operation: input.operation, computerId, jobId: j?.jobId ?? null,
+            name: error instanceof Error ? error.name : typeof error, message: (error instanceof Error ? error.message : String(error)).slice(0, 300) });
         return reply(503, false, 'operator_required');
     }
 }

@@ -111,6 +111,16 @@ it('revokes image authority on owner/phase/job/epoch/digest mismatch', async () 
     s.advance(600000); expect(await s.store.authority(authority, s.deps.now())).toBe(false);
 });
 
+it('logs an uncoded prepare failure (class and message only) before answering operator_required', async () => {
+    const s = rebaseSetup(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+        s.deps.describer.describeVolume = async () => { throw new TypeError('describe exploded'); };
+        const r = await s.run('prepare');
+        expect(r.status).toBe(503); expect(r.body.failureCode).toBe('operator_required'); expect(s.fake.imageJobs).toHaveLength(0);
+        expect(log).toHaveBeenCalledWith('[image-rebase] unexpected failure', expect.objectContaining({ operation: 'prepare', name: 'TypeError', message: 'describe exploded', jobId: null }));
+    } finally { log.mockRestore(); }
+});
+
 it('admission refuses a kill switch without changing source counters or storing a launch nonce', async () => {
     const s = rebaseSetup(); await s.run('prepare'); await s.completePreparation();
     Object.assign(s.env, { EZIL_AWS_KILL_SWITCH: '1' });
