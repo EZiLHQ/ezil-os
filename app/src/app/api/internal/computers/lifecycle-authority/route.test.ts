@@ -168,7 +168,7 @@ describe('authentication fails closed before reading placement', () => {
 
     it('refuses an unreadable request body', async () => {
         const req = request();
-        vi.spyOn(req, 'arrayBuffer').mockRejectedValue(new Error('read failed'));
+        Object.defineProperty(req, 'body', { value: new ReadableStream({ start(controller) { controller.error(new Error('read failed')); } }) });
         await refused(req);
         expect(execute).not.toHaveBeenCalled();
     });

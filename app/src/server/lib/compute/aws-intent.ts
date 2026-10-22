@@ -24,6 +24,7 @@ import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { parseRebaseJson, RebaseDigest, RebaseHash, RebaseUuid } from './aws-rebase-json';
 
 import { AWS_REGION_PATTERN, type Env } from './aws-config';
+import { RebaseSourceReleaseSchema } from './aws-rebase-release';
 
 /** JSON object: region → that region's lifecycle deployment (the infra stack's outputs). */
 export const LIFECYCLE_DEPLOYMENTS_ENV = 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS';
@@ -129,6 +130,24 @@ export const LifecycleDeploymentSchema = z
     });
 export type LifecycleDeployment = z.infer<typeof LifecycleDeploymentSchema>;
 
+/** Legacy source deployments carry the observed lower but cannot authorize a launch. */
+export const SourceLifecycleDeploymentSchema = LifecycleDeploymentSchema.innerType().extend({
+    preparationStateMachineVersionArn: z.string().max(300).nullable().optional(),
+    recoveryStateMachineVersionArn: z.string().max(300).nullable().optional(),
+}).superRefine((d, ctx) => {
+    const legacy = d.preparationStateMachineVersionArn === null || d.recoveryStateMachineVersionArn === null;
+    const { lowerImageDigest, previousLowerImageDigest, preparationStateMachineVersionArn, recoveryStateMachineVersionArn, ...base } = d;
+    if (!(legacy ? LifecycleDeploymentSchema.safeParse(base) : LifecycleDeploymentSchema.safeParse(d)).success
+        || (legacy && (!lowerImageDigest || previousLowerImageDigest === undefined || preparationStateMachineVersionArn === undefined || recoveryStateMachineVersionArn === undefined
+            || lowerImageDigest === previousLowerImageDigest)))
+        ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    if (legacy) for (const [arn, name] of [[preparationStateMachineVersionArn, 'rebase-preparation'], [recoveryStateMachineVersionArn, 'recovery']] as const) {
+        if (arn !== null && (typeof arn !== 'string' || !new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:[1-9][0-9]*$`).test(arn)))
+            ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    }
+});
+export type SourceLifecycleDeployment = z.infer<typeof SourceLifecycleDeploymentSchema>;
+
 /**
  * Every configured region's deployment, or the reason none is usable.
  * A configured region with no deployment, or one whose `region` differs from
@@ -150,7 +169,11 @@ export function readLifecycleDeployments(
     const invalid: string[] = [];
     for (const region of regions) {
         const entry = Object.prototype.hasOwnProperty.call(parsed, region) ? (parsed as Record<string, unknown>)[region] : undefined;
-        const d = LifecycleDeploymentSchema.safeParse(entry);
+        const { releases, ...deployment } = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(8).safeParse(releases).success) {
+            invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`); continue;
+        }
+        const d = LifecycleDeploymentSchema.safeParse(deployment);
         if (!d.success || d.data.region !== region) invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`);
         else deployments[region] = d.data;
     }

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { LifecycleDeploymentSchema } from './aws-intent';
+import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema } from './aws-intent';
 import { RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume } from './aws-rebase-json';
 
 export const RebasePreparationSchema = z.object({
@@ -8,7 +8,7 @@ export const RebasePreparationSchema = z.object({
     sourceInstanceId: z.string().regex(/^i-[0-9a-f]{17}$/), sourceVolumeId: RebaseVolume, fsUuid: RebaseUuid,
     sourceGeneration: RebaseCounter, sourceLeaseEpoch: RebaseCounter, sourceFenceToken: RebaseUuid,
     fromDigest: RebaseDigest, toDigest: RebaseDigest, volumeGiB: z.number().int().min(1).max(16384),
-    sourceDeployment: LifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime,
+    sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime,
 }).strict().superRefine((p, ctx) => {
     const from = p.sourceDeployment, to = p.deployment;
     if (p.fromDigest === p.toDigest || p.fromDigest !== from.lowerImageDigest || p.fromDigest !== to.previousLowerImageDigest

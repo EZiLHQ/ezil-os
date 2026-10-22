@@ -1,3 +1,5 @@
+import { createImageJobStore, type ImageJob } from './aws-rebase-store';
+import { RebaseDigest, RebaseUuid, RebaseSnapshot, RebaseVolume, parseRebaseJson } from './aws-rebase-json';
 import { EnrollmentLeaseSchema, ENROLL_NONCE_TTL_SECONDS, USER_DATA_MAX, type RebasePermit, type EbsRestore, type RebaseSchema } from './aws-rebase-lease';
 export { ENROLL_NONCE_TTL_SECONDS, USER_DATA_MAX, REBASE_ENROLL_RESERVE_SECONDS, REBASE_CLOCK_SKEW_SECONDS } from './aws-rebase-lease';
 /**
@@ -23,7 +25,7 @@ import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import { readEnrollmentPlacement as readPlacement, consumeMigrationEnrollment as consumeEnrollmentNonce, finishMigrationEnrollment as finishEnrollment } from './provider-migrate-provision';
-import { ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { ImageJobConflictError, checkEnrollmentDigest, ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, type Placement, type PlacementDb, type PlacementState } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
@@ -238,7 +240,7 @@ export function workerTunnelClientFromEnv(env: AwsEnv): TunnelClient | null {
     return createWorkerTunnelClient({ workerUrl, secret });
 }
 
-const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+const uuid = z.string().transform(v => v.toLowerCase()).pipe(RebaseUuid);
 /** The host body (`enroll.py`): exactly these fields. */
 export const EnrollBodySchema = z
     .object({
@@ -248,6 +250,9 @@ export const EnrollBodySchema = z
         nonce: z.string().regex(NONCE_RE),
         identityDocument: z.string().min(2).max(8192),
         signature: z.string().min(16).max(16384),
+        lowerImageDigest: RebaseDigest.optional(),
+        ebsRestore: z.object({ v: z.literal(1), recoveryJobId: RebaseUuid, snapshotId: RebaseSnapshot,
+            originalVolumeId: RebaseVolume, volumeId: RebaseVolume, fsUuid: RebaseUuid }).strict().optional(),
     })
     .strict();
 
@@ -347,20 +352,37 @@ const carries = (tags: Readonly<Record<string, string>>, want: Record<string, st
  */
 export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promise<EnrollResponse> {
     if (!isAwsComputersEnabled(deps.env)) return retryLater(404, 'not_found');
-    if (!deps.describer || !deps.tunnels) return retryLater(503, 'enroll_unavailable');
+    if (!deps.describer) return retryLater(503, 'enroll_unavailable');
     const parsed = EnrollBodySchema.safeParse(raw);
     if (!parsed.success) return refuse(400, 'enroll_request_invalid');
     const body = parsed.data;
+    if (!body.ebsRestore && !deps.tunnels) return retryLater(503, 'enroll_unavailable');
     const now = deps.now();
 
     // Placement: an aws-ec2 computer in a boot that expects exactly this enrollment.
-    const { record: p } = await readPlacement(deps.db, body.computerId);
+    const images = createImageJobStore(deps.db, deps.env);
+    let imageJob: ImageJob | null = null;
+    const readBoot = async () => {
+        try { return await readPlacement(deps.db, body.computerId); }
+        catch (error) {
+            if (!(error instanceof ImageJobConflictError)) throw error;
+            const { placement, job } = await images.inspect(body.computerId.toLowerCase());
+            if (!placement || !job || (body.ebsRestore ? !job.rebindDocument || job.phase !== 'rebind_pending' : !job.launchDocument || !['launch_pending', 'verifying'].includes(job.phase))) throw error;
+            imageJob = job;
+            return { provider: placement.provider, store: placement.store, record: { ...placement,
+                generation: (body.ebsRestore ? job.rebindGeneration : job.targetGeneration)!, leaseEpoch: (body.ebsRestore ? job.rebindLeaseEpoch : job.targetLeaseEpoch)!, fenceToken: body.ebsRestore ? job.rebindFenceToken : job.targetFenceToken,
+                instanceId: placement.instanceId === job.sourceInstanceId ? null : placement.instanceId } };
+        }
+    };
+    const { record: p } = await readBoot();
+    if (body.ebsRestore && !imageJob) return refuse(403, 'enroll_refused');
+    if (imageJob && (!body.lowerImageDigest || body.lowerImageDigest !== (body.ebsRestore ? (imageJob as ImageJob).fromDigest : (imageJob as ImageJob).toDigest))) return refuse(403, 'host_digest_mismatch');
     if (!p || p.provider !== 'aws-ec2' || !p.region || !p.zoneId || !p.fenceToken || !p.instanceType) return refuse(403, 'enroll_refused');
     const nonceHash = nonceHashOf(body.nonce);
     // This epoch's enrollment already completed (nonce consumed, tunnel created, success recorded)
     // and the host is retrying because the 200 never reached it. Its nonce can no longer be checked
     // here; the Worker checks it instead, through the derived key (`deriveControlKey`).
-    const replay = !p.enrollNonceHash && p.lastError === ENROLLMENT_SUCCEEDED && p.instanceId !== null;
+    const replay = !p.enrollNonceHash && (p.lastError === ENROLLMENT_SUCCEEDED || (body.ebsRestore && p.lastError === 'maintenance_accepted')) && p.instanceId !== null;
     // The nonce was consumed but completion was never recorded (the completion write failed after
     // the Worker created the tunnel, or the consume's own response was lost). The consuming
     // instance, authenticated below by its AWS-signed identity and the live describe, may finish it.
@@ -384,13 +406,14 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     const cert = readIdentityCertificate(deps.env, p.region);
     const deployments = readLifecycleDeployments(deps.env, [p.region]);
     const browserZone = readAwsBrowserZone(deps.env);
-    if (!cert || !deployments.ok || !browserZone) return retryLater(503, 'enroll_unavailable');
-    const deployment = deployments.deployments[p.region]!;
+    if (!cert || !deployments.ok || (!body.ebsRestore && !browserZone)) return retryLater(503, 'enroll_unavailable');
+    const deployment = imageJob ? JSON.parse((body.ebsRestore ? (imageJob as ImageJob).recoveryDocument : (imageJob as ImageJob).preparationDocument)!).deployment as import('./aws-intent').LifecycleDeployment : deployments.deployments[p.region]!;
+    if (body.lowerImageDigest && !imageJob && !replay && !pending && deployment.lowerImageDigest && body.lowerImageDigest !== deployment.lowerImageDigest) return refuse(403, 'host_digest_mismatch');
     const signature = verifyIdentitySignature(body.identityDocument, body.signature, cert, now);
     if (!signature.ok) return refuse(403, signature.reason);
     let doc: z.infer<typeof IdentityDocumentSchema>;
     try {
-        const d = IdentityDocumentSchema.safeParse(JSON.parse(body.identityDocument));
+        const d = IdentityDocumentSchema.safeParse(parseRebaseJson(body.identityDocument, 8192));
         if (!d.success) return refuse(403, 'identity_document_invalid');
         doc = d.data;
     } catch {
@@ -414,7 +437,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     if (view.availabilityZone !== doc.availabilityZone || view.availabilityZoneId !== p.zoneId) return refuse(403, 'enroll_zone_mismatch');
     const tags = expectedTags(p, deployment.namespace);
     if (!carries(view.tags, tags)) return refuse(403, 'enroll_instance_mismatch');
-    if (!view.publicIp) return refuse(403, 'enroll_instance_mismatch');
+    if (!body.ebsRestore && !view.publicIp!) return refuse(403, 'enroll_instance_mismatch');
     let volumeId: string;
     if (p.volumeId) {
         const v = view.volumes.filter((x) => x.volumeId === p.volumeId);
@@ -429,6 +452,27 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         if (data.length !== 1) return refuse(403, 'enroll_volume_mismatch');
         volumeId = data[0]!.volumeId;
     }
+
+    if (body.lowerImageDigest && !carries(view.volumes.find(v => v.volumeId === volumeId)!.tags, tags)) return refuse(403, 'enroll_volume_mismatch');
+    if (body.lowerImageDigest && !imageJob && (replay || pending)
+        && !await checkEnrollmentDigest(deps.db, p, body.lowerImageDigest)) return refuse(403, 'host_digest_mismatch');
+    if (imageJob && (replay || pending)) {
+        const j: ImageJob = imageJob;
+        if (!j.hostEvidence || j.hostEvidence.instanceId !== doc.instanceId || j.hostEvidence.lowerImageDigest !== body.lowerImageDigest) return refuse(403, 'host_digest_mismatch');
+    }
+    if (body.ebsRestore && imageJob) {
+        try {
+            await images.enrollMaintenance(imageJob, { nonceHash, instanceId: doc.instanceId, lowerImageDigest: body.lowerImageDigest!, report: body.ebsRestore }, deps.now());
+            return { status: 200, body: { maintenance: true, accepted: true } };
+        } catch (error) { if (error instanceof ImageJobConflictError) return refuse(403, 'enroll_refused'); throw error; }
+    }
+    const finishBoot: typeof finishEnrollment = async (database, input) => {
+        if (!imageJob) return finishEnrollment(database, input);
+        const latest = await images.read((imageJob as ImageJob).jobId);
+        if (!latest) return { ok: false, reason: 'cas_conflict' };
+        const placement = await images.finishEnroll(latest, { instanceId: doc.instanceId, success: input.success }, deps.now());
+        return { ok: true, placement };
+    };
 
     // Derive the key before consuming: a missing secret leaves the nonce intact.
     let controlKey: Buffer;
@@ -459,7 +503,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         // Enrollment preserves placement state; the receipt path meters the first RUNNING transition.
         let replayed: TunnelResult;
         try {
-            replayed = await deps.tunnels.createTunnel({ userId: p.ownerUserId }, { ...tunnelRequest(doc.instanceId, view.publicIp), replay: true });
+            replayed = await deps.tunnels!.createTunnel({ userId: p.ownerUserId }, { ...tunnelRequest(doc.instanceId, view.publicIp!), replay: true });
         } catch {
             replayed = { ok: false, status: 0, code: 'tunnel_transport' };
         }
@@ -482,7 +526,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
                 return { ok: false, status: 0, code: 'tunnel_transport' };
             }
         };
-        const request = tunnelRequest(doc.instanceId, view.publicIp);
+        const request = tunnelRequest(doc.instanceId, view.publicIp!);
         let t = await call({ ...request, replay: true });
         if (!t.ok && t.status === 404) {
             t = await call(request);
@@ -495,13 +539,13 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         if (!t.ok) return retryLater(503, 'tunnel_unavailable');
         let done: Awaited<ReturnType<typeof finishEnrollment>>;
         try {
-            done = await finishEnrollment(deps.db, { computerId: p.computerId, expected: p, success: true });
+            done = await finishBoot(deps.db, { computerId: p.computerId, expected: p, success: true });
         } catch {
             return retryLater(503, 'enroll_finish_unavailable');
         }
         if (!done.ok) {
             // A concurrent completion may already have recorded this epoch's success.
-            const { record: current } = await readPlacement(deps.db, p.computerId);
+            const { record: current } = await readBoot();
             const recorded = current && current.generation === p.generation && current.leaseEpoch === p.leaseEpoch && current.lastError === ENROLLMENT_SUCCEEDED;
             if (!recorded) return refuse(409, 'enroll_conflict');
         }
@@ -511,16 +555,16 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     let expected = p;
     let consumed: Placement | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
-        const result = await consumeEnrollmentNonce(deps.db, {
-            computerId: p.computerId, expected, nonceHash,
-            fields: { instanceId: doc.instanceId, volumeId },
-        });
+        const result = imageJob ? { ok: true as const, placement: await images.enroll(imageJob, {
+            nonceHash, instanceId: doc.instanceId, volumeId, lowerImageDigest: body.lowerImageDigest! }, deps.now()) }
+            : await consumeEnrollmentNonce(deps.db, { computerId: p.computerId, expected, nonceHash,
+                fields: { instanceId: doc.instanceId, volumeId }, ...(body.lowerImageDigest ? { lowerImageDigest: body.lowerImageDigest, observedAt: now } : {}) });
         if (result.ok) {
             consumed = result.placement;
             break;
         }
         // Resolve receipt races here; only a swap lost twice with the nonce intact is retryable.
-        const { record: current } = await readPlacement(deps.db, p.computerId);
+        const { record: current } = await readBoot();
         if (!current || current.generation !== p.generation || current.leaseEpoch !== p.leaseEpoch) return refuse(409, 'enroll_stale_epoch');
         if (!current.enrollNonceHash) return refuse(409, 'enroll_nonce_consumed');
         if (!sameHash(current.enrollNonceHash, nonceHash)) return refuse(403, 'enroll_nonce_invalid');
@@ -532,7 +576,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     if (!consumed) return retryLater(503, 'enroll_conflict');
     let tunnel: TunnelResult;
     try {
-        tunnel = await deps.tunnels.createTunnel({ userId: p.ownerUserId }, tunnelRequest(doc.instanceId, view.publicIp));
+        tunnel = await deps.tunnels!.createTunnel({ userId: p.ownerUserId }, tunnelRequest(doc.instanceId, view.publicIp!));
     } catch {
         tunnel = { ok: false, status: 0, code: 'tunnel_transport' };
     }
@@ -541,7 +585,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     if (tunnelOutcomeUnknown(tunnel)) return retryLater(503, 'tunnel_unavailable');
     let finished: Awaited<ReturnType<typeof finishEnrollment>>;
     try {
-        finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
+        finished = await finishBoot(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
     } catch {
         // The completion write failed (a transient database error) after the nonce was consumed:
         // the placement keeps ENROLLMENT_PENDING. A structured retryable answer keeps the host's

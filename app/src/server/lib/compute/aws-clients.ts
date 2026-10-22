@@ -27,7 +27,7 @@
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
-import { DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
+import { DescribeSnapshotsCommand, DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
 import { DescribeExecutionCommand, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
 import { AssumeRoleCommand, AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 
@@ -36,6 +36,7 @@ import { AwsClientError, toAwsClientError } from './aws-errors';
 import { instanceMetadataCredentials } from './aws-instance-credentials';
 import type { Ec2EnrollmentDescriber, Ec2EnrollmentView } from './aws-enroll';
 import type { LifecycleStarter } from './aws-ec2';
+import type { RebaseSnapshotDescriber } from './aws-rebase-evidence';
 import type { LifecycleExecutionReader } from './aws-receipts';
 
 // ── Errors (aws-errors.ts, SDK-free) ──────────────────────────────────────
@@ -305,6 +306,9 @@ export interface Ec2VolumeView {
     attachments?: readonly { instanceId: string; state: string }[];
     encrypted?: boolean;
     kmsKeyId?: string;
+    sizeGiB?: number;
+    snapshotId?: string;
+    zoneId?: string;
 }
 
 export interface Ec2VolumeDescriber {
@@ -339,8 +343,24 @@ const COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 
 export function createEc2EnrollmentDescriber(
     ec2For: (region: string) => RegionalClient,
-): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Ec2ReplacementDescriber {
+): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Ec2ReplacementDescriber & RebaseSnapshotDescriber {
     return {
+        async describeSnapshot(region, snapshotId) {
+            assertRegion(region);
+            if (!/^snap-[0-9a-f]{8,17}$/.test(snapshotId)) throw new AwsClientError('aws_config', false, 'SnapshotIdInvalid');
+            const { client, account } = ec2For(region);
+            let out;
+            try { out = await client.send(new DescribeSnapshotsCommand({ SnapshotIds: [snapshotId], OwnerIds: [account] })) as {
+                Snapshots?: { SnapshotId?: string; OwnerId?: string; VolumeId?: string; VolumeSize?: number; State?: string;
+                    Encrypted?: boolean; KmsKeyId?: string; StartTime?: Date; Tags?: Ec2Tag[] }[] };
+            } catch (error) { if (nameOf(error) === 'InvalidSnapshot.NotFound') return null; throw toAwsClientError(error); }
+            if (!out.Snapshots?.length) return null;
+            const v = out.Snapshots[0]!;
+            if (out.Snapshots.length !== 1 || v.SnapshotId !== snapshotId || v.OwnerId !== account || !(v.StartTime instanceof Date))
+                throw new AwsClientError('aws_error', false, 'DescribeSnapshotsAmbiguous');
+            return { snapshotId, ownerId: v.OwnerId, volumeId: v.VolumeId ?? '', volumeGiB: v.VolumeSize ?? 0, state: v.State ?? 'unknown',
+                encrypted: v.Encrypted === true, kmsKeyId: v.KmsKeyId ?? '', startedAt: v.StartTime, tags: tagMap(v.Tags) };
+        },
         async describeForEnrollment(region, instanceId) {
             assertRegion(region);
             if (!INSTANCE_ID.test(instanceId)) return null;
@@ -387,7 +407,10 @@ export function createEc2EnrollmentDescriber(
             if (volumeIds.length > 0) {
                 try {
                     const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: volumeIds }))) as { Volumes?: { VolumeId?: string; Tags?: Ec2Tag[] }[] };
-                    volumeTags = new Map((out.Volumes ?? []).filter((v) => typeof v.VolumeId === 'string').map((v) => [v.VolumeId!, tagMap(v.Tags)]));
+                    const volumes = out.Volumes ?? [];
+                    if (volumes.some(v => typeof v.VolumeId !== 'string' || !volumeIds.includes(v.VolumeId))
+                        || new Set(volumes.map(v => v.VolumeId)).size !== volumes.length) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
+                    volumeTags = new Map(volumes.map((v) => [v.VolumeId!, tagMap(v.Tags)]));
                 } catch (error) {
                     throw toAwsClientError(error);
                 }
@@ -421,19 +444,25 @@ export function createEc2EnrollmentDescriber(
             assertRegion(region);
             if (!VOLUME_ID.test(volumeId)) return null;
             const { client } = ec2For(region);
-            type Volume = { VolumeId?: string; State?: string; Tags?: Ec2Tag[]; Attachments?: { InstanceId?: string; State?: string }[]; Encrypted?: boolean; KmsKeyId?: string };
+            type Volume = { VolumeId?: string; State?: string; Tags?: Ec2Tag[]; Attachments?: { InstanceId?: string; State?: string }[]; Encrypted?: boolean; KmsKeyId?: string; Size?: number; SnapshotId?: string; AvailabilityZoneId?: string; AvailabilityZone?: string };
             let volumes: Volume[];
             try {
                 const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: Volume[] };
-                volumes = (out.Volumes ?? []).filter((v) => v.VolumeId === volumeId);
+                volumes = out.Volumes ?? [];
             } catch (error) {
                 if (nameOf(error) === 'InvalidVolume.NotFound') return null;
                 throw toAwsClientError(error);
             }
             if (volumes.length === 0) return null;
-            if (volumes.length !== 1) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
+            if (volumes.length !== 1 || volumes[0]!.VolumeId !== volumeId) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
             const v = volumes[0]!;
-            return { volumeId, state: v.State ?? 'unknown', tags: tagMap(v.Tags), encrypted: v.Encrypted, kmsKeyId: v.KmsKeyId,
+            let zoneId = v.AvailabilityZoneId;
+            if (!zoneId && v.AvailabilityZone) {
+                const zones = await client.send(new DescribeAvailabilityZonesCommand({ ZoneNames: [v.AvailabilityZone] })) as { AvailabilityZones?: { ZoneName?: string; ZoneId?: string }[] };
+                if (zones.AvailabilityZones?.length !== 1 || zones.AvailabilityZones[0]!.ZoneName !== v.AvailabilityZone) throw new AwsClientError('aws_error', false, 'VolumeZoneAmbiguous');
+                zoneId = zones.AvailabilityZones[0]!.ZoneId;
+            }
+            return { volumeId, state: v.State ?? 'unknown', tags: tagMap(v.Tags), encrypted: v.Encrypted, kmsKeyId: v.KmsKeyId, sizeGiB: v.Size, snapshotId: v.SnapshotId, zoneId,
                 attachments: v.Attachments?.map((a) => ({ instanceId: a.InstanceId ?? '', state: a.State ?? 'unknown' })) };
         },
 
@@ -515,7 +544,7 @@ export interface AwsSdkFactories {
 export interface AwsSdkCollaborators {
     starter?: LifecycleStarter;
     executions?: LifecycleExecutionReader;
-    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Partial<Ec2ReplacementDescriber>;
+    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Partial<Ec2ReplacementDescriber & RebaseSnapshotDescriber>;
 }
 
 /**

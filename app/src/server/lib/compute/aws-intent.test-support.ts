@@ -1,7 +1,7 @@
 import { buildEnrollmentUserData } from './aws-enroll';
 import { buildRebasePreparation } from './aws-rebase-preparation';
 /** Deterministic lifecycle intents for the fixture contract (aws-intent.fixtures.json). */
-import type { LifecycleDeployment, LifecycleIntent } from './aws-intent';
+import { LifecycleDeploymentSchema, type SourceLifecycleDeployment, type LifecycleDeployment, type LifecycleIntent } from './aws-intent';
 
 export const FIXTURE_ACCOUNT = '123456789012'; // AWS documentation placeholder account
 export function fixtureDeployment(region: 'ap-south-1' | 'us-east-1', instanceTypes: string[] = ['m6i.large', 'c6i.xlarge']): LifecycleDeployment {
@@ -106,7 +106,7 @@ export function fixtureRebaseIntent(restore = false): LifecycleIntent {
         fsUuid: p.intent.fsUuid, generation, leaseEpoch, fenceToken: i.fenceToken,
         issuedAt: '2026-10-22T12:00:00.000Z', expiresAt: '2026-10-22T12:10:00.000Z' };
     return { ...i, targetGeneration: generation, leaseEpoch, dataVolumeId: volumeId,
-        deployment: restore ? p.intent.sourceDeployment : p.intent.deployment,
+        deployment: restore ? LifecycleDeploymentSchema.parse(p.intent.sourceDeployment) : p.intent.deployment,
         userData: buildEnrollmentUserData({ computerId: i.computerId, volumeId, fsUuid: p.intent.fsUuid,
             generation, leaseEpoch, nonce: 'n'.repeat(43), provision: false, enrollUrl: 'https://os.example.com/api/compute/aws/enroll',
             ...(restore ? { ebsRestore: { ...permit, recoveryJobId: '33333333-3333-4333-8333-333333333333',
@@ -118,7 +118,7 @@ export function fixtureRebaseIntent(restore = false): LifecycleIntent {
 }
 
 /** Local release evidence double; registry manifest hashes intentionally differ from baked lower IDs. */
-export function fixtureRebaseRelease(d: LifecycleDeployment) {
+export function fixtureRebaseRelease(d: SourceLifecycleDeployment) {
     return { schemaVersion: 1 as const, accountId: d.accountId, region: d.region, namespace: d.namespace, amiId: d.amiId,
         recipeVersion: '1.2.3', lowerImageDigest: d.lowerImageDigest!,
         lowerImageRef: `${FIXTURE_ACCOUNT}.dkr.ecr.ap-south-1.amazonaws.com/desktop@sha256:${'c'.repeat(64)}`,

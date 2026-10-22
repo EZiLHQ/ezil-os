@@ -742,3 +742,32 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
         expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
     });
 });
+
+describe('authenticated lower-image observations', () => {
+    const digest = 'sha256:' + 'a'.repeat(64);
+    it('backfills an ordinary host in the nonce transaction and rejects a different replay digest', async () => {
+        const s = setup();
+        expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
+        expect(s.placements[0]).toMatchObject({ lower_image_digest: digest, lower_digest_observed_at: NOW, enroll_nonce_hash: null });
+        expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
+        expect((await s.enroll(hostBody({ lowerImageDigest: 'sha256:' + 'b'.repeat(64) }))).body).toMatchObject({ error: 'host_digest_mismatch' });
+        expect(s.placements[0]!.lower_image_digest).toBe(digest);
+    });
+    it('rolls back nonce consumption if digest evidence cannot be persisted', async () => {
+        const s = setup();
+        const db = s.deps.db;
+        s.deps.db = { ...db, transaction: fn => db.transaction(tx => fn({ execute: async query => {
+            const { PgDialect } = await import('drizzle-orm/pg-core');
+            if (new PgDialect().sqlToQuery(query).sql.includes('placement:enroll-digest')) throw new Error('write failed');
+            return tx.execute(query);
+        } })) };
+        await expect(s.enroll(hostBody({ lowerImageDigest: digest }))).rejects.toThrow('write failed');
+        expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE)); expect(s.tunnels).toHaveLength(0);
+    });
+    it('does not observe a lower when the live data volume tags differ', async () => {
+        const view = liveView(); view.volumes = view.volumes.map(v => ({ ...v, tags: { ...v.tags, 'ezil:fence-token': C1 } }));
+        const s = setup([booting()], { view });
+        expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).body).toMatchObject({ error: 'enroll_volume_mismatch' });
+        expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE)); expect(s.tunnels).toHaveLength(0);
+    });
+});

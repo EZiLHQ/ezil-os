@@ -35,6 +35,7 @@ import {
     claimAwsPlacementsPendingRetire,
     claimAwsPlacementsToReconcile,
     PlacementIntegrityError,
+    ImageJobConflictError,
     readCanaryComputer,
     RELEASED_NO_RESOURCES,
     readMonthUsage,
@@ -607,7 +608,7 @@ export async function reconcileAwsFleet(
             }
             if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage }))) limitStops += 1;
         } catch (error) {
-            if (!(error instanceof PlacementIntegrityError)) throw error;
+            if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
     }
     return { checked, stopsStarted, limitStops };
@@ -820,7 +821,7 @@ export async function reconcileDeletedAwsComputers(
                 else if (outcome === 'stuck') stuck += 1;
             } else if (await startRetireAsReconciler(deps, now, deployment)) retiresStarted += 1;
         } catch (error) {
-            if (!(error instanceof PlacementIntegrityError)) throw error;
+            if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
     }
     return { checked, retiresStarted, retired, stuck };

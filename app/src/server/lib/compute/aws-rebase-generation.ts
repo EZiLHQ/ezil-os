@@ -12,12 +12,13 @@ type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
 export function replacementWorkFromExecution(p: Placement, d: LifecycleDeployment, e: Execution): LifecycleWork | null {
     try {
         if (!e.input || !['FAILED', 'TIMED_OUT', 'ABORTED'].includes(e.status)
-            || e.stateMachineVersionArn !== d.stateMachineVersionArn || e.stateMachineAliasArn || e.redriveCount !== 0) return null;
+            || e.stateMachineAliasArn || e.redriveCount !== 0) return null;
         const envelope = envelopeSchema.parse(parseRebaseJson(e.input, 20000));
         if (envelope.digest !== p.lifecycleDigest || createHash('sha256').update(envelope.document).digest('hex') !== envelope.digest) return null;
         const work = buildLifecycleWork(parseRebaseJson(envelope.document) as LifecycleWork['intent']);
         const arn = d.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, `:computer-${work.intent.jobId}`);
-        if (e.executionArn !== arn || work.digest !== envelope.digest || work.intent.deployment.stateMachineVersionArn !== e.stateMachineVersionArn) return null;
+        if (e.executionArn !== arn || work.digest !== envelope.digest || work.intent.deployment.stateMachineVersionArn !== e.stateMachineVersionArn
+            || work.intent.deployment.accountId !== d.accountId || work.intent.deployment.region !== d.region || work.intent.deployment.namespace !== d.namespace) return null;
         return matchesPlacement(work, p) ? work : null;
     } catch { return null; }
 }

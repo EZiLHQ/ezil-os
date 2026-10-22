@@ -428,6 +428,31 @@ export async function setImageReservation(tx: PlacementExecutor, lock: Admission
 }
 
 /** C-2 periodic duplicate check. Any result must alarm and closes admission. */
+export type ImagePlacementFields = Partial<Pick<ImagePlacement, 'state' | 'generation' | 'leaseEpoch' | 'fenceToken' | 'instanceId' | 'volumeId'
+    | 'lifecycleJobId' | 'lifecycleDigest' | 'enrollNonceHash' | 'enrollConsumedHash' | 'enrollExpiresAt' | 'lastError'
+    | 'lowerImageDigest' | 'lowerDigestObservedAt' | 'imageUpgradeJobId' | 'leaseUntil' | 'presenceAt'>>;
+/** Image store only: the caller has validated the job and owner under these same locks. */
+export async function writeImagePlacement(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, fields: ImagePlacementFields): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    const types: Record<keyof ImagePlacementFields, string> = { state: 'text', generation: 'bigint', leaseEpoch: 'bigint', fenceToken: 'uuid',
+        instanceId: 'text', volumeId: 'text', lifecycleJobId: 'uuid', lifecycleDigest: 'text', enrollNonceHash: 'text', enrollConsumedHash: 'text',
+        enrollExpiresAt: 'timestamptz', lastError: 'text', lowerImageDigest: 'text', lowerDigestObservedAt: 'timestamptz', imageUpgradeJobId: 'uuid', leaseUntil: 'timestamptz', presenceAt: 'timestamptz' };
+    const assignments = Object.entries(fields).map(([key, value]) => {
+        const type = types[key as keyof ImagePlacementFields];
+        if (!type) throw new ImageJobConflictError();
+        return sql`${sql.raw(key.replace(/[A-Z]/g, c => '_' + c.toLowerCase()))} = ${value}::${sql.raw(type)}`;
+    });
+    if (fields.leaseEpoch !== undefined && fields.leaseEpoch < p.leaseEpoch) throw new ImageJobConflictError();
+    const rows = rowsOf(await tx.execute(sql`/* placement:image-write */ UPDATE public.ezil_computer_placements
+        SET ${sql.join(assignments, sql`, `)}, updated_at = now()
+        WHERE computer_id = ${p.computerId}::uuid AND owner_user_id = ${p.ownerUserId}::uuid
+          AND provider = 'aws-ec2' AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+          AND fence_token IS NOT DISTINCT FROM ${p.fenceToken}::uuid
+          AND lifecycle_job_id IS NOT DISTINCT FROM ${p.lifecycleJobId}::uuid
+          AND image_upgrade_job_id IS NOT DISTINCT FROM ${p.imageUpgradeJobId}::uuid RETURNING computer_id`));
+    if (rows.length !== 1) throw new ImageJobConflictError();
+}
+
 export async function findDuplicatePlacements(db: PlacementExecutor): Promise<{ computerId: string; rows: number }[]> {
     const rows = rowsOf(
         await db.execute(sql`/* placement:duplicates */ SELECT computer_id::text AS computer_id, count(*)::int AS rows
@@ -1023,6 +1048,12 @@ async function applyUsageInTx(tx: PlacementExecutor, p: Placement, effect: Usage
             WHERE computer_id = ${computerId}::uuid AND instance_id = ${effect.instanceId} AND stopped_at IS NULL)`);
 }
 
+/** Image custody uses the same usage writer while holding admission and placement locks. */
+export async function recordImageUsage(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, effect: UsageEffect): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    await applyUsageInTx(tx, p, effect);
+}
+
 /**
  * Reconciler input (aws-receipts.ts `reconcileAwsFleet`): aws-ec2 placements that may
  * hold running capacity — RUNNING (a guest may have stopped its instance, or its lease
@@ -1119,7 +1150,7 @@ export function noNonCloudflarePlacement(computerId: SQL): SQL {
 }
 
 /** States `claimAwsPlacementsToReconcile` claims: RUNNING plus every state waiting on a receipt. */
-export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
+export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
 
 /**
  * `STOPPED → LEASED` (also RUNNING for a resize), reserving `lease_epoch + 1` (and `generation + 1` for a
@@ -1190,12 +1221,12 @@ export const ENROLLMENT_FAILED = 'enroll_tunnel_failed';
  */
 export async function consumeEnrollmentNonce(
     db: PlacementDb,
-    input: { computerId: string; expected: CasExpectation; nonceHash: string; fields: { instanceId: string; volumeId: string } },
+    input: { computerId: string; expected: CasExpectation; nonceHash: string; fields: { instanceId: string; volumeId: string }; lowerImageDigest?: string; observedAt?: Date },
 ): Promise<TransitionResult> {
     if (!ENROLLABLE_STATES.includes(input.expected.state)) return { ok: false, reason: 'illegal_transition' };
     if (!/^[a-f0-9]{64}$/.test(input.nonceHash)) return { ok: false, reason: 'cas_conflict' };
-    return db.transaction((tx) =>
-        casInTx(
+    return db.transaction(async (tx) => {
+        const result = await casInTx(
             tx,
             input.computerId,
             input.expected,
@@ -1207,8 +1238,25 @@ export async function consumeEnrollmentNonce(
                 provider: 'aws-ec2', enrollNonceHash: input.nonceHash, enrollUnexpired: true,
                 states: ENROLLABLE_STATES, preserveState: true, availableInstanceId: input.fields.instanceId,
             },
-        ),
-    );
+        );
+        if (result.ok && input.lowerImageDigest !== undefined) {
+            if (!/^sha256:[0-9a-f]{64}$/.test(input.lowerImageDigest) || !input.observedAt || !Number.isFinite(input.observedAt.getTime())) throw new ImageJobConflictError();
+            const rows = rowsOf(await tx.execute(sql`/* placement:enroll-digest */ UPDATE public.ezil_computer_placements
+                SET lower_image_digest = ${input.lowerImageDigest}, lower_digest_observed_at = ${input.observedAt}
+                WHERE computer_id = ${input.computerId}::uuid AND generation = ${result.placement.generation} AND lease_epoch = ${result.placement.leaseEpoch}
+                  AND enroll_consumed_hash = ${input.nonceHash} AND image_upgrade_job_id IS NULL RETURNING computer_id`));
+            if (rows.length !== 1) throw new ImageJobConflictError();
+        }
+        return result;
+    });
+}
+
+/** Replays may never replace the digest accepted with this nonce. */
+export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement, digest: string): Promise<boolean> {
+    const rows = rowsOf(await db.execute(sql`SELECT lower_image_digest FROM public.ezil_computer_placements
+        WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+          AND enroll_consumed_hash = ${p.enrollConsumedHash} AND image_upgrade_job_id IS NULL LIMIT 2`));
+    return rows.length === 1 && rows[0]!.lower_image_digest === digest;
 }
 
 /** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
@@ -1355,6 +1403,12 @@ export async function readAdmissionCounters(
     return counters;
 }
 
+/** Image admission supplies the already locked reserved placement; all capacity reads are shared. */
+export async function readImageAdmissionCounters(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, now: Date): Promise<AdmissionCounters> {
+    assertAdmissionLock(tx, lock);
+    return readCounters(tx, { userId: p.ownerUserId, computerId: p.computerId, now, monthStart: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)) }, p);
+}
+
 /**
  * The same admission inputs, read WITHOUT the admission lock and minting nothing:
  * a point-in-time view for a routing pre-check (select.ts canary fallback). It can be
@@ -1382,6 +1436,7 @@ const CAPACITY_PLACEMENTS = sql`(
 async function readCounters(
     tx: PlacementExecutor,
     rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
+    image?: ImagePlacement,
 ): Promise<AdmissionCounters> {
     const input = { ...rawInput, userId: canonicalId(rawInput.userId), computerId: canonicalId(rawInput.computerId) };
     // ezil_computers is user-writable (id, deleted_at, chosen ids on insert): it is a
@@ -1391,7 +1446,7 @@ async function readCounters(
             FROM public.ezil_computers c
             WHERE c.id = ${input.computerId}::uuid`),
     );
-    const target = await readPlacement(tx, input.computerId);
+    const target = image ? { record: image } : await readPlacement(tx, input.computerId);
     const foreignRows = rowsOf(
         await tx.execute(sql`/* placement:usage-foreign */ SELECT count(*)::int AS n
             FROM public.ezil_compute_usage

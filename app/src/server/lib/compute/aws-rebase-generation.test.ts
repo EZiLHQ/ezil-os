@@ -83,3 +83,9 @@ describe('ordinary replace and resize generation settlement', () => {
         expect(replacementWorkFromExecution(s.p, s.work.intent.deployment, e)).toBeNull();
     });
 });
+
+it('reconciles an immutable failed execution after promotion changed the current version', async () => {
+    const s = await setup();
+    const promoted = { ...s.work.intent.deployment, stateMachineVersionArn: s.work.stateMachineArn.replace(/:1$/, ':2') };
+    expect(replacementWorkFromExecution(s.p, promoted, s.execution)).toEqual(s.work);
+});

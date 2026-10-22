@@ -69,6 +69,7 @@ const RUNNING_EXCLUDED = new Set(['STOPPED', 'RETIRED', 'PURGE_ELIGIBLE']);
 
 export interface FakeSeed {
     placements?: Row[];
+    imageJobs?: Row[];
     usage?: Row[];
     computers?: { id: string; user_id: string; deleted_at?: Date | null; created_at?: Date }[];
 }
@@ -118,6 +119,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     const clock = options.clock ?? (() => new Date('2026-10-13T12:00:00Z'));
     const isolation = options.isolation ?? 'read committed';
     const placements: Row[] = (seed.placements ?? []).map((r) => ({ ...r }));
+    const imageJobs: Row[] = (seed.imageJobs ?? []).map(r => ({ ...r }));
     const usage: Row[] = (seed.usage ?? []).map((r) => ({ ...r }));
     const computers = seed.computers ?? [];
     const statements: Statement[] = [];
@@ -132,7 +134,8 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
 
     const value = (expr: string, params: unknown[]): unknown => {
         const p = expr.match(/^\$(\d+)(?:::\w+)?$/);
-        if (p) return params[Number(p[1]) - 1];
+        if (p) return expr.endsWith('::jsonb') && typeof params[Number(p[1]) - 1] === 'string' ? JSON.parse(params[Number(p[1]) - 1] as string) : params[Number(p[1]) - 1];
+        if (expr === "'aws-ec2'") return 'aws-ec2';
         if (expr === 'now()') return clock();
         if (/^\d+$/.test(expr)) return Number(expr);
         throw new Error(`fake db: unsupported value expression ${expr}`);
@@ -144,7 +147,22 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         await tick();
         // Existing placement-only fixtures have no migration intent; migration tests wrap this executor.
         if (text.startsWith('SELECT') && text.includes('FROM public.ezil_compute_migrations')) return { rows: [] };
-        const tag = text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
+        const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
+        const writeRows = imageTable ? imageJobs : placements;
+        const presentWrite = imageTable ? (r: Row) => ({ ...r }) : present;
+        if (imageTable && text.startsWith('SELECT')) {
+            const byJob = /WHERE job_id =/.test(text);
+            return { rows: imageJobs.filter(r => byJob ? r.job_id === params[0] : r.computer_id === params[0]
+                && !['succeeded', 'recovered', 'cancelled'].includes(String(r.phase))).slice(0, 2).map(r => ({ ...r })) };
+        }
+        if (text.startsWith('SELECT user_id::text AS user_id FROM public.ezil_computers'))
+            return { rows: computers.filter(c => c.id === params[0] && c.deleted_at == null).map(c => ({ user_id: c.user_id })) };
+        if (text.startsWith('SELECT id FROM public.ezil_compute_pool_hosts')) return { rows: [] };
+        if (text.startsWith('SELECT lower_image_digest')) return { rows: placements.filter(r => r.computer_id === params[0]
+            && r.generation === params[1] && r.lease_epoch === params[2] && r.enroll_consumed_hash === params[3]
+            && r.image_upgrade_job_id == null).map(r => ({ lower_image_digest: r.lower_image_digest })) };
+        const tag = imageTable && text.startsWith('INSERT') ? 'insert' : imageTable && text.startsWith('UPDATE') ? 'cas'
+            : text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
         switch (tag) {
             case 'image-reservation':
                 return { rows: placements.filter(r => r.image_upgrade_job_id != null && r.computer_id === params[0]).map(r => ({ job_id: r.image_upgrade_job_id })) };
@@ -160,6 +178,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 tx.locks.push(m);
                 return { rows: [{ pg_advisory_xact_lock: '', isolation }] };
             }
+            case 'image-read':
+                return { rows: placements.filter(r => uuidEq(r.computer_id, params[0])).slice(0, 2).map(r => present({
+                    lower_image_digest: null, lower_digest_observed_at: null, image_upgrade_job_id: null, ...r })) };
             case 'read':
                 return { rows: placements.filter((r) => uuidEq(r.computer_id, params[0])).slice(0, 2).map(present) };
             case 'duplicates': {
@@ -317,12 +338,15 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 if (!m) throw new Error('fake db: unparsed insert');
                 const cols = m[1]!.split(',').map((s) => s.trim());
                 const vals = m[2]!.split(',').map((s) => s.trim());
-                const row: Row = placementRow({ computer_id: '' });
+                const row: Row = imageTable ? {} : placementRow({ computer_id: '' });
                 cols.forEach((c, i) => (row[c] = value(vals[i]!, params)));
-                placements.push(row);
-                tx?.undo.push(() => placements.splice(placements.indexOf(row), 1));
-                return { rows: [present(row)] };
+                writeRows.push(row);
+                tx?.undo.push(() => writeRows.splice(writeRows.indexOf(row), 1));
+                return { rows: [presentWrite(row)] };
             }
+            case 'image-cas':
+            case 'image-write':
+            case 'enroll-digest':
             case 'cas': {
                 const m = text.match(/SET\s+([\s\S]*?)\s+WHERE\s+([\s\S]*?)\s+RETURNING/);
                 if (!m) throw new Error('fake db: unparsed update');
@@ -340,7 +364,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                         const values = list[2]!.split(',').map((v) => value(v.trim(), params));
                         return (r) => values.includes(r[list[1]!]);
                     }
-                    const w = text.match(/^(\w+) (=|>) (\$\d+(?:::\w+)?|now\(\))$/);
+                    const w = text.match(/^(\w+) (=|>) (\$\d+(?:::\w+)?|now\(\)|'aws-ec2')$/);
                     if (!w) throw new Error(`fake db: unsupported predicate ${pred}`);
                     if (w[2] === '>' && w[3] !== 'now()' && !w[3]!.endsWith('::timestamptz')) throw new Error(`fake db: unsupported comparison ${pred}`);
                     const col = w[1]!, v = value(w[3]!, params);
@@ -376,13 +400,13 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     return (r: Row) => (r[set[1]!] = set[2]!.trim() === set[1] ? r[set[1]!] : value(set[2]!.trim(), params));
                 });
                 // Atomic match-and-apply, like row-locked UPDATE re-evaluation.
-                const hit = placements.filter((r) => where.every((matches) => matches(r)));
+                const hit = writeRows.filter((r) => where.every((matches) => matches(r)));
                 for (const r of hit) {
                     const before = { ...r };
                     sets.forEach((apply) => apply(r));
                     tx?.undo.push(() => Object.assign(r, before));
                 }
-                return { rows: hit.map(present) };
+                return { rows: hit.map(presentWrite) };
             }
             default:
                 throw new Error(`fake db: untagged statement ${text.slice(0, 60)}`);
@@ -408,5 +432,5 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         },
     };
 
-    return { db, placements, usage, statements, runningExcluded: RUNNING_EXCLUDED };
+    return { db, placements, imageJobs, usage, statements, runningExcluded: RUNNING_EXCLUDED };
 }
