@@ -321,9 +321,10 @@ function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:str
 }
 function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
-    // EC2 clears SubnetId on a terminated instance but keeps its id and tags, so a terminated
-    // source is identified by those; a subnet that IS reported must still be the configured one.
-    const terminated=instance.State?.Name==='terminated';
+    // EC2 clears SubnetId on a terminating (shutting-down) or terminated instance but keeps its id
+    // and tags, so such a source is identified by those; a subnet that IS reported must still be
+    // the configured one. Seen live: shutting-down with no SubnetId (2026-10-22 11:55Z).
+    const terminated=instance.State?.Name==='terminated'||instance.State?.Name==='shutting-down';
     if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)
         ||(terminated?instance.SubnetId!==undefined&&instance.SubnetId!==i.deployment.subnetId:instance.SubnetId!==i.deployment.subnetId)
         ||(instance.Placement?.AvailabilityZoneId!==undefined&&instance.Placement.AvailabilityZoneId!==i.deployment.zoneId))return fail('lifecycle_instance_invalid');

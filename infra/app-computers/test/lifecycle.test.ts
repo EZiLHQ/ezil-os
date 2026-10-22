@@ -11,7 +11,7 @@ import { toLambdaError, MAX_THROTTLE_RETRIES } from '../lib/lifecycle/errors.js'
 import { LifecycleIntentSchema, validateLifecycleReceipt } from '../lib/lifecycle/intent.js';
 import { authorityFor } from '../lib/lifecycle/contract.js';
 
-type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;
+type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;shuttingDownReads?:number;
     fail?:{action:string;times:number;error:Error};applyBeforeFail?:boolean;extraDisk?:boolean;fixture?:ReturnType<typeof lifecycleFixture>};
 async function run(operation:LifecycleIntent['operation'],options:Options={}){
     const f=options.fixture??lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper',f.settings.features);
@@ -20,6 +20,12 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
     if(options.extraDisk)f.state.instances[0]!.BlockDeviceMappings!.push({DeviceName:'/dev/sdg',Ebs:{VolumeId:'vol-99999999999999999',Status:'attached',DeleteOnTermination:false}});
     if(options.staleOldAfterLaunch){const original=f.deps.instances;let stale=true;f.deps.instances=async selector=>{
         const rows=await original(selector);if(Array.isArray(selector)&&f.state.instances.length===2&&stale){stale=false;rows[0]!.instance.State={Name:'stopped'};rows[0]!.instance.SubnetId=f.i.deployment.subnetId;}return rows;};}
+    // Real EC2 reports `shutting-down`, network placement already cleared, before `terminated` (seen live 2026-10-22 11:55Z).
+    let shutting=0;
+    if(options.shuttingDownReads){const original=f.deps.instances;f.deps.instances=async selector=>{
+        const rows=await original(selector);
+        for(const r of rows)if(r.instance.State?.Name==='shutting-down'&&shutting--<=0)r.instance.State={Name:'terminated'};
+        return rows;};}
     const calls:{action:string;parameters:any}[]=[];let lost=false,failures=0;
     for(const s of Object.values(graph.States) as any[])if(s.Type==='Task'&&s.Resource!=='helper')assert.equal(s.Retry,undefined,'EC2 tasks never retry automatically');
     const result=await runAsl(graph,{input:f.envelope,executionArn:f.executionArn,sleep:seconds=>{f.state.now+=seconds*1000;},
@@ -33,7 +39,7 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
                 if(action==='runInstances')f.state.instances.push(f.instance('i-33333333333333333'));
                 if(action==='startInstances')target!.State={Name:'running'};
                 if(action==='stopInstances')target!.State={Name:'stopped'};
-                if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:'terminated'};
+                if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:options.shuttingDownReads?'shutting-down':'terminated'};shutting=options.shuttingDownReads??0;
                     const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];
                     // Real EC2 clears network placement on a terminated instance (seen live 2026-10-22).
                     delete target!.SubnetId;delete target!.VpcId;target!.SecurityGroups=[];target!.NetworkInterfaces=[];}
@@ -186,6 +192,12 @@ for(const operation of ['replace','retire'] as const)test(`${operation}: a diffe
     assert.match(r.cause!,/lifecycle_unexpected_disk/);assert.ok(!r.calls.some(c=>c.action==='terminateInstances'));
 });
 
+test('replace: a source observed shutting-down (network already cleared) waits, then relaunches',async()=>{
+    const r=await run('replace',{shuttingDownReads:2});
+    assert.equal(r.error,undefined,r.cause);assert.ok(r.receipt);
+    assert.equal(r.calls.filter(c=>c.action==='terminateInstances').length,1);
+    assert.equal(r.calls.filter(c=>c.action==='runInstances').length,1);
+});
 test('a stale old-writer observation after launching replacement never repeats stop or termination',async()=>{
     const r=await run('replace',{staleOldAfterLaunch:true});assert.equal(r.error,undefined);
     assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,1);assert.equal(r.calls.filter(c=>c.action==='terminateInstances').length,1);
