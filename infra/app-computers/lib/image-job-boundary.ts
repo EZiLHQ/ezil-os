@@ -8,6 +8,11 @@ export const imageJobBoundaryArn = (account: string, namespace: string) =>
     `arn:aws:iam::${account}:policy/ezil/${namespace}/ezil-${namespace}-image-job-boundary`;
 export const imageJobRoleArns = (account: string, namespace: string) =>
     ['rebase-preparation', 'recovery'].map(name => `arn:aws:iam::${account}:role/ezil/${namespace}/ezil-${namespace}-${name}`);
+/** IAM authorizes GetRole on a role that does not exist yet against role/<name>, without its path.
+ * CloudFormation's pre-create existence check for these explicitly named roles needs exactly that
+ * (seen live in Mumbai 2026-10-22: generated-name roles on the same path were created). */
+export const imageJobRoleNameArns = (account: string, namespace: string) =>
+    ['rebase-preparation', 'recovery'].map(name => `arn:aws:iam::${account}:role/ezil-${namespace}-${name}`);
 
 export const RESTORE_TAG_KEYS = ['ezil:managed-by', 'ezil:stage', 'ezil:computer-id', 'ezil:generation',
     'ezil:fence-token', 'ezil:backup', 'ezil:restored-from-snapshot', 'ezil:original-volume-id', 'ezil:recovery-job-id'] as const;

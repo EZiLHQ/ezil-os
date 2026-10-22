@@ -3,7 +3,7 @@ import type { Construct } from 'constructs';
 import { z } from 'zod';
 import { DEFAULT_STORAGE, INSTANCE_TYPES, NamespaceSchema, REGION_PATTERN, LifecycleDeploymentSchema } from './lifecycle/deployment.js';
 
-import { ImageJobBoundary, imageJobBoundaryArn, imageJobRoleArns } from './image-job-boundary.js';
+import { ImageJobBoundary, imageJobBoundaryArn, imageJobRoleArns, imageJobRoleNameArns } from './image-job-boundary.js';
 
 /** I5 deploy identity. Created ONCE by the founder with their own admin
  * identity (README "Founder bootstrap"); never deployed by CI. No CDK
@@ -318,7 +318,8 @@ export function execStatements(c: IdentityConfig): iam.PolicyStatement[] {
         ...(c.imageJobDeployment ? [new iam.PolicyStatement({ actions: ['iam:CreateRole', 'iam:PutRolePermissionsBoundary', 'iam:PutRolePolicy',
             'iam:DeleteRolePolicy', 'iam:UpdateAssumeRolePolicy', 'iam:UpdateRole', 'iam:DeleteRole'],
             resources: imageJobRoleArns(c.accountId, c.namespace),
-            conditions: { StringEquals: { 'iam:PermissionsBoundary': imageJobBoundaryArn(c.accountId, c.namespace) } } })] : []),
+            conditions: { StringEquals: { 'iam:PermissionsBoundary': imageJobBoundaryArn(c.accountId, c.namespace) } } }),
+            new iam.PolicyStatement({ actions: ['iam:GetRole'], resources: imageJobRoleNameArns(c.accountId, c.namespace) })] : []),
         new iam.PolicyStatement({ actions: ['iam:AttachRolePolicy', 'iam:DetachRolePolicy'], resources: [n.workloadRoles],
             conditions: { StringEquals: { 'iam:PermissionsBoundary': n.boundaryArn }, ArnEquals: { 'iam:PolicyARN': LAMBDA_BASIC_EXECUTION } } }),
         new iam.PolicyStatement({ actions: ['iam:GetRole', 'iam:GetRolePolicy', 'iam:ListRolePolicies', 'iam:ListAttachedRolePolicies',

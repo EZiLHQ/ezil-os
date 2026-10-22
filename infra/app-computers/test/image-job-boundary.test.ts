@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { App, assertions } from 'aws-cdk-lib';
 import { IdentityConfigSchema, boundaryStatements, identityGuardrailStatements, execStatements, DeployIdentityStack } from '../lib/identity.js';
-import { imageJobBoundaryStatements, recoveryRestoreStatements, imageJobBoundaryArn } from '../lib/image-job-boundary.js';
+import { imageJobBoundaryStatements, recoveryRestoreStatements, imageJobBoundaryArn, imageJobRoleNameArns } from '../lib/image-job-boundary.js';
 import { preparationStatements } from '../lib/rebase-preparation.js';
 import { preparationFixture } from './preparation-fixture.js';
 import { evaluate, list } from './iam-evaluate.js';
@@ -85,6 +85,22 @@ test('founder policy and deployment exceptions name only preparation/recovery ro
         assert.equal(evaluate(all, 'iam:CreateRole', arn, { 'iam:PermissionsBoundary': boundary }).allowed, ['rebase-preparation', 'recovery'].includes(role));
     }
     assert.equal(IdentityConfigSchema.safeParse({ ...c, imageJobDeployment: { ...d, namespace: 'foreign' } }).success, false);
+});
+
+test('exec role may only read the two path-less image-job role names (pre-create existence check)', () => {
+    const boundary = imageJobBoundaryArn(cfg.accountId, cfg.namespace);
+    const pathless = (role: string) => `arn:aws:iam::${cfg.accountId}:role/ezil-${cfg.namespace}-${role}`;
+    for (const imageJobDeployment of [undefined, d]) {
+        const c = IdentityConfigSchema.parse({ ...cfg, imageJobDeployment });
+        const all = [...json(execStatements(c)), ...json(identityGuardrailStatements(c))];
+        for (const role of ['rebase-preparation', 'recovery', 'observer', 'app-caller']) {
+            const image = imageJobDeployment !== undefined && ['rebase-preparation', 'recovery'].includes(role);
+            assert.equal(evaluate(all, 'iam:GetRole', pathless(role), {}).allowed, image, role);
+            for (const action of ['iam:CreateRole', 'iam:DeleteRole', 'iam:PutRolePolicy', 'iam:TagRole', 'iam:PassRole', 'iam:GetRolePolicy'])
+                assert.equal(evaluate(all, action, pathless(role), { 'iam:PermissionsBoundary': boundary, 'iam:PassedToService': 'states.amazonaws.com' }).allowed, false, action + ':' + role);
+        }
+    }
+    assert.deepEqual(imageJobRoleNameArns(cfg.accountId, cfg.namespace), [pathless('rebase-preparation'), pathless('recovery')]);
 });
 
 test('image boundary has a reviewed exact policy snapshot', () => {
