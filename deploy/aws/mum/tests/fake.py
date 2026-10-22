@@ -258,9 +258,13 @@ elif tool == "aws":
                 elif mutation == "page":
                     cs["NextToken"] = "more"
                 elif mutation == "context":
-                    props = read("synth-lifecycle-target.json")["Resources"]["Observer"]["Properties"]
-                    props["MemorySize"] = 512
-                    r["AfterContext"] = json.dumps({"Properties": props})
+                    # Real contexts hold resolved values on both sides; After must be the
+                    # AMI/version substitution of Before. An extra change must be refused.
+                    before = read("synth-lifecycle-target.json")["Resources"]["Observer"]["Properties"]
+                    after = json.loads(json.dumps(before))
+                    after["MemorySize"] = 512
+                    r["BeforeContext"] = json.dumps({"Properties": before})
+                    r["AfterContext"] = json.dumps({"Properties": after})
             else:
                 old = {p["ParameterKey"]: p for p in read("stack.json")["Stacks"][0]["Parameters"]}
                 cs["Parameters"] = [old[p["ParameterKey"]] if p.get("UsePreviousValue") else p for p in read("requested.json")]

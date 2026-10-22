@@ -182,7 +182,7 @@ test_case 'lifecycle missing change details refused' lifecycle-missing '{"lifecy
 test_case 'lifecycle parameter value drift refused' lifecycle-parameter '{"lifecycle_change":"parameter"}' 'refuse-lifecycle parameter/resolved SSM change'
 test_case 'lifecycle resolved SSM value drift refused' lifecycle-ssm '{"lifecycle_change":"ssm"}' 'refuse-lifecycle parameter/resolved SSM change'
 test_case 'lifecycle incomplete change-set page refused' lifecycle-page '{"lifecycle_change":"page"}' 'refuse-incomplete change set'
-test_case 'lifecycle change-set property values checked' lifecycle-context '{"lifecycle_change":"context"}' 'refuse-lifecycle change-set values differ'
+test_case 'lifecycle change-set property values checked' lifecycle-context '{"lifecycle_change":"context"}' 'refuse-lifecycle change-set values are not'
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
 python3 "$here/locking.py"

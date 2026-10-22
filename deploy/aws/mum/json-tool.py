@@ -463,19 +463,40 @@ def version_references(value, source, entity):
     return any(version_references(v, source, entity) for v in value.values())
 
 
+KNOWN_AFTER_APPLY = "{{changeSet:KNOWN_AFTER_APPLY}}"
+TRUNCATED = "(Truncated-Signature):"
+
+
+def context_match(expected, actual):
+    """Equal, except that CloudFormation's KNOWN_AFTER_APPLY placeholder matches any value."""
+    if actual == KNOWN_AFTER_APPLY:
+        return True
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        return expected.keys() == actual.keys() and all(context_match(expected[k], actual[k]) for k in expected)
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(context_match(e, x) for e, x in zip(expected, actual))
+    if isinstance(expected, str) and isinstance(actual, str) and KNOWN_AFTER_APPLY in actual:
+        parts = actual.split(KNOWN_AFTER_APPLY)
+        return re.fullmatch(".*".join(re.escape(p) for p in parts), expected, re.S) is not None
+    return expected == actual
+
+
 def lifecycle_changeset(cs_path, stack_path, *template_paths):
     live, candidate, allowed = lifecycle_template(*template_paths)
     cs = read(cs_path)
     check_changeset(cs)
-    need(cs.get("RoleARN") == ROLE, "lifecycle change set must use its execution role")
-    previous = mapping(stack(stack_path).get("Parameters", []))
-    actual = mapping(cs.get("Parameters", []))
+    # DescribeChangeSet does not return RoleARN; the role is passed at creation and the
+    # stack's own RoleARN is verified separately (lifecycle-parameters).
+    need(cs.get("RoleARN") in (ROLE, None), "lifecycle change set must use its execution role")
+    previous = mapping(stack(stack_path).get("Parameters") or [])
+    actual = mapping(cs.get("Parameters") or [])
     need(previous.keys() == actual.keys(), "lifecycle parameter coverage mismatch")
     for key, old in previous.items():
         value = actual[key]
         need(value.get("ParameterValue", old.get("ParameterValue") if value.get("UsePreviousValue") else None) == old.get("ParameterValue") and
              value.get("ResolvedValue") == old.get("ResolvedValue"), "lifecycle parameter/resolved SSM change refused")
     version_ids = {logical for logical, change in allowed.items() if change["action"] in ("Add", "Remove")}
+    context_old_pair, context_new_pair = pair(read(template_paths[3])), pair(read(template_paths[4]))
     seen = set()
     for change in cs["Changes"]:
         need(change.get("Type") == "Resource", "unexpected lifecycle non-resource change")
@@ -494,11 +515,33 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
             scope = expected["attributes"] | ({"Properties"} if expected["properties"] else set())
             need(set(r.get("Scope", [])) == scope and r.get("Details"), "unexplained lifecycle resource change")
             targets, attributes = set(), set()
+
+            def detail_kind(detail):
+                target = detail["Target"]
+                attribute, name = target.get("Attribute"), target.get("Name")
+                direct = (detail.get("ChangeSource") == "DirectModification" and
+                          detail.get("Evaluation", "Static") == "Static" and not detail.get("CausingEntity"))
+                entity = detail.get("CausingEntity") or ""
+                cause = entity.split(".")[0]
+                dependency = (attribute == "Properties" and cause in version_ids and
+                    detail.get("ChangeSource") in ("ResourceReference", "ResourceAttribute") and
+                    detail.get("Evaluation") in ("Static", "Dynamic") and any(
+                        version_references(t["Resources"].get(logical, {}).get("Properties", {}).get(name),
+                                           detail["ChangeSource"], entity)
+                        for t in (live, candidate)))
+                return direct, dependency
+
+            explained = {d["Target"].get("Name") for d in r["Details"] if any(detail_kind(d))}
             for detail in r["Details"]:
                 target = detail["Target"]
                 attribute, name = target.get("Attribute"), target.get("Name")
                 direct = (detail.get("ChangeSource") == "DirectModification" and
                           detail.get("Evaluation", "Static") == "Static" and not detail.get("CausingEntity"))
+                # CloudFormation adds a value-only DirectModification/Dynamic entry next to a
+                # reference-caused change; accept it only for an already explained property.
+                direct = direct or (detail.get("ChangeSource") == "DirectModification" and
+                                    detail.get("Evaluation") == "Dynamic" and not detail.get("CausingEntity") and
+                                    name in explained)
                 # CFN can also describe the validated Version reference as a
                 # dynamic dependency. Only a reference present in this exact
                 # changed property may explain it; no blanket dynamic allowance.
@@ -520,15 +563,28 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
                     attributes.add(attribute)
             need(targets == expected["properties"] and attributes == expected["attributes"],
                  "change set omits synthesized lifecycle property changes")
-        for context, expected_template in (("BeforeContext", live), ("AfterContext", candidate)):
-            if context in r:
-                body = json.loads(r[context]) if isinstance(r[context], str) else r[context]
-                expected_resource = expected_template["Resources"].get(logical)
-                if expected_resource is None:
-                    need(not body, "unexpected context for absent Lambda Version")
-                else:
-                    need(isinstance(body, dict) and same_json(ascii_view(body.get("Properties")), ascii_view(expected_resource.get("Properties", {}))),
-                         "lifecycle change-set values differ from synthesized template")
+        # Before/AfterContext carry RESOLVED values (physical names, stringified numbers,
+        # KNOWN_AFTER_APPLY placeholders), so they cannot equal template intrinsics. For a
+        # modified resource, After must equal Before with only the AMI/version substitution;
+        # a KNOWN_AFTER_APPLY placeholder stands for a value CloudFormation resolves later.
+        # The Version Add/Remove pair is verified at template level above.
+        if r["Action"] == "Modify" and "BeforeContext" in r and "AfterContext" in r:
+            before_ctx = json.loads(r["BeforeContext"]) if isinstance(r["BeforeContext"], str) else r["BeforeContext"]
+            after_ctx = json.loads(r["AfterContext"]) if isinstance(r["AfterContext"], str) else r["AfterContext"]
+            need(isinstance(before_ctx, dict) and isinstance(after_ctx, dict), "unreadable lifecycle change-set context")
+            before_props = dict(before_ctx.get("Properties") or {})
+            after_props = dict(after_ctx.get("Properties") or {})
+            # Large values arrive as "(Truncated-Signature):<hash>" and cannot be compared here.
+            # Accept that only for a property the template-level substitution check already
+            # allows to change (expected["properties"] for this resource).
+            for key in list(before_props):
+                if (str(before_props[key]).startswith(TRUNCATED) and str(after_props.get(key, "")).startswith(TRUNCATED)):
+                    need(key in allowed.get(logical, {}).get("properties", set()) or before_props[key] == after_props.get(key),
+                         "truncated change-set value for a property the template does not change")
+                    before_props.pop(key); after_props.pop(key, None)
+            expected_after = promotion_substitution(before_props, context_old_pair, context_new_pair)
+            need(context_match(ascii_view(expected_after), ascii_view(after_props)),
+                 "lifecycle change-set values are not the AMI/version substitution of the live values")
         print(r["Action"], logical, r["ResourceType"], r.get("Replacement", ""))
     need(seen == allowed.keys(), "change set omits synthesized lifecycle resource changes")
 
@@ -710,7 +766,7 @@ def main(args):
     elif op == "lifecycle-parameters":
         current = stack(a[0])
         need(current.get("RoleARN") == ROLE, "lifecycle stack must use its execution role")
-        write(a[1], [{"ParameterKey": key, "UsePreviousValue": True} for key in mapping(current.get("Parameters", []))])
+        write(a[1], [{"ParameterKey": key, "UsePreviousValue": True} for key in mapping(current.get("Parameters") or [])])
     elif op == "lifecycle-noop":
         cs = read(a[0])
         reason = cs.get("StatusReason", "")
