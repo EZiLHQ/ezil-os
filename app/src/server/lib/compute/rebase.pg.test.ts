@@ -2,10 +2,12 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { SQL, StringChunk, sql } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
+import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { createImageJobStore, newReservedImageJob } from './aws-rebase-store';
+import { createImageJobStore, newReservedImageJob, parseImageJobRow } from './aws-rebase-store';
 import { fixtureRebasePreparation, fixtureRebaseRelease, fixtureRebaseIntent } from './aws-intent.test-support';
 import { buildLifecycleWork } from './aws-intent';
 import { rebaseEnv, rebaseSetup } from './aws-rebase.test-support';
@@ -21,15 +23,31 @@ const job = () => newReservedImageJob({ preparation: prep, ownerUserId: '3333333
     sourceRelease: fixtureRebaseRelease(prep.intent.sourceDeployment), targetRelease: fixtureRebaseRelease(prep.intent.deployment) });
 
 describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
-    const client = PG ? postgres(PG, { max: 12, onnotice: () => {} }) : null;
+    // Match server/db/index.ts: Drizzle installs transparent timestamp codecs,
+    // whereas the old raw postgres-js executor returned Date objects.
+    const client = PG ? postgres(PG, { max: 10, idle_timeout: 20, prepare: false, onnotice: () => {} }) : null;
+    const production = client ? drizzle(client) : null;
     const dialect = new PgDialect();
     const local = (q: string) => q.replaceAll('public.', `${schema}.`);
-    const executor = (c: { unsafe: (q: string, params: never[]) => PromiseLike<unknown> }): PlacementExecutor => ({ execute: async q => {
-        const r = dialect.sqlToQuery(q); return c.unsafe(local(r.sql), r.params as never[]);
-    } });
-    const db: PlacementDb = { execute: q => executor(client!).execute(q), transaction: async fn =>
-        client!.begin(tx => fn(executor(tx))) as Promise<Awaited<ReturnType<typeof fn>>> };
+    // Rewrite SQL identifiers only; preserve bound values and let the real
+    // Drizzle executor and transaction implementation handle every store call.
+    const scoped = (q: SQL): SQL => sql.join(q.queryChunks.map(chunk => chunk instanceof StringChunk
+        ? sql.raw(local(chunk.value.join(''))) : chunk instanceof SQL ? scoped(chunk) : chunk), sql.empty());
+    const executor = (db: Pick<NonNullable<typeof production>, 'execute'>): PlacementExecutor => ({ execute: q => db.execute(scoped(q)) });
+    const db: PlacementDb = { execute: q => executor(production!).execute(q), transaction: fn =>
+        production!.transaction(tx => fn(executor(tx))) };
     const store = createImageJobStore(db, rebaseEnv);
+    const expectMillisecondWrites = async () => {
+        const rows = await production!.execute(sql.raw(`SELECT job_id,
+            created_at = date_trunc('milliseconds', created_at) AS created_ms,
+            updated_at = date_trunc('milliseconds', updated_at) AS updated_ms,
+            reconciled_at IS NOT DISTINCT FROM date_trunc('milliseconds', reconciled_at) AS reconciled_ms,
+            completed_at IS NOT DISTINCT FROM date_trunc('milliseconds', completed_at) AS completed_ms,
+            retain_until IS NOT DISTINCT FROM date_trunc('milliseconds', retain_until) AS retain_ms
+            FROM ${schema}.ezil_computer_image_jobs`));
+        expect(rows.length).toBeGreaterThan(0);
+        for (const row of rows) expect(row).toMatchObject({ created_ms: true, updated_ms: true, reconciled_ms: true, completed_ms: true, retain_ms: true });
+    };
     let created = false;
     beforeAll(async () => {
         await client!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -53,6 +71,30 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
             j.sourceVolumeId, j.fsUuid, j.sourceFenceToken, j.fromDigest, j.createdAt]);
     });
     afterAll(async () => { try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); } finally { await client?.end(); } });
+    it('reads every timestamp as production Drizzle text and normalizes microseconds and offsets', async () => {
+        const j = await store.reserve(job(), repository);
+        await production!.transaction(async tx => {
+            await tx.execute(sql`SET LOCAL TIME ZONE 'Asia/Kolkata'`);
+            // Read-only projection tests PostgreSQL's six-digit output without
+            // violating the millisecond-write invariant of persisted jobs.
+            const rows = await tx.execute(sql.raw(`SELECT j.*,
+                created_at + interval '901 microseconds' AS created_at,
+                '2026-10-22 19:28:51.068901+00'::timestamptz AS updated_at,
+                '2026-10-22 19:28:50.067901+00'::timestamptz AS reconciled_at,
+                '2026-10-22 19:28:51.068901+00'::timestamptz AS completed_at,
+                '2026-10-29 19:28:51.068901+00'::timestamptz AS retain_until,
+                'cancelled'::text AS phase FROM ${schema}.ezil_computer_image_jobs j`));
+            expect(rows).toHaveLength(1);
+            for (const key of ['created_at', 'updated_at', 'reconciled_at', 'completed_at', 'retain_until']) {
+                expect(typeof rows[0]![key]).toBe('string');
+                expect(rows[0]![key]).toMatch(/901\+05:30$/);
+            }
+            expect(parseImageJobRow(rows[0]!)).toEqual({ ...j, phase: 'cancelled', updatedAt: '2026-10-22T19:28:51.068Z',
+                reconciledAt: '2026-10-22T19:28:50.067Z', completedAt: '2026-10-22T19:28:51.068Z', retainUntil: '2026-10-29T19:28:51.068Z' });
+        });
+        expect(await store.read(j.jobId)).toEqual(j);
+        await expectMillisecondWrites();
+    });
     it('concurrent identical reservations yield one row and one placement reservation', async () => {
         const results = await Promise.all(Array.from({ length: 8 }, () => store.reserve(job(), repository)));
         expect(new Set(results.map(j => j.jobId)).size).toBe(1);
@@ -75,6 +117,28 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         const results = await Promise.allSettled(Array.from({ length: 8 }, () => store.transition(j, next)));
         expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
         expect(results.filter(r => r.status === 'rejected')).toHaveLength(7);
+        await expectMillisecondWrites();
+    });
+    it('preserves exact CAS after a microsecond PostgreSQL clock is normalized at the write boundary', async () => {
+        const s = rebaseSetup(db);
+        expect((await s.run('prepare')).status).toBe(202);
+        const j = await s.current();
+        const clock = await production!.execute(sql`SELECT date_trunc('milliseconds', now()) + interval '901 microseconds' AS now`);
+        expect(typeof clock[0]!.now).toBe('string');
+        expect(clock[0]!.now).toMatch(/\d{3}901[+-]/);
+        await expect(s.store.transition(j, { ...j, updatedAt: String(clock[0]!.now) })).rejects.toThrow();
+        const observed = new Date(Math.max(Date.parse(String(clock[0]!.now)), Date.parse(j.updatedAt) + 1));
+        const candidate = { ...j, phase: 'unconfirmed' as const, failureCode: 'operator_required' as const, updatedAt: observed.toISOString() };
+        const results = await Promise.allSettled(Array.from({ length: 8 }, () => s.store.transition(j, candidate)));
+        expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+        expect(results.filter(r => r.status === 'rejected')).toHaveLength(7);
+        const current = (await store.read(j.jobId))!;
+        expect(current.updatedAt).toBe(observed.toISOString());
+        await expectMillisecondWrites();
+        const next = await s.store.transition(current, { ...current, updatedAt: new Date(observed.getTime() + 1).toISOString() });
+        expect(Date.parse(next.updatedAt)).toBe(Date.parse(current.updatedAt) + 1);
+        await expect(s.store.transition(current, { ...current, updatedAt: new Date(observed.getTime() + 2).toISOString() })).rejects.toThrow('image_job_conflict');
+        await expectMillisecondWrites();
     });
     it('duplicate job rows fail closed and do not release the placement', async () => {
         const j = await store.reserve(job(), repository);
@@ -135,6 +199,7 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         expect(await store.enroll(current, input, new Date('2026-10-22T12:01:01.000Z'))).toMatchObject({ lowerImageDigest: j.toDigest });
         await expect(store.enroll(current, { ...input, lowerImageDigest: j.fromDigest }, new Date('2026-10-22T12:01:01.000Z'))).rejects.toThrow();
         expect((await store.read(j.jobId))!.hostEvidence).toEqual(current.hostEvidence);
+        await expectMillisecondWrites();
     });
     it('a placement update failure rolls back the launch document and nonce admission', async () => {
         const j = await ready();
@@ -154,6 +219,23 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         expect(await store.authority(a)).toBe(true);
         await client!.unsafe(`UPDATE ${schema}.ezil_computers SET user_id = $1`, [randomUUID()]);
         await expect(store.authority(a)).rejects.toThrow('image_job_conflict');
+    });
+
+    it('persists completion and retention timestamps at millisecond precision', async () => {
+        const s = rebaseSetup(db);
+        expect((await s.run('prepare')).status).toBe(202);
+        await s.completePreparation(); expect((await s.run('launch')).status).toBe(202);
+        await s.completeLaunch();
+        const j = await s.current(), lease = parseEnrollmentUserData(JSON.parse(j.launchDocument!).userData);
+        const input = { nonceHash: nonceHashOf(lease.nonce), instanceId: s.provider.host!.instanceId,
+            volumeId: j.sourceVolumeId, lowerImageDigest: j.toDigest };
+        await s.store.enroll(j, input, s.deps.now());
+        await s.store.finishEnroll(await s.current(), { instanceId: input.instanceId, success: true }, s.deps.now());
+        expect((await s.run('verify')).body.phase).toBe('succeeded');
+        const completed = (await s.store.read(j.jobId))!;
+        expect(completed.completedAt).not.toBeNull();
+        expect(completed.retainUntil).not.toBeNull();
+        await expectMillisecondWrites();
     });
 
     it('recovery/rebind custody transfers atomically to exactly one new linked preparation', async () => {
@@ -176,6 +258,7 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         expect(child).toMatchObject({ parentJobId: j.jobId, sourceVolumeId: j.restoredVolumeId, snapshotId: null });
         const rows = await client!.unsafe(`SELECT job_id FROM ${schema}.ezil_computer_image_jobs WHERE parent_job_id = $1`, [j.jobId]);
         expect(rows).toHaveLength(1);
+        await expectMillisecondWrites();
     });
 
 });

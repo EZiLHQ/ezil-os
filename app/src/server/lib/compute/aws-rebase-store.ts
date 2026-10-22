@@ -160,7 +160,12 @@ export function parseImageJobRow(row: Record<string, unknown>): ImageJob {
     for (const [key, name, type] of columns) {
         let value = row[name];
         if (type === 'bigint' && typeof value === 'string' && /^[1-9][0-9]*$/.test(value)) value = Number(value);
-        if (type === 'timestamptz' && value instanceof Date && Number.isFinite(value.getTime())) value = value.toISOString();
+        if (type === 'timestamptz' && (value instanceof Date || typeof value === 'string')) {
+            // Drizzle's postgres-js driver returns timestamp text, unlike raw
+            // postgres-js. Normalize only SQL columns, never wire/JSON fields.
+            const date = value instanceof Date ? value : new Date(value);
+            if (Number.isFinite(date.getTime())) value = date.toISOString();
+        }
         out[key] = value;
     }
     return validateImageJob(out);
@@ -275,6 +280,9 @@ const writeOnce = ['preparationExecutionArn', 'snapshotId', 'snapshotEvidence', 
     'restoredVolumeId', 'quarantinedVolumeId', 'rebindJobId', 'rebindDocument', 'rebindDigest', 'rebindExecutionArn', 'rebindGeneration', 'rebindLeaseEpoch', 'rebindFenceToken', 'hostEvidence'] as const;
 const valueSql = (j: ImageJob, key: keyof ImageJob, type: string) => {
     const value = j[key];
+    // All three write paths validate RebaseTime before binding every timestamp.
+    // Keep these millisecond values (no SQL now()/defaults): save's exact
+    // updated_at CAS must round-trip through JavaScript without precision loss.
     // Bind serialized JSON as text before casting: postgres-js otherwise applies
     // its JSONB serializer again and persists a JSON string instead of an object.
     if (type === 'jsonb') return sql`${value === null ? null : JSON.stringify(value)}::text::jsonb`;
