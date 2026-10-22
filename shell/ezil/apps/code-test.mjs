@@ -502,6 +502,58 @@ await settle(4);
     push('a CLOSED Code window no longer listens for restarts', mintedUrls.length === closedMints, `${mintedUrls.length - closedMints}`);
 }
 
+// The real Settings -> session -> Code path with a deferred restart response.
+// The app tests supply the runtime transition; here the built shell must wait for
+// that HTTP completion before minting, and must ignore it if Code closed meanwhile.
+{
+    ENDPOINTS.restart = '/api/shell/restart';
+    const originalFetch = window.fetch;
+    let finishRestart;
+    let restartRequests = 0;
+    window.fetch = async (url, opts) => {
+        if (String(url) !== ENDPOINTS.restart) return originalFetch(url, opts);
+        restartRequests++;
+        return new Promise(resolve => { finishRestart = resolve; });
+    };
+    await ezil.registry.launch('desktop', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    await settle(6);
+    await ezil.registry.launch('settings');
+    await settle(6);
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="troubleshoot"]'));
+    await settle(4);
+    const startRestart = async () => {
+        click(q('.window[data-app="settings"] [data-action="restart"]'));
+        await settle(2);
+        click(qa('button').find(b => b.textContent.trim() === 'Restart'));
+        await settle(4);
+    };
+    const completeRestart = () => finishRestart?.({ ok: true, status: 200, json: async () => ({ ok: true }) });
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    await settle(20);
+    let before = mintedUrls.length;
+    const oldSrc = q('.window[data-app="code"] .window-app-iframe')?.getAttribute('src');
+    await startRestart();
+    push('Settings dispatched one restart while Code is open', restartRequests === 1);
+    push('Code does not re-mint while the AWS restart response is pending', mintedUrls.length === before);
+    push('the pending restart has not assigned another Code frame URL',
+        q('.window[data-app="code"] .window-app-iframe')?.getAttribute('src') === oldSrc);
+    completeRestart();
+    await settle(20);
+    push('HTTP restart completion re-mints Code exactly once through the real Settings handler', mintedUrls.length === before + 1);
+
+    await startRestart();
+    push('a second restart is pending before Code closes', restartRequests === 2);
+    await window.$(q('.window[data-app="code"]')).close();
+    await settle(4);
+    before = mintedUrls.length;
+    completeRestart();
+    await settle(10);
+    push('closing Code during the restart prevents any late re-mint', mintedUrls.length === before && !q('.window[data-app="code"]'));
+    await window.$(q('.window[data-app="settings"]')).close();
+    window.fetch = originalFetch;
+    delete ENDPOINTS.restart;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════

@@ -463,12 +463,25 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
     // A successful restart tells the windows of THAT computer (Code re-mints: on AWS code-server restarts too).
     const restartedId = q('.window[data-app="desktop"]')?.getAttribute('data-ezil-computer-id');
     const realFetch = window.fetch;
-    window.fetch = async (url, opts) => String(url).includes('/api/shell/restart')
-        ? { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{"ok":true}' }
-        : realFetch(url, opts);
+    let completeRestart;
+    let restartRequests = 0;
+    window.fetch = async (url, opts) => {
+        if ( ! String(url).includes('/api/shell/restart') ) return realFetch(url, opts);
+        restartRequests++;
+        return new Promise(resolve => { completeRestart = resolve; });
+    };
     click(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]'));
     await settle(2);
     click(Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart'));
+    await settle(6);
+    push('a pending AWS restart shows Restarting and sends no completion event',
+        restartRequests === 1 && restartEvents.length === 0
+        && /Restarting/.test(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? ''));
+    const pendingButton = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
+    click(pendingButton);
+    await settle(2);
+    push('restart stays disabled while waiting for the replacement runtime', pendingButton?.disabled && restartRequests === 1);
+    completeRestart?.({ ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{"ok":true}' });
     await settle(6);
     window.fetch = realFetch;
     push('🔴 a successful restart notifies the windows of that computer once',
