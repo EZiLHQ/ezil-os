@@ -1,3 +1,7 @@
+import { recoveryDeploymentFor, type LifecycleDeployment } from './deployment.js';
+import { equal } from './contract.js';
+import { parseLease } from './lease.js';
+import type { LifecycleIntent } from './intent.js';
 import type { Snapshot } from '@aws-sdk/client-ec2';
 import type { Dependencies } from './aws.js';
 import { parsePreparationInput, preparationTags, PreparationReceiptSchema, REBASE_PREPARATION_TIMEOUT_SECONDS,
@@ -60,4 +64,15 @@ export function preparationReceipt(i: PreparationDocument, digest: string, snaps
         fromDigest: i.fromDigest, toDigest: i.toDigest, snapshotId: snapshot.SnapshotId,
         snapshotOwnerId: snapshot.OwnerId, snapshotVolumeGiB: snapshot.VolumeSize, snapshotKmsKeyArn: snapshot.KmsKeyId,
         fencedAt, snapshotStartedAt: snapshot.StartTime!.toISOString(), snapshotCompletedAt, verifiedAt });
+}
+
+/** Only maintenance rebind may use a source AMI under the current workflow.
+ * Verify the authoritative preparation before admitting that deployment. */
+export async function matchesLifecycleDeployment(i: LifecycleIntent, configured: LifecycleDeployment,
+    deps: Pick<Dependencies, 'execution' | 'snapshots' | 'now'>): Promise<boolean> {
+    if (equal(i.deployment, configured)) return true;
+    if (!i.rebasePreparation || !i.userData || !parseLease(i.userData).ebsRestore || !configured.preparationStateMachineVersionArn
+        || i.deployment.stateMachineVersionArn !== configured.stateMachineVersionArn) return false;
+    const { document: p } = await verifyPreparation(i.rebasePreparation, configured.preparationStateMachineVersionArn, deps);
+    return equal(p.deployment, configured) && equal(i.deployment, recoveryDeploymentFor(p.sourceDeployment, p.deployment));
 }

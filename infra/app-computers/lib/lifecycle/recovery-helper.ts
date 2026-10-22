@@ -1,3 +1,4 @@
+import { matchesLifecycleDeployment } from './preparation-evidence.js';
 import { createImageRecoveryHelper } from './image-recovery-helper.js';
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
@@ -42,7 +43,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         // The historical cleanup graph cannot prove a pool claim or perform
         // release's detach sequence. Leave its reservation unconfirmed.
         if (['pool-provision', 'adopt', 'release'].includes(i.operation)) return fail();
-        if (!equal(i.deployment, d)
+        if (!await matchesLifecycleDeployment(i, d, deps)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
             || execution.name !== `cleanup-computer-${i.jobId}`
             || e.executionArn !== recoveryMachine.replace(':stateMachine:', ':execution:') + ':' + execution.name) return fail();

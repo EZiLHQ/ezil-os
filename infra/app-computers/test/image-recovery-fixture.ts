@@ -12,8 +12,8 @@ import { createRecoveryHelper } from '../lib/lifecycle/recovery-helper.js';
 import { preparationFixture } from './preparation-fixture.js';
 import { envelopeFor, rebindFixture } from './rebase-fixture.js';
 
-export function imageRecoveryFixture() {
-    const f = preparationFixture(), rebind = rebindFixture(), p = f.preparation;
+export function imageRecoveryFixture(f = preparationFixture(), rebind = rebindFixture()) {
+    const p = f.preparation;
     f.state.now = Date.parse('2026-10-22T11:05:00.000Z');
     const snapshot = f.snapshot(); f.state.snapshots.push(snapshot);
     const receipt = preparationReceipt(p, f.preparationEnvelope.digest, snapshot, '2026-10-22T11:01:00.000Z',
@@ -63,8 +63,8 @@ export function imageRecoveryFixture() {
     return { f, rebind, document, envelope, launch, launchEnvelope, sourceExecutionArn, executionArn, settings, deps, history, writer, restored, helper, event };
 }
 
-export async function runImageRecovery(options: { lost?: boolean; invisibleOnce?: boolean; duplicate?: boolean; pending?: boolean } = {}) {
-    const f = imageRecoveryFixture(), calls: { name: string; parameters: any }[] = [];
+export async function runImageRecovery(options: { lost?: boolean; invisibleOnce?: boolean; duplicate?: boolean; pending?: boolean } = {}, f = imageRecoveryFixture()) {
+    const calls: { name: string; parameters: any }[] = [];
     const result = await runAsl(recoveryDefinition('observer:1', true), { input: f.envelope, executionArn: f.executionArn,
         sleep: seconds => { f.f.state.now += seconds * 1000; }, invoke: async (_resource, parameters, name) => {
             if (name.startsWith('ImageObserve-')) return f.helper(parameters);

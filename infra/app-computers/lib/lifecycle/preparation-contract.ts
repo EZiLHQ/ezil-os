@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { LifecycleDeploymentSchema } from './deployment.js';
+import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema } from './deployment.js';
 import { COUNTER, DIGEST, HASH, INSTANCE, SNAP, TIME, UUID, VOL, strictJson } from './strict-json.js';
 import { EnvelopeSchema } from './contract.js';
 
@@ -9,7 +9,7 @@ export const PreparationDocumentSchema = z.object({
     schemaVersion: z.literal(1), jobId: UUID, computerId: UUID, sourceInstanceId: INSTANCE,
     sourceVolumeId: VOL, fsUuid: UUID, sourceGeneration: COUNTER, sourceLeaseEpoch: COUNTER,
     sourceFenceToken: UUID, fromDigest: DIGEST, toDigest: DIGEST, volumeGiB: z.number().int().min(1).max(16384),
-    sourceDeployment: LifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: TIME,
+    sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: TIME,
 }).strict().superRefine((i, ctx) => {
     const d = i.deployment, s = i.sourceDeployment;
     if (i.fromDigest !== s.lowerImageDigest || i.fromDigest !== d.previousLowerImageDigest || i.toDigest !== d.lowerImageDigest

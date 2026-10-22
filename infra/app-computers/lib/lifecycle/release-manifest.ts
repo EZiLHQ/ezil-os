@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { LifecycleDeploymentSchema, NamespaceSchema, REGION_PATTERN, type LifecycleDeployment } from './deployment.js';
+import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema, NamespaceSchema, REGION_PATTERN, type LifecycleDeployment, type SourceLifecycleDeployment } from './deployment.js';
 import { DIGEST, TIME, strictJson } from './strict-json.js';
 
 const version = z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/);
@@ -19,9 +19,9 @@ export type ReleaseManifest = z.infer<typeof schema>;
 /** Source-only null workflow references are amendment A1 legacy records. They
  * can never authorize maintenance or a target. Registry digests intentionally
  * need not equal baked lower IDs (classic and containerd stores differ). */
-export function parseReleaseManifest(raw: string, deployment: LifecycleDeployment, approvedRepositoryUri: string,
+export function parseReleaseManifest(raw: string, deployment: LifecycleDeployment | SourceLifecycleDeployment, approvedRepositoryUri: string,
     mode: 'target' | 'source' | 'maintenance' = 'target'): ReleaseManifest {
-    const r = schema.parse(strictJson(raw, 16384)), d = LifecycleDeploymentSchema.parse(deployment);
+    const r = schema.parse(strictJson(raw, 16384)), d = (mode === 'source' ? SourceLifecycleDeploymentSchema : LifecycleDeploymentSchema).parse(deployment);
     const fail = (): never => { throw new Error('release_mismatch'); };
     const repository = r.lowerImageRef.split('@')[0]!;
     if (repository !== approvedRepositoryUri || !repository.startsWith(`${r.accountId}.dkr.ecr.${r.region}.amazonaws.com/`)

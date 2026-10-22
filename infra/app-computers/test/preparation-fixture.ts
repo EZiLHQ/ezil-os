@@ -5,8 +5,8 @@ import { SettingsSchema, tagList } from '../lib/lifecycle/contract.js';
 import { preparationSourceTags, preparationTags } from '../lib/lifecycle/preparation-contract.js';
 import { rebaseFixture } from './rebase-fixture.js';
 
-export function preparationFixture() {
-    const f = rebaseFixture(), i = f.preparation, d = i.deployment;
+export function preparationFixture(f = rebaseFixture()) {
+    const i = f.preparation, d = i.deployment;
     const state = { now: Date.parse(i.createdAt), authorized: true, authorityCalls: 0,
         instances: [] as Instance[], volumes: [] as Volume[], snapshots: [] as Snapshot[], executions: {} as Record<string, DescribeExecutionOutput> };
     const root = { DeviceName: '/dev/sda1', Ebs: { VolumeId: 'vol-00000000000000000', Status: 'attached' as const, DeleteOnTermination: true } };

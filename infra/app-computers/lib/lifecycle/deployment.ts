@@ -118,3 +118,35 @@ export const LifecycleDeploymentSchema = z.object({
     }
 });
 export type LifecycleDeployment = z.infer<typeof LifecycleDeploymentSchema>;
+
+/** Historical source metadata never authorizes a target launch. Keep the same
+ * field order as the app: null workflow pins are part of the hashed document. */
+export const SourceLifecycleDeploymentSchema = LifecycleDeploymentSchema.innerType().extend({
+    lowerImageDigest: DIGEST,
+    previousLowerImageDigest: DIGEST.nullable(),
+    preparationStateMachineVersionArn: z.string().max(300).nullable(),
+    recoveryStateMachineVersionArn: z.string().max(300).nullable(),
+}).superRefine((d, ctx) => {
+    const { lowerImageDigest, previousLowerImageDigest, preparationStateMachineVersionArn, recoveryStateMachineVersionArn, ...base } = d;
+    if (!LifecycleDeploymentSchema.safeParse(base).success || lowerImageDigest === previousLowerImageDigest
+        || (preparationStateMachineVersionArn !== null && recoveryStateMachineVersionArn !== null && !LifecycleDeploymentSchema.safeParse(d).success))
+        ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    for (const [arn, name] of [[preparationStateMachineVersionArn, 'rebase-preparation'], [recoveryStateMachineVersionArn, 'recovery']] as const) {
+        if (arn !== null && !new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:[1-9][0-9]*$`).test(arn))
+            ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    }
+});
+export type SourceLifecycleDeployment = z.infer<typeof SourceLifecycleDeploymentSchema>;
+
+/** A legacy AMI uses the verified preparation's current workflows for rollback.
+ * Preserve every source resource pin; never weaken the target deployment schema. */
+export function recoveryDeploymentFor(source: SourceLifecycleDeployment, target: LifecycleDeployment): LifecycleDeployment {
+    const s = SourceLifecycleDeploymentSchema.parse(source), d = LifecycleDeploymentSchema.parse(target);
+    if (s.preparationStateMachineVersionArn !== null && s.recoveryStateMachineVersionArn !== null)
+        return LifecycleDeploymentSchema.parse(s);
+    if ((['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'] as const).some(k => s[k] !== d[k])
+        || d.previousLowerImageDigest !== s.lowerImageDigest) throw new Error('restore_lineage_mismatch');
+    return LifecycleDeploymentSchema.parse({ ...s, stateMachineVersionArn: d.stateMachineVersionArn,
+        preparationStateMachineVersionArn: d.preparationStateMachineVersionArn,
+        recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn });
+}

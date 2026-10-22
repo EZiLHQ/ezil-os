@@ -5,9 +5,9 @@ import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFo
 import { MAX_THROTTLE_RETRIES, NO_ERROR, RecordedErrorSchema, classifyProviderError, throttleDelaySeconds, toLambdaError } from './errors.js';
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
 import { awsDependencies, type Dependencies } from './aws.js';
-import { BURSTABLE_CREDITS, isBurstable } from './deployment.js';
+import { BURSTABLE_CREDITS, isBurstable, type SourceLifecycleDeployment } from './deployment.js';
 import { assertPermitTime, parseLease } from './lease.js';
-import { verifyPreparation } from './preparation-evidence.js';
+import { matchesLifecycleDeployment, verifyPreparation } from './preparation-evidence.js';
 import { verifyMaintenance } from './maintenance-evidence.js';
 import { strictJson } from './strict-json.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases),
@@ -37,7 +37,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             ||Buffer.byteLength(execution.input)>20000||!execution.startDate)return fail();
         const envelope=EnvelopeSchema.parse(strictJson(execution.input,20000));
         const work={...envelope,createdAt:execution.startDate},i=parseLifecycleWork(work);
-        if(!equal(i.deployment,d)||execution.name!==`computer-${i.jobId}`
+        if(!await matchesLifecycleDeployment(i,d,deps)||execution.name!==`computer-${i.jobId}`
             ||event.executionArn!==machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`)return fail('lifecycle_invalid');
         const now=deps.now(),started=execution.startDate.getTime();
         if(!Number.isFinite(started)||started>now+30000||now-started>900000)return fail('lifecycle_expired');
@@ -353,7 +353,8 @@ function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:str
     const done=success(i,digest,instanceId,volumeId,'stopped');
     return {...done,receipt:{...done.receipt,instanceLost:true as const} satisfies LifecycleReceipt};
 }
-function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
+type InstanceIdentity = { deployment: Pick<SourceLifecycleDeployment, 'accountId' | 'subnetId' | 'zoneId'> };
+function assertIdentity(instance:Instance,tags:Record<string,string>,i:InstanceIdentity){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
     // EC2 clears SubnetId on a terminating (shutting-down) or terminated instance but keeps its id
     // and tags, so such a source is identified by those; a subnet that IS reported must still be
@@ -373,7 +374,7 @@ export function assertOnlyExpectedDisks(instance:Instance,v:Volume,rootDeviceNam
 }
 /** `allowAbsent` (replace and retire only): EC2 no longer knowing the instance at all is an answer,
  * not a failure. Nothing else is relaxed: an instance that exists must still be exactly this one. */
-async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies,allowAbsent=false){
+async function getInstance(id:string,tags:Record<string,string>,i:InstanceIdentity,deps:Dependencies,allowAbsent=false){
     const rows=await deps.instances([id]);
     if(rows.length===0&&allowAbsent)return undefined;
     if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
