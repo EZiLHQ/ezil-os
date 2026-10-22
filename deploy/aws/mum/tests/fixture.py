@@ -31,10 +31,21 @@ params = {
 save("stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", "Parameters": [
     {"ParameterKey": k, "ParameterValue": v, **({"ResolvedValue": "ami-" + "1" * 17} if k == "UbuntuAmiId" else {})} for k, v in params.items()
 ], "Outputs": [{"OutputKey": "PipelineArn", "OutputValue": "arn:aws:imagebuilder:ap-south-1:452630323510:image-pipeline/ezil-host-mum"}]}]})
-save("template.json", {"TemplateBody": {"Resources": {
+save("ami-config.json", {"namespace": "mum", "accountId": "452630323510", "region": "ap-south-1", "version": "1.0.1"})
+shutil.copyfile(root / "ami-config.json", root / "original-ami-config.json")
+save("template.json", {"TemplateBody": {"Parameters": {k: {"Type": "String"} for k in params}, "Resources": {
+    "Component": {"Type": "AWS::ImageBuilder::Component", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1", "Data": "synthetic component"}},
     "Recipe": {"Type": "AWS::ImageBuilder::ImageRecipe", "Properties": {"Name": "ezil-host-mum", "Version": "1.0.1"}},
-    "Pipeline": {"Type": "AWS::ImageBuilder::ImagePipeline"},
+    "Pipeline": {"Type": "AWS::ImageBuilder::ImagePipeline", "Properties": {"ImageRecipeArn": {"Ref": "Recipe"}}},
+    "Infrastructure": {"Type": "AWS::ImageBuilder::InfrastructureConfiguration", "Properties": {"Name": "ezil-host-mum", "SubnetId": {"Ref": "SubnetId"}}},
+    "Distribution": {"Type": "AWS::ImageBuilder::DistributionConfiguration", "Properties": {"Name": "ezil-host-mum"}},
+    "BuildRole": {"Type": "AWS::IAM::Role", "Properties": {"RoleName": "ezil-mum-ami-build"}},
 }}})
+if json.loads(sys.argv[2]).get("forced_config_version"):
+    value = json.loads((root / "template.json").read_text())
+    for logical in ("Infrastructure", "Distribution"):
+        value["TemplateBody"]["Resources"][logical]["Properties"]["Name"] += "-1.0.1"
+    save("template.json", value)
 d = {"accountId": "452630323510", "region": "ap-south-1", "namespace": "mum", "amiId": "ami-" + "1" * 17,
      "stateMachineVersionArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:4", "keep": [1, 2]}
 save("config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})

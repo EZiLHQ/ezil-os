@@ -31,6 +31,23 @@ if [[ "${1:-}" == --case ]]; then
     name=$2; scenario=$3; mode=$4
     fixture "$name" "$scenario"
     case "$name" in
+        recipe-*)
+            version=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("version", "1.0.2"))' "$scenario")
+            flags=(--desktop-image desktop:test --source-sha aaaaaaaa --recipe-version "$version" --config "$case_dir/ami-config.json")
+            if [[ "$name" == recipe-dry ]]; then
+                run pass rebuild-ami.sh "${flags[@]}"
+                check recipe-dry
+            elif [[ "$mode" == pass ]]; then
+                run pass rebuild-ami.sh "${flags[@]}" --apply
+                check recipe-applied
+            else
+                run fail rebuild-ami.sh "${flags[@]}" --apply
+                check "$mode"
+                if [[ "$name" != recipe-config-race && "$name" != recipe-build-fail ]]; then
+                    cmp "$case_dir/ami-config.json" "$case_dir/original-ami-config.json"
+                fi
+                if [[ "$name" != recipe-build-fail ]]; then check recipe-no-bake; fi
+            fi ;;
         dry-rebuild)
             run pass rebuild-ami.sh --desktop-image desktop:test --source-sha aaaaaaaa
             check dry-rebuild ;;
@@ -102,5 +119,33 @@ test_case 'concurrent secret edit refused' secret-race '{"secret_race":true}' no
 test_case 'preexisting secret deployment drift refused' secret-drift '{"secret_drift":true}' no-secret-write
 test_case 'synth failure leaves app secret unchanged' synth-fail '{"synth_fail":true}' no-secret-write
 test_case 'stack failure leaves app secret unchanged' stack-fail '{"stack_fail":true}' no-secret-write
+test_case 'version dry-run synthesizes candidate and leaves real config byte-identical' recipe-dry '{}' pass
+test_case 'allowed component/recipe replacements and pipeline reference proceed' recipe-allowed '{}' pass
+test_case 'version comparison is numeric' recipe-numeric '{"version":"1.0.10"}' pass
+test_case 'equal version refused before synth or writes' recipe-equal '{"version":"1.0.1"}' 'refuse-recipe version must be greater'
+test_case 'lower version refused before synth or writes' recipe-lower '{"version":"0.9.9"}' 'refuse-recipe version must be greater'
+test_case 'non-semantic version refused' recipe-invalid '{"version":"1.0.02"}' 'refuse-recipe version must be x.y.z'
+test_case 'out-of-range Image Builder version refused' recipe-range '{"version":"1073741824.0.0"}' 'refuse-recipe version exceeds'
+test_case 'IAM change in change-set description refused' recipe-iam '{"iam_change":true}' 'refuse-unexpected resource change'
+test_case 'IAM template drift refused before uploads' recipe-template-iam '{"template_iam":true}' 'refuse-unexpected template resource change'
+test_case 'parameter definition drift in synthesized template refused' recipe-template-param '{"template_parameter":true}' 'refuse-unexpected template parameter'
+test_case 'oversize inline template uploaded to pinned S3 prefix' recipe-large '{"large_template":52000}' pass
+test_case 'template exceeding S3 limit refused' recipe-too-large '{"large_template":1048576}' 'refuse-synthesized template exceeds'
+test_case 'configuration changes forced only by version string proceed' recipe-forced '{"forced_config_version":true}' pass
+test_case 'unrelated infrastructure configuration change refused' recipe-unforced '{"unforced_config":true}' 'refuse-configuration change is not forced'
+test_case 'unexplained infrastructure change-set entry refused' recipe-unexplained '{"unexplained_config":true}' 'refuse-unexpected versioned Image Builder'
+test_case 'recipe removal refused' recipe-delete '{"delete_recipe":true}' 'refuse-unexpected resource change'
+test_case 'missing component replacement refused' recipe-missing '{"missing_component":true}' 'refuse-change set omits component/recipe'
+test_case 'pipeline replacement without template cause refused' recipe-pipeline '{"pipeline_replacement":true}' 'refuse-unexpected dependent resource replacement'
+test_case 'synth version mismatch refused' recipe-mismatch '{"synth_version_mismatch":true}' 'refuse-synthesized recipe/component version mismatch'
+test_case 'live template version drift from local config refused' recipe-live-drift '{"live_version_drift":true}' 'refuse-live recipe/component version differs'
+test_case 'incomplete change-set page refused' recipe-page '{"pagination":true}' 'refuse-incomplete change set'
+test_case 'version path preserves SSM drift guard' recipe-ssm '{"ssm_drift":true}' 'refuse-resolved SSM'
+test_case 'version path preserves nonallowed parameter guard' recipe-param '{"extra_parameter":true}' 'refuse-extra parameter'
+test_case 'AMI synth failure leaves original config unchanged' recipe-synth-fail '{"synth_fail":true}' recipe-no-bake
+test_case 'change-set execute failure leaves original config unchanged' recipe-execute-fail '{"execute_fail":true}' recipe-update-failed
+test_case 'stack update failure leaves original config unchanged' recipe-stack-fail '{"stack_fail":true}' recipe-update-failed
+test_case 'concurrent config edit after stack update prevents overwrite and bake' recipe-config-race '{"config_race":true}' recipe-config-race
+test_case 'failed bake retains successfully deployed config version and old backup' recipe-build-fail '{"build_fail":true}' recipe-build-fail
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))

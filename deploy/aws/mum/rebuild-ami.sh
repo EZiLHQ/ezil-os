@@ -3,13 +3,16 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 usage() {
-    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--apply] [--release-dir <path>]'
+    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--apply] [--config <path>] [--release-dir <path>]'
 }
-desktop_image= source_sha=
+desktop_image= source_sha= recipe_version=
+config=/root/ezil-aws-mum/config/ami.mum.json
 while (($#)); do
     case "$1" in
         --desktop-image) (($# >= 2)) || die 'missing desktop image'; desktop_image=$2; shift 2 ;;
         --source-sha) (($# >= 2)) || die 'missing source SHA'; source_sha=$2; shift 2 ;;
+        --recipe-version) (($# >= 2)) && [[ -n "$2" ]] || die 'missing recipe version'; recipe_version=$2; shift 2 ;;
+        --config) (($# >= 2)) || die 'missing config path'; config=$2; shift 2 ;;
         --release-dir) (($# >= 2)) || die 'missing release directory'; release_dir=$2; shift 2 ;;
         --apply) apply=true; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -19,8 +22,15 @@ done
 [[ -n "$desktop_image" && "$desktop_image" != -* && "$source_sha" =~ ^[0-9a-f]{7,40}$ ]] || { usage; die 'local image and hexadecimal commit SHA are required'; }
 require_tools aws docker git python3 mktemp date timeout
 require_absolute_release
-assert_identity
 init_work
+if [[ -n "$recipe_version" ]]; then
+    require_tools npm realpath cmp wc
+    [[ -f "$config" && ! -L "$config" ]] || die 'AMI config must be a regular non-symlink file'
+    config=$(realpath -- "$config")
+    cp -- "$config" "$work/previous-ami-config.json"
+    json plan-ami "$work/previous-ami-config.json" "$recipe_version" "$work/ami.mum.json"
+fi
+assert_identity
 show git -C "$repo_root" rev-parse --verify "$source_sha^{commit}"
 full_sha=$(git -C "$repo_root" rev-parse --verify "$source_sha^{commit}")
 [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || die 'source SHA did not resolve to a full commit'
@@ -41,12 +51,42 @@ aws_read cloudformation get-template --stack-name ezil-mum-ami --template-stage 
 # A placeholder is used only in the printed dry-run plan. Apply always reads ECR.
 digest='<ECR-manifest-digest>'
 json parameters "$work/stack.json" "$digest" "$image_id" "$source_uri" "$work/parameters.json"
+template_args=(--use-previous-template)
+template_uri=
+validation_args=()
+if [[ -n "$recipe_version" ]]; then
+    # README host-AMI step (d), package.json synth:ami, and bin/ami.ts.
+    # npm runs in the package directory; the last --output overrides its default.
+    # That script disables AWS credentials, lookups and telemetry. It runs in
+    # dry-run too, using only this temporary nonsecret config and assembly.
+    show env "EZIL_AMI_CONFIG=$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami --output "$work/cdk.out"
+    EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami --output "$work/cdk.out"
+    candidate_template=$work/cdk.out/ezil-mum-ami.template.json
+    validation_args=("$candidate_template" "$work/previous-ami-config.json" "$work/ami.mum.json")
+    json ami-template "$work/template.json" "${validation_args[@]}"
+    template_bytes=$(wc -c < "$candidate_template")
+    ((template_bytes <= 1048576)) || die 'synthesized template exceeds the 1048576-byte S3 limit'
+    say "Synthesized template: $template_bytes bytes; live template response: $(wc -c < "$work/template.json") bytes"
+    if ((template_bytes > 51200)); then
+        template_uri=s3://$bucket/ami/templates/$stamp.json
+        template_args=(--template-url "https://$bucket.s3.$region.amazonaws.com/ami/templates/$stamp.json")
+    else
+        template_args=(--template-body "file://$candidate_template")
+    fi
+fi
 
 say "Desktop tag: $repository:$tag"
 if "$apply"; then
     require_tools flock
     lock_release
     [[ ! -e "$release_dir/build-arn.txt" && ! -e "$release_dir/ami-id.txt" ]] || die 'release already contains a build; inspect/resume it or archive this release directory'
+    [[ ! -e "$release_dir/ami-update-complete.txt" ]] || die 'release already contains a successful AMI stack update; inspect evidence before another bake'
+    if [[ -n "$recipe_version" ]]; then
+        cmp -s "$config" "$work/previous-ami-config.json" || die 'AMI config changed since planning'
+        cp "$work/previous-ami-config.json" "$release_dir/previous-ami-config.json"
+        cp "$work/ami.mum.json" "$release_dir/candidate-ami-config.json"
+        cp "$candidate_template" "$release_dir/candidate-ami-template.json"
+    fi
     # Docker credentials are temporary; no existing Docker credential file is read.
     mkdir "$work/docker"
     show aws --profile "$profile" --region "$region" ecr get-login-password
@@ -54,7 +94,7 @@ if "$apply"; then
     aws --profile "$profile" --region "$region" --no-cli-pager ecr get-login-password |
         docker --config "$work/docker" login --username AWS --password-stdin "${repository%%/*}"
 else
-    say 'DRY RUN: reads identity, stack and local image only; the remaining commands are printed.'
+    say 'DRY RUN: reads identity, stack and local image; an explicit recipe version also synthesizes a temporary candidate. Remaining commands are printed.'
     say 'aws --profile ezil-admin --region ap-south-1 ecr get-login-password | docker --config <temporary-directory> login --username AWS --password-stdin 452630323510.dkr.ecr.ap-south-1.amazonaws.com'
 fi
 # Tag the inspected immutable local ID, so a concurrent local retag cannot change it.
@@ -72,15 +112,21 @@ act git -C "$repo_root" archive --format=tar.gz --output "$work/$archive" "$full
 aws_act s3 cp "$work/$archive" "$source_uri"
 say 'Exact parameter request (only the three allowed values change):'
 cat "$work/parameters.json"
+if [[ -n "${template_uri:-}" ]]; then aws_act s3 cp "$candidate_template" "$template_uri"; fi
 aws_act cloudformation create-change-set --stack-name ezil-mum-ami --change-set-name "$change" --change-set-type UPDATE \
-    --use-previous-template --role-arn "$exec_role" --capabilities CAPABILITY_NAMED_IAM --parameters "file://$work/parameters.json"
+    "${template_args[@]}" --role-arn "$exec_role" --capabilities CAPABILITY_NAMED_IAM --parameters "file://$work/parameters.json"
 if ! "$apply"; then
     show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-ami --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-ami --change-set-name "$change" --include-property-values --output json
     say 'Validate every parameter, resolved SSM value and resource change before execution.'
-    say 'BLOCKER in current template: Components require replacing an immutable recipe without a version bump. Apply refuses this change set.'
+    if [[ -n "$recipe_version" ]]; then
+        say 'Permit only Component/Recipe version replacement, dependent Pipeline changes and configurations forced by the version string; refuse all other resources.'
+    else
+        say 'BLOCKER in current template: Components require replacing an immutable recipe without a version bump. Apply refuses this change set. Supply --recipe-version.'
+    fi
     aws_act cloudformation execute-change-set --stack-name ezil-mum-ami --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation wait stack-update-complete --stack-name ezil-mum-ami
+    if [[ -n "$recipe_version" ]]; then say "After successful stack update only: persist version $recipe_version to $config; retain previous-ami-config.json in $release_dir."; fi
     show aws --profile "$profile" --region "$region" cloudformation describe-stacks --stack-name ezil-mum-ami --output json
     aws_act imagebuilder start-image-pipeline-execution --image-pipeline-arn '<stack PipelineArn>' --query imageBuildVersionArn --output text
     show aws --profile "$profile" --region "$region" imagebuilder get-image --image-build-version-arn '<build ARN>' --output json
@@ -95,8 +141,16 @@ printf 'ApplicationImageRepositoryUri=%s\nDesktopImageDigest=%s\nDesktopImageId=
     "$repository" "$digest" "$image_id" "$tag" "$desktop_image" "$full_sha" "$source_uri" > "$release_dir/desktop.txt"
 wait_changeset ezil-mum-ami "$change"
 cp "$work/changeset.json" "$release_dir/ami-changeset.json"
-json ami-changeset "$work/stack.json" "$work/parameters.json" "$work/changeset.json" "$work/template.json"
+json ami-changeset "$work/stack.json" "$work/parameters.json" "$work/changeset.json" "$work/template.json" "${validation_args[@]}"
+if [[ -n "$recipe_version" ]]; then
+    cmp -s "$config" "$work/previous-ami-config.json" || die 'AMI config changed before execution'
+fi
 execute_changeset ezil-mum-ami "$change"
+if [[ -n "$recipe_version" ]]; then
+    printf '%s\n' "$change" > "$release_dir/ami-update-complete.txt"
+    json persist-ami "$config" "$release_dir/previous-ami-config.json" "$release_dir/candidate-ami-config.json"
+    say "AMI config now uses $recipe_version; previous version saved in $release_dir/previous-ami-config.json"
+fi
 aws_read cloudformation describe-stacks --stack-name ezil-mum-ami --output json > "$work/updated-stack.json"
 pipeline=$(json output "$work/updated-stack.json" PipelineArn)
 [[ "$pipeline" == arn:aws:imagebuilder:ap-south-1:452630323510:image-pipeline/* ]] || die 'invalid stack PipelineArn'

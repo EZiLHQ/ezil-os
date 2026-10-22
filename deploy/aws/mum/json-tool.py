@@ -82,7 +82,124 @@ def check_changeset(cs):
     need(bool(cs.get("Changes")), "empty change set")
 
 
-def ami_changeset(old_path, wanted_path, cs_path, template_path):
+def recipe_version(value):
+    need(isinstance(value, str) and re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value), "recipe version must be x.y.z without leading zeroes")
+    parts = tuple(int(p) for p in value.split("."))
+    need(all(p <= 1073741823 for p in parts), "recipe version exceeds Image Builder limits")
+    return parts
+
+
+def ami_config(path):
+    value = read(path)
+    need(set(value) == {"namespace", "accountId", "region", "version"}, "unexpected AMI config fields")
+    need(value["namespace"] == "mum" and value["accountId"] == ACCOUNT and value["region"] == REGION, "AMI config account/region/namespace mismatch")
+    recipe_version(value["version"])
+    return value
+
+
+def version_pair(before_path, after_path):
+    before, after = ami_config(before_path), ami_config(after_path)
+    need(recipe_version(after["version"]) > recipe_version(before["version"]), "recipe version must be greater than current version")
+    need({**before, "version": after["version"]} == after, "unexpected AMI config change")
+    return before["version"], after["version"]
+
+
+def replace_version(value, before, after):
+    if isinstance(value, str):
+        return value.replace(before, after)
+    if isinstance(value, list):
+        return [replace_version(v, before, after) for v in value]
+    if isinstance(value, dict):
+        return {k: replace_version(v, before, after) for k, v in value.items()}
+    return value
+
+
+def ami_template(old_path, candidate_path, before_path, after_path):
+    """Prove the synthesized template contains only the authorized version update.
+
+    In particular, an allowed Image Builder type does not grant permission to
+    change its subnet, role, KMS key, parent AMI or any other build settings.
+    """
+    previous_version, next_version = version_pair(before_path, after_path)
+    previous, candidate = template(old_path), read(candidate_path)
+    need({k: v for k, v in previous.items() if k != "Resources"} ==
+         {k: v for k, v in candidate.items() if k != "Resources"}, "unexpected template parameter/output/metadata change")
+    old, new = previous["Resources"], candidate["Resources"]
+    need(old.keys() == new.keys(), "unexpected template resource addition/removal")
+    types = {name: "AWS::ImageBuilder::" + name for name in (
+        "Component", "ImageRecipe", "ImagePipeline", "DistributionConfiguration", "InfrastructureConfiguration")}
+    for kind in ("Component", "ImageRecipe", "ImagePipeline"):
+        need(sum(r["Type"] == types[kind] for r in old.values()) == 1, "expected one component, recipe and pipeline")
+    changes = {}
+    for logical, resource in old.items():
+        proposed = new[logical]
+        need(resource["Type"] == proposed["Type"], "unexpected template resource type change")
+        kind = resource["Type"]
+        if kind not in types.values():
+            need(resource == proposed, "unexpected template resource change: " + logical)
+            continue
+        need({k: v for k, v in resource.items() if k != "Properties"} ==
+             {k: v for k, v in proposed.items() if k != "Properties"}, "unexpected resource attributes: " + logical)
+        a, b = resource.get("Properties", {}), proposed.get("Properties", {})
+        need(a.keys() == b.keys(), "unexpected property addition/removal: " + logical)
+        delta = {key for key in a if a[key] != b[key]}
+        if kind in (types["Component"], types["ImageRecipe"]):
+            need(a.get("Version") == previous_version, "live recipe/component version differs from local config")
+            need(b.get("Version") == next_version, "synthesized recipe/component version mismatch")
+            permitted = {"Version", "Data"} if kind == types["Component"] else {"Version"}
+            need(delta <= permitted, "unexpected component/recipe property change")
+        elif delta:
+            # Today's CDK source does not put the version into these resources.
+            # Accept only a literal version substitution if a reviewed source
+            # does so; no unrelated distribution/infrastructure changes.
+            need(replace_version(a, previous_version, next_version) == b,
+                 "configuration change is not forced by the version string: " + logical)
+        changes[logical] = delta
+    return old, changes
+
+
+def versioned_ami_changes(cs, resources, template_changes):
+    by_type = {r["Type"]: k for k, r in resources.items() if r["Type"].startswith("AWS::ImageBuilder::")}
+    component = by_type["AWS::ImageBuilder::Component"]
+    recipe = by_type["AWS::ImageBuilder::ImageRecipe"]
+    pipeline = by_type["AWS::ImageBuilder::ImagePipeline"]
+    seen = set()
+    for change in cs["Changes"]:
+        need(change["Type"] == "Resource", "unexpected non-resource change")
+        r = change["ResourceChange"]
+        logical = r["LogicalResourceId"]
+        need(logical in template_changes and logical not in seen and r["Action"] == "Modify", "unexpected resource change")
+        seen.add(logical)
+        need(r["ResourceType"] == resources[logical]["Type"], "resource type mismatch")
+        need(set(r["Scope"]) == {"Properties"} and bool(r.get("Details")), "unexplained resource change")
+        direct = template_changes[logical]
+        targets = set()
+        for detail in r["Details"]:
+            target = detail["Target"]
+            need(target["Attribute"] == "Properties", "non-property resource change")
+            name, source = target["Name"], detail["ChangeSource"]
+            cause = detail.get("CausingEntity", "").split(".")[0]
+            targets.add(name)
+            expected = name in direct and source == "DirectModification"
+            if logical == recipe and name == "Components":
+                expected |= (source == "ParameterReference" and cause in ALLOWED) or (source in ("ResourceReference", "ResourceAttribute") and cause == component)
+            if logical == pipeline:
+                dependencies = {"ImageRecipeArn": recipe}
+                for kind, prop in (("InfrastructureConfiguration", "InfrastructureConfigurationArn"), ("DistributionConfiguration", "DistributionConfigurationArn")):
+                    dependency = by_type.get("AWS::ImageBuilder::" + kind)
+                    if dependency and template_changes.get(dependency):
+                        dependencies[prop] = dependency
+                expected |= name in dependencies and source in ("ResourceReference", "ResourceAttribute") and cause == dependencies[name]
+            need(expected, "unexpected versioned Image Builder property change")
+        need(direct <= targets, "change set omits synthesized property changes")
+        if logical in (component, recipe):
+            need(r.get("Replacement") == "True" and "Version" in targets, "version bump must replace component and recipe")
+        elif not direct:
+            need(r.get("Replacement") == "False", "unexpected dependent resource replacement")
+    need({component, recipe} <= seen, "change set omits component/recipe version replacement")
+
+
+def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths):
     old = mapping(stack(old_path)["Parameters"])
     wanted = mapping(read(wanted_path))
     cs = read(cs_path)
@@ -96,6 +213,10 @@ def ami_changeset(old_path, wanted_path, cs_path, template_path):
             need(wanted[key] == {"ParameterKey": key, "UsePreviousValue": True}, "extra parameter change requested")
             need(actual[key].get("ParameterValue", old[key].get("ParameterValue") if actual[key].get("UsePreviousValue") else None) == old[key].get("ParameterValue"), "extra parameter change in change set")
             need(actual[key].get("ResolvedValue") == old[key].get("ResolvedValue"), "resolved SSM parameter changed")
+    if version_paths:
+        resources, changes = ami_template(template_path, *version_paths)
+        versioned_ami_changes(cs, resources, changes)
+        return
     resources = template(template_path)["Resources"]
     recipes = [k for k, v in resources.items() if v["Type"] == "AWS::ImageBuilder::ImageRecipe"]
     pipelines = [k for k, v in resources.items() if v["Type"] == "AWS::ImageBuilder::ImagePipeline"]
@@ -181,6 +302,19 @@ def main(args):
         print(digest)
     elif op == "ami-changeset":
         ami_changeset(*a)
+    elif op == "plan-ami":
+        value = ami_config(a[0])
+        need(recipe_version(a[1]) > recipe_version(value["version"]), "recipe version must be greater than current version")
+        value["version"] = a[1]
+        write(a[2], value)
+    elif op == "ami-template":
+        ami_template(*a)
+    elif op == "persist-ami":
+        version_pair(a[1], a[2])
+        need(not os.path.islink(a[0]), "AMI config became a symlink")
+        with open(a[0], "rb") as current, open(a[1], "rb") as backup:
+            need(current.read() == backup.read(), "AMI config changed after stack update; reconcile saved config and stack before baking")
+        write(a[0], ami_config(a[2]))
     elif op == "output":
         outputs = [o["OutputValue"] for o in stack(a[0]).get("Outputs", []) if o["OutputKey"] == a[1]]
         need(len(outputs) == 1, "missing/duplicate stack output")

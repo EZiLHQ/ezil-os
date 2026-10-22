@@ -31,7 +31,57 @@ def preserved():
     return b, a
 
 
-if mode == "dry-rebuild":
+if mode.startswith("recipe-"):
+    if mode == "recipe-dry":
+        assert (root / "ami-config.json").read_bytes() == (root / "original-ami-config.json").read_bytes()
+        assert read("synth-config.json")["version"] == "1.0.2"
+        assert read("synth-template.json")["Resources"]["Component"]["Properties"]["Version"] == "1.0.2"
+        assert has("npm", "synth:ami", "ezil-mum-ami", "--output")
+        assert not any(has(x) for x in ("tag", "push", "get-login-password", "archive", "create-change-set", "start-image-pipeline-execution"))
+        assert not (root / "release").exists()
+        assert "--template-body" in output and "--use-previous-template" not in output
+    elif mode in ("recipe-applied", "recipe-build-fail"):
+        assert read("ami-config.json") == read("synth-config.json")
+        assert (root / "release/previous-ami-config.json").read_bytes() == (root / "original-ami-config.json").read_bytes()
+        assert read("release/candidate-ami-config.json") == read("ami-config.json")
+        assert read("release/candidate-ami-template.json") == read("synth-template.json") == read("submitted-template.json")
+        assert (root / "release/ami-update-complete.txt").exists()
+        assert has("execute-change-set") and has("start-image-pipeline-execution")
+        assert not has("--use-previous-template")
+        if mode == "recipe-applied":
+            assert (root / "release/ami-id.txt").read_text().strip() == "ami-" + "2" * 17
+        else:
+            assert not (root / "release/ami-id.txt").exists()
+            assert "Image Builder FAILED" in output
+        old = {p["ParameterKey"] for p in read("stack.json")["Stacks"][0]["Parameters"]}
+        requested = read("requested.json")
+        assert {p["ParameterKey"] for p in requested} == old
+        for p in requested:
+            if p["ParameterKey"] not in {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}:
+                assert p == {"ParameterKey": p["ParameterKey"], "UsePreviousValue": True}
+        if read("scenario.json").get("large_template"):
+            assert has("create-change-set", "--template-url")
+            assert read("template-upload.json").startswith("s3://ezil-mum-deploy-assets-452630323510/ami/templates/")
+            assert read("uploaded-template.json") == read("synth-template.json")
+            url = next(c[c.index("--template-url") + 1] for c in calls if "--template-url" in c)
+            assert url == read("template-upload.json").replace("s3://ezil-mum-deploy-assets-452630323510/", "https://ezil-mum-deploy-assets-452630323510.s3.ap-south-1.amazonaws.com/")
+        else:
+            assert has("create-change-set", "--template-body")
+    elif mode == "recipe-no-bake":
+        assert not has("start-image-pipeline-execution")
+    elif mode == "recipe-update-failed":
+        assert has("execute-change-set")
+        assert not (root / "release/ami-update-complete.txt").exists()
+        assert not has("start-image-pipeline-execution")
+    elif mode == "recipe-config-race":
+        assert read("ami-config.json")["version"] == "1.0.9"
+        assert read("release/previous-ami-config.json") == read("original-ami-config.json")
+        assert (root / "release/ami-update-complete.txt").exists()
+        assert "AMI config changed after stack update" in output
+        assert not has("start-image-pipeline-execution")
+    else:
+        raise AssertionError(mode)
+elif mode == "dry-rebuild":
     assert not any(has(x) for x in ("tag", "push", "get-login-password", "archive", "create-change-set", "start-image-pipeline-execution"))
     assert not (root / "release").exists()
     assert "UsePreviousValue" in output and "FutureParameter" in output
@@ -57,6 +107,10 @@ elif mode.startswith("refuse-"):
     assert not has("execute-change-set")
     if token in ("wrong AWS account", "region must", "image ID mismatch", "schema-2", "linux/amd64"):
         assert not has("create-change-set")
+    if mode.startswith("refuse-recipe version"):
+        assert not calls, calls
+    if token.startswith(("unexpected template", "synthesized", "configuration change is not forced", "live recipe/component")):
+        assert not any(has(x) for x in ("get-login-password", "push", "s3", "create-change-set"))
 elif mode == "dry-promote":
     assert read("config.json") == read("original-config.json")
     assert not (root / "release").exists()

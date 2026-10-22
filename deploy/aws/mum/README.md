@@ -3,38 +3,67 @@
 These operator scripts default to **dry-run**. They always pin AWS profile
 `ezil-admin`, region `ap-south-1`, and account `452630323510`. Dry-run reads AWS
 identity/stack/version metadata and, for rebuild, the local Docker image. It
-prints proposed writes but does not log in to ECR, push, upload, synthesize,
-change configuration, create a change set, or fetch the app secret. Run locally
+prints proposed writes without logging in to ECR, pushing, uploading, changing
+the real configuration, creating a change set, or fetching the app secret.
+With `--recipe-version`, rebuild also writes a temporary candidate config and
+runs the offline AMI synth. Temporary files are removed on exit. Run locally
 with fake commands for an entirely offline check.
 
-## Current deployment blocker
+## Recipe version updates
 
-**The pinned three-parameter AMI update cannot replace the current immutable
-Image Builder recipe.** `infra/app-computers/lib/ami-pipeline.ts` uses the config's
-literal `version` for the recipe and component. The supplied `ami.mum.json` is
-`1.0.1`. Changing recipe `Components` requires replacement; AWS cannot create
-another recipe with the same name and version. The repository's
-[host AMI instructions](../../../infra/app-computers/README.md#host-ami) explicitly
-require a version bump for changed component parameters.
+Use `rebuild-ami.sh --recipe-version <x.y.z>` for changed desktop/agent inputs.
+The default AMI config is `/root/ezil-aws-mum/config/ami.mum.json`, originally
+`1.0.1`. The requested version must be numerically greater than its current
+version, use three integer segments without leading zeroes, and keep each
+segment at most `1073741823` (Image Builder's limit). No version is inferred.
+The legacy path without this flag still refuses immutable recipe replacement.
 
-The pinned contract allows only `DesktopImageDigest`, `DesktopImageId` and
-`AgentSrcS3Uri`, with the previous template. Rebuild therefore refuses a recipe
-replacement **before executing the change set or starting a bake**. It retains
-the proposed change set and inputs for review. An apply attempt can still upload
-the desktop and agent archive before that refusal. Do not run apply against the
-current template merely to rediscover this known blocker.
+The synth mechanism comes from `infra/app-computers/package.json`'s
+`synth:ami`, `bin/ami.ts`, and README **Host AMI**, step **(d)**. It uses the
+existing `EZIL_AMI_CONFIG` variable, `node --import tsx bin/ami.ts`, and a
+`BootstraplessSynthesizer`; no publish-assets or bootstrap step is needed.
+The package script disables credential-file access, metadata credentials,
+lookups and telemetry. Rebuild invokes it with an isolated assembly directory:
 
-The lead must reconcile the contract and authorize/implement a recipe version
-change before a real bake can succeed. These scripts do not silently bump a
-version, loosen the change guard, or modify another lane. The tests that reach
-the poll loop explicitly use a non-replacing command double; they do not claim
-that AWS supports changing the current recipe in place.
+```bash
+EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" \
+  run synth:ami -- ezil-mum-ami --output "$work/cdk.out"
+```
+
+Here `$work` is the script's private temporary directory, and the final
+`--output` overrides the package script's default `cdk.out/ami`. The resulting
+`ezil-mum-ami.template.json` is compared with the live stack template before any
+uploads. Resource identities, parameters, outputs and all unrelated properties
+must remain unchanged. Component `Version`/`Data` and recipe `Version` may
+change; infrastructure/distribution/pipeline template changes must be literal
+substitutions of the old version with the requested version. Both live immutable
+versions must agree with the local config, and both synthesized versions must
+match the candidate. A template larger than 51,200 bytes is uploaded to
+`s3://ezil-mum-deploy-assets-452630323510/ami/templates/<UTC timestamp>.json`;
+otherwise CloudFormation receives `--template-body`. Above 1,048,576 bytes is
+refused. The synthesized template is never rewritten by this script.
+
+The change-set description is independently checked before execution. Only the
+existing Component, ImageRecipe, ImagePipeline and version-forced
+DistributionConfiguration/InfrastructureConfiguration may change. The component
+and recipe must both be replaced with the new version. Additions, removals,
+unexplained properties, IAM, network, KMS, ECR, S3 and other resource changes
+are refused. All nonallowed parameters use previous values, including resolved
+SSM values; Ubuntu parent drift stops the run.
+
+Apply saves the byte-identical old config as `previous-ami-config.json` and the
+candidate as `candidate-ami-config.json` in the release directory. **Only after
+`execute-change-set` and `wait stack-update-complete` succeed** does it atomically
+persist the new version to the real config, then start the existing bake path.
+Config drift is checked before execution and again before persistence. A failed
+synth/change set/stack update leaves the real config unchanged. A failed bake
+keeps the successfully deployed new version and the old backup.
 
 ## Inputs and safeguards
 
 Prerequisites: Bash, AWS CLI v2, Docker with a local `linux/amd64` desktop image,
 git, Python 3, coreutils (`timeout`, `realpath`, `cmp`), util-linux `flock`, Node
-and npm. Lifecycle dependencies must already be installed in
+and npm. AMI and lifecycle dependencies must already be installed in
 `infra/app-computers`; `npx --no-install` forbids fetching a different CDK.
 AWS credentials are managed by the lead's normal `ezil-admin` setup. Never
 print credentials, read `.pem` files, or run these scripts under a tracing
@@ -49,13 +78,14 @@ Defaults:
 | ECR repository | `452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6` |
 | Asset bucket | `ezil-mum-deploy-assets-452630323510` |
 | CloudFormation role | `arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec` |
+| AMI config | `/root/ezil-aws-mum/config/ami.mum.json` |
 | Lifecycle config | `/root/ezil-aws-mum/config/lifecycle.mum.json` |
 | Release evidence | `/root/ezil-aws-mum/release/next/` |
 | App secret | `ezil-os/billing-staging/app` |
 
 The role ARN follows `identityNames()` in
 `infra/app-computers/lib/identity.ts`, including `/ezil/identity/`.
-`--config` (promotion only) and `--release-dir` accept alternate local paths for
+`--config` (either script) and `--release-dir` accept alternate local paths for
 isolated tests or an explicitly selected release. They do not change AWS targets.
 There are no new environment variables or secret names. Keep a single operator
 and a shared release directory; its lock serializes local applies. Also exclude
@@ -89,11 +119,10 @@ check of AMI ownership, architecture and availability.
 
 ## Lead execution order
 
-Run from the integrated, reviewed EZiL-OS checkout. Resolve the immutable recipe
-blocker above before step 3's apply; under the current contract the procedure
-stops at its dry-run.
+Run from the integrated, reviewed EZiL-OS checkout. Keep the AMI config aligned
+with the live stack and use a fresh release directory for each successful update.
 
-1. Validate this lane offline, then install the pinned lifecycle dependencies on
+1. Validate this lane offline, then install the pinned infrastructure dependencies on
    the lead's authorized builder if they are absent:
 
    ```bash
@@ -109,16 +138,16 @@ stops at its dry-run.
    ```bash
    read -r -p 'Reviewed local desktop image: ' desktop_image
    read -r -p 'Reviewed host-agent source SHA: ' source_sha
-   bash deploy/aws/mum/rebuild-ami.sh --desktop-image "$desktop_image" --source-sha "$source_sha"
+   read -r -p 'New recipe version (greater than current): ' recipe_version
+   bash deploy/aws/mum/rebuild-ami.sh --desktop-image "$desktop_image" --source-sha "$source_sha" --recipe-version "$recipe_version"
    aws --profile ezil-admin --region ap-south-1 --no-cli-pager cloudformation get-template \
      --stack-name ezil-mum-ami --template-stage Original --query TemplateBody --output json
    ```
 
-3. **Only after the recipe contract and implementation are reconciled**, run the
-   approved rebuild and inspect its non-secret evidence:
+3. Run the approved rebuild and inspect its non-secret evidence:
 
    ```bash
-   bash deploy/aws/mum/rebuild-ami.sh --desktop-image "$desktop_image" --source-sha "$source_sha" --apply
+   bash deploy/aws/mum/rebuild-ami.sh --desktop-image "$desktop_image" --source-sha "$source_sha" --recipe-version "$recipe_version" --apply
    cat /root/ezil-aws-mum/release/next/desktop.txt
    cat /root/ezil-aws-mum/release/next/ami-id.txt
    aws --profile ezil-admin --region ap-south-1 --no-cli-pager ec2 describe-images \
@@ -177,12 +206,28 @@ stops at its dry-run.
 
 ## Rollback and partial failures
 
-Keep `release/next/promotion.json` and all old AMIs, snapshots, lifecycle versions
+Keep `release/next/previous-ami-config.json` (the old recipe version),
+`candidate-ami-config.json`, both templates, `promotion.json`, and all old AMIs,
+snapshots, lifecycle versions
 and referenced Lambda versions until canaries and rollback checks finish. After
 success, archive the entire release directory before starting a new promotion;
 an existing journal is deliberately not overwritten. Keep the default directory
 in place while either script holds its lock.
 
+A recipe update does not promote an AMI. If it fails, leave the old AMI and
+published lifecycle version in service. If CloudFormation succeeds but the
+process exits before config persistence or bake startup, retain
+`ami-update-complete.txt` and reconcile the saved candidate, old config and live
+stack before doing anything else. Do not blindly reset the config to the old
+version after a successful update: the live stack now uses the new version.
+The old config backup records the previous version; it is not a command to
+recreate that immutable version. CloudFormation controls replacement cleanup
+of the old recipe/component; these scripts retain AMIs, snapshots and lifecycle
+versions and do not delete them. Use a fresh, greater recipe version for a later
+rebuild. Config and stack writers using different release directories are not
+serialized by the local release lock; exclude them operationally.
+
+The existing `promote-ami.sh --rollback` behavior is unchanged.
 Rollback restores the **previous configured/published pair**, even when that
 version was older than the maximum published version at promotion. It never
 computes rollback by subtracting one. Run:
@@ -202,8 +247,8 @@ still exists. The lead must also verify its referenced Lambda versions and IAM
 permissions remain usable before enabling new admissions; version existence
 alone does not prove execution health.
 
-A failed synth/deploy leaves the journal and the edited local config; the app
-secret remains unchanged. A failure after secret write can leave the target
+For promotion, a failed synth/deploy leaves the journal and the edited local
+config; the app secret remains unchanged. A failure after secret write can leave the target
 pair active, so inspect the failure stage and use the saved journal. Rollback
 accepts the app secret already at either complete pair, refuses a mixed/drifted
 pair, and refuses unrelated local config changes. If rollback's CloudFormation
@@ -236,6 +281,8 @@ of previous images or snapshots.
 `tests/run.sh` uses fake `aws`, `docker`, `git`, `npm`, `npx`, `sleep` and `timeout`
 on PATH, with synthetic data under `/tmp`. It covers dry-run sequencing,
 parameter coverage, image identity, account/region guards, forbidden changes,
-immutable recipes, polling outcomes, promotion/rollback, and secret preservation
-and drift. No live AWS, Docker, Chromium, secret access, actual CDK synth or bake
-is covered by these tests; those remain lead checks.
+immutable recipes, explicit version replacements, synth/change-set allowlists,
+inline/S3 template selection, delayed config persistence, polling outcomes,
+promotion/rollback, and secret preservation and drift. No live AWS, Docker,
+Chromium, secret access, actual CDK synth or bake is covered by these tests;
+those remain lead checks.
