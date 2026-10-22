@@ -15,6 +15,7 @@ import rebase_manifest as manifest
 need = manifest.need
 STACKS = {'identity':'ezil-identity-mum','foundation':'ezil-mum-foundation','workflows':'ezil-mum-lifecycle'}
 ROLE = 'arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec'
+DEPENDENT_VERSION = {'action':'Modify','properties':['StateMachineRevisionId'],'attributes':[]}
 TYPES = {'AWS::IAM::Role','AWS::IAM::Policy','AWS::IAM::ManagedPolicy','AWS::Lambda::Function',
          'AWS::Lambda::Version','AWS::StepFunctions::StateMachine','AWS::StepFunctions::StateMachineVersion',
          'AWS::Logs::LogGroup','AWS::KMS::Key'}
@@ -233,7 +234,7 @@ def validate_templates(phase, before, after, review):
         if (resource and old.get(logical)==resource and resource['Type']=='AWS::StepFunctions::StateMachineVersion'
                 and revision=={'Fn::GetAtt':[source,'StateMachineRevisionId']}
                 and actual.get(source,{}).get('action')=='Modify'
-                and entry=={'action':'Modify','properties':['StateMachineRevisionId'],'attributes':[]}):
+                and entry==DEPENDENT_VERSION):
             actual[logical]=entry
     need(actual==review['changes'] and bool(actual),'review does not exactly enumerate template changes')
     return actual
@@ -289,7 +290,23 @@ def execute(phase, spec, directory, apply, aws, write, digest, sleep=time.sleep)
             need(set(r.get('Scope',[]))==({'Properties'} if expected['properties'] else set()) | set(expected['attributes']),'change-set scope mismatch')
         else:
             need(not r.get('Details') and not r.get('Scope'),'unexpected add/remove details')
-    need(seen==set(allowed),'change-set omits reviewed changes')
+    # With --include-property-values CloudFormation leaves out a dependent version's Dynamic
+    # StateMachineRevisionId replacement (seen live 2026-10-22); the plain view must still list it.
+    omitted=set(allowed)-seen
+    if omitted:
+        need(all(allowed[l]==DEPENDENT_VERSION and after['Resources'][l]['Type']=='AWS::StepFunctions::StateMachineVersion' for l in omitted),'change-set omits reviewed changes')
+        plain=aws('cloudformation','describe-change-set','--stack-name',spec['stackName'],'--change-set-name',spec['changeSetArn'])
+        need(plain['ChangeSetId']==spec['changeSetArn'] and not plain.get('NextToken'),'change-set identity/pagination mismatch')
+        for change in plain['Changes']:
+            r=change['ResourceChange']
+            if r['LogicalResourceId'] not in omitted:continue
+            source=after['Resources'][r['LogicalResourceId']]['Properties']['StateMachineRevisionId']['Fn::GetAtt'][0]
+            need(r['Action']=='Modify' and r['ResourceType']=='AWS::StepFunctions::StateMachineVersion' and r.get('Replacement') in ('True','Conditional')
+                 and bool(r.get('Details')) and all(d['Target'].get('Attribute')=='Properties' and d['Target'].get('Name')=='StateMachineRevisionId'
+                     and d['Target'].get('RequiresRecreation')=='Always' and d.get('ChangeSource')=='ResourceAttribute'
+                     and d.get('CausingEntity')==source+'.StateMachineRevisionId' for d in r['Details']),'unexplained dependent version change')
+            omitted.discard(r['LogicalResourceId'])
+    need(not omitted,'change-set omits reviewed changes')
     live=template_body(aws('cloudformation','get-template','--stack-name',spec['stackName'],'--template-stage','Original'))
     path=Path(directory)/(phase+'-cloudformation.json')
     state=manifest.read(path) if path.exists() else None

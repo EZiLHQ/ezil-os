@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline lane-E contract tests; all cloud/host objects here are local doubles."""
+import contextlib
 import copy
 import importlib.util
 import json
@@ -257,6 +258,40 @@ class DependentVersionReviewTests(unittest.TestCase):
         c, b, a, r = self.docs({'Ver': {'action': 'Modify', 'properties': ['StateMachineRevisionId'], 'attributes': []}})
         a['Resources']['Wf']['Properties']['DefinitionString'] = 'a'; r['changes'].pop('Wf')
         with self.assertRaises(ValueError): c.validate_templates('workflows-test', b, a, r)
+
+
+class DependentVersionExecuteTests(DependentVersionReviewTests):
+    """The property-values change-set view omits the dependent version; the plain view must list it."""
+    def run_execute(self, plain_details):
+        import hashlib, tempfile
+        c, b, a, r = self.docs({'Ver': {'action': 'Modify', 'properties': ['StateMachineRevisionId'], 'attributes': []}})
+        root = Path(tempfile.mkdtemp()); spec = {'stackName': c.STACKS['workflows'], 'roleArn': c.ROLE,
+            'changeSetArn': 'arn:aws:cloudformation:ap-south-1:452630323510:changeSet/x/11111111-1111-4111-8111-111111111111'}
+        for key, value in (('beforeTemplate', b), ('candidateTemplate', a), ('review', r)):
+            path = root / (key + '.json'); path.write_text(json.dumps(value)); spec[key + 'Path'] = str(path)
+            spec[key + 'Sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        wf = {'ResourceChange': {'LogicalResourceId': 'Wf', 'ResourceType': 'AWS::StepFunctions::StateMachine', 'Action': 'Modify', 'Replacement': 'False', 'Scope': ['Properties'],
+              'Details': [{'Target': {'Attribute': 'Properties', 'Name': 'DefinitionString', 'RequiresRecreation': 'Never'}, 'ChangeSource': 'DirectModification'}]}, 'Type': 'Resource'}
+        ver = {'ResourceChange': {'LogicalResourceId': 'Ver', 'ResourceType': 'AWS::StepFunctions::StateMachineVersion', 'Action': 'Modify', 'Replacement': 'Conditional',
+               'Scope': ['Properties'], 'Details': plain_details}, 'Type': 'Resource'}
+        def aws(*args):
+            if args[1] == 'describe-change-set':
+                changes = [wf] if '--include-property-values' in args else [wf, ver]
+                return {'ChangeSetId': spec['changeSetArn'], 'StackName': spec['stackName'], 'Status': 'CREATE_COMPLETE', 'ExecutionStatus': 'AVAILABLE', 'Changes': changes, 'Parameters': None}
+            if args[1] == 'get-template': return {'TemplateBody': a if '--change-set-name' in args else b}
+            if args[1] == 'describe-stacks': return {'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'RoleARN': c.ROLE}]}
+            raise AssertionError(args)
+        digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        with contextlib.redirect_stdout(io.StringIO()): return c.execute('workflows', spec, root, False, aws, None, digest)
+
+    def test_plain_view_dependent_version_satisfies_review(self):
+        self.assertIsNone(self.run_execute([{'Target': {'Attribute': 'Properties', 'Name': 'StateMachineRevisionId', 'RequiresRecreation': 'Always'},
+                                             'ChangeSource': 'ResourceAttribute', 'Evaluation': 'Dynamic', 'CausingEntity': 'Wf.StateMachineRevisionId'}]))
+
+    def test_plain_view_must_explain_the_dependent_version(self):
+        for bad in ([], [{'Target': {'Attribute': 'Properties', 'Name': 'StateMachineArn', 'RequiresRecreation': 'Always'}, 'ChangeSource': 'ResourceAttribute', 'CausingEntity': 'Wf.StateMachineRevisionId'}],
+                    [{'Target': {'Attribute': 'Properties', 'Name': 'StateMachineRevisionId', 'RequiresRecreation': 'Always'}, 'ChangeSource': 'ResourceAttribute', 'CausingEntity': 'Other.StateMachineRevisionId'}]):
+            with self.assertRaises(ValueError): self.run_execute(bad)
 
 
 class RecoveryAddTypesTests(DependentVersionReviewTests):
