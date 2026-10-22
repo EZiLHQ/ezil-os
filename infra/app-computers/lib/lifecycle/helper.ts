@@ -321,7 +321,11 @@ function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:str
 }
 function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
-    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)||instance.SubnetId!==i.deployment.subnetId
+    // EC2 clears SubnetId on a terminated instance but keeps its id and tags, so a terminated
+    // source is identified by those; a subnet that IS reported must still be the configured one.
+    const terminated=instance.State?.Name==='terminated';
+    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)
+        ||(terminated?instance.SubnetId!==undefined&&instance.SubnetId!==i.deployment.subnetId:instance.SubnetId!==i.deployment.subnetId)
         ||(instance.Placement?.AvailabilityZoneId!==undefined&&instance.Placement.AvailabilityZoneId!==i.deployment.zoneId))return fail('lifecycle_instance_invalid');
 }
 /** Terminate guard: an instance carrying anything beyond its root disk and

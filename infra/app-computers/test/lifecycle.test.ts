@@ -19,7 +19,7 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
     if(options.deleteDisk)f.state.instances[0]!.BlockDeviceMappings!.find(m=>m.DeviceName==='/dev/sdf')!.Ebs!.DeleteOnTermination=true;
     if(options.extraDisk)f.state.instances[0]!.BlockDeviceMappings!.push({DeviceName:'/dev/sdg',Ebs:{VolumeId:'vol-99999999999999999',Status:'attached',DeleteOnTermination:false}});
     if(options.staleOldAfterLaunch){const original=f.deps.instances;let stale=true;f.deps.instances=async selector=>{
-        const rows=await original(selector);if(Array.isArray(selector)&&f.state.instances.length===2&&stale){stale=false;rows[0]!.instance.State={Name:'stopped'};}return rows;};}
+        const rows=await original(selector);if(Array.isArray(selector)&&f.state.instances.length===2&&stale){stale=false;rows[0]!.instance.State={Name:'stopped'};rows[0]!.instance.SubnetId=f.i.deployment.subnetId;}return rows;};}
     const calls:{action:string;parameters:any}[]=[];let lost=false,failures=0;
     for(const s of Object.values(graph.States) as any[])if(s.Type==='Task'&&s.Resource!=='helper')assert.equal(s.Retry,undefined,'EC2 tasks never retry automatically');
     const result=await runAsl(graph,{input:f.envelope,executionArn:f.executionArn,sleep:seconds=>{f.state.now+=seconds*1000;},
@@ -34,7 +34,9 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
                 if(action==='startInstances')target!.State={Name:'running'};
                 if(action==='stopInstances')target!.State={Name:'stopped'};
                 if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:'terminated'};
-                    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];}
+                    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];
+                    // Real EC2 clears network placement on a terminated instance (seen live 2026-10-22).
+                    delete target!.SubnetId;delete target!.VpcId;target!.SecurityGroups=[];target!.NetworkInterfaces=[];}
                 if(action==='createTags'){const v=f.state.volumes[0]!;v.Tags=[...v.Tags!.filter(t=>!parameters.Tags.some((n:any)=>n.Key===t.Key)),...parameters.Tags];}
                 if(action==='attachVolume')f.attach(f.state.volumes[0]!,target!);
                 if(action==='modifyInstanceAttribute')assert.equal(target!.State?.Name,'stopped');
