@@ -142,7 +142,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             return JSON.parse(expr.includes('::text::jsonb') ? String(parameter) : JSON.stringify(parameter));
         }
         if (expr === "'aws-ec2'") return 'aws-ec2';
-        if (expr === 'now()') return clock();
+        if (expr === 'now()' || expr === "date_trunc('milliseconds', now())") return clock();
         if (/^\d+$/.test(expr)) return Number(expr);
         throw new Error(`fake db: unsupported value expression ${expr}`);
     };
@@ -343,7 +343,16 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 const m = text.match(/\(([^)]*)\)\s*VALUES\s*\(([\s\S]*)\)\s*RETURNING/);
                 if (!m) throw new Error('fake db: unparsed insert');
                 const cols = m[1]!.split(',').map((s) => s.trim());
-                const vals = m[2]!.split(',').map((s) => s.trim());
+                // Timestamp functions contain commas; split only at the top level.
+                const vals: string[] = [];
+                let depth = 0, start = 0;
+                const values = m[2]!;
+                for (let k = 0; k < values.length; k++) {
+                    if (values[k] === '(') depth++;
+                    else if (values[k] === ')') depth--;
+                    else if (values[k] === ',' && depth === 0) { vals.push(values.slice(start, k).trim()); start = k + 1; }
+                }
+                vals.push(values.slice(start).trim());
                 const row: Row = imageTable ? {} : placementRow({ computer_id: '' });
                 cols.forEach((c, i) => (row[c] = value(vals[i]!, params)));
                 writeRows.push(row);
@@ -392,6 +401,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 }
                 assignments.push(setText.slice(start).trim());
                 const sets = assignments.map((assign) => {
+                    if (assign === "updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')") {
+                        return (r: Row) => { r.updated_at = new Date(Math.max(clock().getTime(), instant(r.updated_at) + 1)); };
+                    }
                     const inc = assign.match(/^(\w+) = (\w+) \+ (\$\d+)$/);
                     if (inc) return (r: Row) => (r[inc[1]!] = Number(r[inc[2]!]) + Number(value(inc[3]!, params)));
                     // Postgres GREATEST ignores NULLs: NULL only when both sides are.

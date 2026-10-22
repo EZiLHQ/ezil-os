@@ -748,7 +748,9 @@ describe('authenticated lower-image observations', () => {
     it('backfills an ordinary host in the nonce transaction and rejects a different replay digest', async () => {
         const s = setup();
         expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
-        expect(s.placements[0]).toMatchObject({ lower_image_digest: digest, lower_digest_observed_at: NOW, enroll_nonce_hash: null });
+        expect(s.placements[0]).toMatchObject({ lower_image_digest: digest, enroll_nonce_hash: null });
+        // The production driver binds ISO text; compare the instant, not the JS representation.
+        expect(new Date(s.placements[0]!.lower_digest_observed_at as string | Date).getTime()).toBe(NOW.getTime());
         expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
         expect((await s.enroll(hostBody({ lowerImageDigest: 'sha256:' + 'b'.repeat(64) }))).body).toMatchObject({ error: 'host_digest_mismatch' });
         expect(s.placements[0]!.lower_image_digest).toBe(digest);

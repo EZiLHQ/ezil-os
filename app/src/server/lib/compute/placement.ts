@@ -290,6 +290,13 @@ export type PlacementFields = Partial<{
     [K in keyof typeof MUTABLE_COLUMNS]: (typeof MUTABLE_COLUMNS)[K][1] extends 'timestamptz' ? Date | null : string | null;
 }>;
 
+// Placement.updatedAt is a JavaScript Date and the generation CAS uses exact
+// SQL equality. Every placement updated_at writer must therefore store whole
+// milliseconds. Advance at least 1 ms on updates, even within one transaction
+// (now() is fixed there), so a same-state write always invalidates old snapshots.
+const PLACEMENT_INSERT_TIME = sql`date_trunc('milliseconds', now())`;
+const PLACEMENT_UPDATE_TIME = sql`GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')`;
+
 const SELECT_COLUMNS = sql.raw(
     [
         'computer_id::text AS computer_id', 'owner_user_id::text AS owner_user_id', 'provider', 'workspace_store', 'generation::text AS generation',
@@ -428,7 +435,7 @@ export async function lockImagePlacement(tx: PlacementExecutor, lock: AdmissionL
 export async function setImageReservation(tx: PlacementExecutor, lock: AdmissionLock, p: ImagePlacement, jobId: string | null): Promise<void> {
     assertAdmissionLock(tx, lock);
     const rows = rowsOf(await tx.execute(sql`/* placement:image-cas */ UPDATE public.ezil_computer_placements
-        SET image_upgrade_job_id = ${jobId}::uuid, updated_at = now()
+        SET image_upgrade_job_id = ${jobId}::uuid, updated_at = ${PLACEMENT_UPDATE_TIME}
         WHERE computer_id = ${p.computerId}::uuid AND owner_user_id = ${p.ownerUserId}::uuid
           AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
           AND image_upgrade_job_id IS NOT DISTINCT FROM ${p.imageUpgradeJobId}::uuid RETURNING computer_id`));
@@ -448,11 +455,14 @@ export async function writeImagePlacement(tx: PlacementExecutor, lock: Admission
     const assignments = Object.entries(fields).map(([key, value]) => {
         const type = types[key as keyof ImagePlacementFields];
         if (!type) throw new ImageJobConflictError();
-        return sql`${sql.raw(key.replace(/[A-Z]/g, c => '_' + c.toLowerCase()))} = ${value}::${sql.raw(type)}`;
+        // Drizzle's postgres-js timestamp serializer passes values through;
+        // postgres-js Bind expects text, not a Date object.
+        const param = value instanceof Date ? value.toISOString() : value;
+        return sql`${sql.raw(key.replace(/[A-Z]/g, c => '_' + c.toLowerCase()))} = ${param}::${sql.raw(type)}`;
     });
     if (fields.leaseEpoch !== undefined && fields.leaseEpoch < p.leaseEpoch) throw new ImageJobConflictError();
     const rows = rowsOf(await tx.execute(sql`/* placement:image-write */ UPDATE public.ezil_computer_placements
-        SET ${sql.join(assignments, sql`, `)}, updated_at = now()
+        SET ${sql.join(assignments, sql`, `)}, updated_at = ${PLACEMENT_UPDATE_TIME}
         WHERE computer_id = ${p.computerId}::uuid AND owner_user_id = ${p.ownerUserId}::uuid
           AND provider = 'aws-ec2' AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
           AND fence_token IS NOT DISTINCT FROM ${p.fenceToken}::uuid
@@ -641,7 +651,7 @@ async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput,
         sql`1`,
         sql.raw(String(INITIAL_LEASE_EPOCH[input.provider])),
         sql`${input.state}`,
-        sql`now()`,
+        PLACEMENT_INSERT_TIME,
         ...keys.map((k) => valueSql(k, fields[k] ?? null)),
     ];
     const rows = rowsOf(
@@ -854,7 +864,7 @@ async function casInTx(
                     ? sql`${col} = GREATEST(${col}, ${valueSql(k, fields[k] ?? null)})`
                     : sql`${col} = ${valueSql(k, fields[k] ?? null)}`;
             }),
-        sql`updated_at = now()`,
+        sql`updated_at = ${PLACEMENT_UPDATE_TIME}`,
     ];
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
@@ -1250,7 +1260,7 @@ export async function consumeEnrollmentNonce(
         if (result.ok && input.lowerImageDigest !== undefined) {
             if (!/^sha256:[0-9a-f]{64}$/.test(input.lowerImageDigest) || !input.observedAt || !Number.isFinite(input.observedAt.getTime())) throw new ImageJobConflictError();
             const rows = rowsOf(await tx.execute(sql`/* placement:enroll-digest */ UPDATE public.ezil_computer_placements
-                SET lower_image_digest = ${input.lowerImageDigest}, lower_digest_observed_at = ${input.observedAt}
+                SET lower_image_digest = ${input.lowerImageDigest}, lower_digest_observed_at = ${input.observedAt.toISOString()}::timestamptz
                 WHERE computer_id = ${input.computerId}::uuid AND generation = ${result.placement.generation} AND lease_epoch = ${result.placement.leaseEpoch}
                   AND enroll_consumed_hash = ${input.nonceHash} AND image_upgrade_job_id IS NULL RETURNING computer_id`));
             if (rows.length !== 1) throw new ImageJobConflictError();
