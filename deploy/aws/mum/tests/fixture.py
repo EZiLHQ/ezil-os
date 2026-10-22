@@ -28,7 +28,7 @@ params = {
     "CloudflaredSha256": "0" * 64, "EnrollUrl": "https://os-staging.ezil.work/api/compute/aws/enroll",
     "FutureParameter": "must-remain",  # proves coverage is discovered, not hard-coded
 }
-save("stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", "Parameters": [
+save("stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", **({} if json.loads(sys.argv[2]).get("no_stack_role") else {"RoleARN": "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec"}), "Parameters": [
     {"ParameterKey": k, "ParameterValue": v, **({"ResolvedValue": "ami-" + "1" * 17} if k == "UbuntuAmiId" else {})} for k, v in params.items()
 ], "Outputs": [{"OutputKey": "PipelineArn", "OutputValue": "arn:aws:imagebuilder:ap-south-1:452630323510:image-pipeline/ezil-host-mum"}]}]})
 save("ami-config.json", {"namespace": "mum", "accountId": "452630323510", "region": "ap-south-1", "version": "1.0.1"})

@@ -53,6 +53,15 @@ digest='<ECR-manifest-digest>'
 json parameters "$work/stack.json" "$digest" "$image_id" "$source_uri" "$work/parameters.json"
 template_args=(--use-previous-template)
 template_uri=
+# Follow the stack's own deployment role: ezil-mum-ami was created with caller
+# credentials (no RoleARN); passing the exec role would re-associate it with a role
+# that cannot resolve the public Ubuntu SSM parameter.
+stack_role=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Stacks"][0].get("RoleARN") or "")' "$work/stack.json")
+role_args=()
+if [[ -n "$stack_role" ]]; then
+    [[ "$stack_role" == "$exec_role" ]] || die "ezil-mum-ami is bound to an unexpected role: $stack_role"
+    role_args=(--role-arn "$exec_role")
+fi
 validation_args=()
 if [[ -n "$recipe_version" ]]; then
     # README host-AMI step (d), package.json synth:ami, and bin/ami.ts.
@@ -119,7 +128,7 @@ say 'Exact parameter request (only the three allowed values change):'
 cat "$work/parameters.json"
 if [[ -n "${template_uri:-}" ]]; then aws_act s3 cp "$candidate_template" "$template_uri"; fi
 aws_act cloudformation create-change-set --stack-name ezil-mum-ami --change-set-name "$change" --change-set-type UPDATE \
-    "${template_args[@]}" --role-arn "$exec_role" --capabilities CAPABILITY_NAMED_IAM --parameters "file://$work/parameters.json"
+    "${template_args[@]}" "${role_args[@]}" --capabilities CAPABILITY_NAMED_IAM --parameters "file://$work/parameters.json"
 if ! "$apply"; then
     show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-ami --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-ami --change-set-name "$change" --include-property-values --output json

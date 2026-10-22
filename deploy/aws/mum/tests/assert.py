@@ -89,6 +89,9 @@ elif mode == "dry-rebuild":
     positions = [output.index(p) for p in sequence]
     assert positions == sorted(positions)
     assert "host-aaaaaaaaaaaa-" in output and "immutable" in output
+elif mode == "no-stack-role":
+    create = next(c for c in calls if "create-change-set" in c)
+    assert "--role-arn" not in create, create
 elif mode == "index-child":
     values = {p["ParameterKey"]: p.get("ParameterValue") for p in read("requested.json")}
     assert values["DesktopImageDigest"] == values["DesktopImageId"] == "sha256:" + "e" * 64, values
