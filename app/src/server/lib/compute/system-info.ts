@@ -18,7 +18,7 @@
 import { SIZES } from '@/server/billing/v2/contract';
 import { deriveGuacamoleSandboxId, getGuacamoleSandboxSystem, resolveCloudflareGuacamoleConfig } from '../cloudflare-guacamole-provider';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
-import { readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { PlacementOwnerError, readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
 
 /**
  * Configured size of every AWS instance type a computer may record (aws-config.ts
@@ -170,8 +170,10 @@ export async function readSystemInfo(
     }
     let placement: ResolvedPlacement;
     try {
-        placement = await readPlacement(db, computer.computerId);
-    } catch {
+        // Owner first: a foreign placement is NOT_FOUND (null) before any image-reservation lookup.
+        placement = await readPlacement(db, computer.computerId, computer.userId);
+    } catch (error) {
+        if (error instanceof PlacementOwnerError) return null;
         return { provider: 'unknown', providerSource: 'unavailable', image: { ...UNKNOWN_IMAGE }, machine: { ...UNKNOWN_MACHINE }, lifecycleState: null, usage: null };
     }
     if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) return null;

@@ -150,6 +150,16 @@ describe('readSystemInfo — read only, honest about what is not known', () => {
         expectNoWorkerCall();
     });
 
+    it("another user's placement under an active image job: null (→ NOT_FOUND) before any reservation lookup", async () => {
+        const { db, statements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: computerId, owner_user_id: OTHER, provider: 'aws-ec2', workspace_store: 'ebs', image_upgrade_job_id: '33333333-3333-4333-8333-333333333333' })],
+            imageJobs: [{ job_id: '33333333-3333-4333-8333-333333333333', computer_id: computerId, phase: 'snapshot_pending' }],
+        });
+        expect(await readSystemInfo(db, computer, READS)).toBeNull();
+        expect(statements.some((st: { sql: string }) => st.sql.includes('placement:image-reservation'))).toBe(false);
+        expectNoWorkerCall();
+    });
+
     it('an unreadable placement (missing table, duplicate, unknown provider): "unknown", not Cloudflare', async () => {
         const missing = { execute: async () => { throw new Error('relation "public.ezil_computer_placements" does not exist'); } };
         expect(await readSystemInfo(missing, computer, READS)).toMatchObject({ provider: 'unknown', providerSource: 'unavailable', image: UNKNOWN_IMAGE });
