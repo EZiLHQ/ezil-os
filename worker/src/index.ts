@@ -540,6 +540,7 @@ import {
   type FlushR2BucketLike,
   type GcR2BucketLike,
 } from './workspace-persist';
+import { exportedSnapshot, exportedChunk, reopenMigrationHeads, MigrationRequestError } from './workspace-migration-export';
 import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
@@ -827,6 +828,11 @@ interface EzilWorkspacePersistRpc {
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
+  beginMigrationExport: EzilSandboxDO['beginMigrationExport'];
+  commitMigration: EzilSandboxDO['commitMigration'];
+  abortMigrationExport: EzilSandboxDO['abortMigrationExport'];
+  reopenMigration: EzilSandboxDO['reopenMigration'];
+  exportMigration: EzilSandboxDO['exportMigration'];
   flushWorkspaceNow(): Promise<FlushOutcome>;
   /**
    * The `POST /sandbox/:name/activity` implementation's DO-side write. See
@@ -3319,7 +3325,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return { systemChangesNotSaved: (await this.ctx.storage.get<{ reason: string; at: number }>(SYSTEM_CHANGES_NOT_SAVED_KEY)) ?? null };
   }
 
-  // ── Migration export (C-7). Operator tooling (M1) drives these; no route yet. ──
+  // ── Migration export (C-7), driven by signed control routes. ──
 
   /**
    * Start exporting this computer: take a final checkpoint of a running
@@ -3329,7 +3335,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * heads the export must copy and later commit against.
    */
   async beginMigrationExport(): Promise<
-    | { ok: true; store: WorkspaceStoreKind; prefix: string; head: { generation: string; chunkGeneration: string; sha256: string; entries: number; chunks: number; etag: string }; systemEtag: string | null }
+    | { ok: true; store: WorkspaceStoreKind; prefix: string; head: { generation: string; chunkGeneration: string; sha256: string; entries: number; chunks: number; totalBytes: number; etag: string }; systemEtag: string | null }
     | { ok: false; reason: string }
   > {
     return this.withWorkspacePersistence(async () => {
@@ -3364,13 +3370,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const systemTooLarge = await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY);
       if (systemTooLarge === true) return { ok: false as const, reason: 'system_too_large' };
       if (systemHead && systemTooLarge !== false) return { ok: false as const, reason: 'system_size_unknown' };
-      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag }));
+      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag,
+        systemHeadEtag: systemHead?.etag ?? null }));
       if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
       const s = head.snapshot;
       return {
         ok: true as const, store: store.kind, prefix: wctx.prefix, systemEtag: systemHead?.etag ?? null,
         head: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation, sha256: s.sha256,
-          entries: s.entries, chunks: s.chunks.length, etag: head.etag },
+          entries: s.entries, chunks: s.chunks.length, totalBytes: s.chunks.reduce((sum, chunk) => sum + chunk.size, 0), etag: head.etag },
       };
     });
   }
@@ -3440,6 +3447,50 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (!wctx || !store.ok || !store.store) return { ok: false };
       await (store.store as unknown as { delete(keys: string[]): Promise<unknown> }).delete([`${wctx.prefix}/${MIGRATING_FLAG}`]);
       return { ok: true };
+    });
+  }
+
+  async reopenMigration(params: { expectedMigratedEtag: string }): Promise<{ ok: true } | { ok: false; reason: string }> {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
+      try {
+        return await reopenMigrationHeads(store.store, wctx.prefix, systemPrefixOf(wctx.prefix), params.expectedMigratedEtag);
+      } catch (err) {
+        return { ok: false as const, reason: err instanceof MigrationRequestError ? err.reason : 'reopen_failed' };
+      }
+    });
+  }
+
+  async exportMigration(index?: number, generation?: string, layer: 'workspace' | 'system' = 'workspace'): Promise<Response> {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return json({ ok: false, error: 'no_context' }, 409);
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return json({ ok: false, error: 'store_unavailable' }, 503);
+      const prefix = layer === 'system' ? systemPrefixOf(wctx.prefix) : wctx.prefix;
+      if (!prefix) return json({ ok: false, error: 'no_system_snapshot' }, 404);
+      try {
+        if (index === undefined) {
+          const head = await exportedSnapshot(store.store, prefix, wctx.prefix);
+          const response = json(head.snapshot);
+          // Identifies this layer's current head; rollback uses the workspace marker etag.
+          response.headers.set('etag', `"${head.etag}"`);
+          response.headers.set('cache-control', 'no-store');
+          return response;
+        }
+        const { body, chunk } = await exportedChunk(store.store, prefix, index, generation, wctx.prefix);
+        return new Response(body, { headers: { ...corsHeaders, 'content-type': 'application/octet-stream',
+          'content-length': String(chunk.size), 'x-ezil-chunk-sha256': chunk.sha256, 'cache-control': 'no-store' } });
+      } catch (err) {
+        if (layer === 'system' && err instanceof MigrationRequestError && err.reason === 'no_checkpoint') {
+          return json({ ok: false, error: 'no_system_snapshot' }, 404);
+        }
+        return json({ ok: false, error: err instanceof MigrationRequestError ? err.reason : 'export_failed' },
+          err instanceof MigrationRequestError ? err.status : 503);
+      }
     });
   }
 
@@ -7371,6 +7422,50 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleTelemetryAck(request, env);
+    }
+
+    const migrationMatch = path.match(/^\/sandbox\/([^/]+)\/migrate\/(begin|commit|abort|reopen|export\/(?:system\/)?(?:head|chunk\/([^/]+)))$/);
+    if (migrationMatch && ((method === 'POST' && !migrationMatch[2].startsWith('export/'))
+      || (method === 'GET' && migrationMatch[2].startsWith('export/')))) {
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      const action = migrationMatch[2];
+      let body: Record<string, unknown> = {};
+      const validEtag = (value: unknown): value is string => typeof value === 'string' && value.length > 0
+        && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
+      if (action === 'commit' || action === 'reopen') {
+        try {
+          const parsed: unknown = await request.json();
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+          body = parsed as Record<string, unknown>;
+        } catch { return json({ ok: false, error: 'invalid_body' }, 400); }
+        if (action === 'commit' && (!(MIGRATION_TARGETS as readonly unknown[]).includes(body.targetProvider)
+          || !validEtag(body.expectedEtag) || !(body.expectedSystemEtag === null || validEtag(body.expectedSystemEtag)))) {
+          return json({ ok: false, error: 'invalid_body' }, 400);
+        }
+        if (action === 'reopen' && !validEtag(body.expectedMigratedEtag)) return json({ ok: false, error: 'invalid_body' }, 400);
+      }
+      const index = migrationMatch[3] === undefined ? undefined : Number(migrationMatch[3]);
+      if (migrationMatch[3] !== undefined && (!/^(0|[1-9][0-9]*)$/.test(migrationMatch[3]) || !Number.isSafeInteger(index))) {
+        return json({ ok: false, error: 'invalid_chunk_index' }, 400);
+      }
+      try {
+        const sandbox = openSandbox(env, decodeURIComponent(migrationMatch[1]));
+        if (action.startsWith('export/')) return await sandbox.exportMigration(index, url.searchParams.get('generation') ?? undefined,
+          action.startsWith('export/system/') ? 'system' : 'workspace');
+        if (action === 'begin') {
+          const result = await sandbox.beginMigrationExport();
+          if (!result.ok) return json({ ok: false, error: result.reason }, 409);
+          return json({ etag: result.head.etag, systemEtag: result.systemEtag, generation: result.head.generation,
+            chunkCount: result.head.chunks, totalBytes: result.head.totalBytes, sha256: result.head.sha256 });
+        }
+        const result = action === 'commit'
+          ? await sandbox.commitMigration(body as { targetProvider: MigrationTarget; expectedEtag: string; expectedSystemEtag: string | null })
+          : action === 'reopen' ? await sandbox.reopenMigration(body as { expectedMigratedEtag: string })
+          : await sandbox.abortMigrationExport();
+        if (!result.ok) return json({ ok: false, error: 'reason' in result ? result.reason : 'migration_failed' }, 409);
+        return json(result);
+      } catch { return json({ ok: false, error: 'migration_failed' }, 503); }
     }
 
     const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);
