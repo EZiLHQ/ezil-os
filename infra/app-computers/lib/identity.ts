@@ -118,6 +118,7 @@ const PURCHASES = ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2
  * Keep actions explicit: no deployment, IAM, KMS administration or EC2 Describe*
  * in the workload allowlist. */
 export const WORKLOAD_UNSCOPABLE = ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeImages',
+    'ec2:DescribeSnapshots',
     'ec2:DescribeLaunchTemplateVersions', 'ec2:DescribeAvailabilityZones', 'logs:DescribeLogGroups',
     'logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery', 'logs:DeleteLogDelivery',
     'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies'] as const;

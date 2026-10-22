@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DIGEST } from './strict-json.js';
 
 /** R10: closed allowlist. A deployment may narrow this list but never extend it.
  * - t3a.medium / t3.medium (2 vCPU / 4 GiB): the free tier. The founder decided
@@ -88,8 +89,21 @@ export const LifecycleDeploymentSchema = z.object({
     amiId: z.string().regex(/^ami-[a-f0-9]{17}$/), namespace: NamespaceSchema,
     instanceTypes: z.array(InstanceTypeSchema).min(1).max(INSTANCE_TYPES.length),
     storage: StorageSchema,
-    dataKeyArn: z.string(), stateMachineVersionArn: z.string(),
+    dataKeyArn: z.string(), stateMachineVersionArn: z.string().max(300),
+    lowerImageDigest: DIGEST.optional(), previousLowerImageDigest: DIGEST.nullable().optional(),
+    preparationStateMachineVersionArn: z.string().max(300).optional(),
+    recoveryStateMachineVersionArn: z.string().max(300).optional(),
 }).strict().superRefine((d, ctx) => {
+    const tuple = [d.lowerImageDigest, d.previousLowerImageDigest, d.preparationStateMachineVersionArn, d.recoveryStateMachineVersionArn];
+    if (tuple.some(v => v !== undefined)) {
+        if (tuple.some(v => v === undefined) || d.lowerImageDigest === d.previousLowerImageDigest)
+            ctx.addIssue({ code: 'custom', message: 'invalid_release_tuple' });
+        for (const [field, name] of [['preparationStateMachineVersionArn', 'rebase-preparation'], ['recoveryStateMachineVersionArn', 'recovery']] as const) {
+            if (!new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:[1-9][0-9]*$`).test(d[field] ?? '')
+                || machineName(d[field] ?? '') === machineName(d.stateMachineVersionArn))
+                ctx.addIssue({ code: 'custom', path: [field], message: 'invalid_release_workflow' });
+        }
+    }
     if (!zoneIdMatchesRegion(d.zoneId, d.region)) ctx.addIssue({ code: 'custom', path: ['zoneId'], message: 'zone_not_in_region' });
     // Exec-role IAM scopes state machines to ezil-<ns>-* names.
     if (!machineName(d.stateMachineVersionArn).startsWith(`ezil-${d.namespace}-`))

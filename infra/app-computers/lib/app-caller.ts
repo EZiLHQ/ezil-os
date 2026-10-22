@@ -1,6 +1,21 @@
-import { CfnOutput, aws_iam as iam } from 'aws-cdk-lib';
+import { CfnOutput, Stack, aws_iam as iam } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { z } from 'zod';
+import { historyReadStatement } from './rebase-preparation.js';
+
+/** Owned constructs register their exact grants before the existing bin
+ * creates AppCaller. No bin edit or guessed history key is needed. */
+type ImageWorkflow = { version: string; historyKeyArn: string; authorityKeyArn?: string };
+const imageWorkflows = new WeakMap<Stack, Map<string, ImageWorkflow[]>>();
+export function registerImageWorkflow(scope: Construct, lifecycleVersion: string, version: string, historyKeyArn: string, authorityKeyArn?: string) {
+    const stack = Stack.of(scope), groups = imageWorkflows.get(stack) ?? new Map<string, ImageWorkflow[]>();
+    const list = groups.get(lifecycleVersion) ?? [];
+    if (!list.some(v => v.version === version)) list.push({ version, historyKeyArn, authorityKeyArn });
+    groups.set(lifecycleVersion, list); imageWorkflows.set(stack, groups);
+}
+export function registeredImageWorkflows(scope: Construct, lifecycleVersion: string) {
+    return imageWorkflows.get(Stack.of(scope))?.get(lifecycleVersion) ?? [];
+}
 
 /** One OIDC issuer the app runs under. The subject is matched exactly
  * (StringEquals), so it must not contain IAM wildcards. */
@@ -126,6 +141,15 @@ export class AppCaller extends Construct {
             }));
         }
         for (const s of appCallerStatements(props.region, props.versionArns, props.historyKeyArn)) this.role.addToPolicy(s);
+        const added = props.versionArns.flatMap(v => registeredImageWorkflows(this, v));
+        if (added.length) {
+            const versions = [...new Set(added.map(v => v.version))];
+            for (const statement of startVersionStatements(versions)) this.role.addToPolicy(statement);
+            this.role.addToPolicy(new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: versions.map(v =>
+                v.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*') }));
+            for (const key of new Set(added.map(v => v.historyKeyArn))) this.role.addToPolicy(historyReadStatement(props.region, key, added.filter(v => v.historyKeyArn === key).map(v => v.version)));
+            this.role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeSnapshots'], resources: ['*'], conditions: { StringEquals: { 'aws:RequestedRegion': props.region } } }));
+        }
         new CfnOutput(this, 'RoleArn', { value: this.role.roleArn });
     }
 }

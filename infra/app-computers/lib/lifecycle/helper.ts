@@ -6,6 +6,9 @@ import { MAX_THROTTLE_RETRIES, NO_ERROR, RecordedErrorSchema, classifyProviderEr
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
 import { awsDependencies, type Dependencies } from './aws.js';
 import { BURSTABLE_CREDITS, isBurstable } from './deployment.js';
+import { assertPermitTime, parseLease } from './lease.js';
+import { verifyPreparation } from './preparation-evidence.js';
+import { strictJson } from './strict-json.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases),
     lastError:RecordedErrorSchema.default(NO_ERROR),throttles:z.number().int().min(0).max(100).default(0)}).strict();
 export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
@@ -31,7 +34,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(execution.executionArn!==event.executionArn||execution.stateMachineArn!==machine||execution.stateMachineVersionArn!==version
             ||execution.stateMachineAliasArn||execution.redriveCount!==0||execution.status!=='RUNNING'||!execution.input
             ||Buffer.byteLength(execution.input)>20000||!execution.startDate)return fail();
-        const envelope=EnvelopeSchema.parse(JSON.parse(execution.input));
+        const envelope=EnvelopeSchema.parse(strictJson(execution.input,20000));
         const work={...envelope,createdAt:execution.startDate},i=parseLifecycleWork(work);
         if(!equal(i.deployment,d)||execution.name!==`computer-${i.jobId}`
             ||event.executionArn!==machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`)return fail('lifecycle_invalid');
@@ -39,6 +42,20 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(!Number.isFinite(started)||started>now+30000||now-started>900000)return fail('lifecycle_expired');
         if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
         const action=async(name:Action,parameters:object)=>{
+            if (i.rebasePreparation && (name === 'runInstances' || name === 'runBurstableInstances')) {
+                const lease = parseLease(i.userData!);
+                // Recovery rebind remains closed until its independent recovery
+                // execution and quarantine evidence are verified.
+                if (lease.ebsRestore) return fail('restore_lineage_mismatch');
+                const verified = await verifyPreparation(i.rebasePreparation, d.preparationStateMachineVersionArn!, deps);
+                const p = verified.document, receipt = verified.receipt;
+                if (!equal(p.deployment, d) || p.computerId !== i.computerId || p.sourceVolumeId !== i.dataVolumeId
+                    || p.sourceInstanceId !== i.previousInstanceId || p.sourceGeneration !== i.previousGeneration
+                    || p.sourceFenceToken !== i.previousFenceToken || p.fsUuid !== lease.fsUuid || p.sourceLeaseEpoch >= i.leaseEpoch
+                    || lease.rebase?.snapshotId !== receipt.snapshotId || lease.rebase.fromDigest !== p.fromDigest || lease.rebase.toDigest !== p.toDigest
+                    || Date.parse(lease.rebasePermit!.issuedAt) < verified.stoppedAt) return fail('snapshot_identity_mismatch');
+                assertPermitTime(lease, deps.now());
+            }
             // Reads can consume time. Recheck authority immediately before
             // returning a mutation and leave its 30-second task window intact.
             if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
@@ -156,6 +173,9 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
                 if(!tagged(v.Tags,{...tags,...{'ezil:generation':String(i.previousGeneration),'ezil:fence-token':i.previousFenceToken!}}))return fail('lifecycle_volume_invalid');
                 return action('createTags',{Resources:[v.VolumeId],Tags:tagList(retagsFor(i))});
             }
+            // §9: this branch is reached only after DescribeVolumes above has
+            // observed BOTH target tag values. A CreateTags API response or
+            // phase='tagged' alone can never authorize a target receipt.
             if(v.State==='available'&&v.Attachments.length===0){
                 if(phase==='attached')return wait(phase);
                 if(target.State?.Name!=='running')return wait(phase);
@@ -345,7 +365,7 @@ async function getInstance(id:string,tags:Record<string,string>,i:LifecycleInten
     if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
     assertIdentity(rows[0].instance,tags,i);return rows[0].instance;
 }
-function assertAttached(instance:Instance,v:Volume,id:string){
+export function assertAttached(instance:Instance,v:Volume,id:string){
     const m=instance.BlockDeviceMappings?.filter(m=>m.Ebs?.VolumeId===v.VolumeId),a=v.Attachments?.[0];
     if(v.State!=='in-use'||m?.length!==1||m[0]?.DeviceName!==DATA_DEVICE||m[0]?.Ebs?.Status!=='attached'||m[0]?.Ebs?.DeleteOnTermination!==false
         ||v.Attachments?.length!==1||a?.InstanceId!==id||a.VolumeId!==v.VolumeId||a.State!=='attached'||a.Device!==DATA_DEVICE||a.DeleteOnTermination!==false)return fail('lifecycle_attachment_invalid');
@@ -358,7 +378,7 @@ function assertEffectiveInstance(v:Instance,i:LifecycleIntent){
         ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1
         ||v.MetadataOptions.InstanceMetadataTags!=='disabled'||v.HibernationOptions?.Configured===true)return fail('lifecycle_instance_invalid');
 }
-async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
+export async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
     const d=i.deployment;
     const [image,template]=await Promise.all([deps.image(d.amiId),deps.template(d.launchTemplateId,d.launchTemplateVersion)]);
     const t=template?.LaunchTemplateData;

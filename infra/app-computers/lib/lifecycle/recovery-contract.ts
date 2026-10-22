@@ -6,6 +6,8 @@ export const RecoverySettingsSchema = z.object({
     recoveryVersionArn: z.string(),
 }).strict().superRefine((s, ctx) => {
     const d = s.lifecycle.deployment;
+    if (d.recoveryStateMachineVersionArn && s.recoveryVersionArn !== d.recoveryStateMachineVersionArn)
+        ctx.addIssue({ code: 'custom', message: 'recovery_version_mismatch' });
     if (!new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$`).test(s.recoveryVersionArn)
         || machineArn(s.recoveryVersionArn) === machineArn(d.stateMachineVersionArn)
         || !machineArn(s.recoveryVersionArn).split(':').at(-1)!.startsWith(`ezil-${d.namespace}-`)) {

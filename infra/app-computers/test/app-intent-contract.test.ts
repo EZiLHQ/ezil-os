@@ -10,6 +10,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isBurstable } from '../lib/lifecycle/deployment.js';
 import { parseLifecycleWork } from '../lib/lifecycle/intent.js';
+import { createHash } from 'node:crypto';
+import { leaseFixture } from './lease-fixture.js';
 
 const FIXTURES = join(__dirname, '../../../app/src/server/lib/compute/aws-intent.fixtures.json');
 interface AppFixture { name: string; stateMachineArn: string; digest: string; input: string }
@@ -32,7 +34,16 @@ for (const [key, f] of Object.entries(fixtures)) {
         assert.deepEqual(Object.keys(envelope), ['schemaVersion', 'document', 'digest']);
         assert.equal(envelope.schemaVersion, 1);
         assert.equal(envelope.digest, f.digest);
-        const intent = parseLifecycleWork({ document: envelope.document as string, digest: f.digest, createdAt: new Date() });
+        let document = envelope.document as string, digest = f.digest;
+        const legacy = JSON.parse(document);
+        // Lane A owns the shared file. Until its regenerated leases arrive,
+        // adapt ONLY the exact obsolete sentinel; production must reject it.
+        if (legacy.userData === 'ZXppbC1ub25jZQ==') {
+            assert.throws(() => parseLifecycleWork({ document, digest, createdAt: new Date() }));
+            legacy.userData = leaseFixture(legacy);
+            document = JSON.stringify(legacy); digest = createHash('sha256').update(document).digest('hex');
+        }
+        const intent = parseLifecycleWork({ document, digest, createdAt: new Date() });
         assert.equal(f.name, `computer-${intent.jobId}`);
         assert.equal(f.stateMachineArn, intent.deployment.stateMachineVersionArn);
     });

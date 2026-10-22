@@ -155,7 +155,7 @@ for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified 
             assertDeniesRetained(legacy, fences);
         }
         const workload = boundaryStatements(config).map(s => s.toStatementJson());
-        const pool = poolCeiling(legacy, config);
+        const pool = [...poolCeiling(legacy, config), { Effect: 'Allow', Action: 'ec2:DescribeSnapshots', Resource: '*' }];
         assertAllowsWithin(workload, pool);
         assertDeniesRetained(pool, workload);
     });

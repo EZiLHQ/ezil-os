@@ -4,6 +4,7 @@ import type { Dependencies } from '../lib/lifecycle/aws.js';
 import { SettingsSchema, tagsFor, tagList, token, initialVolumeTags, poolTagsFor, claimTagsFor } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 import { DEFAULT_STORAGE, type InstanceType, type Storage } from '../lib/lifecycle/deployment.js';
+import { leaseFixture } from './lease-fixture.js';
 export const REGION='ap-south-1',ZONE_ID='aps1-az1';
 export function lifecycleFixture(operation:LifecycleIntent['operation']='provision',options:{instanceType?:InstanceType;instanceTypes?:InstanceType[];dataVolumeGiB?:number;rootDeviceName?:Storage['rootDeviceName'];userData?:string|null;userDataNonce?:boolean}={}){
     const computerId=randomUUID(),generation=['replace','adopt','release'].includes(operation)?2:1;
@@ -24,6 +25,7 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         previousFenceToken:operation==='replace'?randomUUID():null,
         deployment,instanceType,dataVolumeGiB,leaseEpoch:operation==='provision'?1:3,
         userData:options.userData!==undefined?options.userData:['provision','replace'].includes(operation)?'ZXppbC1ub25jZQ==':null};
+    if (i.userData === 'ZXppbC1ub25jZQ==' || i.userData === 'bm9uY2UtZTM=') i.userData = leaseFixture(i);
     const document=JSON.stringify(i),digest=createHash('sha256').update(document).digest('hex');
     const envelope={schemaVersion:1,document,digest};const machine=deployment.stateMachineVersionArn.slice(0,-2);
     const executionArn=machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`;

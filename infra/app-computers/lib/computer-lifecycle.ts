@@ -1,11 +1,13 @@
 import { join } from 'node:path';
-import { CfnOutput, Duration, RemovalPolicy, Stack, aws_cloudwatch as cloudwatch,
+import { CfnOutput, Duration, RemovalPolicy, Stack, Tags, aws_cloudwatch as cloudwatch,
     aws_events as events, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_sqs as sqs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { RETAG_KEYS, POOL_CLAIM_KEYS, POOL_IAM_TYPES, SettingsSchema, type Settings } from './lifecycle/contract.js';
 import { lifecycleDefinition } from './lifecycle/definition.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
+import { RebasePreparation, historyReadStatement } from './rebase-preparation.js';
+import { registerImageWorkflow } from './app-caller.js';
 
 /** Shared graph and trusted control role; it does not allocate a computer.
  * Hosts launch with no instance role (R5), so there is no iam:PassRole here.
@@ -14,13 +16,21 @@ export class ComputerLifecycle extends Construct {
     readonly machine:states.CfnStateMachine;
     readonly version:states.CfnStateMachineVersion;
     readonly historyKey:kms.IKey;
-    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string}){
+    readonly preparation?: RebasePreparation;
+    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this),r=d.region;
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
         if(!new RegExp(`^arn:aws:kms:${r}:${d.accountId}:key/[a-f0-9-]{36}$`).test(props.authorityKeyArn))throw new Error('invalid_authority_key');
         const key=new kms.Key(this,'HistoryKey',{enableKeyRotation:true,removalPolicy:RemovalPolicy.RETAIN});
         this.historyKey=key;
+        Tags.of(key).add('ezil:namespace', d.namespace);
+        if (d.preparationStateMachineVersionArn) {
+            if (props.recoveryVersionArn && props.recoveryVersionArn !== d.recoveryStateMachineVersionArn) throw new Error('recovery_version_mismatch');
+            this.preparation = new RebasePreparation(this, 'Preparation', { settings: s, historyKey: key,
+                authorityKeyArn: props.authorityKeyArn, lambdaReservedConcurrency: props.lambdaReservedConcurrency });
+            registerImageWorkflow(this, d.stateMachineVersionArn, d.preparationStateMachineVersionArn, key.keyArn, props.authorityKeyArn);
+        }
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions:['kms:Encrypt*','kms:Decrypt*','kms:ReEncrypt*','kms:GenerateDataKey*','kms:Describe*'],resources:['*'],
             conditions:{ArnLike:{'kms:EncryptionContext:aws:logs:arn':`arn:aws:logs:${r}:${d.accountId}:log-group:*`}}}));
@@ -34,10 +44,15 @@ export class ComputerLifecycle extends Construct {
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['ec2:DescribeInstances','ec2:DescribeVolumes','ec2:DescribeImages','ec2:DescribeLaunchTemplateVersions'],
             resources:['*'],conditions:{StringEquals:{'aws:RequestedRegion':r}}}));
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['states:DescribeExecution'],resources:[machineArn.replace(':stateMachine:',':execution:')+':computer-*']}));
+        if (d.preparationStateMachineVersionArn) {
+            helper.addToRolePolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeSnapshots'], resources: ['*'], conditions: { StringEquals: { 'aws:RequestedRegion': r } } }));
+            helper.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: [d.preparationStateMachineVersionArn.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*'] }));
+        }
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['secretsmanager:GetSecretValue'],resources:[s.authoritySecretArn]}));
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['kms:Decrypt'],resources:[props.authorityKeyArn],
             conditions:{StringEquals:{'kms:ViaService':`secretsmanager.${r}.amazonaws.com`,'kms:EncryptionContext:SecretARN':s.authoritySecretArn}}}));
-        key.grantDecrypt(helper);
+        if (d.preparationStateMachineVersionArn) helper.addToRolePolicy(historyReadStatement(r, key.keyArn, [d.stateMachineVersionArn, d.preparationStateMachineVersionArn]));
+        else key.grantDecrypt(helper);
         const role=new iam.Role(this,'ControllerRole',{assumedBy:new iam.ServicePrincipal('states.amazonaws.com',{
             conditions:{StringEquals:{'aws:SourceAccount':d.accountId},ArnEquals:{'aws:SourceArn':machineArn}}})});
         helper.currentVersion.grantInvoke(role);key.grantEncryptDecrypt(role);

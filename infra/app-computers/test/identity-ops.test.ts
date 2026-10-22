@@ -35,6 +35,7 @@ function expectedBoundary(killSwitch: boolean, userData = false) {
         { Effect: 'Allow', Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'], Resource: `arn:aws:logs:${R}:${A}:log-group:ezil-pilot-*` },
         { Effect: 'Allow', Action: 'sqs:SendMessage', Resource: `arn:aws:sqs:${R}:${A}:ezil-pilot-*` },
         { Effect: 'Allow', Resource: '*', Action: ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeImages',
+            'ec2:DescribeSnapshots',
             'ec2:DescribeLaunchTemplateVersions', 'ec2:DescribeAvailabilityZones', 'logs:DescribeLogGroups', 'logs:CreateLogDelivery',
             'logs:GetLogDelivery', 'logs:UpdateLogDelivery', 'logs:DeleteLogDelivery', 'logs:ListLogDeliveries',
             'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies'] },

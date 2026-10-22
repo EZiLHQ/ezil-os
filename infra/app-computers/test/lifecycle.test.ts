@@ -79,6 +79,16 @@ for(const [operation,action]of [['provision','createVolume'],['provision','runIn
     test(`lost ${action} reply is observed with no duplicate mutation`,async()=>{const r=await run(operation,{lose:action});assert.equal(r.error,undefined);assert.equal(r.calls.filter(c=>c.action===action).length,1);});
 for(const [operation,action]of [['start','startInstances'],['stop','stopInstances'],['retire','terminateInstances']] as const)
     test(`uncertain ${action} never retries or frees the lifecycle reservation`,async()=>{const r=await run(operation,{lose:action,noEffect:action});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.receipt,undefined);assert.equal(r.calls.filter(c=>c.action===action).length,1);});
+test('replacement cannot report the target generation until DescribeVolumes confirms both retagged values', async () => {
+    const absent = await run('replace', { noEffect: 'createTags' });
+    assert.equal(absent.error, 'LifecycleUnconfirmed'); assert.equal(absent.receipt, undefined);
+    assert.equal(absent.calls.some(c => c.action === 'attachVolume'), false);
+    assert.equal(absent.f.state.volumes[0]!.Tags!.find(t => t.Key === 'ezil:generation')!.Value, String(absent.f.i.previousGeneration));
+    const landed = await run('replace', { lose: 'createTags' });
+    assert.equal(landed.error, undefined); assert.equal(landed.receipt.generation, landed.f.i.targetGeneration);
+    assert.equal(landed.calls.filter(c => c.action === 'createTags').length, 1);
+    assert.equal(landed.f.state.volumes[0]!.Tags!.find(t => t.Key === 'ezil:fence-token')!.Value, landed.f.i.fenceToken);
+});
 test('revocation after allocation never starts compute or reports completion',async()=>{const r=await run('provision',{revokeAfter:'createVolume'});assert.equal(r.error,'LifecycleUnconfirmed');assert.deepEqual(r.calls.map(c=>c.action),['createVolume']);assert.equal(r.f.state.volumes.length,1);});
 test('cross-tenant or deletable disk prevents stop/terminate',async()=>{for(const options of [{foreignDisk:true},{deleteDisk:true}]){const r=await run('replace',options);assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);}});
 test('helper failure codes are recorded on the terminal state, not discarded',async()=>{
@@ -346,7 +356,7 @@ test('start-in-place writes the epoch nonce as userData while stopped, then star
     const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});
     const r=await run('start',{fixture:f});assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
     assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','startInstances']);
-    assert.deepEqual(r.calls[0]!.parameters,{InstanceId:f.state.instances[0]!.InstanceId,UserData:{Value:'bm9uY2UtZTM='}});
+    assert.deepEqual(r.calls[0]!.parameters,{InstanceId:f.state.instances[0]!.InstanceId,UserData:{Value:f.i.userData}});
 });
 // C-6 (PR #200 review 4277908738): an uncertain ModifyInstanceAttribute may never have reached EC2;
 // starting then would boot the previous epoch's nonce. Start only after a DEFINITE write.
@@ -356,7 +366,7 @@ for(const [why,noEffect] of [['did not land',true],['landed',false]] as const)
         const r=await run('start',{fixture:f,lose:'modifyInstanceAttribute',...(noEffect?{noEffect:'modifyInstanceAttribute'}:{})});
         assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
         assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','modifyInstanceAttribute','startInstances']);
-        for(const c of r.calls.filter(c=>c.action==='modifyInstanceAttribute'))assert.deepEqual(c.parameters.UserData,{Value:'bm9uY2UtZTM='});
+        for(const c of r.calls.filter(c=>c.action==='modifyInstanceAttribute'))assert.deepEqual(c.parameters.UserData,{Value:f.i.userData});
     });
 test('start-in-place: a userData write that never gets a definite answer never starts the instance',async()=>{
     const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});

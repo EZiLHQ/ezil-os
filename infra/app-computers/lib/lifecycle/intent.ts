@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { UUID, strictJson } from './strict-json.js';
+import { PreparationReferenceSchema, validateIntentLease } from './lease.js';
 
-const uuid = z.string().uuid().regex(/^[a-f0-9-]+$/);
+const uuid = UUID;
 const positive = z.number().int().min(1).max(2147483647);
 export { LifecycleDeploymentSchema, type LifecycleDeployment } from './deployment.js';
 import { InstanceTypeSchema, LifecycleDeploymentSchema } from './deployment.js';
@@ -21,6 +23,7 @@ export const LifecycleIntentSchema = z.object({
     // C-6: base64 user data carrying the one-time enrollment nonce. Required on
     // a launch, optional on a start-in-place (flagged), absent otherwise.
     userData: z.string().max(4096).regex(/^(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$|^(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$/).nullable(),
+    rebasePreparation: PreparationReferenceSchema.optional(),
 }).strict().refine(i => {
     const pool = ['pool-provision', 'adopt', 'release'].includes(i.operation);
     if (pool && !['m6i.large', 'm6i.xlarge'].includes(i.instanceType)) return false;
@@ -51,7 +54,10 @@ export function parseLifecycleWork(work: LifecycleWork): LifecycleIntent {
         if (!work || typeof work.document !== 'string' || Buffer.byteLength(work.document) > 16384
             || !/^[a-f0-9]{64}$/.test(work.digest) || !(work.createdAt instanceof Date) || !Number.isFinite(work.createdAt.getTime())
             || createHash('sha256').update(work.document, 'utf8').digest('hex') !== work.digest) throw new Error();
-        return LifecycleIntentSchema.parse(JSON.parse(work.document));
+        const intent = LifecycleIntentSchema.parse(strictJson(work.document, 16384));
+        validateIntentLease(intent);
+        if (intent.rebasePreparation && JSON.stringify(intent) !== work.document) throw new Error();
+        return intent;
     } catch { throw new LifecycleError('lifecycle_invalid'); }
 }
 

@@ -91,3 +91,19 @@ test('instances by ID: EC2 NotFound is an empty answer; other errors and the tok
     code='InvalidInstanceID.Malformed';await assert.rejects(deps.instances(['i-22222222222222222']));
     code='UnauthorizedOperation';await assert.rejects(deps.instances(['i-22222222222222222']));
 });
+
+test('snapshot reconciliation scans all pages with every identity tag and refuses repeated pagination tokens', async () => {
+    const f = lifecycleFixture(); let calls = 0, repeat = false;
+    const tags = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot', 'ezil:computer-id': f.i.computerId,
+        'ezil:source-volume-id': 'vol-11111111111111111', 'ezil:source-generation': '1', 'ezil:source-fence-token': f.i.fenceToken,
+        'ezil:preparation-job-id': f.i.jobId, 'ezil:purpose': 'pre-rebase' };
+    const deps = awsDependencies(f.settings, { credentials, fetcher: fetch, requestHandler: { async handle(r: any) {
+        const p = new URLSearchParams(String(r.body)); calls++;
+        assert.equal(p.get('Action'), 'DescribeSnapshots'); assert.equal(p.get('Owner.1'), '123456789012');
+        Object.entries(tags).forEach(([key, value], n) => { assert.equal(p.get(`Filter.${n + 1}.Name`), 'tag:' + key); assert.equal(p.get(`Filter.${n + 1}.Value.1`), value); });
+        return xml('DescribeSnapshots', '<snapshotSet><item><snapshotId>snap-11111111111111111</snapshotId></item></snapshotSet>' +
+            (calls === 1 || repeat ? '<nextToken>next-page</nextToken>' : ''));
+    } } });
+    assert.equal((await deps.snapshots!({ tags })).length, 2); assert.equal(calls, 2);
+    calls = 0; repeat = true; await assert.rejects(deps.snapshots!({ tags }), /snapshot_create_unconfirmed/);
+});

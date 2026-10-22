@@ -47,6 +47,7 @@
               "ec2:DescribeInstances",
               "ec2:DescribeVolumes",
               "ec2:DescribeImages",
+              "ec2:DescribeSnapshots",
               "ec2:DescribeLaunchTemplateVersions",
               "ec2:DescribeAvailabilityZones",
               "logs:DescribeLogGroups",

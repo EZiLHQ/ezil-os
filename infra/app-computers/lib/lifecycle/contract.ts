@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { LifecycleDeploymentSchema, type LifecycleIntent } from './intent.js';
+import { parseLease } from './lease.js';
 
 // Infrastructure pins are shared by the workflow; adding a computer never
 // redeploys this graph. R5: there is no per-writer instance profile and no
@@ -54,6 +55,8 @@ export const BACKUP_TAG='ezil:backup';
 export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume'),[BACKUP_TAG]:i.deployment.namespace});
 export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
 export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest,
+    ...(i.rebasePreparation ? { imageJobId: i.rebasePreparation.preparationJobId,
+        imageJobPhase: parseLease(i.userData!).ebsRestore ? 'rebind' : 'launch' } : {}),
     ...(i.operation==='pool-provision'?{operation:i.operation,poolHostId:i.poolHostId,poolGeneration:i.poolGeneration}:{})});
 export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started','detached','claimed','unpooled'] as const;
 export type Phase=typeof phases[number];
