@@ -29,7 +29,7 @@
  *     no Azure/ACA desktop path to switch away from; Neko is the only mode.
  */
 
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
 import { cookieHeaderFor, getFollowingSameOriginCookies, storeSetCookies, type ProbeCookieJar } from './compute/aws-preview-cookies';
@@ -2068,6 +2068,47 @@ export function resetNekoAdminTokenCacheForTests(): void {
     nekoAdminTokens.clear();
 }
 
+// Diagnostics are process-local, like the token cache. Keep only origins that
+// have warned within the last 30s; a busy polling gate must not flood the logs.
+const displayProbeWarnings = new Map<string, number>();
+type DisplayProbeDiagnostics = {
+    login_is_admin: boolean | null;
+    entries: unknown[] | null;
+    http_statuses: { bootstrap: number | null; login: number[]; sessions: number[] };
+};
+
+/** Only the display probe calls this. No response bodies or credentials escape. */
+function warnAwsDisplayProbe(bootstrap: URL, display: 'blank' | 'unknown', diagnostics: DisplayProbeDiagnostics): void {
+    const now = Date.now();
+    const previous = displayProbeWarnings.get(bootstrap.origin);
+    if (previous !== undefined && now - previous < 30_000) return;
+    for (const [origin, at] of displayProbeWarnings) {
+        if (now - at >= 30_000) displayProbeWarnings.delete(origin);
+    }
+    displayProbeWarnings.set(bootstrap.origin, now);
+    const record = (value: unknown): Record<string, unknown> =>
+        value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const boolean = (value: unknown): boolean | null => typeof value === 'boolean' ? value : null;
+    console.warn('[display-probe]', JSON.stringify({
+        origin: bootstrap.hostname,
+        display,
+        login_is_admin: diagnostics.login_is_admin,
+        session_count: diagnostics.entries?.length ?? null,
+        sessions: diagnostics.entries?.map((value) => {
+            const entry = record(value);
+            const state = record(entry.state);
+            const profile = record(entry.profile);
+            return {
+                is_watching: boolean(state.is_watching),
+                ...('is_connected' in state ? { connected: boolean(state.is_connected) } : {}),
+                ...('is_admin' in profile ? { is_admin: boolean(profile.is_admin) } : {}),
+                id: typeof entry.id === 'string' ? createHash('sha256').update(entry.id).digest('hex').slice(0, 8) : null,
+            };
+        }) ?? [],
+        http_statuses: diagnostics.http_statuses,
+    }));
+}
+
 /**
  * Is anything actually being decoded at the other end of that desktop URL?
  *
@@ -2137,6 +2178,19 @@ export async function probeDesktopDisplay(
 
     const deadline = AbortSignal.timeout(timeoutMs);
 
+    const diagnostics: DisplayProbeDiagnostics = {
+        login_is_admin: null,
+        entries: null,
+        http_statuses: { bootstrap: null, login: [], sessions: [] },
+    };
+    const finish = (result: DesktopDisplayProbe): DesktopDisplayProbe => {
+        if (bootstrap && result.display !== 'live') {
+            // Diagnostic failures must never change a verdict or reject a probe.
+            try { warnAwsDisplayProbe(bootstrap, result.display, diagnostics); } catch { /* best effort */ }
+        }
+        return result;
+    };
+
     // A bootstrap URL (AWS) gates its whole origin behind the cookie the
     // bootstrap sets: take it first, exactly as the browser's iframe did, and
     // send it to that origin only (compute/aws-preview-cookies.ts).
@@ -2147,12 +2201,13 @@ export async function probeDesktopDisplay(
             const res = await fetch(`${bootstrap.origin}${bootstrap.pathname}${bootstrap.search}`, {
                 method: 'GET', headers: { Accept: 'text/html,*/*' }, redirect: 'manual', cache: 'no-store', signal: deadline,
             });
+            diagnostics.http_statuses.bootstrap = res.status;
             storeSetCookies(jar, bootstrap, res.headers);
             await res.body?.cancel().catch(() => undefined);
             cookie = cookieHeaderFor(jar, bootstrap);
-            if (!cookie) return { display: 'unknown', reason: 'login_failed', status: res.status };
+            if (!cookie) return finish({ display: 'unknown', reason: 'login_failed', status: res.status });
         } catch {
-            return { display: 'unknown', reason: 'unreachable' };
+            return finish({ display: 'unknown', reason: 'unreachable' });
         }
     }
     const withCookie = (headers: Record<string, string>) => (cookie ? { ...headers, Cookie: cookie } : headers);
@@ -2172,8 +2227,10 @@ export async function probeDesktopDisplay(
             cache: 'no-store',
             signal: deadline,
         });
+        diagnostics.http_statuses.login.push(loginRes.status);
         if (!loginRes.ok) return { status: loginRes.status };
-        const body = (await loginRes.json()) as { token?: unknown };
+        const body = (await loginRes.json()) as { token?: unknown; profile?: { is_admin?: unknown } | null };
+        diagnostics.login_is_admin = typeof body?.profile?.is_admin === 'boolean' ? body.profile.is_admin : null;
         if (typeof body.token !== 'string' || body.token.length === 0) return {};
         cacheNekoAdminToken(origin, adminPassword, body.token, cookie);
         return { token: body.token };
@@ -2190,7 +2247,7 @@ export async function probeDesktopDisplay(
         if (token === null) {
             const fresh = await login();
             if (!('token' in fresh)) {
-                return { display: 'unknown', reason: 'login_failed', status: fresh.status };
+                return finish({ display: 'unknown', reason: 'login_failed', status: fresh.status });
             }
             token = fresh.token;
         }
@@ -2201,6 +2258,7 @@ export async function probeDesktopDisplay(
             cache: 'no-store',
             signal: deadline,
         });
+        diagnostics.http_statuses.sessions.push(listRes.status);
 
         // The far end stopped honouring a token we were reusing — the container
         // restarted, or Neko did. That is not an observation of the display, so
@@ -2210,7 +2268,7 @@ export async function probeDesktopDisplay(
             reused = false;
             const fresh = await login();
             if (!('token' in fresh)) {
-                return { display: 'unknown', reason: 'login_failed', status: fresh.status };
+                return finish({ display: 'unknown', reason: 'login_failed', status: fresh.status });
             }
             token = fresh.token;
             listRes = await fetch(`${origin}/api/sessions`, {
@@ -2219,17 +2277,19 @@ export async function probeDesktopDisplay(
                 cache: 'no-store',
                 signal: deadline,
             });
+            diagnostics.http_statuses.sessions.push(listRes.status);
         }
 
-        if (!listRes.ok) return { display: 'unknown', reason: 'http_error', status: listRes.status };
+        if (!listRes.ok) return finish({ display: 'unknown', reason: 'http_error', status: listRes.status });
 
         let body: unknown;
         try {
             body = await listRes.json();
         } catch {
-            return { display: 'unknown', reason: 'unrecognised' };
+            return finish({ display: 'unknown', reason: 'unrecognised' });
         }
-        if (!Array.isArray(body)) return { display: 'unknown', reason: 'unrecognised' };
+        if (!Array.isArray(body)) return finish({ display: 'unknown', reason: 'unrecognised' });
+        diagnostics.entries = body;
 
         let watching = 0;
         for (const entry of body) {
@@ -2237,18 +2297,18 @@ export async function probeDesktopDisplay(
             if (typeof state?.is_watching !== 'boolean') {
                 // One entry we cannot read makes the whole count untrustworthy:
                 // the unreadable one could be the watcher.
-                return { display: 'unknown', reason: 'unrecognised' };
+                return finish({ display: 'unknown', reason: 'unrecognised' });
             }
             if (state.is_watching) watching++;
         }
 
-        return watching > 0
+        return finish(watching > 0
             ? { display: 'live', sessions: body.length, watching }
-            : { display: 'blank', sessions: body.length };
+            : { display: 'blank', sessions: body.length });
     } catch {
         // Timeout, transport failure, non-JSON login body. None of them is an
         // observation of the user's screen, and none may be dressed up as one.
-        return { display: 'unknown', reason: 'unreachable' };
+        return finish({ display: 'unknown', reason: 'unreachable' });
     }
     // 🔴 NO `finally { logout }` ANY MORE, and that is the point. The token
     // belongs to `nekoAdminTokens` now; logging it out here would guarantee the
