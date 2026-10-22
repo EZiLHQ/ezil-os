@@ -654,6 +654,91 @@ test('failed WebSocket sends are not counted and cleanup preserves later third-p
   assert.equal(fixture.globals.navigator.clipboard.writeText, newerWrite);
 });
 
+test('prototype send hook observes hidden pre-injection sockets and restores native descriptors', () => {
+  const fixture = probeFixture();
+  fixture.probe.restore();
+  const native = Object.getOwnPropertyDescriptor(fixture.Socket.prototype, 'send');
+  const socket = new fixture.Socket(); // Deliberately never exposed as $client._ws.
+  fixture.install();
+  const probe = fixture.window.__desktopQualityClipboard;
+  probe.reset('test-token');
+  assert.equal(fixture.snapshot().hooks.clipboardSend, 'installed');
+  assert.equal(fixture.snapshot().socketsObserved, 0);
+  socket.send(JSON.stringify({ event: 'control/clipboard', text: 'unrelated-private-text' }));
+  socket.send(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  socket.send('private-non-json');
+  const data = fixture.snapshot();
+  assert.equal(data.testTokenSends, 1); assert.equal(data.clipboardSends, 2);
+  assert.equal(data.socketsObserved, 1);
+  assert.ok(!/private|test-token/.test(JSON.stringify(data)));
+  socket.emit(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  assert.equal(fixture.snapshot().testTokenEvents, 1, 'a hidden socket gains receive observation on its first send');
+  assert.equal(probe.restore().restored, true);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(fixture.Socket.prototype, 'send'), native);
+  assert.equal(socket.listeners.length, 0);
+});
+
+test('instance and prototype send hooks count once and preserve results, errors and later send replacements', () => {
+  const fixture = probeFixture();
+  fixture.probe.restore();
+  const socket = fixture.window.$client._ws = new fixture.Socket();
+  const error = new Error('private-send-error');
+  socket.send = function (...args) {
+    assert.equal(this, socket);
+    fixture.Socket.prototype.send.apply(this, args);
+    if (args[1]) throw error;
+    return 'sent';
+  };
+  const original = socket.send;
+  fixture.install();
+  const probe = fixture.window.__desktopQualityClipboard;
+  probe.reset('test-token');
+  const message = JSON.stringify({ event: 'control/clipboard', text: 'test-token' });
+  assert.equal(socket.send(message), 'sent');
+  assert.equal(fixture.snapshot().testTokenSends, 1);
+  assert.throws(() => socket.send(message, true), value => value === error);
+  assert.equal(fixture.snapshot().testTokenSends, 1, 'an outer throw must not be counted by the nested native hook');
+  socket.send = function (...args) { return original.apply(this, args); };
+  fixture.snapshot();
+  socket.send(message);
+  assert.equal(fixture.snapshot().testTokenSends, 2);
+  const replacement = () => 'third-party';
+  fixture.Socket.prototype.send = replacement;
+  assert.equal(probe.restore().restored, true);
+  assert.equal(fixture.Socket.prototype.send, replacement);
+});
+
+test('send observer survives unavailable receive listeners and reports genuinely unhookable sends', () => {
+  const fixture = probeFixture();
+  fixture.probe.restore();
+  const socket = fixture.window.$client._ws = new fixture.Socket();
+  socket.addEventListener = undefined;
+  fixture.install();
+  const probe = fixture.window.__desktopQualityClipboard;
+  probe.reset('test-token');
+  socket.send(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  assert.equal(fixture.snapshot().hooks.clipboardSend, 'installed');
+  assert.equal(fixture.snapshot().testTokenSends, 1);
+  assert.equal(fixture.snapshot().socketsObserved, 0);
+  probe.restore();
+  Object.freeze(fixture.Socket.prototype);
+  Object.freeze(socket);
+  fixture.install();
+  assert.equal(fixture.snapshot().hooks.clipboardSend, 'installation_failed');
+  assert.equal(fixture.window.__desktopQualityClipboard.restore().restored, true);
+});
+
+test('receive hook failures do not break constructing or sending on a new socket', () => {
+  const fixture = probeFixture();
+  fixture.Socket.prototype.addEventListener = () => { throw new Error('private-listener-error'); };
+  const socket = new fixture.window.WebSocket();
+  fixture.probe.reset('test-token');
+  socket.send(JSON.stringify({ event: 'control/clipboard', text: 'test-token' }));
+  assert.equal(fixture.snapshot().hooks.websocket, 'installation_failed');
+  assert.equal(fixture.snapshot().testTokenSends, 1);
+  assert.equal(fixture.probe.restore().restored, true);
+});
+
 test('clipboard evidence identifies each missing stage without deriving success from equality alone', () => {
   const complete = { status: 'observed', socketsObserved: 1,
     hooks: { websocket: 'installed', clipboardHandler: 'installed', clipboardWrite: 'installed' },
@@ -686,22 +771,32 @@ test('clipboard evidence identifies each missing stage without deriving success 
 
 function browserClipboardFixture({ receiveEvent = true, runHandler = true, allowWrite = true,
   callWrite = true, localMatches = true, readAllowed = true, sendUpstream = true,
-  eventName = 'control/clipboard', failCopy = false, failGrant = false, delayedSend = false } = {}) {
-  let localText = '', remoteText = '', focused = false, opened = false, closed = false, copied = false;
+  eventName = 'control/clipboard', failCopy = false, failGrant = false, delayedSend = false,
+  preexistingSocket = false, hiddenSocket = false, noReceiveObserver = false,
+  pasteMatches = true, readbackEvent = true, fullFrameVideo = false, failEntry = false,
+  failLocalWrite = false, wrongSendToken = false, delayedReadback = false } = {}) {
+  let localText = '', remoteText = '', omnibox = '', selected = false;
+  let focused = false, opened = false, closed = false, copied = false, inside = true;
   const actions = [], grants = new Set(), token = 'browser-to-local-fixture';
-  const origin = 'https://box-nekodesktop.example.test';
+  const localToken = 'local-to-browser-fixture', origin = 'https://box-nekodesktop.example.test';
+  const frameBounds = { x: 100, y: 100, width: 800, height: 600 };
+  const videoBounds = fullFrameVideo ? frameBounds : { x: 140, y: 170, width: 640, height: 360 };
   const remoteClipboard = {
     async writeText(value) {
       assert.equal(focused, true, 'frame write happens after focus');
       assert.ok(grants.has(origin));
-      if (!allowWrite) throw Object.assign(new Error('private-write-error'), { name: 'NotAllowedError' });
+      if (!allowWrite || (failLocalWrite && value === localToken)) {
+        throw Object.assign(new Error('private-write-error'), { name: 'NotAllowedError' });
+      }
       localText = localMatches || value !== token ? value : 'private-mismatch';
+      if (value === localToken) actions.push('write-frame-local');
     },
     async readText() { assert.equal(focused, true); return localText; },
   };
   const nativeWrite = remoteClipboard.writeText;
   const fixture = probeFixture({ clipboard: remoteClipboard, user: { member: { can_access_clipboard: true } },
     document: { hasFocus: () => focused, featurePolicy: { allowsFeature: () => true } } });
+  if (preexistingSocket || hiddenSocket || noReceiveObserver) fixture.probe.restore();
   const client = fixture.window.$client;
   Object.assign(client, { connected: true, _channel: { readyState: 'open' } });
   client.$accessor.remote = { hosting: true, controlling: true, locked: false, implicitHosting: true };
@@ -710,54 +805,97 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
     if (callWrite) await remoteClipboard.writeText(text).catch(() => {});
   };
   const nativeHandler = client[eventName];
-  const socket = client._ws = new fixture.window.WebSocket();
+  const socket = new fixture.window.WebSocket();
+  if (!hiddenSocket) client._ws = socket;
+  if (noReceiveObserver) socket.addEventListener = () => { throw new Error('receive hook unavailable'); };
   socket.onmessage = async ({ data }) => {
     const message = JSON.parse(data);
     if (runHandler) await client[message.event]?.({ text: message.text });
   };
+  fixture.globals.Event = class Event { constructor(type) { this.type = type; } };
+  fixture.window.dispatchEvent = event => {
+    assert.equal(event.type, 'focus');
+    assert.deepEqual(actions.slice(-4), ['leave', 'mouseenter', 'video-click', 'focus']);
+    assert.equal(localText, localToken, 'entry sync reads the freshly written frame clipboard');
+    actions.push('window-focus');
+    if (sendUpstream) {
+      const send = () => {
+        const text = wrongSendToken ? 'private-unrelated-token' : localText;
+        socket.send(JSON.stringify({ event: 'control/clipboard', text }));
+        remoteText = text; actions.push('send');
+      };
+      if (delayedSend) setTimeout(send, 10);
+      else send();
+    }
+    return true;
+  };
   const input = {
     first() { return this; }, async waitFor() {},
+    async boundingBox() { return videoBounds; },
     async click() { assert.ok(grants.has(origin), 'permissions precede the first overlay entry'); focused = true; actions.push('click'); },
     async focus() { focused = true; actions.push('focus'); },
-    async dispatchEvent(event) {
-      assert.equal(event, 'mouseenter'); assert.equal(focused, true);
-      assert.equal(localText, 'local-to-browser-fixture', 'entry sync reads the freshly written clipboard');
-      actions.push('mouseenter');
-      if (sendUpstream) {
-        const send = () => {
-          socket.send(JSON.stringify({ event: 'control/clipboard', text: localText }));
-          remoteText = localText; actions.push('send');
-        };
-        if (delayedSend) setTimeout(send, 10);
-        else send();
-      }
-    },
+    async dispatchEvent() { assert.fail('entry must use real mouse movement, not a synthetic overlay event'); },
     async evaluate(fn) { return runInNewContext(`(${fn.toString()})()`, fixture.globals); },
     async press(key) {
       actions.push(key);
-      if (key === 'Control+v') assert.equal(remoteText, 'local-to-browser-fixture', 'send must complete before paste');
-      if (key === 'Control+c') {
-        if (failCopy) throw new Error('private-copy-error');
-        remoteText = token; copied = true;
-        if (receiveEvent) await socket.emit(JSON.stringify({ event: eventName, text: token }));
+      if (key === 'Control+l' || key === 'Control+a') selected = true;
+      else if (key === 'Control+v') {
+        assert.equal(remoteText, localToken, 'send must complete before paste');
+        omnibox = pasteMatches ? remoteText : 'private-wrong-paste'; selected = false;
+      } else if (key === 'End') selected = false;
+      else if (key === 'Control+c') {
+        const readback = omnibox.endsWith('-readback');
+        if (failCopy && !readback) throw new Error('private-copy-error');
+        remoteText = omnibox;
+        actions.push(readback ? 'copy-readback' : 'copy-remote-to-local');
+        if (!readback) copied = true;
+        if (readback ? readbackEvent : receiveEvent) {
+          const message = JSON.stringify({ event: eventName, text: remoteText });
+          if (readback && delayedReadback) setTimeout(() => socket.emit(message), 10);
+          else await socket.emit(message);
+        }
+      } else {
+        const text = key === 'Minus' ? '-' : key.length === 1 ? key : null;
+        if (text) { omnibox = (selected ? '' : omnibox) + text; selected = false; }
       }
     },
   };
-  const frame = { url: () => `${origin}/`, locator: () => input,
-    evaluate: async (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, { ...fixture.globals, arg }) };
-  const page = { frames: () => opened ? [frame] : [], evaluate: (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, {
-    arg, navigator: { clipboard: {
-      writeText: async value => { localText = value; actions.push('write-local'); },
-      readText: async () => {
-        if (!readAllowed && copied) throw Object.assign(new Error('private-read-error'), { name: 'SecurityError' });
-        return localText;
+  const frame = { url: () => `${origin}/`, locator: selector => {
+    assert.ok(['video:visible', 'textarea.overlay:visible'].includes(selector));
+    return input;
+  }, frameElement: async () => ({ boundingBox: async () => frameBounds, dispose: async () => {} }),
+  evaluate: async (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, { ...fixture.globals, arg }) };
+  const inVideo = (x, y) => x >= videoBounds.x && x < videoBounds.x + videoBounds.width
+    && y >= videoBounds.y && y < videoBounds.y + videoBounds.height;
+  const page = { frames: () => opened ? [frame] : [], viewportSize: () => ({ width: 1200, height: 900 }),
+    mouse: {
+      async move(x, y) {
+        if (failEntry) throw new Error('private-pointer-error');
+        const entered = inVideo(x, y);
+        assert.notEqual(entered, inside, 'pointer must actually leave and re-enter the overlay');
+        actions.push(entered ? 'mouseenter' : 'leave'); inside = entered;
       },
-    } },
-  }) };
+      async click(x, y) {
+        assert.equal(x, videoBounds.x + videoBounds.width / 2);
+        assert.equal(y, videoBounds.y + videoBounds.height / 2);
+        assert.equal(inside, true); focused = true; actions.push('video-click');
+      },
+    }, evaluate: (fn, arg) => runInNewContext(`(${fn.toString()})(arg)`, {
+      arg, navigator: { clipboard: {
+        writeText: async value => {
+          assert.notEqual(value, localToken, 'local-to-remote write belongs to the Neko frame, not the shell');
+          localText = value; actions.push('write-local');
+        },
+        readText: async () => {
+          if (!readAllowed && copied) throw Object.assign(new Error('private-read-error'), { name: 'SecurityError' });
+          return localText;
+        },
+      } },
+    }) };
   const quality = desktopQuality({ page, context: { grantPermissions: async (_permissions, { origin }) => {
     if (failGrant) throw new Error('permission unavailable');
     grants.add(origin); actions.push('grant');
-  } }, runId: 'fixture', codeReady: false, browserReady: true, clipboardTimeoutMs: delayedSend ? 100 : 0,
+  } }, runId: 'fixture', codeReady: false, browserReady: true, clipboardTimeoutMs: delayedSend || delayedReadback ? 200 : 0,
   openApp: async () => { opened = true; }, closeApp: async () => { closed = true; }, shot: async () => {},
   appWindow: () => ({ locator: () => ({ elementHandle: async () => ({
     contentFrame: async () => frame, dispose: async () => {},
@@ -769,17 +907,28 @@ function browserClipboardFixture({ receiveEvent = true, runHandler = true, allow
   } };
 }
 
-test('Browser grants before overlay entry and waits for the new upstream send before pasting', async () => {
-  const fixture = browserClipboardFixture({ delayedSend: true });
+test('Browser writes in the frame, leaves and re-enters video, clicks, focuses, waits for send and verifies the remote paste', async () => {
+  const fixture = browserClipboardFixture({ delayedSend: true, delayedReadback: true,
+    preexistingSocket: true, hiddenSocket: true });
   const evidence = {};
   await fixture.quality.clipboard(evidence);
   const browser = evidence.browser.evidence;
-  assert.equal(browser.localToRemote.status, 'SKIP');
-  assert.equal(browser.localToRemote.reason, 'sidecar_has_no_omnibox_text_readback');
-  assert.equal(browser.localToRemote.evidence.upstreamSent, true);
+  assert.equal(browser.localToRemote.status, 'PASS');
+  const local = browser.localToRemote.evidence;
+  assert.equal(local.upstreamSent, true); assert.equal(local.exactEquality, true);
+  assert.equal(local.readback.method, 'remote_omnibox_copy_event');
+  assert.equal(local.readback.remoteEquals, true);
+  assert.equal(local.localWriteContext, 'neko_frame');
+  assert.equal(local.diagnosticsAfter.testTokenSends, 1, 'upstream evidence survives the readback token reset');
+  assert.equal(local.readback.diagnostics.testTokenEvents, 1);
+  assert.deepEqual(local.interaction, { exitScope: 'neko_frame', videoClicked: true,
+    overlayFocused: true, windowFocusDispatched: true });
   const actions = fixture.actions;
-  for (const [first, second] of [['grant', 'click'], ['write-local', 'focus'], ['focus', 'mouseenter'],
-    ['mouseenter', 'send'], ['send', 'Control+v']]) assert.ok(actions.indexOf(first) < actions.indexOf(second));
+  for (const [first, second] of [['grant', 'click'], ['write-frame-local', 'leave'], ['leave', 'mouseenter'],
+    ['mouseenter', 'video-click'], ['video-click', 'focus'], ['focus', 'window-focus'],
+    ['window-focus', 'send'], ['send', 'Control+v'], ['Control+v', 'copy-readback']]) {
+    assert.ok(actions.indexOf(first) < actions.indexOf(second), `${first} precedes ${second}`);
+  }
   assert.equal(browser.smoke.writeResolved, true); assert.equal(browser.smoke.readResolved, true);
   assert.equal(browser.smoke.localEquals, true);
   const result = browser.remoteToLocal.evidence;
@@ -793,6 +942,67 @@ test('Browser grants before overlay entry and waits for the new upstream send be
   fixture.verifyCleanup();
 });
 
+test('a full-frame video exits into the shell and re-enters the correct frame centre', async () => {
+  const fixture = browserClipboardFixture({ fullFrameVideo: true }), evidence = {};
+  await fixture.quality.clipboard(evidence);
+  assert.equal(evidence.browser.evidence.localToRemote.status, 'PASS');
+  assert.equal(evidence.browser.evidence.localToRemote.evidence.interaction.exitScope, 'shell_page');
+  fixture.verifyCleanup();
+});
+
+test('frame clipboard and pointer errors have precise failures and never paste', async () => {
+  for (const [options, reason] of [[{ failLocalWrite: true }, 'local_clipboard_write_failed'],
+    [{ failEntry: true }, 'neko_clipboard_entry_failed']]) {
+    const fixture = browserClipboardFixture(options), evidence = {};
+    await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+    const local = evidence.browser.evidence.localToRemote;
+    assert.equal(local.status, 'FAIL'); assert.equal(local.reason, reason);
+    assert.equal(local.evidence.pasteDispatched, false);
+    assert.ok(!fixture.actions.includes('Control+v'));
+    assert.equal(evidence.browser.evidence.remoteToLocal.status, 'PASS');
+    assert.ok(!JSON.stringify(evidence).includes('private'));
+    fixture.verifyCleanup();
+  }
+});
+
+test('an unrelated upstream clipboard send cannot authorize paste', async () => {
+  const fixture = browserClipboardFixture({ wrongSendToken: true }), evidence = {};
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+  const local = evidence.browser.evidence.localToRemote;
+  assert.equal(local.reason, 'no_upstream_clipboard_send');
+  assert.equal(local.evidence.diagnosticsAfter.clipboardSends, 1);
+  assert.equal(local.evidence.diagnosticsAfter.testTokenSends, 0);
+  assert.equal(local.evidence.pasteDispatched, false);
+  assert.ok(!fixture.actions.includes('Control+v'));
+  fixture.verifyCleanup();
+});
+
+test('remote paste mismatch and absent copy events fail instead of trusting local clipboard equality or skipping', async () => {
+  for (const [options, reason] of [[{ pasteMatches: false }, 'remote_omnibox_paste_mismatch'],
+    [{ readbackEvent: false }, 'remote_omnibox_copy_not_observed']]) {
+    const fixture = browserClipboardFixture(options), evidence = {};
+    await assert.rejects(fixture.quality.clipboard(evidence), /browser/);
+    const local = evidence.browser.evidence.localToRemote;
+    assert.equal(local.status, 'FAIL'); assert.equal(local.reason, reason);
+    assert.equal(local.evidence.upstreamSent, true); assert.equal(local.evidence.pasteDispatched, true);
+    assert.equal(local.evidence.exactEquality, false); assert.equal(local.evidence.readback.remoteEquals, false);
+    assert.equal(evidence.browser.evidence.remoteToLocal.status, 'PASS');
+    assert.ok(!JSON.stringify(evidence).includes('private'));
+    fixture.verifyCleanup();
+  }
+});
+
+test('remote readback skips only when its receive observer is unavailable, after proving send and paste', async () => {
+  const fixture = browserClipboardFixture({ noReceiveObserver: true }), evidence = {};
+  await assert.rejects(fixture.quality.clipboard(evidence), /browser/); // Independent remote-to-local observation fails.
+  const local = evidence.browser.evidence.localToRemote;
+  assert.equal(local.status, 'SKIP');
+  assert.equal(local.reason, 'remote_omnibox_readback_unavailable:clipboard_event_observer_unavailable');
+  assert.equal(local.evidence.upstreamSent, true); assert.equal(local.evidence.pasteDispatched, true);
+  assert.equal(local.evidence.readback.remoteEquals, null); assert.equal(local.evidence.exactEquality, false);
+  fixture.verifyCleanup();
+});
+
 test('late clipboard notifications during cleanup do not overwrite the failed verdict snapshot', async () => {
   const fixture = browserClipboardFixture({ receiveEvent: false }), evidence = {};
   const snapshot = fixture.fixture.probe.snapshot;
@@ -800,7 +1010,7 @@ test('late clipboard notifications during cleanup do not overwrite the failed ve
   fixture.fixture.probe.snapshot = function () {
     // Wait until the first post-copy poll has decided failure, then simulate
     // a notification just before the next (cleanup) snapshot.
-    if (fixture.actions.includes('Control+c')) {
+    if (fixture.actions.includes('copy-remote-to-local')) {
       if (++copySnapshots === 2) fixture.socket.emit(JSON.stringify({ event: 'control/clipboard', text: 'browser-to-local-fixture' }));
     }
     return snapshot();

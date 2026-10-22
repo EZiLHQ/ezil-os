@@ -2,9 +2,9 @@
  * Selectors: Code uses the active editor's .view-lines (rendered text, not a
  * private Monaco API); Neko uses textarea.overlay and video, as documented in
  * worker/assets/neko-branding/www/ezil-mobile.js:32 and e2e/hosted-continuity.mjs:383.
- * The sidecar contract (worker/sidecar/contract.mjs) exposes page snapshots,
- * not browser-chrome/omnibox text. Clipboard checks that need that observation
- * explicitly skip. Font screenshots require human glyph inspection.
+ * The sidecar cannot read editable browser chrome. Verify a remote omnibox
+ * paste by copying it back with an appended marker and observing the server's
+ * clipboard notification. Font screenshots require human glyph inspection.
  */
 import { isIP } from 'node:net';
 
@@ -152,6 +152,7 @@ export function installNekoClipboardProbe() {
   // Per-token resets otherwise make a connected but idle socket look blind.
   const lifetime = { messagesReceived: 0, listenerDeliveries: 0, onmessageDeliveries: 0, controlRequests: 0 };
   const restores = [], sockets = new Set(), handlers = new WeakMap();
+  const sendWrappers = new WeakSet(), sending = new WeakSet();
   const errorName = error => ['Error', 'NotAllowedError', 'SecurityError', 'AbortError', 'TypeError',
     'NotFoundError', 'InvalidStateError', 'NotSupportedError', 'DataError', 'UnknownError']
     .includes(error?.name) ? error.name : 'OtherError';
@@ -251,7 +252,36 @@ export function installNekoClipboardProbe() {
       } catch { hooks.clipboardHandler = 'installation_failed'; }
     }
   };
+  const observeSend = owner => {
+    try {
+      const original = owner?.send;
+      if (typeof original !== 'function' || sendWrappers.has(original)) return;
+      const wrapped = function (...args) {
+        // An instance override can call the native prototype. Count only the
+        // outer successful send, preserving the receiver, return and throws.
+        if (sending.has(this)) return Reflect.apply(original, this, args);
+        sending.add(this);
+        try {
+          const returned = Reflect.apply(original, this, args);
+          try { observeSocket(this); } catch { /* Receive hooks are independent. */ }
+          let message;
+          try { message = JSON.parse(args[0]); } catch { return returned; }
+          if (message?.event === 'control/clipboard') {
+            counters.clipboardSends++;
+            if (matches(message)) counters.testTokenSends++;
+          }
+          if (message?.event === 'control/request') { counters.controlRequests++; lifetime.controlRequests++; }
+          return returned;
+        } finally { sending.delete(this); }
+      };
+      replace(owner, 'send', wrapped); sendWrappers.add(wrapped);
+      hooks.clipboardSend = 'installed';
+    } catch { hooks.clipboardSend = 'installation_failed'; }
+  };
   const observeSocket = socket => {
+    // Do this before receive hooks: an adapter may lack addEventListener, or
+    // replace send on an already observed socket after reconnecting.
+    if (socket) observeSend(socket);
     if (!socket || sockets.has(socket)) return;
     const seen = new WeakSet();
     const receive = event => {
@@ -311,25 +341,6 @@ export function installNekoClipboardProbe() {
       set(assigned);
       hooks.websocketOnmessage = 'installed';
     } catch { hooks.websocketOnmessage = 'installation_failed'; }
-    try {
-      const original = socket.send;
-      if (typeof original === 'function') {
-        replace(socket, 'send', function (...args) {
-          // A returned send proves the client handed the message to WebSocket,
-          // not that the server applied it. Do not count throws as sends.
-          const returned = Reflect.apply(original, this, args);
-          let message;
-          try { message = JSON.parse(args[0]); } catch { return returned; }
-          if (message?.event === 'control/clipboard') {
-            counters.clipboardSends++;
-            if (matches(message)) counters.testTokenSends++;
-          }
-          if (message?.event === 'control/request') { counters.controlRequests++; lifetime.controlRequests++; }
-          return returned;
-        });
-        hooks.clipboardSend = 'installed';
-      }
-    } catch { hooks.clipboardSend = 'installation_failed'; }
   };
   const attach = () => {
     attachHandlers();
@@ -362,10 +373,13 @@ export function installNekoClipboardProbe() {
   try {
     const NativeWebSocket = window.WebSocket;
     if (typeof NativeWebSocket === 'function') {
+      // Older images may not expose $client._ws. A prototype hook also sees
+      // sockets created before injection, and attaches receive hooks on send.
+      observeSend(NativeWebSocket.prototype);
       replace(window, 'WebSocket', new Proxy(NativeWebSocket, {
         construct(target, args, newTarget) {
           const socket = Reflect.construct(target, args, newTarget);
-          observeSocket(socket);
+          try { observeSocket(socket); } catch { hooks.websocket = 'installation_failed'; }
           return socket;
         },
       }));
@@ -454,6 +468,71 @@ async function waitForClipboardSend(frame, timeoutMs) {
     await sleep(50);
   } while (true);
   return diagnostics;
+}
+
+async function enterNekoClipboardTarget(page, { frame, input }) {
+  const video = await frame.locator('video:visible').first().boundingBox();
+  const overlay = await input.boundingBox();
+  if (!video || !overlay) throw clipboardFailure('neko_clipboard_target_geometry_unavailable');
+  const left = Math.min(video.x, overlay.x), top = Math.min(video.y, overlay.y);
+  const right = Math.max(video.x + video.width, overlay.x + overlay.width);
+  const bottom = Math.max(video.y + video.height, overlay.y + overlay.height);
+  const exitWithin = bounds => {
+    if (!bounds) return null;
+    const x = bounds.x + bounds.width / 2, y = bounds.y + bounds.height / 2;
+    return [ { x, y: bounds.y + 1 }, { x: bounds.x + 1, y },
+      { x, y: bounds.y + bounds.height - 1 }, { x: bounds.x + bounds.width - 1, y } ]
+      .find(point => point.x < left || point.x >= right || point.y < top || point.y >= bottom);
+  };
+  const element = await frame.frameElement();
+  let bounds;
+  try { bounds = await element.boundingBox(); } finally { await element.dispose(); }
+  let exit = exitWithin(bounds), exitScope = 'neko_frame';
+  if (!exit) {
+    // A full-frame overlay has no in-frame exit point. Leave the iframe and
+    // re-enter its video using the same real pointer path.
+    const viewport = page.viewportSize();
+    exit = viewport && exitWithin({ x: 0, y: 0, ...viewport }); exitScope = 'shell_page';
+  }
+  if (!exit) throw clipboardFailure('neko_clipboard_pointer_exit_unavailable');
+  // Bounding boxes already use top-page coordinates, including iframe offset.
+  const centre = { x: video.x + video.width / 2, y: video.y + video.height / 2 };
+  if (centre.x < overlay.x || centre.x >= overlay.x + overlay.width
+      || centre.y < overlay.y || centre.y >= overlay.y + overlay.height) {
+    throw clipboardFailure('neko_video_centre_outside_overlay');
+  }
+  await page.mouse.move(exit.x, exit.y);
+  await page.mouse.move(centre.x, centre.y);
+  await page.mouse.click(centre.x, centre.y);
+  await input.focus();
+  await frame.evaluate(() => window.dispatchEvent(new Event('focus')));
+  return { exitScope, videoClicked: true, overlayFocused: true, windowFocusDispatched: true };
+}
+
+async function readNekoOmnibox({ frame, input }, token, timeoutMs) {
+  // Copying the unchanged paste may produce no notification: it is already
+  // the X11 clipboard. Append only a marker so a fresh matching server event
+  // proves the remote omnibox contained the pasted token, not a local echo.
+  const marker = '-readback', expected = `${token}${marker}`;
+  await nekoClipboardDiagnostics(frame, expected);
+  await input.press('End');
+  await typeNeko(input, marker);
+  await input.press('Control+a'); await input.press('Control+c');
+  const deadline = performance.now() + timeoutMs;
+  let diagnostics;
+  do {
+    diagnostics = await nekoClipboardDiagnostics(frame);
+    if (diagnostics.testTokenEvents > 0 || performance.now() >= deadline) break;
+    await sleep(50);
+  } while (true);
+  const available = diagnostics.status === 'observed' && diagnostics.hooks?.websocket === 'installed'
+    && diagnostics.socketsObserved > 0;
+  const remoteEquals = available ? diagnostics.testTokenEvents > 0 : null;
+  return { method: 'remote_omnibox_copy_event', diagnostics, remoteEquals,
+    reason: !available ? 'remote_omnibox_readback_unavailable:clipboard_event_observer_unavailable'
+      : remoteEquals ? null
+      : diagnostics.controlClipboardEvents + diagnostics.clipboardUpdatedEvents > 0
+        ? 'remote_omnibox_paste_mismatch' : 'remote_omnibox_copy_not_observed' };
 }
 
 async function observeNekoCopy(page, frame, token, timeoutMs) {
@@ -718,32 +797,42 @@ export function desktopQuality({ page, context, runId, codeReady, browserReady,
             data.diagnostics = await nekoClipboardDiagnostics(target.frame);
             data.smoke = await target.frame.evaluate(token => window.__desktopQualityClipboard?.smoke(token)
               ?? { reason: 'neko_probe_not_installed' }, `clipboard-smoke-${runId}`);
-            // The sidecar's snapshot.url is the committed page URL, not the
-            // editable omnibox. Never substitute local overlay.value or OCR.
             return await qualityChecks(data, {
               localToRemote: async result => {
                 const token = `local-to-browser-${runId}`;
                 result.diagnosticsBefore = await nekoClipboardDiagnostics(target.frame, token);
                 result.upstreamSent = false;
+                result.pasteDispatched = false; result.exactEquality = false;
+                let stage = 'local_clipboard_write_failed';
                 try {
-                  await page.evaluate(token => navigator.clipboard.writeText(token), token);
-                  // A stationary pointer does not produce another mouseenter
-                  // on click. Focus first, then run the client's actual entry
-                  // listener after writing the new clipboard value.
-                  await target.input.focus();
-                  await target.input.dispatchEvent('mouseenter');
+                  // Clipboard permissions and focus belong to the Neko frame,
+                  // which is cross-origin from the OS shell.
+                  await target.frame.evaluate(token => navigator.clipboard.writeText(token), token);
+                  result.localWriteContext = 'neko_frame';
+                  stage = 'neko_clipboard_entry_failed';
+                  result.interaction = await enterNekoClipboardTarget(page, target);
+                  stage = 'clipboard_upstream_observation_failed';
                   const sent = await waitForClipboardSend(target.frame, clipboardTimeoutMs);
+                  result.diagnosticsAfter = sent;
                   result.upstreamSent = sent.testTokenSends > 0;
                   if (!result.upstreamSent) throw clipboardFailure(sent.hooks?.clipboardSend === 'installed'
                     ? 'no_upstream_clipboard_send' : 'clipboard_send_observer_unavailable');
+                  stage = 'remote_omnibox_paste_failed';
                   await target.input.press('Control+l'); await target.input.press('Control+v');
+                  result.pasteDispatched = true;
                   await shot('clipboard-browser', result, 'desktop', true);
                   result.contract = 'worker/sidecar/contract.mjs:SIDECAR_WIRE';
-                  await target.input.press('Escape');
-                  return 'sidecar_has_no_omnibox_text_readback';
+                  stage = 'remote_omnibox_readback_failed';
+                  result.readback = await readNekoOmnibox(target, token, clipboardTimeoutMs);
+                  result.exactEquality = result.readback.remoteEquals === true;
+                  if (result.readback.remoteEquals === null) return result.readback.reason;
+                  if (!result.exactEquality) throw clipboardFailure(result.readback.reason);
                 } catch (error) {
-                  throw error.qualityReason ? error : clipboardFailure('clipboard_upstream_observation_failed');
-                } finally { result.diagnosticsAfter = await nekoClipboardDiagnostics(target.frame); }
+                  throw error.qualityReason ? error : clipboardFailure(stage);
+                } finally {
+                  result.diagnosticsAfter ??= await nekoClipboardDiagnostics(target.frame);
+                  await target.input.press('Escape').catch(() => {});
+                }
               },
               remoteToLocal: async result => {
                 const token = `browser-to-local-${runId}`;
