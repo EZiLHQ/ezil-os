@@ -126,7 +126,7 @@ function checkStack(stack: Stack): string[] {
                 // 59 for create-time ENI tags (RunInstances' primary ENI must carry the
                 // compute tags). DescribeSnapshots adds exactly 24 characters;
                 // preserve the hard 6144 quota and the remaining headroom.
-                if (p.ManagedPolicyName?.endsWith('-boundary'))
+                if (p.ManagedPolicyName?.endsWith('-boundary') && !p.ManagedPolicyName.endsWith('-image-job-boundary'))
                     limit(id + '/boundary headroom', documentSize(p.PolicyDocument, resources), 5710);
                 break;
             case 'AWS::IAM::Role':
@@ -218,7 +218,17 @@ test('preparation, launch observers and app caller stay within IAM and KMS polic
     const f = preparationFixture(), stack = new Stack(new App({ autoSynth: false }), 'PreparationQuota', { env });
     applyWorkloadIdentity(stack, f.settings.deployment.accountId, f.settings.deployment.namespace);
     const controller = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: lifecycle.authorityKeyArn });
+    new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: f.settings, recoveryVersionArn: f.settings.deployment.recoveryStateMachineVersionArn! }, sourceHistoryKey: controller.historyKey });
     new AppCaller(stack, 'AppCaller', { config: AppCallerConfigSchema.parse({ ...lifecycle.appCaller, enabled: true }),
         region: f.settings.deployment.region, versionArns: [f.settings.deployment.stateMachineVersionArn], historyKeyArn: controller.historyKey.keyArn });
+    assert.deepEqual(checkStack(stack), []);
+});
+
+test('founder image boundary and deployment-policy aggregate quotas with the longest scope', () => {
+    const f = preparationFixture(), namespace = 'a'.repeat(21), region = 'ap-northeast-1';
+    const deployment = JSON.parse(JSON.stringify(f.settings.deployment).replaceAll('pilot', namespace).replaceAll('ap-south-1', region).replaceAll('aps1-az1', 'apne1-az1'));
+    deployment.storage.dataMinGiB = 16384; deployment.storage.dataMaxGiB = 16384;
+    const config = IdentityConfigSchema.parse({ ...identity, namespace, region, imageJobDeployment: deployment, maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true });
+    const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'ImageIdentityMaximum', { config, env: { account: config.accountId, region } });
     assert.deepEqual(checkStack(stack), []);
 });

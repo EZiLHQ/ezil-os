@@ -72,19 +72,19 @@ export function createPreparationHelper(settings: Settings, deps: Dependencies) 
                     if (state === 'stopped') {
                         if (!['initial', 'stopped'].includes(e.phase)) return emit('wait');
                         assertAttached(source, v, i.sourceInstanceId); assertOnlyExpectedDisks(source, v, i.sourceDeployment.storage.rootDeviceName);
-                        return action('terminateInstances', { InstanceIds: [i.sourceInstanceId] });
+                        return await action('terminateInstances', { InstanceIds: [i.sourceInstanceId] });
                     }
                     if (!['running', 'pending'].includes(state ?? '')) throw new Error('source_identity_mismatch');
                     if (e.phase !== 'initial') return emit('wait');
                     assertAttached(source, v, i.sourceInstanceId);
-                    return action('stopInstances', { InstanceIds: [i.sourceInstanceId], Force: false, Hibernate: false, SkipOsShutdown: false });
+                    return await action('stopInstances', { InstanceIds: [i.sourceInstanceId], Force: false, Hibernate: false, SkipOsShutdown: false });
                 }
             } else if (!control.fencedAt) throw new Error('writer_not_fenced');
             if (v.State !== 'available' || v.Attachments.length) return emit('wait');
             control.fencedAt ??= new Date(now).toISOString();
             if (Date.parse(control.fencedAt) < began || Date.parse(control.fencedAt) > now) throw new Error('snapshot_not_fresh');
             if (!control.snapshotId && !control.createAttempted)
-                return action('createSnapshot', { VolumeId: i.sourceVolumeId, Description: 'EZiL pre-rebase checkpoint',
+                return await action('createSnapshot', { VolumeId: i.sourceVolumeId, Description: 'EZiL pre-rebase checkpoint',
                     TagSpecifications: [{ ResourceType: 'snapshot', Tags: tagList(preparationTags(i)) }] });
             uncertain = !control.snapshotId;
             const snapshots = await deps.snapshots(control.snapshotId ? [control.snapshotId] : { tags: preparationTags(i) });

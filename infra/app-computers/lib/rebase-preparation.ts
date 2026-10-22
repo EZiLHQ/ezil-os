@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { CfnOutput, Duration, RemovalPolicy, Tags, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_stepfunctions as states } from 'aws-cdk-lib';
+import { applyImageJobBoundary } from './image-job-boundary.js';
 import { Construct } from 'constructs';
 import type { Settings } from './lifecycle/contract.js';
 import { SNAPSHOT_TAG_KEYS } from './lifecycle/preparation-contract.js';
@@ -75,6 +76,7 @@ export class RebasePreparation extends Construct {
         observer.addToRolePolicy(historyReadStatement(d.region, props.historyKey.keyArn, [d.preparationStateMachineVersionArn]));
         const role = new iam.Role(this, 'RebasePreparationRole', { roleName: name, path: `/ezil/${d.namespace}/`,
             assumedBy: new iam.ServicePrincipal('states.amazonaws.com', { conditions: { StringEquals: { 'aws:SourceAccount': d.accountId }, ArnEquals: { 'aws:SourceArn': machineArn } } }) });
+        applyImageJobBoundary(role, d);
         role.addToPolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [observer.currentVersion.functionArn] }));
         role.addToPolicy(new iam.PolicyStatement({ actions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey'], resources: [props.historyKey.keyArn] }));
         for (const statement of preparationStatements(s)) role.addToPolicy(statement);

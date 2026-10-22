@@ -107,3 +107,20 @@ test('snapshot reconciliation scans all pages with every identity tag and refuse
     assert.equal((await deps.snapshots!({ tags })).length, 2); assert.equal(calls, 2);
     calls = 0; repeat = true; await assert.rejects(deps.snapshots!({ tags }), /snapshot_create_unconfirmed/);
 });
+
+test('restored volume discovery scans every lineage page without inventing an EC2 client-token filter', async () => {
+    const f = lifecycleFixture(); let pages = 0, repeat = false;
+    const tags = { 'ezil:stage': 'pilot', 'ezil:recovery-job-id': f.i.jobId, 'ezil:restored-from-snapshot': 'snap-11111111111111111' };
+    const deps = awsDependencies(f.settings, { credentials, fetcher: fetch, requestHandler: { async handle(r: any) {
+        const p = new URLSearchParams(String(r.body)); pages++;
+        assert.equal(p.get('Action'), 'DescribeVolumes');
+        Object.entries(tags).forEach(([key, value], index) => {
+            assert.equal(p.get(`Filter.${index + 1}.Name`), 'tag:' + key); assert.equal(p.get(`Filter.${index + 1}.Value.1`), value);
+        });
+        assert.ok(![...p.values()].includes('client-token'));
+        return xml('DescribeVolumes', '<volumeSet><item><volumeId>vol-11111111111111111</volumeId></item></volumeSet>'
+            + (pages === 1 || repeat ? '<nextToken>next-page</nextToken>' : ''));
+    } } });
+    assert.equal((await deps.restoredVolumes!(tags)).length, 2); assert.equal(pages, 2);
+    pages = 0; repeat = true; await assert.rejects(deps.restoredVolumes!(tags), /restore_lineage_mismatch/);
+});

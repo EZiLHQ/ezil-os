@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { App, Stack, assertions } from 'aws-cdk-lib';
+import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { ComputerLifecycle } from '../lib/computer-lifecycle.js';
 import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
 import { preparationStatements } from '../lib/rebase-preparation.js';
@@ -65,6 +66,7 @@ test('owned lifecycle construct wires preparation, exact observer version, histo
     const f = preparationFixture(), stack = new Stack(new App(), 'RebaseIam', { env: { account: '123456789012', region: 'ap-south-1' } });
     applyWorkloadIdentity(stack, '123456789012', 'pilot');
     const lifecycle = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: f.intent.deployment.dataKeyArn });
+    new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: f.settings, recoveryVersionArn: f.settings.deployment.recoveryStateMachineVersionArn! }, sourceHistoryKey: lifecycle.historyKey });
     new AppCaller(stack, 'AppCaller', { config: AppCallerConfigSchema.parse({ enabled: true, providers: [{ name: 'github',
         providerArn: 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com', issuerHost: 'token.actions.githubusercontent.com',
         audience: 'sts.amazonaws.com', subject: 'repo:example/repo:environment:test' }] }), region: 'ap-south-1',
@@ -75,12 +77,20 @@ test('owned lifecycle construct wires preparation, exact observer version, histo
     assert.equal(machine.Properties.LoggingConfiguration.IncludeExecutionData, false);
     const role = Object.values(all).find(r => r.Type === 'AWS::IAM::Role' && r.Properties.RoleName === 'ezil-pilot-rebase-preparation')!;
     assert.equal(role.Properties.Path, '/ezil/pilot/');
-    assert.equal(role.Properties.PermissionsBoundary, 'arn:aws:iam::123456789012:policy/ezil/identity/ezil-pilot-boundary');
+    assert.equal(role.Properties.PermissionsBoundary, 'arn:aws:iam::123456789012:policy/ezil/pilot/ezil-pilot-image-job-boundary');
     assert.deepEqual(role.Properties.AssumeRolePolicyDocument.Statement[0].Condition, { StringEquals: { 'aws:SourceAccount': '123456789012' },
         ArnEquals: { 'aws:SourceArn': 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-rebase-preparation' } });
+    const bounded = Object.values(all).filter(r => r.Type === 'AWS::IAM::Role' && String(r.Properties.PermissionsBoundary).endsWith('-image-job-boundary'));
+    assert.deepEqual(bounded.map(r => r.Properties.RoleName).sort(), ['ezil-pilot-rebase-preparation', 'ezil-pilot-recovery']);
+    for (const resource of Object.values(all).filter(r => r.Type === 'AWS::IAM::Role' && !bounded.includes(r)))
+        assert.equal(resource.Properties.PermissionsBoundary, 'arn:aws:iam::123456789012:policy/ezil/identity/ezil-pilot-boundary');
     const policies = Object.entries(all).filter(([id, r]) => id.startsWith('AppCaller') && r.Type === 'AWS::IAM::Policy').flatMap(([, r]) => r.Properties.PolicyDocument.Statement);
     assert.ok(policies.some(s => list(s.Action).includes('states:StartExecution') && list(s.Resource).includes('arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-rebase-preparation')));
     assert.ok(policies.some(s => list(s.Action).includes('ec2:DescribeSnapshots') && s.Condition.StringEquals['aws:RequestedRegion'] === 'ap-south-1'));
+    assert.ok(policies.some(s => list(s.Action).includes('states:StartExecution') && list(s.Resource).includes('arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery')));
+    const decrypts = policies.filter(s => list(s.Action).includes('kms:Decrypt'));
+    assert.ok(decrypts.some(s => JSON.stringify(s.Resource).includes('RecoveryHistoryKey') && JSON.stringify(s.Condition).includes('ezil-pilot-recovery')));
+    assert.ok(!decrypts.some(s => JSON.stringify(s.Resource).includes('RecoveryHistoryKey') && JSON.stringify(s.Condition).includes('rebase-preparation')));
     const observerPolicies = Object.entries(all).filter(([id, r]) => id.startsWith('LifecyclePreparationObserverRole') && r.Type === 'AWS::IAM::Policy').flatMap(([, r]) => r.Properties.PolicyDocument.Statement);
     assert.ok(observerPolicies.length);
     assert.ok(observerPolicies.every(s => list(s.Action).every(a => /^ec2:Describe|^states:DescribeExecution$|^kms:Decrypt$|^secretsmanager:GetSecretValue$|^logs:(CreateLogStream|PutLogEvents)$/.test(a))));

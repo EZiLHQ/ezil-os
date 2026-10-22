@@ -6,11 +6,26 @@ import { historyReadStatement } from './rebase-preparation.js';
 /** Owned constructs register their exact grants before the existing bin
  * creates AppCaller. No bin edit or guessed history key is needed. */
 type ImageWorkflow = { version: string; historyKeyArn: string; authorityKeyArn?: string };
+const imageReaders = new WeakMap<Stack, Map<string, iam.Role[]>>();
+export function registerImageHistoryReader(scope: Construct, lifecycleVersion: string, role: iam.Role) {
+    const stack = Stack.of(scope), groups = imageReaders.get(stack) ?? new Map<string, iam.Role[]>();
+    groups.set(lifecycleVersion, [...groups.get(lifecycleVersion) ?? [], role]); imageReaders.set(stack, groups);
+    for (const item of registeredImageWorkflows(scope, lifecycleVersion)) grantImageRead(role, item);
+}
+function grantImageRead(role: iam.Role, item: ImageWorkflow) {
+    const region = item.version.split(':')[3]!;
+    role.addToPolicy(new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: [
+        item.version.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*'] }));
+    role.addToPolicy(historyReadStatement(region, item.historyKeyArn, [item.version]));
+}
 const imageWorkflows = new WeakMap<Stack, Map<string, ImageWorkflow[]>>();
 export function registerImageWorkflow(scope: Construct, lifecycleVersion: string, version: string, historyKeyArn: string, authorityKeyArn?: string) {
     const stack = Stack.of(scope), groups = imageWorkflows.get(stack) ?? new Map<string, ImageWorkflow[]>();
     const list = groups.get(lifecycleVersion) ?? [];
-    if (!list.some(v => v.version === version)) list.push({ version, historyKeyArn, authorityKeyArn });
+    if (!list.some(v => v.version === version)) {
+        const item = { version, historyKeyArn, authorityKeyArn }; list.push(item);
+        for (const role of imageReaders.get(stack)?.get(lifecycleVersion) ?? []) grantImageRead(role, item);
+    }
     groups.set(lifecycleVersion, list); imageWorkflows.set(stack, groups);
 }
 export function registeredImageWorkflows(scope: Construct, lifecycleVersion: string) {

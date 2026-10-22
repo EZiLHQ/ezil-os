@@ -14,6 +14,7 @@ export interface Dependencies {
     image(id:string):Promise<Image|undefined>;
     template(id:string,version:string):Promise<LaunchTemplateVersion|undefined>;
     snapshots?(selector: string[] | { tags: Record<string, string> }): Promise<Snapshot[]>;
+    restoredVolumes?(tags: Record<string, string>): Promise<Volume[]>;
     imageAuthority?(request: ImageAuthorityRequest): Promise<boolean>;
     now():number;
 }
@@ -82,6 +83,17 @@ export function awsDependencies(settings:Settings,test?:{requestHandler:EC2Clien
                 if (next) seen.add(next);
             } while (next);
             return rows;
+        },
+        restoredVolumes: async tags => {
+            const volumes: Volume[] = [], seen = new Set<string>(); let next: string | undefined;
+            do {
+                const result = await ec2.send(new DescribeVolumesCommand({ Filters: Object.entries(tags).map(([key, value]) =>
+                    ({ Name: 'tag:' + key, Values: [value] })), NextToken: next }), request());
+                volumes.push(...result.Volumes ?? []); next = result.NextToken;
+                if (next && seen.has(next)) throw new Error('restore_lineage_mismatch');
+                if (next) seen.add(next);
+            } while (next);
+            return volumes;
         },
         authority: (i, digest) => authorize(authorityFor(i, digest)),
     };

@@ -8,6 +8,7 @@ import { awsDependencies, type Dependencies } from './aws.js';
 import { BURSTABLE_CREDITS, isBurstable } from './deployment.js';
 import { assertPermitTime, parseLease } from './lease.js';
 import { verifyPreparation } from './preparation-evidence.js';
+import { verifyMaintenance } from './maintenance-evidence.js';
 import { strictJson } from './strict-json.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases),
     lastError:RecordedErrorSchema.default(NO_ERROR),throttles:z.number().int().min(0).max(100).default(0)}).strict();
@@ -41,12 +42,15 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         const now=deps.now(),started=execution.startDate.getTime();
         if(!Number.isFinite(started)||started>now+30000||now-started>900000)return fail('lifecycle_expired');
         if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
+        const maintenance = i.rebasePreparation && parseLease(i.userData!).ebsRestore;
         const action=async(name:Action,parameters:object)=>{
-            if (i.rebasePreparation && (name === 'runInstances' || name === 'runBurstableInstances')) {
+            if (maintenance) {
+                const current = await deps.volumes([i.dataVolumeId!]);
+                if (current.length !== 1) return fail('restore_lineage_mismatch');
+                await verifyMaintenance(i, current[0]!, deps, name === 'runInstances' || name === 'runBurstableInstances');
+            }
+            if (i.rebasePreparation && !maintenance && (name === 'runInstances' || name === 'runBurstableInstances')) {
                 const lease = parseLease(i.userData!);
-                // Recovery rebind remains closed until its independent recovery
-                // execution and quarantine evidence are verified.
-                if (lease.ebsRestore) return fail('restore_lineage_mismatch');
                 const verified = await verifyPreparation(i.rebasePreparation, d.preparationStateMachineVersionArn!, deps);
                 const p = verified.document, receipt = verified.receipt;
                 if (!equal(p.deployment, d) || p.computerId !== i.computerId || p.sourceVolumeId !== i.dataVolumeId
@@ -89,8 +93,17 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(!tagged(v.Tags,tags)&&!(i.operation==='replace'&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
+        // Bind historical source identity to its retained deployment, including
+        // a different approved subnet in the same AZ. Maintenance also proves
+        // custody of the failed original volume before using its clone.
+        const preparation = i.rebasePreparation ? (maintenance ? await verifyMaintenance(i, v, deps)
+            : await verifyPreparation(i.rebasePreparation, d.preparationStateMachineVersionArn!, deps)) : undefined;
+        if (preparation && (preparation.document.sourceInstanceId !== i.previousInstanceId
+            || preparation.document.sourceGeneration !== i.previousGeneration || preparation.document.sourceFenceToken !== i.previousFenceToken))
+            return fail('source_identity_mismatch');
+        const sourceIntent = preparation ? { ...i, deployment: preparation.document.sourceDeployment } : i;
         const sourceId=i.previousInstanceId??i.providerInstanceId;
-        const source=sourceId?await getInstance(sourceId,previousTags,i,deps,['replace','retire','stop'].includes(i.operation)):undefined;
+        const source=sourceId?await getInstance(sourceId,previousTags,sourceIntent,deps,['replace','retire','stop'].includes(i.operation)):undefined;
         // A replace whose previous instance EC2 no longer knows (the app's instance_lost recovery)
         // has nothing to stop or terminate. The volume must not claim an attachment to it; the
         // launch below still requires the volume `available` and unattached, and its tags were
@@ -111,6 +124,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(v.State!=='available'||v.Attachments.length)return fail('lifecycle_volume_invalid');
             return lostStop(i,envelope.digest,sourceId,v.VolumeId);
         }
+        if (maintenance && source && source.State?.Name !== 'terminated') return fail('writer_not_fenced');
         if(source&&['stop','retire','replace'].includes(i.operation)){
             const status=source.State?.Name;
             if(status==='terminated'){
@@ -378,7 +392,7 @@ function assertEffectiveInstance(v:Instance,i:LifecycleIntent){
         ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1
         ||v.MetadataOptions.InstanceMetadataTags!=='disabled'||v.HibernationOptions?.Configured===true)return fail('lifecycle_instance_invalid');
 }
-export async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
+export async function launchParameters(i:LifecycleIntent,digest:string,deps:Pick<Dependencies, 'image' | 'template'>):Promise<RunInstancesRequest>{
     const d=i.deployment;
     const [image,template]=await Promise.all([deps.image(d.amiId),deps.template(d.launchTemplateId,d.launchTemplateVersion)]);
     const t=template?.LaunchTemplateData;

@@ -7,7 +7,7 @@ import { RETAG_KEYS, POOL_CLAIM_KEYS, POOL_IAM_TYPES, SettingsSchema, type Setti
 import { lifecycleDefinition } from './lifecycle/definition.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
 import { RebasePreparation, historyReadStatement } from './rebase-preparation.js';
-import { registerImageWorkflow } from './app-caller.js';
+import { registerImageWorkflow, registerImageHistoryReader } from './app-caller.js';
 
 /** Shared graph and trusted control role; it does not allocate a computer.
  * Hosts launch with no instance role (R5), so there is no iam:PassRole here.
@@ -41,6 +41,7 @@ export class ComputerLifecycle extends Construct {
             timeout:Duration.seconds(55),memorySize:256,...(props.lambdaReservedConcurrency===null?{}:{reservedConcurrentExecutions:props.lambdaReservedConcurrency??2}),logGroup:helperLogs,
             depsLockFilePath:join(__dirname,'../package-lock.json'),bundling:{minify:true,sourceMap:false,externalModules:[]},
             environment:{EZIL_LIFECYCLE_SETTINGS:JSON.stringify(s)}});
+        if (d.preparationStateMachineVersionArn) registerImageHistoryReader(this, d.stateMachineVersionArn, helper.role as iam.Role);
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['ec2:DescribeInstances','ec2:DescribeVolumes','ec2:DescribeImages','ec2:DescribeLaunchTemplateVersions'],
             resources:['*'],conditions:{StringEquals:{'aws:RequestedRegion':r}}}));
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['states:DescribeExecution'],resources:[machineArn.replace(':stateMachine:',':execution:')+':computer-*']}));

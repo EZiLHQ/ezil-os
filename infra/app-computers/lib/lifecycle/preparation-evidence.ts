@@ -24,7 +24,7 @@ export function assertSnapshot(snapshot: Snapshot, i: PreparationDocument, fence
 /** Re-read the pinned successful preparation and the actual snapshot on each
  * launch. The database launch authority separately proves the reservation is
  * still current; a document hash is never treated as a signature. */
-export async function verifyPreparation(ref: z.infer<typeof PreparationReferenceSchema>, version: string, deps: Dependencies) {
+export async function verifyPreparation(ref: z.infer<typeof PreparationReferenceSchema>, version: string, deps: Pick<Dependencies, 'execution' | 'snapshots' | 'now'>) {
     const machine = version.replace(/:[1-9][0-9]*$/, ''), expectedArn = machine.replace(':stateMachine:', ':execution:') + `:computer-${ref.preparationJobId}`;
     if (ref.executionArn !== expectedArn || !deps.snapshots) throw new Error('preparation_failed');
     const execution = await deps.execution(ref.executionArn), now = deps.now();

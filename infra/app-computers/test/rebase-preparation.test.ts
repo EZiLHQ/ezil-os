@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { createPreparationHelper, preparationControl } from '../lib/lifecycle/preparation-helper.js';
 import { preparationDefinition } from '../lib/lifecycle/preparation-definition.js';
@@ -115,4 +116,27 @@ test('authority revoked during snapshot recheck prevents launch', async () => {
     const { f, executionArn, helper } = await launchFixture(), snapshots = f.deps.snapshots!;
     f.deps.snapshots = async selector => { const result = await snapshots(selector); f.state.authorized = false; return result; };
     await assert.rejects(helper({ executionArn, phase: 'initial' }), /lifecycle_authority_denied/);
+});
+
+test('retained source uses its own approved subnet instead of the new deployment subnet', async () => {
+    const { f, executionArn, helper } = await launchFixture();
+    f.preparation.sourceDeployment.subnetId = 'subnet-22222222222222222';
+    f.instance.SubnetId = f.preparation.sourceDeployment.subnetId;
+    const document = JSON.stringify(f.preparation), digest = createHash('sha256').update(document).digest('hex');
+    f.intent.rebasePreparation!.digest = digest;
+    const preparationExecution = f.state.executions[f.reference.executionArn]!;
+    preparationExecution.input = JSON.stringify({ schemaVersion: 1, document, digest });
+    preparationExecution.output = JSON.stringify({ ...JSON.parse(preparationExecution.output!), digest });
+    const launchDocument = JSON.stringify(f.intent);
+    f.state.executions[executionArn]!.input = JSON.stringify({ schemaVersion: 1, document: launchDocument,
+        digest: createHash('sha256').update(launchDocument).digest('hex') });
+    assert.equal((await helper({ executionArn, phase: 'initial' })).decision, 'runInstances');
+    f.instance.SubnetId = 'subnet-33333333333333333';
+    await assert.rejects(helper({ executionArn, phase: 'initial' }), /lifecycle_instance_invalid/);
+});
+test('a late preparation authority denial is a bounded failure before the provider mutation', async () => {
+    const f = preparationFixture(); let calls = 0;
+    f.deps.imageAuthority = async () => ++calls < 2;
+    const result = await createPreparationHelper(f.settings, f.deps)({ executionArn: f.reference.executionArn, phase: 'initial', control: preparationControl });
+    assert.equal(result.decision, 'failed'); assert.equal(result.code, 'authority_revoked'); assert.equal(result.parameters, undefined);
 });
