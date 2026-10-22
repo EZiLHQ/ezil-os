@@ -478,6 +478,31 @@ await settle(4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5b. A DESKTOP RESTART RE-MINTS THE CODE WINDOW OF THAT COMPUTER ONLY.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    await settle(20);
+    const frame = () => q('.window[data-app="code"] .window-app-iframe');
+    const before = mintedUrls.length, src = frame()?.getAttribute('src');
+    push('a Code window is open before the restart', !! frame() && !! src);
+    window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: 'some-other-computer' } }));
+    await settle(10);
+    push('a restart of ANOTHER computer does not re-mint Code', mintedUrls.length === before, `${mintedUrls.length - before}`);
+    window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: COMPUTER.id } }));
+    await settle(20);
+    push('🔴 a restart of THIS computer re-mints Code exactly once', mintedUrls.length === before + 1, `${mintedUrls.length - before}`);
+    push('the Code frame now shows the freshly minted URL',
+        !! frame() && frame().getAttribute('src') === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
+    await window.$(q('.window[data-app="code"]')).close();
+    await settle(6);
+    const closedMints = mintedUrls.length;
+    window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: COMPUTER.id } }));
+    await settle(10);
+    push('a CLOSED Code window no longer listens for restarts', mintedUrls.length === closedMints, `${mintedUrls.length - closedMints}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════
 // Every request must be same-origin EXCEPT the code-preview frame itself,

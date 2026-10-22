@@ -581,9 +581,14 @@ export async function openCodeWindow (ctx = {}) {
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
+    // Restart desktop (Settings → Troubleshoot) restarts code-server too on an AWS host, and the
+    // open frame then shows "Cannot reconnect". Re-mint for the same computer (live 2026-10-22).
+    const on_restarted = (e) => { if ( ! disposed && e?.detail?.computerId === computer.id ) void start_boot(); };
+
     const dispose = () => {
         if (disposed) return;
         disposed = true;
+        window.removeEventListener('ezil:desktop-restarted', on_restarted);
         nativeSurface?.dispose();
         stop_timers();
         stop_runtime_recheck?.();
@@ -608,6 +613,7 @@ export async function openCodeWindow (ctx = {}) {
         return true;
     };
     window.addEventListener('ezil:teardown', dispose);
+    window.addEventListener('ezil:desktop-restarted', on_restarted);
 
     void start_boot();
     return el_window;

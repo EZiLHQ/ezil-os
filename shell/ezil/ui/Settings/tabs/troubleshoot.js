@@ -338,6 +338,8 @@ async function handleRestart ($win) {
 
     if ( res.ok ) {
         status = 'restarted';
+        // Windows bound to this computer's runtime (Code) re-open: on AWS the restart restarts code-server.
+        window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } }));
     } else {
         status = 'failed';
         failReason = reasonCopy(res.errorCode);
