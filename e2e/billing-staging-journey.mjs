@@ -368,13 +368,31 @@ async function checkout(page, upgrade, email, evidence) {
   const started = performance.now();
   // Reloading before Stripe confirms cancels the payment (seen live 2026-10-22: a fixed 5 s
   // wait left a fresh member on Free with no webhook). Wait for Stripe's own confirmation.
-  evidence.checkoutConfirmed = await until(async () => {
+  const confirmed = (timeout) => until(async () => {
     for (const frame of await stripeFrames(page).catch(() => [])) {
       const text = await frame.locator('body').innerText({ timeout: 1000 }).catch(() => '');
       if (/Thanks for subscribing|Payment successful|Subscription confirmed/i.test(text)) return true;
     }
     return null;
-  }, 'Stripe payment confirmation', 45_000).catch(() => false);
+  }, 'Stripe payment confirmation', timeout).catch(() => false);
+  evidence.checkoutConfirmed = await confirmed(20_000);
+  // Stripe's invisible bot check sometimes swallows an automated click (an hCaptcha
+  // "Please try again" frame, the form intact, no webhook). Retry once, as a person would.
+  if (!evidence.checkoutConfirmed && await submit.isVisible().catch(() => false) && await submit.isEnabled().catch(() => false)) {
+    evidence.checkoutResubmitted = true;
+    await submit.click();
+    evidence.checkoutConfirmed = await confirmed(45_000);
+  }
+  if (!evidence.checkoutConfirmed) {
+    // Keep what Stripe showed instead (a decline, 3DS step or bot challenge) before the reload.
+    await page.screenshot({ path: join(process.env.E2E_OUT || '.', 'checkout-unconfirmed.png'), fullPage: true }).catch(() => {});
+    const shown = [];
+    for (const frame of await stripeFrames(page).catch(() => [])) {
+      const text = compact(await frame.locator('body').innerText({ timeout: 1000 }).catch(() => '')).replace(/!function\(.*$/, '');
+      if (text) shown.push({ frame: frame.url().split(/[?#]/)[0].split('/').pop()?.slice(0, 60), text: text.slice(0, 300) });
+    }
+    evidence.checkoutUnconfirmedFrames = shown;
+  }
   await waitForPlan(page, upgrade, evidence, started);
 }
 
