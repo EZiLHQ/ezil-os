@@ -66,6 +66,10 @@ for phase in before target; do
 done
 baseline_template=$work/before/app-computers/cdk.out/lifecycle/ezil-mum-lifecycle.template.json
 candidate_template=$synth_project/cdk.out/lifecycle/ezil-mum-lifecycle.template.json
+# The live stack was deployed with CDK version reporting (an AWS::CDK::Metadata resource);
+# the repo's synth disables it. Carry the live metadata resource into both syntheses so
+# drift checks compare like with like and the change set does not remove it.
+json carry-cdk-metadata "$work/lifecycle-live.json" "$baseline_template" "$candidate_template"
 validation_args=("$work/lifecycle-live.json" "$baseline_template" "$candidate_template" "$work/before.json" "$work/target.json" "$rollback")
 json lifecycle-template "${validation_args[@]}"
 if "$apply"; then

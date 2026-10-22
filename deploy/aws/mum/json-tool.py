@@ -692,6 +692,17 @@ def main(args):
         need(a[1] in versions(a[0]), "expected lifecycle version not published")
     elif op == "lifecycle-changeset":
         lifecycle_changeset(*a)
+    elif op == "carry-cdk-metadata":
+        live = template(a[0])
+        carried = {k: v for k, v in live.get("Resources", {}).items() if v.get("Type") == "AWS::CDK::Metadata"}
+        for path in a[1:3]:
+            value = read(path)
+            for k, v in carried.items():
+                existing = value["Resources"].get(k)
+                need(existing is None or same_json(existing, v), "synthesized CDK metadata conflicts with the live stack")
+                need(not v.get("Condition") or v["Condition"] in value.get("Conditions", {}), "live CDK metadata condition missing from synth")
+                value["Resources"][k] = copy.deepcopy(v)
+            write(path, value)
     elif op == "lifecycle-template":
         lifecycle_template(*a)
     elif op == "lifecycle-equal":
