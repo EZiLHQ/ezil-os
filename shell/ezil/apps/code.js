@@ -187,9 +187,7 @@ async function mintCodePreviewUrlOnce (computerId) {
         return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.' };
     }
 
-    if ( data?.ok !== true ) {
-        return { ok: false, errorCode: data?.errorCode ?? 'unknown' };
-    }
+    if ( data?.ok !== true ) return session.pendingOrRefused(data);
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // `session.js`'s `previewUrl()` follows for `appPreviewUrl`.

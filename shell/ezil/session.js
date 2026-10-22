@@ -564,6 +564,14 @@ async function openDesktopOnce (computerId, screen) {
  * @returns {Promise<{ok: true, url: string, expiresAt?: number}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
+/**
+ * A not-ok preview body for the wake loop. `computeProvider` must travel with it: an AWS
+ * pending answer returns at once, and `withWakeAndOneRetry` widens its ask cap only for AWS.
+ */
+export function pendingOrRefused (data) {
+    return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider };
+}
+
 export async function previewUrl (computerId) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
@@ -589,9 +597,7 @@ async function previewUrlOnce (computerId) {
     }
 
     const data = res.data ?? {};
-    if ( data.ok !== true ) {
-        return { ok: false, errorCode: data.errorCode ?? 'unknown' };
-    }
+    if ( data.ok !== true ) return pendingOrRefused(data);
     if ( typeof data.appPreviewUrl !== 'string' || data.appPreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // as `openDesktop` above.
@@ -1102,7 +1108,7 @@ export default {
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
     openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, confirmDisplay,
-    previewUrl, focusApp,
+    previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
