@@ -15,6 +15,9 @@ import type { ChatRequest, StreamEvent } from './types';
 
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
 export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
+/** Coupled to the Gateway's default `per_user_concurrency`; shared by all models for an identity. */
+export const GATEWAY_MAX_IN_FLIGHT = 2;
+const CONCURRENCY_WAIT_BUDGET_MS = 60_000;
 const MODELS_TTL_MS = 5 * 60_000;
 const SIDE_CALL_TIMEOUT_MS = 5_000;
 const MICRO_PER_CREDIT = 1_000_000;
@@ -52,12 +55,18 @@ export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconc
 export type GatewayGrant = { remaining_micro: number; live: boolean };
 export type GatewayBalance = { state?: string; available_micro: number; held_micro: number; grants: GatewayGrant[] };
 
-const modelsCache = new Map<ResolvedProvider, { at: number; models: GatewayModels }>();
+// Only Bearer auth is sent by this transport. Equivalent resolved providers must share admission
+// and catalog state; neither their display name nor ignored custom headers change the identity.
+function providerIdentity(provider: ResolvedProvider): string {
+    return JSON.stringify([provider.baseUrl, provider.apiKey ?? '']);
+}
+
+const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: number; models: GatewayModels }>();
 
 /** Clear the `/v1/models` cache after availability/limit refusals, and in tests. */
 export function forgetGatewayModels(baseUrl?: string): void {
     if (baseUrl === undefined) modelsCache.clear();
-    else for (const provider of modelsCache.keys()) if (provider.baseUrl === baseUrl) modelsCache.delete(provider);
+    else for (const [key, cached] of modelsCache) if (cached.baseUrl === baseUrl) modelsCache.delete(key);
 }
 
 function authHeaders(provider: ResolvedProvider): Record<string, string> {
@@ -96,15 +105,15 @@ export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayMod
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens) };
 }
 
-/** `GET /v1/models`, cached for five minutes per resolved provider (including its auth context). `undefined` when it cannot be read. */
+/** `GET /v1/models`, cached for five minutes per base URL + auth context. `undefined` when it cannot be read. */
 export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(), signal?: AbortSignal): Promise<GatewayModels | undefined> {
-    const key = provider;
+    const key = providerIdentity(provider);
     const cached = modelsCache.get(key);
     if (cached && now - cached.at < MODELS_TTL_MS) return cached.models;
     try {
         const { status, json } = await getJson(provider, '/models', doFetch, signal);
         const models = status === 200 ? asModels(json) : undefined;
-        if (models) modelsCache.set(key, { at: now, models });
+        if (models) modelsCache.set(key, { baseUrl: provider.baseUrl, at: now, models });
         return models;
     } catch {
         return undefined;
@@ -231,6 +240,45 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
 
 // ── the turn ──────────────────────────────────────────────────────────────────
 
+type AdmissionGate = { active: number; queue: (() => void)[] };
+const admissionGates = new Map<string, AdmissionGate>();
+
+/** FIFO admission; only retries after a server concurrency refusal have a queue deadline. */
+function acquireGatewaySlot(key: string, signal: AbortSignal, budget?: { ms: number; error: GatewayError }): Promise<() => void> {
+    signal.throwIfAborted();
+    const gate = admissionGates.get(key) ?? { active: 0, queue: [] };
+    admissionGates.set(key, gate);
+    return new Promise((resolve, reject) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const cleanup = () => { clearTimeout(timer); signal.removeEventListener('abort', onAbort); };
+        const enter = () => {
+            cleanup();
+            gate.active++;
+            let released = false;
+            resolve(() => {
+                if (released) return;
+                released = true;
+                gate.active--;
+                const next = gate.queue.shift();
+                if (next) next();
+                else if (gate.active === 0) admissionGates.delete(key);
+            });
+        };
+        const leave = (error: unknown) => {
+            const index = gate.queue.indexOf(enter);
+            if (index >= 0) gate.queue.splice(index, 1);
+            cleanup();
+            reject(error);
+        };
+        const onAbort = () => leave(signal.reason);
+        if (gate.active < GATEWAY_MAX_IN_FLIGHT) { enter(); return; }
+        if (budget && budget.ms <= 0) { reject(budget.error); return; }
+        gate.queue.push(enter);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (budget) timer = setTimeout(() => leave(budget.error), budget.ms);
+    });
+}
+
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
         if (signal.aborted) { reject(signal.reason); return; }
@@ -282,7 +330,7 @@ async function timedResponse(doFetch: typeof fetch, url: string, init: RequestIn
     return new Response(body, { status: response.status, headers: response.headers });
 }
 
-/** One UUID and one serialization, at most one resend per call. No retries after generation starts. */
+/** One UUID and serialization, bounded admission retries. No retries after generation starts. */
 export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, options: GatewayOptions): AsyncGenerator<StreamEvent> {
     const provider = model.provider;
     const doFetch = options.fetch ?? fetch;
@@ -308,50 +356,80 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         // Callback is for tests/integration, never used for gateway prompt logging.
         options.onRequest?.(url, built, idempotencyKey);
         const headers = { ...authHeaders(provider), 'content-type': 'application/json', accept: stream ? 'text/event-stream' : 'application/json', 'idempotency-key': idempotencyKey };
+        const identity = providerIdentity(provider);
         let retried = false;
-        let response: Response;
+        let concurrencyStarted: number | undefined;
+        let concurrencyWaited = 0;
+        let concurrencyRetries = 0;
+        let concurrencyError: GatewayError | undefined;
+        // Count both requested sleeps (also with injected clocks) and elapsed time, including re-queueing.
+        const remainingWait = () => Math.max(0, CONCURRENCY_WAIT_BUDGET_MS - Math.max(concurrencyWaited,
+            concurrencyStarted === undefined ? 0 : now() - concurrencyStarted));
         for (;;) {
             options.signal.throwIfAborted();
+            const release = await acquireGatewaySlot(identity, options.signal,
+                concurrencyError ? { ms: remainingWait(), error: concurrencyError } : undefined);
+            let waitMs: number;
             try {
+                options.signal.throwIfAborted();
+                if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
                 attemptAbort = new AbortController();
-                response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort);
-            } catch (error) {
-                if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
+                let response: Response;
+                try {
+                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort);
+                } catch (error) {
+                    if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
+                    if (!retried) { retried = true; continue; }
+                    throw new GatewayError('EZiL AI: cannot reach EZiL AI. Retry the request', undefined, 'os_unreachable', requestId);
+                }
+                status = response.status;
+                hold = response.headers.get('x-ezil-hold-micro');
+                requestId = response.headers.get('x-ezil-request-id') ?? undefined;
+                if (response.ok) {
+                    options.signal.throwIfAborted();
+                    if (!response.body) throw new GatewayResponseError(requestId);
+                    const contentType = response.headers.get('content-type') ?? '';
+                    if (!(stream ? contentType.includes('text/event-stream') : contentType.includes('application/json'))) {
+                        await response.body.cancel();
+                        throw new GatewayResponseError(requestId, 'invalid_response');
+                    }
+                    const events = stream ? gatewayStream(sseEvents(response.body), requestId) : gatewayJson(await response.json(), requestId);
+                    for await (const event of events) {
+                        options.signal.throwIfAborted();
+                        if (event.type === 'usage') used = event.usage;
+                        if (event.type === 'stop') stopReason = event.reason;
+                        yield event;
+                    }
+                    if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId);
+                    return;
+                }
+                // Body read failures happen after headers: never treat them as pre-header transport failures.
+                const body = parseErrorBody(await response.text());
+                requestId = body.request_id ?? requestId;
+                const retryAfter = response.headers.get('retry-after');
+                if (status === 429 && body.code === 'concurrency_limit') {
+                    concurrencyStarted ??= now();
+                    concurrencyError = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
+                    const remaining = remainingWait();
+                    if (remaining <= 0) throw concurrencyError;
+                    const fallback = Math.min(15, 2 ** Math.min(concurrencyRetries + 1, 4));
+                    waitMs = Math.min(remaining, Math.min(15, Math.max(1, retryDelay(retryAfter, fallback, now()))) * 1000);
+                    concurrencyWaited += waitMs;
+                    concurrencyRetries++;
+                    retried = true;
+                } else if (!retried && status === 429 && body.code === 'rate_limited') {
+                    retried = true;
+                    waitMs = retryDelay(retryAfter, 60, now()) * 1000;
+                } else {
+                    if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
+                    throw describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
+                }
+            } finally {
                 attemptAbort.abort();
-                if (!retried) { retried = true; continue; }
-                throw new GatewayError('EZiL AI: cannot reach EZiL AI. Retry the request', undefined, 'os_unreachable', requestId);
+                release();
             }
-            status = response.status;
-            hold = response.headers.get('x-ezil-hold-micro');
-            requestId = response.headers.get('x-ezil-request-id') ?? undefined;
-            if (response.ok) break;
-            // Body read failures happen after headers: never treat them as pre-header transport failures.
-            const body = parseErrorBody(await response.text());
-            requestId = body.request_id ?? requestId;
-            if (!retried && status === 429 && (body.code === 'rate_limited' || body.code === 'concurrency_limit')) {
-                retried = true;
-                attemptAbort.abort();
-                await (options.sleep ?? defaultSleep)(retryDelay(response.headers.get('retry-after'), body.code === 'rate_limited' ? 60 : 5, now()) * 1000, options.signal);
-                continue;
-            }
-            if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
-            throw describeGatewayError(model.model, status, response.headers.get('retry-after'), body, requestId ?? null, undefined, now());
+            await (options.sleep ?? defaultSleep)(waitMs, options.signal);
         }
-        options.signal.throwIfAborted();
-        if (!response.body) throw new GatewayResponseError(requestId);
-        const contentType = response.headers.get('content-type') ?? '';
-        if (!(stream ? contentType.includes('text/event-stream') : contentType.includes('application/json'))) {
-            await response.body.cancel();
-            throw new GatewayResponseError(requestId, 'invalid_response');
-        }
-        const events = stream ? gatewayStream(sseEvents(response.body), requestId) : gatewayJson(await response.json(), requestId);
-        for await (const event of events) {
-            options.signal.throwIfAborted();
-            if (event.type === 'usage') used = event.usage;
-            if (event.type === 'stop') stopReason = event.reason;
-            yield event;
-        }
-        if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId);
     } catch (error) {
         if (options.signal.aborted) return;
         if (attemptAbort.signal.reason instanceof GatewayError) error = attemptAbort.signal.reason;

@@ -1,8 +1,9 @@
 // Integration: the VS Code-facing provider against in-process mock Anthropic / OpenAI servers, with a
 // fake `vscode` module. Exercises the full Agent-mode tool-call round trip both ways.
 
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { parseModelsConfig, type ResolvedConfig, type ResolvedModel } from '../src/config';
+import { forgetGatewayModels } from '../src/gateway';
 import type { Usage } from '../src/types';
 import { startMockAnthropic, type MockServer as AnthropicMock } from './fixtures/mock-anthropic';
 import { startMockOpenAI, type MockServer as OpenAIMock } from './fixtures/mock-openai';
@@ -254,6 +255,9 @@ const { frames, messageJson } = await import('./fixtures/gateway-response');
 const { gatewayTokenCount, KIMI } = await import('../src/gateway-messages');
 
 describe('EZiL gateway VS Code bridge', () => {
+    // Fixtures reuse the same URL/auth identity but provide independent catalogs in each test.
+    beforeEach(() => forgetGatewayModels());
+
     function catalog(maxInputTokens = 131072, maxOutputTokens = 8192) {
         return { data: [gw(), gw(KIMI)].map(model => ({ id: model.model, alias: model.model, upstream_model: 'upstream', enabled: true,
             max_input_tokens: maxInputTokens, max_output_tokens: maxOutputTokens })) };

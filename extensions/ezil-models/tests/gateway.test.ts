@@ -82,8 +82,8 @@ describe('gateway transport', () => {
         const s = server(() => error(401, 'os_session_missing', {}, { 'x-ezil-hold-micro': '1' }));
         await expect(run(s.fetch)).rejects.toThrow(); expect(s.posts()).toHaveLength(1);
     });
-    for (const code of ['rate_limited', 'concurrency_limit']) test(`429 ${code} one capped wait and same-key retry`, async () => {
-        const waits: number[] = []; const s = server(() => error(429, code, {}, { 'retry-after': '90' }));
+    test('429 rate_limited one capped wait and same-key retry', async () => {
+        const waits: number[] = []; const s = server(() => error(429, 'rate_limited', {}, { 'retry-after': '90' }));
         await expect(run(s.fetch, { sleep: async ms => { waits.push(ms); } })).rejects.toThrow();
         sameAttempt(s.posts()); expect(waits).toEqual([60000]);
     });
@@ -95,7 +95,7 @@ describe('gateway transport', () => {
         expect(s.calls).toHaveLength(1);
         expect(waits).toEqual([]);
     });
-    for (const [status, code] of [[409, 'idempotency_replay'], [504, 'upstream_timeout'], [500, 'internal_error'], [503, 'no_provider_route'], [429, 'tpm_limited']] as const) test(`no retry ${status} ${code}`, async () => {
+    for (const [status, code] of [[409, 'idempotency_replay'], [504, 'upstream_timeout'], [500, 'internal_error'], [503, 'no_provider_route'], [429, 'tpm_limited'], [429, 'daily_budget_reached']] as const) test(`no retry ${status} ${code}`, async () => {
         const s = server(() => error(status, code)); await expect(run(s.fetch)).rejects.toThrow(); expect(s.posts()).toHaveLength(1);
     });
     test('mixed failures cannot stack retries', async () => {
@@ -186,7 +186,12 @@ describe('gateway errors and credits', () => {
         const s = server(() => json(catalog)); const provider = gw().provider;
         await gatewayModels(provider, s.fetch, 0); await gatewayModels(provider, s.fetch, 10); expect(s.calls).toHaveLength(1);
         await gatewayModels(provider, s.fetch, 300001); expect(s.calls).toHaveLength(2);
-        await gatewayModels({ ...provider }, s.fetch, 300002); expect(s.calls).toHaveLength(3);
+        await gatewayModels({ ...provider }, s.fetch, 300002); expect(s.calls).toHaveLength(2);
+        await gatewayModels({ ...provider, apiKey: 'different-synthetic-auth' }, s.fetch, 300002); expect(s.calls).toHaveLength(3);
+        await gatewayModels({ ...provider, baseUrl: 'https://other.invalid/ai/v1' }, s.fetch, 300002); expect(s.calls).toHaveLength(4);
+        forgetGatewayModels(provider.baseUrl);
+        await gatewayModels(provider, s.fetch, 300003); expect(s.calls).toHaveLength(5);
+        await gatewayModels({ ...provider, baseUrl: 'https://other.invalid/ai/v1' }, s.fetch, 300003); expect(s.calls).toHaveLength(5);
     });
     for (const field of ['max_input_tokens', 'max_output_tokens']) {
         for (const value of [undefined, null, '4096', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {

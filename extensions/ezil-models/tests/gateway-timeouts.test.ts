@@ -4,7 +4,7 @@ import { ask, gw } from './fixtures/gateway';
 import { frames } from './fixtures/gateway-response';
 
 // Deterministic timers without sleeping or relying on AbortSignal.timeout's native clock.
-async function fakeClock(check: (advance: (ms: number) => Promise<void>) => Promise<void>) {
+async function fakeClock(check: (advance: (ms: number) => Promise<void>, now: () => number) => Promise<void>) {
     let now = 0;
     let id = 0;
     const timers = new Map<number, { at: number; run: () => void }>();
@@ -24,7 +24,7 @@ async function fakeClock(check: (advance: (ms: number) => Promise<void>) => Prom
                 now = next[1].at; timers.delete(next[0]); next[1].run(); await flush();
             }
             now = until; await flush();
-        });
+        }, () => now);
         expect(timers.size).toBe(0);
     } finally { timeout.mockRestore(); clear.mockRestore(); clock.mockRestore(); }
 }
@@ -34,6 +34,33 @@ async function drain(fetchImpl: typeof fetch, signal = new AbortController().sig
 }
 
 describe('bounded gateway waits', () => {
+    test('re-queueing after a concurrency refusal cannot extend the 60-second budget', async () => fakeClock(async (advance, now) => {
+        const model = gw(); const signal = new AbortController().signal;
+        let calls = 0; let finished = false;
+        const fetch = (async () => {
+            calls++;
+            return calls === 1
+                ? new Response(JSON.stringify({ error: { code: 'concurrency_limit' } }), { status: 429 })
+                : new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } });
+        }) as unknown as typeof globalThis.fetch;
+        const retry = (async () => {
+            try { for await (const _ of gatewayChat(model, ask(), { signal, fetch, now })) { /* drain */ } }
+            catch (error) { return error as Error; }
+            finally { finished = true; }
+        })();
+        await advance(0);
+        // Pause consumers after their first part, so two healthy responses hold slots across the deadline.
+        const holders = [0, 1].map(() => gatewayChat(model, ask(), { signal, fetch, now }));
+        try {
+            await Promise.all(holders.map(g => g.next()));
+            await advance(2000); expect(calls).toBe(3);
+            await advance(57_999); expect(finished).toBe(false);
+            await advance(1);
+            expect((await retry)?.message).toBe('EZiL AI: Wait for the current response to finish');
+            expect(calls).toBe(3); expect(finished).toBe(true);
+        } finally { await Promise.all(holders.map(g => g.return(undefined))); }
+    }));
+
     test('stalled headers time out at 30s, abort transport, and never retry', async () => fakeClock(async advance => {
         let calls = 0; let signal: AbortSignal | undefined;
         const result = drain((async (_url, init) => { calls++; signal = init?.signal ?? undefined; return new Promise<Response>(() => {}); }) as typeof fetch).catch(error => error);
