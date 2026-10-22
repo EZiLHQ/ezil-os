@@ -17,6 +17,7 @@ const oldRuntime = 'a'.repeat(32), newRuntime = 'b'.repeat(32);
 const ack = () => Response.json({ ok: true, outcome: 'restart_requested' }, { status: 202 });
 const relay = (runtimeId = oldRuntime) => Response.json({ ok: true, runtimeId, expiresAt: Date.now() + 600_000 });
 let fetchMock: ReturnType<typeof vi.fn>;
+let logs: string[];
 // The placement fake also schedules zero-delay SQL yields; drive those with the poll timers.
 async function complete<T>(pending: Promise<T>): Promise<T> {
     await vi.runAllTimersAsync();
@@ -24,6 +25,8 @@ async function complete<T>(pending: Promise<T>): Promise<T> {
 }
 const dispatches = () => fetchMock.mock.calls.filter(([, init]) => init.method === 'POST');
 beforeEach(() => {
+    logs = [];
+    vi.spyOn(console, 'info').mockImplementation((line: string) => { logs.push(line); });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     let runtime = oldRuntime;
     fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
@@ -32,7 +35,11 @@ beforeEach(() => {
     });
     vi.stubGlobal('fetch', fetchMock);
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });
+afterEach(() => {
+    // Every operator line has only fixed codes, HTTP status, durations and counts.
+    for (const line of logs) expect(line).toMatch(/^\[aws-restart\] phase=(preflight|a|b|c_or_d) code=[a-z_]+ status=\d+ elapsed_ms=\d+ phase_ms=\d+ polls=\d+ unreadable=\d+$/);
+    vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers();
+});
 
 it('provider signs current owned epoch and exact requests; only reads placement', async () => {
     const { fake, restart } = setup();
@@ -163,4 +170,50 @@ it('lost transport and invalid JSON return a redacted unavailable value', async 
     expect(await complete(setup().restart())).toEqual(failure);
     fetchMock.mockResolvedValueOnce(relay()).mockResolvedValueOnce(new Response('LEAK'));
     expect(await complete(setup().restart())).toEqual(failure);
+});
+
+it('logs successful baseline, queued dispatch and observed completion with timings', async () => {
+    await complete(setup().restart());
+    expect(logs.map(line => line.match(/phase=(\S+) code=(\S+)/)!.slice(1))).toEqual([
+        ['preflight', 'started'], ['a', 'baseline_ready'], ['b', 'dispatch_queued'], ['c_or_d', 'runtime_changed'],
+    ]);
+    expect(logs[1]).toContain('status=200');
+    expect(logs[2]).toContain('status=202');
+    expect(logs[3]).toMatch(/phase_ms=0 polls=1 unreadable=0$/);
+});
+it.each([
+    ['transport', 'baseline_transport_failed', 0], ['json', 'baseline_response_invalid', 200],
+    ['http', 'baseline_http_error', 503], ['identity', 'baseline_runtime_invalid', 200],
+])('logs baseline failure category and never dispatches: %s', async (mode, code, status) => {
+    fetchMock.mockImplementation(async () => {
+        if (mode === 'transport') throw new Error('LEAK secret https://credential.example');
+        if (mode === 'json') return new Response('LEAK');
+        if (mode === 'http') return Response.json({ ok: true, runtimeId: newRuntime, error: 'LEAK' }, { status: 503 });
+        return relay('LEAK');
+    });
+    expect(await complete(setup().restart())).toEqual(failure);
+    expect(logs.at(-1)).toContain(`phase=a code=${code} status=${status}`);
+    expect(dispatches()).toHaveLength(0);
+});
+it.each(['transport', 'json', 'rejected'])('logs dispatch failures separately from readiness: %s', async mode => {
+    fetchMock.mockResolvedValueOnce(relay());
+    if (mode === 'transport') fetchMock.mockRejectedValueOnce(new Error('LEAK'));
+    else fetchMock.mockResolvedValueOnce(mode === 'json' ? new Response('LEAK') : Response.json({ error: 'LEAK' }, { status: 503 }));
+    expect(await complete(setup().restart())).toEqual(failure);
+    const code = mode === 'transport' ? 'transport_failed' : mode === 'json' ? 'response_invalid' : 'rejected';
+    expect(logs.at(-1)).toContain(`phase=b code=dispatch_${code}`);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+it.each(['unchanged', 'unreadable'])('logs the limits of host-completion evidence with poll counts: %s', async mode => {
+    fetchMock.mockResolvedValueOnce(relay()).mockResolvedValueOnce(ack()).mockImplementation(async () => {
+        if (mode === 'unreadable') throw new Error('LEAK');
+        return relay();
+    });
+    expect(await complete(setup().restart())).toEqual(failure);
+    expect(logs.at(-1)).toContain(`phase=c_or_d code=runtime_${mode === 'unchanged' ? 'unchanged' : 'unreadable_transport_failed'}`);
+    expect(logs.at(-1)).toContain(`phase_ms=180000 polls=90 unreadable=${mode === 'unchanged' ? 0 : 90}`);
+});
+it('logs preflight failure before any baseline read', async () => {
+    expect(await complete(setup([], {}).restart())).toEqual(failure);
+    expect(logs.at(-1)).toContain('phase=preflight code=placement_unavailable');
 });

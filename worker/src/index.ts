@@ -4364,6 +4364,23 @@ async function awsControlTarget(env: Env, request: Request, name: string, prefix
   return { record, zone };
 }
 
+/** Same boot-bound Chat identity for preview bootstrap and an in-place restart. */
+function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
+  const registry = awsRegistryFor(env);
+  return async (bootId: string) => {
+    const secret = resolveNekoDerivationSecret(env);
+    if (!secret) throw new RelayFailure('ai_proxy_not_configured');
+    const res = await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.aiNonce}`, {
+      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId }),
+    }));
+    const { nonce } = await res.json() as { nonce: string | null };
+    if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
+    const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
+    return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
+      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
+  };
+}
+
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
   return async (signal) => {
@@ -4749,18 +4766,7 @@ async function handlePreview(
             const zone = resolveAwsOriginZone(env);
             if (!zone) throw new RelayFailure('aws_origin_unavailable');
             return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
-              aiConfig: async (bootId) => {
-                const secret = resolveNekoDerivationSecret(env);
-                if (!secret) throw new RelayFailure('ai_proxy_not_configured');
-                const res = await registry(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.aiNonce}`, {
-                  method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId }),
-                }));
-                const { nonce } = await res.json() as { nonce: string | null };
-                if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
-                const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
-                return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
-                  proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
-              },
+              aiConfig: awsDesktopAiConfig(env, record),
               neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
           },
           nowMs: Date.now,
@@ -7879,7 +7885,10 @@ export default {
       const aws = await awsControlTarget(env, request, decodeURIComponent(restartMatch[1]), 'restart');
       if (aws instanceof Response) return aws;
       if (aws) return (await import('./aws-restart')).handleAwsRestart(
-        request, aws, resolvePreviewSecrets(env), (input, init) => fetch(input, init));
+        request, aws, resolvePreviewSecrets(env), (input, init) => fetch(input, init), {
+          mint: awsRelayMint(env), neko: () => deriveNekoCredentials(env, aws.record.sandboxId),
+          aiConfig: awsDesktopAiConfig(env, aws.record),
+        });
       return handleRestart(
         env,
         url,

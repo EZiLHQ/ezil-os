@@ -526,22 +526,29 @@ describe('AWS AI signed boot delivery', () => {
 
 describe('AWS restart route registration', () => {
   it('routes signed retries to the host and refuses unsigned, foreign and fenced requests', async () => {
-    const e = env({ AWS_ROUTING_ENABLED: '1' });
+    const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
     expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
     await verifyAwsTunnelOrigin(name => (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS.get(name), SID);
-    const host = installAwsHost();
+    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', desktop: 'running', ice: 'applied', aiConfigured: true });
     const path = `/sandbox/${SID}/restart`;
     const body = JSON.stringify({ requestId: 'a'.repeat(64) });
+    let originalAi: unknown;
     for (let i = 0; i < 2; i++) {
       const r = await worker.fetch(await signed('POST', path, body), e);
       expect(r.status).toBe(202);
       expect(await r.json()).toEqual({ ok: true, outcome: 'restart_requested' });
+      expect(host.pushed!.neko).toEqual(await deriveNekoCredentials(e, SID));
+      expect(host.pushed!.ai?.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
+      if (i === 0) originalAi = host.pushed!.ai;
+      else expect(host.pushed!.ai).toEqual(originalAi);
     }
-    expect(host.paths).toEqual(Array(2).fill(`POST /__ezil/control/restart-desktop/${'a'.repeat(64)}`));
+    expect(host.paths.filter(p => p.includes('/restart-desktop/'))).toEqual(Array(2).fill(`POST /__ezil/control/restart-desktop/${'a'.repeat(64)}`));
+    expect(host.paths.map(p => p.split('/')[3])).toEqual(['desktop', 'ice', 'restart-desktop', 'desktop', 'ice', 'restart-desktop']);
+    expect(host.turnCalls).toBe(2);
     expect(host.bad).toEqual([]);
     expect((await worker.fetch(new Request(`https://api.ezil.work${path}`, { method: 'POST', body }), e)).status).toBe(401);
     expect((await worker.fetch(await signed('POST', path, body, claims({ leaseEpoch: 99 })), e)).status).toBe(502);
     expect((await worker.fetch(await signed('POST', path, JSON.stringify({ requestId: 'a'.repeat(64), action: 'exec' })), e)).status).toBe(400);
-    expect(host.paths).toHaveLength(2);
+    expect(host.paths).toHaveLength(6);
   });
 });
