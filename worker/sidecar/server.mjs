@@ -80,10 +80,13 @@ export function createSidecarServer (surface) {
         res.end(body);
     }
 
-    function errorPayload (code) {
+    // Fixed text only: built from the constant route list, never from the request.
+    const UNKNOWN_VERB_DETAIL = `Unknown verb. This surface is a fixed verb set (${ROUTES.join(', ')}) and has no CDP passthrough.`;
+
+    function errorPayload (code, detail = 'Request failed.') {
         // Return a value from the fixed contract, never an exception's own string.
         const safeCode = ERROR_CODES.find((known) => known === code) ?? 'chrome_unreachable';
-        return { ok: false, error: safeCode, detail: 'Request failed.' };
+        return { ok: false, error: safeCode, detail };
     }
 
     function readBody (req) {
@@ -129,7 +132,7 @@ export function createSidecarServer (surface) {
             return respond(
                 res,
                 otherMethod ? 405 : 404,
-                errorPayload('bad_request'),
+                errorPayload('bad_request', UNKNOWN_VERB_DETAIL),
             );
         }
 

@@ -29,9 +29,9 @@ async function withLogs(run) {
     try { await run(logs); } finally { logs.mockRestore(); }
 }
 
-function assertPrivate(result, code = 'chrome_unreachable', status = 200) {
+function assertPrivate(result, code = 'chrome_unreachable', status = 200, detail = 'Request failed.') {
     expect(result.status).toBe(status);
-    expect(result.body).toEqual({ ok: false, error: code, detail: 'Request failed.' });
+    expect(result.body).toEqual({ ok: false, error: code, detail });
     expect(result.text).not.toContain(PRIVATE_MESSAGE);
     expect(result.text).not.toContain(PRIVATE_STACK);
 }
@@ -84,8 +84,12 @@ describe('sidecar error response boundary', () => {
     });
 
     it('unknown paths and wrong methods return fixed errors without reflecting input', async () => {
-        assertPrivate(await request(surfaceFor(null), { url: `/private-${PRIVATE_MESSAGE}` }), 'bad_request', 404);
-        assertPrivate(await request(surfaceFor(null), { method: 'GET' }), 'bad_request', 405);
+        // The refusal names the fixed verb set (constant text), never the request.
+        const unknownVerb = expect.stringMatching(/^Unknown verb\. This surface is a fixed verb set \(.+\) and has no CDP passthrough\.$/);
+        const missing = await request(surfaceFor(null), { url: `/private-${PRIVATE_MESSAGE}` });
+        assertPrivate(missing, 'bad_request', 404, unknownVerb);
+        expect(missing.text).not.toContain('private-');
+        assertPrivate(await request(surfaceFor(null), { method: 'GET' }), 'bad_request', 405, unknownVerb);
         assertPrivate(await request(surfaceFor(null), { body: 'null' }), 'bad_request');
     });
 });
