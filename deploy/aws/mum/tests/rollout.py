@@ -277,6 +277,21 @@ class CloudFormationTests(unittest.TestCase):
             c=json.loads(json.dumps(b));c['Resources']['ExecRole']['Properties']['Policies'][0]['PolicyDocument']['Statement'][1].update(widen)
             with self.assertRaises(ValueError):cfn.validate_templates('identity',a,c,r)
 
+    def test_image_role_existence_read_is_exact(self):
+        a,b,r=self.templates()
+        prefix='arn:aws:iam::452630323510:'
+        role={'Type':'AWS::IAM::Role','Properties':{'RoleName':'unchanged','Policies':[{'PolicyName':'exec','PolicyDocument':{'Statement':[
+            {'Effect':'Allow','Action':['iam:GetRole'],'Resource':prefix+'role/ezil/mum/*'}]}}]}}
+        a['Resources']['ExecRole']=role;b['Resources']['ExecRole']=json.loads(json.dumps(role))
+        read={'Effect':'Allow','Action':'iam:GetRole','Resource':[prefix+'role/ezil-mum-rebase-preparation',prefix+'role/ezil-mum-recovery']}
+        b['Resources']['ExecRole']['Properties']['Policies'][0]['PolicyDocument']['Statement'].append(read)
+        r['changes']['ExecRole']={'action':'Modify','properties':['Policies'],'attributes':[]}
+        cfn.validate_templates('identity',a,b,r)
+        for widen in ({'Resource':prefix+'role/*'},{'Resource':[prefix+'role/ezil-mum-observer']},{'Action':['iam:GetRole','iam:PassRole']},
+                      {'Action':'iam:GetRolePolicy'},{'Condition':{'StringEquals':{'aws:RequestedRegion':'ap-south-1'}}}):
+            c=json.loads(json.dumps(b));c['Resources']['ExecRole']['Properties']['Policies'][0]['PolicyDocument']['Statement'][1].update(widen)
+            with self.assertRaises(ValueError,msg=str(widen)):cfn.validate_templates('identity',a,c,r)
+
     def test_new_boundary_must_copy_every_shared_global_deny(self):
         a,b,r=self.templates();stmts=b['Resources']['ImageJobBoundary']['Properties']['PolicyDocument']['Statement']
         removed=stmts.pop(0)

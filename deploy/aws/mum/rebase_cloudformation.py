@@ -95,13 +95,24 @@ def _narrow_image_role_allow(statement):
                 'arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary'}}
             and set(statement)<={'Sid','Effect','Action','Resource','Condition'})
 
+IMAGE_JOB_ROLE_NAMES=tuple(arn.replace(':role/ezil/mum/',':role/') for arn in IMAGE_JOB_ROLES)
+
+def _image_role_existence_read(statement):
+    """An added Allow of only iam:GetRole on the two image-job roles' path-less ARNs: IAM authorizes
+    CloudFormation's pre-create GetRole on a not-yet-existing named role against role/<name>."""
+    resources=statement.get('Resource');resources=[resources] if isinstance(resources,str) else resources
+    return (statement.get('Effect')=='Allow' and set(statement)<={'Sid','Effect','Action','Resource'}
+            and action_set(statement)=={'iam:GetRole'} and isinstance(resources,list) and resources
+            and set(resources)<=set(IMAGE_JOB_ROLE_NAMES))
+
 def _without_tightening(right,expected):
-    """Drop statements added to `right` that only tighten (any Deny) or that are the narrow image-role Allow."""
+    """Drop statements added to `right` that only tighten (any Deny), the narrow image-role Allow,
+    or the image-role pre-create existence read."""
     if isinstance(right,dict) and isinstance(expected,dict):
         out={}
         for k,v in right.items():
             if k=='Statement' and isinstance(v,list) and isinstance(expected.get(k),list):
-                out[k]=[st for st in v if st in expected[k] or not (st.get('Effect')=='Deny' or _narrow_image_role_allow(st))]
+                out[k]=[st for st in v if st in expected[k] or not (st.get('Effect')=='Deny' or _narrow_image_role_allow(st) or _image_role_existence_read(st))]
             else: out[k]=_without_tightening(v,expected.get(k))
         return out
     if isinstance(right,list) and isinstance(expected,list) and len(right)==len(expected):
