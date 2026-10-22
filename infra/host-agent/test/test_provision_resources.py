@@ -22,8 +22,8 @@ ROOT_ID, DATA_ID, EXTRA_ID = ("vol-" + c * 17 for c in ("a", "b", "c"))
 
 
 def userdata(**over):
-    d = {"v": 1, "computerId": "11111111-1111-1111-1111-111111111111",
-         "fsUuid": "22222222-2222-2222-2222-222222222222",
+    d = {"v": 1, "computerId": "11111111-1111-4111-8111-111111111111",
+         "fsUuid": "22222222-2222-4222-8222-222222222222",
          "generation": 1, "leaseEpoch": 1, "provision": True}
     return json.dumps({**d, **over})
 

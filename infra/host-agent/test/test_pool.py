@@ -40,6 +40,7 @@ class Clock:
 
 class PoolTest(unittest.TestCase):
     def setUp(self):
+        self.patch(guard, "committed_digest", return_value="sha256:" + "a" * 64)
         temp = tempfile.TemporaryDirectory(prefix="ezil-pool-")
         self.addCleanup(temp.cleanup)
         self.cfg = config.Config(dict(config.DEFAULTS))

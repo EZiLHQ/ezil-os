@@ -208,17 +208,34 @@ def enroll(cfg, lease, instance_id=None, pool_claim=None):
         "poolHostId": pool_claim["poolHostId"], "poolGeneration": pool_claim["poolGeneration"],
         "fence": pool_claim["fence"],
     }
-    body = json.dumps({"computerId": lease["computerId"], "generation": lease["generation"],
-                       "leaseEpoch": lease["leaseEpoch"], **proof,
-                       "identityDocument": ident["document"], "signature": ident["signature"]}).encode()
+    is_maintenance = "ebsRestore" in lease
+    digest = guard.committed_digest(cfg, lease, maintenance=is_maintenance)
+    payload = {"computerId": lease["computerId"], "generation": lease["generation"],
+               "leaseEpoch": lease["leaseEpoch"], **proof,
+               "identityDocument": ident["document"], "signature": ident["signature"],
+               "lowerImageDigest": digest}
+    if is_maintenance:
+        from . import maintenance
+        payload["ebsRestore"] = maintenance.report_spec(lease)
+    body = json.dumps(payload).encode()
     # Bounded retries in this one oneshot activation, so the units that require enrollment
     # simply wait for it (a systemd Restart= would fail their start jobs first).
     deadline = time.monotonic() + float(cfg.get("enrollRetrySeconds", 540))
+    authorization = lease.get("rebasePermit") or lease.get("ebsRestore")
+    if authorization:
+        deadline = min(deadline, time.monotonic() +
+                       leasemod.timestamp_ms(authorization["expiresAt"]) / 1000 - time.time())
     delay = float(cfg.get("enrollRetryInitialSeconds", 2))
     while True:
+        remaining = deadline - time.monotonic()
+        if authorization:
+            remaining = min(remaining, leasemod.timestamp_ms(authorization["expiresAt"]) / 1000 - time.time())
+            if remaining <= 0:
+                raise Refused("permit_expired")
         try:
             status, resp = http.request("POST", cfg.enrollUrl, body=body,
-                                        headers={"Content-Type": "application/json"}, timeout=20,
+                                        headers={"Content-Type": "application/json"},
+                                        timeout=min(20, remaining) if authorization else 20,
                                         ca_file=cfg.caFile, server_name=cfg.tlsServerName)
         except OSError as e:   # no answer: nothing can have been decided
             code, why = "enroll_retry_exhausted", f"transport: {type(e).__name__}"
@@ -227,7 +244,10 @@ def enroll(cfg, lease, instance_id=None, pool_claim=None):
                 # The app consumed the nonce. Keep it locally until the credentials are durable:
                 # an unusable body or a failed write is retried, and the re-send replays.
                 try:
-                    persist(cfg, lease, parse_answer(resp), instance_id)
+                    if is_maintenance:
+                        maintenance.persist(cfg, lease, resp)
+                    else:
+                        persist(cfg, lease, parse_answer(resp), instance_id)
                 except Malformed:
                     code, why = "enroll_response_malformed", "HTTP 200 with an unusable body"
                 except OSError as e:

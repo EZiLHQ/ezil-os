@@ -37,6 +37,12 @@ def open_dir_below(root, rel):
 
 def read_regular_at(dfd, name, st=None, limit=None):
     try:
+        st = st or os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    try:
         fd = os.open(name, FILE_FLAGS, dir_fd=dfd)
     except OSError:
         return None
@@ -69,12 +75,40 @@ def write_file_durable_at(dfd, name, data, mode=0o600):
         pass
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dfd)
     try:
-        os.write(fd, data)
+        pending = memoryview(data)
+        while pending:
+            written = os.write(fd, pending)
+            if written <= 0:
+                raise OSError("short durable write")
+            pending = pending[written:]
         os.fsync(fd)
     finally:
         os.close(fd)
     os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
     os.fsync(dfd)
+
+
+def unlink_durable_at(dfd, name):
+    os.unlink(name, dir_fd=dfd)
+    os.fsync(dfd)
+
+
+def regular_xattrs_at(dfd, name, st):
+    """Include ACLs and security/user metadata; unreadable metadata is not equality."""
+    fd = None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        fd = os.open(name, FILE_FLAGS, dir_fd=dfd)
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            return None
+        return {key: os.getxattr(fd, key) for key in os.listxattr(fd)}
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def empty_dir_fd(fd):

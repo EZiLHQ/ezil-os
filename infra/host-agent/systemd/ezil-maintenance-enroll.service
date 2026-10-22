@@ -1,0 +1,10 @@
+[Unit]
+Description=EZiL: maintenance-only EBS rebind receipt (no desktop credentials)
+Requires=ezil-guard.service
+After=ezil-guard.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent maintenance-enroll
