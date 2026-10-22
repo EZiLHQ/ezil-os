@@ -275,7 +275,10 @@ const writeOnce = ['preparationExecutionArn', 'snapshotId', 'snapshotEvidence', 
     'restoredVolumeId', 'quarantinedVolumeId', 'rebindJobId', 'rebindDocument', 'rebindDigest', 'rebindExecutionArn', 'rebindGeneration', 'rebindLeaseEpoch', 'rebindFenceToken', 'hostEvidence'] as const;
 const valueSql = (j: ImageJob, key: keyof ImageJob, type: string) => {
     const value = j[key];
-    return sql`${type === 'jsonb' && value !== null ? JSON.stringify(value) : value}::${sql.raw(type)}`;
+    // Bind serialized JSON as text before casting: postgres-js otherwise applies
+    // its JSONB serializer again and persists a JSON string instead of an object.
+    if (type === 'jsonb') return sql`${value === null ? null : JSON.stringify(value)}::text::jsonb`;
+    return sql`${value}::${sql.raw(type)}`;
 };
 
 export function createImageJobStore(db: PlacementDb, env: Env = process.env) {

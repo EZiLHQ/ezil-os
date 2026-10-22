@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import postgres from 'postgres';
 import { describe, expect, it } from 'vitest';
 import { fixtureRebasePreparation, fixtureRebaseRelease } from './aws-intent.test-support';
 import { IMAGE_JOB_NEXT, IMAGE_JOB_PHASES, newReservedImageJob, parseImageJobRow, validateImageJob } from './aws-rebase-store';
@@ -7,6 +8,7 @@ import { parseRebaseRelease } from './aws-rebase-release';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { assertNoImageReservation, readPlacement, transitionPlacement } from './placement';
 import { leasePoolHost } from './ready-pool';
+import { rebaseSetup } from './aws-rebase.test-support';
 
 const p = fixtureRebasePreparation();
 const repository = '123456789012.dkr.ecr.ap-south-1.amazonaws.com/desktop';
@@ -31,6 +33,36 @@ describe('image job store and release read contracts', () => {
         expect(ddl).not.toMatch(/PRIMARY KEY|UNIQUE|REFERENCES|DEFAULT|CREATE POLICY|GRANT |TRIGGER/);
         expect(ddl).toContain('REVOKE ALL ON TABLE public.ezil_computer_image_jobs FROM public, anon, authenticated;');
         expect(ddl).toContain('ALTER TABLE public.ezil_computer_image_jobs ENABLE ROW LEVEL SECURITY;');
+    });
+    it('release and evidence binds survive postgres-js serialization as JSON objects or SQL NULL', async () => {
+        const s = rebaseSetup();
+        expect((await s.run('prepare')).status).toBe(202);
+        await s.completePreparation();
+        expect((await s.run('launch')).status).toBe(202);
+        const j = await s.current();
+        // Construct the driver for its actual codecs only; never open a socket.
+        const client = postgres({ host: '127.0.0.1', database: 'unused', username: 'unused', password: 'unused' });
+        try {
+            const serialized: unknown[] = [];
+            for (const statement of s.fake.statements.filter(q => /^(INSERT INTO|UPDATE) public\.ezil_computer_image_jobs/.test(q.sql))) {
+                for (const match of statement.sql.matchAll(/\$(\d+)::(text::)?jsonb/g)) {
+                    const value = statement.params[Number(match[1]) - 1];
+                    // PostgreSQL describes the first cast's OID to the driver.
+                    const oid = match[2] ? 25 : 3802;
+                    serialized.push(value === null ? null : JSON.parse(String(client.options.serializers[oid]!(value))));
+                }
+            }
+            expect(serialized).toContainEqual(j.sourceRelease);
+            expect(serialized).toContainEqual(j.targetRelease);
+            expect(serialized).toContainEqual(j.snapshotEvidence);
+            expect(serialized).toContain(null);
+            expect(serialized.every(value => value === null || typeof value === 'object')).toBe(true);
+        } finally { await client.end(); }
+    });
+    it('rejects double-encoded JSONB instead of silently accepting corrupt release data', () => {
+        const j = make();
+        expect(() => parseImageJobRow({ ...rowOf(j), source_release: JSON.stringify(j.sourceRelease) })).toThrow();
+        expect(() => parseImageJobRow({ ...rowOf(j), target_release: JSON.stringify(j.targetRelease) })).toThrow();
     });
     it.each([
         { sourceGeneration: '1' }, { sourceLeaseEpoch: true }, { sourceGeneration: 2147483648 }, { phase: 'running' },

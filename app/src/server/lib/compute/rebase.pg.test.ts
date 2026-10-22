@@ -59,6 +59,16 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         expect(await client!.unsafe(`SELECT job_id FROM ${schema}.ezil_computer_image_jobs`)).toHaveLength(1);
         await expect(assertNoImageReservation(db, job().computerId)).rejects.toThrow('image_job_conflict');
     });
+    it('stores releases as JSONB objects and absent evidence as SQL NULL', async () => {
+        const expected = job();
+        expect(await store.reserve(expected, repository)).toEqual(expected);
+        expect(await store.read(expected.jobId)).toEqual(expected);
+        const rows = await client!.unsafe(`SELECT jsonb_typeof(source_release) AS source_type,
+            jsonb_typeof(target_release) AS target_type, snapshot_evidence IS NULL AS no_snapshot,
+            host_evidence IS NULL AS no_host FROM ${schema}.ezil_computer_image_jobs`);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toEqual({ source_type: 'object', target_type: 'object', no_snapshot: true, no_host: true });
+    });
     it('only one phase CAS consumes the old timestamp', async () => {
         const j = await store.reserve(job(), repository);
         const next = { ...j, phase: 'fencing' as const, updatedAt: '2026-10-22T11:00:01.000Z' };

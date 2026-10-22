@@ -8,11 +8,12 @@
  *   `monthUsageFromRows` on a mixed fixture (open runs, month-boundary runs, NULL and
  *   non-NULL egress, runs outside the month).
  */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { drizzle } from 'drizzle-orm/postgres-js';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import postgres from 'postgres';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { readMonthUsage, peekAdmissionCounters, type PlacementExecutor } from './placement';
@@ -86,26 +87,42 @@ describe('readMonthUsage totals in the database', () => {
 });
 
 const PG = process.env.EZIL_PG_TEST_URL;
+const schema = `placement_usage_test_${randomUUID().replaceAll('-', '')}`;
 
 describe.skipIf(!PG)('readMonthUsage on real Postgres equals usage.ts arithmetic', () => {
     const client = PG ? postgres(PG, { max: 1, onnotice: () => {} }) : null;
-    afterAll(async () => { await client?.end(); });
+    const dialect = new PgDialect();
+    const local = (q: string) => q.replaceAll('public.', `${schema}.`);
+    const db: PlacementExecutor = { execute: async q => {
+        const rendered = dialect.sqlToQuery(q);
+        return client!.unsafe(local(rendered.sql), rendered.params as never[]);
+    } };
+    let created = false;
+    afterAll(async () => {
+        try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); }
+        finally { await client?.end(); }
+    });
 
-    beforeEach(async () => {
-        const sqlFile = readFileSync(path.resolve(__dirname, '../../../../../docs/aws-computers/sql/0001_compute_placement.sql.txt'), 'utf8');
+    beforeAll(async () => {
         await client!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-            DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-            DROP TABLE IF EXISTS public.ezil_computer_placements, public.ezil_compute_usage;`);
-        await client!.unsafe(sqlFile);
+            DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
+        await client!.unsafe(`CREATE SCHEMA ${schema}`); created = true;
+        // Capacity includes in-flight migrations as well as placements. Install
+        // both contracts locally; never depend on or drop another suite's tables.
+        for (const file of ['../../../../../docs/aws-computers/sql/0001_compute_placement.sql.txt', '../../../../drizzle/0006_compute_migrations.sql'])
+            await client!.unsafe(local(readFileSync(path.resolve(__dirname, file), 'utf8')));
+    });
+    beforeEach(async () => {
+        await client!.unsafe(`TRUNCATE ${schema}.ezil_computer_placements, ${schema}.ezil_compute_usage, ${schema}.ezil_compute_migrations`);
     });
 
     it('SQL totals equal monthUsageFromRows on a mixed fixture', async () => {
         for (const r of FIXTURE) {
-            await client!`INSERT INTO public.ezil_compute_usage (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, egress_bytes, observed_by, updated_at)
+            await client!`INSERT INTO ${client!(schema)}.ezil_compute_usage (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, egress_bytes, observed_by, updated_at)
                 VALUES (${r.computer_id}::uuid, ${r.user_id}::uuid, 'i-x', ${r.instance_type}, ${r.started_at.toISOString()}::timestamptz,
                     ${r.stopped_at ? r.stopped_at.toISOString() : null}::timestamptz, ${r.egress_bytes}, 'test', now())`;
         }
-        const got = plain(await readMonthUsage(drizzle(client!) as unknown as PlacementExecutor, NOW, MONTH));
+        const got = plain(await readMonthUsage(db, NOW, MONTH));
         const want = plain(reference());
         expect(Object.keys(got.byUser)).toEqual(Object.keys(want.byUser));
         for (const [user, t] of Object.entries(want.byUser)) {
@@ -133,19 +150,18 @@ describe.skipIf(!PG)('readMonthUsage on real Postgres equals usage.ts arithmetic
         // execute them on PG: this checks the SQL independently of the fake's sums.
         const fake = createFakePlacementDb({ placements: rows });
         const expected = await peekAdmissionCounters(fake.db, { userId: U1, computerId: C(1), now: NOW, monthStart: MONTH });
-        await client!.unsafe('TRUNCATE public.ezil_computer_placements');
         for (const row of rows) {
-            await client!`INSERT INTO public.ezil_computer_placements
+            await client!`INSERT INTO ${client!(schema)}.ezil_computer_placements
                 (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, instance_type, updated_at)
                 VALUES (${String(row.computer_id)}::uuid, ${U1}::uuid, ${String(row.provider)}, ${String(row.workspace_store)}, 1, 0,
                     ${String(row.state)}, ${row.region as string | null}, ${row.instance_type as string | null}, now())`;
         }
         const statements = fake.statements.filter(s => /placement:count-running(?:-region)? \*\//.test(s.sql));
         expect(statements).toHaveLength(2);
-        const global = await client!.unsafe(statements[0]!.sql, statements[0]!.params.map(String));
+        const global = await client!.unsafe(local(statements[0]!.sql), statements[0]!.params.map(String));
         expect(global.map(r => ({ n: Number(r.n), vcpu: Number(r.vcpu) }))).toEqual([{ n: 6, vcpu: 34 }]);
         expect(expected).toMatchObject({ runningCount: 6, runningVcpu: 34, runningUnplaced: 2, runningVcpuUnplaced: 16 });
-        const regional = await client!.unsafe(statements[1]!.sql, statements[1]!.params.map(String));
+        const regional = await client!.unsafe(local(statements[1]!.sql), statements[1]!.params.map(String));
         expect(Object.fromEntries(regional.map(r => [r.region ?? 'unplaced', [Number(r.n), Number(r.vcpu)]]))).toEqual({
             'ap-south-1': [2, 6], 'us-east-1': [2, 12], unplaced: [2, 16],
         });

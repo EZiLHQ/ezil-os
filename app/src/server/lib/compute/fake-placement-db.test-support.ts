@@ -133,8 +133,14 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     });
 
     const value = (expr: string, params: unknown[]): unknown => {
-        const p = expr.match(/^\$(\d+)(?:::\w+)?$/);
-        if (p) return expr.endsWith('::jsonb') && typeof params[Number(p[1]) - 1] === 'string' ? JSON.parse(params[Number(p[1]) - 1] as string) : params[Number(p[1]) - 1];
+        const p = expr.match(/^\$(\d+)(?:::\w+)*$/);
+        if (p) {
+            const parameter = params[Number(p[1]) - 1];
+            if (!expr.endsWith('::jsonb') || parameter === null) return parameter;
+            // Match postgres-js's first-cast serializer: a direct JSONB bind
+            // serializes even strings, whereas text is parsed by the SQL cast.
+            return JSON.parse(expr.includes('::text::jsonb') ? String(parameter) : JSON.stringify(parameter));
+        }
         if (expr === "'aws-ec2'") return 'aws-ec2';
         if (expr === 'now()') return clock();
         if (/^\d+$/.test(expr)) return Number(expr);
