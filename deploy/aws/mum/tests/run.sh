@@ -133,6 +133,8 @@ test_case 'IAM change in change-set description refused' recipe-iam '{"iam_chang
 test_case 'IAM template drift refused before uploads' recipe-template-iam '{"template_iam":true}' 'refuse-unexpected template resource change'
 test_case 'parameter definition drift in synthesized template refused' recipe-template-param '{"template_parameter":true}' 'refuse-unexpected template parameter'
 test_case 'live template ? for a non-ASCII character is not a Data change' recipe-nonascii '{"non_ascii_data":true}' pass
+test_case 'dynamic value entries explained by references proceed' recipe-dynamic '{"live_dynamic":true}' pass
+test_case 'dynamic entry on an unexplained property refused' recipe-dynamic-bad '{"dynamic_unexplained":true}' 'refuse-unexpected versioned Image Builder'
 test_case 'oversize inline template uploaded to pinned S3 prefix' recipe-large '{"large_template":52000}' pass
 test_case 'template exceeding S3 limit refused' recipe-too-large '{"large_template":1048576}' 'refuse-synthesized template exceeds'
 test_case 'configuration changes forced only by version string proceed' recipe-forced '{"forced_config_version":true}' pass

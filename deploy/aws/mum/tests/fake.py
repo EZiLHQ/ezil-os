@@ -189,6 +189,13 @@ elif tool == "aws":
                         {"Target": {"Attribute": "Properties", "Name": "Components", "RequiresRecreation": "Always"}, "ChangeSource": source, "CausingEntity": cause}
                         for source, cause in [("ResourceReference", "Component"), *[("ParameterReference", k) for k in ("AgentSrcS3Uri", "DesktopImageDigest", "DesktopImageId")]]
                     ])
+                    if scenario.get("live_dynamic") or scenario.get("dynamic_unexplained"):
+                        # Real CloudFormation also lists value-only Dynamic entries for referenced properties.
+                        dyn = lambda name, rec: {"Target": {"Attribute": "Properties", "Name": name, "RequiresRecreation": rec}, "ChangeSource": "DirectModification", "Evaluation": "Dynamic"}
+                        cs["Changes"][1]["ResourceChange"]["Details"].append(dyn("Components", "Always"))
+                        cs["Changes"][2]["ResourceChange"]["Details"].append(dyn("ImageRecipeArn", "Never"))
+                        if scenario.get("dynamic_unexplained"):
+                            cs["Changes"][1]["ResourceChange"]["Details"].append(dyn("ParentImage", "Always"))
                     if scenario.get("iam_change"):
                         cs["Changes"].append({"Type": "Resource", "ResourceChange": {"Action": "Modify", "LogicalResourceId": "BuildRole", "ResourceType": "AWS::IAM::Role"}})
                     if scenario.get("forced_config_version"):

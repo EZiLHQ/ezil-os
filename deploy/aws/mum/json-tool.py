@@ -186,6 +186,21 @@ def versioned_ami_changes(cs, resources, template_changes):
         need(set(r["Scope"]) == {"Properties"} and bool(r.get("Details")), "unexplained resource change")
         direct = template_changes[logical]
         targets = set()
+        dependencies = {"ImageRecipeArn": recipe}
+        for kind, prop in (("InfrastructureConfiguration", "InfrastructureConfigurationArn"), ("DistributionConfiguration", "DistributionConfigurationArn")):
+            dependency = by_type.get("AWS::ImageBuilder::" + kind)
+            if dependency and template_changes.get(dependency):
+                dependencies[prop] = dependency
+
+        def referenced(name, source, cause):
+            if logical == recipe and name == "Components":
+                return (source == "ParameterReference" and cause in ALLOWED) or (source in ("ResourceReference", "ResourceAttribute") and cause == component)
+            if logical == pipeline:
+                return name in dependencies and source in ("ResourceReference", "ResourceAttribute") and cause == dependencies[name]
+            return False
+
+        explained = {d["Target"]["Name"] for d in r["Details"]
+                     if referenced(d["Target"]["Name"], d["ChangeSource"], d.get("CausingEntity", "").split(".")[0])}
         for detail in r["Details"]:
             target = detail["Target"]
             need(target["Attribute"] == "Properties", "non-property resource change")
@@ -193,15 +208,11 @@ def versioned_ami_changes(cs, resources, template_changes):
             cause = detail.get("CausingEntity", "").split(".")[0]
             targets.add(name)
             expected = name in direct and source == "DirectModification"
-            if logical == recipe and name == "Components":
-                expected |= (source == "ParameterReference" and cause in ALLOWED) or (source in ("ResourceReference", "ResourceAttribute") and cause == component)
-            if logical == pipeline:
-                dependencies = {"ImageRecipeArn": recipe}
-                for kind, prop in (("InfrastructureConfiguration", "InfrastructureConfigurationArn"), ("DistributionConfiguration", "DistributionConfigurationArn")):
-                    dependency = by_type.get("AWS::ImageBuilder::" + kind)
-                    if dependency and template_changes.get(dependency):
-                        dependencies[prop] = dependency
-                expected |= name in dependencies and source in ("ResourceReference", "ResourceAttribute") and cause == dependencies[name]
+            expected |= referenced(name, source, cause)
+            # CloudFormation also lists a value-only "DirectModification / Dynamic" entry
+            # for a property whose change comes from a reference; accept it only when that
+            # same property is already explained by an allowed reference in this change.
+            expected |= source == "DirectModification" and detail.get("Evaluation") == "Dynamic" and name in explained
             need(expected, "unexpected versioned Image Builder property change")
         need(direct <= targets, "change set omits synthesized property changes")
         if logical in (component, recipe):
