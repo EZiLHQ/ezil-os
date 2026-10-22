@@ -74,9 +74,9 @@ elif tool in ("npm", "npx", "sleep"):
             resources["Infrastructure"]["Properties"]["SubnetId"] = "subnet-unexpected"
         if scenario.get("synth_version_mismatch"):
             resources["Recipe"]["Properties"]["Version"] = "1.0.0"
-        output = Path(flag("--output"))
-        assert str(output).startswith("/tmp/ezil-mum.")
-        output.mkdir()
+        assert "--output" not in args, "synth:ami pins its own -o; a second --output is rejected"
+        output = Path(flag("--prefix")) / "cdk.out" / "ami"
+        output.mkdir(parents=True, exist_ok=True)
         (output / "ezil-mum-ami.template.json").write_text(json.dumps(value))
         save("synth-template.json", value)
 elif tool == "timeout":

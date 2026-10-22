@@ -56,11 +56,15 @@ template_uri=
 validation_args=()
 if [[ -n "$recipe_version" ]]; then
     # README host-AMI step (d), package.json synth:ami, and bin/ami.ts.
-    # npm runs in the package directory; the last --output overrides its default.
-    # That script disables AWS credentials, lookups and telemetry. It runs in
-    # dry-run too, using only this temporary nonsecret config and assembly.
-    show env "EZIL_AMI_CONFIG=$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami --output "$work/cdk.out"
-    EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami --output "$work/cdk.out"
+    # synth:ami already pins -o cdk.out/ami (CDK rejects a second --output), so synth
+    # there and copy the template out. That script disables AWS credentials, lookups
+    # and telemetry. It runs in dry-run too, using only this temporary nonsecret config.
+    synth_out="$repo_root/infra/app-computers/cdk.out/ami"
+    rm -f "$synth_out/ezil-mum-ami.template.json"
+    show env "EZIL_AMI_CONFIG=$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami
+    EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$repo_root/infra/app-computers" run synth:ami -- ezil-mum-ami
+    mkdir -p "$work/cdk.out"
+    cp "$synth_out/ezil-mum-ami.template.json" "$work/cdk.out/ezil-mum-ami.template.json"
     candidate_template=$work/cdk.out/ezil-mum-ami.template.json
     validation_args=("$candidate_template" "$work/previous-ami-config.json" "$work/ami.mum.json")
     json ami-template "$work/template.json" "${validation_args[@]}"

@@ -36,7 +36,7 @@ if mode.startswith("recipe-"):
         assert (root / "ami-config.json").read_bytes() == (root / "original-ami-config.json").read_bytes()
         assert read("synth-config.json")["version"] == "1.0.2"
         assert read("synth-template.json")["Resources"]["Component"]["Properties"]["Version"] == "1.0.2"
-        assert has("npm", "synth:ami", "ezil-mum-ami", "--output")
+        assert has("npm", "synth:ami", "ezil-mum-ami")
         assert not any(has(x) for x in ("tag", "push", "get-login-password", "archive", "create-change-set", "start-image-pipeline-execution"))
         assert not (root / "release").exists()
         assert "--template-body" in output and "--use-previous-template" not in output
