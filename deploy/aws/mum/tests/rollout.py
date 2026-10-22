@@ -96,7 +96,7 @@ class SchemaTests(unittest.TestCase):
 
     def evidence(self):
         return {'placements':self.expected['placements'],'columns':self.expected['columns'],
-                'indexes':{k:'CREATE INDEX '+k+' ON public.ezil_computer_image_jobs USING btree ('+v+')' for k,v in self.expected['indexes'].items()},
+                'indexes':dict(self.expected['indexes']),
                 'rls':True,'constraints':0,'defaults':0,'triggers':0,'policies':0,'grants':0}
 
     def receipt(self):
@@ -344,7 +344,7 @@ class IntegrationTests(unittest.TestCase):
         sql=Path(manifest.read(self.path)['schemaPath']).read_bytes();shape=schema.expected_schema(sql.decode())
         return {'schemaVersion':1,'systemIdentifier':'1234567890123456789','schemaSha256':hashlib.sha256(sql).hexdigest(),'applied':True,
                 'before':dict(placements={},columns={},indexes={},rls=False,constraints=0,defaults=0,triggers=0,policies=0,grants=0),
-                'after':dict(placements=shape['placements'],columns=shape['columns'],indexes={k:'CREATE INDEX '+k+' ON public.ezil_computer_image_jobs USING btree ('+v+')' for k,v in shape['indexes'].items()},rls=True,constraints=0,defaults=0,triggers=0,policies=0,grants=0)}
+                'after':dict(placements=shape['placements'],columns=shape['columns'],indexes=dict(shape['indexes']),rls=True,constraints=0,defaults=0,triggers=0,policies=0,grants=0)}
 
     def aws(self,*args):
         self.calls.append(args);service,op=args[:2]
