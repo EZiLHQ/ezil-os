@@ -258,9 +258,9 @@ def execute(phase, spec, directory, apply, aws, write, digest, sleep=time.sleep)
     need(cs.get('RoleARN',spec['roleArn'])==spec['roleArn'],'change set role drift')
     need(stack.get('RoleARN')==(spec['roleArn']), 'stack execution role drift')
     need(spec['roleArn']==(None if phase=='identity' else ROLE),'unapproved stack execution role')
-    previous={p['ParameterKey']:p for p in stack.get('Parameters',[])}
-    actual={p['ParameterKey']:p for p in cs.get('Parameters',[])}
-    need(len(previous)==len(stack.get('Parameters',[])) and len(actual)==len(cs.get('Parameters',[])) and previous.keys()==actual.keys(),'parameter coverage mismatch')
+    previous={p['ParameterKey']:p for p in (stack.get('Parameters') or [])}
+    actual={p['ParameterKey']:p for p in (cs.get('Parameters') or [])}
+    need(len(previous)==len(stack.get('Parameters') or []) and len(actual)==len((cs.get('Parameters') or [])) and previous.keys()==actual.keys(),'parameter coverage mismatch')
     for key,p in previous.items():
         target=actual[key]
         if phase=='foundation' and key=='HostAmiId' and cs['ExecutionStatus']=='AVAILABLE':

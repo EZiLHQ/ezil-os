@@ -302,7 +302,7 @@ class IntegrationTests(unittest.TestCase):
         patch.object(RELEASE.json_tool,'APP_SECRET_LOCK',str(self.root/'app-secret.lock')).start()
         patch('sys.stdout',new_callable=io.StringIO).start()
         self.specs={};self.templates={};self.cloud={};self.calls=[];self.payloads={};self.commands={}
-        self.fail_app=False;self.lost_put=False;self.lost_execute=False;self.bad_change=False
+        self.fail_app=False;self.lost_put=False;self.lost_execute=False;self.bad_change=False;self.null_params=False
         self.generation=0
         self.envelope={'VersionId':'initial','SecretString':json.dumps({'keep':'synthetic','EZIL_AWS_KILL_SWITCH':'1',TOOL.KEY:{TOOL.REGION:self.source,'other':{'keep':True}}})}
         self.outer_original=manifest.loads(self.envelope['SecretString'])
@@ -381,7 +381,9 @@ class IntegrationTests(unittest.TestCase):
             phase=next(k for k,v in cfn.STACKS.items() if v==flag('--stack-name'));before,after,review=self.templates[phase];spec=self.specs[phase]
             if op=='describe-stacks':
                 params=[{'ParameterKey':'HostAmiId','ParameterValue':self.value['amiId'] if self.cloud[phase] else self.source['amiId']}] if phase=='foundation' else []
-                return {'Stacks':[{'StackStatus':'UPDATE_COMPLETE','RoleARN':spec['roleArn'],'Parameters':params}]}
+                stack={'StackStatus':'UPDATE_COMPLETE','RoleARN':spec['roleArn'],'Parameters':params}
+                if self.null_params and not params:del stack['Parameters']
+                return {'Stacks':[stack]}
             if op=='get-template':return {'TemplateBody':after if '--change-set-name' in args or self.cloud[phase] else before}
             if op=='describe-change-set':
                 changes=[]
@@ -389,7 +391,8 @@ class IntegrationTests(unittest.TestCase):
                     details=[{'Target':{'Attribute':'Properties','Name':p,'RequiresRecreation':'Never'},'ChangeSource':'DirectModification','Evaluation':'Static'} for p in r['properties']]
                     changes.append({'Type':'Resource','ResourceChange':{'LogicalResourceId':logical,'ResourceType':after['Resources'][logical]['Type'],'Action':r['action'],'Replacement':'False','Scope':['Properties'] if r['action']=='Modify' else [],'Details':details}})
                 if self.bad_change:changes[0]['ResourceChange']['Replacement']='True'
-                return {'ChangeSetId':spec['changeSetArn'],'StackName':spec['stackName'],'Status':'CREATE_COMPLETE','ExecutionStatus':'EXECUTE_COMPLETE' if self.cloud[phase] else 'AVAILABLE','Changes':changes,'Parameters':[{'ParameterKey':'HostAmiId','ParameterValue':self.value['amiId']}] if phase=='foundation' else []}
+                params=[{'ParameterKey':'HostAmiId','ParameterValue':self.value['amiId']}] if phase=='foundation' else (None if self.null_params else [])
+                return {'ChangeSetId':spec['changeSetArn'],'StackName':spec['stackName'],'Status':'CREATE_COMPLETE','ExecutionStatus':'EXECUTE_COMPLETE' if self.cloud[phase] else 'AVAILABLE','Changes':changes,'Parameters':params}
             if op=='execute-change-set':
                 self.assertEqual(manifest.read(self.directory/(phase+'-cloudformation.json'))['status'],'executing')
                 self.cloud[phase]=True
@@ -441,6 +444,12 @@ class IntegrationTests(unittest.TestCase):
     def test_uncertain_cloud_execution_reconciles_readback_and_retains_id(self):
         RELEASE.apply_schema(self.path,True);self.lost_execute=True
         with self.assertRaises(TimeoutError):RELEASE.apply_cloud(self.path,'apply-identity',True)
+        RELEASE.apply_cloud(self.path,'apply-identity',True)
+        self.assertEqual(sum(c[:2]==('cloudformation','execute-change-set') for c in self.calls),1)
+
+    def test_parameterless_stack_null_change_set_parameters_apply(self):
+        # Real CloudFormation omits a parameterless stack's Parameters and returns a change set's as null.
+        RELEASE.apply_schema(self.path,True);self.null_params=True
         RELEASE.apply_cloud(self.path,'apply-identity',True)
         self.assertEqual(sum(c[:2]==('cloudformation','execute-change-set') for c in self.calls),1)
 
