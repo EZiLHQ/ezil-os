@@ -24,7 +24,7 @@ def preserved():
     assert type(b) is type(a)
     b, a = (json.loads(b), json.loads(a)) if isinstance(b, str) else (b, a)
     assert b["us-east-1"] == a["us-east-1"]
-    for key in b["ap-south-1"].keys() - {"amiId", "stateMachineVersionArn"}:
+    for key in b["ap-south-1"].keys() - {"amiId", "stateMachineVersionArn", "launchTemplateVersion"}:
         assert b["ap-south-1"][key] == a["ap-south-1"][key]
     assert "synthetic-private-do-not-print" not in output
     assert "keepSynthetic" not in output
@@ -110,7 +110,7 @@ elif mode == "parameters":
 elif mode.startswith("refuse-"):
     token = mode.removeprefix("refuse-")
     assert token in output, output
-    assert not has("execute-change-set")
+    assert not any("execute-change-set" in c and "ezil-mum-foundation" not in c for c in calls)
     if token in ("wrong AWS account", "region must", "image ID mismatch", "schema-2", "linux/amd64"):
         assert not has("create-change-set")
     if mode.startswith("refuse-recipe version"):
@@ -122,13 +122,31 @@ elif mode == "dry-promote":
     assert not (root / "release").exists()
     assert has("npm", "synth:lifecycle") and not has("npx") and not has("create-change-set") and not has("secretsmanager")
     assert "lifecycle:11" in output
-    sequence = ["Edit ", "synth:lifecycle", "publish-assets", "s3 cp", "create-change-set", "wait change-set-create-complete", "describe-change-set", "execute-change-set", "wait stack-update-complete", "put-secret-value"]
+    sequence = ["Plan ", "synth:lifecycle", "create-change-set", "wait change-set-create-complete", "describe-change-set", "execute-change-set", "wait stack-update-complete", "Require read-back version 8", "Edit ", "publish-assets", "s3 cp", "put-secret-value"]
     positions = [output.index(p) for p in sequence]
     assert positions == sorted(positions)
+    assert "--use-previous-template" in output and "launchTemplateVersion=8" in output
+    assert read("launch-template-versions.json") == read("original-launch-template-versions.json")
 elif mode == "promote":
     b, a = preserved()
     assert a["ap-south-1"]["amiId"] == "ami-" + "2" * 17
     assert a["ap-south-1"]["stateMachineVersionArn"].endswith(":11")
+    assert a["ap-south-1"]["launchTemplateVersion"] == "8"
+    assert read("config.json")["settings"]["deployment"]["launchTemplateVersion"] == "8"
+    versions = read("launch-template-versions.json")
+    assert versions[:-1] == read("original-launch-template-versions.json")
+    assert versions[-1]["VersionNumber"] == 8 and versions[-1]["LaunchTemplateData"]["ImageId"] == a["ap-south-1"]["amiId"]
+    assert read("release/promoted-launch-template.json")["LaunchTemplateVersions"] == [versions[-1]]
+    assert read("foundation-requested.json") == [
+        {"ParameterKey": "HostAmiId", "ParameterValue": "ami-" + "2" * 17},
+        {"ParameterKey": "FutureParameter", "UsePreviousValue": True}, {"ParameterKey": "Parent", "UsePreviousValue": True}]
+    foundation_execute = next(i for i, c in enumerate(calls) if "execute-change-set" in c and "ezil-mum-foundation" in c)
+    foundation_describe = next(i for i, c in enumerate(calls) if "describe-change-set" in c and "ezil-mum-foundation" in c)
+    readback = next(i for i, c in enumerate(calls) if i > foundation_execute and "describe-launch-template-versions" in c and "$Latest" in c)
+    publish = next(i for i, c in enumerate(calls) if "publish-assets" in c)
+    lifecycle_execute = next(i for i, c in enumerate(calls) if "execute-change-set" in c and "ezil-mum-lifecycle" in c)
+    secret_write = next(i for i, c in enumerate(calls) if "put-secret-value" in c)
+    assert foundation_describe < foundation_execute < readback < publish < lifecycle_execute < secret_write
     assert read("config.json")["preserve"] == {"nested": True}
     assert has("npm", "synth:lifecycle") and has("npx", "publish-assets")
     assert any("put-secret-value" in c and any(str(x).startswith("file://") and "ezil-secret." in str(x) for x in c) for c in calls)
@@ -137,6 +155,46 @@ elif mode == "rollback":
     b, a = preserved()
     assert b == a
     assert read("config.json") == read("original-config.json")
+    assert a["ap-south-1"]["launchTemplateVersion"] == "3"
+    assert sum("execute-change-set" in c and "ezil-mum-foundation" in c for c in calls) <= 1
+    versions = read("launch-template-versions.json")
+    assert versions[:2] == read("original-launch-template-versions.json")
+elif mode == "no-foundation-execute":
+    assert not has("execute-change-set", "ezil-mum-foundation")
+    assert read("launch-template-versions.json") == read("original-launch-template-versions.json")
+elif mode == "foundation-stopped":
+    assert not has("publish-assets") and not has("execute-change-set", "ezil-mum-lifecycle")
+    assert not has("put-secret-value")
+    assert read("config.json") == read("original-config.json")
+    assert read("secret.json")["VersionId"] == "initial"
+    reasons = {
+        "secret_template_drift": "secret operation refused",
+        "foundation_extra_resource": "unexpected foundation resource change",
+        "foundation_extra_parameter": "foundation extra parameter/resolved SSM change refused",
+        "foundation_ssm": "foundation extra parameter/resolved SSM change refused",
+        "foundation_role": "unexpected CloudFormation execution role",
+        "foundation_no_role": "foundation stack must use its execution role",
+        "foundation_role_race": "unexpected CloudFormation execution role",
+        "foundation_stack_race": "foundation changed since planning",
+        "foundation_version_race": "foundation changed since planning",
+        "foundation_identity": "foundation launch-template identity mismatch",
+        "configured_template_mismatch": "launch-template read-back AMI/version mismatch",
+        "foundation_property": "unexpected foundation property change",
+        "foundation_path": "unexpected foundation property change",
+        "foundation_context": "foundation change-set values are not only the AMI change",
+        "foundation_replacement": "foundation replacement/unexplained change refused",
+        "foundation_page": "incomplete change set",
+        "foundation_readback_mismatch": "launch-template read-back AMI/version mismatch",
+        "foundation_readback_version": "launch-template read-back AMI/version mismatch",
+        "foundation_readback_data": "launch-template read-back changed data outside ImageId",
+        "foundation_post_parameter": "foundation extra parameter/resolved SSM change refused",
+    }
+    for scenario, reason in reasons.items():
+        if read("scenario.json").get(scenario):
+            assert reason in output, output
+elif mode == "foundation-partial":
+    assert has("execute-change-set", "ezil-mum-foundation")
+    assert (root / "release/promotion.json").exists()
 elif mode == "no-secret-write":
     assert not has("put-secret-value")
     assert "synthetic-private-do-not-print" not in output
@@ -159,3 +217,4 @@ else:
     raise AssertionError(mode)
 assert not any(has(command) for command in ("deregister-image", "delete-snapshot", "delete-image", "commit", "checkout"))
 assert not has("git", "push")
+assert not has("delete-launch-template-versions") and not has("delete-launch-template")

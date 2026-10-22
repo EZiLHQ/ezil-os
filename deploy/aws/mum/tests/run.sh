@@ -31,6 +31,17 @@ if [[ "${1:-}" == --case ]]; then
     name=$2; scenario=$3; mode=$4
     fixture "$name" "$scenario"
     case "$name" in
+        foundation-readback-rollback)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
+            check foundation-stopped
+            check foundation-partial
+            printf '%s\n' '{"noop_rollback":true}' > "$case_dir/scenario.json"
+            run pass promote-ami.sh --rollback --config "$case_dir/config.json" --apply
+            check rollback ;;
+        foundation-*)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
+            check foundation-stopped
+            check "$mode" ;;
         lifecycle-*)
             run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
             check no-secret-write
@@ -119,7 +130,7 @@ test_case 'poll request bounded by remaining 90-minute deadline' poll-timeout '{
 test_case 'promotion dry-run and latest published N+1' dry-promote '{}' dry-promote
 test_case 'promotion preserves string-encoded deployment and all other secret keys' promote '{}' promote
 test_case 'promotion preserves object-encoded deployment and all other secret keys' object-secret '{"object_secret":true}' promote
-test_case 'rollback restores previous AMI/version and preserves unrelated values' rollback '{}' rollback
+test_case 'rollback restores previous AMI/template/workflow and preserves unrelated values' rollback '{}' rollback
 test_case 'rollback dry-run leaves config and secret unchanged' dry-rollback '{}' dry-rollback
 test_case 'rollback accepts verified CloudFormation no-op' noop-rollback '{"noop_rollback":true}' rollback
 test_case 'rollback recovers promotion that failed at synth' partial-rollback '{"synth_fail":true}' rollback
@@ -128,6 +139,30 @@ test_case 'concurrent lifecycle publication refused' version-race '{"version_rac
 test_case 'unexpected deployed version leaves secret unchanged' wrong-output '{"wrong_output":true}' no-secret-write
 test_case 'concurrent secret edit refused' secret-race '{"secret_race":true}' no-secret-write
 test_case 'preexisting secret deployment drift refused' secret-drift '{"secret_drift":true}' no-secret-write
+test_case 'preexisting secret template version drift refused before foundation execute' foundation-secret-drift '{"secret_template_drift":true}' no-foundation-execute
+test_case 'foundation parameter and Dynamic details accepted' promote '{"foundation_dynamic":true}' promote
+test_case 'foundation extra resource refused before execution' foundation-resource '{"foundation_extra_resource":true}' no-foundation-execute
+test_case 'foundation extra parameter refused before execution' foundation-parameter '{"foundation_extra_parameter":true}' no-foundation-execute
+test_case 'foundation resolved SSM drift refused' foundation-ssm '{"foundation_ssm":true}' no-foundation-execute
+test_case 'foundation different role refused' foundation-role '{"foundation_role":true}' no-foundation-execute
+test_case 'foundation absent role refused' foundation-no-role '{"foundation_no_role":true}' no-foundation-execute
+test_case 'foundation role race refused' foundation-role-race '{"foundation_role_race":true}' no-foundation-execute
+test_case 'foundation parameter race refused' foundation-stack-race '{"foundation_stack_race":true}' no-foundation-execute
+test_case 'foundation launch-template identity refused' foundation-identity '{"foundation_identity":true}' no-foundation-execute
+test_case 'configured template AMI mismatch refused' foundation-config-mismatch '{"configured_template_mismatch":true}' no-foundation-execute
+test_case 'foundation extra property refused' foundation-property '{"foundation_property":true}' no-foundation-execute
+test_case 'foundation nested property path refused' foundation-path '{"foundation_path":true}' no-foundation-execute
+test_case 'foundation context changes outside ImageId refused' foundation-context '{"foundation_context":true}' no-foundation-execute
+test_case 'foundation replacement refused' foundation-replacement '{"foundation_replacement":true}' no-foundation-execute
+test_case 'foundation incomplete change-set page refused' foundation-page '{"foundation_page":true}' no-foundation-execute
+test_case 'foundation concurrent template version refused' foundation-version-race '{"foundation_version_race":true}' no-foundation-execute
+test_case 'foundation read-back AMI mismatch blocks lifecycle publication' foundation-readback-mismatch '{"foundation_readback_mismatch":true}' foundation-partial
+test_case 'foundation read-back version mismatch blocks lifecycle publication' foundation-readback-version '{"foundation_readback_version":true}' foundation-partial
+test_case 'foundation read-back data drift blocks lifecycle publication' foundation-readback-data '{"foundation_readback_data":true}' foundation-partial
+test_case 'foundation post-update parameter drift blocks lifecycle publication' foundation-post-parameter '{"foundation_post_parameter":true}' foundation-partial
+test_case 'foundation read-back AWS failure blocks lifecycle publication' foundation-readback-fail '{"foundation_readback_fail":true}' foundation-partial
+test_case 'foundation wait failure blocks lifecycle publication' foundation-wait-fail '{"foundation_wait_fail":true}' foundation-partial
+test_case 'rollback after foundation read-back failure restores retained version' foundation-readback-rollback '{"foundation_readback_mismatch":true}' rollback
 test_case 'synth failure leaves app secret unchanged' synth-fail '{"synth_fail":true}' no-secret-write
 test_case 'stack failure leaves app secret unchanged' stack-fail '{"stack_fail":true}' no-secret-write
 test_case 'version dry-run synthesizes candidate and leaves real config byte-identical' recipe-dry '{}' pass

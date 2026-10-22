@@ -80,6 +80,8 @@ Defaults:
 | Item | Value |
 | --- | --- |
 | AMI stack | `ezil-mum-ami` |
+| Foundation stack | `ezil-mum-foundation` |
+| Computer launch template | `lt-06f691fc1e4dfe3cc` (`ComputerLaunchTemplate`) |
 | Lifecycle stack | `ezil-mum-lifecycle` |
 | ECR repository | `452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6` |
 | Asset bucket | `ezil-mum-deploy-assets-452630323510` |
@@ -96,7 +98,8 @@ The role ARN follows `identityNames()` in
 The AMI stack currently has **no RoleARN**: rebuild omits `--role-arn`, retaining
 caller-credential execution. It passes the execution role only when the AMI
 stack is already bound to that exact role; any other role is refused. Promotion
-requires the lifecycle stack and its change set to use the execution role.
+requires both the foundation and lifecycle stacks to use the execution role.
+An absent or different foundation `RoleARN` is refused.
 `--config` (either script) and `--release-dir` accept alternate local paths for
 isolated tests or an explicitly selected release. They do not change AWS targets.
 There are no new environment variables or secret names. Both scripts acquire the
@@ -188,21 +191,45 @@ with the live stack and use a fresh release directory for each successful update
      --stack-name ezil-mum-lifecycle --query 'Stacks[0].Outputs' --output json
    ```
 
-   Promotion obtains the maximum published version number (not the locally
-   configured number) and proposes `N+1`. It saves `promotion.json` containing
+   Promotion first checks that the configured launch-template version exists and
+   its `LaunchTemplateData.ImageId` equals the configured AMI. It proposes the
+   latest launch-template version plus one, independently of the configured
+   version, and the maximum published workflow version plus one. It saves `promotion.json` containing
    the previous and target non-secret configs. Using `bin/lifecycle.ts` via
    `npm run synth:lifecycle`, it synthesizes baseline and candidate in separate
    private copies under `$work/before/app-computers` and
    `$work/target/app-computers`. Each uses its existing `cdk.out/lifecycle` default.
    The live template must match the baseline synth, and the configs may differ
-   only in `amiId` and the predicted `stateMachineVersionArn`. For every changed
+   only in `amiId`, `launchTemplateVersion` and the predicted `stateMachineVersionArn`. For every changed
    resource property, the candidate must equal the baseline after recursively
-   substituting only the old AMI and published version with the proposed pair.
+   substituting only the old AMI and workflow version with their proposed values,
+   plus the launch-template version inside the complete serialized deployment settings.
    This includes strings inside `Fn::Join`, `Fn::Sub` and IAM `PolicyDocument`.
    Separate numeric version arguments are changed only within an intrinsic
    expression resolving to the configured workflow version ARN; unrelated
    numbers and identifiers stay unchanged. An added IAM action or principal,
    a widened resource, or any unrelated property fails validation.
+
+   After both synths validate, promotion creates a foundation UPDATE change set
+   with `--use-previous-template`, the existing `ezil-mum-cfn-exec` role, and
+   `HostAmiId=<new AMI>`. Every other discovered parameter uses its previous value.
+   This change set is the server-side dry run: before execution the validator
+   requires exactly one Modify of `ComputerLaunchTemplate`, only its
+   `LaunchTemplateData` property, no replacement, and details explained by
+   `HostAmiId`. It refuses extra resources, parameters, resolved SSM changes,
+   unrelated property paths, incomplete pages and unexpected context values.
+   The stack, role and latest template version are rechecked before execution.
+
+   Once the foundation update completes, promotion reads the latest template
+   version back from EC2. Its number must equal the prediction, its ImageId must
+   equal the target AMI, and all other launch data must remain unchanged. The
+   foundation's role, physical launch-template ID and parameters are also checked
+   again. Only then can it edit the lifecycle config or publish lifecycle assets.
+   `foundation-cs.txt`, the change-set description, `previous-foundation-stack.json`,
+   `previous-latest-launch-template.json`, `promoted-foundation-stack.json` and
+   `promoted-launch-template.json` retain non-secret evidence in the release directory.
+   Default dry-run prints these mutations without creating or executing a change
+   set; `--apply` always validates the real change set before executing it.
 
    Exactly one removed/added `AWS::Lambda::Version` pair is permitted, for the
    same existing function whose only change is its substituted environment.
@@ -212,7 +239,7 @@ with the live stack and use a fresh release directory for each successful update
    References to that validated pair may move from the old to the new logical ID.
    All other resource additions/removals and replacements remain refused.
 
-   For an admissible candidate, the script saves both synths and the live template
+   After foundation verification, the script saves both synths and the live template
    in the release evidence, edits the config, then runs `cdk publish-assets` from
    the candidate's private copy, S3 template upload, and CloudFormation UPDATE
    through the execution role. Every live parameter uses its previous value.
@@ -226,12 +253,15 @@ with the live stack and use a fresh release directory for each successful update
    `WorkflowVersionArn` to match the predicted published version.
 
    Only then does it update the app secret. The JSON transformation changes only
-   `EZIL_AWS_LIFECYCLE_DEPLOYMENTS["ap-south-1"].amiId` and
-   `.stateMachineVersionArn`. String-encoded and object-encoded deployment maps
+   `EZIL_AWS_LIFECYCLE_DEPLOYMENTS["ap-south-1"].amiId`,
+   `.launchTemplateVersion` and `.stateMachineVersionArn`. All three must match
+   either the complete old or complete target deployment before an edit.
+   String-encoded and object-encoded deployment maps
    retain their encoding type; the deployed app renderer expects the existing
    string encoding. Other regions, deployment fields and outer secret keys are
-   preserved. Payloads stay in memory, go to AWS via stdin, and are never put in
-   logs, argv, journals or files. The entire read/modify/write/read-back operation
+   preserved. Payloads are edited in memory and sent through a private 0600
+   temporary request file removed immediately after the AWS call; they never
+   appear in logs, argv or release journals. The entire read/modify/write/read-back operation
    holds `/root/ezil-aws-mum/locks/app-secret.lock` using `flock(2)`. It re-reads
    VersionId immediately before `put-secret-value`, then verifies both the returned
    version and complete payload. Promotion and rollback use the same lock even
@@ -267,7 +297,7 @@ with the live stack and use a fresh release directory for each successful update
    enrollment, desktop readiness, AI request routing, stop and wake. On the new
    host, compare `/etc/ezil-host/lower-image-digest` with `DesktopImageId` and
    check `systemctl is-active ezil-host.target`. Confirm the launched EC2 AMI and
-   lifecycle execution version match the promoted pair. Existing computers do
+   launch-template version and lifecycle execution version match the promoted deployment. Existing computers do
    not acquire the new AMI automatically. The staging deploy runbook documents
    any health-route limitations affecting `smoke`; do not treat that as AMI proof.
 
@@ -275,7 +305,7 @@ with the live stack and use a fresh release directory for each successful update
 
 Keep `release/next/previous-ami-config.json` (the old recipe version),
 `candidate-ami-config.json`, both templates, `promotion.json`, and all old AMIs,
-snapshots, lifecycle versions
+snapshots, launch-template versions, lifecycle versions
 and referenced Lambda versions until canaries and rollback checks finish. After
 success, archive the entire release directory before starting a new promotion;
 an existing journal is deliberately not overwritten. Keep the common lock files
@@ -293,8 +323,8 @@ of the old recipe/component; these scripts retain AMIs, snapshots and lifecycle
 versions and do not delete them. Use a fresh, greater recipe version for a later
 rebuild. Different release directories and checkouts share the operator lock.
 
-Rollback restores the **previous configured/published pair**, even when that
-version was older than the maximum published version at promotion. It never
+Rollback restores the **previous configured AMI, launch-template version and workflow version**, even when those
+versions were older than the latest published versions at promotion. It never
 computes rollback by subtracting one. Run:
 
 ```bash
@@ -305,9 +335,15 @@ AWS_PROFILE=ezil-admin AWS_REGION=ap-south-1 bash deploy/aws/os-staging/deploy.s
 ```
 
 Rollback validates the prior lifecycle configuration using the same strict
-allow-list and change-set mechanism, then restores only the two app-secret
+allow-list and change-set mechanism, then restores only the three app-secret
 fields. Rollbacks requiring IAM changes or resource replacement are also refused.
-A verified no-op can restore the app pair without redeploying. The app is
+It first verifies the retained launch-template version's ImageId against the
+journaled AMI, then checks it again just before lifecycle execution. Rollback
+does not update foundation `HostAmiId`, switch the template's default version,
+create another template version or delete any version. The lifecycle and app
+explicitly pin the retained version, so foundation may still describe the newer
+AMI afterward. Do not infer the active app deployment from the foundation alone.
+A verified no-op can restore the app deployment without redeploying. The app is
 deliberately pinned back to the retained **original previous** version. The script checks it
 still exists. The lead must also verify its referenced Lambda versions and IAM
 permissions remain usable before enabling new admissions; version existence
@@ -316,13 +352,22 @@ alone does not prove execution health.
 For promotion, a failed synth or template validation leaves the journal and the
 original config; the app secret remains unchanged. A later failed deploy leaves
 the journal and edited local config. A failure after secret write can leave the target
-pair active, so inspect the failure stage and use the saved journal. Rollback
-accepts the app secret already at either complete pair, refuses a mixed/drifted
-pair, and refuses unrelated local config changes. If rollback's CloudFormation
+deployment active, so inspect the failure stage and use the saved journal. Rollback
+accepts the app secret already at either complete deployment, refuses a mixed/drifted
+deployment, and refuses unrelated local config changes. If rollback's CloudFormation
 change set is empty (e.g. promotion failed before changing the stack), AWS reports
 the no-op as a failed change set. Rollback accepts only AWS's specific no-changes
-reason with an empty change list; it skips execution and restores the app pair.
+reason with an empty change list; it skips execution and restores the app deployment.
 Other change-set failures still stop the operation.
+
+If the foundation update or read-back fails, lifecycle publication and the app
+secret update stop, and the local config stays unchanged. Foundation may already
+have created the new version: retain the evidence and use the journaled rollback
+to restore the old deployment. The script never tries to undo this by deleting a
+template version. A later attempt to promote an AMI already present in foundation
+is refused; reconcile that partial promotion explicitly before retrying. All
+foundation and lifecycle publishers must respect the common operator lock;
+rechecks cannot exclude an external publisher that ignores it.
 
 To resume inspection of a running/timed-out build without another bake:
 

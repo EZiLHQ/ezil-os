@@ -58,13 +58,25 @@ if json.loads(sys.argv[2]).get("forced_config_version"):
         value["TemplateBody"]["Resources"][logical]["Properties"]["Name"] += "-1.0.1"
     save("template.json", value)
 d = {"accountId": "452630323510", "region": "ap-south-1", "namespace": "mum", "amiId": "ami-" + "1" * 17,
+     "launchTemplateId": "lt-06f691fc1e4dfe3cc", "launchTemplateVersion": "3",
      "stateMachineVersionArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:4", "keep": [1, 2]}
+save("foundation-stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE",
+    "RoleARN": "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec", "Parameters": [
+        {"ParameterKey": "HostAmiId", "ParameterValue": d["amiId"]},
+        {"ParameterKey": "FutureParameter", "ParameterValue": "must-remain"},
+        {"ParameterKey": "Parent", "ParameterValue": "/aws/example", "ResolvedValue": "fixed"}]}]})
+save("launch-template-versions.json", [{"LaunchTemplateId": d["launchTemplateId"], "VersionNumber": n,
+    "LaunchTemplateData": {"ImageId": d["amiId"], "MetadataOptions": {"HttpTokens": "required"}, "InstanceType": "t3a.large"}}
+    for n in (3, 7)])  # The configured version need not be the latest.
+shutil.copyfile(root / "launch-template-versions.json", root / "original-launch-template-versions.json")
 save("config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
 save("original-config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
 save("live-lifecycle-config.json", {"settings": {"deployment": d}, "preserve": {"nested": True}})
 deployments = {"ap-south-1": d, "us-east-1": {"amiId": "other-region", "untouched": [3, 4]}}
 if json.loads(sys.argv[2]).get("secret_drift"):
     d["amiId"] = "ami-" + "9" * 17
+if json.loads(sys.argv[2]).get("secret_template_drift"):
+    d["launchTemplateVersion"] = "99"
 raw = deployments if json.loads(sys.argv[2]).get("object_secret") else json.dumps(deployments)
 secret = {"keepSynthetic": "synthetic-private-do-not-print", "unicode": "£☺\\\n", "EZIL_AWS_LIFECYCLE_DEPLOYMENTS": raw}
 save("secret.json", {"VersionId": "initial", "SecretString": json.dumps(secret)})

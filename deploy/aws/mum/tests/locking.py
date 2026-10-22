@@ -24,7 +24,7 @@ class LockingTests(unittest.TestCase):
         self.env = {**os.environ, "PATH": str(self.root / "bin") + os.pathsep + os.environ["PATH"]}
         self.processes = []
         target = copy.deepcopy(self.read("config.json"))
-        target["settings"]["deployment"].update(amiId="ami-" + "2" * 17,
+        target["settings"]["deployment"].update(amiId="ami-" + "2" * 17, launchTemplateVersion="8",
             stateMachineVersionArn="arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:11")
         self.save("target.json", target)
 

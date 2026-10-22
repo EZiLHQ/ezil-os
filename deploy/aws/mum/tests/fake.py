@@ -178,6 +178,84 @@ elif tool == "aws":
             save("uploaded-template.json", json.loads(Path(args[-2]).read_text()))
             save("template-upload.json", args[-1])
     elif service == "cloudformation":
+        if flag("--stack-name") == "ezil-mum-foundation":
+            value = read("foundation-stack.json")
+            role = "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec"
+            template_id = "lt-06f691fc1e4dfe3cc"
+            if operation == "describe-stacks":
+                if scenario.get("foundation_role") or (scenario.get("foundation_role_race") and (root / "foundation-requested.json").exists()):
+                    value["Stacks"][0]["RoleARN"] = "arn:aws:iam::452630323510:role/wrong"
+                if scenario.get("foundation_no_role"):
+                    value["Stacks"][0].pop("RoleARN")
+                if scenario.get("foundation_stack_race") and (root / "foundation-requested.json").exists():
+                    value["Stacks"][0]["Parameters"][1]["ParameterValue"] = "changed"
+                if scenario.get("foundation_post_parameter") and (root / "foundation-executed").exists():
+                    value["Stacks"][0]["Parameters"][1]["ParameterValue"] = "changed"
+                out(value)
+            elif operation == "describe-stack-resource":
+                assert flag("--logical-resource-id") == "ComputerLaunchTemplate"
+                out({"StackResourceDetail": {"LogicalResourceId": "ComputerLaunchTemplate", "ResourceType": "AWS::EC2::LaunchTemplate",
+                    "PhysicalResourceId": "lt-00000000000000000" if scenario.get("foundation_identity") else template_id}})
+            elif operation == "create-change-set":
+                assert_locked("operator.lock")
+                assert "--use-previous-template" in args and "--template-url" not in args and "--template-body" not in args
+                assert flag("--role-arn") == role and flag("--change-set-type") == "UPDATE"
+                assert read("config.json") == read("original-config.json")
+                save("foundation-requested.json", json.loads(Path(flag("--parameters").removeprefix("file://")).read_text()))
+            elif operation == "describe-change-set":
+                previous = {p["ParameterKey"]: p for p in value["Stacks"][0]["Parameters"]}
+                actual = [previous[p["ParameterKey"]] if p.get("UsePreviousValue") else p for p in read("foundation-requested.json")]
+                data = read("launch-template-versions.json")[-1]["LaunchTemplateData"]
+                after = {**data, "ImageId": actual[0]["ParameterValue"]}
+                resource = {"Action": "Modify", "LogicalResourceId": "ComputerLaunchTemplate", "PhysicalResourceId": template_id,
+                    "ResourceType": "AWS::EC2::LaunchTemplate", "Replacement": "False", "Scope": ["Properties"], "Details": [
+                        {"Target": {"Attribute": "Properties", "Name": "LaunchTemplateData", "RequiresRecreation": "Never"},
+                         "ChangeSource": "ParameterReference", "CausingEntity": "HostAmiId", "Evaluation": "Static"}],
+                    "BeforeContext": json.dumps({"Properties": {"LaunchTemplateData": data}}),
+                    "AfterContext": json.dumps({"Properties": {"LaunchTemplateData": after}})}
+                cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "Parameters": actual,
+                    "Changes": [{"Type": "Resource", "ResourceChange": resource}]}
+                if scenario.get("foundation_extra_resource"):
+                    cs["Changes"].append({"Type": "Resource", "ResourceChange": {"LogicalResourceId": "Bucket", "Action": "Remove"}})
+                if scenario.get("foundation_extra_parameter"):
+                    actual[1]["ParameterValue"] = "changed"
+                if scenario.get("foundation_ssm"):
+                    actual[2]["ResolvedValue"] = "changed"
+                if scenario.get("foundation_property"):
+                    resource["Details"][0]["Target"]["Name"] = "LaunchTemplateName"
+                if scenario.get("foundation_path"):
+                    resource["Details"][0]["Target"]["Path"] = "/Properties/LaunchTemplateData/InstanceType"
+                if scenario.get("foundation_context"):
+                    resource["AfterContext"] = json.dumps({"Properties": {"LaunchTemplateData": {**after, "InstanceType": "m5.large"}}})
+                if scenario.get("foundation_replacement"):
+                    resource["Replacement"] = "True"
+                if scenario.get("foundation_page"):
+                    cs["NextToken"] = "more"
+                if scenario.get("foundation_dynamic"):
+                    resource["Details"].append({"Target": {"Attribute": "Properties", "Name": "LaunchTemplateData", "RequiresRecreation": "Never"},
+                        "ChangeSource": "DirectModification", "Evaluation": "Dynamic"})
+                out(cs)
+            elif operation == "execute-change-set":
+                assert read("config.json") == read("original-config.json")
+                assert not (root / "executed").exists()
+                (root / "foundation-executed").touch()
+                wanted = read("foundation-requested.json")[0]["ParameterValue"]
+                value["Stacks"][0]["Parameters"][0]["ParameterValue"] = wanted
+                save("foundation-stack.json", value)
+                versions = read("launch-template-versions.json")
+                versions.append({**versions[-1], "VersionNumber": versions[-1]["VersionNumber"] + (2 if scenario.get("foundation_readback_version") else 1),
+                    "LaunchTemplateData": {**versions[-1]["LaunchTemplateData"], "ImageId": wanted}})
+                if scenario.get("foundation_readback_mismatch"):
+                    versions[-1]["LaunchTemplateData"]["ImageId"] = "ami-" + "9" * 17
+                if scenario.get("foundation_readback_data"):
+                    versions[-1]["LaunchTemplateData"]["InstanceType"] = "m5.large"
+                save("launch-template-versions.json", versions)
+            elif operation == "wait":
+                if scenario.get("foundation_wait_fail") and "stack-update-complete" in args:
+                    raise SystemExit(1)
+            else:
+                raise SystemExit("unexpected foundation command")
+            raise SystemExit(0)
         lifecycle = flag("--stack-name") == "ezil-mum-lifecycle"
         if operation == "describe-stacks":
             value = read("stack.json")
@@ -348,8 +426,21 @@ elif tool == "aws":
             status = "FAILED" if scenario.get("build_fail") else ("BUILDING" if count == 0 else "AVAILABLE")
             out({"image": {"state": {"status": status}, "outputResources": {"amis": [{"region": "ap-south-1", "image": "ami-" + "2" * 17}]}}})
     elif service == "ec2":
-        assert operation == "describe-images"
-        out({"Images": [{"ImageId": flag("--image-ids"), "OwnerId": "452630323510", "State": "available", "Architecture": "x86_64"}]})
+        if operation == "describe-launch-template-versions":
+            assert flag("--launch-template-id") == "lt-06f691fc1e4dfe3cc"
+            if scenario.get("foundation_readback_fail") and (root / "foundation-executed").exists():
+                raise SystemExit(1)
+            values = read("launch-template-versions.json")
+            if scenario.get("foundation_version_race") and (root / "foundation-requested.json").exists():
+                values[-1]["VersionNumber"] += 1
+            number = flag("--versions")
+            selected = [values[-1]] if number == "$Latest" else [v for v in values if str(v["VersionNumber"]) == number]
+            if scenario.get("configured_template_mismatch") and number == "3":
+                selected[0]["LaunchTemplateData"]["ImageId"] = "ami-" + "9" * 17
+            out({"LaunchTemplateVersions": selected})
+        else:
+            assert operation == "describe-images"
+            out({"Images": [{"ImageId": flag("--image-ids"), "OwnerId": "452630323510", "State": "available", "Architecture": "x86_64"}]})
     elif service == "secretsmanager":
         assert_locked("app-secret.lock")
         if operation == "get-secret-value":

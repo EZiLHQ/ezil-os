@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix="ezil-mum-real-synth.") as folder:
                         .replace("123456789012", "452630323510").replace("pilot", "mum"))
     config.pop("recoveryVersionArn", None)
     baseline = copy.deepcopy(config)
-    config["settings"]["deployment"].update(amiId="ami-22222222222222222",
+    config["settings"]["deployment"].update(amiId="ami-22222222222222222", launchTemplateVersion="2",
         stateMachineVersionArn="arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:2")
     templates = []
     for phase, value in (("before", baseline), ("target", config)):

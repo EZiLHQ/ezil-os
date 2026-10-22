@@ -30,6 +30,10 @@ release_dir=$(realpath -m -- "$release_dir")
 assert_identity
 if "$apply"; then mkdir -p -- "$release_dir"; fi
 cp -- "$config" "$work/original-config.json"
+launch_template=lt-06f691fc1e4dfe3cc
+aws_read cloudformation describe-stacks --stack-name ezil-mum-foundation --output json > "$work/foundation-before.json"
+aws_read cloudformation describe-stack-resource --stack-name ezil-mum-foundation --logical-resource-id ComputerLaunchTemplate --output json > "$work/foundation-resource.json"
+json foundation-check "$work/foundation-before.json" "$work/foundation-resource.json"
 aws_read stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json > "$work/versions.json"
 if "$rollback"; then
     [[ -f "$release_dir/promotion.json" ]] || die 'rollback journal missing'
@@ -37,17 +41,28 @@ if "$rollback"; then
 else
     [[ ! -e "$release_dir/promotion.json" ]] || die 'promotion journal exists; rollback or archive the prior release directory'
     json copy-config "$config" "$work/before.json"
-    json plan-promotion "$config" "$work/versions.json" "$ami" "$work/target.json"
+    read -r previous_ami previous_version previous_template_version <<< "$(json pair "$config")"
+    aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions "$previous_template_version" --output json > "$work/configured-template.json"
+    json launch-template-version "$config" "$work/configured-template.json"
+    aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions '$Latest' --output json > "$work/latest-template-before.json"
+    template_version=$(json foundation-plan "$work/foundation-before.json" "$work/latest-template-before.json" "$ami" "$work/foundation-parameters.json")
+    json plan-promotion "$config" "$work/versions.json" "$ami" "$template_version" "$work/target.json"
 fi
 deployment_pair=$(json pair "$work/target.json")
-read -r ami version <<< "$deployment_pair"
+read -r ami version template_version <<< "$deployment_pair"
+if "$rollback"; then
+    # Rollback pins the retained version; it never modifies/deletes template versions.
+    aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions "$template_version" --output json > "$work/rollback-template.json"
+    json launch-template-version "$work/target.json" "$work/rollback-template.json"
+fi
 aws_read ec2 describe-images --image-ids "$ami" --owners "$account" --output json > "$work/image.json"
 json image "$work/image.json" "$ami"
 stamp=$(date -u +%Y%m%d%H%M%S)
+foundation_change=foundation-ami-$stamp
 change=lifecycle-$stamp
 if "$rollback"; then change=rollback-$stamp; fi
 template_uri=s3://$bucket/templates/ezil-mum-$change.json
-say "Edit $config: settings.deployment.amiId=$ami; settings.deployment.stateMachineVersionArn=$version"
+say "Plan $config: settings.deployment.amiId=$ami; settings.deployment.launchTemplateVersion=$template_version; settings.deployment.stateMachineVersionArn=$version"
 say 'Check app secret deployment alignment in memory; no secret keys or values are displayed.'
 if "$apply"; then
     json secret-check "$work/before.json" "$work/target.json"
@@ -72,6 +87,43 @@ candidate_template=$synth_project/cdk.out/lifecycle/ezil-mum-lifecycle.template.
 json carry-cdk-metadata "$work/lifecycle-live.json" "$baseline_template" "$candidate_template"
 validation_args=("$work/lifecycle-live.json" "$baseline_template" "$candidate_template" "$work/before.json" "$work/target.json" "$rollback")
 json lifecycle-template "${validation_args[@]}"
+if ! "$rollback"; then
+    # CloudFormation's change set is the server-side dry run. Validate its entire
+    # resource/parameter diff before executing it, even when --apply was requested.
+    aws_act cloudformation create-change-set --stack-name ezil-mum-foundation --change-set-name "$foundation_change" --change-set-type UPDATE \
+        --use-previous-template --role-arn "$exec_role" --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+        --parameters "file://$work/foundation-parameters.json"
+    if "$apply"; then
+        printf '%s\n' "$foundation_change" > "$release_dir/foundation-cs.txt"
+        cp "$work/foundation-before.json" "$release_dir/previous-foundation-stack.json"
+        cp "$work/latest-template-before.json" "$release_dir/previous-latest-launch-template.json"
+        wait_changeset ezil-mum-foundation "$foundation_change" || die 'foundation change-set creation failed; inspect the journal'
+        cp "$work/changeset.json" "$release_dir/$foundation_change.json"
+        json foundation-changeset "$work/changeset.json" "$work/foundation-before.json" "$work/foundation-parameters.json"
+        aws_read cloudformation describe-stacks --stack-name ezil-mum-foundation --output json > "$work/foundation-recheck.json"
+        aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions '$Latest' --output json > "$work/latest-template-recheck.json"
+        json foundation-unchanged "$work/foundation-before.json" "$work/foundation-recheck.json" "$work/latest-template-before.json" "$work/latest-template-recheck.json"
+        cmp -s "$config" "$work/original-config.json" || die 'lifecycle config changed before foundation execution'
+        execute_changeset ezil-mum-foundation "$foundation_change"
+        aws_read cloudformation describe-stacks --stack-name ezil-mum-foundation --output json > "$work/foundation-after.json"
+        aws_read cloudformation describe-stack-resource --stack-name ezil-mum-foundation --logical-resource-id ComputerLaunchTemplate --output json > "$work/foundation-resource-after.json"
+        aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions '$Latest' --output json > "$work/latest-template-after.json"
+        json foundation-readback "$work/foundation-before.json" "$work/foundation-after.json" "$work/foundation-resource-after.json" \
+            "$work/latest-template-before.json" "$work/latest-template-after.json" "$work/target.json"
+        cp "$work/foundation-after.json" "$release_dir/promoted-foundation-stack.json"
+        cp "$work/latest-template-after.json" "$release_dir/promoted-launch-template.json"
+        say "Foundation launch-template version $template_version read back and verified for $ami."
+    else
+        show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-foundation --change-set-name "$foundation_change"
+        show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-foundation --change-set-name "$foundation_change" --include-property-values --output json
+        say 'Require only ComputerLaunchTemplate / LaunchTemplateData and HostAmiId to change, with the existing execution role.'
+        aws_act cloudformation execute-change-set --stack-name ezil-mum-foundation --change-set-name "$foundation_change"
+        show aws --profile "$profile" --region "$region" cloudformation wait stack-update-complete --stack-name ezil-mum-foundation
+        show aws --profile "$profile" --region "$region" ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions '$Latest' --output json
+        say "Require read-back version $template_version, ImageId=$ami and all other launch data unchanged before lifecycle publication."
+    fi
+fi
+say "Edit $config: AMI=$ami; launchTemplateVersion=$template_version; workflow=$version"
 if "$apply"; then
     cp "$work/lifecycle-live.json" "$release_dir/previous-lifecycle-template.json"
     cp "$baseline_template" "$release_dir/baseline-lifecycle-template.json"
@@ -90,12 +142,12 @@ aws_act cloudformation create-change-set --stack-name ezil-mum-lifecycle --chang
 if ! "$apply"; then
     show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-lifecycle --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-lifecycle --change-set-name "$change" --include-property-values --output json
-    say 'Require exact AMI/version substitutions and matching change-set details; allow only the validated Lambda Version Add/Remove pair.'
+    say 'Require exact AMI/launch-template/workflow substitutions and matching change-set details; allow only the validated Lambda Version Add/Remove pair.'
     aws_act cloudformation execute-change-set --stack-name ezil-mum-lifecycle --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation wait stack-update-complete --stack-name ezil-mum-lifecycle
     show aws --profile "$profile" --region "$region" stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json
     say "Verify published $version (promotion also requires matching stack WorkflowVersionArn)."
-    say 'Under the common app-secret flock: read and edit in memory, re-read VersionId immediately before put-secret-value via stdin, then verify returned VersionId and payload.'
+    say 'Under the common app-secret flock: read and edit in memory, re-read VersionId immediately before put-secret-value via a private temporary request file, then verify returned VersionId and payload.'
     say 'DRY RUN complete: no config, stack, release record or secret changed.'
     exit 0
 fi
@@ -117,10 +169,13 @@ fi
 # Prevent another publisher from silently taking the predicted version number.
 aws_read stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json > "$work/pre-execute-versions.json"
 if ! "$rollback"; then
-    json plan-promotion "$work/before.json" "$work/pre-execute-versions.json" "$ami" "$work/rechecked.json" >/dev/null
+    json plan-promotion "$work/before.json" "$work/pre-execute-versions.json" "$ami" "$template_version" "$work/rechecked.json" >/dev/null
     cmp -s "$work/rechecked.json" "$work/target.json" || die 'published versions changed; refuse execution and review journal'
 fi
 cmp -s "$config" "$work/target.json" || die 'lifecycle config changed before execution'
+# Check the exact retained/published version again before enabling lifecycle use.
+aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions "$template_version" --output json > "$work/target-template-recheck.json"
+json launch-template-version "$work/target.json" "$work/target-template-recheck.json"
 if "$has_changes"; then execute_changeset ezil-mum-lifecycle "$change"; fi
 aws_read stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json > "$work/published.json"
 json published "$work/published.json" "$version"
@@ -130,4 +185,4 @@ if ! "$rollback"; then
 fi
 json secret-update "$work/before.json" "$work/target.json"
 json copy-config "$work/target.json" "$release_dir/promoted-config.json"
-say "Deployment configured: $ami at $version. Refresh the staging app from its secret, then run the host canary described in README.md."
+say "Deployment configured: $ami, launch-template version $template_version, workflow $version. Refresh the staging app from its secret, then run the host canary described in README.md."

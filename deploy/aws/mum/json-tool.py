@@ -17,6 +17,7 @@ KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
 SECRET = "ezil-os/billing-staging/app"
 ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/ezil/identity/ezil-mum-cfn-exec"
+LAUNCH_TEMPLATE = "lt-06f691fc1e4dfe3cc"
 APP_SECRET_LOCK = "/root/ezil-aws-mum/locks/app-secret.lock"
 
 
@@ -69,7 +70,8 @@ def pair(config):
     need(d["accountId"] == ACCOUNT and d["region"] == REGION and d["namespace"] == "mum", "config account/region/namespace mismatch")
     need(re.fullmatch(r"ami-[0-9a-f]{17}", d["amiId"]), "invalid AMI")
     need(re.fullmatch(re.escape(MACHINE) + r":[1-9][0-9]*", d["stateMachineVersionArn"]), "invalid lifecycle version")
-    return {k: d[k] for k in ("amiId", "stateMachineVersionArn")}
+    need(isinstance(d.get("launchTemplateVersion"), str) and re.fullmatch(r"[1-9][0-9]{0,9}", d["launchTemplateVersion"]), "invalid launch-template version")
+    return {k: d[k] for k in ("amiId", "stateMachineVersionArn", "launchTemplateVersion")}
 
 
 def versions(path):
@@ -83,6 +85,102 @@ def check_changeset(cs):
     need(not cs.get("NextToken"), "incomplete change set; pagination must be resolved")
     need(cs.get("RoleARN", ROLE) == ROLE, "change set uses unexpected role")
     need(bool(cs.get("Changes")), "empty change set")
+
+
+def foundation_stack(path):
+    value = stack(path)
+    need(value.get("RoleARN") == ROLE, "foundation stack must use its execution role")
+    parameters = mapping(value.get("Parameters") or [])
+    need("HostAmiId" in parameters, "foundation HostAmiId parameter missing")
+    return value, parameters
+
+
+def foundation_resource(path):
+    resource = read(path)["StackResourceDetail"]
+    need(resource.get("LogicalResourceId") == "ComputerLaunchTemplate" and
+         resource.get("ResourceType") == "AWS::EC2::LaunchTemplate" and
+         resource.get("PhysicalResourceId") == LAUNCH_TEMPLATE,
+         "foundation launch-template identity mismatch")
+
+
+def launch_template(path):
+    response = read(path)
+    values = response["LaunchTemplateVersions"]
+    need(not response.get("NextToken") and len(values) == 1, "expected one launch-template version")
+    value = values[0]
+    need(value.get("LaunchTemplateId") == LAUNCH_TEMPLATE and type(value.get("VersionNumber")) is int and
+         0 < value["VersionNumber"] < 10**10, "launch-template identity/version mismatch")
+    need(isinstance(value.get("LaunchTemplateData"), dict), "launch-template data missing")
+    return value
+
+
+def check_launch_template(config_path, version_path):
+    config = read(config_path)
+    deployment = pair(config)
+    need(config["settings"]["deployment"].get("launchTemplateId") == LAUNCH_TEMPLATE, "configured launch-template identity mismatch")
+    value = launch_template(version_path)
+    need(str(value["VersionNumber"]) == deployment["launchTemplateVersion"] and
+         value["LaunchTemplateData"].get("ImageId") == deployment["amiId"], "launch-template read-back AMI/version mismatch")
+    return value
+
+
+def foundation_parameters(previous, actual, ami):
+    need(previous.keys() == actual.keys(), "foundation parameter coverage mismatch")
+    for key, old in previous.items():
+        value = actual[key]
+        expected = ami if key == "HostAmiId" else old.get("ParameterValue")
+        need(value.get("ParameterValue", old.get("ParameterValue") if value.get("UsePreviousValue") else None) == expected and
+             value.get("ResolvedValue") == old.get("ResolvedValue"), "foundation extra parameter/resolved SSM change refused")
+
+
+def foundation_changeset(cs_path, stack_path, wanted_path):
+    _, previous = foundation_stack(stack_path)
+    wanted = mapping(read(wanted_path))
+    need(wanted.keys() == previous.keys(), "foundation parameter coverage mismatch")
+    ami = wanted["HostAmiId"]["ParameterValue"]
+    for key in previous.keys() - {"HostAmiId"}:
+        need(wanted[key] == {"ParameterKey": key, "UsePreviousValue": True}, "foundation extra parameter change requested")
+    cs = read(cs_path)
+    check_changeset(cs)
+    foundation_parameters(previous, mapping(cs.get("Parameters") or []), ami)
+    need(len(cs["Changes"]) == 1, "unexpected foundation resource change")
+    change = cs["Changes"][0]
+    r = change["ResourceChange"]
+    need(change.get("Type") == "Resource" and r.get("Action") == "Modify" and
+         r.get("LogicalResourceId") == "ComputerLaunchTemplate" and r.get("ResourceType") == "AWS::EC2::LaunchTemplate" and
+         r.get("PhysicalResourceId") == LAUNCH_TEMPLATE, "unexpected foundation resource change")
+    need(r.get("Replacement") == "False" and r.get("Scope") == ["Properties"] and r.get("Details"),
+         "foundation replacement/unexplained change refused")
+    explained = any(d.get("ChangeSource") == "ParameterReference" and d.get("CausingEntity") == "HostAmiId" for d in r["Details"])
+    for detail in r["Details"]:
+        target = detail["Target"]
+        parameter = detail.get("ChangeSource") == "ParameterReference" and detail.get("CausingEntity") == "HostAmiId"
+        dynamic = detail.get("ChangeSource") == "DirectModification" and detail.get("Evaluation") == "Dynamic" and not detail.get("CausingEntity") and explained
+        need(target.get("Attribute") == "Properties" and target.get("Name") == "LaunchTemplateData" and
+             target.get("RequiresRecreation") == "Never" and (parameter or dynamic) and
+             target.get("Path") in (None, "/Properties/LaunchTemplateData", "/Properties/LaunchTemplateData/ImageId"),
+             "unexpected foundation property change")
+    # With property values present, an ImageId update must explain the entire context.
+    if r.get("BeforeContext") is not None or r.get("AfterContext") is not None:
+        before, after = json.loads(r["BeforeContext"]), json.loads(r["AfterContext"])
+        expected = copy.deepcopy(before)
+        need(expected["Properties"]["LaunchTemplateData"]["ImageId"] == previous["HostAmiId"]["ParameterValue"],
+             "foundation change-set ImageId differs from HostAmiId")
+        expected["Properties"]["LaunchTemplateData"]["ImageId"] = ami
+        need(same_json(expected, after), "foundation change-set values are not only the AMI change")
+
+
+def foundation_readback(before_path, after_path, resource_path, old_version_path, new_version_path, config_path):
+    _, previous = foundation_stack(before_path)
+    _, actual = foundation_stack(after_path)
+    foundation_resource(resource_path)
+    deployment = pair(read(config_path))
+    foundation_parameters(previous, actual, deployment["amiId"])
+    old = launch_template(old_version_path)
+    new = check_launch_template(config_path, new_version_path)
+    need(new["VersionNumber"] == old["VersionNumber"] + 1, "launch-template latest version differs from prediction")
+    expected = {**old["LaunchTemplateData"], "ImageId": deployment["amiId"]}
+    need(same_json(expected, new["LaunchTemplateData"]), "launch-template read-back changed data outside ImageId")
 
 
 def recipe_version(value):
@@ -298,12 +396,25 @@ def promotion_literal(value):
 def promotion_substitution(value, old_pair, new_pair, version_ids=None):
     """Replace complete identifiers recursively; qualify numeric version arguments.
 
-    A bare number is a version only inside a Join/Sub resolving to the configured
-    workflow version ARN. IAM condition values and unrelated numbers stay fixed.
+    A launch-template version changes only in serialized deployment settings.
+    A bare workflow number changes only inside a Join/Sub resolving to its ARN.
+    IAM condition values and unrelated numbers stay fixed.
     Logical ID substitutions come only from the independently checked Version pair.
     """
     if isinstance(value, str):
-        replacements = {old_pair[key]: new_pair[key] for key in old_pair}
+        try:
+            settings = json.loads(value)
+        except (ValueError, TypeError):
+            settings = None
+        if isinstance(settings, dict) and isinstance(settings.get("deployment"), dict) and all(
+                settings["deployment"].get(k) == v for k, v in old_pair.items()):
+            expected = copy.deepcopy(settings)
+            expected["deployment"]["launchTemplateVersion"] = new_pair["launchTemplateVersion"]
+            adjusted = re.sub(r'("launchTemplateVersion"\s*:\s*)"' + re.escape(old_pair["launchTemplateVersion"]) + r'"',
+                              lambda m: m[1] + json.dumps(new_pair["launchTemplateVersion"]), value)
+            if same_json(json.loads(adjusted), expected):
+                value = adjusted
+        replacements = {old_pair[key]: new_pair[key] for key in ("amiId", "stateMachineVersionArn")}
         pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(k) for k in replacements) + r")(?![A-Za-z0-9_])"
         return re.sub(pattern, lambda match: replacements[match[0]], value)
     if isinstance(value, list):
@@ -481,6 +592,18 @@ def context_match(expected, actual):
     return expected == actual
 
 
+def version_context_match(expected, actual):
+    """Check Version context literals; physical reference values are resolved by CFN."""
+    if isinstance(expected, dict) and len(expected) == 1 and next(iter(expected)).startswith(("Ref", "Fn::")) and isinstance(actual, str):
+        literal = promotion_literal(expected)
+        return literal is None or context_match(literal, actual)
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        return expected.keys() == actual.keys() and all(version_context_match(expected[k], actual[k]) for k in expected)
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(version_context_match(e, a) for e, a in zip(expected, actual))
+    return context_match(expected, actual)
+
+
 def lifecycle_changeset(cs_path, stack_path, *template_paths):
     live, candidate, allowed = lifecycle_template(*template_paths)
     cs = read(cs_path)
@@ -497,6 +620,7 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
              value.get("ResolvedValue") == old.get("ResolvedValue"), "lifecycle parameter/resolved SSM change refused")
     version_ids = {logical for logical, change in allowed.items() if change["action"] in ("Add", "Remove")}
     context_old_pair, context_new_pair = pair(read(template_paths[3])), pair(read(template_paths[4]))
+    context_version_ids = lifecycle_version_pair(live["Resources"], candidate["Resources"], context_old_pair, context_new_pair)
     seen = set()
     for change in cs["Changes"]:
         need(change.get("Type") == "Resource", "unexpected lifecycle non-resource change")
@@ -510,6 +634,11 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
         if r["Action"] in ("Add", "Remove"):
             need(r.get("Replacement") in (None, "False") and not r.get("Scope") and not r.get("Details"),
                  "unexplained Lambda Version pair change")
+            context = r.get("AfterContext" if r["Action"] == "Add" else "BeforeContext")
+            if context is not None:
+                context = json.loads(context) if isinstance(context, str) else context
+                need(version_context_match(resource.get("Properties", {}), context.get("Properties", {})),
+                     "Lambda Version change-set values differ from the validated template")
         else:
             need(r.get("Replacement") == "False", "lifecycle resource replacement refused")
             scope = expected["attributes"] | ({"Properties"} if expected["properties"] else set())
@@ -582,9 +711,9 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
                     need(key in allowed.get(logical, {}).get("properties", set()) or before_props[key] == after_props.get(key),
                          "truncated change-set value for a property the template does not change")
                     before_props.pop(key); after_props.pop(key, None)
-            expected_after = promotion_substitution(before_props, context_old_pair, context_new_pair)
+            expected_after = promotion_substitution(before_props, context_old_pair, context_new_pair, context_version_ids)
             need(context_match(ascii_view(expected_after), ascii_view(after_props)),
-                 "lifecycle change-set values are not the AMI/version substitution of the live values")
+                 "lifecycle change-set values are not the AMI/version substitution of the live values; values differ")
         print(r["Action"], logical, r["ResourceType"], r.get("Replacement", ""))
     need(seen == allowed.keys(), "change set omits synthesized lifecycle resource changes")
 
@@ -621,7 +750,7 @@ def edit_secret(envelope, before, after):
     deployments = json.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     need(isinstance(deployments, dict) and isinstance(deployments.get(REGION), dict), "regional deployments missing")
     d = deployments[REGION]
-    # Both fields must match together: do not accept a half-applied deployment.
+    # All three fields must match together: never accept a half-applied deployment.
     current = {k: d.get(k) for k in before}
     need(current in (before, after), "secret deployment drift; refusing overwrite")
     d.update(after)
@@ -743,12 +872,34 @@ def main(args):
         need(previous["stateMachineVersionArn"] in published, "configured lifecycle version is not published")
         need(previous["amiId"] != a[2], "AMI already configured")
         version = max(int(v.rsplit(":", 1)[1]) for v in published) + 1
-        config["settings"]["deployment"].update(amiId=a[2], stateMachineVersionArn=f"{MACHINE}:{version}")
+        config["settings"]["deployment"].update(amiId=a[2], stateMachineVersionArn=f"{MACHINE}:{version}", launchTemplateVersion=a[3])
         pair(config)
-        write(a[3], config)
+        write(a[4], config)
         print(json.dumps({"previous": previous, "target": pair(config)}, indent=2))
     elif op == "pair":
-        p = pair(read(a[0])); print(p["amiId"], p["stateMachineVersionArn"])
+        p = pair(read(a[0])); print(p["amiId"], p["stateMachineVersionArn"], p["launchTemplateVersion"])
+    elif op == "launch-template-version":
+        check_launch_template(*a)
+    elif op == "foundation-check":
+        foundation_stack(a[0])
+        foundation_resource(a[1])
+    elif op == "foundation-plan":
+        _, previous = foundation_stack(a[0])
+        latest = launch_template(a[1])
+        need(latest["LaunchTemplateData"].get("ImageId") == previous["HostAmiId"]["ParameterValue"],
+             "foundation HostAmiId differs from latest launch-template AMI")
+        need(previous["HostAmiId"]["ParameterValue"] != a[2], "foundation AMI already configured; reconcile previous promotion before retrying")
+        write(a[3], [{"ParameterKey": key, **({"ParameterValue": a[2]} if key == "HostAmiId" else {"UsePreviousValue": True})} for key in previous])
+        print(latest["VersionNumber"] + 1)
+    elif op == "foundation-changeset":
+        foundation_changeset(*a)
+    elif op == "foundation-unchanged":
+        before, _ = foundation_stack(a[0])
+        after, _ = foundation_stack(a[1])
+        need(all(same_json(before.get(k), after.get(k)) for k in ("StackId", "LastUpdatedTime", "Parameters")) and
+             same_json(launch_template(a[2]), launch_template(a[3])), "foundation changed since planning; refuse execution")
+    elif op == "foundation-readback":
+        foundation_readback(*a)
     elif op == "copy-config":
         config = read(a[0]); pair(config); write(a[1], config)
     elif op == "journal":
