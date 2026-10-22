@@ -31,10 +31,7 @@ def expected_schema(sql):
     expected += ''.join(f'CREATE INDEX {name} ON public.ezil_computer_image_jobs ({cols});\n' for name, cols in indexes.items())
     expected += 'REVOKE ALL ON TABLE public.ezil_computer_image_jobs FROM public, anon, authenticated;\nALTER TABLE public.ezil_computer_image_jobs ENABLE ROW LEVEL SECURITY;\n'
     need(sql == expected and len(indexes) == 4, 'SQL is outside the exact contract DDL grammar')
-    # Catalog evidence reads pg_indexes.indexdef, so compare PostgreSQL's canonical rendering
-    # (seen live on the staging DB 2026-10-22), not the bare column list.
-    canonical = {name: f'CREATE INDEX {name} ON public.ezil_computer_image_jobs USING btree ({cols})' for name, cols in indexes.items()}
-    return {'placements': PLACEMENTS, 'columns': columns, 'indexes': canonical}
+    return {'placements': PLACEMENTS, 'columns': columns, 'indexes': indexes}
 
 
 # Catalog evidence includes all job columns, indexes, RLS, grants, and policies;
@@ -125,7 +122,7 @@ def validate_receipt(receipt, sql_bytes, system_id):
     after = receipt['after']
     need(set(after) == {'placements','columns','indexes','rls','constraints','defaults','triggers','policies','grants'}, 'invalid schema evidence')
     need(after['placements'] == expected['placements'] and after['columns'] == expected['columns'], 'schema columns mismatch')
-    need(after['indexes'] == expected['indexes'], 'schema indexes mismatch')
+    need(after['indexes'] == {k: 'CREATE INDEX '+k+' ON public.ezil_computer_image_jobs USING btree ('+v+')' for k,v in expected['indexes'].items()}, 'schema indexes mismatch')
     need(after['rls'] is True and all(type(after[k]) is int and after[k] == 0 for k in ('constraints','defaults','triggers','policies','grants')), 'schema access mismatch')
     empty = {'placements':{},'columns':{},'indexes':{},'rls':False,'constraints':0,'defaults':0,'triggers':0,'policies':0,'grants':0}
     need(receipt['before'] == (empty if receipt['applied'] else after), 'partial schema refused')
