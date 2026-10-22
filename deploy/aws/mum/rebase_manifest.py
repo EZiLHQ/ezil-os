@@ -105,15 +105,23 @@ def _schema(value, rule, schema):
         need(value is None, "manifest null type mismatch")
 
 
-def validate(value, *, target=False, repository=None):
-    schema = read(Path(__file__).with_name("rebase-release.schema.json"))
+def validate(value, *, target=False, source=False, repository=None):
+    need(not (target and source), "legacy source cannot authorize a target")
+    schema = read(Path(__file__).with_name("rebase-source-release.schema.json" if source else "rebase-release.schema.json"))
     _schema(value, schema, schema)
     need(len(json.dumps(value, ensure_ascii=False).encode()) <= 16384, "manifest exceeds byte limit")
     need(value["namespace"] not in RESERVED, "reserved namespace")
     need(all(int(n) <= 1073741823 for n in value["recipeVersion"].split(".")), "recipe version exceeds limit")
     parsed = datetime.strptime(value["createdAt"], "%Y-%m-%dT%H:%M:%S.%fZ")
     need(parsed.isoformat(timespec="milliseconds") + "Z" == value["createdAt"], "noncanonical manifest time")
-    deployment_tuple(value)
+    if source:
+        need(matches(DIGEST, value["lowerImageDigest"]), "invalid source lower")
+        need(value["previousLowerImageDigest"] != value["lowerImageDigest"], "equal source lowers")
+        for key, suffix in (("stateMachineVersionArn", "lifecycle"), ("preparationStateMachineVersionArn", "rebase-preparation"), ("recoveryStateMachineVersionArn", "recovery")):
+            if value[key] is not None:
+                workflow(value[key], value, suffix)
+    else:
+        deployment_tuple(value)
     current_repo, _ = image_ref(value["lowerImageRef"], value["accountId"], value["region"], repository)
     previous, ref = value["previousLowerImageDigest"], value["previousLowerImageRef"]
     need((previous is None) == (ref is None), "previous ID/reference must be paired")

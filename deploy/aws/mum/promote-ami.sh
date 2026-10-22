@@ -3,12 +3,13 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 usage() {
-    say 'Usage: promote-ami.sh (--ami <ami-id> | --rollback) [--apply] [--config <path>] [--release-dir <path>]'
+    say 'Usage: promote-ami.sh (--ami <ami-id> | --manifest <release.json> | --rollback) [--apply] [--config <path>] [--release-dir <path>]'
 }
-ami= rollback=false
+ami= manifest= rollback=false
 config=/root/ezil-aws-mum/config/lifecycle.mum.json
 while (($#)); do
     case "$1" in
+        --manifest) (($# >= 2)) || die 'missing release manifest'; manifest=$2; shift 2 ;;
         --ami) (($# >= 2)) || die 'missing AMI'; ami=$2; shift 2 ;;
         --config) (($# >= 2)) || die 'missing config path'; config=$2; shift 2 ;;
         --release-dir) (($# >= 2)) || die 'missing release directory'; release_dir=$2; shift 2 ;;
@@ -18,6 +19,15 @@ while (($#)); do
         *) usage; die "unknown argument: $1" ;;
     esac
 done
+if [[ -n "$manifest" || "$rollback" == true && -f "$release_dir/rebase-promotion.json" ]]; then
+    [[ -z "$ami" ]] || die 'manifest promotion cannot use --ami'
+    manifest=${manifest:-$release_dir/rebase-release.json}
+    operation=promote-canary
+    if "$rollback"; then operation=rollback; fi
+    options=()
+    if "$apply"; then options=(--apply); fi
+    exec bash "$script_dir/rebase-release.sh" "$operation" --manifest "$manifest" "${options[@]}"
+fi
 if "$rollback"; then [[ -z "$ami" ]] || die '--rollback uses the journal AMI, omit --ami'
 else [[ "$ami" =~ ^ami-[0-9a-f]{17}$ ]] || { usage; die 'valid AMI required'; }; fi
 require_tools aws python3 mktemp date realpath npm npx cmp

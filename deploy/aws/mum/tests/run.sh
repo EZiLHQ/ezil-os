@@ -222,3 +222,4 @@ printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
 python3 "$here/locking.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rebase.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rollout.py"

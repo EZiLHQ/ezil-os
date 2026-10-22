@@ -308,19 +308,14 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any('get-login-password' in call or 'push' in call for call in calls))
         self.assertNotIn('synthetic-private-do-not-print', result.stdout + result.stderr)
 
-    def test_finalize_actual_cli_fake_aws_dry_apply_resume_and_hash_drift(self):
+    def test_finalize_actual_cli_refuses_missing_phase_receipts(self):
         self.cli('plan', '--release-dir', str(self.directory), '--config', str(self.config), '--identity-config', str(self.identity))
         plan = str(self.directory / 'rebase-plan.json')
-        self.cli('finalize', '--plan', plan)
+        for flags in ([], ['--apply']):
+            self.cli('finalize', '--plan', plan, *flags, expected=1)
         self.assertFalse((self.directory / 'rebase-release.json').exists())
-        self.cli('finalize', '--plan', plan, '--apply')
-        final = (self.directory / 'rebase-release.json').read_bytes()
-        self.cli('finalize', '--plan', plan, '--apply')
-        self.assertEqual((self.directory / 'rebase-release.json').read_bytes(), final)
-        manifest.load(self.directory / 'rebase-release.json', target=True)
         self.config.write_text(self.config.read_text() + ' ')
         self.cli('finalize', '--plan', plan, '--apply', expected=1)
-        self.assertEqual((self.directory / 'rebase-release.json').read_bytes(), final)
 
     def test_final_readbacks_require_both_lowers_and_published_tuple(self):
         self.assertEqual(RELEASE.final_manifest(self.plan, self.evidence, self.value['createdAt']), self.value)
@@ -343,7 +338,7 @@ class ReleaseTests(unittest.TestCase):
         self.cli('plan', '--release-dir', str(self.directory), '--config', str(self.config), '--identity-config', str(self.identity), expected=1)
         self.assertFalse((self.directory / 'rebase-plan.json').exists())
 
-    def test_unimplemented_deployment_phases_fail_closed(self):
+    def test_deployment_phases_require_complete_reviewed_plan(self):
         (self.directory / 'rebase-release.json').write_text(json.dumps(self.value))
         for operation in ('apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary'):
             self.cli(operation, '--manifest', str(self.directory / 'rebase-release.json'), '--apply', expected=1)

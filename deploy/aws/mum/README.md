@@ -231,7 +231,7 @@ with the live stack and use a fresh release directory for each successful update
    Default dry-run prints these mutations without creating or executing a change
    set; `--apply` always validates the real change set before executing it.
 
-   Exactly one removed/added `AWS::Lambda::Version` pair is permitted, for the
+   Each removed/added `AWS::Lambda::Version` pair must independently reference the
    same existing function whose only change is its substituted environment.
    Version properties and attributes must match after substitution. The pinned
    CDK changes the Version's logical ID hash, with identical Version properties;
@@ -445,38 +445,163 @@ repository/workflow identity checks and semantic pair constraints. Both registry
 manifest IDs and classic Docker config IDs are supported without assuming they
 are equal.
 
-The `plan` and `finalize` release operations are implemented. **The
-`apply-schema`, `apply-identity`, `apply-workflows`, `apply-app` and
-`promote-canary` operations currently refuse execution, including with `--apply`.**
-They require a follow-up implementation before the contract's complete rollout
-can run. The legacy `promote-ami.sh --ami` also refuses an existing rebase tuple;
-it must not change an AMI while retaining stale digest evidence. The low-level
-secret/journal tools preserve the complete tuple for promotion and rollback,
-but this is not a complete rebase promotion interface.
+The release phases are implemented and default to dry run. `plan` writes only a
+local nonsecret plan. Every later mutation requires `--apply`. The legacy
+`promote-ami.sh --ami` still refuses a rebase tuple; use `--manifest` instead.
 
-To prepare a plan after the bake, supply a reviewed desired lifecycle config
-whose complete deployment tuple matches the candidate bake, and the reviewed
-identity config. The authority origin must be exactly
-`https://os-staging.ezil.work`. The exact SQL draft must exist at
-`docs/aws-computers/sql/0002_image_rebase.sql.txt` in the integrated checkout.
-Planning stores hashes of those files and bake/source-release evidence; it
-refuses missing inputs. It does not invent AMI IDs or workflow versions.
+Amendment A1's `rebase-source-release.schema.json` permits null preparation and
+recovery versions in **source evidence only**. The target schema stays strict.
+Promotion and rollback append/retain complete immutable release records under
+`app-secret.lock`, preserve string/object encoding and other regions, and journal
+both full deployment entries before writing. All records are retained, including
+records referenced by placements or unfinished jobs. At eight records the tool
+refuses a ninth; it never guesses whether a record can be collected. Duplicate
+source digests refuse instead of making source resolution ambiguous.
+
+For A3, a maintenance bake keeps the promoted lower ID, changes the reviewed
+agent commit, clears both previous parameters, and records
+`maintenance-source-release.json`. The selected commit must contain the
+maintenance implementation. Containerd's resolved child ID is compared after
+push; a different lower refuses before any AMI stack update.
+
+```bash
+bash deploy/aws/mum/rebuild-ami.sh --desktop-image "$CURRENT_DESKTOP_IMAGE" \
+  --source-sha "$REVIEWED_SHA" --recipe-version "$NEW_RECIPE_VERSION" \
+  --maintenance-release "$CURRENT_SOURCE_MANIFEST" --release-dir "$MAINTENANCE_RELEASE_DIR"
+# Review, then repeat with --apply.
+```
+
+Maintenance plans/final manifests have `previous=null` and validate as full
+source records, never rebase targets. `promote-canary` refuses a maintenance plan.
+A same-digest maintenance record cannot replace a retained registry record.
+The lead must resolve its source registration before using it for recovery;
+retention and unique-source checks are intentionally not relaxed.
+
+To plan an upgrade, supply the reviewed desired lifecycle/identity configs, the
+independently observed preview PostgreSQL system ID, and a rollout review file.
+The authority origin is fixed to `https://os-staging.ezil.work`; SQL is exactly
+`docs/aws-computers/sql/0002_image_rebase.sql.txt`. A system ID must be observed
+independently on the verified preview DB host, not learned through the connection
+that this command is about to trust.
+
+The lead first synthesizes, publishes assets and **stages, but does not execute**
+three reviewed change sets. `rollout.json` has this closed shape (absolute file
+paths and actual change-set ARNs replace the placeholders):
+
+```json
+{
+  "schemaVersion": 1,
+  "stacks": {
+    "identity": {
+      "stackName": "ezil-identity-mum",
+      "changeSetArn": "arn:aws:cloudformation:ap-south-1:452630323510:changeSet/REVIEWED/UUID",
+      "roleArn": null,
+      "beforeTemplatePath": "/review/identity-before.json",
+      "candidateTemplatePath": "/review/identity-candidate.json",
+      "reviewPath": "/review/identity-review.json"
+    },
+    "foundation": {
+      "stackName": "ezil-mum-foundation",
+      "changeSetArn": "arn:aws:cloudformation:ap-south-1:452630323510:changeSet/REVIEWED/UUID",
+      "roleArn": "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec",
+      "beforeTemplatePath": "/review/foundation-before.json",
+      "candidateTemplatePath": "/review/foundation-before.json",
+      "reviewPath": "/review/foundation-review.json"
+    },
+    "workflows": {
+      "stackName": "ezil-mum-lifecycle",
+      "changeSetArn": "arn:aws:cloudformation:ap-south-1:452630323510:changeSet/REVIEWED/UUID",
+      "roleArn": "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec",
+      "beforeTemplatePath": "/review/lifecycle-before.json",
+      "candidateTemplatePath": "/review/lifecycle-candidate.json",
+      "reviewPath": "/review/lifecycle-review.json"
+    }
+  },
+  "app": {
+    "tag": "REVIEWED_IMMUTABLE_TAG",
+    "gitSha": "FULL_REVIEWED_COMMIT_EQUAL_TO_AGENT_COMMIT",
+    "checksumSha256": "SHA256_OF_THE_UPLOADED_TAG_SHA256_FILE"
+  }
+}
+```
+
+Each review file is `{ "schemaVersion": 1, "changes": { ... } }`. Its map names
+**every and only** changed logical resource. Values are
+`{"action":"Modify","properties":["PolicyDocument"],"attributes":[]}`;
+property and attribute arrays are sorted. Add/Remove have empty arrays. The
+foundation map is exactly `ComputerLaunchTemplate` / Modify /
+`["LaunchTemplateData"]` / `[]`: it reuses its unchanged template and only changes
+`HostAmiId`. All other parameter values and resolved SSM values are preserved.
+
+The plan pins every review/template byte, config, SQL, bake/source record, and the
+checked-in staging installer. The identity validator requires A2's dedicated
+boundary, all shared global denies, and the 6144-byte limit; the shared boundary
+can only gain DescribeSnapshots. Identity role-write conditions may admit the
+new boundary alongside the existing one, with no other change. Workflow templates
+must bind exactly the preparation and recovery execution roles to it. Existing
+exports, conditions, storage/network resources and IAM denies remain fenced.
+The lead must review the exact IAM/code deltas against the integrated BC source;
+this operator does not replace BC's IAM/ASL security tests.
 
 ```bash
 bash deploy/aws/mum/rebase-release.sh plan --release-dir "$REBASE_RELEASE_DIR" \
-  --config "$REVIEWED_LIFECYCLE_CONFIG" --identity-config "$REVIEWED_IDENTITY_CONFIG"
-# After the lead has deployed and independently reviewed the required artifacts:
+  --config "$REVIEWED_LIFECYCLE_CONFIG" --identity-config "$REVIEWED_IDENTITY_CONFIG" \
+  --expect-system-id "$VERIFIED_PREVIEW_SYSTEM_ID" --rollout "$REVIEWED_ROLLOUT_JSON"
+# For each command below: review its default dry run, then repeat with --apply.
+bash deploy/aws/mum/rebase-release.sh apply-schema --plan "$REBASE_RELEASE_DIR/rebase-plan.json"
+bash deploy/aws/mum/rebase-release.sh apply-identity --plan "$REBASE_RELEASE_DIR/rebase-plan.json"
+bash deploy/aws/mum/rebase-release.sh apply-workflows --plan "$REBASE_RELEASE_DIR/rebase-plan.json"
 bash deploy/aws/mum/rebase-release.sh finalize --plan "$REBASE_RELEASE_DIR/rebase-plan.json"
-bash deploy/aws/mum/rebase-release.sh finalize --plan "$REBASE_RELEASE_DIR/rebase-plan.json" --apply
+bash deploy/aws/mum/rebase-release.sh apply-app --manifest "$REBASE_RELEASE_DIR/rebase-release.json"
+bash deploy/aws/mum/rebase-release.sh promote-canary --manifest "$REBASE_RELEASE_DIR/rebase-release.json"
+# Equivalent promoter entry point:
+bash deploy/aws/mum/promote-ami.sh --manifest "$REBASE_RELEASE_DIR/rebase-release.json"
+# Rollback only after reviewing the retained promotion journal:
+bash deploy/aws/mum/promote-ami.sh --rollback --manifest "$REBASE_RELEASE_DIR/rebase-release.json"
 ```
 
-Finalization reads Image Builder recipe/bindings, the available private AMI,
-the pinned launch-template version, and all three published Standard workflow
-versions. It writes `rebase-release.json` only after all checks pass. Repeating
-finalize preserves the original manifest and timestamp; changed inputs or
-readbacks refuse. Files are private and written with file and directory fsync.
-Finalization proves those artifact readbacks; it does not prove schema, IAM,
-compatible app deployment or canary acceptance.
+Schema application uses SSM on `i-014810524754b9ed0`, the existing
+`ezil-main-preview-artifacts-452630323510-aps1/os-staging/images/` prefix and
+`postgres:17-alpine`, matching `rw-sql.sh`. It validates host tags, restricts the DB
+URL to `10.61.20.35:5432`, refuses btgq/curomaa and routing overrides, pins the system
+ID inside the transaction, and enables error-stop. Catalog evidence before/after
+covers columns, indexes, RLS, grants, constraints, defaults and triggers. An exact
+existing installation is resumable; a partial/different schema refuses. Uploaded
+operation payloads are removed after successful SSM completion. SQL never enters
+a hosted migration runner.
+
+Identity/workflow application verifies the exact submitted change-set template,
+parameters, resolved SSM values, resource/property coverage and replacement
+flags before executing its recorded ARN. It reconciles a lost execute result
+against the same change set and live template. It does not recreate an uncertain
+change set. Workflow completion additionally reads the foundation's pinned LT,
+checks that launch data changed only in ImageId, and verifies all three retained
+published Standard workflow versions. Finalization requires successful schema,
+identity and workflow receipts before writing the immutable final manifest.
+
+App installation embeds the existing `install-host.sh`, adds a checksum-marker
+pin, verifies the running full commit, and holds the existing app-secret lock.
+The app and agent must come from the same reviewed integrated commit. Promotion
+rechecks live artifacts, CAS-checks the entire before/after tuple and secret
+VersionId under that lock, restarts the pinned app, and checks its actual running
+entry. Rollback restores the previous complete tuple and retains all registry
+records; it changes no user-data volume or digest. Cloud resources/versions stay
+retained, so rollback selects the source's published versions rather than
+reverting IAM or deleting an AMI.
+
+**Admission stays gated.** Cloud, app and promotion phases require the existing
+`EZIL_AWS_KILL_SWITCH=1` in the app secret and verify it in the running app. No tool
+opens it. After all readbacks and the running app entry agree, the lead reviews
+canary policy/caps, performs the existing lock-protected gate change and app
+refresh, then runs the computer canary below. Restore the gate before rollback.
+
+Resume the failed phase using the same plan and directory. SSM journals precede
+submission; an uncertain missing submission refuses until its command is found.
+A known failed idempotent operation can retry and retains prior command IDs.
+Successful app installs are followed by fresh running-app inspection. Keep all
+phase journals after partial rollout. Provider errors and secret payloads are
+suppressed; only nonsecret receipts are persisted. Offline doubles do not prove
+live IAM effectiveness, PostgreSQL execution, Docker, or canary health.
 
 The computer interface uses the existing
 `EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET` environment value in memory, signs the exact

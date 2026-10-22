@@ -556,35 +556,43 @@ def lifecycle_version_pair(old, new, old_pair, new_pair):
     removed, added = old.keys() - new.keys(), new.keys() - old.keys()
     if not removed and not added:
         return {}
-    need(len(removed) == len(added) == 1,
-         "lifecycle resource addition/removal refused: expected one Lambda Version pair")
-    previous, target = next(iter(removed)), next(iter(added))
-    a, b = old[previous], new[target]
-    need(a["Type"] == b["Type"] == "AWS::Lambda::Version",
-         "lifecycle resource addition/removal refused: only a Lambda Version pair is permitted")
-    function = a.get("Properties", {}).get("FunctionName")
-    need(function == b.get("Properties", {}).get("FunctionName") and isinstance(function, dict) and
-         set(function) == {"Ref"}, "Lambda Version pair must reference the same function")
-    logical = function["Ref"]
-    need(logical in old and logical in new and
-         old[logical]["Type"] == new[logical]["Type"] == "AWS::Lambda::Function",
-         "Lambda Version pair must reference the same existing function")
-    old_props, new_props = old[logical].get("Properties", {}), new[logical].get("Properties", {})
-    need(not same_json(old_props.get("Environment"), new_props.get("Environment")) and
-         same_json(promotion_substitution(old_props.get("Environment"), old_pair, new_pair), new_props.get("Environment")) and
-         same_json({k: v for k, v in old_props.items() if k != "Environment"},
-                   {k: v for k, v in new_props.items() if k != "Environment"}),
-         "Lambda Version pair is not forced by the substituted function environment")
-    # The pinned CDK derives the currentVersion logical ID hash from Environment.
-    # Its Version properties (including any explicit CodeSha256/Description) are
-    # unchanged; never treat those fields as an unchecked escape hatch.
-    need(same_json(promotion_substitution(a, old_pair, new_pair), b),
-         "Lambda Version pair properties/attributes are not forced by AMI/version pair")
-    return {previous: target}
+    need(len(removed) == len(added), "lifecycle resource addition/removal refused: unmatched Lambda Version pairs")
+    result = {}
+    for previous in sorted(removed):
+        resource = old[previous]
+        need(resource["Type"] == "AWS::Lambda::Version", "lifecycle resource addition/removal refused: only Lambda Version pairs")
+        matches = [key for key in added if new[key]["Type"] == "AWS::Lambda::Version" and
+                   new[key].get("Properties", {}).get("FunctionName") == resource.get("Properties", {}).get("FunctionName")]
+        need(len(matches) == 1, "lifecycle resource addition/removal refused: expected one Lambda Version for the same function")
+        target = matches[0]
+        need(target not in result.values(), "duplicate Lambda Version target")
+        a, b = old[previous], new[target]
+        need(a["Type"] == b["Type"] == "AWS::Lambda::Version",
+             "lifecycle resource addition/removal refused: only a Lambda Version pair is permitted")
+        function = a.get("Properties", {}).get("FunctionName")
+        need(function == b.get("Properties", {}).get("FunctionName") and isinstance(function, dict) and
+             set(function) == {"Ref"}, "Lambda Version pair must reference the same function")
+        logical = function["Ref"]
+        need(logical in old and logical in new and
+             old[logical]["Type"] == new[logical]["Type"] == "AWS::Lambda::Function",
+             "Lambda Version pair must reference the same existing function")
+        old_props, new_props = old[logical].get("Properties", {}), new[logical].get("Properties", {})
+        need(not same_json(old_props.get("Environment"), new_props.get("Environment")) and
+             same_json(promotion_substitution(old_props.get("Environment"), old_pair, new_pair), new_props.get("Environment")) and
+             same_json({k: v for k, v in old_props.items() if k != "Environment"},
+                       {k: v for k, v in new_props.items() if k != "Environment"}),
+             "Lambda Version pair is not forced by the substituted function environment")
+        # The pinned CDK derives the currentVersion logical ID hash from Environment.
+        # Its Version properties (including any explicit CodeSha256/Description) are
+        # unchanged; never treat those fields as an unchecked escape hatch.
+        need(same_json(promotion_substitution(a, old_pair, new_pair), b),
+             "Lambda Version pair properties/attributes are not forced by AMI/version pair")
+        result[previous] = target
+    return result
 
 
 def lifecycle_template(live_path, baseline_path, candidate_path, before_path, after_path, rollback="false"):
-    """Derive exact changes from substitution, with one environment-forced Version pair."""
+    """Derive exact changes from substitution, with independently proven environment-forced Version pairs."""
     before, after = read(before_path), read(after_path)
     old_pair, new_pair = pair(before), pair(after)
     expected = copy.deepcopy(before)
@@ -840,6 +848,40 @@ def edit_secret(envelope, before, after):
     return outer
 
 
+def edit_release_secret(envelope, before, after, records):
+    """CAS the complete tuple and append immutable records; capacity fails closed.
+
+    Retaining ALL records satisfies placement/job retention without racing the DB.
+    A separately reviewed garbage collector is required when eight slots are full.
+    """
+    updated = edit_secret(envelope, before, after)
+    raw = updated[KEY]
+    deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
+    d = deployments[REGION]
+    retained = d.get("releases", [])
+    need(isinstance(retained, list) and len(retained) <= 8, "invalid release registry")
+    for record in retained:
+        release.validate(record, source=True, repository=REPOSITORY)
+        need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
+    need(len({json.dumps(r, sort_keys=True) for r in retained}) == len(retained), "duplicate release records")
+    for record in records:
+        release.validate(record, source=True, repository=REPOSITORY)
+        need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign release record")
+        if record not in retained:
+            retained.append(copy.deepcopy(record))
+    need(1 <= len(retained) <= 8, "release registry full; retained placement/job evidence must never be dropped")
+    need(len({r["lowerImageDigest"] for r in retained}) == len(retained), "ambiguous source release digest; no record may be silently replaced")
+    retained.sort(key=lambda r: r["createdAt"])
+    targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
+    # Legacy rollback remains a source-only deployment, never a rebase target.
+    if set(release.TUPLE) <= after.keys():
+        need(len(targets) == 1, "target release is not unique")
+        release.validate(targets[0], repository=REPOSITORY)
+    d["releases"] = retained
+    updated[KEY] = json.dumps(deployments, separators=(",", ":")) if isinstance(raw, str) else deployments
+    return updated
+
+
 @contextmanager
 def app_secret_lock():
     # flock(2), shared with with-app-secret-lock.sh and every external writer.
@@ -863,7 +905,13 @@ def _secret_update(before_path, after_path, apply, lock_fd):
 
     before, after = pair(read(before_path)), pair(read(after_path))
     envelope = aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
-    updated = edit_secret(envelope, before, after)
+    outer = release.loads(envelope["SecretString"])
+    deployments = release.loads(outer[KEY]) if isinstance(outer[KEY], str) else outer[KEY]
+    if "releases" in deployments[REGION]:
+        records = read(after_path)["settings"]["deployment"].get("releases", [])
+        updated = edit_release_secret(envelope, before, after, records)
+    else:
+        updated = edit_secret(envelope, before, after)
     if apply:
         request = {"SecretId": SECRET, "SecretString": json.dumps(updated, separators=(",", ":"))}
         payload = json.dumps(request)
@@ -901,7 +949,7 @@ def main(args):
     elif op == "previous-parameters":
         need(PREVIOUS <= mapping(stack(a[0])["Parameters"]).keys(), "previous pair requires a recipe version bump")
     elif op in ("previous-release", "secret-predecessor"):
-        manifest = release.load(a[0], repository=REPOSITORY)
+        manifest = release.load(a[0], source=True, repository=REPOSITORY)
         need(manifest["accountId"] == ACCOUNT and manifest["region"] == REGION and manifest["namespace"] == "mum", "previous release identity mismatch")
         if op == "previous-release":
             need((manifest["lowerImageRef"], manifest["lowerImageDigest"]) == tuple(a[1:3]), "previous release lower mismatch")
@@ -912,8 +960,14 @@ def main(args):
                 deployments = release.loads(outer[KEY]) if isinstance(outer[KEY], str) else outer[KEY]
                 d = deployments[REGION]
                 release.deployment_tuple(d)
-                need(all(d.get(k) == manifest[k] for k in (*release.PROMOTION, "accountId", "region", "namespace", "launchTemplateId")),
+                need(all(d.get(k) == manifest[k] for k in (*((release.PROMOTION) if set(release.TUPLE) <= d.keys() else release.PROMOTION[:3]), "accountId", "region", "namespace", "launchTemplateId")),
                      "previous release is not the promoted app tuple")
+    elif op in ("maintenance-agent", "maintenance-lower"):
+        manifest = release.load(a[0], source=True, repository=REPOSITORY)
+        if op == "maintenance-agent":
+            need(release.matches(r"[0-9a-f]{40}", a[1]) and a[1] != manifest["agentCommit"], "maintenance bake requires a new reviewed agent commit")
+        else:
+            need(a[1] == manifest["lowerImageDigest"], "maintenance bake must preserve the promoted lower ID")
     elif op == "bake-inputs":
         params = mapping(read(a[0]))
         def value(key):

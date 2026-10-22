@@ -3,9 +3,9 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 usage() {
-    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--apply] [--config <path>] [--release-dir <path>]'
+    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--maintenance-release <source-manifest>] [--apply] [--config <path>] [--release-dir <path>]'
 }
-desktop_image= source_sha= recipe_version= previous_ref= previous_id= previous_release=
+desktop_image= source_sha= recipe_version= previous_ref= previous_id= previous_release= maintenance_release=
 config=/root/ezil-aws-mum/config/ami.mum.json
 while (($#)); do
     case "$1" in
@@ -14,6 +14,7 @@ while (($#)); do
         --recipe-version) (($# >= 2)) && [[ -n "$2" ]] || die 'missing recipe version'; recipe_version=$2; shift 2 ;;
         --previous-desktop-image-ref) (($# >= 2)) && [[ -n "$2" ]] || die 'missing previous image reference'; previous_ref=$2; shift 2 ;;
         --previous-desktop-image-id) (($# >= 2)) && [[ -n "$2" ]] || die 'missing previous image ID'; previous_id=$2; shift 2 ;;
+        --maintenance-release) (($# >= 2)) || die 'missing maintenance source release'; maintenance_release=$2; shift 2 ;;
         --previous-release) (($# >= 2)) || die 'missing previous release manifest'; previous_release=$2; shift 2 ;;
         --config) (($# >= 2)) || die 'missing config path'; config=$2; shift 2 ;;
         --release-dir) (($# >= 2)) || die 'missing release directory'; release_dir=$2; shift 2 ;;
@@ -25,6 +26,7 @@ done
 [[ -n "$desktop_image" && "$desktop_image" != -* && "$source_sha" =~ ^[0-9a-f]{7,40}$ ]] || { usage; die 'local image and hexadecimal commit SHA are required'; }
 [[ -n "$previous_ref" && -n "$previous_id" || -z "$previous_ref" && -z "$previous_id" ]] || die 'previous reference and ID must be supplied together'
 [[ -z "$previous_release" || -n "$previous_ref" ]] || die 'previous release requires previous image pair'
+[[ -z "$maintenance_release" || -z "$previous_ref$previous_id$previous_release" ]] || die 'maintenance bake cannot include a previous lower'
 require_tools aws docker git python3 mktemp date timeout
 require_absolute_release
 init_work
@@ -47,6 +49,12 @@ if [[ -n "$previous_ref" ]]; then
     json secret-predecessor "$work/previous-rebase-release.json"
     previous_args=("$previous_ref" "$previous_id")
 fi
+if [[ -n "$maintenance_release" ]]; then
+    [[ -f "$maintenance_release" && ! -L "$maintenance_release" && -n "$recipe_version" ]] || die 'maintenance source and new recipe version required'
+    cp -- "$maintenance_release" "$work/maintenance-source-release.json"
+    json secret-predecessor "$work/maintenance-source-release.json"
+    previous_args=("" "")
+fi
 show git -C "$repo_root" rev-parse --verify "$source_sha^{commit}"
 full_sha=$(git -C "$repo_root" rev-parse --verify "$source_sha^{commit}")
 [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || die 'source SHA did not resolve to a full commit'
@@ -57,6 +65,10 @@ show docker image inspect --format '{{.Os}}/{{.Architecture}}' "$desktop_image"
 show docker image inspect --format '{{.Id}}' "$desktop_image"
 image_id=$(docker image inspect --format '{{.Id}}' "$desktop_image")
 [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'invalid local Docker image ID'
+if [[ -n "$maintenance_release" ]]; then
+    json maintenance-agent "$work/maintenance-source-release.json" "$full_sha"
+    [[ "$(git -C "$repo_root" cat-file -t "$full_sha:infra/host-agent/lib/ezil_host/maintenance.py")" == blob ]] || die 'reviewed agent lacks maintenance rebind support'
+fi
 stamp=$(date -u +%Y%m%d%H%M%S)
 tag=host-${full_sha:0:12}-$stamp
 change=ami-${full_sha:0:12}-$stamp
@@ -130,6 +142,9 @@ if "$apply"; then
     aws_read ecr batch-get-image --repository-name "${repository#*/}" --image-ids "imageTag=$tag" --output json > "$work/manifest.json"
     read -r digest pinned_id < <(json manifest "$work/manifest.json" "$image_id")
     [[ -n "$digest" && -n "$pinned_id" ]] || die 'could not resolve the pushed image digest'
+    if [[ -n "$maintenance_release" ]]; then
+        json maintenance-lower "$work/maintenance-source-release.json" "$pinned_id"
+    fi
     json parameters "$work/stack.json" "$digest" "$pinned_id" "$source_uri" "$work/parameters.json" "${previous_args[@]}"
 else
     show aws --profile "$profile" --region "$region" ecr batch-get-image --repository-name "${repository#*/}" --image-ids "imageTag=$tag" --output json
@@ -165,6 +180,9 @@ cp "$work/template.json" "$release_dir/ami-template.json"
 cp "$work/parameters.json" "$release_dir/ami-parameters.json"
 if [[ -n "$previous_ref" ]]; then
     cp "$work/previous-rebase-release.json" "$release_dir/previous-rebase-release.json"
+fi
+if [[ -n "$maintenance_release" ]]; then
+    cp "$work/maintenance-source-release.json" "$release_dir/maintenance-source-release.json"
 fi
 json bake-inputs "$work/parameters.json" "$full_sha" "$recipe_version" "$work/template.json" "$release_dir/bake-inputs.json"
 

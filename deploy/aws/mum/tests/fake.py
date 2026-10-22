@@ -58,7 +58,7 @@ if tool == "git":
     if "rev-parse" in args:
         out("a" * 40)
     elif "cat-file" in args:
-        out("tree")
+        out("blob" if args[-1].endswith("/maintenance.py") else "tree")
     elif "archive" in args:
         Path(flag("--output")).write_bytes(b"synthetic archive")
     else:
@@ -156,7 +156,15 @@ elif tool == "aws":
     service, operation = args[start:start + 2]
     if (root / "rebase-readbacks.json").exists() and service != "sts":
         evidence = read("rebase-readbacks.json")
-        if (service, operation) == ("imagebuilder", "get-image"):
+        if (service, operation) == ('ec2','describe-instances'):
+            out({'Reservations':[{'Instances':[{'InstanceId':'i-014810524754b9ed0','State':{'Name':'running'},'Tags':[{'Key':'ezil:env','Value':'billing-staging'},{'Key':'ezil:purpose','Value':'os-staging'}]}]}]})
+        elif (service,operation) in (('s3api','put-object'),('s3api','delete-object')):
+            out({})
+        elif (service,operation)==('ssm','send-command'):
+            out({'Command':{'CommandId':'11111111-1111-4111-8111-111111111111'}})
+        elif (service,operation)==('ssm','get-command-invocation'):
+            out({'Status':'Success','ResponseCode':0,'StandardOutputContent':json.dumps(read('schema-readback.json'))})
+        elif (service, operation) == ("imagebuilder", "get-image"):
             out(evidence["build"])
         elif (service, operation) == ("ec2", "describe-images"):
             out(evidence["image"])
@@ -169,7 +177,7 @@ elif tool == "aws":
             raise SystemExit('unexpected rebase readback')
         raise SystemExit(0)
     if (service, operation) == ("sts", "get-caller-identity"):
-        out("000000000000" if scenario.get("wrong_account") else "452630323510")
+        out(("000000000000" if scenario.get("wrong_account") else "452630323510") if "--query" in args else {"Account":"000000000000" if scenario.get("wrong_account") else "452630323510"})
     elif service == "ecr":
         if operation == "get-login-password":
             out("synthetic-login")
