@@ -17,9 +17,25 @@ const KNOWN: ReadonlySet<string> = new Set(['ExecutionStarted', 'ExecutionFailed
     'WaitStateEntered', 'WaitStateExited',
     'LambdaFunctionScheduled', 'LambdaFunctionStarted', 'LambdaFunctionSucceeded', 'LambdaFunctionFailed', 'LambdaFunctionTimedOut',
     'LambdaFunctionStartFailed', 'LambdaFunctionScheduleFailed',
-    'TaskScheduled', 'TaskStarted', 'TaskSucceeded', 'TaskFailed', 'TaskTimedOut', 'TaskStartFailed', 'TaskSubmitted', 'TaskSubmitFailed']);
+    'TaskScheduled', 'TaskStarted', 'TaskSucceeded', 'TaskFailed', 'TaskTimedOut', 'TaskStartFailed']);
 /** The only provider calls a release makes (infra/app-computers lifecycle helper `observePool`). */
 const RELEASE_TASKS: ReadonlySet<string> = new Set(['stopInstances', 'detachVolume', 'terminateInstances']);
+const ANSWERS: ReadonlySet<string> = new Set(['TaskSucceeded', 'TaskFailed', 'TaskTimedOut']);
+/** Each event type's only legitimate parent (previousEventId) type; every such event is that parent's single child of its kind. */
+const PARENT: Readonly<Record<string, string>> = { TaskStarted: 'TaskScheduled', TaskStartFailed: 'TaskScheduled',
+    TaskSucceeded: 'TaskStarted', TaskFailed: 'TaskStarted', TaskTimedOut: 'TaskStarted',
+    LambdaFunctionScheduled: 'TaskStateEntered', LambdaFunctionScheduleFailed: 'TaskStateEntered', LambdaFunctionStarted: 'LambdaFunctionScheduled',
+    LambdaFunctionStartFailed: 'LambdaFunctionScheduled', LambdaFunctionSucceeded: 'LambdaFunctionStarted', LambdaFunctionFailed: 'LambdaFunctionStarted',
+    LambdaFunctionTimedOut: 'LambdaFunctionStarted' };
+/** A sibling group: at most one start per schedule, one outcome per start. */
+const GROUP: Readonly<Record<string, string>> = { TaskStarted: 'start', TaskStartFailed: 'start', TaskSucceeded: 'outcome', TaskFailed: 'outcome',
+    TaskTimedOut: 'outcome', LambdaFunctionScheduled: 'schedule', LambdaFunctionScheduleFailed: 'schedule', LambdaFunctionStarted: 'start',
+    LambdaFunctionStartFailed: 'start', LambdaFunctionSucceeded: 'outcome', LambdaFunctionFailed: 'outcome', LambdaFunctionTimedOut: 'outcome' };
+const FAILURES: ReadonlySet<string> = new Set(['LambdaFunctionFailed', 'LambdaFunctionTimedOut', 'LambdaFunctionStartFailed', 'LambdaFunctionScheduleFailed',
+    'TaskFailed', 'TaskTimedOut', 'TaskStartFailed']);
+type TaskDetails = { resource?: string; resourceType?: string };
+const taskDetails = (event: HistoryEvent): TaskDetails | undefined => event.taskScheduledEventDetails ?? event.taskStartedEventDetails
+    ?? event.taskSucceededEventDetails ?? event.taskFailedEventDetails ?? event.taskTimedOutEventDetails ?? event.taskStartFailedEventDetails;
 const named = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 const truncated = (event: HistoryEvent) => Object.values(event).some(v => v && typeof v === 'object'
     && ((v as { inputDetails?: { truncated?: boolean } }).inputDetails?.truncated || (v as { outputDetails?: { truncated?: boolean } }).outputDetails?.truncated));
@@ -56,6 +72,22 @@ export function proveFailedReleaseTermination(e: Execution, events: readonly His
     });
     if (!valid) return null;
     const byId = new Map(events.map(event => [event.id!, event]));
+    // The final failure descends from a failed observe/task: ExecutionFailed <- Fail state <- a state exit <- a failure event.
+    const exited = byId.get(failState.previousEventId!), failure = exited && byId.get(exited.previousEventId!);
+    if (!exited?.type?.endsWith('StateExited') || !failure || !FAILURES.has(failure.type ?? '')) return null;
+    // Every task/Lambda event hangs off exactly one legitimate parent, unique in its sibling group, carrying the same EC2 resource.
+    const seen = new Set<string>();
+    for (const event of events) {
+        const type = event.type ?? '', parentType = PARENT[type];
+        if (!parentType) continue;
+        const parent = byId.get(event.previousEventId!), key = event.previousEventId + ':' + GROUP[type];
+        if (parent?.type !== parentType || seen.has(key)) return null;
+        seen.add(key);
+        if (type.startsWith('Task')) {
+            const own = taskDetails(event), up = taskDetails(parent);
+            if (own?.resourceType !== 'aws-sdk:ec2' || !own.resource || own.resource !== up?.resource || up.resourceType !== 'aws-sdk:ec2') return null;
+        }
+    }
     // Every provider call is a release step naming exactly this host (and, to detach, exactly its data volume).
     const scheduled = events.filter(event => event.type === 'TaskScheduled');
     for (const s of scheduled) {
@@ -67,11 +99,22 @@ export function proveFailedReleaseTermination(e: Execution, events: readonly His
             ? parameters.VolumeId !== volumeId || parameters.InstanceId !== instanceId
             : !Array.isArray(parameters.InstanceIds) || parameters.InstanceIds.length !== 1 || parameters.InstanceIds[0] !== instanceId) return null;
     }
+    for (const done of events.filter(event => event.type === 'TaskSucceeded')) {
+        const d = done.taskSucceededEventDetails!, out = parse(d.output) as Record<string, unknown> | undefined;
+        if (!out || d.outputDetails?.truncated) return null;
+        if (d.resource === 'detachVolume' ? out.InstanceId !== instanceId || out.VolumeId !== volumeId
+            : d.resource === 'stopInstances' ? !Array.isArray(out.StoppingInstances) || out.StoppingInstances.length !== 1
+                || (out.StoppingInstances[0] as { InstanceId?: unknown } | undefined)?.InstanceId !== instanceId
+            : d.resource === 'terminateInstances' ? !Array.isArray(out.TerminatingInstances) || out.TerminatingInstances.length !== 1
+                || (out.TerminatingInstances[0] as { InstanceId?: unknown } | undefined)?.InstanceId !== instanceId
+            : true) return null;
+    }
     let terminatedAt: Date | null = null;
     for (const s of scheduled.filter(event => event.taskScheduledEventDetails!.resource === 'terminateInstances')) {
         const started = events.find(event => event.type === 'TaskStarted' && event.previousEventId === s.id);
         if (started?.taskStartedEventDetails?.resource !== 'terminateInstances' || started.taskStartedEventDetails.resourceType !== 'aws-sdk:ec2') return null;
-        const done = events.find(event => event.previousEventId === started.id && event.type?.startsWith('Task') && event.type !== 'TaskStateExited');
+        // Only a terminal task outcome answers the request (a following state entry does not).
+        const done = events.find(event => event.previousEventId === started.id && ANSWERS.has(event.type ?? ''));
         if (!done) return null; // An unanswered termination request is never a witness.
         if (done.type !== 'TaskSucceeded') continue;
         const out = parse(done.taskSucceededEventDetails?.output) as { TerminatingInstances?: { InstanceId?: unknown; CurrentState?: { Code?: unknown; Name?: unknown } }[] } | undefined;

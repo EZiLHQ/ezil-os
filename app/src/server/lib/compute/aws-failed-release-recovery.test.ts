@@ -70,6 +70,8 @@ describe('failed release whose host it already terminated (incident 2026-10-25)'
         ['wrong host generation', s => { (s.host.tags as Record<string, string>)['ezil:generation'] = '2'; }, 'instance_identity'],
         ['data disk still mapped', s => { s.host.volumes = [{ volumeId: s.original.intent.dataVolumeId!, deviceName: '/dev/sdf', deleteOnTermination: false, tags: {} }]; }, 'instance_disks'],
         ['retained root mapping', s => { s.host.volumes = [{ volumeId: 'vol-22222222222222222', deviceName: '/dev/sda1', deleteOnTermination: false, tags: {} }]; }, 'instance_disks'],
+        ['two root mappings', s => { s.host.volumes = [{ volumeId: 'vol-22222222222222222', deviceName: '/dev/sda1', deleteOnTermination: true, tags: {} },
+            { volumeId: 'vol-33333333333333333', deviceName: '/dev/sda1', deleteOnTermination: true, tags: {} }]; }, 'instance_disks'],
         ['extra mapping', s => { s.host.volumes = [{ volumeId: 'vol-22222222222222222', deviceName: '/dev/sda1', deleteOnTermination: true, tags: {} },
             { volumeId: 'vol-33333333333333333', deviceName: '/dev/sdg', deleteOnTermination: true, tags: {} }]; }, 'instance_disks'],
         ['wrong KMS key', s => { s.volume.kmsKeyId = 'arn:aws:kms:ap-south-1:123456789012:key/other'; }, 'volume_identity'],
@@ -94,6 +96,56 @@ describe('failed release whose host it already terminated (incident 2026-10-25)'
         expect(s.usage[0]!.stopped_at).toBeNull(); expect(s.meter.stopped).not.toHaveBeenCalled();
     });
 
+    it.each([
+        ['in 2099', (c: Record<string, string>) => { c.stoppedAt = '2099-01-01T00:00:00.000Z'; }],
+        ['before the failed release started', (c: Record<string, string>) => { c.stoppedAt = new Date(START.getTime() - 1).toISOString(); }],
+        ['after the failed release stopped', (c: Record<string, string>) => { c.stoppedAt = new Date(STOP.getTime() + 1).toISOString(); }],
+        ['unparseable', (c: Record<string, string>) => { c.stoppedAt = 'not-a-time'; }],
+        ['missing the source interval', (c: Record<string, string>) => { delete c.sourceStoppedAt; }],
+        ['source interval moved', (c: Record<string, string>) => { c.sourceStartedAt = new Date(START.getTime() - 3_600_000).toISOString(); c.stoppedAt = new Date(START.getTime() - 60_000).toISOString(); }],
+    ])('a corrupted saved termination time (%s) never settles or closes usage', async (_name, corrupt) => {
+        const s = failedReleaseSetup(); await s.tick();
+        const row = s.placements[0]!, context = JSON.parse(String(row.last_error).slice('pool_release_recovery:'.length));
+        corrupt(context); row.last_error = 'pool_release_recovery:' + JSON.stringify(context);
+        s.finish(); await s.tick(); await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED');
+        expect(s.usage[0]!.stopped_at).toBeNull(); expect(s.meter.stopped).not.toHaveBeenCalled();
+    });
+
+    it('settlement re-proves the ORIGINAL failed release: a different (still valid) witnessed time refuses', async () => {
+        const s = failedReleaseSetup(); await s.tick();
+        const h = failedReleaseHistory(s.original);
+        const n = h.findIndex(e => e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'terminateInstances');
+        for (const e of h.slice(n, n + 2)) e.timestamp = new Date(TERMINATED.getTime() + 10); // the result and its state exit
+        expect(proveFailedReleaseTermination(s.failed, h, s.original)?.terminatedAt).toEqual(new Date(TERMINATED.getTime() + 10));
+        s.histories.set(s.failed.executionArn!, h);
+        s.finish(); await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED' });
+        expect(await s.context()).toMatchObject({ error: 'replay_identity', stoppedAt: TERMINATED.toISOString() });
+        expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
+    it('settlement waits (RECOVERING) while the original failed release cannot be read, then settles', async () => {
+        const s = failedReleaseSetup(); await s.tick(); s.finish();
+        const history = s.histories.get(s.failed.executionArn!)!; s.histories.delete(s.failed.executionArn!);
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
+        expect(await s.context()).toMatchObject({ error: 'describe_unavailable' });
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        s.histories.set(s.failed.executionArn!, history); await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'STOPPED' }); expect(s.usage[0]!.stopped_at).toEqual(TERMINATED);
+    });
+
+    it.each([
+        ['a foreign namespace alias', (s: Setup) => { s.volume.tags = { ...s.volume.tags, 'ezil:namespace': 'pilot' }; }],
+        ['a foreign computer alias', (s: Setup) => { s.volume.tags = { ...s.volume.tags, 'ezil:computer': '99999999-9999-4999-8999-999999999999' }; }],
+    ])('final settlement re-checks every present volume alias: %s added after the reservation refuses', async (_name, mutate) => {
+        const s = failedReleaseSetup(); await s.tick(); mutate(s);
+        s.finish(); await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED');
+        expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
     it('a concurrent reservation (job CAS) starts exactly one replay', async () => {
         const s = failedReleaseSetup(); const stale = await s.current();
         await Promise.all([applyLifecycleReceipt(s.deps, stale, D), applyLifecycleReceipt(s.deps, stale, D)]);
@@ -114,6 +166,15 @@ describe('failed release whose host it already terminated (incident 2026-10-25)'
         await s.tick(); await s.tick();
         expect(s.starts).toHaveLength(1);
         expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
+    it('after a failed replay, even a new lifecycle version never re-enters the terminated branch (its replay has no witness)', async () => {
+        const s = failedReleaseSetup(); await s.tick(); s.finish('FAILED'); await s.tick();
+        const next = { ...D, stateMachineVersionArn: D.stateMachineVersionArn.replace(':19', ':20') };
+        await applyLifecycleReceipt(s.deps, await s.current(), next);
+        expect(s.starts).toHaveLength(1);
+        expect(await s.context()).toMatchObject({ error: 'volume_attachment' });
+        expect(s.deps.executions!.history).toHaveBeenCalledTimes(1); // only the original failed release's history was ever read
     });
 
     it('a failed STOP (not a release) never enters the terminated branch', async () => {
@@ -143,7 +204,15 @@ describe('failed-release termination witness (the failed execution\'s own histor
         ['no terminate call at all', h => reid(h.filter(e => !JSON.stringify(e).includes('terminateInstances')))],
         ['unanswered terminate', h => reid(h.filter(e => !(e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'terminateInstances')))],
         ['foreign region', h => { at(h, 'TaskScheduled', 'terminateInstances').taskScheduledEventDetails!.region = 'us-east-1'; }],
-        ['a non-release provider call', h => { at(h, 'TaskScheduled', 'stopInstances').taskScheduledEventDetails!.resource = 'runInstances'; }],
+        ['a non-release provider call', h => { const s = at(h, 'TaskScheduled', 'stopInstances');
+            h.find(e => e.id === s.previousEventId)!.stateEnteredEventDetails!.name = 'startInstances'; s.taskScheduledEventDetails!.resource = 'startInstances'; }],
+        ['an unanswered earlier terminate request, even with a later witness', h => {
+            const n = h.findIndex(e => e.type === 'TaskStateEntered' && e.stateEnteredEventDetails?.name === 'terminateInstances');
+            const extra = h.slice(n, n + 3).map(e => structuredClone(e)); // entered, scheduled, started; never answered
+            return reid([...h.slice(0, n), ...extra, ...h.slice(n)]); }],
+        ['execution failure not connected to the Fail state', h => { h.at(-1)!.previousEventId = h.at(-1)!.id! - 2; }],
+        ['whole history before the execution started', h => h.map(e => ({ ...e, timestamp: new Date(e.timestamp!.getTime() - 3_600_000) }))],
+        ['whole history after the execution stopped', h => h.map(e => ({ ...e, timestamp: new Date(e.timestamp!.getTime() + 3_600_000) }))],
         ['detach of a foreign volume', h => { at(h, 'TaskScheduled', 'detachVolume').taskScheduledEventDetails!.parameters = JSON.stringify({ VolumeId: 'vol-99999999999999999', InstanceId: 'i-11111111111111111' }); }],
         ['scheduled outside its own task state', h => { at(h, 'TaskScheduled', 'terminateInstances').previousEventId =
             h.find(e => e.type === 'TaskStateEntered' && e.stateEnteredEventDetails?.name === 'stopInstances')!.id; }],
@@ -161,6 +230,29 @@ describe('failed-release termination witness (the failed execution\'s own histor
         ['unknown event type', h => { h[2]!.type = 'MapRunStarted'; }],
         ['non-sequential ids', h => { h[3]!.id = 99; }],
         ['too short', h => h.slice(0, 2)],
+        // Root early review P2-1: every provider event belongs to one connected, identity-checked chain.
+        ['foreign stop output', h => { const d = at(h, 'TaskSucceeded', 'stopInstances').taskSucceededEventDetails!;
+            d.output = d.output!.replaceAll('i-11111111111111111', 'i-99999999999999999'); }],
+        ['foreign detach output (volume)', h => { const d = at(h, 'TaskSucceeded', 'detachVolume').taskSucceededEventDetails!;
+            d.output = d.output!.replace('vol-11111111111111111', 'vol-99999999999999999'); }],
+        ['foreign detach output (instance)', h => { const d = at(h, 'TaskSucceeded', 'detachVolume').taskSucceededEventDetails!;
+            d.output = d.output!.replace('i-11111111111111111', 'i-99999999999999999'); }],
+        ['orphan runInstances result', h => { const n = h.findIndex(e => e.type === 'TaskStateEntered' && e.stateEnteredEventDetails?.name === 'terminateInstances');
+            const orphan = { ...structuredClone(at(h, 'TaskSucceeded', 'stopInstances')), taskSucceededEventDetails: { resourceType: 'aws-sdk:ec2', resource: 'runInstances',
+                output: JSON.stringify({ Instances: [{ InstanceId: 'i-99999999999999999' }] }), outputDetails: { truncated: false } } };
+            orphan.timestamp = h[n - 1]!.timestamp;
+            const out = reid([...h.slice(0, n), orphan, ...h.slice(n)]); out[n]!.previousEventId = 2; return out; }],
+        ['orphan TaskStarted', h => { const n = h.findIndex(e => e.type === 'TaskStateEntered' && e.stateEnteredEventDetails?.name === 'terminateInstances');
+            const orphan = structuredClone(at(h, 'TaskStarted', 'stopInstances')); orphan.timestamp = h[n - 1]!.timestamp;
+            const out = reid([...h.slice(0, n), orphan, ...h.slice(n)]); out[n]!.previousEventId = 2; return out; }],
+        ['second outcome for one terminate start', h => { const n = h.indexOf(at(h, 'TaskSucceeded', 'terminateInstances'));
+            const twin = structuredClone(h[n]!); const out = reid([...h.slice(0, n + 1), twin, ...h.slice(n + 1)]); out[n + 1]!.previousEventId = out[n]!.previousEventId; return out; }],
+        ['stop outcome chained to the terminate start', h => { at(h, 'TaskSucceeded', 'stopInstances').previousEventId = at(h, 'TaskStarted', 'terminateInstances').id; }],
+        ['a submitted (.sync) task', h => { at(h, 'TaskStarted', 'detachVolume').type = 'TaskSubmitted'; }],
+        ['disconnected final-failure ancestry', h => { h.at(-2)!.previousEventId = 1; }],
+        ['Fail state reached after a successful observe', h => { const exited = h.find(e => e.id === h.at(-2)!.previousEventId)!;
+            const failed = h.find(e => e.id === exited.previousEventId)!; failed.type = 'LambdaFunctionSucceeded'; delete failed.lambdaFunctionFailedEventDetails; }],
+        ['orphan observer result', h => { const n = h.findIndex(e => e.type === 'LambdaFunctionSucceeded'); h[n]!.previousEventId = 1; }],
     ];
     it('the intact history proves exactly the witnessed termination time', () => {
         const s = failedReleaseSetup();

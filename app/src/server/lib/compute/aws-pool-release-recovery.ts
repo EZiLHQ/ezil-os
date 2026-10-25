@@ -13,9 +13,15 @@ import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLiveP
 const PREFIX = 'pool_release_recovery:';
 type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
 type Replay = { intent: LifecycleWork['intent']; stoppedAt: string | null; sourceJobId: string; error: string | null;
-    basis?: 'ec2_state_transition' | 'recovery_success' | 'failed_release_termination'; sourceStartedAt?: string };
+    basis?: 'ec2_state_transition' | 'recovery_success' | 'failed_release_termination'; sourceStartedAt?: string; sourceStoppedAt?: string };
 /** Bases whose saved stop time was proven (and bounded) before the reservation CAS. */
 const provenBasis = (basis: Replay['basis']) => basis === 'ec2_state_transition' || basis === 'failed_release_termination';
+/** A saved failed-release termination time must still lie inside the failed execution's own interval, never in the future. */
+function savedTerminationValid(saved: Replay, now: Date): boolean {
+    if (saved.basis !== 'failed_release_termination') return true;
+    const [start, at, stop] = [saved.sourceStartedAt, saved.stoppedAt, saved.sourceStoppedAt].map(v => typeof v === 'string' ? Date.parse(v) : NaN);
+    return [start, at, stop].every(Number.isFinite) && start! <= at! && at! <= stop! && stop! <= now.getTime();
+}
 function replay(p: Placement): Replay | null {
     try { return p.lastError?.startsWith(PREFIX) ? JSON.parse(p.lastError.slice(PREFIX.length)) : null; }
     catch { return null; }
@@ -43,6 +49,13 @@ function matches(p: Placement, work: LifecycleWork): boolean {
         && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId;
 }
 export { replay as poolReleaseReplay, matches as matchesPoolReleaseRecovery };
+/** The failed source release's identity for this placement (its job/digest are not the placement's after the reservation). */
+function sameIdentity(p: Placement, work: LifecycleWork): boolean {
+    const i = work.intent;
+    return i.operation === 'release' && i.computerId === p.computerId && i.targetGeneration === p.generation && i.leaseEpoch === p.leaseEpoch
+        && i.fenceToken === p.fenceToken && i.providerInstanceId === p.instanceId && i.dataVolumeId === p.volumeId && i.instanceType === p.instanceType
+        && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId;
+}
 function executionMatches(e: Execution, work: LifecycleWork): boolean {
     return !e.stateMachineAliasArn && e.redriveCount === 0
         && e.executionArn === lifecycleExecutionArn(work.intent.deployment, work.intent.jobId)
@@ -50,7 +63,7 @@ function executionMatches(e: Execution, work: LifecycleWork): boolean {
 }
 function ownedTags(tags: Record<string, string> | undefined, p: Placement, d: LifecycleDeployment): boolean {
     if (!tags || tags['ezil:managed-by'] !== 'app-computer-platform' || tags['ezil:stage'] !== d.namespace
-        || tags['ezil:generation'] !== String(p.generation)) return false;
+        || tags['ezil:generation'] !== String(p.generation) || (tags['ezil:namespace'] !== undefined && tags['ezil:namespace'] !== d.namespace)) return false;
     return ((tags['ezil:computer-id'] === p.computerId && tags['ezil:fence-token'] === p.fenceToken)
         || (tags['ezil:computer'] === p.computerId && tags['ezil:fence'] === p.fenceToken))
         && Object.entries({ 'ezil:computer-id': p.computerId, 'ezil:computer': p.computerId,
@@ -104,6 +117,17 @@ async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: Lif
     return proof ? { terminatedAt: proof.terminatedAt } : { error: 'termination_not_proven' };
 }
 
+async function rewitness(deps: ReceiptDeps, p: Placement, saved: Replay, d: LifecycleDeployment): Promise<boolean> {
+    if (!deps.executions?.history || !saved.sourceJobId) return false;
+    const arn = lifecycleExecutionArn(d, saved.sourceJobId);
+    const source = await deps.executions.describe(p.region!, arn);
+    const work = executionWork(source);
+    if (!work || work.intent.jobId !== saved.sourceJobId || !sameIdentity(p, work)) return false;
+    const proof = proveFailedReleaseTermination(source, await deps.executions.history(p.region!, arn), work);
+    return !!proof && proof.terminatedAt.toISOString() === saved.stoppedAt
+        && source.startDate?.toISOString() === saved.sourceStartedAt && source.stopDate?.toISOString() === saved.sourceStoppedAt;
+}
+
 /** Recover only positively identified, stopped resources of a terminally failed stop.
  * The replay document is written WITH the new job CAS, before StartExecution. It
  * contains no boot secret and survives process loss, deployment changes and retries.
@@ -130,7 +154,7 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
     let planned: LifecycleWork | null = null;
     if (saved?.intent) {
         try { planned = buildLifecycleWork(saved.intent); } catch { return fail('replay_invalid'); }
-        if (planned.intent.operation !== 'release' || !matches(p, planned)
+        if (planned.intent.operation !== 'release' || !matches(p, planned) || !savedTerminationValid(saved, now())
             || (saved.basis !== 'recovery_success' && !Number.isFinite(Date.parse(saved.stoppedAt ?? '')))) return fail('replay_identity');
     }
     let e: Execution;
@@ -168,6 +192,15 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
         // Legacy replay timestamps came from the FAILED execution and are not stop proof.
         const basis = provenBasis(saved!.basis) ? saved!.basis! : 'recovery_success';
         const stoppedAt = basis === 'recovery_success' ? e.stopDate : new Date(saved!.stoppedAt!);
+        if (basis === 'failed_release_termination') {
+            // The witnessed termination preceded this recovery's own replay, and is re-proven from the ORIGINAL failed release
+            // (exact job, interval and witnessed time): a stale or altered saved context never bills.
+            if (!(e.startDate instanceof Date && stoppedAt!.getTime() <= e.startDate.getTime())) return fail('replay_identity');
+            let rewitnessed;
+            try { rewitnessed = await rewitness(deps, p, saved!, work.intent.deployment); }
+            catch { return fail('describe_unavailable', 'RECOVERING'); }
+            if (!rewitnessed) return fail('replay_identity');
+        }
         if (basis === 'recovery_success' && !boundedTime(stoppedAt, e.startDate, now())) {
             return fail('recovery_success_time_missing_or_invalid', 'RECOVERING');
         }
@@ -224,6 +257,7 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
     const context: Replay = { intent: next.intent, sourceStartedAt,
         basis: terminatedAt ? 'failed_release_termination' : saved?.basis === 'ec2_state_transition' || proven ? 'ec2_state_transition' : 'recovery_success',
         stoppedAt: terminatedAt ? terminatedAt.toISOString() : saved?.basis === 'ec2_state_transition' ? saved.stoppedAt : proven ? evidence.stoppedAt!.toISOString() : null,
+        ...(terminatedAt ? { sourceStoppedAt: e.stopDate!.toISOString() } : {}),
         sourceJobId: saved?.sourceJobId ?? p.lifecycleJobId, error: null };
     const reserved = await writeLivePoolRecovery(deps.db, p, 'RECOVERING', {
         lifecycleJobId: next.intent.jobId, lifecycleDigest: next.digest, lastError: PREFIX + JSON.stringify(context),
