@@ -55,11 +55,12 @@ export function fixtureSharedLowerSuccessor() {
     return { ...f, deployment, target, entry: { ...deployment, releases: [...f.releases, target] } };
 }
 
-/** Offline 1.0.13 → 1.0.15 capacity fixture; pins are synthetic, not live evidence. */
-export function fixtureReleaseRegistry10() {
+/** Offline capacity fixture: 1.0.16 is the tenth record, corrective 1.0.17 the eleventh, the next train the twelfth.
+ * Pins are synthetic, not live evidence. */
+export function fixtureReleaseRegistry12() {
     const f = fixtureReleaseRegistry106();
     const retained = [...f.releases];
-    for (const n of [7, 8, 9, 10, 11, 13, 15]) retained.push({ ...f.release106,
+    for (const n of [7, 8, 9, 10, 11, 13, 16, 17, 18]) retained.push({ ...f.release106,
         amiId: `ami-${n.toString(16).padStart(17, '0')}`, recipeVersion: `1.0.${n}`,
         launchTemplateVersion: String(n),
         stateMachineVersionArn: f.release106.stateMachineVersionArn.replace(/:[0-9]+$/, `:${n + 10}`),
@@ -67,9 +68,10 @@ export function fixtureReleaseRegistry10() {
         recoveryStateMachineVersionArn: f.release106.recoveryStateMachineVersionArn.replace(/:[0-9]+$/, `:${n}`),
         createdAt: `2026-10-23T${String(n).padStart(2, '0')}:00:00.000Z`,
     });
-    const release113 = retained[8]!, release115 = retained[9]!;
+    const release116 = retained[9]!, release117 = retained[10]!, release118 = retained[11]!;
     const deploymentFor = (r: RebaseSourceRelease): LifecycleDeployment => ({ ...f.deployment106,
         amiId: r.amiId, launchTemplateVersion: r.launchTemplateVersion, stateMachineVersionArn: r.stateMachineVersionArn,
         preparationStateMachineVersionArn: r.preparationStateMachineVersionArn!, recoveryStateMachineVersionArn: r.recoveryStateMachineVersionArn! });
-    return { ...f, retained, release113, release115, deployment113: deploymentFor(release113), deployment115: deploymentFor(release115) };
+    return { ...f, retained, release116, release117, release118,
+        deployment116: deploymentFor(release116), deployment117: deploymentFor(release117), deployment118: deploymentFor(release118) };
 }

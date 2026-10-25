@@ -87,15 +87,16 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(again,back)
 
     def test_registry_full_refuses_without_dropping_any_record(self):
-        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,29)]]
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,31)]]
+        self.assertEqual(len(records),12)
         for record in records: manifest.validate(record, source=True, repository=TOOL.REPOSITORY)
         original=copy.deepcopy(records)
         envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:dict(self.source,releases=records)}})}
         with self.assertRaisesRegex(ValueError,'registry full'): TOOL.edit_release_secret(envelope,self.old,self.new,[self.target])
         self.assertEqual(records,original)
 
-    def test_nine_to_ten_and_rollback_preserve_all_records(self):
-        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,28)]
+    def test_eleven_to_twelve_and_rollback_preserve_all_records(self):
+        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,30)]
         records=[self.source,*extra]
         for encoded in (True,False):
             d={TOOL.REGION:dict(self.source,releases=records),'other':{'keep':True}}
@@ -104,7 +105,7 @@ class RegistryTests(unittest.TestCase):
             forward=TOOL.edit_release_secret(envelope,self.old,self.new,[self.source,self.target])
             back=TOOL.edit_release_secret({'SecretString':json.dumps(forward)},self.new,self.old,[self.source])
             restored=json.loads(back[TOOL.KEY]) if encoded else back[TOOL.KEY]
-            self.assertEqual(len(restored[TOOL.REGION]['releases']),10)
+            self.assertEqual(len(restored[TOOL.REGION]['releases']),12)
             self.assertEqual(restored[TOOL.REGION]['releases'],[*records,self.target])
             self.assertEqual({k:restored[TOOL.REGION][k] for k in self.old},self.old)
             self.assertEqual(restored['other'],d['other'])
@@ -112,10 +113,10 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(isinstance(back[TOOL.KEY],str),encoded)
             self.assertEqual(envelope,frozen)
             self.assertEqual(TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[self.source]),back)
-            eleventh=dict(self.target,amiId='ami-'+'f'*17)
+            thirteenth=dict(self.target,amiId='ami-'+'f'*17)
             with self.assertRaisesRegex(ValueError,'registry full'):
-                TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.new,[eleventh])
-            oversized=dict(restored[TOOL.REGION],releases=[*records,self.target,eleventh])
+                TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.new,[thirteenth])
+            oversized=dict(restored[TOOL.REGION],releases=[*records,self.target,thirteenth])
             with self.assertRaisesRegex(ValueError,'invalid release registry'):
                 TOOL.edit_release_secret({'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:oversized}})},self.old,self.new,[])
 
@@ -124,8 +125,8 @@ class RegistryTests(unittest.TestCase):
         root=HERE.parents[3]
         for name in ('aws-intent.ts','aws-rebase-release.ts'):
             source=(root/'app/src/server/lib/compute'/name).read_text()
-            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['10'])
-        for name, expected in (('json-tool.py',[10,10]),('registry_gc.py',[10])):
+            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['12'])
+        for name, expected in (('json-tool.py',[12,12]),('registry_gc.py',[12])):
             tree=ast.parse((HERE.parent/name).read_text())
             caps=[node.comparators[-1].value for node in ast.walk(tree) if isinstance(node,ast.Compare)
                   and isinstance(node.comparators[-1],ast.Constant)
@@ -133,14 +134,15 @@ class RegistryTests(unittest.TestCase):
                   and any(ast.unparse(value) in ('len(retained)','len(records)') for value in [node.left,*node.comparators])]
             self.assertEqual(caps,expected)
         # JSON manifests describe ONE record, including nullable legacy sources.
-        records=[dict(self.target,amiId='ami-'+format(n,'017x')) for n in range(10)]
+        records=[dict(self.target,amiId='ami-'+format(n,'017x')) for n in range(12)]
         records[0]=dict(self.source,preparationStateMachineVersionArn=None,recoveryStateMachineVersionArn=None)
         for record in records:
             self.assertEqual(manifest.validate(record,source=True,repository=TOOL.REPOSITORY),record)
         self.assertEqual(manifest.validate(records[-1],target=True,repository=TOOL.REPOSITORY),records[-1])
 
-    def test_ten_record_registry_rejects_invalid_retained_evidence(self):
-        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x')) for n in range(20,28)],self.target]
+    def test_twelve_record_registry_rejects_invalid_retained_evidence(self):
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x')) for n in range(20,30)],self.target]
+        self.assertEqual(len(records),12)
         for kind in ('duplicate','foreign','malformed','mutable workflow','rewrite'):
             invalid=copy.deepcopy(records)
             incoming=[]
@@ -1403,9 +1405,9 @@ class IntegrationTests(unittest.TestCase):
                                  self.ledger, lambda: None, path=self.path, plan=plan, fd=fd)
         return commit, after
 
-    def test_ten_record_rollback_retains_invoking_compatible_app(self):
+    def test_twelve_record_rollback_retains_invoking_compatible_app(self):
         outer=manifest.loads(self.envelope['SecretString']);d=outer[TOOL.KEY][TOOL.REGION]
-        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,28)]
+        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,30)]
         d['releases'].extend(extra)
         self.envelope['SecretString']=json.dumps(outer)
         stage1.seed_ledger(self.ledger,self.envelope)
@@ -1415,9 +1417,9 @@ class IntegrationTests(unittest.TestCase):
         self.through_app();RELEASE.promote(self.manifest,True)
         target=manifest.read(self.manifest)
         self.assertNotEqual(target['agentCommit'],self.source['agentCommit'])
-        self.assertEqual(len(self.running_deployment['releases']),10)
+        self.assertEqual(len(self.running_deployment['releases']),12)
         RELEASE.promote(self.manifest,True,rollback=True)
-        self.assertEqual(len(self.running_deployment['releases']),10)
+        self.assertEqual(len(self.running_deployment['releases']),12)
         self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
         self.assertEqual(self.running_deployment['amiId'],self.source['amiId'])
         self.assertEqual(self.running_sha,target['agentCommit'])

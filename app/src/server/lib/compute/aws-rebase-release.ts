@@ -50,7 +50,7 @@ function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('release_mismatch');
     const { releases, ...rawDeployment } = entry as Record<string, unknown>;
     const deployment = LifecycleDeploymentSchema.parse(rawDeployment);
-    const records = z.array(RebaseSourceReleaseSchema).min(1).max(10).parse(releases);
+    const records = z.array(RebaseSourceReleaseSchema).min(1).max(12).parse(releases);
     if (records.some((r, i) => i > 0 && Date.parse(r.createdAt) < Date.parse(records[i - 1]!.createdAt))) throw new Error('release_mismatch');
     const targetKeys = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn',
         'lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
