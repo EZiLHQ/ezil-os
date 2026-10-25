@@ -42,7 +42,7 @@ describe('billing v2 placement selection', () => {
         expect(placements).toEqual([]);
         // placement, reservation, active capacity-demand and live computer reads; admission happens at ensure
         expect(statements).toHaveLength(4);
-        expect(statements.filter(q => q.sql.includes('/* demand:peek */'))).toHaveLength(1);
+        expect(statements.filter(q => q.sql.includes('/* demand:hold */'))).toHaveLength(1);
     });
 
     it.each([false, true])('(a) paid + no row + created before SINCE stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
@@ -412,4 +412,29 @@ it('confines a fresh paid cutover to Mumbai even when other regions have capacit
     await resolveComputeProvider(createFakePlacementDb().db, computer, { ...ON, AWS_REGIONS: 'us-east-1,ap-south-1' });
     expect(factory.mock.calls.at(-1)?.[0].env?.().AWS_REGIONS).toBe('ap-south-1');
     factory.mockRestore();
+});
+
+// Capacity demand (1.0.18): a first-open computer whose reservation EXPIRED stays on the AWS path, so the owner's
+// public stop reaches the AWS provider and releases the terminal attempt; afterwards routing is ordinary again.
+describe('first-open expired capacity attempt: public stop/retry reachability', () => {
+    const owner = '11111111-1111-4111-8111-111111111111', cid = '22222222-2222-4222-8222-222222222222';
+    const row = (state: string, closedMs: number | null) => ({ id: `00000000-0000-4000-8000-00000000000${state === 'expired' ? 1 : 2}`,
+        request_id: '33333333-3333-4333-8333-333333333333', owner_user_id: owner, computer_id: cid, kind: 'create', region: 'ap-south-1',
+        zone_id: 'aps1-az1', instance_type: 'm6i.large', vcpu: 2, deployment_digest: 'a'.repeat(64), source_generation: null, source_lease_epoch: null,
+        state, revision: 2, cleanup: [], created_at: new Date('2026-10-13T11:50:00Z'), expires_at: new Date('2026-10-13T11:55:00Z'),
+        closed_at: closedMs === null ? null : new Date(closedMs) });
+    const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_COMPUTE_PLACEMENT_READS: '1' };
+    it('routes AWS while the expired attempt is unreleased (never a Cloudflare pin), then ordinary after the stop marker', async () => {
+        const held = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }], demands: [row('expired', Date.parse('2026-10-13T11:55:01Z'))] });
+        expect((await resolveComputeProvider(held.db, { computerId: cid, userId: owner }, env, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(held.placements).toEqual([]);
+        const released = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }],
+            demands: [row('expired', Date.parse('2026-10-13T11:55:01Z')), row('cancelled', Date.parse('2026-10-13T11:58:00Z'))] });
+        expect(await resolveComputeProvider(released.db, { computerId: cid, userId: owner }, env)).toBe(cloudflareComputeProvider);
+    });
+    it('another user never inherits the hold', async () => {
+        const other = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }], demands: [row('expired', Date.parse('2026-10-13T11:55:01Z'))] });
+        await expect(resolveComputeProvider(other.db, { computerId: cid, userId: '44444444-4444-4444-8444-444444444444' }, env)).resolves.toBeDefined();
+        expect(other.statements.some(q => q.sql.includes('/* demand:hold */') && q.params.includes('44444444-4444-4444-8444-444444444444'))).toBe(true);
+    });
 });

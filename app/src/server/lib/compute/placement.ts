@@ -830,9 +830,8 @@ export async function pinCloudflarePlacement(db: PlacementDb, computer: { comput
         if (existing.record) return existing;
         // Under the computer lock (demand writers hold it too): an active AWS demand is never re-pinned to Cloudflare.
         if (options.honorDemand) {
-            const { readActiveDemandForComputer } = await import('./capacity-demand');
-            const demand = await readActiveDemandForComputer(tx, computer.computerId);
-            if (demand && demand.ownerUserId === canonicalId(computer.userId)) return { provider: 'aws-ec2', store: 'ebs', record: null };
+            const { hasDemandHoldForRouting } = await import('./capacity-demand');
+            if (await hasDemandHoldForRouting(tx, computer.computerId, canonicalId(computer.userId))) return { provider: 'aws-ec2', store: 'ebs', record: null };
         }
         const { createProviderMigrationStore } = await import('./provider-migrate-store');
         const m = await createProviderMigrationStore(tx).readByComputer(computer.computerId);

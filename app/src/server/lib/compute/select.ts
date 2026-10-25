@@ -115,9 +115,8 @@ export async function resolveComputeProvider(
         // eligibility or gates changed since it was reserved, AWS disabled included (never a Cloudflare pin
         // meanwhile). Environments with no AWS deployment configured have no demand table to read.
         if (awsDemandCapable(env)) {
-            const { readActiveDemandForComputer } = await import('./capacity-demand');
-            const demand = await readActiveDemandForComputer(db, computer.computerId);
-            if (demand && demand.ownerUserId === computer.userId.toLowerCase()) return freshAwsProvider();
+            const { hasDemandHoldForRouting } = await import('./capacity-demand');
+            if (await hasDemandHoldForRouting(db, computer.computerId, computer.userId.toLowerCase())) return freshAwsProvider();
         }
         const { createProviderMigrationStore } = await import('./provider-migrate-store');
         const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId);

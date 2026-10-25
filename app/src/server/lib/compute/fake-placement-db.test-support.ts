@@ -180,6 +180,13 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             const close = (d: Row, state: string) => { const before = { ...d }; Object.assign(d, { state, closed_at: clock(), revision: Number(d.revision) + 1 });
                 tx?.undo.push(() => Object.assign(d, before)); return d; };
             switch (demandTag) {
+                case 'hold': {
+                    const [computerId, owner] = params as unknown[];
+                    const mine = demands.filter(d => uuidEq(d.computer_id, computerId) && uuidEq(d.owner_user_id, owner));
+                    const released = (d: Row) => demands.some(c => uuidEq(c.computer_id, d.computer_id) && c.state === 'cancelled'
+                        && new Date(c.closed_at as string).getTime() >= new Date(d.closed_at as string).getTime());
+                    return { rows: mine.filter(d => (active(d) && new Date(d.expires_at as string).getTime() > now) || (d.state === 'expired' && !released(d))).slice(0, 1) };
+                }
                 case 'peek': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d) && new Date(d.expires_at as string).getTime() > now).slice(0, 2) };
                 case 'computer': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d)) };
                 case 'region': return { rows: demands.filter(d => d.region === params[0] && active(d)) };

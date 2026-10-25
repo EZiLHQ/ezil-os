@@ -1301,3 +1301,21 @@ describe('fresh replacement launch status', () => {
         expect(await another.status(ctx, me)).not.toHaveProperty('computeLaunching');
     });
 });
+
+// Capacity demand (1.0.18): the public stop is the explicit release of a terminal expired first-open attempt.
+describe('stop releases a terminal expired capacity attempt (no placement yet)', () => {
+    const expired = { id: '00000000-0000-4000-8000-000000000001', request_id: '33333333-3333-4333-8333-333333333333', owner_user_id: U1, computer_id: C1,
+        kind: 'create', region: 'ap-south-1', zone_id: 'aps1-az1', instance_type: 'm6i.large', vcpu: 2, deployment_digest: 'a'.repeat(64),
+        source_generation: null, source_lease_epoch: null, state: 'expired', revision: 2, cleanup: [],
+        created_at: new Date(NOW.getTime() - 600_000), expires_at: new Date(NOW.getTime() - 300_000), closed_at: new Date(NOW.getTime() - 299_000) };
+    it('answers already_stopped and records the cancellation marker exactly once; another user cannot release it', async () => {
+        const s = setup({ demands: [expired] }, { dbClock: () => NOW });
+        expect(await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toEqual({ ok: true, terminated: false, outcome: 'already_stopped' });
+        expect(s.demands.map(d => d.state)).toEqual(['expired', 'cancelled']);
+        expect(await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ outcome: 'aws_placement_missing' }); // nothing left to release
+        expect(s.demands).toHaveLength(2);
+        const other = setup({ demands: [expired] }, { dbClock: () => NOW });
+        await other.provider.stop(ctx, { userId: '99999999-9999-4999-8999-999999999999', computerId: C1 }, 'user').catch(() => null);
+        expect(other.demands.map(d => d.state)).toEqual(['expired']);
+    });
+});
