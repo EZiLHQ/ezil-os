@@ -10,7 +10,7 @@ import * as awsFactories from './aws-ec2';
 import { AwsProviderNotImplementedError, createAwsEc2StubProvider } from './aws-ec2';
 import { cloudflareComputeProvider } from './cloudflare';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { PlacementIntegrityError, PlacementOwnerError } from './placement';
+import { PlacementIntegrityError, PlacementOwnerError, pinCloudflarePlacement } from './placement';
 import { providerForPlacement, resolveComputeProvider, selectComputeProvider } from './select';
 import type { EntitlementRecord } from './tier';
 
@@ -424,13 +424,41 @@ describe('first-open expired capacity attempt: public stop/retry reachability', 
         state, revision: 2, cleanup: [], created_at: new Date('2026-10-13T11:50:00Z'), expires_at: new Date('2026-10-13T11:55:00Z'),
         closed_at: closedMs === null ? null : new Date(closedMs) });
     const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_COMPUTE_PLACEMENT_READS: '1' };
-    it('routes AWS while the expired attempt is unreleased (never a Cloudflare pin), then ordinary after the stop marker', async () => {
+    it('routes AWS while the expired attempt is unreleased (never a Cloudflare pin), and STAYS AWS after the stop/Retry marker', async () => {
         const held = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }], demands: [row('expired', Date.parse('2026-10-13T11:55:01Z'))] });
         expect((await resolveComputeProvider(held.db, { computerId: cid, userId: owner }, env, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
         expect(held.placements).toEqual([]);
+        // RETRY-118 routing decision: historical demand is durable AWS intent (sticky), never a Cloudflare fallback.
         const released = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }],
             demands: [row('expired', Date.parse('2026-10-13T11:55:01Z')), row('cancelled', Date.parse('2026-10-13T11:58:00Z'))] });
-        expect(await resolveComputeProvider(released.db, { computerId: cid, userId: owner }, env)).toBe(cloudflareComputeProvider);
+        expect((await resolveComputeProvider(released.db, { computerId: cid, userId: owner }, env, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(released.placements).toEqual([]);
+    });
+    // Root RETRY-118 backend P2: reset -> AWS disabled -> reopen must never pin Cloudflare. As reproduced: AWS off while
+    // the deployment configuration (hence the demand table) and placement reads remain.
+    const disabled = { EZIL_AWS_COMPUTERS_ENABLED: '0', EZIL_COMPUTE_PLACEMENT_READS: '1',
+        EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ 'ap-south-1': { region: 'ap-south-1' } }) };
+    it.each([
+        ['reset marker after the expired attempt', [row('expired', Date.parse('2026-10-13T11:55:01Z')), row('cancelled', Date.parse('2026-10-13T11:58:00Z'))]],
+        ['a consumed demand only (downgrade after a placement was later removed)', [{ ...row('expired', Date.parse('2026-10-13T11:55:01Z')), state: 'consumed' }]],
+        ['a cancelled demand only', [row('cancelled', Date.parse('2026-10-13T11:58:00Z'))]],
+    ])('AWS disabled with %s: the selector stays AWS and inserts no Cloudflare placement', async (_label, demands) => {
+        const f = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }], demands });
+        expect((await resolveComputeProvider(f.db, { computerId: cid, userId: owner }, disabled, {}, { pinCloudflare: true })).kind).toBe('aws-ec2');
+        expect(f.placements).toEqual([]);
+    });
+    it('the transactional Cloudflare-pin guard itself honors historical demand (no insert), whatever the selector did', async () => {
+        const f = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }],
+            demands: [row('expired', Date.parse('2026-10-13T11:55:01Z')), row('cancelled', Date.parse('2026-10-13T11:58:00Z'))] });
+        expect(await pinCloudflarePlacement(f.db, { computerId: cid, userId: owner }, { honorDemand: true }))
+            .toEqual({ provider: 'aws-ec2', store: 'ebs', record: null });
+        expect(f.placements).toEqual([]);
+    });
+    it('another owner\'s historical demand never holds this computer for a different user', async () => {
+        const stranger = '44444444-4444-4444-8444-444444444444';
+        const f = createFakePlacementDb({ computers: [{ id: cid, user_id: stranger }],
+            demands: [row('expired', Date.parse('2026-10-13T11:55:01Z')), row('cancelled', Date.parse('2026-10-13T11:58:00Z'))] });
+        expect(await resolveComputeProvider(f.db, { computerId: cid, userId: stranger }, disabled)).toBe(cloudflareComputeProvider);
     });
     it('another user never inherits the hold', async () => {
         const other = createFakePlacementDb({ computers: [{ id: cid, user_id: owner }], demands: [row('expired', Date.parse('2026-10-13T11:55:01Z'))] });

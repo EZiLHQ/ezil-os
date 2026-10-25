@@ -182,10 +182,8 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             switch (demandTag) {
                 case 'hold': {
                     const [computerId, owner] = params as unknown[];
-                    const mine = demands.filter(d => uuidEq(d.computer_id, computerId) && uuidEq(d.owner_user_id, owner));
-                    const released = (d: Row) => demands.some(c => uuidEq(c.computer_id, d.computer_id) && c.state === 'cancelled'
-                        && new Date(c.closed_at as string).getTime() >= new Date(d.closed_at as string).getTime());
-                    return { rows: mine.filter(d => active(d) || (d.state === 'expired' && !released(d))).slice(0, 1) };
+                    // RETRY-118 routing decision: any demand of this exact owner/computer, in any state, is AWS intent.
+                    return { rows: demands.filter(d => uuidEq(d.computer_id, computerId) && uuidEq(d.owner_user_id, owner)).slice(0, 1) };
                 }
                 case 'peek': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d) && new Date(d.expires_at as string).getTime() > now).slice(0, 2) };
                 case 'computer': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d)) };

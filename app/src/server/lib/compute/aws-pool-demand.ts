@@ -15,7 +15,7 @@ import { createPoolDispatchStore } from './aws-pool-dispatch';
 import { poolWork, type PoolDispatchStore } from './aws-pool-replenish';
 import { startLifecycleJob } from './aws-receipts';
 import { cancelExpiredAttempt, closeDemand, closeExpiredDemands, demandDeploymentDigest, insertDemand, lockComputerDemand, lockRegionDemands,
-    resetExpiredAttempt, terminalExpiredAttempt, type CleanupTarget, type ExpiredAttemptReset } from './capacity-demand';
+    resetExpiredAttempt, terminalExpiredAttempt, type CleanupTarget, type ExpiredAttemptReset, type ResetPlacementView } from './capacity-demand';
 import { decideAdmission } from './admission';
 import { readAwsAdmissionConfig } from './aws-config';
 import { createProviderMigrationStore } from './provider-migrate-store';
@@ -147,14 +147,27 @@ export async function cancelComputerDemand(db: PlacementDb, computerId: string, 
     });
 }
 
-/** The owner's explicit Retry of one expired attempt (RETRY-118), in the lock order admission -> computer -> demand. */
+/** The owner's explicit Retry of one expired attempt (RETRY-118), in the lock order admission -> computer -> demand.
+ * Everything is read under those locks: the computer's current owner and deletion, image reservations, a non-terminal
+ * provider migration and the placement (typed for resetExpiredAttempt). Unreadable state refuses (blocked). */
 export async function resetCapacityAttempt(db: PlacementDb, key: { computerId: string; ownerUserId: string; attemptId: string }): Promise<ExpiredAttemptReset> {
+    const owner = key.ownerUserId.toLowerCase();
     return withAdmission(db, async (tx, lock) => {
         await lockComputerUnderAdmission(tx, lock, key.computerId);
-        // An image reservation makes readPlacement fail closed: treat it like a placement (touch nothing).
-        const hasPlacement = await readPlacement(tx, key.computerId).then(r => r.record !== null, () => true);
-        return resetExpiredAttempt(tx, lock, { computerId: key.computerId, ownerUserId: key.ownerUserId.toLowerCase(),
-            attemptId: key.attemptId.toLowerCase(), hasPlacement });
+        const computer = await readCanaryComputer(tx, key.computerId);
+        if (!computer || computer.deleted || computer.userId !== owner) return 'not_found';
+        const placement = await (async (): Promise<ResetPlacementView> => {
+            try {
+                await assertNoImageReservation(tx, key.computerId);
+                const migration = await createProviderMigrationStore(tx).readByComputer(key.computerId);
+                if (migration && !['committed', 'failed_reopened', 'failed_needs_operator'].includes(migration.state)) return { kind: 'blocked' };
+                const record = (await readPlacement(tx, key.computerId)).record;
+                return record === null ? { kind: 'absent' } : { kind: 'present', placement: record };
+            } catch {
+                return { kind: 'blocked' };
+            }
+        })();
+        return resetExpiredAttempt(tx, lock, { computerId: key.computerId, ownerUserId: owner, attemptId: key.attemptId.toLowerCase(), placement });
     });
 }
 

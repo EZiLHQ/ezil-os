@@ -11,7 +11,7 @@
 import { createHash } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { assertHeldAdmissionLock, type AdmissionLock, type PlacementExecutor } from './placement';
+import { assertHeldAdmissionLock, type AdmissionLock, type Placement, type PlacementExecutor } from './placement';
 
 export const DEMAND_TTL_SECONDS = 300;
 /** The complete validated deployment a demand is bound to (sorted-key canonical JSON, storage normalized exactly as
@@ -116,18 +116,41 @@ export async function terminalExpiredAttempt(tx: PlacementExecutor, lock: Admiss
 
 export type ExpiredAttemptReset = 'reset' | 'already_reset' | 'superseded' | 'not_found';
 
+/** The computer's placement as the caller read it UNDER the admission and computer locks, or `blocked` when an image
+ * reservation, a non-terminal provider migration or unreadable/conflicting state forbids any reset. */
+export type ResetPlacementView = { kind: 'absent' } | { kind: 'present'; placement: Placement } | { kind: 'blocked' };
+
+/** A create attempt resets only with no placement; a wake attempt only against its exact, settled STOPPED source. */
+function placementAllowsReset(view: ResetPlacementView, owner: string, d: {
+    kind: unknown; region: unknown; zoneId: unknown; sourceGeneration: unknown; sourceLeaseEpoch: unknown }): boolean {
+    if (view.kind === 'blocked') return false;
+    if (d.kind === 'create') return d.sourceGeneration === null && d.sourceLeaseEpoch === null && view.kind === 'absent';
+    if (d.kind !== 'wake' || view.kind !== 'present' || d.sourceGeneration === null || d.sourceLeaseEpoch === null) return false;
+    const p = view.placement;
+    // The source a wake attempt named: owned AWS, STOPPED, same generation/epoch and region/zone, no lifecycle work,
+    // and the identity a wake needs intact. Its type/deployment need not match the attempt's target (resize, a newer
+    // release); the normal reopen reauthorizes all of that.
+    return p.provider === 'aws-ec2' && p.ownerUserId === owner && p.state === 'STOPPED'
+        && p.generation === Number(d.sourceGeneration) && p.leaseEpoch === Number(d.sourceLeaseEpoch)
+        && p.region === d.region && p.zoneId === d.zoneId && p.lifecycleJobId === null && p.lifecycleDigest === null
+        && !!p.instanceId && !!p.volumeId && !!p.instanceType && !!p.region && !!p.fsUuid && !!p.fenceToken;
+}
+
 /**
  * The owner's explicit Retry of ONE expired attempt (RETRY-118). Under the admission and computer locks, it inserts
  * the existing closed 'cancelled' marker only when `attemptId` is this owner's, expired, not yet released, the newest
- * expired attempt of the computer, with no active demand and no placement. It never closes, alters or deletes a row.
+ * expired attempt of the computer, with no active demand, and the placement read under the same locks allows it
+ * (`placementAllowsReset`: none for a create; the exact settled STOPPED source for a wake). It never closes, alters or
+ * deletes a row, and never touches a placement, epoch, volume, usage or pool row.
  * - already_reset: that attempt was already released (a duplicate click), nothing written.
- * - superseded: a placement, an active demand or a newer expired attempt exists: nothing written, the client rereads.
+ * - superseded: the placement does not allow it, or an active demand or a newer expired attempt exists: nothing written.
  * - not_found: unknown id, another computer's, another owner's, or not expired: nothing written.
  */
 export async function resetExpiredAttempt(tx: PlacementExecutor, lock: AdmissionLock, key: {
-    computerId: string; ownerUserId: string; attemptId: string; hasPlacement: boolean }): Promise<ExpiredAttemptReset> {
+    computerId: string; ownerUserId: string; attemptId: string; placement: ResetPlacementView }): Promise<ExpiredAttemptReset> {
     assertHeldAdmissionLock(tx, lock);
-    const target = rowsOf(await tx.execute(sql`/* demand:resetread */ SELECT d.id::text AS id,
+    const target = rowsOf(await tx.execute(sql`/* demand:resetread */ SELECT d.id::text AS id, d.kind, d.region, d.zone_id,
+            d.source_generation, d.source_lease_epoch,
             EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands c WHERE c.computer_id = d.computer_id
                 AND c.state = 'cancelled' AND c.closed_at >= d.closed_at) AS released,
             EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands n WHERE n.computer_id = d.computer_id
@@ -139,7 +162,9 @@ export async function resetExpiredAttempt(tx: PlacementExecutor, lock: Admission
             AND d.owner_user_id = ${key.ownerUserId}::uuid AND d.state = 'expired'`))[0];
     if (!target) return 'not_found';
     if (target.released === true) return 'already_reset';
-    if (key.hasPlacement || target.newer === true || target.active === true) return 'superseded';
+    if (target.newer === true || target.active === true || !placementAllowsReset(key.placement, key.ownerUserId, {
+        kind: target.kind, region: target.region, zoneId: target.zone_id,
+        sourceGeneration: target.source_generation ?? null, sourceLeaseEpoch: target.source_lease_epoch ?? null })) return 'superseded';
     // The same conditions again in the write itself: exactly this row's marker, or nothing.
     const written = rowsOf(await tx.execute(sql`/* demand:reset */ INSERT INTO public.ezil_compute_capacity_demands
         (request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest,
@@ -172,15 +197,14 @@ export async function cancelExpiredAttempt(tx: PlacementExecutor, lock: Admissio
                 AND c.state = 'cancelled' AND c.closed_at >= d.closed_at)
         ORDER BY d.closed_at DESC LIMIT 1 RETURNING id`)).length === 1;
 }
-/** Routing only: this owner's computer holds an unclosed AWS demand (whatever its deadline: a passed but not yet swept demand
- * still holds) or a terminal expired attempt not yet released by a stop. Either keeps the computer on the AWS path, so its open
- * is answered by AWS and its stop can release the attempt. Capacity credit keeps its own live-deadline rule. */
+/** Routing only, never capacity: ANY demand this exact owner ever recorded for this computer, in any state (active,
+ * expired, consumed or cancelled, including a Retry or stop marker), is durable AWS routing intent (root RETRY-118
+ * routing decision). The selector and the transactional Cloudflare-pin guard both honor it, so reset -> AWS disabled ->
+ * reopen can never fall back to a Cloudflare pin; such a computer gets the ordinary AWS refusal instead. Capacity credit
+ * still requires an unexpired, active, fully bound demand (aws-pool-runtime.ts claimDemand). */
 export async function hasDemandHoldForRouting(db: PlacementExecutor, computerId: string, ownerUserId: string): Promise<boolean> {
     return rowsOf(await db.execute(sql`/* demand:hold */ SELECT d.id FROM public.ezil_compute_capacity_demands d
         WHERE d.computer_id = ${computerId}::uuid AND d.owner_user_id = ${ownerUserId}::uuid
-            AND (d.closed_at IS NULL
-                OR (d.state = 'expired' AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands c
-                    WHERE c.computer_id = d.computer_id AND c.state = 'cancelled' AND c.closed_at >= d.closed_at)))
         LIMIT 1`)).length > 0;
 }
 /** Unlocked read for routing/status only: never renews, launches or decides capacity. */

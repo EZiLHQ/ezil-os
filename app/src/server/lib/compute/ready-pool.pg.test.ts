@@ -20,7 +20,7 @@ import { applyLifecycleReceipt, lifecycleExecutionArn, type LifecycleExecutionRe
 import type { Placement, PlacementDb, PlacementExecutor } from './placement';
 import { lockImagePlacement, lockPoolClaimPlacement, pinCloudflarePlacement, readAdmissionCounters, readImageAdmissionCounters, readPlacement, savePoolEnrollmentNonce, withAdmission } from './placement';
 import { cancelComputerDemand, reservePoolDemand, resetCapacityAttempt, type PoolDemandDeps } from './aws-pool-demand';
-import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest, hasDemandHoldForRouting } from './capacity-demand';
+import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest, hasDemandHoldForRouting, lockComputerDemandLive } from './capacity-demand';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { createPoolDeps } from './aws-pool-runtime';
 import * as poolData from './ready-pool';
@@ -1066,7 +1066,145 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             await db.execute(sql`DELETE FROM public.ezil_computer_placements WHERE computer_id = ${uuid(432)}::uuid`); // fixture only
             expect(await cancelComputerDemand(db, uuid(432), uuid(432))).toBe(true);
             expect(await states()).toEqual(['cancelled', 'expired']);
-            expect(await hold()).toBe(false);
+            // RETRY-118 routing decision: the released attempt still records AWS intent for this owner (sticky).
+            expect(await hold()).toBe(true);
+            expect(await hold(999)).toBe(false);
+        });
+        describe('RETRY-118 backend (root review): typed wake reset, sticky routing, zero capacity credit', () => {
+            const FS = 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5', FENCE = 'fe0fe0fe-fe0f-4e0f-8e0f-e0fe0fe0fe0f';
+            /** A settled STOPPED AWS source as a completed normal stop leaves it (generation 2, epoch 3). */
+            const stoppedSource = async (n: number) => {
+                await requester(n);
+                await db.execute(sql`INSERT INTO public.ezil_computer_placements
+                    (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type,
+                     instance_id, volume_id, fs_uuid, fence_token, lifecycle_job_id, lifecycle_digest, updated_at)
+                    VALUES (${uuid(n)}::uuid, ${uuid(n)}::uuid, 'aws-ec2', 'ebs', 2, 3, 'STOPPED', ${c.region}, ${c.zoneId}, 'm6i.large',
+                        ${`i-${String(n).padStart(17, '0')}`}, ${`vol-${String(n).padStart(17, '0')}`}, ${FS}::uuid, ${FENCE}::uuid, NULL, NULL,
+                        ${NOW.toISOString()}::timestamptz)`);
+            };
+            /** An expired attempt exactly as the sweep leaves it (valid created < expires <= closed timeline). */
+            const expiredAttempt = async (n: number, kind: 'create' | 'wake', source: [number, number] | null, instanceType = 'm6i.xlarge') =>
+                ((await db.execute(sql`INSERT INTO public.ezil_compute_capacity_demands
+                    (request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest,
+                     source_generation, source_lease_epoch, state, cleanup, created_at, expires_at, closed_at)
+                    VALUES (gen_random_uuid(), ${uuid(n)}::uuid, ${uuid(n)}::uuid, ${kind}, ${c.region}, ${c.zoneId}, ${instanceType}, 4,
+                        ${demandDeploymentDigest(deployment)}, ${source?.[0] ?? null}::integer, ${source?.[1] ?? null}::integer, 'expired', '[]'::jsonb,
+                        now() - interval '3 seconds', now() - interval '2 seconds', now() - interval '1 second') RETURNING id::text AS id`)) as Record<string, unknown>[])[0]!.id as string;
+            const placementRowOf = async (n: number) => ((await db.execute(sql`SELECT * FROM public.ezil_computer_placements WHERE computer_id = ${uuid(n)}::uuid`)) as Record<string, unknown>[]);
+            const demandRowsOf = async (n: number) => (await demands()).filter(d => d.computer_id === uuid(n));
+            const poolRows = async () => (await db.execute(sql`SELECT * FROM public.ezil_compute_pool_hosts ORDER BY id`)) as Record<string, unknown>[];
+
+            it('wake: only the exact settled STOPPED source resets (a resized target is fine); every mismatch writes nothing', async () => {
+                await runB(); await host(342, xl, 'ready'); await stoppedSource(450);
+                const attemptId = await expiredAttempt(450, 'wake', [2, 3]); // target m6i.xlarge over an m6i.large source: a resize
+                const reset = () => resetCapacityAttempt(db, { computerId: uuid(450), ownerUserId: uuid(450), attemptId });
+                const placementBefore = await placementRowOf(450), demandsBefore = await demandRowsOf(450), countsBefore = await counts();
+                const poolBefore = await poolRows(), capacityBefore = await readPoolDemand(db, c, NOW);
+                const mismatch = async (label: string, change: SQL, restore: SQL, expected: string = 'superseded') => {
+                    await db.execute(change);
+                    expect(await reset(), label).toBe(expected);
+                    await db.execute(restore);
+                    expect(await demandRowsOf(450), label).toEqual(demandsBefore);
+                };
+                const P = (set: SQL) => sql`UPDATE public.ezil_computer_placements SET ${set} WHERE computer_id = ${uuid(450)}::uuid`;
+                await db.execute(sql`INSERT INTO auth.users (id) VALUES (${uuid(451)}::uuid) ON CONFLICT DO NOTHING`);
+                await mismatch('placement owner', P(sql`owner_user_id = ${uuid(451)}::uuid`), P(sql`owner_user_id = ${uuid(450)}::uuid`));
+                await mismatch('generation', P(sql`generation = 5`), P(sql`generation = 2`));
+                await mismatch('lease epoch', P(sql`lease_epoch = 9`), P(sql`lease_epoch = 3`));
+                await mismatch('region', P(sql`region = 'us-east-1'`), P(sql`region = ${c.region}`));
+                await mismatch('zone', P(sql`zone_id = 'aps1-az3'`), P(sql`zone_id = ${c.zoneId}`));
+                await mismatch('lifecycle job', P(sql`lifecycle_job_id = ${randomUUID()}::uuid`), P(sql`lifecycle_job_id = NULL`));
+                await mismatch('lifecycle digest', P(sql`lifecycle_digest = ${'d'.repeat(64)}`), P(sql`lifecycle_digest = NULL`));
+                await mismatch('not STOPPED', P(sql`state = 'RUNNING'`), P(sql`state = 'STOPPED'`));
+                await mismatch('identity missing (fs uuid)', P(sql`fs_uuid = NULL`), P(sql`fs_uuid = ${FS}::uuid`));
+                await mismatch('identity missing (volume)', P(sql`volume_id = NULL`), P(sql`volume_id = ${`vol-${String(450).padStart(17, '0')}`}`));
+                await mismatch('image reservation', P(sql`image_upgrade_job_id = ${randomUUID()}::uuid`), P(sql`image_upgrade_job_id = NULL`));
+                await mismatch('provider migration in flight', sql`INSERT INTO public.ezil_compute_migrations (user_id, computer_id, from_provider, to_provider, to_size, state)
+                    VALUES (${uuid(450)}::uuid, ${uuid(450)}::uuid, 'cloudflare', 'aws-ec2', 'standard', 'fenced')`,
+                    sql`DELETE FROM public.ezil_compute_migrations WHERE computer_id = ${uuid(450)}::uuid`);
+                await mismatch('computer deleted', sql`UPDATE public.ezil_computers SET deleted_at = now() WHERE id = ${uuid(450)}::uuid`,
+                    sql`UPDATE public.ezil_computers SET deleted_at = NULL WHERE id = ${uuid(450)}::uuid`, 'not_found');
+                await mismatch('computer re-owned', sql`UPDATE public.ezil_computers SET user_id = ${uuid(451)}::uuid WHERE id = ${uuid(450)}::uuid`,
+                    sql`UPDATE public.ezil_computers SET user_id = ${uuid(450)}::uuid WHERE id = ${uuid(450)}::uuid`, 'not_found');
+                expect(await placementRowOf(450)).toEqual(placementBefore);
+                // The valid STOPPED source: reset writes exactly the marker and nothing else.
+                expect(await reset()).toBe('reset');
+                expect(await placementRowOf(450)).toEqual(placementBefore);
+                expect(await counts()).toEqual(countsBefore);
+                expect(await poolRows()).toEqual(poolBefore);
+                expect((await demandRowsOf(450)).map(d => d.state).sort()).toEqual(['cancelled', 'expired']);
+                // Zero capacity credit: no active demand, and the regional demand/liability view is unchanged.
+                expect(await readPoolDemand(db, c, NOW)).toEqual(capacityBefore);
+                expect(await reset()).toBe('already_reset');
+            });
+
+            it('a computer that changed hands: the new owner can never reset the previous owner\'s attempt (demand owner check)', async () => {
+                await requester(459); await requester(460);
+                const previous = await expiredAttempt(459, 'create', null); // recorded while 459 owned the computer
+                await db.execute(sql`UPDATE public.ezil_computers SET user_id = ${uuid(460)}::uuid WHERE id = ${uuid(459)}::uuid`);
+                const before = await demandRowsOf(459);
+                expect(await resetCapacityAttempt(db, { computerId: uuid(459), ownerUserId: uuid(460), attemptId: previous })).toBe('not_found');
+                expect(await demandRowsOf(459)).toEqual(before);
+            });
+
+            it('create attempt with any placement present is superseded; a wake attempt with no placement is superseded', async () => {
+                await stoppedSource(452);
+                const create = await expiredAttempt(452, 'create', null);
+                expect(await resetCapacityAttempt(db, { computerId: uuid(452), ownerUserId: uuid(452), attemptId: create })).toBe('superseded');
+                await requester(453);
+                const wake = await expiredAttempt(453, 'wake', [2, 3]);
+                expect(await resetCapacityAttempt(db, { computerId: uuid(453), ownerUserId: uuid(453), attemptId: wake })).toBe('superseded');
+                expect((await demands()).filter(d => d.state === 'cancelled')).toEqual([]);
+            });
+
+            it('concurrency: admission and reset serialize under the locks; whichever wins, exactly one marker and a consistent outcome', async () => {
+                const { deps } = runtime();
+                await runB(); await host(343, xl, 'ready'); await requester(454);
+                expect(await reservePoolDemand(deps, want(454))).toBe('waiting');
+                await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second', created_at = now() - interval '2 seconds'
+                    WHERE computer_id = ${uuid(454)}::uuid`);
+                await markPoolHost(db, uuid(343), ['retiring'], 'retired', NOW); await host(344, xl, 'ready');
+                const first = await reservePoolDemand(deps, want(454)); // closes it as expired (terminal)
+                expect(first).toMatchObject({ outcome: 'expired' });
+                const attemptId = (first as { attemptId: string }).attemptId;
+                const [reset, reopen] = await Promise.all([
+                    resetCapacityAttempt(db, { computerId: uuid(454), ownerUserId: uuid(454), attemptId }),
+                    reservePoolDemand(deps, want(454)),
+                ]);
+                expect(reset).toBe('reset');
+                // Reset first → the reopen reserves a fresh attempt; admission first → it was still terminal.
+                expect(reopen === 'waiting' || (typeof reopen === 'object' && reopen.attemptId === attemptId)).toBe(true);
+                expect((await demandRowsOf(454)).filter(d => d.state === 'cancelled')).toHaveLength(1);
+                // Admission-first for a create: a placement that commits before the reset makes it superseded.
+                await requester(455);
+                const created = await expiredAttempt(455, 'create', null);
+                await db.execute(sql`INSERT INTO public.ezil_computer_placements
+                    (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type, instance_id, updated_at)
+                    VALUES (${uuid(455)}::uuid, ${uuid(455)}::uuid, 'aws-ec2', 'ebs', 1, 1, 'UNCONFIRMED', ${c.region}, ${c.zoneId}, 'm6i.large', NULL, ${NOW.toISOString()}::timestamptz)`);
+                expect(await resetCapacityAttempt(db, { computerId: uuid(455), ownerUserId: uuid(455), attemptId: created })).toBe('superseded');
+            });
+
+            it('routing: reset -> AWS disabled -> reopen never pins Cloudflare (selector and transactional guard); history is per owner', async () => {
+                await requester(456);
+                const attemptId = await expiredAttempt(456, 'create', null, 'm6i.large');
+                expect(await resetCapacityAttempt(db, { computerId: uuid(456), ownerUserId: uuid(456), attemptId })).toBe('reset');
+                expect(await hasDemandHoldForRouting(db, uuid(456), uuid(456))).toBe(true);
+                // The transactional pin guard: no Cloudflare insert for this owner's computer.
+                expect(await pinCloudflarePlacement(db, { computerId: uuid(456), userId: uuid(456) }, { honorDemand: true }))
+                    .toEqual({ provider: 'aws-ec2', store: 'ebs', record: null });
+                expect(await placementRowOf(456)).toEqual([]);
+                // A different owner never inherits it (their own computer pins normally).
+                expect(await hasDemandHoldForRouting(db, uuid(456), uuid(457))).toBe(false);
+                // Consumed-only history (e.g. a later downgrade) still holds; capacity credit needs a live active demand.
+                await requester(458);
+                await db.execute(sql`INSERT INTO public.ezil_compute_capacity_demands
+                    (request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest, source_generation, source_lease_epoch,
+                     state, cleanup, created_at, expires_at, closed_at)
+                    VALUES (gen_random_uuid(), ${uuid(458)}::uuid, ${uuid(458)}::uuid, 'create', ${c.region}, ${c.zoneId}, 'm6i.large', 2,
+                        ${demandDeploymentDigest(deployment)}, NULL, NULL, 'consumed', '[]'::jsonb, now() - interval '3 seconds', now() - interval '2 seconds', now() - interval '1 second')`);
+                expect(await hasDemandHoldForRouting(db, uuid(458), uuid(458))).toBe(true);
+                expect(await withAdmission(db, (tx, lock) => lockComputerDemandLive(tx, lock, uuid(458)))).toBeNull();
+            });
         });
         it('size: a selection changed between the refused open and the reservation refuses (no stale retirement)', async () => {
             const { deps, starter } = runtime();
