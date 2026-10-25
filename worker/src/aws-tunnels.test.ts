@@ -127,18 +127,133 @@ describe('replay of a completed create (Codex PR #200: enrollment 200 lost)', ()
   });
 });
 
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+// Let the service's microtasks drain without imposing a latency threshold.
+const nextTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+describe('create overlaps only the work after the durable pending marker and tunnel ID', () => {
+  it('starts all three legs together and publishes only after the last settlement', async () => {
+    const s = memStorage(); const f = fakeApi(); const original = { ...f.api };
+    const pending = gate(); const tunnel = gate();
+    const gates = { ingress: gate(), dns: gate(), token: gate() };
+    const started: string[] = [];
+    const put = s.put;
+    s.put = async (key, value) => { if (key === 'pending_create') await pending.promise; await put(key, value); };
+    f.api.createTunnel = async (name) => { await tunnel.promise; return original.createTunnel(name); };
+    f.api.putTunnelIngress = async (...args) => { started.push('ingress'); await gates.ingress.promise; return original.putTunnelIngress(...args); };
+    f.api.createDnsCname = async (...args) => { started.push('dns'); await gates.dns.promise; return original.createDnsCname(...args); };
+    f.api.getTunnelToken = async (...args) => { started.push('token'); await gates.token.promise; return original.getTunnelToken(...args); };
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    let settled = false;
+    const creating = svc.create(claims(), body()).then((r) => { settled = true; return r; });
+    try {
+      await nextTurn();
+      expect(f.calls).toEqual([]); expect(f.lookups).toEqual([]); expect(started).toEqual([]);
+      pending.resolve(); await nextTurn();
+      expect(s.map.has('pending_create')).toBe(true); expect(started).toEqual([]);
+      expect(f.lookups).toEqual([`findTunnel ezil-c-${SID}-g1-e2`]);
+      tunnel.resolve(); await nextTurn();
+      expect(started.slice().sort()).toEqual(['dns', 'ingress', 'token']);
+      for (const leg of ['token', 'ingress'] as const) {
+        gates[leg].resolve(); await nextTurn();
+        expect(settled).toBe(false); expect(s.map.has('tunnel')).toBe(false); expect(s.map.has('pending_create')).toBe(true);
+      }
+      gates.dns.resolve();
+      expect(await creating).toEqual({ status: 200, body: { tunnelToken: 'token-for-tun-1-0123456789' } });
+      expect(s.map.get('tunnel')).toMatchObject({ tunnelId: 'tun-1', dnsRecordId: 'dns-1' });
+      expect(s.map.has('pending_create')).toBe(false);
+    } finally {
+      pending.resolve(); tunnel.resolve(); Object.values(gates).forEach((g) => g.resolve()); await creating;
+    }
+  });
+
+  for (const failure of ['ingress', 'dns', 'token'] as const) {
+    for (const synchronous of [false, true]) {
+      for (const followup of ['remove', 'new epoch', 'restart retry'] as const) {
+        it(`${failure} ${synchronous ? 'throw' : 'rejection'} drains the other write before ${followup}`, async () => {
+          const s = memStorage(); const f = fakeApi(); const original = { ...f.api };
+          const outstanding = gate();
+          const heldLeg = failure === 'dns' ? 'ingress' : 'dns';
+          const started: string[] = []; const completed: string[] = [];
+          let failed = false; let held = false;
+          function step<T>(leg: string, run: () => Promise<T>): Promise<T> {
+            started.push(leg);
+            if (leg === failure && !failed) {
+              failed = true;
+              if (synchronous) throw new Error('injected failure');
+              return Promise.reject(new Error('injected failure'));
+            }
+            if (leg === heldLeg && !held) {
+              held = true;
+              return outstanding.promise.then(run).then((r) => { completed.push(leg); return r; });
+            }
+            return run();
+          }
+          f.api.putTunnelIngress = (...args) => step('ingress', () => original.putTunnelIngress(...args));
+          f.api.createDnsCname = (...args) => step('dns', () => original.createDnsCname(...args));
+          f.api.getTunnelToken = (...args) => step('token', () => original.getTunnelToken(...args));
+          const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+          let settled = false;
+          const creating = svc.create(claims(), body()).then((r) => { settled = true; return r; });
+          let queued: ReturnType<typeof svc.create> | undefined;
+          try {
+            await nextTurn();
+            const beforeQueue = { calls: [...f.calls], lookups: [...f.lookups], state: structuredClone(s.map) };
+            if (followup === 'remove') queued = svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }));
+            if (followup === 'new epoch') queued = svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
+            await nextTurn();
+            expect(started.slice().sort()).toEqual(['dns', 'ingress', 'token']);
+            expect(settled).toBe(false); expect(completed).toEqual([]);
+            expect(s.map.has('pending_create')).toBe(true); expect(s.map.has('tunnel')).toBe(false);
+            expect({ calls: f.calls, lookups: f.lookups, state: s.map }).toEqual(beforeQueue);
+            outstanding.resolve();
+            expect(await creating).toEqual({ status: 502, body: { ok: false, error: 'tunnel_create_failed' } });
+            expect(completed).toEqual([heldLeg]);
+            if (followup === 'restart retry') {
+              expect(s.map.get('pending_create')).toMatchObject({ leaseEpoch: 2 });
+              expect(s.map.has('tunnel')).toBe(false);
+              const restarted = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+              expect((await restarted.create(claims(), body())).status).toBe(200);
+              expect(f.calls.filter((c) => c.startsWith('createTunnel'))).toHaveLength(1);
+              expect((s.map.get('tunnel') as AwsTunnelRecord).tunnelId).toBe('tun-1');
+            } else {
+              expect((await queued!).status).toBe(200);
+              if (followup === 'remove') {
+                expect(f.tunnels.size).toBe(0); expect(f.dns.size).toBe(0); expect(s.map.has('tunnel')).toBe(false);
+                expect(s.map.get('fenced_epoch')).toBe(2);
+              } else {
+                expect([...f.tunnels.keys()]).toEqual([`ezil-c-${SID}-g1-e3`]);
+                expect([...f.dns.keys()]).toEqual([`c-${SID}-g1-e3.${ZONE}`]);
+                expect((s.map.get('tunnel') as AwsTunnelRecord).leaseEpoch).toBe(3);
+                expect(f.calls.indexOf('deleteTunnel tun-1')).toBeLessThan(f.calls.indexOf(`createTunnel ezil-c-${SID}-g1-e3`));
+              }
+            }
+            expect(s.map.has('pending_create')).toBe(false);
+          } finally {
+            outstanding.resolve(); await creating; if (queued) await queued;
+          }
+        });
+      }
+    }
+  }
+});
+
 describe('create (fence-first, once per epoch)', () => {
   it('creates tunnel, ingress to the edge, proxied CNAME, stores an unverified record, returns only the token', async () => {
     const s = memStorage(); const { api, calls } = fakeApi();
     const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => 42 });
     const r = await svc.create(claims(), body());
     expect(r).toEqual({ status: 200, body: { tunnelToken: 'token-for-tun-1-0123456789' } });
-    expect(calls).toEqual([
-      `createTunnel ezil-c-${SID}-g1-e2`,
+    expect(calls[0]).toBe(`createTunnel ezil-c-${SID}-g1-e2`);
+    expect(calls.slice(1).sort()).toEqual([
       `ingress tun-1 c-${SID}-g1-e2.${ZONE} http://127.0.0.1:18080`,
       `dns c-${SID}-g1-e2.${ZONE} -> tun-1.cfargotunnel.com`,
       'getTunnelToken tun-1',
-    ]);
+    ].sort());
     const rec = s.map.get('tunnel') as AwsTunnelRecord;
     expect(rec).toMatchObject({ computerId: CID, sandboxId: SID, generation: 1, leaseEpoch: 2, tunnelId: 'tun-1', dnsRecordId: 'dns-1', originVerified: false, createdAt: 42 });
     expect(JSON.stringify(r.body)).not.toContain(vectors.controlKeyBase64);

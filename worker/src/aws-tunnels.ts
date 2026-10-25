@@ -413,9 +413,19 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         // Before the first Cloudflare call, so a lost response is always recoverable by name.
         await deps.storage.put(PENDING_KEY, pending);
         const tunnelId = await ensureTunnel(api, pending.tunnelName);
-        await api.putTunnelIngress(tunnelId, hostname, `http://127.0.0.1:${edgePort}`);
-        const dnsRecordId = await ensureDns(api, hostname, `${tunnelId}.cfargotunnel.com`);
-        const tunnelToken = await api.getTunnelToken(tunnelId);
+        // Drain every leg before returning or releasing the serial queue: a failed
+        // sibling must not let removal/new-epoch cleanup overtake an outstanding write.
+        // Defer invocation too, so a synchronous throw cannot bypass the barrier.
+        const [ingress, dns, token] = await Promise.allSettled([
+          Promise.resolve().then(() => api.putTunnelIngress(tunnelId, hostname, `http://127.0.0.1:${edgePort}`)),
+          Promise.resolve().then(() => ensureDns(api, hostname, `${tunnelId}.cfargotunnel.com`)),
+          Promise.resolve().then(() => api.getTunnelToken(tunnelId)),
+        ]);
+        if (ingress.status === 'rejected') throw ingress.reason;
+        if (dns.status === 'rejected') throw dns.reason;
+        if (token.status === 'rejected') throw token.reason;
+        const dnsRecordId = dns.value;
+        const tunnelToken = token.value;
         const record: AwsTunnelRecord = {
           computerId: body.computerId, sandboxId: body.sandboxId, generation: body.generation, leaseEpoch: body.leaseEpoch,
           instanceId: body.instanceId, region: body.region, publicIp: body.publicIp, tunnelId, dnsRecordId, hostname,
