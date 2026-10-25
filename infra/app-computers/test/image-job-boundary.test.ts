@@ -7,7 +7,7 @@ import { IdentityConfigSchema, boundaryStatements, identityGuardrailStatements, 
 import { imageJobBoundaryStatements, recoveryRestoreStatements, imageJobBoundaryArn, imageJobRoleNameArns } from '../lib/image-job-boundary.js';
 import { preparationStatements } from '../lib/rebase-preparation.js';
 import { preparationFixture } from './preparation-fixture.js';
-import { evaluate, list } from './iam-evaluate.js';
+import { evaluate, list, starExample } from './iam-evaluate.js';
 
 const json = (s: { toStatementJson(): any }[]) => s.map(x => x.toStatementJson());
 const cfg = IdentityConfigSchema.parse(JSON.parse(readFileSync(join(__dirname, '../config/identity.example.json'), 'utf8')));
@@ -15,6 +15,19 @@ const d = preparationFixture().settings.deployment;
 const contextFor = (s: any) => Object.fromEntries(Object.entries(s.Condition ?? {}).flatMap(([op, entries]) => Object.entries(entries as any)
     .filter(([, v]) => op !== 'Null' || v === 'false')
     .map(([key, v]) => [key, op === 'Null' ? 'present' : op.startsWith('For') ? v : list(v)[0]])));
+
+test('IAM concrete examples expand every star and preserve wildcard allow/deny scope', () => {
+    const actionPattern = 'ec2:*Snapshot*', resourcePattern = 'arn:aws:ec2:*:123456789012:snapshot/*';
+    const action = starExample(actionPattern, 'Example'), resource = starExample(resourcePattern, 'test');
+    assert.equal(action, 'ec2:ExampleSnapshotExample');
+    assert.equal(resource, 'arn:aws:ec2:test:123456789012:snapshot/test');
+    assert.equal(starExample('ec2:CreateSnapshot', 'Example'), 'ec2:CreateSnapshot');
+    const allow = { Effect: 'Allow', Action: actionPattern, Resource: resourcePattern };
+    assert.deepEqual(evaluate([allow], action, resource, {}), { allowed: true, denied: false });
+    assert.deepEqual(evaluate([allow], 'ec2:DescribeInstances', resource, {}), { allowed: false, denied: false });
+    assert.deepEqual(evaluate([allow], action, 'arn:aws:ec2:test:999999999999:snapshot/test', {}), { allowed: false, denied: false });
+    assert.deepEqual(evaluate([allow, { ...allow, Effect: 'Deny' }], action, resource, {}), { allowed: false, denied: true });
+});
 
 test('image boundary fits 6144 bytes at longest namespace/region with every feature and volume cap', () => {
     for (const poolLifecycle of [false, true]) for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
@@ -32,7 +45,7 @@ test('snapshot and restore grants retain conditions under the boundary, includin
         const context = contextFor(s);
         // Null presence must not overwrite exact values in our fixture.
         Object.assign(context, s.Condition?.StringEquals, s.Condition?.ArnEquals, s.Condition?.Bool);
-        for (const action of list(s.Action)) for (const resource of list(s.Resource).map(r => r.replace('*', 'test'))) {
+        for (const action of list(s.Action)) for (const resource of list(s.Resource).map(r => starExample(r, 'test'))) {
             assert.equal(evaluate(roles, action, resource, context).allowed, true, action);
             assert.equal(evaluate(ceiling, action, resource, context).allowed, true, action);
             for (const key of Object.keys(context)) {
@@ -52,7 +65,7 @@ test('all shared global denies survive; snapshot sharing, storage destruction, t
             const context = contextFor(s);
             for (const key of Object.keys(s.Condition?.StringNotEquals ?? {})) context[key] = 'foreign';
             for (const action of list(s.Action ?? ['ec2:RunInstances'])) for (const resource of list(s.Resource ?? ['*']))
-                assert.equal(evaluate(ceiling, action.replace('*', 'Example'), resource.replace('*', 'test'), context).denied, true, action);
+                assert.equal(evaluate(ceiling, starExample(action, 'Example'), starExample(resource, 'test'), context).denied, true, action);
         }
         for (const action of ['ec2:CopySnapshot', 'ec2:ModifySnapshotAttribute', 'ec2:ResetSnapshotAttribute', 'ec2:DetachVolume', 'ec2:DeleteTags', 'iam:PassRole', 'ec2:ModifyInstanceMetadataOptions'])
             assert.equal(evaluate(ceiling, action, '*', { 'aws:RequestedRegion': d.region }).denied, true);

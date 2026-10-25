@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Strict JSON transforms for the M5 scripts. Secret payloads stay in memory."""
 import copy
+import argparse
 from contextlib import contextmanager
+from datetime import datetime
 import fcntl
 import json
 import os
@@ -35,14 +37,18 @@ def read(path):
     return release.read(path)
 
 
-def write(path, value):
+def write(path, value, *, serialized=None):
     """Atomic, private file for NONSECRET configuration and release evidence only."""
+    need(serialized is None or release.loads(serialized) == value, 'serialized evidence mismatch')
     folder = os.path.dirname(os.path.abspath(path))
     fd, temp = tempfile.mkstemp(dir=folder, prefix=".mum-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
-            json.dump(value, out, indent=2)
-            out.write("\n")
+            if serialized is None:
+                json.dump(value, out, indent=2)
+                out.write("\n")
+            else:
+                out.write(serialized)
             out.flush()
             os.fsync(out.fileno())
         os.replace(temp, path)
@@ -338,7 +344,7 @@ def ascii_view(value):
     return value
 
 
-def versioned_ami_changes(cs, resources, template_changes):
+def versioned_ami_changes(cs, resources, template_changes, reviewed_base_change=False):
     by_type = {r["Type"]: k for k, r in resources.items() if r["Type"].startswith("AWS::ImageBuilder::")}
     component = by_type["AWS::ImageBuilder::Component"]
     recipe = by_type["AWS::ImageBuilder::ImageRecipe"]
@@ -361,6 +367,12 @@ def versioned_ami_changes(cs, resources, template_changes):
                 dependencies[prop] = dependency
 
         def referenced(name, source, cause):
+            if reviewed_base_change and logical == recipe and name == "ParentImage":
+                # Live CloudFormation (2026-10-23) reports a re-resolved SSM parent as
+                # Static/DirectModification with no causing entity. ami_template() already
+                # refuses any template-level ParentImage change, so this only admits the
+                # validated, reviewed base re-resolution.
+                return (source == "ParameterReference" and cause == "UbuntuAmiId") or (source == "DirectModification" and cause == "")
             if logical == recipe and name == "Components":
                 return (source == "ParameterReference" and cause in ALLOWED) or (source in ("ResourceReference", "ResourceAttribute") and cause == component)
             if logical == pipeline:
@@ -390,7 +402,33 @@ def versioned_ami_changes(cs, resources, template_changes):
     need({component, recipe} <= seen, "change set omits component/recipe version replacement")
 
 
-def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths):
+def base_image_review(old_id, new_id, images_path):
+    need(all(isinstance(i, str) and re.fullmatch(r"ami-[0-9a-f]{17}", i) for i in (old_id, new_id)),
+         "invalid reviewed base AMI identity")
+    response = read(images_path)
+    images = response["Images"]
+    need(not response.get("NextToken") and len(images) == 2 and
+         {i.get("ImageId") for i in images} == {old_id, new_id}, "reviewed base image response mismatch")
+    previous = next(i for i in images if i["ImageId"] == old_id)
+    candidate = next(i for i in images if i["ImageId"] == new_id)
+    need(candidate.get("OwnerId") == "099720109477", "reviewed base image owner is not Canonical")
+    need(re.fullmatch(r"ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24\.04-amd64-server-[0-9]{8}(\.[0-9]+)?",
+                      candidate.get("Name", "")), "reviewed base image name mismatch")
+    need(candidate.get("State") == "available", "reviewed base image is not available")
+    need(candidate.get("Architecture") == "x86_64", "reviewed base image architecture mismatch")
+
+    def creation_date(image):
+        value = image.get("CreationDate", "")
+        need(isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z", value),
+             "invalid base image creation date")
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    need(creation_date(candidate) > creation_date(previous), "reviewed base image is not newer")
+    return {"oldId": old_id, "newId": new_id, "name": candidate["Name"], "creationDate": candidate["CreationDate"]}
+
+
+def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths,
+                  reviewed_base_ami=None, base_images_path=None):
     old = mapping(stack(old_path)["Parameters"])
     wanted = mapping(read(wanted_path))
     cs = read(cs_path)
@@ -399,17 +437,21 @@ def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths)
     additions = wanted.keys() - old.keys()
     need(old.keys() <= wanted.keys() == actual.keys() and additions <= PREVIOUS, "parameter coverage mismatch")
     need(not additions or version_paths and PREVIOUS <= read(version_paths[0]).get("Parameters", {}).keys(), "new parameters require reviewed template")
+    review = None
     for key in wanted:
         if key in ALLOWED:
             need(actual[key].get("ParameterValue") == wanted[key]["ParameterValue"], "unexpected allowed parameter value")
         else:
             need(wanted[key] == {"ParameterKey": key, "UsePreviousValue": True}, "extra parameter change requested")
             need(actual[key].get("ParameterValue", old[key].get("ParameterValue") if actual[key].get("UsePreviousValue") else None) == old[key].get("ParameterValue"), "extra parameter change in change set")
-            need(actual[key].get("ResolvedValue") == old[key].get("ResolvedValue"), "resolved SSM parameter changed")
+        if actual[key].get("ResolvedValue") != old.get(key, {}).get("ResolvedValue"):
+            need(key == "UbuntuAmiId" and reviewed_base_ami, "resolved SSM parameter changed")
+            need(reviewed_base_ami == actual[key].get("ResolvedValue"), "reviewed base AMI does not match resolved value")
+            review = base_image_review(old[key].get("ResolvedValue"), reviewed_base_ami, base_images_path)
     if version_paths:
         resources, changes = ami_template(template_path, *version_paths)
-        versioned_ami_changes(cs, resources, changes)
-        return
+        versioned_ami_changes(cs, resources, changes, reviewed_base_change=review is not None)
+        return review
     resources = template(template_path)["Resources"]
     recipes = [k for k, v in resources.items() if v["Type"] == "AWS::ImageBuilder::ImageRecipe"]
     pipelines = [k for k, v in resources.items() if v["Type"] == "AWS::ImageBuilder::ImagePipeline"]
@@ -434,6 +476,7 @@ def ami_changeset(old_path, wanted_path, cs_path, template_path, *version_paths)
             # replacement, which cannot create a second identical name/version.
             need(r.get("Replacement") == "False" and all(d["Target"].get("RequiresRecreation") == "Never" for d in r["Details"]),
                  "immutable Image Builder recipe replacement: contract needs a reviewed recipe version bump; refusing execution")
+    return review
 
 
 def same_json(a, b):
@@ -852,25 +895,26 @@ def edit_release_secret(envelope, before, after, records):
     """CAS the complete tuple and append immutable records; capacity fails closed.
 
     Retaining ALL records satisfies placement/job retention without racing the DB.
-    A separately reviewed garbage collector is required when eight slots are full.
+    A separately reviewed garbage collector is required when nine slots are full.
     """
     updated = edit_secret(envelope, before, after)
     raw = updated[KEY]
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 8, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= 9, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
-    need(len({json.dumps(r, sort_keys=True) for r in retained}) == len(retained), "duplicate release records")
+    identity = lambda r: (r["lowerImageDigest"], r["amiId"])
+    need(len({identity(r) for r in retained}) == len(retained), "duplicate release pair")
     for record in records:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign release record")
+        need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 8, "release registry full; retained placement/job evidence must never be dropped")
-    need(len({r["lowerImageDigest"] for r in retained}) == len(retained), "ambiguous source release digest; no record may be silently replaced")
+    need(1 <= len(retained) <= 9, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.
@@ -948,7 +992,7 @@ def main(args):
         write(a[4], [{"ParameterKey": key, **({"ParameterValue": values[key]} if key in values else {"UsePreviousValue": True})} for key in keys])
     elif op == "previous-parameters":
         need(PREVIOUS <= mapping(stack(a[0])["Parameters"]).keys(), "previous pair requires a recipe version bump")
-    elif op in ("previous-release", "secret-predecessor"):
+    elif op in ("previous-release", "secret-predecessor", "secret-retained"):
         manifest = release.load(a[0], source=True, repository=REPOSITORY)
         need(manifest["accountId"] == ACCOUNT and manifest["region"] == REGION and manifest["namespace"] == "mum", "previous release identity mismatch")
         if op == "previous-release":
@@ -959,9 +1003,10 @@ def main(args):
                 outer = release.loads(envelope["SecretString"])
                 deployments = release.loads(outer[KEY]) if isinstance(outer[KEY], str) else outer[KEY]
                 d = deployments[REGION]
-                release.deployment_tuple(d)
-                need(all(d.get(k) == manifest[k] for k in (*((release.PROMOTION) if set(release.TUPLE) <= d.keys() else release.PROMOTION[:3]), "accountId", "region", "namespace", "launchTemplateId")),
-                     "previous release is not the promoted app tuple")
+                if op == "secret-retained":
+                    release.retained_release(d, manifest)
+                else:
+                    release.promoted_release(d, manifest)
     elif op in ("maintenance-agent", "maintenance-lower"):
         manifest = release.load(a[0], source=True, repository=REPOSITORY)
         if op == "maintenance-agent":
@@ -1012,7 +1057,20 @@ def main(args):
                 need(config == a[1], "image ID mismatch between ECR and local Docker image")
                 print(pushed, config)  # classic store: ID == config digest
     elif op == "ami-changeset":
-        ami_changeset(*a)
+        parser = argparse.ArgumentParser(prog="json-tool.py ami-changeset")
+        parser.add_argument("paths", nargs="+")
+        parser.add_argument("--reviewed-base-ami")
+        parser.add_argument("--base-images")
+        parser.add_argument("--base-review-output")
+        options = parser.parse_args(a)
+        review = ami_changeset(*options.paths, reviewed_base_ami=options.reviewed_base_ami,
+                               base_images_path=options.base_images)
+        if review is not None:
+            write(options.base_review_output, review)
+    elif op == "base-ami-id":
+        base_id = mapping(stack(a[0])["Parameters"])["UbuntuAmiId"].get("ResolvedValue", "")
+        need(re.fullmatch(r"ami-[0-9a-f]{17}", base_id), "invalid live base AMI ID")
+        print(base_id)
     elif op == "plan-ami":
         value = ami_config(a[0])
         need(recipe_version(a[1]) > recipe_version(value["version"]), "recipe version must be greater than current version")

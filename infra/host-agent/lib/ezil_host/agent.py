@@ -299,10 +299,16 @@ class Agent:
         the desktop runs, its unit's state and whether the agent's restarts are exhausted.
         Never the config itself."""
         c = desktop.read_desktop_config(self.cfg, int(now * 1000))
-        return {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
+        result = {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
                 "bootId": desktop.host_boot_id(), "aiConfigured": desktop.ai_configured(self.cfg),
                 "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg),
                 "unit": self._desktop_unit(), "restartsExhausted": self._restarts_exhausted(now)}
+        from . import pool
+        if os.path.lexists(os.path.join(self.cfg.stateDir, pool.EPOCH_FILE)):
+            result["sessionReady"] = c is not None and pool.session_ready(self.cfg, self.lease)
+            if result["desktop"] == "running" and not result["sessionReady"]:
+                result["desktop"] = "starting"
+        return result
 
     def restart_desktop(self):
         """Restart the desktop through its unit: a relay config arrived after it started

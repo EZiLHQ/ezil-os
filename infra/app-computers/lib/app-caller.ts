@@ -122,6 +122,7 @@ export function appCallerStatements(region: string, versionArns: string[], histo
     return [
         ...startVersionStatements(versionArns),
         new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: executions }),
+        new iam.PolicyStatement({ actions: ['states:GetExecutionHistory'], resources: executions }),
         // The lifecycle machine encrypts execution data with its customer-managed history key, and
         // DescribeExecution then needs kms:Decrypt by the CALLER (Step Functions encryption-at-rest
         // docs). Only that key, only through Step Functions, only for these machines.

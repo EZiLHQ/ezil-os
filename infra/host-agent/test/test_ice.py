@@ -182,7 +182,9 @@ class RelayStore(unittest.TestCase):
             t[0] += s
             if calls[0] == 3:
                 desktop.write_desktop_config(self.cfg, desktop.validate_desktop_config(relay_config(now_ms), now_ms))
+        started = t[0]
         self.assertIsNotNone(desktop.wait_desktop_config(self.cfg, 30, clock=clock, sleep=sleep_then_arrive))
+        self.assertEqual(t[0] - started, 0.75)
 
 
 class AgentIce(unittest.TestCase):

@@ -99,7 +99,7 @@ describe('qa UI honesty', () => {
             expect(html).not.toMatch(/standard-hour|overage|billed separately/i);
             if (opener === 'openComputeUpgradeSheet') {
                 expect(html).toContain('$100/month');
-                expect(html).toContain('after payment. Your Mumbai computer is prepared then.');
+                expect(html).toContain('after payment. Your AWS computer is prepared then.');
             }
             handle.close();
         }

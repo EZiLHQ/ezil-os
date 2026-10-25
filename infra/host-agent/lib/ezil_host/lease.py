@@ -237,18 +237,3 @@ class Imds:
         return (self.get("/latest/user-data", t),
                 self.get("/latest/dynamic/instance-identity/document", t).decode("utf-8"),
                 self.get("/latest/dynamic/instance-identity/pkcs7", t).decode("ascii").strip())
-
-    def fence_tag(self):
-        """404 on the tag *collection* means tags are disabled. A missing fence on
-        an enabled collection is a refusal, never permission to use the fallback."""
-        token = self._token()
-        path = "/latest/meta-data/tags/instance"
-        status, body = http.request("GET", self.base + path,
-                                    headers={"X-aws-ec2-metadata-token": token}, timeout=5)
-        if status == 404:
-            return None
-        if status != 200:
-            raise LeaseError(f"imds_tags_failed: {status}")
-        if b"ezil:fence" not in body.splitlines():
-            raise LeaseError("imds_fence_missing")
-        return self.get(path + "/ezil:fence", token).decode("ascii").strip()

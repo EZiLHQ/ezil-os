@@ -1,4 +1,8 @@
+import { POOL_TYPES, type PoolClass } from './ready-pool';
+import { isPoolReleaseRecovering } from './aws-pool-release-recovery';
 import { settleReplacementGeneration } from './aws-rebase-generation';
+import { failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
+import { writePoolOpen } from './placement';
 /**
  * aws-ec2 provider (docs/AWS-COMPUTERS.md C-1, C-3).
  *
@@ -19,9 +23,9 @@ import { settleReplacementGeneration } from './aws-rebase-generation';
  * whose plaintext goes only into that intent's user data (`aws-enroll.ts`).
  *
  * Persistence model: the computer's disk is a retained EBS data volume.
- * Stop/idle = instance stopped (no running services; EBS only). Wake = cold
- * boot of the same instance on the same volume. Running processes and RAM
- * are NOT preserved. A wake stays in the placement's region: a full region
+ * With pool mode on, session end releases the host and keeps the volume;
+ * wake adopts a clean host or falls back to cold replacement. Otherwise the
+ * configured start/replace behavior applies. Processes and RAM are not preserved. A wake stays in the placement's region: a full region
  * answers `capacity_unavailable`, it never moves the computer.
  */
 
@@ -30,7 +34,7 @@ import { randomBytes as nodeRandomBytes, randomUUID } from 'node:crypto';
 // Migration provisions use the same lease builder, with its optional restore input.
 export { buildEnrollmentUserData as buildAwsProvisionUserData } from './aws-enroll';
 
-import { runAdmission, type AdmissionRefusal } from './admission';
+import { runAdmission, type AdmissionRefusal, type AdmissionRequest } from './admission';
 import {
     AWS_TIER_DATA_GIB,
     instanceTypeForTier,
@@ -53,14 +57,15 @@ import {
     type LifecycleOperation,
     type LifecycleWork,
 } from './aws-intent';
-import { ENROLLMENT_FAILED, INSTANCE_LOST, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { ENROLLMENT_FAILED, INSTANCE_LOST, reservePoolHostForBoot, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import type { Ec2ComputerResourceFinder, Ec2ReplacementDescriber, Ec2VolumeDescriber } from './aws-clients';
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
-import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
+import { applyLifecycleReceipt, isPoolMode, POOL_RELEASED, sessionEndWork, type PoolDeps, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 import { requestAwsRestart } from './aws-restart';
+import { poolPriorityForEntitlement } from './select';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -121,6 +126,7 @@ export const AWS_RETIRE_AFTER_STOP = 'retire_after_stop';
 export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RETIRE_AFTER_STOP];
 
 export interface AwsProviderDeps {
+    pool?: PoolDeps;
     db: PlacementDb;
     meter?: ComputeMeter;
     env?: () => Env;
@@ -174,6 +180,24 @@ export const AWS_STATE_FOR: Readonly<Record<PlacementState, AwsComputerState>> =
     RETIRING: 'error', RETIRED: 'error', PURGE_ELIGIBLE: 'error',
     WARMING: 'error', READY: 'error', CLAIMED: 'error',
 };
+
+/** Replacement admission clears the instance binding. After enrollment, use the
+ * current execution's intent, already read by reconciliation, to distinguish a
+ * fresh replacement from a start of the same instance. Never infer from wake mode.
+ */
+function isReplacementLaunching(p: Placement, input?: string): boolean {
+    if (!['LEASED', 'STARTING', 'MOUNTING'].includes(p.state) || p.generation <= 1
+        || !p.lifecycleJobId || !p.lifecycleDigest) return false;
+    if (p.instanceId === null) return true;
+    try {
+        const envelope = JSON.parse(input ?? '');
+        const work = buildLifecycleWork(JSON.parse(envelope.document));
+        const intent = work.intent;
+        return intent.operation === 'replace' && work.digest === p.lifecycleDigest
+            && intent.jobId === p.lifecycleJobId && intent.computerId === p.computerId
+            && intent.targetGeneration === p.generation && intent.leaseEpoch === p.leaseEpoch;
+    } catch { return false; }
+}
 
 /** Refusals a user can do nothing about but wait: the region (or fleet) is full. Never answered by moving regions. */
 const CAPACITY_REFUSALS: readonly AdmissionRefusal[] = ['max_running', 'region_capacity'];
@@ -272,18 +296,19 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         const outcome = await startLifecycleJob(deps.starter!, region, work, deps.sleep);
         if (outcome === 'started') return 'started';
         if (outcome === 'refused') {
-            if (work.intent.operation === 'replace' && await settleReplacementGeneration(reconcileDeps(), p, work, true) === 'settled') return 'failed';
+            if (work.intent.operation === 'replace' && await settleReplacementGeneration(reconcileDeps(), p, { ...work, intent: work.intent }, true) === 'settled') return 'failed';
             await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo, fields: { enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null } });
             return 'failed';
         }
-        await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, undo });
+        await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, undo,
+            ...(work.intent.operation === 'adopt' && p.lastError ? { context: p.lastError } : {}) });
         return 'pending';
     };
 
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
-    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter });
+    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter, pool: deps.pool });
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
@@ -297,16 +322,28 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         deployments: Record<string, LifecycleDeployment>,
         e: Env,
         limits = true,
-    ): Promise<{ placement: Placement; limit: SessionLimit | null }> => {
+    ): Promise<{ placement: Placement; limit: SessionLimit | null; computeLaunching?: boolean }> => {
         const deployment = deployments[p.region ?? ''];
         if (!deployment || p.provider !== 'aws-ec2') return { placement: p, limit: null };
-        await applyLifecycleReceipt(reconcileDeps(), p, deployment);
+        let executionInput: string | undefined;
+        const receiptDeps = reconcileDeps();
+        const executions = deps.executions;
+        if (executions) receiptDeps.executions = {
+            describe: async (region, arn) => {
+                const execution = await executions.describe(region, arn);
+                executionInput = execution.input;
+                return execution;
+            },
+            // Failed-adopt recovery requires complete history from the same reader.
+            ...(executions.history ? { history: executions.history.bind(executions) } : {}),
+        };
+        await applyLifecycleReceipt(receiptDeps, p, deployment);
         let fresh = (await ownPlacement(c)) ?? p;
         if (await reconcileGuestStop(reconcileDeps(), fresh, deployment)) return { placement: (await ownPlacement(c)) ?? fresh, limit: null };
-        if (!limits) return { placement: fresh, limit: null };
+        if (!limits) return { placement: fresh, limit: null, computeLaunching: isReplacementLaunching(fresh, executionInput) };
         const limit = await enforceSessionLimits(reconcileDeps(), fresh, deployment, { now: now(), caps: sessionLimitCaps(e) });
         if (limit) fresh = (await ownPlacement(c)) ?? fresh;
-        return { placement: fresh, limit };
+        return { placement: fresh, limit, computeLaunching: isReplacementLaunching(fresh, executionInput) };
     };
 
     /**
@@ -342,7 +379,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         if (!p.instanceId || !p.volumeId || !p.fenceToken) return { ok: false, terminated: false, outcome: 'aws_placement_incomplete', error: 'aws_placement_incomplete' };
         let work: LifecycleWork;
         try {
-            work = buildLifecycleWork(sameGenerationIntent(p, 'stop', deployment, { userData: null, leaseEpoch: p.leaseEpoch }));
+            work = sessionEndWork(p, deployment, newId(), deps.pool);
         } catch (error) {
             if (!(error instanceof LifecycleIntentInvalidError)) throw error;
             return { ok: false, terminated: false, outcome: 'aws_intent_invalid', error: 'aws_intent_invalid' };
@@ -390,6 +427,50 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         return { ok: false, terminated: false, outcome: AWS_RETIRING };
     };
 
+    /** Admission reserves a cold boot first, but no execution can start until
+     * commit. A pool lease replaces that boot's work in the same transaction. */
+    const admitBoot = async (request: AdmissionRequest, tier: AwsTier | undefined, e: Env,
+        workRef: { get(): LifecycleWork | undefined; set(work: LifecycleWork): void }) => {
+        const result = await reservePoolHostForBoot(deps.db,
+            db => runAdmission(db, request, { env: e, now }),
+            async (tx, p) => {
+                const cold = workRef.get()!;
+                const deployment = cold.intent.deployment;
+                if (!isPoolMode(deployment) || !tier || tier === 'free' || !POOL_TYPES.includes(p.instanceType as PoolClass['instanceType'])) return null;
+                if (!deps.pool) throw new LifecycleIntentInvalidError();
+                // Recheck under the admission lock, immediately before reserving a host.
+                // Missing or uncertain attachment evidence uses the existing cold path.
+                if (p.volumeId) {
+                    const volume = await deps.describer?.describeVolume?.(p.region!, p.volumeId).catch(() => null);
+                    if (!volume || volume.volumeId !== p.volumeId || volume.state !== 'available' || volume.attachments?.length !== 0) return null;
+                }
+                const c: PoolClass = { region: p.region!, zoneId: p.zoneId!, instanceType: p.instanceType as PoolClass['instanceType'], deployment };
+                const host = await deps.pool.leasePoolHost(tx, c, p.computerId, poolPriorityForEntitlement(deps.entitlement), now());
+                if (!host) return null;
+                if (host.state !== 'leased' || host.leasedComputerId !== p.computerId || !host.instanceId
+                    || host.region !== c.region || host.zoneId !== c.zoneId || host.instanceType !== c.instanceType) {
+                    throw new LifecycleIntentInvalidError();
+                }
+                const work = deps.pool.buildWork({ ...cold.intent, operation: 'adopt', poolHostId: host.poolHostId,
+                    providerInstanceId: host.instanceId, dataVolumeId: p.volumeId,
+                    dataVolumeGiB: p.volumeId === null ? AWS_TIER_DATA_GIB[tier] : null,
+                    userData: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
+                });
+                workRef.set(work);
+                return { instanceId: host.instanceId, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest,
+                    enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null, lastError: poolAdoptSource(cold.intent) };
+            }, async (tx, p) => {
+                if (isPoolMode(workRef.get()!.intent.deployment)) await deps.pool?.validateCapacity?.(tx, p);
+            });
+        const work = workRef.get();
+        if (result.admitted && work?.intent.operation === 'adopt') {
+            // Planner failure must not discard a committed adopt or enable a cold retry.
+            await deps.pool!.replenish({ region: result.placement.region!, zoneId: result.placement.zoneId!,
+                instanceType: result.placement.instanceType as PoolClass['instanceType'] }, now()).catch(() => console.error('[compute.pool] replenish failed after lease'));
+        }
+        return result;
+    };
+
     return {
         kind: 'aws-ec2',
 
@@ -402,7 +483,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             // Settle an existing placement first: a receipt may have landed, or its host idle-stopped itself.
             // An explicit open is the owner's presence: it renews the lease BEFORE the session limits
             // are checked, so only an hour cap (never a lapsed lease) can stop what the owner is opening.
-            let placement = found && found.provider === 'aws-ec2' ? (await reconcileOwn(c, found, cfg.deployments, cfg.e, false)).placement : found;
+            const reconciled = found && found.provider === 'aws-ec2'
+                ? await reconcileOwn(c, found, cfg.deployments, cfg.e, false) : null;
+            let placement = reconciled?.placement ?? found;
             if (placement && placement.provider === 'aws-ec2' && placement.state === 'RUNNING') {
                 placement = await renewLease(c, placement, now());
                 const settled = await reconcileOwn(c, placement, cfg.deployments, cfg.e);
@@ -436,8 +519,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 let work: LifecycleWork | undefined;
                 let admitted;
                 try {
-                    admitted = await runAdmission(
-                        deps.db,
+                    admitted = await admitBoot(
                         {
                             kind: 'create',
                             userId: c.userId,
@@ -463,7 +545,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 };
                             },
                         },
-                        { env: cfg.e, now },
+                        tier, cfg.e, { get: () => work, set: value => { work = value; } },
                     );
                 } catch (error) {
                     if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
@@ -484,6 +566,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
 
             if (placement.provider !== 'aws-ec2') return notReady('provider_mismatch');
             let resizeTo: Exclude<AwsTier, 'free'> | undefined;
+            let openTier: AwsTier | undefined;
             if (placement.state === 'RUNNING' || placement.state === 'STOPPED' ||
                 (placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED)) {
                 // Resolve the current paid plan on every open, including legacy callers
@@ -492,6 +575,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     const tier = deps.entitlement !== undefined
                         ? tierForEntitlement(deps.entitlement, plusPlanIds(cfg.e))
                         : await deps.tierFor?.(c.userId);
+                    openTier = tier;
                     if (tier && tier !== 'free' && instanceTypeForTier(tier) !== placement.instanceType) resizeTo = tier;
                 } catch {
                     return notReady('aws_tier_unavailable');
@@ -518,8 +602,34 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
                     // A lost instance (INSTANCE_LOST: EC2 terminated it) can only come back as a REPLACE onto its volume.
-                    const replace = resizeTo !== undefined || placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace';
+                    const replace = resizeTo !== undefined || placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace' || isPoolMode(deployment) || placement.lastError === POOL_RELEASED;
                     const instanceType = resizeTo ? instanceTypeForTier(resizeTo) : placement.instanceType;
+                    let poolTier = placement.state === 'STOPPED' ? openTier : undefined;
+                    if (placement.lastError === POOL_OPEN_RELEASE_FAILED) poolTier = undefined;
+                    if (isPoolMode(deployment) && poolTier && poolTier !== 'free' && POOL_TYPES.includes(instanceType as PoolClass['instanceType'])) {
+                        if (!deps.pool) return notReady('aws_intent_invalid');
+                        const volume = await deps.describer?.describeVolume?.(placement.region, placement.volumeId).catch(() => null);
+                        if (volume?.volumeId === placement.volumeId && volume.attachments?.some(a => a.instanceId === placement.instanceId)) {
+                            const source = await deps.describer?.describeForEnrollment(placement.region, placement.instanceId).catch(() => null);
+                            if (source?.instanceId === placement.instanceId && source.state !== 'terminated') {
+                                const work = sessionEndWork(placement, deployment, newId(), deps.pool);
+                                const reserved = await writePoolOpen(deps.db, placement, 'STOPPING', {
+                                    lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: POOL_OPEN_RELEASE,
+                                    enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
+                                });
+                                if (!reserved.ok) return notReady('computer_starting', true);
+                                const outcome = await startLifecycleJob(deps.starter, placement.region, work, deps.sleep);
+                                if (outcome === 'refused') {
+                                    await failPoolOpenRelease(reconcileDeps(), reserved.placement);
+                                    // The next poll follows the cold path with the original source identity.
+                                } else if (outcome === 'unknown') {
+                                    await markLifecycleStartUnknown(deps.db, { computerId: placement.computerId,
+                                        ownerUserId: c.userId, expected: reserved.placement, undo: 'STOPPED' });
+                                }
+                                return notReady('computer_starting', true);
+                            }
+                        }
+                    }
                     // The lease's compare-and-swap moves the epoch (and, for a replace, the
                     // generation) by exactly one, so this boot's intent is fully known BEFORE
                     // the lease and its job, digest, fence and nonce hash are written by that
@@ -543,28 +653,33 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
                         throw error;
                     }
-                    const leased = await runAdmission(
-                        deps.db,
-                        {
-                            kind: 'lease',
-                            userId: c.userId,
-                            computerId: c.computerId,
-                            expected: { generation: placement.generation, leaseEpoch: placement.leaseEpoch },
-                            leaseUntil: new Date(now().getTime() + leaseSeconds * 1000),
-                            replace,
-                            resizeTo,
-                            fields: {
-                                fenceToken,
-                                enrollNonceHash: nonce.nonceHash,
-                                enrollExpiresAt: nonce.expiresAt,
-                                enrollConsumedHash: null, // the previous epoch's proof never outlives it
-                                lifecycleJobId: work.intent.jobId,
-                                lifecycleDigest: work.digest,
-                                lastError: null,
+                    let leased;
+                    try {
+                        leased = await admitBoot(
+                            {
+                                kind: 'lease',
+                                userId: c.userId,
+                                computerId: c.computerId,
+                                expected: { generation: placement.generation, leaseEpoch: placement.leaseEpoch },
+                                leaseUntil: new Date(now().getTime() + leaseSeconds * 1000),
+                                replace,
+                                resizeTo,
+                                fields: {
+                                    fenceToken,
+                                    enrollNonceHash: nonce.nonceHash,
+                                    enrollExpiresAt: nonce.expiresAt,
+                                    enrollConsumedHash: null, // the previous epoch's proof never outlives it
+                                    lifecycleJobId: work.intent.jobId,
+                                    lifecycleDigest: work.digest,
+                                    lastError: null,
+                                },
                             },
-                        },
-                        { env: cfg.e, now },
-                    );
+                            poolTier, cfg.e, { get: () => work, set: value => { work = value; } },
+                        );
+                    } catch (error) {
+                        if (error instanceof LifecycleIntentInvalidError) return notReady('aws_intent_invalid');
+                        throw error;
+                    }
                     if (!leased.admitted) return leased.reason === 'cas_conflict'
                         ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
                         : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
@@ -582,14 +697,15 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         userId: p.ownerUserId, computerId: p.computerId, endedAt: now(), reason: 'resize',
                     }));
                     // Pending: the boot may be running; it stays LEASED with its job for the receipt path.
-                    if (r === 'pending') return notReady('computer_starting', true);
+                    if (r === 'pending') return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
                     if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
                     await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STARTING' });
-                    return notReady('computer_starting', true);
+                    return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
                 }
                 default: {
+                    if (isPoolOpenRelease(placement) || isPoolReleaseRecovering(placement)) return notReady('computer_starting', true);
                     const state = AWS_STATE_FOR[placement.state];
-                    if (state === 'starting') return notReady('computer_starting', true);
+                    if (state === 'starting') return { ...notReady('computer_starting', true), ...(reconciled?.computeLaunching ? { computeLaunching: true } : {}) };
                     if (state === 'stopping') return notReady('computer_stopping', true);
                     return notReady(placement.state === 'RECOVERING' ? 'computer_recovering' : 'computer_unavailable');
                 }
@@ -602,9 +718,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             let p = await ownPlacement(c);
             if (!p || p.provider !== 'aws-ec2') return { ok: false, error: 'aws_placement_missing' };
             // A status poll is not presence: it renews nothing, and a lapsed lease or a reached cap stops here.
-            p = (await reconcileOwn(c, p, cfg.deployments, cfg.e)).placement;
-            const state = AWS_STATE_FOR[p.state];
-            return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region };
+            const settled = await reconcileOwn(c, p, cfg.deployments, cfg.e);
+            p = settled.placement;
+            const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) ? 'starting' : AWS_STATE_FOR[p.state];
+            return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}) };
         },
 
         async stop(_ctx, c): Promise<StopResult> {

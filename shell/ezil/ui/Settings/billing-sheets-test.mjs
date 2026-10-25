@@ -403,7 +403,7 @@ test('v3 upgrade shows catalog benefits, prorated price, exact target and recove
     await h.ready('upgrade');
     assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$100\/month/);
     assert.match(h.text(), /Usage included/); assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 3);
-    assert.match(h.text(), /after payment\. Your Mumbai computer is prepared then/);
+    assert.match(h.text(), /after payment\. Your AWS computer is prepared then/);
     assert.match(h.text(), /Due now \$12/); assert.doesNotMatch(h.text(), /standard-hour|\bcompute\b/i);
     assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);

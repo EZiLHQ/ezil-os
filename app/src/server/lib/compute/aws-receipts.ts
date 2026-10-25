@@ -1,4 +1,6 @@
+import { reconcilePoolReleaseRecovery } from './aws-pool-release-recovery';
 import { replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
+import { failPoolOpenRelease, isPoolOpenRelease, POOL_OPEN_RELEASE_FAILED, recoverRefusedAdopt } from './aws-pool-recovery';
 import { createProviderMigrationStore } from './provider-migrate-store';
 /**
  * Lifecycle receipts: the RECONCILER path (docs/AWS-COMPUTERS.md C-3).
@@ -12,7 +14,7 @@ import { createProviderMigrationStore } from './provider-migrate-store';
  * reconciler may call it for any placement.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
@@ -24,7 +26,7 @@ import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegion
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
-import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
+import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
     INSTANCE_LOST,
@@ -40,6 +42,8 @@ import {
     RELEASED_NO_RESOURCES,
     readMonthUsage,
     readPlacement,
+    publishAttachedPoolClaim,
+    type PlacementExecutor,
     transitionPlacementAsReconciler,
     type Placement,
     type PlacementDb,
@@ -51,6 +55,8 @@ import { usageFor, utcMonthStart, type MonthUsage } from './usage';
 
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
 export interface LifecycleExecutionReader {
+    /** Complete, bounded execution history, read with the same regional caller. */
+    history?(region: string, executionArn: string): Promise<import("@aws-sdk/client-sfn").HistoryEvent[]>;
     describe(
         region: string,
         executionArn: string,
@@ -67,7 +73,7 @@ export function lifecycleExecutionArn(d: LifecycleDeployment, jobId: string): st
 }
 
 /** Infra `LifecycleReceiptSchema` (intent.ts): the workflow's success output. */
-const LifecycleReceiptSchema = z
+export const LifecycleReceiptSchema = z
     .object({
         schemaVersion: z.literal(1),
         jobId: z.string().regex(/^[a-f0-9-]{36}$/),
@@ -113,7 +119,46 @@ export function nextInstanceTypeAfterCapacity(tier: AwsTier, failedType: string)
     return i >= 0 && i + 1 < types.length ? types[i + 1]! : null;
 }
 
+export type { PoolClass, PoolHostRow } from './ready-pool';
+import type { PoolClass } from './ready-pool';
+export interface PoolDeps {
+    readyAt?: typeof import('./ready-pool').readPoolSessionReadyAt;
+    validateCapacity?(tx: PlacementExecutor, p: Placement): Promise<void>;
+    leasePoolHost: typeof import('./ready-pool').leasePoolHost;
+    retireLease?: typeof import('./ready-pool').retirePoolLease;
+    publishPoolClaim: typeof import('./ready-pool').publishPoolClaim;
+    buildWork: typeof buildLifecycleWork;
+    replenish(c: PoolClass, now: Date): Promise<void>;
+}
+
+/** No deployment pool flag exists in v1. No new environment variable. */
+export function isPoolMode(deployment: Pick<LifecycleDeployment, 'region' | 'namespace'>): boolean {
+    return deployment.region === 'ap-south-1' && deployment.namespace === 'mum';
+}
+export const POOL_RELEASED = 'pool_released';
+
+export function sessionEndWork(p: Placement, deployment: LifecycleDeployment, jobId: string,
+    pool?: PoolDeps): LifecycleWork {
+    const intent = currentGenerationIntent(p, 'stop', deployment, { jobId, userData: null, leaseEpoch: p.leaseEpoch });
+    if (!isPoolMode(deployment)) return buildLifecycleWork(intent);
+    if (!pool) throw new LifecycleIntentInvalidError();
+    return pool.buildWork({ ...intent, operation: 'release' });
+}
+
+/** Only the execution's digest-bound input identifies a pool operation. */
+function executionIntent(input: string | undefined, digest: string): LifecycleIntent | null {
+    try {
+        const envelope = JSON.parse(input ?? '');
+        if (envelope.digest !== digest || createHash('sha256').update(envelope.document).digest('hex') !== digest) return null;
+        const intent = JSON.parse(envelope.document);
+        if (['provision', 'replace', 'start', 'stop', 'retire', 'release'].includes(intent.operation)
+            || (intent.operation === 'adopt' && /^[a-f0-9-]{36}$/.test(intent.poolHostId))) return intent;
+    } catch { /* Missing or malformed execution input supplies no authority. */ }
+    return null;
+}
+
 export interface ReceiptDeps {
+    pool?: PoolDeps;
     db: PlacementDb;
     meter?: ComputeMeter;
     now?: () => Date;
@@ -184,8 +229,11 @@ export async function startLifecycleJob(
  * digest, the generation, epoch and fence; anything else is a conflict and
  * the placement goes UNCONFIRMED. A boot is RUNNING only once BOTH the
  * provider receipt arrived AND GW-1 enrollment explicitly succeeded.
+ * `terminalOnly` leaves every describe failure pending, bypassing unknown-start
+ * recovery for the frequent stop-settlement pass.
  */
-export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment): Promise<void> {
+export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment, options: { terminalOnly?: boolean } = {}): Promise<void> {
+    if (!options.terminalOnly && await reconcilePoolReleaseRecovery(deps, p0, deployment)) return;
     // Migration provision receipts restore a host, but cannot open a normal epoch before commit.
     let migrationCommitted = false;
     if (p0.lastError?.startsWith('migration_pending:')) {
@@ -193,6 +241,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (!m || m.state !== 'committed' || m.computerId !== p0.computerId || m.userId !== p0.ownerUserId) return;
         migrationCommitted = true;
     }
+    let claimReadyAt: Date | null = null;
     let startDate: Date | null = null;
     let stopDate: Date | null = null;
     let endReason: EpochEndReason = 'provider_stop';
@@ -207,8 +256,8 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
                 console.error('[billing.meter] unknown instance type, epoch not opened', { computerId: p.computerId });
             } else {
                 const metered = await recordComputeMeter(() => deps.meter?.ready({
-                    userId: p.ownerUserId, computerId: p.computerId, size, readyAt: at,
-                    overheadSeconds: !migrationCommitted && startDate ? Math.max(0, Math.floor((at.getTime() - startDate.getTime()) / 1000)) : 0,
+                    userId: p.ownerUserId, computerId: p.computerId, size, readyAt: claimReadyAt ?? at,
+                    overheadSeconds: !migrationCommitted && startDate ? Math.max(0, Math.floor(((claimReadyAt ?? at).getTime() - startDate.getTime()) / 1000)) : 0,
                 }));
                 // TODO(lane C): stop the AWS loser of a concurrent ready race; the start gate cannot close this residual race.
                 if (metered === 'concurrent') console.info('[billing.epoch] concurrent AWS ready', {
@@ -238,12 +287,18 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         // No such execution, for a job whose start got no answer: once that is settled, the
         // request never reached Step Functions (`settleUnknownStart`). Otherwise unknown:
         // report the current state, try again on the next poll.
-        if (isExecutionAbsent(error)) await settleUnknownStart(deps, p, deployment);
+        if (!options.terminalOnly && isExecutionAbsent(error)) await settleUnknownStart(deps, p, deployment);
         return;
     }
     if (e.status === 'RUNNING') return;
     if (e.status !== 'SUCCEEDED') {
         if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(e.status)) {
+            const poolIntent = executionIntent(e.input, p.lifecycleDigest);
+            if (poolIntent?.operation === 'release' && isPoolOpenRelease(p)) {
+                await failPoolOpenRelease(deps, p);
+                return;
+            }
+            if (await recoverRefusedAdopt(deps, p, poolIntent, e)) return;
             const work = replacementWorkFromExecution(p, deployment, e);
             const outcome = work ? await settleReplacementGeneration(deps, p, work) : 'unconfirmed';
             if (outcome === 'settled') return;
@@ -255,6 +310,11 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         return;
     }
     if (p.state === 'UNCONFIRMED') return;
+    const poolWork = executionIntent(e.input, p.lifecycleDigest);
+    // Pool jobs cannot be interpreted as cold jobs when their input is unavailable.
+    if (isPoolMode(deployment) && !poolWork) return;
+    const adopting = poolWork?.operation === 'adopt';
+    const releasing = poolWork?.operation === 'release';
     const stopping = p.state === 'DRAINING' || p.state === 'STOPPING';
     const retiring = p.state === 'RETIRING';
     let receipt: z.infer<typeof LifecycleReceiptSchema>;
@@ -270,7 +330,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     const conflict =
         r.jobId !== p.lifecycleJobId || r.digest !== p.lifecycleDigest || r.computerId !== p.computerId.toLowerCase() ||
         r.generation !== p.generation || r.leaseEpoch !== p.leaseEpoch || r.fenceToken !== p.fenceToken ||
-        r.state !== (stopping ? 'stopped' : retiring ? 'retired' : 'running') ||
+        r.state !== (releasing || retiring ? 'retired' : stopping ? 'stopped' : 'running') ||
         (p.volumeId !== null && r.volumeId !== p.volumeId) ||
         // Any recorded instance belongs to this generation; a receipt cannot replace its identity.
         ((stopping || retiring || p.instanceId !== null) && r.instanceId !== p.instanceId);
@@ -280,6 +340,12 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     }
     startDate = e.startDate ?? null;
     stopDate = e.stopDate ?? null;
+    // Use the same provider evidence as stop-settlement epochs for pool release usage.
+    if (releasing) {
+        if (stopDate && startDate && Number.isFinite(stopDate.getTime()) && Number.isFinite(startDate.getTime())
+            && stopDate >= startDate && stopDate <= (deps.now ?? deps.clock ?? (() => new Date()))()) close.stoppedAt = stopDate;
+        else stopDate = null; // Invalid evidence uses the existing DB-clock close and observation-time meter.
+    }
     // Session limits keep their reason in lastError. An unknown StartExecution
     // overwrites it, so those ambiguous stops conservatively use provider_stop too.
     const providerStop = ['lease_expired', 'user_hours_cap', 'global_hours_cap'].includes(p.lastError ?? '')
@@ -289,7 +355,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null,
         // A stop that found its instance already gone (`instanceLost`): STOPPED with INSTANCE_LOST,
         // so the next open is a REPLACE onto the retained volume even in start mode (aws-ec2.ts).
-        lastError: stopping ? (r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : migrationCommitted ? ENROLLMENT_SUCCEEDED : p.lastError,
+        lastError: stopping ? (releasing ? POOL_RELEASED : r.instanceLost ? INSTANCE_LOST : null) : retiring ? null : migrationCommitted ? ENROLLMENT_SUCCEEDED : p.lastError,
     };
     // Fence GW-1 before a stop or retire is final: the tunnel must not outlive the instance.
     // Pending until the Worker confirms, so a failure is retried on the next look. No tunnel
@@ -309,6 +375,28 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         await step(p, 'RETIRED', done, close);
         return;
     }
+    if (adopting) {
+        if (!deps.pool) return;
+        const enrollmentReadyAt = p.updatedAt;
+        if (p.state === 'LEASED') p = await step(p, 'STARTING');
+        if (!p) return;
+        // A successful attach only publishes a claim. Enrollment after mount and
+        // desktop readiness is the claim completion and the tenant billing boundary.
+        if (enrolled(p)) {
+            claimReadyAt = deps.pool.readyAt ? await deps.pool.readyAt(deps.db, poolWork.poolHostId!, p) : enrollmentReadyAt;
+            if (!claimReadyAt) return;
+            const usage: UsageEffect = { kind: 'open', instanceId: r.instanceId,
+                instanceType: p.instanceType!, startedAt: claimReadyAt, observedBy: USAGE_OBSERVER };
+            if (p.state === 'STARTING') p = await step(p, 'MOUNTING');
+            if (p) await step(p, 'RUNNING', done, usage);
+        } else {
+            await publishAttachedPoolClaim(deps.db, p, r.volumeId, tx => deps.pool!.publishPoolClaim(tx,
+                poolWork.poolHostId!, { computerId: p!.computerId, generation: p!.generation,
+                    leaseEpoch: p!.leaseEpoch, fence: p!.fenceToken!, volumeSerial: r.volumeId.replace('-', '') },
+                (deps.now ?? (() => new Date()))()));
+        }
+        return;
+    }
     // A confirmed running instance opens its usage row, dated from the job's start (the
     // instance ran from then on: counting it is the safe direction for a cap).
     const open: UsageEffect = {
@@ -318,6 +406,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (p.state === 'DRAINING') p = await step(p, 'STOPPING');
         if (!p) return;
         if (!(await fence(p))) return;
+        if (releasing) await deps.pool?.retireLease?.(deps.db, p);
         await step(p, 'STOPPED', done, close);
         return;
     }
@@ -354,7 +443,8 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
     if (operation && deps.starter) {
         let work: LifecycleWork | null = null;
         try {
-            const rebuilt = buildLifecycleWork(currentGenerationIntent(p, operation, deployment, { jobId: p.lifecycleJobId, userData: null, leaseEpoch: p.leaseEpoch }));
+            const rebuilt = operation === 'stop' ? sessionEndWork(p, deployment, p.lifecycleJobId, deps.pool)
+                : buildLifecycleWork(currentGenerationIntent(p, operation, deployment, { jobId: p.lifecycleJobId, userData: null, leaseEpoch: p.leaseEpoch }));
             if (rebuilt.digest === p.lifecycleDigest) work = rebuilt;
         } catch (error) {
             if (!(error instanceof LifecycleIntentInvalidError)) throw error;
@@ -374,7 +464,8 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
             // Retain the failed replacement identity for a delayed execution readback.
             // Absence cannot reconstruct its authorized source pair or justify generation-1.
             ...(unresolvedReplacement ? {} : { lifecycleJobId: null, lifecycleDigest: null }),
-            enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null, lastError: LIFECYCLE_START_FAILED,
+            enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
+            lastError: isPoolOpenRelease(p) ? POOL_OPEN_RELEASE_FAILED : LIFECYCLE_START_FAILED,
         },
     });
 }
@@ -487,7 +578,7 @@ async function startStopAsReconciler(deps: GuestStopDeps, p: Placement, deployme
     if (!p.region || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return false;
     let work: LifecycleWork;
     try {
-        work = buildLifecycleWork(currentGenerationIntent(p, 'stop', deployment, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
+        work = sessionEndWork(p, deployment, (deps.newId ?? randomUUID)(), deps.pool);
     } catch (error) {
         if (error instanceof LifecycleIntentInvalidError) return false;
         throw error;
@@ -572,6 +663,45 @@ export async function enforceSessionLimits(
 
 /** Most placements one fleet pass looks at (each RUNNING one costs a DescribeInstances). */
 export const FLEET_RECONCILE_LIMIT = 20;
+
+/**
+ * Cheap minute pass: only settle recorded stops/retires through the ordinary receipt
+ * path. Reuse the placement writer's rotating claim (including other fleet states),
+ * then filter before any AWS read. At most 20 claims/describes per pass; larger fleets
+ * rotate across minute ticks. No guest probes, usage-cap scans, or lifecycle starts.
+ * Missing executions remain pending, even after the unknown-start settle window.
+ */
+export async function runAwsStopSettlement(
+    env: Env,
+    deps: Pick<ReceiptDeps, 'db' | 'executions' | 'tunnels' | 'meter' | 'now' | 'clock'> & { signal?: AbortSignal },
+): Promise<{ ok: true; skipped: string } | { ok: true; checked: number; settled: number }> {
+    if (!isAwsComputersEnabled(env)) return { ok: true, skipped: 'aws_disabled' };
+    const regions = readAwsRegions(env);
+    if (!regions.ok) return { ok: true, skipped: 'aws_config_invalid' };
+    const d = readLifecycleDeployments(env, regions.regions.map(r => r.name));
+    if (!d.ok) return { ok: true, skipped: 'aws_config_invalid' };
+    if (!deps.executions) return { ok: true, skipped: 'aws_executions_unconfigured' };
+    let checked = 0;
+    let settled = 0;
+    if (deps.signal?.aborted) return { ok: true, checked, settled };
+    for (const { computerId } of await claimAwsPlacementsToReconcile(deps.db, FLEET_RECONCILE_LIMIT)) {
+        if (deps.signal?.aborted) break;
+        try {
+            const { record } = await readPlacement(deps.db, computerId);
+            if (!record || record.provider !== 'aws-ec2' || !['STOPPING', 'RETIRING'].includes(record.state)
+                || !record.lifecycleJobId || !record.lifecycleDigest) continue;
+            const deployment = d.deployments[record.region ?? ''];
+            if (!deployment) continue;
+            checked += 1;
+            await applyLifecycleReceipt(deps, record, deployment, { terminalOnly: true });
+            const { record: current } = await readPlacement(deps.db, computerId);
+            if (current && ['STOPPED', 'RETIRED'].includes(current.state) && current.lifecycleJobId === null) settled += 1;
+        } catch (error) {
+            if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
+        }
+    }
+    return { ok: true, checked, settled };
+}
 
 /**
  * Settle aws-ec2 placements that may hold running capacity: apply the current receipt,

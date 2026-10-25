@@ -68,6 +68,9 @@ describe('placement tables have exactly one writer module', () => {
                 return false; // deleted in the working tree but still in the index
             }
         });
-        expect(offenders).toEqual([]);
+        // P8 demand reads placements to avoid double-counting leased hosts. It cannot write them.
+        const demandPath = 'app/src/server/lib/compute/ready-pool.ts';
+        expect(offenders.filter(p => p !== demandPath)).toEqual([]);
+        expect(readFileSync(path.join(REPO, demandPath), 'utf8')).not.toMatch(/(?:UPDATE|INSERT INTO|DELETE FROM) public\.ezil_computer_(?:placements|usage)/i);
     });
 });

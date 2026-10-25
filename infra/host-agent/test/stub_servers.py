@@ -27,6 +27,53 @@ class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         return req, ("unix", 0)
 
 
+class PoolApp:
+    """In-process variant for pool unit tests: same strict field and nonce checks
+    as the socket stub, without opening a network socket or logging identities.
+    """
+
+    def __init__(self, pool_lease, identity, claim, answer, empty_polls=2):
+        self.pool, self.identity, self.claim, self.answer = pool_lease, identity, claim, answer
+        self.empty_polls = empty_polls
+        self.calls = []
+        self.enrolled = False
+
+    def request(self, method, url, *, body=None, headers=None, **kwargs):
+        path = url.split("/api/compute/aws/", 1)[1]
+        self.calls.append((method, path))
+        payload = json.loads(body) if body is not None else None
+        if path.startswith("pool/"):
+            assert base64.b64decode(headers["X-Ezil-Identity-Document"]).decode() == self.identity["document"]
+            assert headers["X-Ezil-Identity-Signature"] == "".join(self.identity["signature"].split())
+            assert headers["X-Ezil-Pool-Host-Id"] == self.pool["poolHostId"]
+            assert headers["X-Ezil-Pool-Generation"] == str(self.pool["poolGeneration"])
+        if path == "pool/enroll":
+            assert method == "POST"
+            assert payload == {"poolHostId": self.pool["poolHostId"], "poolGeneration": self.pool["poolGeneration"],
+                               "identityDocument": self.identity["document"], "signature": self.identity["signature"]}
+            return 200, b"{}"
+        if path == "pool/ready":
+            assert method == "POST"
+            assert payload == {"poolHostId": self.pool["poolHostId"], "health": {"editorOk": True}}
+            return 200, b"{}"
+        if path == "pool/claim":
+            assert method == "GET" and body is None
+            if self.empty_polls:
+                self.empty_polls -= 1
+                return 204, b""
+            return 200, json.dumps(self.claim).encode()
+        assert path == "enroll" and method == "POST"
+        assert set(payload) == {"computerId", "generation", "leaseEpoch", "nonce", "identityDocument",
+                                "signature", "lowerImageDigest"}
+        for k in ("computerId", "generation", "leaseEpoch"):
+            assert payload[k] == self.claim[k]
+        assert payload["nonce"] == self.claim["enrollNonce"]
+        assert payload["identityDocument"] == self.identity["document"]
+        assert payload["signature"] == self.identity["signature"]
+        self.enrolled = True
+        return 200, self.answer  # exact replay returns the same durable credentials
+
+
 def imds(sock, d):
     tokens = set()
 

@@ -22,7 +22,7 @@ import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
     applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, reconcileGuestStop, startRetireAsReconciler, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
-    runAwsBackgroundReconcile, sessionLimitFor, enforceSessionLimits, type GuestStopDeps, type LifecycleExecutionReader,
+    runAwsBackgroundReconcile, runAwsStopSettlement, sessionLimitFor, enforceSessionLimits, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
@@ -135,6 +135,129 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     };
     return { ...fake, provider, status, enroll, read, deleted, created, starts, tunnels, executions };
 }
+
+describe('minute stop settlement', () => {
+    const pending = (over: Record<string, unknown> = {}) => row({ state: 'STOPPING', instance_id: I_NEW,
+        enroll_nonce_hash: null, enroll_expires_at: null, last_error: 'lease_expired', ...over });
+    const stoppedAt = new Date(NOW.getTime() - 42_000);
+    const success = { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }), stopDate: stoppedAt };
+    const usage = () => [{ computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium',
+        started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: null, observed_by: 'receipt', updated_at: NOW }];
+    const run = (s: ReturnType<typeof setup>) => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels });
+
+    it('settles a SUCCEEDED stop, fences the tunnel, clears the job, closes usage and meters the execution stop time exactly once', async () => {
+        const meter = { ready: vi.fn(), stopped: vi.fn(), heartbeat: vi.fn() };
+        const s = setup([pending()], success, { usage: usage() });
+        const pass = () => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels, meter });
+        expect(await pass()).toEqual({ ok: true, checked: 1, settled: 1 });
+        expect(s.placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null, lifecycle_digest: null,
+            last_error: null, volume_id: VOL, generation: 2, lease_epoch: 3 });
+        expect(s.deleted).toEqual([{ owner: { userId: U1 }, req: { computerId: C1,
+            sandboxId: expect.any(String), generation: 2, leaseEpoch: 3 } }]);
+        expect(s.usage[0]).toMatchObject({ stopped_at: NOW, observed_by: 'lifecycle-receipt' });
+        expect(meter.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: stoppedAt, reason: 'provider_stop' });
+        expect(await pass()).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(s.read).toHaveLength(1);
+        expect(s.deleted).toHaveLength(1);
+        expect(meter.stopped).toHaveBeenCalledTimes(1);
+        expect(s.starts).toEqual([]);
+    });
+
+    it('settles a successful retire through the same fence and receipt path', async () => {
+        const s = setup([pending({ state: 'RETIRING' })], { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) });
+        expect(await run(s)).toEqual({ ok: true, checked: 1, settled: 1 });
+        expect(s.placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null, lifecycle_digest: null, volume_id: VOL });
+        expect(s.deleted).toHaveLength(1);
+    });
+
+    it.each(['RUNNING', 'PENDING_REDRIVE', 'throw'])('leaves an execution with status/error %s pending', async status => {
+        const s = setup([pending()], status === 'throw' ? 'throw' : { status }, { usage: usage() });
+        const before = { ...s.placements[0] };
+        expect(await run(s)).toEqual({ ok: true, checked: 1, settled: 0 });
+        expect(s.placements[0]).toEqual({ ...before, reconciled_at: NOW });
+        expect(s.deleted).toEqual([]);
+        expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
+    it('does not undo or restart an absent execution after the unknown-start window', async () => {
+        const s = setup([pending({ last_error: 'lifecycle_start_unknown:RUNNING', updated_at: new Date(NOW.getTime() - 600_000) })]);
+        const before = { ...s.placements[0] };
+        s.executions.describe = vi.fn().mockRejectedValue(Object.assign(new Error('missing'), {
+            name: 'ExecutionDoesNotExist', $metadata: { httpStatusCode: 400 },
+        }));
+        expect(await runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels, clock: () => NOW }))
+            .toEqual({ ok: true, checked: 1, settled: 0 });
+        expect(s.placements[0]).toEqual({ ...before, reconciled_at: NOW });
+        expect(s.deleted).toEqual([]);
+        expect(s.starts).toEqual([]);
+    });
+
+    it('retries a failed tunnel fence before closing usage or clearing the stop job', async () => {
+        const s = setup([pending()], success, { usage: usage() });
+        const fence = vi.spyOn(s.tunnels, 'deleteTunnel').mockResolvedValueOnce({ ok: false });
+        expect(await run(s)).toMatchObject({ checked: 1, settled: 0 });
+        expect(s.placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: JOB, lifecycle_digest: DIGEST });
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(await run(s)).toMatchObject({ settled: 1 });
+        expect(fence).toHaveBeenCalledTimes(2);
+        expect(s.usage[0]!.stopped_at).toEqual(NOW);
+    });
+
+    it.each(['FAILED', 'TIMED_OUT', 'ABORTED'])('uses existing failure settlement for a terminal %s execution', async status => {
+        const s = setup([pending()], { status });
+        expect(await run(s)).toMatchObject({ checked: 1, settled: 0 });
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: `failed:${status}` });
+        expect(s.deleted).toEqual([]);
+    });
+
+    it('filters other placement states before describing or enforcing expired leases/caps', async () => {
+        const s = setup(['RUNNING', 'STARTING', 'UNCONFIRMED'].map((state, i) => pending({ state,
+            computer_id: `c0c0c0c0-c0c0-4c0c-8c0c-${String(i).padStart(12, '0')}`, lease_until: new Date(0) })));
+        expect(await run(s)).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(s.read).toEqual([]);
+        expect(s.statements.some(s => s.sql.includes('usage-month'))).toBe(false);
+        expect(s.starts).toEqual([]);
+    });
+
+    it('bounds each pass to 20 claims and reaches a stop behind unresolved jobs on the next pass', async () => {
+        const rows = Array.from({ length: 25 }, (_, i) => pending({
+            computer_id: `c0c0c0c0-c0c0-4c0c-8c0c-${String(i).padStart(12, '0')}`,
+            lifecycle_job_id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, '0')}`,
+        }));
+        rows.push(pending());
+        const s = setup(rows, arn => arn.endsWith(JOB) ? success : { status: 'RUNNING' });
+        expect(await run(s)).toEqual({ ok: true, checked: 20, settled: 0 });
+        expect(s.read).toHaveLength(20);
+        expect(s.placements.filter(p => p.reconciled_at !== null)).toHaveLength(20);
+        expect(await run(s)).toEqual({ ok: true, checked: 20, settled: 1 });
+        expect(s.placements.at(-1)).toMatchObject({ state: 'STOPPED' });
+    });
+
+    it('skips without touching the database when AWS is disabled, configuration is invalid, or the reader is absent', async () => {
+        const s = setup([pending()]);
+        for (const [environment, executions, skipped] of [
+            [env({ EZIL_AWS_COMPUTERS_ENABLED: '0' }), s.executions, 'aws_disabled'],
+            [env({ AWS_REGIONS: '' }), s.executions, 'aws_config_invalid'],
+            [env({ [LIFECYCLE_DEPLOYMENTS_ENV]: '{}' }), s.executions, 'aws_config_invalid'],
+            [env(), undefined, 'aws_executions_unconfigured'],
+        ] as const) {
+            expect(await runAwsStopSettlement(environment, { db: s.db, executions })).toEqual({ ok: true, skipped });
+        }
+        expect(s.statements).toEqual([]);
+    });
+
+    it('honors cancellation before claiming and between rows', async () => {
+        const s = setup([pending(), pending({ computer_id: U2 })]);
+        const controller = new AbortController();
+        const pass = () => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, signal: controller.signal });
+        s.executions.describe = vi.fn(async () => { controller.abort(); return { status: 'RUNNING' }; });
+        expect(await pass()).toEqual({ ok: true, checked: 1, settled: 0 });
+        expect(s.executions.describe).toHaveBeenCalledTimes(1);
+        const statementCount = s.statements.length;
+        expect(await pass()).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(s.statements).toHaveLength(statementCount);
+    });
+});
 
 describe('billing v2 observations', () => {
     const meter = () => ({ ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) });

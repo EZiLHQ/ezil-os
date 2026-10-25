@@ -469,6 +469,7 @@ export async function writeImagePlacement(tx: PlacementExecutor, lock: Admission
           AND lifecycle_job_id IS NOT DISTINCT FROM ${p.lifecycleJobId}::uuid
           AND image_upgrade_job_id IS NOT DISTINCT FROM ${p.imageUpgradeJobId}::uuid RETURNING computer_id`));
     if (rows.length !== 1) throw new ImageJobConflictError();
+    if (fields.state !== undefined) await applyTransitionUsageInTx(tx, { ...p, ...fields });
 }
 
 export async function findDuplicatePlacements(db: PlacementExecutor): Promise<{ computerId: string; rows: number }[]> {
@@ -554,6 +555,44 @@ async function takeAdmissionLock(tx: PlacementExecutor): Promise<AdmissionLock> 
  */
 export function withAdmission<T>(db: PlacementDb, fn: (tx: PlacementExecutor, lock: AdmissionLock) => Promise<T>): Promise<T> {
     return db.transaction(async (tx) => fn(tx, await takeAdmissionLock(tx)));
+}
+
+/** Reserve the host and its boot authority before admission's transaction commits.
+ * Admission remains the only ticket issuer. A failed host reservation rolls back
+ * the placement too, so a cold writer cannot race an ambiguous adoption.
+ */
+export function reservePoolHostForBoot(
+    db: PlacementDb,
+    admit: (db: PlacementDb) => Promise<import('./admission').AdmissionOutcome>,
+    fieldsFor: (tx: PlacementExecutor, placement: Placement) => Promise<PlacementFields | null>,
+    validate?: (tx: PlacementExecutor, placement: Placement) => Promise<void>,
+): Promise<import('./admission').AdmissionOutcome> {
+    return db.transaction(async tx => {
+        const scoped: PlacementDb = { execute: query => tx.execute(query), transaction: fn => fn(tx) };
+        const result = await admit(scoped);
+        if (!result.admitted) return result;
+        const fields = await fieldsFor(tx, result.placement);
+        if (fields === null) { await validate?.(tx, result.placement); return result; }
+        const bound = await casInTx(tx, result.placement.computerId, result.placement, result.placement.state,
+            { generation: 0, leaseEpoch: 0 }, fields, { ownerUserId: result.placement.ownerUserId,
+                provider: 'aws-ec2', lifecycleJobId: result.placement.lifecycleJobId!, lifecycleDigest: result.placement.lifecycleDigest! });
+        if (!bound.ok) throw new Error('pool_reservation_conflict');
+        await validate?.(tx, bound.placement);
+        return { admitted: true, placement: bound.placement };
+    });
+}
+
+/** Keep adopt authority until enrollment finishes; publishing the claim and
+ * recording the attached disk share the image-reservation exclusion boundary. */
+export function publishAttachedPoolClaim(db: PlacementDb, p: Placement, volumeId: string,
+    publish: (tx: PlacementExecutor) => Promise<unknown>): Promise<void> {
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, p.computerId);
+        const bound = await casInTx(tx, p.computerId, p, p.state, { generation: 0, leaseEpoch: 0 },
+            { volumeId }, { provider: 'aws-ec2', instanceId: p.instanceId, lifecycleJobId: p.lifecycleJobId!,
+                lifecycleDigest: p.lifecycleDigest!, fenceToken: p.fenceToken!, lastError: p.lastError, updatedAt: p.updatedAt });
+        if (bound.ok) await publish(tx);
+    });
 }
 
 function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
@@ -845,6 +884,8 @@ async function casInTx(
         /** Timestamp fields written as GREATEST(current, new): concurrent writers can never move them back. */
         monotonic?: readonly ('presenceAt' | 'leaseUntil')[];
     } = {},
+    usage?: UsageEffect,
+    unopenedAdopt = false,
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
@@ -890,7 +931,9 @@ async function casInTx(
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
     // Belt and braces behind the pre-read: throwing inside the transaction rolls a multi-row update back.
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
-    return { ok: true, placement: parsePlacementRow(rows[0]!, computerId) };
+    const placement = parsePlacementRow(rows[0]!, computerId);
+    if (!unopenedAdopt) await applyTransitionUsageInTx(tx, placement, usage);
+    return { ok: true, placement };
 }
 
 /** Reconciler only: settle provisional replacement authority from verified volume tags.
@@ -912,8 +955,31 @@ export async function reconcileReplacementGeneration(db: PlacementDb, expected: 
             enrollExpiresAt: null, leaseUntil: null, lastError: confirmed.instanceLost ? INSTANCE_LOST : LIFECYCLE_START_FAILED,
         }, { provider: 'aws-ec2', ownerUserId: expected.ownerUserId, confirmedGeneration: confirmed.generation,
             lifecycleJobId: expected.lifecycleJobId!, lifecycleDigest: expected.lifecycleDigest!, fenceToken: expected.fenceToken!,
-            volumeId: expected.volumeId!, updatedAt: expected.updatedAt });
-        if (result.ok) await applyUsageInTx(tx, result.placement, { kind: 'close', observedBy: 'generation-reconcile' });
+            volumeId: expected.volumeId!, updatedAt: expected.updatedAt }, { kind: 'close', observedBy: 'generation-reconcile' });
+        return result;
+    });
+}
+
+/** Pool-open bookkeeping is atomic with burning a refused, unclaimed lease.
+ * Only receipt evidence may restore source authority; epochs never move backwards.
+ */
+export async function writePoolOpen(db: PlacementDb, expected: Placement, to: 'STOPPING' | 'STOPPED',
+    fields: PlacementFields, generation = expected.generation,
+    retire?: (tx: PlacementExecutor) => Promise<void>): Promise<TransitionResult> {
+    if (expected.provider !== 'aws-ec2' || !expected.instanceId || !expected.volumeId || !expected.fenceToken
+        || !Number.isSafeInteger(generation) || generation < 1 || generation > expected.generation
+        || !(to === 'STOPPING' ? expected.state === 'STOPPED'
+            : ['LEASED', 'STARTING', 'MOUNTING', 'STOPPING', 'UNCONFIRMED'].includes(expected.state)))
+        return { ok: false, reason: 'cas_conflict' };
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, expected.computerId);
+        const result = await casInTx(tx, expected.computerId, expected, to, { generation: 0, leaseEpoch: 0 }, fields, {
+            provider: 'aws-ec2', ownerUserId: expected.ownerUserId, instanceId: expected.instanceId,
+            volumeId: expected.volumeId!, fenceToken: expected.fenceToken!, confirmedGeneration: generation,
+            lifecycleJobId: expected.lifecycleJobId ?? undefined, lifecycleDigest: expected.lifecycleDigest ?? undefined,
+            lastError: expected.lastError, updatedAt: expected.updatedAt,
+        });
+        if (result.ok && retire) await retire(tx);
         return result;
     });
 }
@@ -977,7 +1043,7 @@ export const LIFECYCLE_START_FAILED = 'lifecycle_start_failed';
 export function lifecycleStartUnknownUndo(p: Pick<Placement, 'state' | 'lastError'>): PlacementState | null {
     const prefix = `${LIFECYCLE_START_UNKNOWN}:`;
     if (!p.lastError?.startsWith(prefix)) return null;
-    const undo = p.lastError.slice(prefix.length) as PlacementState;
+    const undo = p.lastError.slice(prefix.length).split(':', 1)[0] as PlacementState;
     return PLACEMENT_TRANSITIONS[p.state]?.includes(undo) ? undo : 'UNCONFIRMED';
 }
 
@@ -989,12 +1055,12 @@ export function lifecycleStartUnknownUndo(p: Pick<Placement, 'state' | 'lastErro
  */
 export async function markLifecycleStartUnknown(
     db: PlacementDb,
-    input: { computerId: string; ownerUserId?: string; expected: CasExpectation & Pick<Placement, 'lastError'>; undo: PlacementState },
+    input: { computerId: string; ownerUserId?: string; expected: CasExpectation & Pick<Placement, 'lastError'>; undo: PlacementState; context?: string },
 ): Promise<TransitionResult> {
     if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.undo)) return { ok: false, reason: 'illegal_transition' };
     return db.transaction((tx) =>
         casInTx(tx, input.computerId, input.expected, input.expected.state, { generation: 0, leaseEpoch: 0 },
-            { lastError: `${LIFECYCLE_START_UNKNOWN}:${input.undo}` },
+            { lastError: `${LIFECYCLE_START_UNKNOWN}:${input.undo}${input.context ? `:${input.context}` : ''}` },
             { provider: 'aws-ec2', preserveState: true, lastError: input.expected.lastError, ...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}) }),
     );
 }
@@ -1021,37 +1087,90 @@ export async function transitionPlacementAsReconciler(
     if (!PLACEMENT_TRANSITIONS[from]?.includes(input.to) && !RECONCILER_TRANSITIONS[from]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
     return db.transaction(async (tx) => {
         const r = await casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {},
-            { instanceId: input.expected.instanceId, lastError: input.expected.lastError });
-        if (r.ok && input.usage) await applyUsageInTx(tx, r.placement, input.usage);
+            { instanceId: input.expected.instanceId, lastError: input.expected.lastError }, input.usage);
         return r;
     });
+}
+
+/** A live pool recovery keeps its job, fence and replay document in one CAS.
+ * Same-state writes only record diagnostics; they never imply stopped usage.
+ */
+export async function writeLivePoolRecovery(db: PlacementDb, p: Placement,
+    to: 'UNCONFIRMED' | 'RECOVERING' | 'STOPPED', fields: PlacementFields, usage?: UsageEffect,
+    completion?: 'unopened-adopt'): Promise<TransitionResult> {
+    if (p.provider !== 'aws-ec2' || !['UNCONFIRMED', 'RECOVERING'].includes(p.state)
+        || (to === 'STOPPED' && p.state !== 'RECOVERING')) return { ok: false, reason: 'illegal_transition' };
+    return db.transaction(async tx => {
+        const computer = await readCanaryComputer(tx, p.computerId);
+        if (!computer || computer.deleted || computer.userId !== p.ownerUserId) return { ok: false, reason: 'cas_conflict' };
+        if (completion === 'unopened-adopt') {
+            // The exception is admitted only for the exact durable recovery and
+            // fixed completion fields, with placement, pool and usage revalidated.
+            const { adoptRecoveryReplay, matchesAdoptRecovery, authorizeAdoptRecovery } = await import('./aws-pool-recovery');
+            const current = await lockPoolClaimPlacement(tx, p.computerId), work = adoptRecoveryReplay(p);
+            if (to !== 'STOPPED' || p.state !== 'RECOVERING' || usage !== undefined || !work
+                || !current || current.state !== 'RECOVERING' || current.lastError !== p.lastError
+                || !matchesAdoptRecovery(current, work)
+                || Object.keys(fields).length !== 4 || fields.lifecycleJobId !== null || fields.lifecycleDigest !== null
+                || fields.lastError !== 'pool_released' || fields.leaseUntil !== null
+                || !await authorizeAdoptRecovery(tx, current, true)) return { ok: false, reason: 'cas_conflict' };
+        }
+        return casInTx(tx, p.computerId, p, to, { generation: 0, leaseEpoch: 0 }, fields, {
+            provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId, lastError: p.lastError,
+            lifecycleJobId: p.lifecycleJobId ?? undefined, lifecycleDigest: p.lifecycleDigest ?? undefined,
+            fenceToken: p.fenceToken ?? undefined, volumeId: p.volumeId ?? undefined, updatedAt: p.updatedAt,
+        }, usage, completion === 'unopened-adopt');
+    });
+}
+
+/** Call while holding the placement and pool locks. Any open computer usage,
+ * or any historical use of this host (even for another computer), disqualifies it. */
+export async function assertUnopenedAdoptUsage(tx: PlacementExecutor, p: Placement): Promise<void> {
+    const rows = rowsOf(await tx.execute(sql`/* placement:adopt-unopened */ SELECT computer_id FROM public.ezil_compute_usage
+        WHERE (computer_id = ${p.computerId}::uuid AND stopped_at IS NULL) OR instance_id = ${p.instanceId} LIMIT 1`));
+    if (rows.length !== 0) throw new Error('adopt_recovery_usage');
 }
 
 // ── Usage ledger writes (R9) ─────────────────────────────────────────────
 
 /**
- * What a confirmed lifecycle receipt means for the usage ledger. Written only by
- * `transitionPlacementAsReconciler`, in the SAME transaction as the CAS that applied
- * the receipt, so only the transition's winner writes and each run is recorded once.
+ * Usage effects share the transaction of the placement write, so only the
+ * transition's winner writes. Ordinary terminal transitions close usage, including
+ * refusal rollbacks and image recovery, even when their caller supplies no effect.
+ * The strictly validated unopened-adopt completion bypasses this writer entirely.
  *
  * - `open`: the receipt confirmed this instance running. Any other open row of the
  *   computer is closed first (a replaced instance is gone); a row already open for
  *   this instance is kept, so re-applying is a no-op. `startedAt` is when the
  *   lifecycle job started (its execution start), else the database clock.
- * - `close`: the receipt confirmed the computer's instance stopped or retired.
+ * - `close`: close ALL open rows for the computer, across instances and epochs.
+ *   `stoppedAt`, when supplied, is provider evidence; otherwise use the database clock.
  *
  * Egress is NOT measured: `egress_bytes` is always written NULL, so the egress caps
  * do not bind yet (usage.ts). Only the hour caps are real.
  */
 export type UsageEffect =
     | { kind: 'open'; instanceId: string; instanceType: string; startedAt: Date | null; observedBy: string }
-    | { kind: 'close'; observedBy: string };
+    | { kind: 'close'; observedBy: string; stoppedAt?: Date };
+
+/** UNCONFIRMED alone is not proof of a stopped instance; resolved paths close explicitly. */
+async function applyTransitionUsageInTx(tx: PlacementExecutor, p: Placement, effect?: UsageEffect): Promise<void> {
+    if (p.state === 'STOPPED' || p.state === 'RETIRED' || p.state === 'PURGE_ELIGIBLE') {
+        // A terminal write cannot leave or open a usage row, even if a caller asks to open one.
+        await applyUsageInTx(tx, p, { kind: 'close', observedBy: effect?.observedBy ?? 'placement-transition',
+            ...(effect?.kind === 'close' && effect.stoppedAt ? { stoppedAt: effect.stoppedAt } : {}) });
+    } else if (effect) {
+        await applyUsageInTx(tx, p, effect);
+    }
+}
 
 async function applyUsageInTx(tx: PlacementExecutor, p: Placement, effect: UsageEffect): Promise<void> {
     const computerId = canonicalId(p.computerId);
     if (effect.kind === 'close') {
+        // Deliberately no instance, generation, owner or LIMIT filter: legacy duplicate
+        // rows must all close. Already-closed billing history is never rewritten.
         await tx.execute(sql`/* placement:usage-close */ UPDATE public.ezil_compute_usage
-            SET stopped_at = now(), observed_by = ${effect.observedBy}, updated_at = now()
+            SET stopped_at = ${effect.stoppedAt ? sql`${effect.stoppedAt.toISOString()}::timestamptz` : sql`now()`}, observed_by = ${effect.observedBy}, updated_at = now()
             WHERE computer_id = ${computerId}::uuid AND stopped_at IS NULL`);
         return;
     }
@@ -1168,7 +1287,7 @@ export function noNonCloudflarePlacement(computerId: SQL): SQL {
 }
 
 /** States `claimAwsPlacementsToReconcile` claims: RUNNING plus every state waiting on a receipt. */
-export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
+export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED', 'RECOVERING'];
 
 /**
  * `STOPPED → LEASED` (also RUNNING for a resize), reserving `lease_epoch + 1` (and `generation + 1` for a
@@ -1278,18 +1397,19 @@ export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement,
 }
 
 /** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
+export const POOL_SESSION_PENDING = 'pool_session_pending';
 export async function finishEnrollment(
     db: PlacementDb,
-    input: { computerId: string; expected: Placement; success: boolean },
+    input: { computerId: string; expected: Placement; success: boolean; poolClaim?: boolean; sessionReady?: boolean },
 ): Promise<TransitionResult> {
     return db.transaction((tx) => casInTx(
         tx, input.computerId, input.expected, input.success ? input.expected.state : 'UNCONFIRMED',
         { generation: 0, leaseEpoch: 0 },
         // Success keeps the consumed proof for the replay window; a failure can never be recovered.
-        input.success ? { lastError: ENROLLMENT_SUCCEEDED } : { lastError: ENROLLMENT_FAILED, enrollConsumedHash: null, enrollExpiresAt: null },
+        input.success ? { lastError: input.poolClaim && !input.sessionReady ? POOL_SESSION_PENDING : ENROLLMENT_SUCCEEDED } : { lastError: ENROLLMENT_FAILED, enrollConsumedHash: null, enrollExpiresAt: null },
         {
             provider: 'aws-ec2', states: ENROLLABLE_STATES, preserveState: input.success,
-            instanceId: input.expected.instanceId, lastError: ENROLLMENT_PENDING, nonceConsumed: true,
+            instanceId: input.expected.instanceId, lastError: input.sessionReady ? POOL_SESSION_PENDING : ENROLLMENT_PENDING, nonceConsumed: true,
         },
     ));
 }
@@ -1303,6 +1423,39 @@ export interface UsageRow {
     startedAt: Date;
     stoppedAt: Date | null;
     egressBytes: number | null;
+}
+
+export interface StaleOpenUsageRow extends UsageRow {
+    instanceId: string;
+    stoppedAt: null;
+    observedBy: string;
+    placementState: PlacementState;
+    placementUpdatedAt: Date;
+}
+
+/**
+ * Read-only operator report, not a billing repair. Transitional/UNCONFIRMED rows
+ * may still be running and need investigation; this helper never closes them.
+ */
+export async function findStaleOpenUsage(db: PlacementExecutor): Promise<StaleOpenUsageRow[]> {
+    const rows = rowsOf(await db.execute(sql`/* placement:usage-stale */
+        SELECT u.computer_id::text AS computer_id, u.user_id::text AS user_id,
+            u.instance_id, u.instance_type, u.started_at, u.egress_bytes::text AS egress_bytes,
+            u.observed_by, p.state AS placement_state, p.updated_at AS placement_updated_at
+        FROM public.ezil_compute_usage u
+        JOIN public.ezil_computer_placements p ON p.computer_id = u.computer_id
+        WHERE u.stopped_at IS NULL AND p.state NOT IN ('RUNNING', 'STARTING', 'MOUNTING')
+        ORDER BY u.started_at, u.computer_id, u.instance_id`));
+    return rows.map(r => {
+        const computerId = String(r.computer_id);
+        const startedAt = timestamp(r.started_at), placementUpdatedAt = timestamp(r.placement_updated_at);
+        if (!startedAt || !placementUpdatedAt || !oneOf(PLACEMENT_STATES, r.placement_state))
+            throw new PlacementIntegrityError('invalid_row', computerId);
+        return { computerId, userId: String(r.user_id), instanceId: String(r.instance_id),
+            instanceType: r.instance_type === null ? null : String(r.instance_type), startedAt, stoppedAt: null,
+            egressBytes: r.egress_bytes === null ? null : Number(r.egress_bytes), observedBy: String(r.observed_by),
+            placementState: r.placement_state, placementUpdatedAt };
+    });
 }
 
 export interface AdmissionCounters {
@@ -1594,4 +1747,26 @@ export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date,
     const rows: Record<string, unknown>[] = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] })?.rows) ?? [];
     return rows.map(row => ({ userId: String(row.user_id), computerId: String(row.computer_id),
         toSize: row.sku === 'standard_monthly_v3' ? 'standard' : 'premium' }));
+}
+
+/** Pool claim nonce writes retain the placement row lock and exact epoch binding. */
+export async function lockPoolClaimPlacement(tx: PlacementExecutor, computerId: string): Promise<Placement | null> {
+    await tx.execute(sql`SELECT computer_id FROM public.ezil_computer_placements WHERE computer_id = ${computerId}::uuid FOR UPDATE`);
+    return (await readPlacement(tx, computerId)).record;
+}
+export async function savePoolEnrollmentNonce(tx: PlacementExecutor, p: Placement,
+    nonce: { nonceHash: string; expiresAt: Date }): Promise<boolean> {
+    return rowsOf(await tx.execute(sql`UPDATE public.ezil_computer_placements
+        SET enroll_nonce_hash = ${nonce.nonceHash}, enroll_expires_at = ${nonce.expiresAt.toISOString()}::timestamptz,
+            updated_at = greatest(updated_at + interval '1 millisecond', clock_timestamp())
+        WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
+            AND instance_id = ${p.instanceId} AND enroll_consumed_hash IS NULL AND enroll_nonce_hash IS NULL
+        RETURNING computer_id`)).length === 1;
+}
+export async function readPoolMigrationReservations(tx: PlacementExecutor): Promise<number> {
+    const result = rowsOf(await tx.execute(sql`SELECT count(*) AS count FROM public.ezil_compute_migrations m
+        WHERE m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
+        AND NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = m.computer_id
+            AND p.provider = 'aws-ec2' AND p.state NOT IN ('STOPPED', 'RETIRED', 'PURGE_ELIGIBLE'))`));
+    return Number(result[0]?.count);
 }

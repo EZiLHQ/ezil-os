@@ -19,8 +19,8 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
     const instanceType=options.instanceType??'m6i.large',dataVolumeGiB=operation==='provision'?options.dataVolumeGiB??20:operation==='adopt'?options.dataVolumeGiB??null:null;
     const i:LifecycleIntent={schemaVersion:1,jobId:randomUUID(),computerId,revision:1,operation,targetGeneration:generation,fenceToken:randomUUID(),
         providerInstanceId:['provision','replace','pool-provision'].includes(operation)?null:'i-11111111111111111',
-        dataVolumeId:['provision','pool-provision'].includes(operation)||(operation==='adopt'&&dataVolumeGiB!==null)?null:'vol-11111111111111111',
-        ...(operation==='pool-provision'?{poolHostId:computerId,poolGeneration:generation}:operation==='adopt'?{poolHostId:randomUUID()}:{}),
+        dataVolumeId:['provision','pool-provision','pool-retire'].includes(operation)||(operation==='adopt'&&dataVolumeGiB!==null)?null:'vol-11111111111111111',
+        ...(['pool-provision','pool-retire'].includes(operation)?{poolHostId:computerId,poolGeneration:generation}:operation==='adopt'?{poolHostId:randomUUID()}:{}),
         previousGeneration:operation==='replace'?1:null,previousInstanceId:operation==='replace'?'i-22222222222222222':null,
         previousFenceToken:operation==='replace'?randomUUID():null,
         deployment,instanceType,dataVolumeGiB,leaseEpoch:operation==='provision'?1:3,
@@ -47,7 +47,9 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         const old=instance(i.previousInstanceId??i.providerInstanceId!,i.previousGeneration??i.targetGeneration,i.previousFenceToken??i.fenceToken);
         old.ClientToken='historical-token';if(operation==='start')old.State={Name:'stopped'};
         const v=volume();v.Tags=old.Tags;
-        if(operation==='adopt'){
+        if(operation==='pool-retire'){
+            old.Tags=tagList(poolTagsFor(i));
+        }else if(operation==='adopt'){
             old.Tags=tagList(poolTagsFor(i));v.Tags=tagList(tagsFor(i,1,randomUUID()));
         }else{
             attach(v,old);
@@ -56,6 +58,7 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
                 v.Tags=tagList({...tagsFor(i),...claimTagsFor(i)});
             }
         }
+        old.Tags!.push({Key:'aws:ec2launchtemplate:id',Value:deployment.launchTemplateId});
         state.instances.push(old);if(i.dataVolumeId!==null)state.volumes.push(v);
     }
     const deps:Dependencies={now:()=>state.now,execution:async()=>structuredClone(state.execution),authority:async()=>{state.authorityCalls++;return state.authorized;},

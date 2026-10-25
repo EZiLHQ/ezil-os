@@ -74,7 +74,7 @@ describe('v3 public plans', () => {
         expect(faq[4].answer).toContain('4 vCPU counts double and 8 vCPU counts four times');
         expect(cards(render()).join('')).not.toMatch(/standard-hour|500|40 hours a month|5 hours a month/);
         expect(cards(render())[0]).toContain('2 vCPU · 6 GB');
-        expect(cards(render())[2]).toContain('Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) in Mumbai');
+        expect(cards(render())[2]).toContain('Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)');
     });
 
     it('respects the pricing gate with fake config, including the unavailable state', () => {

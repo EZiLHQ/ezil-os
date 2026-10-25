@@ -44,21 +44,34 @@ export function parseRebaseRelease(raw: unknown, deployment: LifecycleDeployment
     return r;
 }
 
-/** A1: registry records are immutable release evidence, separate from workflow deployments. */
-export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null) {
+/** Validate registry evidence before deciding whether the source needs an EC2 observation. */
+function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null) {
     if (lowerImageDigest === null) throw new Error('source_digest_unknown');
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('release_mismatch');
     const { releases, ...rawDeployment } = entry as Record<string, unknown>;
     const deployment = LifecycleDeploymentSchema.parse(rawDeployment);
-    const records = z.array(RebaseSourceReleaseSchema).min(1).max(8).parse(releases);
+    const records = z.array(RebaseSourceReleaseSchema).min(1).max(9).parse(releases);
     if (records.some((r, i) => i > 0 && Date.parse(r.createdAt) < Date.parse(records[i - 1]!.createdAt))) throw new Error('release_mismatch');
     const targetKeys = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn',
         'lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
     const targets = records.filter(r => targetKeys.every(k => r[k] === deployment[k]));
     const sources = records.filter(r => r.lowerImageDigest === lowerImageDigest);
-    if (targets.length !== 1 || sources.length !== 1) throw new Error('release_mismatch');
-    const target = RebaseReleaseSchema.parse(targets[0]), source = sources[0]!;
+    if (targets.length !== 1 || sources.length === 0) throw new Error('release_mismatch');
+    const target = RebaseReleaseSchema.parse(targets[0]);
     const repository = target.lowerImageRef.split('@')[0]!;
+    return { sources, target, deployment, repository };
+}
+
+export function rebaseSourceRequiresAmi(entry: unknown, lowerImageDigest: string | null): boolean {
+    return rebaseReleaseCandidates(entry, lowerImageDigest).sources.length > 1;
+}
+
+/** A1/B2: an AMI is provider evidence, never HTTP input; a unique lower needs no observation. */
+export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null, observedSourceAmiId?: string) {
+    const { sources, target, deployment, repository } = rebaseReleaseCandidates(entry, lowerImageDigest);
+    const matches = sources.length > 1 ? sources.filter(r => r.amiId === observedSourceAmiId) : sources;
+    if (matches.length !== 1) throw new Error('release_mismatch');
+    const source = matches[0]!;
     if (source.accountId !== target.accountId || source.region !== target.region || source.namespace !== target.namespace
         || source.lowerImageRef.split('@')[0] !== repository) throw new Error('release_mismatch');
     if (target.previousLowerImageDigest !== lowerImageDigest) throw new Error('unsupported_predecessor');

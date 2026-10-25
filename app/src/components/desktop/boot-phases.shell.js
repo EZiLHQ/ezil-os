@@ -622,12 +622,12 @@ export const BOOT_PROGRESS_LONG_SUBTEXT =
 /** @type {Record<BootFailureReason, BootFailureCopy>} */
 export const BOOT_FAILURE_COPY = {
     operations_paused: {
-        title: 'Your Mumbai computer is paused by operations',
+        title: 'Your AWS computer is paused by operations',
         body: 'Your files are kept. Only operations can resume this computer. Try again only checks whether the pause has been lifted.',
     },
     capacity_unavailable: {
-        title: 'No Mumbai capacity right now',
-        body: 'Your files are kept. This computer can start when Mumbai capacity is available. Try again checks availability.',
+        title: 'No capacity in India right now',
+        body: 'Your files are kept. This computer can start when capacity in India is available. Try again checks availability.',
     },
     user_hours_cap: {
         title: "This month's computer hours are used up",

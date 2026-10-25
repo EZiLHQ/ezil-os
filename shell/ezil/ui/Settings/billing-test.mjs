@@ -842,7 +842,7 @@ try {
         contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === null ? 'No session time limit' : 'Sessions up to 1 hour');
         if ( tier !== 'free' ) {
             contains('[data-role="plan-card"]', `Renews on Nov 1 for $${tier === 'standard' ? 20 : 100}`);
-            contains('[data-role="your-computer"]', 'Your own computer in Mumbai');
+            contains('[data-role="your-computer"]', 'Your own computer on AWS (India)');
             contains('[data-action="portal"]', 'Manage payment');
             contains('[data-action="cancel"]', 'Cancel');
         }

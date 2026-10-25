@@ -105,7 +105,7 @@ const calls = [];
 /** Bumped per mint so each minted URL is distinguishable from every other. */
 let mintSeq = 0;
 /** What `confirmFrame` should answer next. Flipped to drive BOTH directions. */
-let confirmAnswer = true;
+let confirmAnswer; // Unknown until Direction A supplies an authenticated verdict.
 /** What `/api/shell/code-preview-url` should answer next. */
 let codePreviewUrlMode = 'ok';
 
@@ -145,6 +145,7 @@ window.fetch = async (url, opts = {}) => {
 
     if ( u.startsWith(ENDPOINTS.desktop) ) {
         if ( u.includes('confirm=frame') ) {
+            if ( confirmAnswer === undefined ) return json({ ok: false });
             return json({ ok: true, confirmed: confirmAnswer, status: confirmAnswer ? 200 : 500 });
         }
         if ( (opts.method ?? 'GET') === 'GET' ) return json({ ok: true, guacamoleRunning: true });
@@ -349,11 +350,12 @@ push('\u{1f534} ...and offers no Retry, because there is nothing to retry yet',
 push('...and is actually painted that way, not just flagged (computed display is NOT none)',
     !! progressA && window.getComputedStyle(progressA).display !== 'none',
     `display=${progressA && window.getComputedStyle(progressA).display}`);
-push('nothing asked the server before `load`',
-    ! calls.some(c => c.url.includes('confirm=frame')));
+push('the server was probed before `load`, without hiding an unconfirmed frame',
+    calls.some(c => c.url.includes('confirm=frame')) && progressA?.hidden === false);
 
+confirmAnswer = true;
 fireLoad(iframe2);
-await settle(14);
+await settle(30);
 
 push('the server WAS asked (load alone never reveals the frame)',
     calls.some(c => c.url.includes('confirm=frame')));

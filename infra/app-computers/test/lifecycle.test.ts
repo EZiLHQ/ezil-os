@@ -127,9 +127,10 @@ test('slow reads cannot dispatch a mutation beyond the original deadline',async(
 });
 test('allocation retry preserves the exact token and approved parameters',async()=>{
     const f=lifecycleFixture(),helper=createLifecycleHelper(f.settings,f.deps);
-    const first=await helper({executionArn:f.executionArn,phase:'initial'}),retry=await helper({executionArn:f.executionArn,phase:'volume'});
+    const lastError={Error:'States.Timeout',Cause:'lost response'};
+    const first=await helper({executionArn:f.executionArn,phase:'initial'}),retry=await helper({executionArn:f.executionArn,phase:'volume',lastError});
     assert.deepEqual(first,retry);f.state.volumes.push(f.volume());
-    const run=await helper({executionArn:f.executionArn,phase:'volume'}),rerun=await helper({executionArn:f.executionArn,phase:'instance'});
+    const run=await helper({executionArn:f.executionArn,phase:'volume'}),rerun=await helper({executionArn:f.executionArn,phase:'instance',lastError});
     assert.deepEqual(run,rerun);
 });
 test('unexpected AMI data devices cannot silently allocate extra volumes',async()=>{
@@ -285,7 +286,7 @@ test('graph: only the burstable state forwards CreditSpecification, and both sta
     assert.deepEqual(Object.keys(burst.Parameters),[...Object.keys(plain.Parameters),'CreditSpecification.$']);
     assert.equal(burst.Parameters['CreditSpecification.$'],'$.step.parameters.CreditSpecification');
     assert.ok(!Object.keys(plain.Parameters).includes('CreditSpecification.$'));
-    assert.equal(burst.Next,'After-runBurstableInstances');assert.equal(g.States['After-runBurstableInstances'].Next,'Observe-instance');
+    assert.equal(burst.Next,'Observe-instance');assert.equal(g.States['After-runBurstableInstances'].Next,'Observe-instance');
 });
 test('tier map: free = t3a.medium then t3.medium (burstable), plus / compute4 / compute8 are non-burstable; all allowlisted; schema refuses bad maps',()=>{
     assert.deepEqual(TIER_INSTANCE_TYPES,{free:['t3a.medium','t3.medium'],plus:['m6i.large'],compute4:['m6i.xlarge'],compute8:['m6i.2xlarge']});

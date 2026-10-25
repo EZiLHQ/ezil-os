@@ -50,7 +50,8 @@ export async function runAsl(graph: any, opts: { input: any; executionArn: strin
     sleep: (seconds: number) => void; maxSteps?: number }): Promise<AslRun> {
     let data = structuredClone(opts.input), next: string = graph.StartAt;
     const visited: string[] = [];
-    for (let n = 0; n < (opts.maxSteps ?? 2000); n++) {
+    // Preserve the old test safety budget at the lifecycle's 5x faster cadence.
+    for (let n = 0; n < (opts.maxSteps ?? 10000); n++) {
         const s = graph.States[next]; assert.ok(s, `unknown state ${next}`); visited.push(next);
         if (s.Type === 'Fail') return { error: s.Error ?? evaluate(s.ErrorPath, data, opts.executionArn),
             cause: s.Cause ?? (s.CausePath ? evaluate(s.CausePath, data, opts.executionArn) : undefined), data, visited };

@@ -180,3 +180,8 @@ async function isAwsCanary(db: PlacementExecutor, computer: ComputerRef, env: En
     // pinned there on its first sandbox start, so no one gets a computer that cannot start.
     return (await precheckAdmission(db, { userId, computerId: computer.computerId, env })).admit;
 }
+
+/** Premium is a plan priority, independent of the requested machine size (P1/P7). */
+export function poolPriorityForEntitlement(record: EntitlementRecord | null | undefined): 1 | 2 {
+    return record?.planId === 'premium_monthly_v3' || record?.planId === 'compute_monthly_v2' || record?.planId === 'pro_monthly_v1' ? 2 : 1;
+}

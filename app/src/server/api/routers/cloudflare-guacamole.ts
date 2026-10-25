@@ -75,7 +75,7 @@ import {
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
-import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
+import { prepareAwsPoolSession, requestAwsPreview } from '@/server/lib/compute/aws-preview';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer } from './compute-dispatch';
@@ -241,6 +241,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
@@ -510,6 +511,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
@@ -709,6 +711,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);

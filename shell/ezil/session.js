@@ -234,11 +234,20 @@ const AWS_MAX_ISSUES = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
 // A paid upgrade includes host provisioning and workspace/system restore.
 // Count from the first migration answer, then allow a full ordinary AWS wake.
 export const MIGRATION_DEADLINE_MS = 8 * 60_000;
+// A replacement AMI boot gets one bounded budget, retained after enrollment.
+export const LAUNCH_DEADLINE_MS = 8 * 60_000;
+export { LAUNCH_COPY } from './launch-copy.js';
+
+const LAUNCH_MAX_ISSUES = Math.ceil(LAUNCH_DEADLINE_MS / WAKE_REASK_MS) + 2;
 const MIGRATION_MAX_ISSUES = Math.ceil(MIGRATION_DEADLINE_MS / WAKE_REASK_MS) + 2;
 
 // Per-request observations let a window show a warm request's progress too.
 // Concurrent opens cannot clear one another's still-active migration signal.
 const migratingRequests = new Map();
+const launchingRequests = new Map();
+export function isComputeLaunching (computerId) {
+    return !!computerId && [...launchingRequests.values()].includes(computerId);
+}
 export function isComputeMigrating (computerId) {
     return !!computerId && [...migratingRequests.values()].includes(computerId);
 }
@@ -350,6 +359,7 @@ async function withWakeAndOneRetry (issue, what, computerId) {
     let maxIssues = MAX_ISSUES;
     let deadline = t0 + WAKE_DEADLINE_MS;
     let migrationStartedAt = null;
+    let launchStartedAt = null;
     let wakeResumed = false;
     const progressKey = Symbol();
 
@@ -396,10 +406,22 @@ async function withWakeAndOneRetry (issue, what, computerId) {
                     maxIssues = asks - 1 + AWS_MAX_ISSUES;
                 }
             }
+            const launching = res.ok !== true && res.errorCode === 'sandbox_starting'
+                && res.computeProvider === 'aws-ec2' && res.computeLaunching === true;
+            if (launching && !migrating) {
+                if (computerId) launchingRequests.set(progressKey, computerId);
+                if (launchStartedAt === null) {
+                    launchStartedAt = now;
+                    deadline = Math.max(deadline, launchStartedAt + LAUNCH_DEADLINE_MS);
+                    maxIssues = Math.max(maxIssues, asks - 1 + LAUNCH_MAX_ISSUES);
+                }
+            } else {
+                launchingRequests.delete(progressKey);
+            }
             if ( res.ok === true ) return res;
 
             if ( res.errorCode === 'sandbox_starting' ) {
-                if (res.computeProvider === 'aws-ec2' && migrationStartedAt === null) maxIssues = AWS_MAX_ISSUES;
+                if (res.computeProvider === 'aws-ec2' && migrationStartedAt === null && launchStartedAt === null) maxIssues = AWS_MAX_ISSUES;
                 const waited = now - t0;
                 if ( now >= deadline ) {
                     console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
@@ -439,6 +461,7 @@ async function withWakeAndOneRetry (issue, what, computerId) {
         }
     } finally {
         migratingRequests.delete(progressKey);
+        launchingRequests.delete(progressKey);
     }
 }
 
@@ -545,6 +568,7 @@ async function openDesktopOnce (computerId, screen) {
             errorCode: data.errorCode ?? 'unknown',
             computeProvider: data.computeProvider,
             ...(data.computeMigrating === true ? { computeMigrating: true } : {}),
+            ...(data.computeLaunching === true ? { computeLaunching: true } : {}),
             message: typeof data.error === 'string' ? data.error : undefined,
         };
     }
@@ -606,11 +630,12 @@ async function openDesktopOnce (computerId, screen) {
  */
 /**
  * A not-ok preview body for the wake loop. Preserve the provider and explicit
- * migration signal so fast AWS replies receive the appropriate bounded budget.
+ * migration or fresh-launch signal so fast AWS replies receive the appropriate bounded budget.
  */
 export function pendingOrRefused (data) {
     return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
-        ...(data?.computeMigrating === true ? { computeMigrating: true } : {}) };
+        ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
+        ...(data?.computeLaunching === true ? { computeLaunching: true } : {}) };
 }
 
 export async function previewUrl (computerId) {
@@ -699,14 +724,40 @@ export async function focusApp (computerId, app, timeoutMs = STATUS_TIMEOUT_MS) 
  *   desktop and must not be read as either verdict.
  */
 export async function confirmFrame (computerId, frameUrl, surface = 'desktop') {
-    if ( ! computerId || ! frameUrl ) return undefined;
+    return (await observeFrame(computerId, frameUrl, surface)).confirmed;
+}
+
+/**
+ * Keep the authenticated probe's transient failure evidence for Code's bounded
+ * recovery. The boolean API above still exposes just the health verdict.
+ * A retryable negative is still unconfirmed; auth/origin refusals never qualify.
+ */
+export async function observeFrame (computerId, frameUrl, surface = 'desktop') {
+    const unknown = { confirmed: undefined, retryable: false };
+    const refused = { confirmed: false, retryable: false };
+    if ( ! computerId || ! frameUrl ) return unknown;
     const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
         + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`
         + (payload()?.desktopState?.provider === 'local-vm' ? `&surface=${encodeURIComponent(surface)}` : '');
     const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
-    if ( ! res.ok ) return undefined;
-    if ( res.data?.ok !== true ) return undefined;
-    return res.data.confirmed === true;
+    // An HTTP authentication/authorization refusal is an answer, even if the
+    // response body is absent, non-JSON, or claims success. Never retry it.
+    if ( ! res.ok ) return res.status === 401 || res.status === 403 ? refused : unknown;
+    const data = res.data;
+    if ( surface === 'code' && data?.confirmed === true ) {
+        // Both hosted/local HTTP probes return a successful status and omit
+        // reason on success. A malformed or contradictory positive must not
+        // release Code's overlay, including after its recovery navigation.
+        const confirmed = data.ok === true && Number.isInteger(data.status)
+            && data.status >= 200 && data.status < 400 && !Object.hasOwn(data, 'reason');
+        return { confirmed, retryable: false };
+    }
+    if ( data?.ok !== true ) return unknown;
+    return {
+        confirmed: data.confirmed === true,
+        retryable: data.confirmed === false && (data.reason === 'unreachable'
+            || (data.reason === 'http_error' && [500, 502, 503, 504].includes(data.status))),
+    };
 }
 
 /**
@@ -1148,12 +1199,12 @@ export default {
     get, set, del,
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
-    openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, confirmDisplay,
+    openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
     previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
-    withWakeAndOneRetry, isComputeMigrating,
+    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

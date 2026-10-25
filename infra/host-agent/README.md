@@ -25,7 +25,7 @@ The pool client's wire format is:
 - `POST /api/compute/aws/pool/enroll`: `{poolHostId, poolGeneration,
   identityDocument, signature}`; `signature` is the IMDS PKCS7, as in C-6.
 - `POST /api/compute/aws/pool/ready`: `{poolHostId,
-  health:{ok:true, desktop:true, editor:true}}`.
+  health:{editorOk:true}}`.
 - `GET /api/compute/aws/pool/claim`: no body. All three requests carry
   `X-Ezil-Pool-Host-Id`, `X-Ezil-Pool-Generation`, `X-Ezil-Identity-Document`
   (base64 of the exact document bytes), and `X-Ezil-Identity-Signature`
@@ -37,35 +37,62 @@ to 30 seconds, bounded by `enrollRetrySeconds`. Other refusals and malformed
 claims stop adoption. Idle hosts refresh enrollment and readiness every five
 minutes to remain inside the contract's ten-minute enrollment window.
 
-On a claim, the host checks `ezil:fence` through IMDS tags when available. Only a
-404 on the tag collection enables the launch template's tags-disabled fallback:
-trust the fence in the identity-authenticated claim delivered over verified TLS.
-The contract specifies no independent claim-signature format. A host-only,
-fsynced `stateDir/pool-epoch.json` reserves the claim before disk access; replayed
-or lower epochs refuse, and even a later epoch cannot reuse this single-use host.
-A crash after reservation requires retirement/replacement, never pool re-entry.
+Claims require `{computerId, generation, leaseEpoch, fence, volumeSerial,
+enrollNonce}`. The nonce uses the existing C-6 format and is passed as `nonce`
+to the ordinary computer enrollment endpoint. There is no alternate pool proof.
+Counters use the ordinary lease's positive 32-bit range. Duplicate JSON keys,
+nonfinite values, malformed claims and device paths in `volumeSerial` refuse.
 
-The volume is selected solely through its EBS serial under `/dev/disk/by-id`;
-root backing devices are excluded regardless of their NVMe names. Existing disks
-can supply their filesystem UUID via `blkid`; the regular read-only marker checks
-still verify computer, volume, UUID, generation, digest and a strictly increasing
-epoch. After enrollment, the disposable desktop stops and its scratch data is
-deleted. The existing clean/overlay/desktop chain starts the user's `/root`,
-workspace and profiles on the data disk. This switches the container/home by
-restarting the desktop; live in-process home migration is not implemented.
+Before disk access, the host accepts only the claim returned by the authenticated
+app connection for its signed instance identity. IMDS metadata tags are disabled;
+the host never reads them. A host-only, fsynced `stateDir/pool-epoch.json` stores
+the accepted generation, lease epoch, fence and instance binding. Both counters
+must increase for a new acceptance, and single-use hosts refuse every second claim.
+A nonblocking lock excludes concurrent guard activations.
 
-**App-lane integration:** the minimal pinned claim omits two pieces the cold path
-uses. An optional `nonce` in the claim uses the existing C-6 enrollment unchanged.
-Without it, the host sends `{poolHostId, poolGeneration, fence}` instead of `nonce`
-to `/api/compute/aws/enroll`; the app must validate that proof against the adopted
-placement. The current cold-only endpoint needs that app-lane extension or a
-claim-provided nonce. For an unformatted new disk, the claim must additionally
-carry `provision:true` and the placement's `fsUuid`; the host refuses to invent
-either. L4c must implement the header and health shapes above. Live IMDS, runc,
-serial mounting and application interoperability still require the lead's EC2 test.
+A reserved claim resumes only on the same instance and pool generation, with
+the exact saved claim. The saved lease pins the UUID before the marker commit; an
+interrupted commit may reuse only the normal guard's exact same-instance marker.
+Durable enrollment credentials are reused after a crash, and the nonce is removed
+from both the lease and reservation after persistence. A settled enrollment
+refusal burns the host. It never becomes an idle spare again.
 
-Offline behavior tests:
-`python3 -m unittest discover -s infra/host-agent/test -p 'test_pool.py'`.
+After enrollment, the disposable desktop stops and its scratch data is deleted.
+The existing clean/overlay/agent/edge/tunnel ordering lets the relay config arrive
+before the desktop unit starts the user's disk-backed `/root`, workspace and
+profiles. Pool desktops require that config within a bounded 30-second wait and
+never start with `ice_missing`. The desktop unit starts detached runc and supervises
+it; a process restart attaches to an already-running desktop instead of issuing
+a second start. After an actual container exit, the existing bounded systemd
+restart policy still applies. Editor/desktop health gets a separate 30-second wait.
+
+The existing authenticated GW-5 `desktop` status response adds `sessionReady` for
+adopted hosts. It is true only with the committed disk stamp, matching completed
+claim, applied and unexpired relay config, and both desktop/editor health checks.
+Until then, a running container is reported as `starting`. After the one desktop
+switch and successful health check, the host sends an identity-authenticated
+`POST /api/compute/aws/pool/session-ready` with `{sessionReady:true}`. The app
+finishes the consumed enrollment at this time; acknowledgement retries preserve
+that timestamp. Initial enrollment supplies tunnel credentials without starting billing.
+
+New-volume claims carry `createVolume:true` and the placement's `fsUuid`. Only a
+serial-selected device with no filesystem or partition signature can use the
+existing cold-path initialization. Retained volumes are never reformatted.
+Claim-to-ready p90 <=30 seconds still requires live measurement.
+
+Offline tests (no sockets, AWS, Docker, real mounts or credentials):
+
+```sh
+python3 infra/host-agent/test/run-offline.py
+python3 -m unittest discover -s infra/host-agent/test -p test_pool.py
+python3 infra/host-agent/test/mutate-pool.py
+```
+
+The offline runner discovers the Python tests and explicitly excludes the TCP
+`test_edge.EdgeE2E` class. Pool protocol tests use the in-process `PoolApp` variant
+of `stub_servers.py`; block devices, IMDS and runc are mocked. The mutation runner
+uses throwaway copies and names the regression for each removed guard. The full
+privileged `test/run-all.sh` also includes pool tests through `test-units.sh`.
 
 ## Canary serial diagnostics (default off)
 

@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { AWS_RETIREMENT_UNDERWAY, AWS_RETIRING, AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
 import { START_ATTEMPTS } from './aws-receipts';
 import type { AwsTier } from './aws-config';
-import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
+import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { nonceHashOf } from './aws-enroll';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
@@ -454,7 +454,7 @@ describe('ensure: resize to the current paid plan', () => {
 describe('ensure: wake by replace (default): a NEW instance on the SAME volume, same region', () => {
     it('STOPPED → leased (generation + 1, epoch + 1, new fence, nonce hash) → replace intent → STARTING', async () => {
         const { provider, placements, calls, statements } = setup({ placements: [stopped({ generation: 3, lease_epoch: 7, enroll_consumed_hash: 'c'.repeat(64), enroll_expires_at: new Date('2026-10-14T12:00:00Z') })] });
-        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true, computeLaunching: true });
         expect(calls).toHaveLength(1);
         expect(calls[0]).toMatchObject({ region: 'ap-south-1', stateMachineArn: DEPLOYMENTS['ap-south-1'].stateMachineVersionArn });
         const i = calls[0]!.intent;
@@ -993,10 +993,14 @@ describe('Codex 4277262199: a StartExecution whose answer is lost is not a refus
                 throw Object.assign(new Error('refused'), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 400 } });
             },
         };
-        const { provider, placements } = setup({ placements: [stopped()] }, { e: startMode(), starter });
+        const openUsage = { computer_id: C1, user_id: U1, instance_id: 'i-previous', instance_type: 't3a.medium',
+            started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: null, observed_by: 'receipt', updated_at: NOW };
+        const { provider, placements, usage } = setup({ placements: [stopped()], usage: [openUsage] }, { e: startMode(), starter });
         expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'aws_lifecycle_start_failed' });
         expect(n).toBe(2);
         expect(placements[0]).toMatchObject({ state: 'STOPPED', generation: 1 });
+        expect(usage[0]!.stopped_at).toBeInstanceOf(Date);
+        expect(usage[0]!.observed_by).toBe('placement-transition');
     });
 });
 
@@ -1199,3 +1203,101 @@ describe('Codex 4278130068: an answered throttle is retried, never treated as a 
     });
 });
 
+
+
+describe('fresh replacement launch status', () => {
+    const me = { userId: U1, computerId: C1 };
+    for (const failStart of [false, 'lost'] as const) {
+        it.each([
+            ['wake mode', {}, { e: env({ EZIL_AWS_WAKE_MODE: 'replace' }) }],
+            ['enrollment failure', { state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED }, { e: startMode() }],
+            ['lost instance', { last_error: 'instance_lost' }, { e: startMode() }],
+            ['stopped resize', {}, { e: startMode(), tier: 'plus' as AwsTier }],
+            ['running resize', { state: 'RUNNING' }, { e: startMode(), tier: 'plus' as AwsTier }],
+        ])(`%s flags the first and repeated ensure/status (start answer lost: ${failStart})`, async (_name, row, over) => {
+            const s = setup({ placements: [stopped(row)] }, { ...over, failStart });
+            const first = await s.provider.ensure(ctx, me, opts);
+            expect(s.calls[0]!.intent.operation).toBe('replace');
+            expect(first).toMatchObject({ ok: false, errorCode: 'computer_starting', computeLaunching: true });
+            const calls = s.calls.length;
+            // A new provider represents another request/process, with no in-memory launch history.
+            const another = createAwsEc2Provider({ db: s.db, env: () => startMode(), now: () => NOW, starter: s.starter });
+            expect(await another.ensure(ctx, me, opts)).toMatchObject({ computeLaunching: true });
+            expect(await another.status(ctx, me)).toMatchObject({ state: 'starting', computeLaunching: true });
+            expect(s.calls).toHaveLength(calls);
+            expect(first).not.toHaveProperty('computeMigrating');
+        });
+    }
+
+    it.each([false, 'lost'] as const)('an existing stopped instance starts without launch status (lost: %s)', async failStart => {
+        const s = setup({ placements: [stopped({ generation: 4 })] }, { e: startMode(), failStart });
+        for (let i = 0; i < 2; i++) {
+            expect(await s.provider.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+            expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+        }
+        expect(s.calls[0]!.intent.operation).toBe('start');
+    });
+
+    it.each(['start', 'replace'])('a running host has no launch status in %s mode', async mode => {
+        const s = setup({ placements: [stopped({ state: 'RUNNING', generation: 4 })] }, { e: startMode({ EZIL_AWS_WAKE_MODE: mode }) });
+        expect(await s.provider.ensure(ctx, me, opts)).toEqual({ ok: true });
+        expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+        expect(s.calls).toHaveLength(0);
+    });
+
+    it('a refused replacement has no launch status', async () => {
+        const s = setup({ placements: [stopped()] }, { failStart: true });
+        expect(await s.provider.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+        expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+    });
+
+    it.each([
+        ['first provision', { state: 'PROVISIONING', generation: 1 }],
+        ['first generation', { state: 'STARTING', generation: 1 }],
+        ['stopping', { state: 'STOPPING', generation: 4 }],
+        ['no job', { state: 'STARTING', generation: 4, lifecycle_job_id: null }],
+        ['no digest', { state: 'STARTING', generation: 4, lifecycle_digest: null }],
+    ])('%s cannot claim replacement launch status from a missing instance alone', async (_name, row) => {
+        const s = setup({ placements: [stopped({ instance_id: null, lifecycle_job_id: crypto.randomUUID(), lifecycle_digest: 'a'.repeat(64), ...row })] });
+        expect(await s.provider.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+        expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+    });
+
+    for (const operation of ['replace', 'start'] as const) {
+        it.each(['LEASED', 'STARTING', 'MOUNTING'])(`%s after enrollment derives ${operation} from the recorded execution`, async state => {
+            const s = setup({ placements: [stopped({ generation: 3 })] }, { e: operation === 'start' ? startMode() : env() });
+            await s.provider.ensure(ctx, me, opts);
+            const work = buildLifecycleWork(s.calls[0]!.intent);
+            Object.assign(s.placements[0]!, { state, instance_id: 'i-22222222222222222', last_error: 'enroll_succeeded' });
+            const describe = vi.fn(async () => ({ status: 'RUNNING', input: work.input }));
+            const another = createAwsEc2Provider({ db: s.db, env: () => startMode(), now: () => NOW, starter: s.starter, executions: { describe } });
+            const ensured = await another.ensure(ctx, me, opts);
+            const status = await another.status(ctx, me);
+            expect(('computeLaunching' in ensured && ensured.computeLaunching) === true).toBe(operation === 'replace');
+            expect(status.computeLaunching === true).toBe(operation === 'replace');
+            expect(describe).toHaveBeenCalledTimes(2); // reuse receipt reads, no additional AWS request
+            Object.assign(s.placements[0]!, { state: 'RUNNING', lifecycle_job_id: null, lifecycle_digest: null });
+            expect(await another.ensure(ctx, me, opts)).toEqual({ ok: true });
+            expect(await another.status(ctx, me)).not.toHaveProperty('computeLaunching');
+        });
+    }
+
+    it.each(['missing input', 'malformed input', 'digest', 'job', 'computer', 'generation', 'epoch'])('%s cannot grant an enrolled instance launch status', async mismatch => {
+        const s = setup({ placements: [stopped()] });
+        await s.provider.ensure(ctx, me, opts);
+        const work = buildLifecycleWork(s.calls[0]!.intent);
+        Object.assign(s.placements[0]!, { instance_id: 'i-22222222222222222',
+            ...(mismatch === 'digest' ? { lifecycle_digest: 'a'.repeat(64) } : {}),
+            ...(mismatch === 'job' ? { lifecycle_job_id: crypto.randomUUID() } : {}),
+            ...(mismatch === 'generation' ? { generation: 3 } : {}),
+            ...(mismatch === 'epoch' ? { lease_epoch: 4 } : {}),
+        });
+        const input = mismatch === 'missing input' ? undefined : mismatch === 'malformed input' ? '{' : mismatch === 'computer'
+            ? buildLifecycleWork({ ...work.intent, computerId: U2, userData: Buffer.from(JSON.stringify({ ...leaseOf(work.intent.userData), computerId: U2 })).toString('base64') }).input : work.input;
+        if (mismatch === 'computer') s.placements[0]!.lifecycle_digest = buildLifecycleWork({ ...work.intent, computerId: U2, userData: Buffer.from(JSON.stringify({ ...leaseOf(work.intent.userData), computerId: U2 })).toString('base64') }).digest;
+        const another = createAwsEc2Provider({ db: s.db, env: () => env(), now: () => NOW, starter: s.starter,
+            executions: { describe: async () => ({ status: 'RUNNING', input }) } });
+        expect(await another.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+        expect(await another.status(ctx, me)).not.toHaveProperty('computeLaunching');
+    });
+});

@@ -8,7 +8,7 @@ import {
 
 import { readAwsBrowserZone, type Env } from './aws-config';
 import {
-    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ImageJobConflictError, PlacementIntegrityError, PlacementOwnerError,
+    ENROLLMENT_FAILED, ENROLLMENT_PENDING, POOL_SESSION_PENDING, ImageJobConflictError, PlacementIntegrityError, PlacementOwnerError,
     readPlacement, type Placement, type PlacementExecutor,
 } from './placement';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
@@ -31,10 +31,13 @@ const unavailable = (reason: UnavailableReason) => {
 
 const starting = () => ({ ok: false as const, error: 'sandbox_starting', errorCode: 'sandbox_starting' });
 
-function placementRefusal(p: Placement | null) {
+function placementRefusal(p: Placement | null, preparePool = false) {
     if (!p) return unavailable('placement_missing');
     if (p.provider !== 'aws-ec2') return unavailable('placement_provider');
     if (p.generation < 1 || p.leaseEpoch < 1) return unavailable('placement_epoch_invalid');
+    if (preparePool) return p.lastError === POOL_SESSION_PENDING && p.enrollNonceHash === null && p.enrollConsumedHash !== null
+        && p.instanceId !== null && p.volumeId !== null && p.lifecycleJobId !== null && p.lifecycleDigest !== null
+        && ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state) ? null : starting();
     if (p.lastError === ENROLLMENT_FAILED) return unavailable('enrollment_failed');
     if (['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state)) return starting();
     if (p.state !== 'RUNNING') return unavailable('placement_not_running');
@@ -88,6 +91,7 @@ export async function requestAwsPreview(
     hmacSecret: string,
     correlationId: string,
     env: Env = process.env,
+    preparePool = false,
 ) {
     if (!config.isConfigured || !hmacSecret.trim()) return unavailable('config_missing');
     // The ONLY zone an AWS browser host may sit in: the Worker's configured preview root
@@ -103,7 +107,7 @@ export async function requestAwsPreview(
         // Check ownership BEFORE the reservation read (including the second read below).
         const readOwned = () => readPlacement(db, computer.computerId, computer.userId);
         const { record: placement } = await readOwned();
-        const refused = placementRefusal(placement);
+        const refused = placementRefusal(placement, preparePool);
         if (refused) return refused;
         if (!placement) return unavailable('placement_missing');
         const sandboxId = deriveGuacamoleSandboxId(placement.ownerUserId, placement.computerId);
@@ -185,3 +189,8 @@ export async function requestAwsPreview(
 }
 
 export type AwsPreviewResult = Awaited<ReturnType<typeof requestAwsPreview>>;
+
+/** Prime the existing Worker relay exchange after enrollment, before session-ready. No URLs escape. */
+export async function prepareAwsPoolSession(...args: Parameters<typeof requestAwsPreview>): Promise<void> {
+    await requestAwsPreview(args[0], args[1], args[2], args[3], args[4], args[5], args[6], true);
+}

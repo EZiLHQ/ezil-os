@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+// Materialize every star in an IAM test pattern, never a partially wildcarded example.
+export const starExample = (pattern: string, value: string): string => pattern.replaceAll('*', value);
 export const list = (v: any): any[] => v === undefined ? [] : [v].flat();
 const matches = (pattern: string, value: string) => new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$').test(value);
 export function evaluate(statements: any[], action: string, resource: string, context: Record<string, unknown>) {

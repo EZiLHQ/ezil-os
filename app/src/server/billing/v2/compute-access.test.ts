@@ -208,7 +208,7 @@ describe('billingV2EntitlementReader', () => {
     });
 
     it.each([{ BILLING_TAB_ENABLED: '1' }, { BILLING_ENFORCEMENT: '1' }])('either metering flag reads billing (%j)', async config => {
-        const { deps } = fixture({ config: readBillingConfig(config), subs: [subscription({ sku: 'compute_monthly_v2' })], sizePreference: 'cmp-8' });
+        const { deps } = fixture({ config: readBillingConfig(config), subs: [subscription({ sku: 'compute_monthly_v2' })], grants:[grant()], sizePreference: 'cmp-8' });
         expect(await billingV2EntitlementReader(() => deps).read(USER)).toEqual({ source: 'billing_v2',
             status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false });
     });
@@ -486,16 +486,30 @@ describe('v3 compute enforcement', () => {
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW }))
             .toEqual({ allowed: false, reason: 'fair_use_paused' });
     });
+    it('paid cancellation at period end keeps access only through the paid period', async () => {
+        const {deps,input}=fixture({config:readBillingConfig({BILLING_ENFORCEMENT:'1'}),
+            subs:[subscription({sku:'premium_monthly_v3',cancelAtPeriodEnd:true})], grants:[grant()]});
+        const reader=billingV2EntitlementReader(()=>deps);
+        expect(await reader.read(USER)).toMatchObject({provider:'aws',status:'active'});
+        input.subs=[subscription({sku:'premium_monthly_v3',cancelAtPeriodEnd:true,currentPeriodEnd:NOW})];
+        expect(await reader.read(USER)).toMatchObject({provider:'cloudflare',planId:'free_v3'});
+        input.subs=[subscription({sku:'premium_monthly_v3',status:'canceled'})];
+        expect(await reader.read(USER)).toMatchObject({provider:'cloudflare',planId:'free_v3'});
+    });
     it('requires a paid-period receipt, and rejects revoked or foreign grants', async () => {
         const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }), subs: [subscription({ sku: 'standard_monthly_v3' })] });
         const gate = () => gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW });
         expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({status:'expired'});
         input.grants = [grant({ amount: BigInt(144000), subscriptionId: 'foreign' })];
         expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({status:'expired'});
         input.grants = [grant({ amount: BigInt(144000) })];
         expect(await gate()).toEqual({ allowed: true });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({status:'active'});
         input.grants = [...input.grants, grant({ kind: 'revoke', amount: BigInt(-144000) })];
         expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({status:'expired'});
     });
     it('retains paid Standard while an upgrade requires payment and blocks a second computer', async () => {
         const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),

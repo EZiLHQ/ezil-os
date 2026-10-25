@@ -76,6 +76,13 @@ export function planFromSubscriptions(input: {
     let current: Candidate | undefined;
     let delinquent: Candidate | undefined;
     const now = input.now.getTime();
+    // Match the pool SQL's selection before funding is evaluated: latest period
+    // end, latest start, then subscription ID. Input/query order is not authority.
+    const preferred = (a: Candidate, b: Candidate) => a.end > b.end || (a.end === b.end
+        && ((a.sub.currentPeriodStart?.getTime() ?? -Infinity) > (b.sub.currentPeriodStart?.getTime() ?? -Infinity)
+            || (a.sub.currentPeriodStart?.getTime() === b.sub.currentPeriodStart?.getTime()
+                && a.sub.stripeSubscriptionId < b.sub.stripeSubscriptionId)));
+
 
     for (const sub of input.subs) {
         const offer = offerBySku(sub.sku);
@@ -85,9 +92,9 @@ export function planFromSubscriptions(input: {
         const end = sub.currentPeriodEnd?.getTime() ?? NaN;
         const candidate = { sub, offer, status, end: Number.isFinite(end) ? end : -Infinity };
         if ((status === 'active' || status === 'cancels') && start <= now && now < end) {
-            if (!current || candidate.end > current.end) current = candidate;
+            if (!current || preferred(candidate,current)) current = candidate;
         } else if (status === 'past_due' || status === 'incomplete') {
-            if (!delinquent || candidate.end > delinquent.end) delinquent = candidate;
+            if (!delinquent || preferred(candidate,delinquent)) delinquent = candidate;
         }
     }
 

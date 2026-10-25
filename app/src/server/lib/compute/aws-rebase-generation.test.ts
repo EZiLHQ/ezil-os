@@ -20,7 +20,11 @@ async function setup(pair: 'source' | 'target' = 'source') {
         zone_id: i.deployment.zoneId, instance_id: null, instance_type: i.instanceType, volume_id: i.dataVolumeId,
         lifecycle_job_id: i.jobId, lifecycle_digest: work.digest, fence_token: i.fenceToken,
         enroll_nonce_hash: 'a'.repeat(64), enroll_consumed_hash: 'b'.repeat(64), enroll_expires_at: now,
-    })] }, { clock: () => now });
+    })], usage: [i.previousInstanceId, 'i-22222222222222222'].map(instance_id => ({
+        computer_id: i.computerId, user_id: '11111111-1111-4111-8111-111111111111', instance_id,
+        instance_type: i.instanceType, started_at: new Date('2026-10-22T09:00:00Z'), stopped_at: null,
+        egress_bytes: null, observed_by: 'lifecycle-receipt', updated_at: now,
+    })) }, { clock: () => now });
     const p = (await readPlacement(fake.db, i.computerId)).record!;
     const source: Ec2EnrollmentView = { instanceId: i.previousInstanceId!, state: 'terminated', tags: tags(false),
         availabilityZone: 'ap-south-1a', availabilityZoneId: i.deployment.zoneId, publicIp: null, volumes: [] };
@@ -45,6 +49,8 @@ describe('ordinary replace and resize generation settlement', () => {
         expect(p.fenceToken).toBe(pair === 'source' ? s.work.intent.previousFenceToken : s.work.intent.fenceToken);
         expect(p.leaseEpoch).toBe(s.p.leaseEpoch);
         expect([p.lifecycleJobId, p.lifecycleDigest, p.enrollNonceHash, p.enrollConsumedHash, p.enrollExpiresAt]).toEqual([null, null, null, null, null]);
+        expect(s.fake.usage).toHaveLength(2);
+        for (const row of s.fake.usage) expect(row).toMatchObject({ stopped_at: now, observed_by: 'generation-reconcile' });
         expect(await settleReplacementGeneration(s.deps, s.p, s.work)).toBe('unconfirmed');
     });
     it('a definite StartExecution refusal may restore a stopped source without inventing a target', async () => {
@@ -55,6 +61,16 @@ describe('ordinary replace and resize generation settlement', () => {
         expect(s.fake.placements[0]!.generation).toBe(1);
         expect(s.fake.placements[0]!.lease_epoch).toBe(4);
         expect(s.fake.placements[0]!.instance_type).toBe('t3a.medium');
+        for (const row of s.fake.usage) expect(row).toMatchObject({ stopped_at: now, observed_by: 'generation-reconcile' });
+    });
+    it('a lower_digest_mismatch host refusal with no enrollment closes usage when resolved to STOPPED', async () => {
+        const s = await setup();
+        s.fake.placements[0]!.enroll_consumed_hash = null;
+        const p = (await readPlacement(s.fake.db, s.p.computerId)).record!;
+        await applyLifecycleReceipt({ ...s.deps, executions: { describe: async () => ({ ...s.execution,
+            error: 'LifecycleRefused', cause: 'lower_digest_mismatch' }) } }, p, s.work.intent.deployment);
+        expect(s.fake.placements[0]).toMatchObject({ state: 'STOPPED', enroll_consumed_hash: null, lifecycle_job_id: null });
+        for (const row of s.fake.usage) expect(row).toMatchObject({ stopped_at: now, observed_by: 'generation-reconcile' });
     });
     it.each(['missing target', 'live target', 'live source', 'unknown volume', 'wrong tags', 'foreign key', 'owner race', 'job race', 'epoch race'])(
         '%s cannot release a failed replacement', async (fault) => {
@@ -70,6 +86,7 @@ describe('ordinary replace and resize generation settlement', () => {
             if (fault === 'epoch race') s.fake.placements[0]!.lease_epoch = 5;
             expect(await settleReplacementGeneration(s.deps, s.p, s.work)).toBe(fault === 'wrong tags' ? 'generation_drift' : 'unconfirmed');
             expect(s.fake.placements[0]!.state).toBe('STARTING');
+            expect(s.fake.usage.every(row => row.stopped_at === null)).toBe(true);
         });
     it.each(['hash', 'version', 'alias', 'redrive', 'execution', 'duplicate'])('rejects %s execution evidence', async (fault) => {
         const s = await setup();
@@ -79,7 +96,12 @@ describe('ordinary replace and resize generation settlement', () => {
         if (fault === 'alias') e.stateMachineAliasArn = 'alias';
         if (fault === 'redrive') e.redriveCount = 1;
         if (fault === 'execution') e.executionArn += 'x';
-        if (fault === 'duplicate') e.input = e.input.replace('{', '{"schemaVersion":1,');
+        if (fault === 'duplicate') {
+            // Insert exactly one duplicate envelope key; leave nested/serialized JSON intact.
+            expect(e.input.startsWith('{')).toBe(true);
+            e.input = '{"schemaVersion":1,' + e.input.slice(1);
+            expect(JSON.parse(e.input)).toEqual(JSON.parse(s.execution.input));
+        }
         expect(replacementWorkFromExecution(s.p, s.work.intent.deployment, e)).toBeNull();
     });
 });

@@ -10,6 +10,7 @@ import { DIGEST } from './strict-json.js';
  * - m6i.large (2 vCPU / 8 GiB): the upgraded tier.
  * - c6i.xlarge (4 vCPU / 8 GiB): benchmarks only.
  * - m6i.xlarge / m6i.2xlarge (4 / 8 vCPU): paid Compute sizes cmp-4 / cmp-8, billing v2. */
+export const POOL_INSTANCE_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
 export const INSTANCE_TYPES = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'] as const;
 export const InstanceTypeSchema = z.enum(INSTANCE_TYPES);
 export type InstanceType = z.infer<typeof InstanceTypeSchema>;

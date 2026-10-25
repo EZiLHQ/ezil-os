@@ -7,7 +7,7 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
-    consumeEnrollmentNonce, createPlacement, lockImagePlacement, readPlacement, reconcileReplacementGeneration,
+    consumeEnrollmentNonce, createPlacement, findStaleOpenUsage, lockImagePlacement, readPlacement, reconcileReplacementGeneration,
     setImageReservation, transitionPlacement, withAdmission, writeImagePlacement,
     type ImagePlacementFields, type Placement, type PlacementDb, type PlacementExecutor,
 } from './placement';
@@ -76,6 +76,65 @@ describe.skipIf(!PG)('placement writes on production Drizzle PostgreSQL', () => 
                 '${nonceHash}', '2099-01-02T00:00:00.000Z', '2026-10-22T00:00:00.000Z')`));
     });
     afterAll(async () => { try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); } finally { await client?.end(); } });
+
+    const seedUsage = async () => {
+        for (const instance of ['i-old', 'i-current', 'i-current']) await db.execute(sql`
+            INSERT INTO public.ezil_compute_usage
+                (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, egress_bytes, observed_by, updated_at)
+            VALUES (${computerId}::uuid, ${ownerUserId}::uuid, ${instance}, 'm6i.large',
+                '2026-10-22T09:00:00Z', NULL, NULL, 'receipt', '2026-10-22T09:00:00Z')`);
+        await db.execute(sql`INSERT INTO public.ezil_compute_usage
+            (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, egress_bytes, observed_by, updated_at)
+            VALUES (${computerId}::uuid, ${ownerUserId}::uuid, 'i-history', 'm6i.large',
+                '2026-10-21T09:00:00Z', '2026-10-21T10:00:00Z', 123, 'history', '2026-10-21T10:00:00Z')`);
+    };
+    const ledger = () => db.execute(sql`SELECT * FROM public.ezil_compute_usage ORDER BY instance_id, started_at`) as Promise<Record<string, unknown>[]>;
+
+    it('a refused lease closes all instances and duplicates while preserving historical rows', async () => {
+        await seedUsage();
+        const history = (await ledger()).find(r => r.instance_id === 'i-history');
+        expect(await transitionPlacement(db, { computerId, ownerUserId, expected: await current(), to: 'STOPPED' })).toMatchObject({ ok: true });
+        const rows = await ledger();
+        expect(rows).toHaveLength(4);
+        expect(rows.every(r => r.stopped_at !== null)).toBe(true);
+        const closed = rows.filter(r => r.instance_id !== 'i-history');
+        expect(new Set(closed.map(r => r.stopped_at)).size).toBe(1);
+        expect(closed.every(r => r.observed_by === 'placement-transition' && r.updated_at === r.stopped_at)).toBe(true);
+        expect(rows.find(r => r.instance_id === 'i-history')).toEqual(history);
+    });
+
+    it('image recovery into STOPPED closes the complete open ledger', async () => {
+        await seedUsage();
+        await imageUpdate({ state: 'RECOVERING' });
+        await imageUpdate({ state: 'STOPPED' });
+        expect((await ledger()).every(r => r.stopped_at !== null)).toBe(true);
+    });
+
+    it('a failed usage write rolls back the terminal placement transition', async () => {
+        await seedUsage();
+        const before = await ledger(), p = await current();
+        await client!.unsafe(`ALTER TABLE ${schema}.ezil_compute_usage ADD CONSTRAINT forbid_close
+            CHECK (observed_by <> 'placement-transition')`);
+        try {
+            await expect(transitionPlacement(db, { computerId, ownerUserId, expected: p, to: 'STOPPED' })).rejects.toThrow();
+            expect(await current()).toEqual(p);
+            expect(await ledger()).toEqual(before);
+        } finally { await client!.unsafe(`ALTER TABLE ${schema}.ezil_compute_usage DROP CONSTRAINT forbid_close`); }
+    });
+
+    it('reports stale open rows with native codecs and leaves every row unchanged', async () => {
+        await seedUsage();
+        const before = await ledger();
+        const report = await findStaleOpenUsage(db);
+        expect(report).toHaveLength(3);
+        expect(report[0]).toMatchObject({ computerId, userId: ownerUserId, placementState: 'LEASED', stoppedAt: null,
+            startedAt: new Date('2026-10-22T09:00:00Z'), placementUpdatedAt: new Date('2026-10-22T00:00:00Z') });
+        for (const state of ['RUNNING', 'STARTING', 'MOUNTING']) {
+            await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET state = '${state}'`);
+            expect(await findStaleOpenUsage(db)).toEqual([]);
+        }
+        expect(await ledger()).toEqual(before);
+    });
 
     it('binds all image Date fields through the production driver and preserves NULL clearing', async () => {
         const times = { enrollExpiresAt: new Date('2026-10-22T12:30:00.123Z'),

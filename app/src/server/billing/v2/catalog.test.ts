@@ -191,6 +191,12 @@ describe('planFromSubscriptions', () => {
         expect(subs).toEqual([later, earlier]);
     });
 
+    it('ties use latest start then subscription ID, never input order or funding',()=>{
+        const a=subscription({stripeSubscriptionId:'sub-a'}),b=subscription({stripeSubscriptionId:'sub-b',sku:'compute_monthly_v2'});
+        for(const subs of [[a,b],[b,a]])expect(resolve(subs).subscriptionId).toBe('sub-a');
+        const later={...b,currentPeriodStart:new Date(a.currentPeriodStart!.getTime()+1000)};
+        for(const subs of [[a,later],[later,a]])expect(resolve(subs).subscriptionId).toBe('sub-b');
+    });
     it('prefers a current subscription over a delinquent row with a later end', () => {
         const current = subscription();
         const delinquent = subscription({

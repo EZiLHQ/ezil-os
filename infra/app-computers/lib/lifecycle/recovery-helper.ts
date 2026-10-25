@@ -42,7 +42,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         const i = parseLifecycleWork({ ...envelope, createdAt: source.startDate });
         // The historical cleanup graph cannot prove a pool claim or perform
         // release's detach sequence. Leave its reservation unconfirmed.
-        if (['pool-provision', 'adopt', 'release'].includes(i.operation)) return fail();
+        if (['pool-provision', 'pool-retire', 'adopt', 'release'].includes(i.operation)) return fail();
         if (!await matchesLifecycleDeployment(i, d, deps)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
             || execution.name !== `cleanup-computer-${i.jobId}`
@@ -101,7 +101,9 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         }
         if (targets.length && !v) return fail();
         for (const { instance } of targets) {
-            if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || instance.SubnetId !== d.subnetId
+            // EC2 may omit networking fields after termination; reported values must still match.
+            const subnetOmitted = instance.State?.Name === 'terminated' && instance.SubnetId === undefined;
+            if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || (!subnetOmitted && instance.SubnetId !== d.subnetId)
                 || (instance.Placement?.AvailabilityZoneId !== undefined && instance.Placement.AvailabilityZoneId !== d.zoneId)) return fail();
         }
         if (v?.Attachments?.some(a => !targets.some(t => t.instance.InstanceId === a.InstanceId) || a.VolumeId !== v.VolumeId)) return fail();

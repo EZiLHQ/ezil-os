@@ -116,8 +116,15 @@ test('item 6: storage deletion is denied; only lifecycle may detach an owned vol
             assert.ok(statements(t, prefix).some(s => s.Effect === 'Deny' && actions(s).includes(action)), `${prefix} denies ${action}`);
         }
     }
-    const detach = allows(all, 'ec2:DetachVolume'); assert.equal(detach.length, 1);
-    assert.equal(detach[0]!.Condition!.Null!['aws:ResourceTag/ezil:computer'], 'false');
+    const detach = allows(all, 'ec2:DetachVolume'); assert.equal(detach.length, 4);
+    assert.equal(detach[0]!.Condition!.Null!['aws:ResourceTag/ezil:computer-id'], 'false');
+    assert.equal(detach[1]!.Condition!.Null!['aws:ResourceTag/ezil:computer'], 'false');
+    for (const statement of detach) {
+        assert.equal(statement.Condition!.StringEquals!['ec2:ResourceTag/ezil:managed-by'], 'app-computer-platform');
+        assert.equal(statement.Condition!.StringEquals!['ec2:ResourceTag/ezil:stage'], 'pilot');
+        if (JSON.stringify(statement.Resource).includes(':volume/'))
+            assert.equal(statement.Condition!.StringEquals!['ec2:AvailabilityZoneId'], 'aps1-az1');
+    }
     assert.ok(statements(t, 'RecoveryRecoveryRole').some(s => s.Effect === 'Deny' && actions(s).includes('ec2:DetachVolume')));
     assert.ok(!all.some(s => s.Effect === 'Allow' && actions(s).some(a => a === 'ec2:*' || a === '*' || a === 'iam:CreateRole')));
     const stop = allows(all, 'ec2:StopInstances');

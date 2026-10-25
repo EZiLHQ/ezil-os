@@ -1,165 +1,353 @@
-/** Offline, single-use ready pool. No lifecycle caller imports this module. */
-import { sql, type SQL } from 'drizzle-orm';
-import { assertNoImageReservation, lockImagePlacement, withAdmission, type PlacementDb } from './placement';
-import { AWS_REGION_PATTERN, instanceVcpu } from './aws-config';
+/** Single-use warm hosts. Callers own admission, lifecycle execution and transactions. */
+import { sql } from 'drizzle-orm';
+import { RUNNING_CLASS_STATES, type PlacementExecutor } from './placement';
+import { AWS_REGION_PATTERN, INSTANCE_VCPU, instanceVcpu, readAwsRegions } from './aws-config';
 
-export const POOL_INSTANCE_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
-export type PoolInstanceType = typeof POOL_INSTANCE_TYPES[number];
-export interface PoolExecutor { execute(query: SQL): Promise<unknown> }
-export interface LeasedPoolHost {
-    id: string;
-    region: string;
-    zoneId: string;
-    instanceId: string;
-    instanceType: PoolInstanceType;
-    state: 'leased';
-    generation: number;
-    leasedGeneration: number;
-    leasedComputerId: string;
-    leaseToken: string;
-    leasedAt: Date;
-    editorReadyAt: Date;
+export const POOL_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
+export type PoolClass = { region: string; zoneId: string; instanceType: typeof POOL_TYPES[number]; deployment?: import('./aws-intent').LifecycleDeployment };
+export type PoolHostState = 'booting' | 'ready' | 'leased' | 'retiring' | 'retired' | 'failed';
+export interface PoolHostRow {
+    poolHostId: string; poolGeneration: number; region: string; zoneId: string; instanceType: string;
+    instanceId: string | null; state: PoolHostState; readyAt: Date | null; enrolledAt: Date | null;
+    leasedComputerId: string | null; leasedAt: Date | null; claimGeneration: number | null;
+    claimPublishedAt?: Date | null;
+    claimLeaseEpoch: number | null; claimFence: string | null; claimVolumeSerial: string | null;
 }
-
+export interface PoolDemand {
+    pending?: number; opens15m: number; activeStandard: number; activePremium: number; bootMinutes: number | null;
+    ready?: number; spares: number; vcpuInUse: number; regionVcpuCap: number; killSwitch: boolean;
+    idleReady: { poolHostId: string; readyAt: Date; obsolete?: boolean; unusable?: boolean }[];
+    booting: { poolHostId: string; createdAt: Date }[];
+}
+export type PoolData = Pick<typeof import('./ready-pool'), 'recordPoolEnrollment' | 'recordPoolReady' | 'readPoolClaim' | 'markPoolHost' | 'readPoolDemand' | 'readPoolReadinessDiagnostics' | 'planPool' | 'POOL_POLICY'>;
+export interface PoolReadinessDiagnostic {
+    poolHostId: string; instanceId: string | null; createdAt: string; enrolledAt: string | null; health: string;
+}
+export const POOL_POLICY: Record<string, { minSpares: number; maxSpares: number }> = {
+    'ap-south-1:m6i.large': { minSpares: 1, maxSpares: 4 },
+    'ap-south-1:m6i.xlarge': { minSpares: 1, maxSpares: 4 },
+    'ap-south-1:m6i.2xlarge': { minSpares: 1, maxSpares: 4 },
+};
+const MINUTE = 60_000;
 function rowsOf(result: unknown): Record<string, unknown>[] {
     const rows = Array.isArray(result) ? result : (result as { rows?: unknown } | null)?.rows;
     if (!Array.isArray(rows)) throw new Error('pool_result_invalid');
     return rows as Record<string, unknown>[];
 }
-function generationOf(value: unknown): number {
+function count(value: unknown): number {
     const n = Number(value);
-    if (!Number.isSafeInteger(n) || n < 1) throw new Error('pool_generation_invalid');
+    if (value === null || !Number.isSafeInteger(n) || n < 0) throw new Error('pool_count_invalid');
     return n;
 }
-function checkClass(region: string, instanceType: PoolInstanceType): void {
-    if (!AWS_REGION_PATTERN.test(region) || !POOL_INSTANCE_TYPES.includes(instanceType)) throw new Error('pool_class_invalid');
+function positive(value: unknown): number {
+    const n = count(value);
+    if (n === 0) throw new Error('pool_generation_invalid');
+    return n;
+}
+function checkClass(c: PoolClass): void {
+    if (!AWS_REGION_PATTERN.test(c.region) || !POOL_TYPES.includes(c.instanceType) || !c.zoneId) throw new Error('pool_class_invalid');
+}
+/** Provision input is immutable; a different release is not a compatible spare. */
+function compatibleDeployment(c: PoolClass) {
+    return c.deployment ? sql`(lifecycle_input::jsonb->>'document')::jsonb->'deployment' = ${JSON.stringify({...c.deployment, storage: {rootDeviceName:'/dev/sda1', ...c.deployment.storage}})}::jsonb` : sql`TRUE`;
+}
+/** Identical readiness predicate for leasing and counting usable warm capacity. */
+function usableReady(at: string) {
+    return sql`state = 'ready' AND health = 'healthy'
+                AND instance_id IS NOT NULL
+                AND editor_ready_at IS NOT NULL AND editor_ready_at <= ${at}::timestamptz
+                AND ready_at IS NOT NULL AND ready_at <= ${at}::timestamptz
+                AND enrolled_at > ${at}::timestamptz - interval '10 minutes' AND enrolled_at <= ${at}::timestamptz
+                AND generation > 0 AND generation <= ${Number.MAX_SAFE_INTEGER}
+                AND leased_computer_id IS NULL AND leased_at IS NULL
+                AND leased_generation IS NULL AND lease_token IS NULL`;
+}
+const date = (value: unknown) => value == null ? null : new Date(value as string | Date);
+const nullableString = (value: unknown) => value == null ? null : String(value);
+function host(row: Record<string, unknown>): PoolHostRow {
+    return {
+        poolHostId: String(row.id), poolGeneration: positive(row.generation), region: String(row.region),
+        zoneId: String(row.zone_id), instanceType: String(row.instance_type), instanceId: nullableString(row.instance_id),
+        state: row.state as PoolHostState, readyAt: date(row.ready_at), enrolledAt: date(row.enrolled_at),
+        leasedComputerId: nullableString(row.leased_computer_id), leasedAt: date(row.leased_at),
+        claimGeneration: row.claim_generation == null ? null : positive(row.claim_generation),
+        claimLeaseEpoch: row.claim_lease_epoch == null ? null : positive(row.claim_lease_epoch),
+        ...(row.claim_generation != null ? { claimPublishedAt: date(row.updated_at) } : {}),
+        claimFence: nullableString(row.claim_fence), claimVolumeSerial: nullableString(row.claim_volume_serial),
+    };
+}
+function optionalHost(result: unknown): PoolHostRow | null {
+    const row = rowsOf(result)[0];
+    return row ? host(row) : null;
+}
+function requiredHost(result: unknown): PoolHostRow {
+    const row = optionalHost(result);
+    if (!row) throw new Error('pool_state_conflict');
+    return row;
 }
 
-/** All clean-host writes must use this boundary: additiveSQL cannot express
- * CHECKs or DEFAULTs. Only the atomic lease statement may enter leased state. */
-export async function insertPoolHost(db: PoolExecutor, input: {
-    id: string; region: string; zoneId: string; instanceId: string; instanceType: PoolInstanceType;
-    state: string; health: string; editorReadyAt: Date | null; now: Date; generation?: number;
-}): Promise<void> {
-    checkClass(input.region, input.instanceType);
-    if (!['booting', 'ready', 'draining', 'retired'].includes(input.state)) throw new Error('pool_state_invalid');
-    if (!['unknown', 'healthy', 'unhealthy'].includes(input.health)) throw new Error('pool_health_invalid');
-    const generation = generationOf(input.generation ?? 1);
-    const at = input.now.toISOString();
-    await db.execute(sql`
-        INSERT INTO public.ezil_compute_pool_hosts
-            (id, region, zone_id, instance_id, instance_type, state, health, editor_ready_at,
-             generation, leased_computer_id, leased_generation, lease_token, leased_at, created_at, updated_at)
-        VALUES (${input.id}::uuid, ${input.region}, ${input.zoneId}, ${input.instanceId}, ${input.instanceType},
-            ${input.state}, ${input.health}, ${input.editorReadyAt?.toISOString() ?? null}::timestamptz,
-            ${generation}, NULL, NULL, NULL, NULL, ${at}::timestamptz, ${at}::timestamptz)
-    `);
-}
-
-/** Admission lock excludes image reservations; candidate selection and host lease remain atomic. */
-export async function leasePoolHost(db: PlacementDb, args: {
-    region: string; instanceType: PoolInstanceType; computerId: string; now: Date;
-}): Promise<LeasedPoolHost | null> {
-    checkClass(args.region, args.instanceType);
-    return withAdmission(db, async (tx, lock) => {
-        await lockImagePlacement(tx, lock, args.computerId);
-        await assertNoImageReservation(tx, args.computerId);
-        const at = args.now.toISOString();
-        const rows = rowsOf(await tx.execute(sql`
-            UPDATE public.ezil_compute_pool_hosts
-            SET state = 'leased', leased_computer_id = ${args.computerId}::uuid,
-                leased_generation = generation, lease_token = gen_random_uuid(),
-                leased_at = ${at}::timestamptz, generation = generation + 1, updated_at = ${at}::timestamptz
-            WHERE id = (
-                SELECT id FROM public.ezil_compute_pool_hosts
-                WHERE region = ${args.region} AND instance_type = ${args.instanceType}
-                    AND state = 'ready' AND health = 'healthy' AND editor_ready_at IS NOT NULL
-                    AND generation > 0 AND generation < ${Number.MAX_SAFE_INTEGER}
-                    AND leased_computer_id IS NULL AND leased_generation IS NULL AND lease_token IS NULL AND leased_at IS NULL
-                ORDER BY editor_ready_at, id FOR UPDATE SKIP LOCKED LIMIT 1
-            )
-            RETURNING id, region, zone_id, instance_id, instance_type, state, generation,
-                leased_generation, leased_computer_id, lease_token, leased_at, editor_ready_at
-        `));
-        const row = rows[0];
-        if (!row) return null;
-        return {
-            id: String(row.id), region: String(row.region), zoneId: String(row.zone_id),
-            instanceId: String(row.instance_id), instanceType: row.instance_type as PoolInstanceType,
-            state: 'leased', generation: generationOf(row.generation), leasedGeneration: generationOf(row.leased_generation),
-            leasedComputerId: String(row.leased_computer_id), leaseToken: String(row.lease_token),
-            leasedAt: new Date(row.leased_at as string | Date), editorReadyAt: new Date(row.editor_ready_at as string | Date),
-        };
-    });
-}
-
-/** Pass the returned host.generation (2 on first lease), not leasedGeneration (1).
- * Single-use hosts drain; they cannot return to the clean pool after user access. */
-export async function releasePoolHost(db: PoolExecutor, args: {
-    id: string; leaseToken: string; generation: number;
-}): Promise<'released' | 'fenced'> {
-    if (!Number.isSafeInteger(args.generation) || args.generation < 2) return 'fenced';
-    const rows = rowsOf(await db.execute(sql`
+export async function leasePoolHost(tx: PlacementExecutor, c: PoolClass, computerId: string, priority: 1 | 2, now: Date): Promise<PoolHostRow | null> {
+    checkClass(c);
+    if (priority !== 1 && priority !== 2) throw new Error('pool_priority_invalid');
+    const at = now!.toISOString();
+    return optionalHost(await tx.execute(sql`
         UPDATE public.ezil_compute_pool_hosts
-        SET state = 'draining', leased_computer_id = NULL, leased_generation = NULL,
-            lease_token = NULL, leased_at = NULL, updated_at = now()
-        WHERE id = ${args.id}::uuid AND state = 'leased' AND lease_token = ${args.leaseToken}::uuid
-            AND generation = ${args.generation} AND leased_generation = ${args.generation - 1}
-            AND leased_computer_id IS NOT NULL AND leased_at IS NOT NULL
-        RETURNING id
+        SET state = 'leased', leased_computer_id = ${computerId}::uuid, leased_generation = generation,
+            lease_token = gen_random_uuid(), leased_at = ${at}::timestamptz,
+            pool_priority = ${priority}, updated_at = ${at}::timestamptz
+        WHERE id = (
+            SELECT id FROM public.ezil_compute_pool_hosts
+            WHERE region = ${c.region} AND zone_id = ${c.zoneId} AND instance_type = ${c.instanceType}
+                AND ${compatibleDeployment(c)}
+                AND ${usableReady(at)}
+            ORDER BY pool_priority DESC, ready_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED LIMIT 1
+        ) RETURNING *
     `));
-    return rows.length === 1 ? 'released' : 'fenced';
 }
 
-export interface PoolCounts {
-    region: string; instanceType: PoolInstanceType;
-    ready: number; booting: number; leased: number; draining: number;
+/** Identity authentication is performed by the enrollment endpoint before this CAS. */
+export async function recordPoolEnrollment(db: PlacementExecutor, poolHostId: string, instanceId: string, now: Date): Promise<PoolHostRow> {
+    if (!instanceId) throw new Error('pool_instance_invalid');
+    return requiredHost(await db.execute(sql`
+        UPDATE public.ezil_compute_pool_hosts SET instance_id = ${instanceId}, enrolled_at = ${now.toISOString()}::timestamptz,
+            updated_at = ${now.toISOString()}::timestamptz
+        WHERE id = ${poolHostId}::uuid AND state IN ('booting', 'ready')
+            AND leased_computer_id IS NULL AND leased_at IS NULL
+            AND (instance_id IS NULL OR instance_id = ${instanceId})
+        RETURNING *
+    `));
 }
-export interface PoolTarget { region: string; instanceType: PoolInstanceType; count: number }
-export interface PoolBoot { region: string; instanceType: PoolInstanceType; count: number }
+export async function recordPoolReady(db: PlacementExecutor, poolHostId: string, health: { editorOk: boolean }, now: Date): Promise<PoolHostRow> {
+    if (health.editorOk !== true) throw new Error('pool_editor_unhealthy');
+    const at = now.toISOString();
+    return requiredHost(await db.execute(sql`
+        UPDATE public.ezil_compute_pool_hosts SET state = 'ready', health = 'healthy',
+            editor_ready_at = COALESCE(editor_ready_at, ${at}::timestamptz),
+            ready_at = COALESCE(ready_at, ${at}::timestamptz), updated_at = ${at}::timestamptz
+        WHERE id = ${poolHostId}::uuid AND state IN ('booting', 'ready')
+            AND instance_id IS NOT NULL AND leased_computer_id IS NULL AND leased_at IS NULL
+            AND enrolled_at > ${at}::timestamptz - interval '10 minutes' AND enrolled_at <= ${at}::timestamptz
+        RETURNING *
+    `));
+}
 
-/** runningVcpu includes all existing/reserved compute, including the pool. maxHosts
- * caps all non-retired pool hosts. Booting hosts already satisfy the ready target.
- * Sorting by region then type makes allocation independent of input order. Invalid
- * counts refuse the entire plan; they must never create apparent spare capacity. */
-export function replenishPlan(args: {
-    pool: readonly PoolCounts[];
-    runningVcpu: number;
-    budget: { maxGlobalVcpu: number; maxHosts: number; maxBootsPerPass: number };
-    targets: readonly PoolTarget[];
-}): PoolBoot[] {
-    const count = (n: number) => { if (!Number.isSafeInteger(n) || n < 0) throw new Error('pool_count_invalid'); return n; };
-    let hosts = 0;
-    let poolVcpu = 0;
-    const available = new Map<string, number>();
-    const key = (r: string, t: string) => `${r}/${t}`;
-    for (const row of args.pool) {
-        checkClass(row.region, row.instanceType);
-        const total = count(row.ready) + count(row.booting) + count(row.leased) + count(row.draining);
-        hosts = count(hosts + total);
-        poolVcpu = count(poolVcpu + total * instanceVcpu(row.instanceType));
-        const k = key(row.region, row.instanceType);
-        available.set(k, count((available.get(k) ?? 0) + row.ready + row.booting));
-    }
-    // Even an inconsistent global counter cannot omit known pool capacity.
-    let vcpuLeft = Math.max(0, count(args.budget.maxGlobalVcpu) - Math.max(count(args.runningVcpu), poolVcpu));
-    let hostSlots = Math.max(0, count(args.budget.maxHosts) - hosts);
-    let bootsLeft = count(args.budget.maxBootsPerPass);
-    const targets = new Map<string, PoolTarget>();
-    for (const target of args.targets) {
-        checkClass(target.region, target.instanceType);
-        count(target.count);
-        const k = key(target.region, target.instanceType);
-        if (targets.has(k)) throw new Error('pool_target_duplicate');
-        targets.set(k, target);
-    }
-    const plan: PoolBoot[] = [];
-    for (const k of [...targets.keys()].sort()) {
-        const target = targets.get(k)!;
-        const vcpu = instanceVcpu(target.instanceType);
-        const n = Math.min(Math.max(0, target.count - (available.get(k) ?? 0)), hostSlots, bootsLeft, Math.floor(vcpuLeft / vcpu));
-        if (n > 0) plan.push({ region: target.region, instanceType: target.instanceType, count: n });
-        hostSlots -= n; bootsLeft -= n; vcpuLeft -= n * vcpu;
-    }
-    return plan;
+/** Publish only AFTER successful adopt/attach. Endpoint supplies the epoch's one-time enroll nonce separately. */
+export async function publishPoolClaim(db: PlacementExecutor, poolHostId: string, claim: {
+    computerId: string; generation: number; leaseEpoch: number; fence: string; volumeSerial: string;
+}, now: Date): Promise<PoolHostRow> {
+    positive(claim.generation); positive(claim.leaseEpoch);
+    if (!claim.fence || !claim.volumeSerial) throw new Error('pool_claim_invalid');
+    return requiredHost(await db.execute(sql`
+        UPDATE public.ezil_compute_pool_hosts SET claim_generation = ${claim.generation}, claim_lease_epoch = ${claim.leaseEpoch},
+            claim_fence = ${claim.fence}, claim_volume_serial = ${claim.volumeSerial},
+            updated_at = CASE WHEN claim_generation IS NULL THEN ${now.toISOString()}::timestamptz ELSE updated_at END
+        WHERE id = ${poolHostId}::uuid AND state = 'leased' AND leased_computer_id = ${claim.computerId}::uuid
+            AND ((claim_generation IS NULL AND claim_lease_epoch IS NULL AND claim_fence IS NULL AND claim_volume_serial IS NULL)
+                OR (claim_generation = ${claim.generation} AND claim_lease_epoch = ${claim.leaseEpoch}
+                AND claim_fence = ${claim.fence} AND claim_volume_serial = ${claim.volumeSerial}))
+        RETURNING *
+    `));
+}
+export async function readPoolClaim(db: PlacementExecutor, poolHostId: string, instanceId: string): Promise<PoolHostRow | null> {
+    return optionalHost(await db.execute(sql`
+        SELECT * FROM public.ezil_compute_pool_hosts
+        WHERE id = ${poolHostId}::uuid AND instance_id = ${instanceId} AND state = 'leased'
+            AND leased_computer_id IS NOT NULL AND claim_generation IS NOT NULL AND claim_lease_epoch IS NOT NULL
+            AND claim_fence IS NOT NULL AND claim_volume_serial IS NOT NULL
+    `));
+}
+
+/** Readiness and leasing have dedicated guarded writes; generic marks can only move toward retirement. */
+export async function markPoolHost(db: PlacementExecutor, poolHostId: string, from: PoolHostState[], to: PoolHostState, now: Date): Promise<PoolHostRow | null> {
+    const predecessors: Partial<Record<PoolHostState, PoolHostState[]>> = {
+        failed: ['booting'], retiring: ['booting', 'ready', 'leased', 'failed', 'retiring'], retired: ['retiring'],
+    };
+    const allowed = from.filter(state => predecessors[to]?.includes(state));
+    if (!allowed.length) return null;
+    return optionalHost(await db.execute(sql`
+        UPDATE public.ezil_compute_pool_hosts SET state = ${to}, updated_at = ${now.toISOString()}::timestamptz
+        WHERE id = ${poolHostId}::uuid AND state IN (${sql.join(allowed.map(state => sql`${state}`), sql`, `)}) RETURNING *
+    `));
+}
+
+/** A single class plan. The caller holds the advisory lock and shares the two-boot budget across classes. */
+export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: number; provision: number; retire: string[]; fail: string[] } {
+    for (const n of [d.opens15m, d.activeStandard, d.activePremium, d.spares, d.vcpuInUse, d.regionVcpuCap]) count(n);
+    const boot = d.bootMinutes ?? 4;
+    if (!Number.isFinite(boot) || boot <= 0) throw new Error('pool_boot_minutes_invalid');
+    const policy = POOL_POLICY[`${c.region}:${c.instanceType}`] ?? { minSpares: 0, maxSpares: 0 };
+    const recent = Math.ceil(d.opens15m * boot / 15);
+    const base = Math.ceil(0.04 * d.activeStandard + 0.10 * d.activePremium);
+    const pending = count(d.pending ?? 0);
+    const eligible = d.activeStandard + d.activePremium > 0;
+    const desired = eligible ? Math.min(policy.maxSpares, Math.max(policy.minSpares, base, recent, pending + policy.minSpares)) : 0;
+    const capacity = Math.floor((d.regionVcpuCap - d.vcpuInUse) / instanceVcpu(c.instanceType)) + d.spares;
+    const target = d.killSwitch ? 0 : Math.max(0, Math.min(desired, capacity));
+    const excess = Math.max(0, d.spares - target);
+    const aged = d.idleReady.filter(h => d.killSwitch || now.getTime() - h.readyAt.getTime() > 30 * MINUTE)
+        .sort((a, b) => b.readyAt.getTime() - a.readyAt.getTime() || a.poolHostId.localeCompare(b.poolHostId));
+    const ready = d.ready ?? Math.max(0,d.spares-d.booting.length);
+    const readyExcess = Math.min(excess,Math.max(0,ready-target));
+    const retire = [...aged.filter(h => h.obsolete || h.unusable), ...aged.filter(h => !h.obsolete && !h.unusable).slice(0, readyExcess)]
+        .slice(0, 2).map(h => h.poolHostId);
+    const fail = d.booting.filter(h => now.getTime() - h.createdAt.getTime() > 10 * MINUTE).map(h => h.poolHostId);
+    return { target, provision: Math.min(2, Math.max(0, target - d.spares)), retire, fail };
+}
+
+/** One snapshot: billing epochs measure recent demand, never subscription eligibility.
+ * Paid subscribers use their stored size selection and sticky placement zone; new users default to Mumbai.
+ * Hosts linked to a live placement count only once in regional capacity, including during adoption.
+ */
+export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: Date): Promise<PoolDemand> {
+    checkClass(c);
+    const at = now.toISOString();
+    const vcpu = (column: ReturnType<typeof sql>) => sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU)
+        .map(([type, n]) => sql`WHEN ${type} THEN ${n}::int`), sql` `)} ELSE 8 END`;
+    const running = sql.join(RUNNING_CLASS_STATES.map(state => sql`${state}`), sql`, `);
+    const row = rowsOf(await db.execute(sql`
+        WITH effective AS (
+            SELECT DISTINCT ON (s.user_id) s.user_id, s.sku, s.status, s.stripe_subscription_id, s.current_period_start, s.current_period_end,
+                CASE WHEN s.sku = 'standard_monthly_v3' THEN 'm6i.large'
+                    WHEN pref.size = 'cmp-4' THEN 'm6i.xlarge'
+                    WHEN pref.size = 'cmp-8' THEN 'm6i.2xlarge' ELSE 'm6i.large' END AS instance_type
+            FROM public.ezil_billing_subscriptions s
+            JOIN auth.users u ON u.id = s.user_id
+            LEFT JOIN public.ezil_billing_size_preferences pref ON pref.user_id = s.user_id
+            WHERE s.status IN ('active','trialing') AND s.sku IN ('standard_monthly_v3', 'premium_monthly_v3',
+                'standard_monthly_v2','compute_monthly_v2','pro_monthly_v1')
+                AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
+                AND s.current_period_start <= ${at}::timestamptz AND s.current_period_end > ${at}::timestamptz
+            ORDER BY s.user_id, s.current_period_end DESC, s.current_period_start DESC, s.stripe_subscription_id COLLATE "C"
+        ), eligible AS (
+            SELECT s.* FROM effective s WHERE s.status = 'active' AND s.sku IN ('standard_monthly_v3','premium_monthly_v3')
+                AND COALESCE((SELECT sum(g.amount) FROM public.ezil_billing_grants g
+                    WHERE g.user_id = s.user_id AND g.subscription_id = s.stripe_subscription_id
+                        AND g.meter = 'compute_std_seconds' AND g.period_start < s.current_period_end
+                        AND g.period_end > s.current_period_start AND g.period_start <= ${at}::timestamptz
+                        AND g.period_end > ${at}::timestamptz), 0) > 0
+                AND NOT EXISTS (SELECT 1 FROM public.ezil_billing_payment_issues issue
+                    WHERE issue.user_id = s.user_id AND issue.subscription_id = s.stripe_subscription_id
+                        AND issue.invoice_kind = 'subscription' AND issue.resolved_at IS NULL AND issue.issue <> 'voided')
+        ), subscribers AS (
+            SELECT s.* FROM eligible s WHERE s.instance_type = ${c.instanceType}
+                AND (EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.owner_user_id = s.user_id
+                    AND p.provider = 'aws-ec2' AND p.region = ${c.region} AND p.zone_id = ${c.zoneId}
+                    AND p.state NOT IN ('RETIRED', 'PURGE_ELIGIBLE'))
+                OR (${c.region} = 'ap-south-1' AND NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p
+                    WHERE p.owner_user_id = s.user_id AND p.provider = 'aws-ec2' AND p.state NOT IN ('RETIRED', 'PURGE_ELIGIBLE'))))
+        ), class_placements AS (
+            SELECT * FROM public.ezil_computer_placements
+            WHERE provider = 'aws-ec2' AND region = ${c.region} AND zone_id = ${c.zoneId} AND instance_type = ${c.instanceType}
+                AND state NOT IN ('RETIRED', 'PURGE_ELIGIBLE')
+        ), all_class_hosts AS (
+            SELECT *, COALESCE((${compatibleDeployment(c)}), false) AS compatible FROM public.ezil_compute_pool_hosts
+            WHERE region = ${c.region} AND zone_id = ${c.zoneId} AND instance_type = ${c.instanceType}
+        ), class_hosts AS (
+            SELECT * FROM all_class_hosts WHERE compatible
+        ), live_placements AS (
+            SELECT * FROM public.ezil_computer_placements
+            WHERE provider = 'aws-ec2' AND (region = ${c.region} OR region IS NULL) AND state IN (${running})
+        )
+        SELECT
+            (SELECT count(DISTINCT e.id) FROM public.ezil_billing_compute_epochs e
+                JOIN public.ezil_billing_subscriptions s ON s.stripe_subscription_id = e.subscription_id AND s.user_id = e.user_id
+                WHERE e.size = ${c.instanceType === 'm6i.2xlarge' ? 'cmp-8' : c.instanceType === 'm6i.xlarge' ? 'cmp-4' : 'std-2'} AND e.ready_at > ${at}::timestamptz - interval '15 minutes' AND e.ready_at <= ${at}::timestamptz
+                    AND s.sku IN ('standard_monthly_v3', 'premium_monthly_v3')
+                    AND EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = e.computer_id
+                        AND p.owner_user_id = e.user_id AND p.provider = 'aws-ec2' AND p.region = ${c.region} AND p.zone_id = ${c.zoneId})) AS opens,
+            (SELECT count(*) FROM subscribers WHERE sku = 'standard_monthly_v3') AS standard,
+            (SELECT count(*) FROM subscribers WHERE sku = 'premium_monthly_v3') AS premium,
+            (SELECT count(*) FROM class_placements p JOIN subscribers s ON s.user_id = p.owner_user_id
+                WHERE p.state IN ('PROVISIONING', 'STARTING') AND p.instance_id IS NULL
+                    AND p.lifecycle_job_id IS NULL) AS pending,
+            (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (ready_at - created_at)) / 60)
+                FROM class_hosts WHERE ready_at > ${at}::timestamptz - interval '24 hours'
+                    AND ready_at <= ${at}::timestamptz AND ready_at > created_at) AS boot_minutes,
+            (SELECT count(*) FROM class_hosts WHERE state = 'booting' OR (${usableReady(at)})) AS spares,
+            (SELECT count(*) FROM class_hosts WHERE ${usableReady(at)}) AS ready,
+            COALESCE((SELECT sum(${vcpu(sql`instance_type`)}) FROM live_placements), 0)
+                + COALESCE((SELECT sum(${vcpu(sql`h.instance_type`)}) FROM public.ezil_compute_pool_hosts h
+                    WHERE h.region = ${c.region} AND h.state <> 'retired'
+                        AND NOT EXISTS (SELECT 1 FROM live_placements p WHERE p.instance_id = h.instance_id
+                            OR (p.computer_id = h.leased_computer_id AND p.instance_id IS NULL))), 0) AS vcpu,
+            (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'readyAt', ready_at, 'obsolete', NOT compatible, 'unusable', NOT COALESCE((${usableReady(at)}),false))), '[]')
+                FROM all_class_hosts WHERE state = 'ready' AND leased_at IS NULL AND leased_computer_id IS NULL AND ready_at IS NOT NULL) AS idle_ready,
+            (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'createdAt', created_at)), '[]')
+                FROM all_class_hosts WHERE state = 'booting' AND leased_computer_id IS NULL AND leased_at IS NULL
+                    AND claim_generation IS NULL AND claim_lease_epoch IS NULL AND claim_fence IS NULL AND claim_volume_serial IS NULL) AS booting
+    `))[0];
+    if (!row) throw new Error('pool_demand_missing');
+    const regions = readAwsRegions(process.env);
+    const regionVcpuCap = regions.ok ? (regions.regions.find(r => r.name === c.region)?.maxRunning ?? 0) * 2 : 0;
+    return {
+        pending: count(row.pending ?? 0), opens15m: count(row.opens), activeStandard: count(row.standard), activePremium: count(row.premium),
+        bootMinutes: row.boot_minutes == null ? null : Number(row.boot_minutes), spares: count(row.spares), ready: count(row.ready ?? 0),
+        vcpuInUse: count(row.vcpu), regionVcpuCap, killSwitch: process.env.EZIL_AWS_KILL_SWITCH === '1',
+        idleReady: (row.idle_ready as { poolHostId: string; readyAt: string; obsolete?: boolean; unusable?: boolean }[]).map(h => ({ poolHostId:h.poolHostId, readyAt: new Date(h.readyAt), ...(h.obsolete ? {obsolete:true} : {}), ...(h.unusable ? {unusable:true} : {}) })),
+        booting: (row.booting as { poolHostId: string; createdAt: string }[]).map(h => ({ ...h, createdAt: new Date(h.createdAt) })),
+    };
+}
+
+export { host as poolHostFromRow };
+
+/** Read-only early warning. Host age is measured from creation, as in the unchanged ten-minute failure rule. */
+export async function readPoolReadinessDiagnostics(db: PlacementExecutor, c: PoolClass, now: Date): Promise<PoolReadinessDiagnostic[]> {
+    checkClass(c);
+    return rowsOf(await db.execute(sql`
+        SELECT id, instance_id, created_at, enrolled_at, health FROM public.ezil_compute_pool_hosts
+        WHERE region = ${c.region} AND zone_id = ${c.zoneId} AND instance_type = ${c.instanceType}
+            AND state = 'booting' AND ready_at IS NULL
+            AND created_at < ${now.toISOString()}::timestamptz - interval '5 minutes'
+        ORDER BY created_at, id
+    `)).map(row => ({ poolHostId: String(row.id), instanceId: nullableString(row.instance_id),
+        createdAt: date(row.created_at)!.toISOString(), enrolledAt: date(row.enrolled_at)?.toISOString() ?? null,
+        health: String(row.health) }));
+}
+
+/** A refused adopt still consumes the host. Never retire a published tenant claim. */
+export async function retireRefusedPoolLease(db: PlacementExecutor, poolHostId: string,
+    p: { computerId: string; instanceId: string | null }): Promise<void> {
+    const changed = rowsOf(await db.execute(sql`/* pool:refused-adopt */
+        UPDATE public.ezil_compute_pool_hosts SET state = 'retiring', leased_computer_id = NULL, updated_at = now()
+        WHERE id = ${poolHostId}::uuid AND instance_id = ${p.instanceId}
+            AND leased_computer_id = ${p.computerId}::uuid AND state = 'leased'
+            AND claim_generation IS NULL AND claim_lease_epoch IS NULL
+            AND claim_fence IS NULL AND claim_volume_serial IS NULL
+        RETURNING id`));
+    if (changed.length !== 1) throw new Error('pool_refusal_conflict');
+}
+
+/** A confirmed release burns the single-use host; cold fallback has no matching pool row. */
+export async function retirePoolLease(db: PlacementExecutor, p: { computerId: string; instanceId: string | null; generation: number; leaseEpoch: number }): Promise<void> {
+    await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = 'retired', updated_at = now()
+        WHERE state = 'leased' AND instance_id = ${p.instanceId} AND leased_computer_id = ${p.computerId}::uuid
+            AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}`);
+}
+
+/** Durable tenant readiness belongs to the claimed epoch, independently of placement updated_at. */
+export async function recordPoolSessionReady(db: PlacementExecutor, poolHostId: string,
+    p: { computerId: string; instanceId: string | null; generation: number; leaseEpoch: number }, at: Date): Promise<boolean> {
+    return rowsOf(await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET session_ready_at = ${at.toISOString()}::timestamptz
+        WHERE id = ${poolHostId}::uuid AND state = 'leased' AND instance_id = ${p.instanceId}
+            AND leased_computer_id = ${p.computerId}::uuid AND claim_generation = ${p.generation}
+            AND claim_lease_epoch = ${p.leaseEpoch} AND session_ready_at IS NULL RETURNING id`)).length === 1;
+}
+export async function readPoolSessionReadyAt(db: PlacementExecutor, poolHostId: string,
+    p: { computerId: string; instanceId: string | null; generation: number; leaseEpoch: number }): Promise<Date | null> {
+    const found = rowsOf(await db.execute(sql`SELECT session_ready_at FROM public.ezil_compute_pool_hosts
+        WHERE id = ${poolHostId}::uuid AND state = 'leased' AND instance_id = ${p.instanceId}
+            AND leased_computer_id = ${p.computerId}::uuid AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}`));
+    const at = found.length === 1 ? date(found[0]!.session_ready_at) : null;
+    return at && Number.isFinite(at.getTime()) ? at : null;
+}
+
+/** Only the host claim observer uses this: ordinary claim reads remain published-only. */
+export async function readPendingPoolAdopt(db: PlacementExecutor, poolHostId: string, instanceId: string): Promise<PoolHostRow | null> {
+    return optionalHost(await db.execute(sql`
+        SELECT * FROM public.ezil_compute_pool_hosts
+        WHERE id = ${poolHostId}::uuid AND instance_id = ${instanceId} AND state = 'leased'
+            AND leased_computer_id IS NOT NULL AND claim_generation IS NULL AND claim_lease_epoch IS NULL
+            AND claim_fence IS NULL AND claim_volume_serial IS NULL
+    `));
 }

@@ -195,23 +195,17 @@ def persist(cfg, lease, answer, instance_id=None):
     return mark_nonce_consumed(cfg, dict(load_lease(cfg), sandboxId=sandbox_id, zone=zone))
 
 
-def enroll(cfg, lease, instance_id=None, pool_claim=None):
-    # Only the pool adopter supplies this alternative proof, after reserving its
-    # fence/epoch. Ordinary boots still require their one-time nonce.
-    if lease.get("nonceConsumed") or (not lease.get("nonce") and pool_claim is None):
+def enroll(cfg, lease, instance_id=None):
+    if lease.get("nonceConsumed") or not lease.get("nonce"):
         raise Refused("enroll_nonce_absent", "nonce already used for this epoch")
     if not cfg.enrollUrl:
         raise Refused("enroll_url_unset")
     with open(os.path.join(cfg.runDir, "identity.json"), encoding="utf-8") as f:
         ident = json.load(f)
-    proof = {"nonce": lease["nonce"]} if lease.get("nonce") else {
-        "poolHostId": pool_claim["poolHostId"], "poolGeneration": pool_claim["poolGeneration"],
-        "fence": pool_claim["fence"],
-    }
     is_maintenance = "ebsRestore" in lease
     digest = guard.committed_digest(cfg, lease, maintenance=is_maintenance)
     payload = {"computerId": lease["computerId"], "generation": lease["generation"],
-               "leaseEpoch": lease["leaseEpoch"], **proof,
+               "leaseEpoch": lease["leaseEpoch"], "nonce": lease["nonce"],
                "identityDocument": ident["document"], "signature": ident["signature"],
                "lowerImageDigest": digest}
     if is_maintenance:
@@ -260,7 +254,7 @@ def enroll(cfg, lease, instance_id=None, pool_claim=None):
             else:
                 # A settled refusal: the app refused the nonce for good. Never send it again.
                 wipe_nonce(cfg, lease)
-                raise Refused("enroll_refused", f"HTTP {status}: {resp[:200]!r}")
+                raise Refused("enroll_refused", f"HTTP {status}")
         if time.monotonic() + delay > deadline:   # the nonce stays: a later run may retry
             raise Refused(code, why)
         print(f"[enroll] not enrolled yet ({why}); retrying in {delay:g}s", flush=True)

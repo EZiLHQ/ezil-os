@@ -4,11 +4,11 @@ import * as shell from './boot-phases.shell.js';
 
 describe.each([['app', app], ['shell', shell]] as const)('%s AWS refusal copy', (_name, boot) => {
     it.each([
-        ['kill_switch', 'operations_paused', 'Your Mumbai computer is paused by operations', 'Only operations can resume'],
-        ['aws_disabled', 'operations_paused', 'Your Mumbai computer is paused by operations', 'Only operations can resume'],
-        ['capacity_unavailable', 'capacity_unavailable', 'No Mumbai capacity right now', 'Try again checks availability'],
-        ['region_capacity', 'capacity_unavailable', 'No Mumbai capacity right now', 'Try again checks availability'],
-        ['max_running', 'capacity_unavailable', 'No Mumbai capacity right now', 'Try again checks availability'],
+        ['kill_switch', 'operations_paused', 'Your AWS computer is paused by operations', 'Only operations can resume'],
+        ['aws_disabled', 'operations_paused', 'Your AWS computer is paused by operations', 'Only operations can resume'],
+        ['capacity_unavailable', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
+        ['region_capacity', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
+        ['max_running', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
         ['user_hours_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your monthly computer hours renew next month'],
         ['global_hours_cap', 'global_hours_cap', "This month's computer hours are used up", 'The service has reached its monthly computer hours limit'],
     ] as const)('%s is terminal with truthful copy and an honest manual recheck', (errorCode, reason, title, detail) => {

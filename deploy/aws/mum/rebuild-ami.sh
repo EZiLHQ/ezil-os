@@ -3,19 +3,22 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 usage() {
-    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--maintenance-release <source-manifest>] [--apply] [--config <path>] [--release-dir <path>]'
+    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--reviewed-base-ami <ami-id>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--maintenance-release <source-manifest>] [--deployed-release <manifest>] [--apply] [--config <path>] [--release-dir <path>]'
 }
-desktop_image= source_sha= recipe_version= previous_ref= previous_id= previous_release= maintenance_release=
+desktop_image= source_sha= recipe_version= previous_ref= previous_id= previous_release= maintenance_release= deployed_release=
+reviewed_base_ami=
 config=/root/ezil-aws-mum/config/ami.mum.json
 while (($#)); do
     case "$1" in
         --desktop-image) (($# >= 2)) || die 'missing desktop image'; desktop_image=$2; shift 2 ;;
         --source-sha) (($# >= 2)) || die 'missing source SHA'; source_sha=$2; shift 2 ;;
         --recipe-version) (($# >= 2)) && [[ -n "$2" ]] || die 'missing recipe version'; recipe_version=$2; shift 2 ;;
+        --reviewed-base-ami) (($# >= 2)) && [[ "$2" =~ ^ami-[0-9a-f]{17}$ ]] || die 'reviewed base AMI must be an AMI ID'; reviewed_base_ami=$2; shift 2 ;;
         --previous-desktop-image-ref) (($# >= 2)) && [[ -n "$2" ]] || die 'missing previous image reference'; previous_ref=$2; shift 2 ;;
         --previous-desktop-image-id) (($# >= 2)) && [[ -n "$2" ]] || die 'missing previous image ID'; previous_id=$2; shift 2 ;;
         --maintenance-release) (($# >= 2)) || die 'missing maintenance source release'; maintenance_release=$2; shift 2 ;;
         --previous-release) (($# >= 2)) || die 'missing previous release manifest'; previous_release=$2; shift 2 ;;
+        --deployed-release) (($# >= 2)) || die 'missing deployed release manifest'; deployed_release=$2; shift 2 ;;
         --config) (($# >= 2)) || die 'missing config path'; config=$2; shift 2 ;;
         --release-dir) (($# >= 2)) || die 'missing release directory'; release_dir=$2; shift 2 ;;
         --apply) apply=true; shift ;;
@@ -39,20 +42,24 @@ if [[ -n "$recipe_version" ]]; then
     json plan-ami "$work/previous-ami-config.json" "$recipe_version" "$work/ami.mum.json"
 fi
 assert_identity
+if [[ -n "$previous_ref$maintenance_release$deployed_release" ]]; then
+    [[ -n "$deployed_release" && -f "$deployed_release" && ! -L "$deployed_release" ]] || die 'deployed release manifest required (--deployed-release)'
+    cp -- "$deployed_release" "$work/deployed-release.json"
+    json secret-predecessor "$work/deployed-release.json"
+fi
 previous_args=()
 if [[ -n "$recipe_version" ]]; then previous_args=("" ""); fi
 if [[ -n "$previous_ref" ]]; then
     previous_release=${previous_release:-$release_dir/previous-rebase-release.json}
-    [[ -f "$previous_release" && ! -L "$previous_release" ]] || die 'previous promoted release manifest required (--previous-release)'
+    [[ -f "$previous_release" && ! -L "$previous_release" ]] || die 'retained image predecessor required (--previous-release)'
     json previous-release "$previous_release" "$previous_ref" "$previous_id"
     cp -- "$previous_release" "$work/previous-rebase-release.json"
-    json secret-predecessor "$work/previous-rebase-release.json"
+    json secret-retained "$work/previous-rebase-release.json"
     previous_args=("$previous_ref" "$previous_id")
 fi
 if [[ -n "$maintenance_release" ]]; then
     [[ -f "$maintenance_release" && ! -L "$maintenance_release" && -n "$recipe_version" ]] || die 'maintenance source and new recipe version required'
     cp -- "$maintenance_release" "$work/maintenance-source-release.json"
-    json secret-predecessor "$work/maintenance-source-release.json"
     previous_args=("" "")
 fi
 show git -C "$repo_root" rev-parse --verify "$source_sha^{commit}"
@@ -161,6 +168,9 @@ if ! "$apply"; then
     show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-ami --change-set-name "$change"
     show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-ami --change-set-name "$change" --include-property-values --output json
     say 'Validate every parameter, resolved SSM value and resource change before execution.'
+    if [[ -n "$reviewed_base_ami" ]]; then
+        say "Accept Ubuntu parent drift only to $reviewed_base_ami after describe-images verifies Canonical ownership, Noble amd64 name, available state and a newer creation date; save base-image-review.json."
+    fi
     if [[ -n "$recipe_version" ]]; then
         say 'Permit only Component/Recipe version replacement, dependent Pipeline changes and configurations forced by the version string; refuse all other resources.'
     else
@@ -178,6 +188,9 @@ fi
 cp "$work/stack.json" "$release_dir/previous-ami-stack.json"
 cp "$work/template.json" "$release_dir/ami-template.json"
 cp "$work/parameters.json" "$release_dir/ami-parameters.json"
+if [[ -n "$deployed_release" ]]; then
+    cp "$work/deployed-release.json" "$release_dir/deployed-release.json"
+fi
 if [[ -n "$previous_ref" ]]; then
     cp "$work/previous-rebase-release.json" "$release_dir/previous-rebase-release.json"
 fi
@@ -191,7 +204,17 @@ printf 'ApplicationImageRepositoryUri=%s\nDesktopImageDigest=%s\nDesktopImageId=
     "$repository" "$digest" "$pinned_id" "$previous_ref" "$previous_id" "$tag" "$desktop_image" "$full_sha" "$source_uri" > "$release_dir/desktop.txt"
 wait_changeset ezil-mum-ami "$change"
 cp "$work/changeset.json" "$release_dir/ami-changeset.json"
-json ami-changeset "$work/stack.json" "$work/parameters.json" "$work/changeset.json" "$work/template.json" "${validation_args[@]}"
+rm -f -- "$release_dir/base-image-review.json"
+base_review_args=()
+if [[ -n "$reviewed_base_ami" ]]; then
+    old_base_ami=$(json base-ami-id "$work/stack.json")
+    aws_read ec2 describe-images --image-ids "$old_base_ami" "$reviewed_base_ami" --output json > "$work/base-images.json"
+    base_review_args=(--reviewed-base-ami "$reviewed_base_ami" --base-images "$work/base-images.json" --base-review-output "$work/base-image-review.json")
+fi
+json ami-changeset "$work/stack.json" "$work/parameters.json" "$work/changeset.json" "$work/template.json" "${validation_args[@]}" "${base_review_args[@]}"
+if [[ -f "$work/base-image-review.json" ]]; then
+    cp "$work/base-image-review.json" "$release_dir/base-image-review.json"
+fi
 if [[ -n "$recipe_version" ]]; then
     cmp -s "$config" "$work/previous-ami-config.json" || die 'AMI config changed before execution'
 fi

@@ -124,7 +124,11 @@ describe('ordinary admission respects image reservations', () => {
             if (text.includes('placement:image-read')) return { rows: [] };
             return tx.execute(q);
         } })) };
-        await expect(leasePoolHost(db, { computerId: p.intent.computerId, region: 'ap-south-1', instanceType: 'm6i.large', now: new Date() })).rejects.toThrow('image_job_conflict');
+        await expect(import('./placement').then(({ withAdmission, lockImagePlacement }) => withAdmission(db, async (tx, lock) => {
+            await lockImagePlacement(tx, lock, p.intent.computerId);
+            await assertNoImageReservation(tx, p.intent.computerId);
+            return leasePoolHost(tx, { region: 'ap-south-1', zoneId: 'aps1-az1', instanceType: 'm6i.large' }, p.intent.computerId, 1, new Date());
+        }))).rejects.toThrow('image_job_conflict');
         expect(fake.statements.some(s => /UPDATE public.ezil_compute_pool_hosts/.test(s.sql))).toBe(false);
     });
 });

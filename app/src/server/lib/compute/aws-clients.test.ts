@@ -223,7 +223,7 @@ describe('Step Functions execution reader', () => {
 const INSTANCE = 'i-0123456789abcdef0';
 const DATA = 'vol-0123456789abcdef0';
 const ROOT = 'vol-0fedcba9876543210';
-function ec2Fake(o: { transitionReason?: string; placement?: Record<string, string>; volumes?: { VolumeId: string; Tags?: { Key: string; Value: string }[] }[]; dot?: boolean; zones?: unknown } = {}) {
+function ec2Fake(o: { imageId?: string; transitionReason?: string; placement?: Record<string, string>; volumes?: { VolumeId: string; Tags?: { Key: string; Value: string }[] }[]; dot?: boolean; zones?: unknown } = {}) {
     return fakeSender((c) => {
         switch (cmdName(c)) {
             case 'DescribeInstancesCommand':
@@ -231,6 +231,8 @@ function ec2Fake(o: { transitionReason?: string; placement?: Record<string, stri
                     Reservations: [{
                         Instances: [{
                             InstanceId: INSTANCE,
+                            ImageId: o.imageId,
+                            RootDeviceName: '/dev/xvda',
                             State: { Name: 'running' },
                             StateTransitionReason: o.transitionReason,
                             Placement: o.placement ?? { AvailabilityZone: 'us-east-1a', AvailabilityZoneId: 'use1-az1' },
@@ -254,6 +256,10 @@ function ec2Fake(o: { transitionReason?: string; placement?: Record<string, stri
 }
 
 describe('EC2 enrollment describer', () => {
+    it.each(['ami-55555555555555555', undefined])('preserves provider ImageId %s without inventing a fallback', async imageId => {
+        const view = await createEc2EnrollmentDescriber(regional(ec2Fake({ imageId }))).describeForEnrollment(R, INSTANCE);
+        expect(view?.imageId).toBe(imageId);
+    });
     it.each([
         ['User initiated (2026-10-19 12:34:56 GMT)', new Date('2026-10-19T12:34:56Z')],
         ['User initiated', undefined],
@@ -269,11 +275,11 @@ describe('EC2 enrollment describer', () => {
         const ec2 = ec2Fake();
         const view = await createEc2EnrollmentDescriber(regional(ec2)).describeForEnrollment(R, INSTANCE);
         expect(view).toEqual({
-            instanceId: INSTANCE, state: 'running', availabilityZone: 'us-east-1a', availabilityZoneId: 'use1-az1', publicIp: '203.0.113.7',
+            instanceId: INSTANCE, rootDeviceName: '/dev/xvda', state: 'running', availabilityZone: 'us-east-1a', availabilityZoneId: 'use1-az1', publicIp: '203.0.113.7',
             tags: { 'ezil:generation': '2' },
             volumes: [
-                { volumeId: ROOT, deleteOnTermination: true, tags: {} },
-                { volumeId: DATA, deleteOnTermination: false, tags: { 'ezil:disk-kind': 'data' } },
+                { volumeId: ROOT, deviceName: '/dev/xvda', deleteOnTermination: true, tags: {} },
+                { volumeId: DATA, deviceName: '/dev/sdf', deleteOnTermination: false, tags: { 'ezil:disk-kind': 'data' } },
             ],
         });
         expect(input(ec2.calls[0])).toEqual({ InstanceIds: [INSTANCE] });
@@ -643,5 +649,38 @@ describe('EC2 app-caller credential cache', () => {
     it.each([{}, STS_OK(new Date('invalid')), STS_OK(NOW)])('refuses missing or invalid/expired STS credentials', async (response) => {
         const provider = instanceRoleCallerCredentials({ roleArn: ROLE, sts: fakeSender(() => response), now: () => NOW });
         await expect(provider()).rejects.toMatchObject({ code: 'aws_caller_unavailable', awsName: 'StsCredentialsIncomplete' });
+    });
+});
+
+describe('bounded provider execution history', () => {
+    it('paginates through the normal collaborators using the regional caller', async () => {
+        const sts = vi.fn(() => fakeSender(() => STS_OK(new Date(NOW.getTime() + 3600_000))));
+        const sender = fakeSender(c => input(c).nextToken ? { events: [{ id: 2 } ] } : { events: [{ id: 1 }], nextToken: 'next' });
+        const sfn = vi.fn((_region: string, credentials: () => Promise<unknown>) => fakeSender(async c => { await credentials(); return sender.send(c); }));
+        const c = createAwsSdkCollaborators(ENV_ON, { sts, sfn, token: () => 'test', now: () => NOW });
+        expect(await c.executions!.history!(R, EXECUTION)).toEqual([{ id: 1 }, { id: 2 }]);
+        expect(sfn.mock.calls[0]![0]).toBe(R); expect(input(sts.mock.results[0]!.value.calls[0]).RoleArn).toBe(ROLE);
+        expect(sender.calls.map(cmdName)).toEqual(['GetExecutionHistoryCommand', 'GetExecutionHistoryCommand']);
+        expect(sender.calls.map(input)).toEqual([undefined, 'next'].map(nextToken => ({ executionArn: EXECUTION, nextToken,
+            maxResults: 1000, reverseOrder: false, includeExecutionData: true })));
+    });
+    it.each(['region', 'account', 'name'])('refuses invalid %s before a history request', async fault => {
+        const sender = fakeSender(() => ({ events: [] }));
+        await expect(createSfnExecutionReader(regional(sender, fault === 'account' ? '999999999999' : A)).history!(fault === 'region' ? 'ap-south-1' : R,
+            fault === 'name' ? EXECUTION.replace(NAME, 'manual') : EXECUTION)).rejects.toThrow();
+        expect(sender.calls).toEqual([]);
+    });
+    it.each(['repeat-token', 'page-bound', 'event-bound', 'byte-bound', 'missing-events', 'error'])('refuses incomplete history: %s', async fault => {
+        let n = 0;
+        const sender = fakeSender(() => {
+            n++;
+            if (fault === 'error') throw awsError('ThrottlingException');
+            if (fault === 'missing-events') return {};
+            if (fault === 'byte-bound') return { events: [{ pad: 'x'.repeat(8 * 1024 * 1024) }] };
+            if (fault === 'event-bound') return { events: Array(1000).fill({}), nextToken: String(n) };
+            return { events: [], nextToken: fault === 'repeat-token' ? 'same' : String(n) };
+        });
+        await expect(createSfnExecutionReader(regional(sender)).history!(R, EXECUTION)).rejects.toThrow();
+        expect(n).toBeLessThanOrEqual(fault === 'event-bound' ? 11 : 100);
     });
 });

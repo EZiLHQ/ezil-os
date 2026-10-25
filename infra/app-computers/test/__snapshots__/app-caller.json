@@ -41,6 +41,11 @@
                 "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
               },
               {
+                "Action": "states:GetExecutionHistory",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+              },
+              {
                 "Action": "kms:Decrypt",
                 "Condition": {
                   "StringEquals": {
@@ -175,6 +180,11 @@
               },
               {
                 "Action": "states:DescribeExecution",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+              },
+              {
+                "Action": "states:GetExecutionHistory",
                 "Effect": "Allow",
                 "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
               },

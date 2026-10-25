@@ -147,7 +147,7 @@ test('copy follows migration observations, stays computer-scoped, then restores 
             other.render({ kind: 'progress' });
             assert.equal(label(other), 'Opening Browser…');
             if (now < 3_000) {
-                assert.equal(label(spinner), 'Moving your computer to Mumbai');
+                assert.equal(label(spinner), 'Moving your computer to AWS (India)');
                 assert.equal(spinner.el.querySelector('.ezil-app-spinner-sub').textContent,
                     'This first start takes a few minutes. Your files come with you.');
                 assert.equal(spinner.el.querySelector('.ezil-app-spinner-sub').hidden, false);

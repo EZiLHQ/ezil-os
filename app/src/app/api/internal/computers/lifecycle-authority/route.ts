@@ -1,10 +1,15 @@
+import { poolJobAuthority } from '@/server/lib/compute/aws-pool-dispatch';
+import { authorizeAdoptRecovery } from '@/server/lib/compute/aws-pool-recovery';
+import { buildLifecycleWork } from '@/server/lib/compute/aws-intent';
+import { isPoolReleaseRecovering, poolReleaseReplay, matchesPoolReleaseRecovery } from '@/server/lib/compute/aws-pool-release-recovery';
+import { isPoolMode } from '@/server/lib/compute/aws-receipts';
 import { createImageJobStore } from '@/server/lib/compute/aws-rebase-store';
 import { RebaseUuid } from '@/server/lib/compute/aws-rebase-json';
 import { readWorkflowRequest } from '@/server/lib/compute/aws-workflow-auth';
 import { z } from 'zod';
 
 import { db } from '@/server/db';
-import { ImageJobConflictError, PlacementIntegrityError, readLifecyclePlacement, type PlacementState } from '@/server/lib/compute/placement';
+import { ImageJobConflictError, PlacementIntegrityError, readCanaryComputer, readLifecyclePlacement, type PlacementState } from '@/server/lib/compute/placement';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -19,9 +24,15 @@ const AuthoritySchema = z.object({
     jobId: uuid,
     leaseEpoch: z.number().int().min(1).max(2147483647),
     digest: z.string().regex(HEX_SHA256),
+    operation: z.enum(['pool-provision', 'pool-retire']).optional(),
+    poolHostId: uuid.optional(),
+    poolGeneration: z.number().int().min(1).max(2147483647).optional(),
     imageJobId: uuid.optional(),
     imageJobPhase: z.enum(['preparation', 'launch', 'recovery', 'rebind']).optional(),
-}).strict().refine(a => (a.imageJobId === undefined) === (a.imageJobPhase === undefined));
+}).strict().refine(a => (a.imageJobId === undefined) === (a.imageJobPhase === undefined)
+    && (a.operation === undefined) === (a.poolHostId === undefined)
+    && (a.operation === undefined) === (a.poolGeneration === undefined)
+    && !(a.operation && a.imageJobId));
 
 // C-3 / PLACEMENT_TRANSITIONS: only an execution still in flight may act.
 const IN_FLIGHT_STATES = new Set<PlacementState>([
@@ -44,6 +55,11 @@ export async function POST(req: Request): Promise<Response> {
     const authority = parsed.data;
 
     try {
+        if (authority.operation && authority.poolHostId && authority.poolGeneration) {
+            if (!await poolJobAuthority(db, { ...authority, operation: authority.operation, poolHostId: authority.poolHostId,
+                poolGeneration: authority.poolGeneration }, process.env)) return refuse();
+            return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
+        }
         if (authority.imageJobId && authority.imageJobPhase) {
             if (!await createImageJobStore(db).authority({ ...authority, imageJobId: authority.imageJobId, imageJobPhase: authority.imageJobPhase })) return refuse();
             return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
@@ -51,10 +67,24 @@ export async function POST(req: Request): Promise<Response> {
         // Migration-aware: a computer moving to AWS is authorised for its hidden launch intent only.
         const { record } = await readLifecyclePlacement(db, authority.computerId);
         if (!record || record.provider !== 'aws-ec2'
+            || record.computerId !== authority.computerId
             || record.lifecycleJobId !== authority.jobId
             || record.lifecycleDigest !== authority.digest
-            || record.leaseEpoch !== authority.leaseEpoch
-            || !IN_FLIGHT_STATES.has(record.state)) return refuse();
+            || record.leaseEpoch !== authority.leaseEpoch) return refuse();
+        if (!IN_FLIGHT_STATES.has(record.state)) {
+            if (await authorizeAdoptRecovery(db, record))
+                return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
+            // Only the durable live-release replay can authorize RECOVERING.
+            // Deleted-computer and image recovery have separate authority.
+            if (!isPoolReleaseRecovering(record)) return refuse();
+            let work;
+            try { work = buildLifecycleWork(poolReleaseReplay(record)!.intent); }
+            catch { return refuse(); }
+            if (work.intent.operation !== 'release' || !isPoolMode(work.intent.deployment)
+                || !matchesPoolReleaseRecovery(record, work)) return refuse();
+            const computer = await readCanaryComputer(db, authority.computerId);
+            if (!computer || computer.deleted || computer.userId !== record.ownerUserId) return refuse();
+        }
     } catch (error) {
         // Corrupt/duplicate placements are refused; a failed read is uncertain.
         return (error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError) ? refuse() : unavailable();

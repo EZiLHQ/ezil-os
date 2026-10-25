@@ -1058,6 +1058,7 @@ export async function openDesktopWindow (ctx = {}) {
     const spinner = AppSpinner({
         label: `Opening ${ctx.appName || title}…`,
         isMigrating: () => session.isComputeMigrating(computer.id),
+        isLaunching: () => session.isComputeLaunching(computer.id),
         onRetry: () => { void start_boot(); },
     });
     el_body.appendChild(spinner.el);
@@ -1096,8 +1097,8 @@ export async function openDesktopWindow (ctx = {}) {
      * function's decision (the reveal/failure code paths own it directly).
      */
     const show_panel = () => {
-        // A migration has its own honest copy, including on the shared warm path.
-        const show_phases = show_phase_list && !session.isComputeMigrating(computer.id);
+        // Migration and fresh launch copy stay visible on the shared warm path too.
+        const show_phases = show_phase_list && !session.isComputeMigrating(computer.id) && !session.isComputeLaunching(computer.id);
         progress.el.hidden = ! show_phases;
         spinner.el.hidden = show_phases;
     };

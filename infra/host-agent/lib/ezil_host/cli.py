@@ -92,6 +92,10 @@ def step(cfg, name, detach=False):
         return f"lease generation={l['generation']} leaseEpoch={l['leaseEpoch']}"
     lease = _lease(cfg)
     if name == "guard":
+        record = pool.read_record(cfg)
+        if record is not None and lease.get("kind") != "pool":
+            lease = {"kind": "pool", "poolHostId": record["poolHostId"],
+                     "poolGeneration": record["poolGeneration"], "appOrigin": record.get("appOrigin")}
         if lease.get("kind") == "pool":
             return pool.run(cfg, lease)
         return "guard " + guard.run_guard(cfg, lease, rebase_runner=rebase.run_job)
@@ -105,10 +109,14 @@ def step(cfg, name, detach=False):
     if name == "overlay":
         desktop.overlay_mount(cfg)
         desktop.netns_up(cfg)
-        desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"))
+        # Pool specs are built once, with the enrolled relay, in run_desktop.
+        if pool.session_record(cfg, lease) is None:
+            desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"))
         return "overlay mounted, netns up, spec written"
     if name == "desktop":
         refuse_while_stopping(cfg, name)
+        if pool.session_record(cfg, lease) is not None:
+            return pool.run_desktop(cfg, lease, detach=detach)
         relay = desktop_relay(cfg, lease)
         if relay is not None:
             print(f"[desktop] relay {relay}", flush=True)

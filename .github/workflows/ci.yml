@@ -214,6 +214,7 @@ jobs:
                    shell/ezil/apps/viewer-evidence-test.mjs \
                    shell/ezil/apps/code-test.mjs \
                    shell/ezil/apps/preview-focus-test.mjs \
+                   shell/ezil/apps/frame-confirmation-test.mjs \
                    shell/ezil/apps/registry-trace-test.mjs \
                    shell/ezil/native-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \

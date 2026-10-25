@@ -36,7 +36,7 @@ export const tagsFor = (i:LifecycleIntent,generation=i.targetGeneration,fence=i.
  * (computer-id, managed-by, stage) are set once, at creation (ec2:CreateAction). */
 export const RETAG_KEYS = ['ezil:generation','ezil:fence-token'] as const;
 export const retagsFor = (i:LifecycleIntent) => ({'ezil:generation':String(i.targetGeneration),'ezil:fence-token':i.fenceToken});
-export const POOL_IAM_TYPES = ['m6i.large','m6i.xlarge','m6i.2xlarge'] as const;
+export { POOL_INSTANCE_TYPES as POOL_IAM_TYPES } from './deployment.js';
 export const POOL_CLAIM_KEYS = ['ezil:computer','ezil:generation','ezil:fence'] as const;
 export const poolTagsFor = (i:LifecycleIntent) => ({
     'ezil:managed-by':'app-computer-platform','ezil:stage':i.deployment.namespace,
@@ -57,7 +57,7 @@ export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
 export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest,
     ...(i.rebasePreparation ? { imageJobId: i.rebasePreparation.preparationJobId,
         imageJobPhase: parseLease(i.userData!).ebsRestore ? 'rebind' : 'launch' } : {}),
-    ...(i.operation==='pool-provision'?{operation:i.operation,poolHostId:i.poolHostId,poolGeneration:i.poolGeneration}:{})});
+    ...(['pool-provision','pool-retire'].includes(i.operation)?{operation:i.operation,poolHostId:i.poolHostId,poolGeneration:i.poolGeneration}:{})});
 export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started','detached','claimed','unpooled'] as const;
 export type Phase=typeof phases[number];
 /** `runBurstableInstances` is RunInstances for a T-family type: the same EC2

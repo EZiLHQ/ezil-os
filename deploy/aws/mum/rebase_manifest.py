@@ -78,6 +78,18 @@ def deployment_tuple(d):
         workflow(d[key], d, suffix)
 
 
+def promoted_release(d, record):
+    """Legacy deployments lack the four rebase fields as a group."""
+    deployment_tuple(d)
+    keys = PROMOTION if set(TUPLE) <= d.keys() else PROMOTION[:3]
+    need(all(d.get(k) == record[k] for k in (*keys, "accountId", "region", "namespace", "launchTemplateId")),
+         "deployed release is not the promoted app tuple")
+
+
+def retained_release(d, record):
+    need(record in d.get("releases", []), "image predecessor is not retained in live registry")
+
+
 def _schema(value, rule, schema):
     # Execute the checked-in contract schema using only its explicit keywords.
     if "$ref" in rule:

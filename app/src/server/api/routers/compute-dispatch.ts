@@ -25,6 +25,8 @@ import { TRPCError } from '@trpc/server';
 import { billingV2EntitlementReader } from '@/server/billing/v2/compute-access';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
+import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
+import type { PlacementDb } from '@/server/lib/compute/placement';
 import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
@@ -96,7 +98,7 @@ export async function routeComputer(
         // Gate routing with the authenticated owner before any reservation read.
         // The resolver repeats this check for its own fresh placement read.
         await readPlacement(db as PlacementExecutor, computer.computerId, computer.userId);
-        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, getEntitlement, aws), {
+        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, { ...awsDepsFor(env, getEntitlement, aws), pool: createPoolDeps(db as PlacementDb, env) }, {
             pinCloudflare, resolveEntitlement: getEntitlement,
             onPlacement: placement => { instanceType = placement.record?.instanceType ?? null; },
         });
@@ -151,8 +153,9 @@ function awsMigrationAnswer(result: ComputeStatus) {
  * Ready → ask the Worker's AWS route for the current placement's URLs.
  * The callback is lazy: an ensure refusal must never issue a preview request.
  */
-export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>) {
+export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>, preparePool?: () => Promise<void>) {
     if (!result.ok) {
+        if (result.errorCode === 'computer_starting' && result.retryable) await preparePool?.();
         return {
             ok: false as const,
             error: result.errorCode,
@@ -161,6 +164,8 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
             provider: 'cloudflare-guacamole' as const,
             computeProvider: 'aws-ec2' as const,
             ...awsMigrationAnswer(result),
+            ...(result.errorCode === 'computer_starting' && result.retryable === true && result.computeLaunching === true
+                ? { computeLaunching: true as const } : {}),
         };
     }
     return {

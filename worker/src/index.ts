@@ -63,7 +63,7 @@ import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@clou
 // AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
 import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
-import { AwsTunnelRegistry, lookupAwsTunnel, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
+import { AwsTunnelRegistry, lookupAwsTunnel, lookupAwsTunnelForBrowser, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
 import { awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
@@ -7473,7 +7473,7 @@ export default {
         zone: resolveAwsOriginZone(env),
         secrets: resolvePreviewSecrets(env).slice(0, 1),
         zoneRoot: (() => { try { return resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT); } catch { return ''; } })(),
-        lookup: (sid) => (registry ? lookupAwsTunnel(registry, sid) : Promise.resolve(null)),
+        lookup: (sid) => (registry ? lookupAwsTunnelForBrowser(registry, sid) : Promise.resolve(null)),
         fetch: (input, init) => fetch(input, init),
         nowMs: Date.now,
       });

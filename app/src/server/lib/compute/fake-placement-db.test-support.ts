@@ -236,6 +236,14 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 ).size;
                 return { rows: [{ n }] };
             }
+            case 'usage-stale': {
+                const excluded = text.match(/p\.state NOT IN \(([^)]+)\)/)![1]!.split(',').map(s => s.trim().replaceAll("'", ''));
+                return { rows: usage.filter(u => u.stopped_at == null).flatMap(u => placements
+                    .filter(p => uuidEq(p.computer_id, u.computer_id) && !excluded.includes(String(p.state)))
+                    .map((p): Row => ({ ...u, placement_state: p.state, placement_updated_at: p.updated_at })))
+                    .sort((a, b) => new Date(String(a.started_at)).getTime() - new Date(String(b.started_at)).getTime()
+                        || String(a.computer_id).localeCompare(String(b.computer_id)) || String(a.instance_id).localeCompare(String(b.instance_id))) };
+            }
             case 'usage-month': {
                 // The SQL totals per user in the database; answer with the same arithmetic
                 // (usage.ts `monthUsageFromRows`, the reference placement-usage-sql pins on real
@@ -257,12 +265,14 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             case 'usage-close':
             case 'usage-close-other': {
                 if (!tx) throw new Error('fake db: a usage write outside its transition transaction');
-                const [observedBy, computerId, keepInstance] = params as string[];
+                const dated = tag === 'usage-close' && /SET stopped_at = \$1::timestamptz/.test(text);
+                const stoppedAt = dated ? new Date(String(params[0])) : clock();
+                const [observedBy, computerId, keepInstance] = (dated ? params.slice(1) : params) as string[];
                 const hit = usage.filter((u) => uuidEq(u.computer_id, computerId) && u.stopped_at == null
                     && (tag === 'usage-close' || u.instance_id !== keepInstance));
                 for (const u of hit) {
                     const before = { ...u };
-                    Object.assign(u, { stopped_at: clock(), observed_by: observedBy, updated_at: clock() });
+                    Object.assign(u, { stopped_at: stoppedAt, observed_by: observedBy, updated_at: clock() });
                     tx.undo.push(() => Object.assign(u, before));
                 }
                 return { rows: [] };

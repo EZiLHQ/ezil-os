@@ -227,6 +227,56 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     }
   });
 
+  it.each(['matching', 'empty', 'mismatch'])('first browser route verifies %s connectors without a preview open', async (mode) => {
+    let checks = 0;
+    const deleted: string[] = [];
+    const tunnelFetch: FetchLike = async (url, init) => {
+      if (init.method === 'DELETE') deleted.push(new URL(url).pathname);
+      if (init.method === 'GET' && url.endsWith('/connections')) {
+        checks++;
+        const origins = mode === 'matching' ? ['13.200.1.2'] : mode === 'empty' ? [] : ['203.0.113.9'];
+        return Response.json({ success: true, result: [{ conns: origins.map((origin_ip) => ({ origin_ip })) }] });
+      }
+      return cfApiFetch(url);
+    };
+    const e = env({ AWS_ROUTING_ENABLED: '1' }, tunnelFetch);
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    let forwarded = 0;
+    globalThis.fetch = (async () => { forwarded++; return new Response('origin'); }) as typeof fetch;
+    for (let i = 0; i < 2; i++) {
+      const response = await worker.fetch(new Request(`https://aws-8443-${SID}-aws.ezil.work/vscode`, { headers: { cookie } }), e);
+      expect(response.status).toBe(mode === 'matching' ? 200 : 502);
+      if (mode !== 'matching') expect(await response.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+    }
+    expect(checks).toBe(1);
+    expect(forwarded).toBe(mode === 'matching' ? 2 : 0);
+    expect(deleted).toEqual(mode === 'mismatch' ? [
+      '/client/v4/zones/zone/dns_records/tid',
+      '/client/v4/accounts/acct/cfd_tunnel/tid/connections',
+      '/client/v4/accounts/acct/cfd_tunnel/tid',
+    ] : []);
+  });
+
+  it.each(['empty', 'mismatch'])('preview route preserves the %s connector verdict', async (mode) => {
+    const deleted: string[] = [];
+    const tunnelFetch: FetchLike = async (url, init) => {
+      if (init.method === 'DELETE') deleted.push(new URL(url).pathname);
+      if (init.method === 'GET' && url.endsWith('/connections')) {
+        const origins = mode === 'empty' ? [] : ['203.0.113.9'];
+        return Response.json({ success: true, result: [{ conns: origins.map((origin_ip) => ({ origin_ip })) }] });
+      }
+      return cfApiFetch(url);
+    };
+    const e = env({ AWS_ROUTING_ENABLED: '1' }, tunnelFetch);
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    const response = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(response.status).toBe(mode === 'empty' ? 503 : 502);
+    expect(await response.json()).toEqual({ ok: false,
+      error: mode === 'empty' ? 'aws_origin_starting' : 'tunnel_origin_mismatch' });
+    expect(deleted).toHaveLength(mode === 'empty' ? 0 : 3);
+  });
+
   it('preview, HTTP and WebSocket requests recheck expired origins and fence mismatches', async () => {
     for (const target of ['preview', 'http', 'websocket']) {
       let now = Date.now();

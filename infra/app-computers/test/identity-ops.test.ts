@@ -13,7 +13,7 @@ import { applyWorkloadIdentity, tagWorkload, workloadSynthesizer } from '../lib/
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
 import { LifecycleDeploymentSchema } from '../lib/lifecycle/deployment.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
-import { evaluate, list } from './iam-evaluate.js';
+import { evaluate, list, starExample } from './iam-evaluate.js';
 
 const A = '123456789012', R = REGION;
 const cfg = IdentityConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R,
@@ -123,7 +123,7 @@ for (const poolLifecycle of [undefined, false, true]) for (const killSwitch of [
                         [{ Effect: 'Deny', Resource: '*', Condition: undefined }]);
                 }
                 for (const kind of ['instance', 'volume']) {
-                    const resource = EC2(kind).replace('*', 'test');
+                    const resource = starExample(EC2(kind), 'test');
                     const context = { 'aws:RequestedRegion': R, ...COMPUTE('Resource') };
                     assert.deepEqual(evaluate(statements, action, resource, context),
                         { allowed: poolLifecycle === true, denied: poolLifecycle !== true });

@@ -172,7 +172,7 @@ def read_desktop_config(cfg, now_ms):
         return None
 
 
-def wait_desktop_config(cfg, timeout, poll=1.0, clock=time.time, sleep=time.sleep):
+def wait_desktop_config(cfg, timeout, poll=0.25, clock=time.time, sleep=time.sleep):
     """Bounded: the config, or None after `timeout` seconds (the desktop then starts without
     a relay, reports ice_missing, and the Worker's next push schedules a restart)."""
     deadline = clock() + max(0.0, float(timeout))

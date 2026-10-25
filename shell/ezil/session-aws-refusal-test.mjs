@@ -4,9 +4,9 @@ import { openDesktop, previewUrl, withWakeAndOneRetry } from './session.js';
 import { BOOT_FAILURE_COPY, computeBootUiState } from './boot-phases.js';
 
 const refusals = [
-    ['kill_switch', 'Your Mumbai computer is paused by operations'],
-    ['aws_disabled', 'Your Mumbai computer is paused by operations'],
-    ['capacity_unavailable', 'No Mumbai capacity right now'],
+    ['kill_switch', 'Your AWS computer is paused by operations'],
+    ['aws_disabled', 'Your AWS computer is paused by operations'],
+    ['capacity_unavailable', 'No capacity in India right now'],
     ['user_hours_cap', "This month's computer hours are used up"],
     ['global_hours_cap', "This month's computer hours are used up"],
 ];

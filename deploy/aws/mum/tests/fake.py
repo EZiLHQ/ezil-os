@@ -154,7 +154,7 @@ elif tool == "aws":
     assert flag("--region") == "ap-south-1"
     start = args.index("--no-cli-pager") + 1
     service, operation = args[start:start + 2]
-    if (root / "rebase-readbacks.json").exists() and service != "sts":
+    if (root / "rebase-readbacks.json").exists() and service not in ("sts", "secretsmanager", "cloudformation"):
         evidence = read("rebase-readbacks.json")
         if (service, operation) == ('ec2','describe-instances'):
             out({'Reservations':[{'Instances':[{'InstanceId':'i-014810524754b9ed0','State':{'Name':'running'},'Tags':[{'Key':'ezil:env','Value':'billing-staging'},{'Key':'ezil:purpose','Value':'os-staging'}]}]}]})
@@ -163,7 +163,9 @@ elif tool == "aws":
         elif (service,operation)==('ssm','send-command'):
             out({'Command':{'CommandId':'11111111-1111-4111-8111-111111111111'}})
         elif (service,operation)==('ssm','get-command-invocation'):
-            out({'Status':'Success','ResponseCode':0,'StandardOutputContent':json.dumps(read('schema-readback.json'))})
+            out({'Status':scenario.get('rebase_ssm_status','Success'),'ResponseCode':0,'StandardOutputContent':json.dumps(read('schema-readback.json'))})
+        elif (service,operation)==('ssm','list-commands'):
+            out({'Commands':[{'CommandId':flag('--command-id'),'Status':scenario.get('rebase_ssm_status','Success')}]})
         elif (service, operation) == ("imagebuilder", "get-image"):
             out(evidence["build"])
         elif (service, operation) == ("ec2", "describe-images"):
@@ -204,6 +206,17 @@ elif tool == "aws":
             save("uploaded-template.json", json.loads(Path(args[-2]).read_text()))
             save("template-upload.json", args[-1])
     elif service == "cloudformation":
+        if flag("--stack-name") == "ezil-identity-mum":
+            assert_locked("app-secret.lock")
+            assert "--change-set-name" not in args
+            if operation == "get-template":
+                assert flag("--template-stage") == "Original"
+                out(read("identity-live-template.json"))
+            elif operation == "describe-stacks":
+                out(read("identity-live-stack.json"))
+            else:
+                raise SystemExit("unexpected unchanged identity command")
+            raise SystemExit(0)
         if flag("--stack-name") == "ezil-mum-foundation":
             value = read("foundation-stack.json")
             role = "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec"
@@ -374,8 +387,12 @@ elif tool == "aws":
                 cs["Parameters"] = [old[p["ParameterKey"]] if p.get("UsePreviousValue") else p for p in read("requested.json")]
                 if scenario.get("extra_parameter"):
                     next(p for p in cs["Parameters"] if p["ParameterKey"] == "EnrollUrl")["ParameterValue"] = "https://wrong.example"
-                if scenario.get("ssm_drift"):
+                if scenario.get("ssm_drift") or scenario.get("base_review"):
                     next(p for p in cs["Parameters"] if p["ParameterKey"] == "UbuntuAmiId")["ResolvedValue"] = "ami-" + "9" * 17
+                if scenario.get("base_path_changed"):
+                    next(p for p in cs["Parameters"] if p["ParameterKey"] == "UbuntuAmiId")["ParameterValue"] = "/aws/changed"
+                if scenario.get("other_ssm"):
+                    next(p for p in cs["Parameters"] if p["ParameterKey"] == scenario["other_ssm"])["ResolvedValue"] = "ami-" + "9" * 17
                 mutable = scenario.get("non_replacing_double", False)
                 cs["Changes"] = [{"Type": "Resource", "ResourceChange": {"Action": "Modify", "LogicalResourceId": "Recipe", "ResourceType": "AWS::ImageBuilder::ImageRecipe", "Scope": ["Properties"], "Replacement": "False" if mutable else "True", "Details": [
                     {"Target": {"Attribute": "Properties", "Name": "Components", "RequiresRecreation": "Never" if mutable else "Always"}, "ChangeSource": "ParameterReference", "CausingEntity": key}
@@ -398,6 +415,20 @@ elif tool == "aws":
                         {"Target": {"Attribute": "Properties", "Name": "Components", "RequiresRecreation": "Always"}, "ChangeSource": source, "CausingEntity": cause}
                         for source, cause in [("ResourceReference", "Component"), *[("ParameterReference", k) for k in ("AgentSrcS3Uri", "DesktopImageDigest", "DesktopImageId")]]
                     ])
+                    if scenario.get("base_live_shape"):
+                        # Live CloudFormation 2026-10-23: re-resolved SSM parent is Static/DirectModification, no cause.
+                        detail = {"Target": {"Attribute": "Properties", "Name": "ParentImage", "RequiresRecreation": "Always"},
+                                  "ChangeSource": "DirectModification", "Evaluation": "Static"}
+                        if scenario.get("base_live_cause"):
+                            detail["CausingEntity"] = scenario["base_live_cause"]
+                        cs["Changes"][1]["ResourceChange"]["Details"].append(detail)
+                    elif scenario.get("base_review") or scenario.get("base_unexplained_parent"):
+                        cs["Changes"][1]["ResourceChange"]["Details"].extend([
+                            {"Target": {"Attribute": "Properties", "Name": "ParentImage", "RequiresRecreation": "Always"},
+                             "ChangeSource": "ParameterReference", "CausingEntity": scenario.get("base_parent_cause", "UbuntuAmiId")},
+                            {"Target": {"Attribute": "Properties", "Name": "ParentImage", "RequiresRecreation": "Always"},
+                             "ChangeSource": "DirectModification", "Evaluation": "Dynamic"},
+                        ])
                     if scenario.get("live_dynamic") or scenario.get("dynamic_unexplained"):
                         # Real CloudFormation also lists value-only Dynamic entries for referenced properties.
                         dyn = lambda name, rec: {"Target": {"Attribute": "Properties", "Name": name, "RequiresRecreation": rec}, "ChangeSource": "DirectModification", "Evaluation": "Dynamic"}
@@ -466,7 +497,21 @@ elif tool == "aws":
             out({"LaunchTemplateVersions": selected})
         else:
             assert operation == "describe-images"
-            out({"Images": [{"ImageId": flag("--image-ids"), "OwnerId": "452630323510", "State": "available", "Architecture": "x86_64"}]})
+            if "--owners" not in args:
+                ids = args[args.index("--image-ids") + 1:args.index("--output")]
+                assert len(ids) == 2 and ids[0] == "ami-" + "1" * 17
+                if scenario.get("base_describe_fail"):
+                    raise SystemExit("synthetic describe-images failure")
+                images = [
+                    {"ImageId": ids[0], "CreationDate": scenario.get("base_old_date", "2026-10-17T10:41:57.000Z")},
+                    {"ImageId": ids[1], "OwnerId": "099720109477", "State": "available", "Architecture": "x86_64",
+                     "Name": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20261023",
+                     "CreationDate": "2026-10-23T10:41:57Z", **scenario.get("base_image", {})},
+                ]
+                out({"Images": images[:scenario.get("base_image_count", 2)],
+                     **({"NextToken": "more"} if scenario.get("base_image_page") else {})})
+            else:
+                out({"Images": [{"ImageId": flag("--image-ids"), "OwnerId": "452630323510", "State": "available", "Architecture": "x86_64"}]})
     elif service == "secretsmanager":
         assert_locked("app-secret.lock")
         if operation == "get-secret-value":

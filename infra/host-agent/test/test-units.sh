@@ -86,6 +86,7 @@ check "enroll: the nonce is re-sent only after an answer that consumed nothing; 
 check "enroll: a 200 retires the nonce only after its credentials are durable; malformed/write error/crash keep it and the replay converges" pyunit test_enroll_durability
 check "guard: waits, bounded, for the late-attached data volume (wake link, provision disk)" pyunit test_boot_retries.VolumeWait
 check "lease: IMDS transport errors retried, bounded; HTTP refusals final" pyunit test_boot_retries.ImdsRetry
+check "pool: tagged claim, serial disk, nonce, single desktop transition, readiness and crash resume" pyunit test_pool
 check "history: env + read-only profile.d make an open terminal append each command (real pty bash)" pyunit test_history_stop.HistoryInjection
 check "history: a still-running command is saved when the terminal shell is hung up before the stop" pyunit test_history_stop.HangupBeforeStop
 check "hangup: a shell outside the container pid namespace is never signalled; membership read after the pidfd pin" pyunit test_history_stop.HangupScope

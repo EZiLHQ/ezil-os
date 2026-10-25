@@ -111,7 +111,7 @@ const calls = [];
 /** Bumped per mint so each minted URL is distinguishable from every other. */
 let mintSeq = 0;
 /** What `confirmFrame` should answer next. Flipped to drive BOTH directions. */
-let confirmAnswer = true;
+let confirmAnswer; // Unknown until Direction A supplies an authenticated verdict.
 /** What `/api/shell/preview-url` should answer next. */
 let previewUrlMode = 'ok';
 /** What `/api/shell/focus` should answer next. */
@@ -150,6 +150,7 @@ window.fetch = async (url, opts = {}) => {
 
     if ( u.startsWith(ENDPOINTS.desktop) ) {
         if ( u.includes('confirm=frame') ) {
+            if ( confirmAnswer === undefined ) return json({ ok: false });
             return json({ ok: true, confirmed: confirmAnswer, status: confirmAnswer ? 200 : 500 });
         }
         if ( (opts.method ?? 'GET') === 'GET' ) return json({ ok: true, guacamoleRunning: true });
@@ -193,8 +194,8 @@ const click = (el) => el?.dispatchEvent(new window.MouseEvent('click', { bubbles
  * browser gives and exactly the signal the shell must refuse to trust: what
  * happens next has to come from `session.confirmFrame`, not from this event.
  *
- * `settle_frame` also has a 4s fallback timer, so the window is not DEPENDENT
- * on this — it just makes the test take 4s less per case.
+ * `settle_frame` also probes early on a bounded timer, independently of load.
+ * Neither trigger is itself evidence that the frame is usable.
  */
 const fireLoad = (iframe) => iframe?.dispatchEvent(new window.Event('load'));
 
@@ -298,11 +299,12 @@ push('and the fresh URL is the one the SECOND call returned',
 const progressA = win2?.querySelector('[data-kind]');
 push('the boot panel is still up at the moment `load` fires',
     !! progressA && progressA.hidden === false, `hidden=${progressA?.hidden}`);
-push('nothing asked the server before `load`',
-    ! calls.some(c => c.url.includes('confirm=frame')));
+push('the server was probed before `load`, without hiding an unconfirmed frame',
+    calls.some(c => c.url.includes('confirm=frame')) && progressA?.hidden === false);
 
+confirmAnswer = true;
 fireLoad(iframe2);
-await settle(14);
+await settle(30);
 
 push('the server WAS asked (load alone never reveals the frame)',
     calls.some(c => c.url.includes('confirm=frame')));

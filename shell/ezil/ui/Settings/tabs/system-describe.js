@@ -171,5 +171,5 @@ export function describePlan (info) {
     const p = info && info.plan;
     if ( ! p ) return { value: 'Not reported', hint: 'Plan entitlement is not available.' };
     const status = { preparing: 'being prepared', blocked: 'paused', failed: 'preparation failed', ready: 'ready' }[p.status] || 'status unknown';
-    return { value: `${p.vcpu} vCPU / ${p.memoryGB} GB in Mumbai — ${status}`, hint: p.reason || '' };
+    return { value: `${p.vcpu} vCPU / ${p.memoryGB} GB on AWS (India) — ${status}`, hint: p.reason || '' };
 }

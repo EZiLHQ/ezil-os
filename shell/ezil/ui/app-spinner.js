@@ -11,7 +11,7 @@
 // they used `BootProgress` anyway, rendering "Waking your machine" and four
 // container phases describing nothing that is actually happening to an HTML
 // document. They now use this instead, exclusively. An observed upgrade
-// migration gets its own copy until the move finishes.
+// migration or fresh replacement launch gets its own copy while observed.
 //
 // `apps/desktop-window.js` (a REAL streamed container) keeps `BootProgress`
 // too, but opens showing THIS component and only reveals the phase panel
@@ -43,9 +43,11 @@ import {
     BOOT_NOT_CONFIGURED_COPY,
 } from '../boot-phases.js';
 
+import { LAUNCH_COPY } from '../launch-copy.js';
+
 // Like the boot copy tables, static text is rendered via textContent.
 const MIGRATION_COPY = {
-    title: 'Moving your computer to Mumbai',
+    title: 'Moving your computer to AWS (India)',
     body: 'This first start takes a few minutes. Your files come with you.',
 };
 
@@ -60,10 +62,11 @@ const MIGRATION_COPY = {
  *   Preview…", "Opening Code…" — never machine vocabulary.
  * @param {() => void} [opts.onRetry] Called by the failure state's Retry button.
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
+ * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific
  *   failure guidance. Changes wording only, never readiness or retry behavior.
  */
-export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigrating = () => false } = {}) {
+export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     root.setAttribute('role', 'status');
@@ -101,11 +104,11 @@ export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigr
         root.setAttribute('data-kind', state.kind);
 
         if ( state.kind === 'progress' ) {
-            const migrating = isMigrating() === true;
+            const copy = isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
             el_ring.hidden = false;
-            el_label.textContent = migrating ? MIGRATION_COPY.title : label;
-            el_sub.hidden = !migrating;
-            el_sub.textContent = migrating ? MIGRATION_COPY.body : '';
+            el_label.textContent = copy ? copy.title : label;
+            el_sub.hidden = !copy;
+            el_sub.textContent = copy ? copy.body : '';
             el_actions.hidden = true;
             return;
         }

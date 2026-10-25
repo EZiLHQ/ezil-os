@@ -2,7 +2,7 @@
 
 The guard unit owns a disposable desktop while it waits. Adoption uses the normal
 disk guard and enrollment; the rest of the boot chain opens the user's overlay/home.
-Only a verified HTTPS claim may supply the fence when IMDS tags are disabled.
+The authenticated claim is authority; durable state permits only exact-instance resume.
 """
 import base64
 import fcntl
@@ -20,14 +20,18 @@ from .fsops import DIR_FLAGS, Refused, read_regular_at
 
 EPOCH_FILE = "pool-epoch.json"       # host root disk; survives reboots, never guest-visible
 POLL_SECONDS = 1.0
+READY_POLL_SECONDS = 0.25
+TIMING_FILE = "pool-session-timing.json"
+TIMING_PHASES = ("claimObservedMs", "guardDoneMs", "enrollDoneMs", "warmStoppedMs",
+                 "relayAvailableMs", "desktopStartedMs", "desktopHealthyMs")
 FENCE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
 SERIAL_RE = re.compile(r"vol-?([0-9a-f]{8,17})")
 
 
-def parse_claim(raw):
+def parse_claim(raw, *, require_nonce=True):
     try:
-        claim = json.loads(raw)
-    except (ValueError, UnicodeDecodeError, TypeError) as e:
+        claim = leasemod.strict_json(raw)
+    except (ValueError, UnicodeDecodeError, TypeError, RecursionError) as e:
         raise Refused("pool_claim_malformed") from e
     if not isinstance(claim, dict):
         raise Refused("pool_claim_malformed")
@@ -35,21 +39,50 @@ def parse_claim(raw):
         raise Refused("pool_claim_invalid", "computerId")
     for field in ("generation", "leaseEpoch"):
         value = claim.get(field)
-        if type(value) is not int or not 1 <= value <= 2**53 - 1:
+        if type(value) is not int or not 1 <= value <= 2147483647:
             raise Refused("pool_claim_invalid", field)
     for field, pattern in (("fence", FENCE_RE), ("volumeSerial", SERIAL_RE),
-                           ("nonce", leasemod.NONCE_RE), ("fsUuid", leasemod.UUID_RE)):
-        if field in ("nonce", "fsUuid") and field not in claim:
+                           ("enrollNonce", leasemod.NONCE_RE), ("fsUuid", leasemod.UUID_RE)):
+        if field not in claim and (field == "fsUuid" or (field == "enrollNonce" and not require_nonce)):
             continue
         if not isinstance(claim.get(field), str) or not pattern.fullmatch(claim[field]):
             raise Refused("pool_claim_invalid", field)
-    if "provision" in claim and type(claim["provision"]) is not bool:
-        raise Refused("pool_claim_invalid", "provision")
-    if claim.get("provision") and "fsUuid" not in claim:
-        raise Refused("pool_claim_invalid", "provision requires fsUuid")
+    if "createVolume" in claim and type(claim["createVolume"]) is not bool:
+        raise Refused("pool_claim_invalid", "createVolume")
+    if claim.get("createVolume") and "fsUuid" not in claim:
+        raise Refused("pool_claim_invalid", "createVolume requires fsUuid")
+    if "claimPublishedAtMs" in claim:
+        published = claim["claimPublishedAtMs"]
+        if type(published) not in (int, float) or not 0 <= published <= 4102444800000:
+            raise Refused("pool_claim_invalid", "claimPublishedAtMs")
     # Unknown response fields cannot override local paths, authority or device identity.
     return {k: claim[k] for k in ("computerId", "generation", "leaseEpoch", "fence",
-                                  "volumeSerial", "nonce", "fsUuid", "provision") if k in claim}
+                                  "volumeSerial", "enrollNonce", "fsUuid", "createVolume", "claimPublishedAtMs") if k in claim}
+
+
+def timing(cfg, phase=None, claim=None):
+    """Boot-local monotonic milliseconds, shared by guard and desktop units.
+
+    tmpfs avoids mixing monotonic clocks across reboots. Never copy claim material
+    into telemetry; publication time is the sole optional wall-clock value.
+    """
+    path = os.path.join(cfg.runDir, TIMING_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            values = json.load(f)
+    except (OSError, ValueError):
+        values = {}
+    keys = (*TIMING_PHASES, "claimPublishedAtMs")
+    values = {k: v for k, v in values.items() if k in keys and type(v) in (int, float)
+              and 0 <= v <= 9007199254740991} if isinstance(values, dict) else {}
+    if phase is not None:
+        values.setdefault(phase, round(time.monotonic() * 1000))
+        if claim is not None:
+            published = claim.get("claimPublishedAtMs")
+            if type(published) in (int, float) and 0 <= published <= 4102444800000:
+                values["claimPublishedAtMs"] = published
+        enroll._write_private(path, json.dumps(values).encode())
+    return values
 
 
 def app_origin(cfg, lease):
@@ -88,9 +121,12 @@ class Client:
         deadline = time.monotonic() + float(self.cfg.get("enrollRetrySeconds", 540))
         delay = 1.0
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refused("pool_retry_exhausted", endpoint)
             try:
                 status, response = http.request(method, self.origin + "/api/compute/aws/pool/" + endpoint,
-                                                body=body, headers=headers, timeout=20,
+                                                body=body, headers=headers, timeout=min(20, remaining),
                                                 ca_file=self.cfg.caFile, server_name=self.cfg.tlsServerName)
             except (OSError, HTTPException):
                 pass
@@ -114,62 +150,88 @@ class Client:
             raise Refused("pool_enroll_invalid_status")
 
     def ready(self, health):
-        self.request("POST", "ready", {"poolHostId": self.lease["poolHostId"], "health": health})
+        self.request("POST", "ready", {"poolHostId": self.lease["poolHostId"],
+                                       "health": {"editorOk": health["ok"]}})
 
     def claim(self):
         status, body = self.request("GET", "claim")
         return None if status == 204 else parse_claim(body)
 
 
-def reserve_claim(cfg, pool_lease, claim, tag_fence):
-    """Persist before mounting/enrolling. A crash burns this host; it cannot become
-    a spare again. The flock also excludes concurrent guard activations.
-
-    When tags are disabled (None), the fence is the authority returned by the app
-    over verified TLS to this identity-authenticated request, not an unsigned
-    value from disk/user data. No independent claim-signature format is defined.
-    """
-    if tag_fence is not None and tag_fence != claim["fence"]:
-        raise Refused("pool_fence_mismatch")
-    os.makedirs(cfg.stateDir, mode=0o700, exist_ok=True)
-    root = os.open(cfg.stateDir, DIR_FLAGS)
+def read_record(cfg):
     try:
-        fcntl.flock(root, fcntl.LOCK_EX)
+        root = os.open(cfg.stateDir, DIR_FLAGS)
+    except FileNotFoundError:
+        return None
+    try:
         try:
             st = os.stat(EPOCH_FILE, dir_fd=root, follow_symlinks=False)
         except FileNotFoundError:
-            previous = None
-        else:
-            raw = read_regular_at(root, EPOCH_FILE, st, limit=65536)
-            try:
-                previous = json.loads(raw)
-                if not isinstance(previous, dict) or type(previous.get("leaseEpoch")) is not int:
+            return None
+        try:
+            record = leasemod.strict_json(read_regular_at(root, EPOCH_FILE, st, limit=65536))
+            if record["phase"] not in ("reserved", "guarding", "enrolled", "switched", "failed"):
+                raise ValueError
+            record["claim"] = parse_claim(json.dumps(record["claim"]),
+                                         require_nonce=record["phase"] in ("reserved", "guarding"))
+            leasemod.parse(json.dumps({"kind": "pool", "poolHostId": record["poolHostId"],
+                                      "poolGeneration": record["poolGeneration"]}))
+            if not isinstance(record["instanceId"], str) or not record["instanceId"]:
+                raise ValueError
+            if "lease" in record:
+                saved = leasemod.parse(json.dumps({k: v for k, v in record["lease"].items()
+                                                   if k in leasemod.LEASE_KEYS}))
+                if (any(saved[k] != record["claim"][k] for k in ("computerId", "generation", "leaseEpoch"))
+                        or saved["volumeId"].replace("-", "") != record["claim"]["volumeSerial"].replace("-", "")):
                     raise ValueError
-            except (ValueError, TypeError) as e:
-                raise Refused("pool_epoch_malformed") from e
-        if previous is not None:
-            if claim["leaseEpoch"] <= previous["leaseEpoch"]:
-                raise Refused("epoch_not_increasing")
-            raise Refused("pool_host_already_claimed")
-        record = {k: claim[k] for k in ("computerId", "generation", "leaseEpoch", "fence", "volumeSerial")}
-        record.update(poolHostId=pool_lease["poolHostId"], poolGeneration=pool_lease["poolGeneration"])
-        enroll._write_private(os.path.join(cfg.stateDir, EPOCH_FILE), json.dumps(record).encode())
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError, leasemod.LeaseError, Refused) as e:
+            raise Refused("pool_epoch_malformed") from e
+        return record
     finally:
         os.close(root)
+
+
+def save_record(cfg, record):
+    enroll._write_private(os.path.join(cfg.stateDir, EPOCH_FILE), json.dumps(record).encode())
+
+
+def reserve_claim(cfg, pool_lease, claim):
+    """Caller holds the adoption lock. Never accept a second claim on this host."""
+    claim = parse_claim(json.dumps(claim))
+    previous = read_record(cfg)
+    if previous is not None:
+        if (claim["generation"] <= previous["claim"]["generation"]
+                or claim["leaseEpoch"] <= previous["claim"]["leaseEpoch"]):
+            raise Refused("epoch_not_increasing")
+        raise Refused("pool_host_already_claimed")
+    instance_id = guard.current_instance_id(cfg)
+    if not instance_id:
+        raise Refused("pool_instance_missing")
+    record = dict(poolHostId=pool_lease["poolHostId"], poolGeneration=pool_lease["poolGeneration"],
+                  instanceId=instance_id, claim=dict(claim), phase="reserved",
+                  appOrigin=app_origin(cfg, pool_lease))
+    save_record(cfg, record)
+    return record
 
 
 def computer_lease(cfg, claim):
     # The EC2 attachment name (/dev/sdf) is deliberately irrelevant here.
     volume_id = "vol-" + SERIAL_RE.fullmatch(claim["volumeSerial"])[1]
     device = guard.wait_device_for_volume(cfg, volume_id)
-    fs_uuid = claim.get("fsUuid") or guard.fs_uuid(device)
-    if fs_uuid is None:
-        raise Refused("pool_volume_unformatted", "a new volume requires provision and fsUuid in the claim")
+    observed_uuid = guard.fs_uuid(device)
+    fs_uuid = claim.get("fsUuid") or observed_uuid
+    if observed_uuid is None:
+        if not claim.get("createVolume") or not fs_uuid:
+            raise Refused("pool_volume_unformatted")
+        # blkid probes every signature (including filesystems without UUIDs and partition tables).
+        probe = subprocess.run(["blkid", "-p", "-o", "export", device], capture_output=True, text=True)
+        if probe.returncode != 2 or probe.stdout.strip():
+            raise Refused("pool_volume_has_signature")
     lease = {"v": 1, "computerId": claim["computerId"], "generation": claim["generation"],
              "leaseEpoch": claim["leaseEpoch"], "volumeId": volume_id, "fsUuid": fs_uuid,
-             "provision": claim.get("provision", False)}
-    if "nonce" in claim:
-        lease["nonce"] = claim["nonce"]
+             "provision": claim.get("createVolume", False)}
+    if "enrollNonce" in claim:
+        lease["nonce"] = claim["enrollNonce"]
     return leasemod.parse(json.dumps(lease))
 
 
@@ -213,8 +275,8 @@ def health(cfg):
     return {"ok": all(results), "desktop": results[0], "editor": results[1]}
 
 
-def wait_ready(cfg):
-    deadline = time.monotonic() + 180
+def wait_ready(cfg, timeout=180):
+    deadline = time.monotonic() + timeout
     while True:
         try:
             result = health(cfg)
@@ -224,7 +286,7 @@ def wait_ready(cfg):
             return result
         if time.monotonic() >= deadline:
             raise Refused("pool_desktop_not_ready")
-        time.sleep(POLL_SECONDS)
+        time.sleep(min(READY_POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
 def wait_claim(client, warm):
@@ -242,7 +304,8 @@ def wait_claim(client, warm):
 
 
 def stop_warm(cfg):
-    desktop.stop(cfg)
+    # Disposable root-only guest: no tenant history or data needs a TERM grace.
+    desktop.stop(cfg, grace=0, kill=True)
     if desktop.state(cfg) != "absent":
         raise Refused("pool_desktop_stop_failed")
     desktop.overlay_umount(cfg)
@@ -252,40 +315,147 @@ def stop_warm(cfg):
 
 
 def run(cfg, pool_lease):
-    if os.path.lexists(os.path.join(cfg.stateDir, EPOCH_FILE)):
-        raise Refused("pool_host_already_claimed")
+    os.makedirs(cfg.stateDir, mode=0o700, exist_ok=True)
+    root = os.open(cfg.stateDir, DIR_FLAGS)
+    try:
+        try:
+            fcntl.flock(root, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise Refused("pool_adoption_busy") from e
+        return _adopt(cfg, pool_lease)
+    finally:
+        os.close(root)
+
+
+def _adopt(cfg, pool_lease):
+    from .cli import enroll_or_reuse
+
+    record = read_record(cfg)
     client = Client(cfg, pool_lease)
-    client.enroll()
     warm = warm_config(cfg)
     mounted = False
     succeeded = False
+    stopped = record is not None and record["phase"] == "switched"
+    stop_attempted = stopped
     try:
-        start_warm(warm, pool_lease)
-        client.ready(wait_ready(warm))
-        claim = wait_claim(client, warm)
-        reserve_claim(cfg, pool_lease, claim, leasemod.Imds(cfg).fence_tag())
-        lease = computer_lease(cfg, claim)
-        # Pool claims always require a strict disk epoch increase, including on
-        # the same instance; the cold path's reboot exception does not apply.
-        guard.run_guard(cfg, lease, rebase_runner=rebase.run_job, allow_reboot=False)
+        if record is None:
+            client.enroll()
+            # A guard process may have died while waiting for a claim.
+            if desktop.state(warm) != "running":
+                start_warm(warm, pool_lease)
+            client.ready(wait_ready(warm))
+            claim = wait_claim(client, warm)
+            timing(cfg, "claimObservedMs", claim)
+            record = reserve_claim(cfg, pool_lease, claim)
+        else:
+            if (record["poolHostId"] != pool_lease["poolHostId"]
+                    or record["poolGeneration"] != pool_lease["poolGeneration"]
+                    or record["instanceId"] != guard.current_instance_id(cfg)):
+                raise Refused("pool_resume_mismatch")
+            if record["phase"] == "failed":
+                raise Refused("pool_host_already_claimed")
+            claim = record["claim"]
+        # The saved lease pins the filesystem UUID across interrupted marker commits.
+        lease = record.get("lease") or computer_lease(cfg, claim)
+        resumed_guard = record["phase"] != "reserved"
+        record["lease"] = lease
+        if not resumed_guard:
+            record["phase"] = "guarding"
+            save_record(cfg, record)
+        guard.run_guard(cfg, lease, rebase_runner=rebase.run_job, allow_reboot=resumed_guard)
         mounted = True
+        timing(cfg, "guardDoneMs")
         enroll._write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
         enrollment_cfg = config.Config(dict(cfg))
         enrollment_cfg["enrollUrl"] = client.origin + "/api/compute/aws/enroll"
-        enroll.enroll(enrollment_cfg, lease, instance_id=guard.current_instance_id(cfg),
-                      pool_claim={**pool_lease, "fence": claim["fence"]})
+        try:
+            enroll_or_reuse(enrollment_cfg, lease)
+        except Refused as e:
+            if e.code in ("enroll_refused", "enroll_nonce_absent"):
+                record["phase"] = "failed"
+                record["claim"].pop("enrollNonce", None)
+                record["lease"].pop("nonce", None)
+                save_record(cfg, record)
+            raise
+        timing(cfg, "enrollDoneMs")
+        record["lease"] = enroll.load_lease(cfg)
+        record["claim"].pop("enrollNonce", None)
+        record["phase"] = "switched" if stopped else "enrolled"
+        save_record(cfg, record)
+        if not stopped:
+            stop_attempted = True
+            stop_warm(warm)
+            stopped = True
+            timing(cfg, "warmStoppedMs")
+            record["phase"] = "switched"
+            save_record(cfg, record)
         succeeded = True
     finally:
         try:
-            stop_warm(warm)
-        except BaseException:
-            succeeded = False
-            raise
+            if not stop_attempted:
+                stop_warm(warm)
         finally:
             if not succeeded:
                 guard.clear_stamp(cfg)
                 if mounted:
                     subprocess.run(["umount", cfg.dataMount], check=True)
-    # The normal clean/overlay/desktop steps now use the data disk's /root,
-    # workspace and profiles. No warm home content is copied to the tenant disk.
-    return "pool claimed; data guarded and enrolled; desktop home switches to the user disk"
+    # Relay arrives via the existing agent/edge/tunnel units. The desktop step
+    # makes the single warm-to-user transition only after that config arrives.
+    return "pool claimed; data guarded and enrolled; waiting for the user desktop"
+
+
+def session_record(cfg, lease):
+    record = read_record(cfg)
+    if record is not None:
+        if (record["phase"] != "switched" or any(record["claim"][k] != lease.get(k)
+                for k in ("computerId", "generation", "leaseEpoch"))):
+            raise Refused("pool_session_mismatch")
+    return record
+
+
+def run_desktop(cfg, lease, detach=False):
+    """One transition, owned by the normal desktop unit. Reattach after a crash
+    between runc start and health completion instead of restarting a live session.
+    """
+    if session_record(cfg, lease) is None:
+        raise Refused("pool_session_missing")
+    guard.require_stamp(cfg, lease)
+    if desktop.state(cfg) != "running":
+        relay = desktop.wait_desktop_config(cfg, min(30, float(cfg.get("iceWaitSeconds", 90))))
+        if relay is None:
+            raise Refused("pool_relay_missing")
+        timing(cfg, "relayAvailableMs")
+        desktop.build_spec(cfg, lease, os.environ.get("EZIL_DESKTOP_MODE", "desktop"), desktop_config=relay)
+        desktop.write_ice_state(cfg, "applied", relay["expiresAt"])
+        if desktop.run(cfg, detach=True, log=os.path.join(cfg.runDir, "desktop.log")) != 0:
+            raise Refused("pool_desktop_start_failed")
+        timing(cfg, "desktopStartedMs")
+    if desktop.read_ice_state(cfg) != "applied":
+        raise Refused("pool_relay_missing")
+    wait_ready(cfg, timeout=30)
+    timing(cfg, "desktopHealthyMs")
+    record = session_record(cfg, lease)
+    if not record.get("sessionReadyReported"):
+        client = Client(cfg, {"poolHostId": record["poolHostId"], "poolGeneration": record["poolGeneration"],
+                              "appOrigin": record["appOrigin"]})
+        status, _ = client.request("POST", "session-ready", {"sessionReady": True, "timing": timing(cfg)})
+        if status != 200:
+            raise Refused("pool_session_ack_refused")
+        record["sessionReadyReported"] = True
+        save_record(cfg, record)
+    if not detach:
+        # Keep the Type=simple unit alive while supervising detached runc.
+        while desktop.state(cfg) == "running":
+            time.sleep(POLL_SECONDS)
+    return "pool user desktop healthy with disk home and relay"
+
+
+def session_ready(cfg, lease):
+    """GW-5 desktop status is the existing session readiness acknowledgement."""
+    try:
+        if session_record(cfg, lease) is None:
+            return False
+        guard.require_stamp(cfg, lease)
+        return desktop.read_ice_state(cfg) == "applied" and health(cfg)["ok"]
+    except (Refused, OSError, subprocess.SubprocessError):
+        return False

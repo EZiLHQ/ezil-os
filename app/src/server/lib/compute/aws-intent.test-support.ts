@@ -128,3 +128,12 @@ export function fixtureRebaseRelease(d: SourceLifecycleDeployment) {
         preparationStateMachineVersionArn: d.preparationStateMachineVersionArn!, recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn!,
         launchTemplateId: d.launchTemplateId, launchTemplateVersion: d.launchTemplateVersion, createdAt: '2026-10-22T10:00:00.000Z' };
 }
+
+export function fixturePoolIntent(operation: 'pool-provision' | 'pool-retire' | 'adopt' | 'release'): LifecycleIntent {
+    const base = fixtureIntent('start');
+    const poolHostId = '11111111-1111-4111-8111-111111111111';
+    if (operation === 'release') return { ...base, operation };
+    if (operation === 'adopt') return { ...base, operation, poolHostId };
+    return { ...base, operation, computerId: poolHostId, targetGeneration: 1, poolHostId, poolGeneration: 1,
+        providerInstanceId: operation === 'pool-provision' ? null : base.providerInstanceId, dataVolumeId: null };
+}

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
-import { AWS_BROWSER_ROUTE_TOKEN, requestAwsPreview } from './aws-preview';
+import { AWS_BROWSER_ROUTE_TOKEN, prepareAwsPoolSession, requestAwsPreview } from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { EnsureOptions } from './provider';
 import { ENROLLMENT_FAILED, ENROLLMENT_PENDING } from './placement';
@@ -351,4 +351,21 @@ describe('AWS browser route token', () => {
         expect(worker).toContain(`export const AWS_BROWSER_ROUTE_TOKEN = '${AWS_BROWSER_ROUTE_TOKEN}';`);
         expect(worker).toContain('https://aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}.${zoneRoot}/preview-bootstrap');
     });
+});
+
+it('pool relay preparation sends only an enrolled pending epoch and never returns user URLs', async () => {
+    const pending = row({ state: 'MOUNTING', last_error: 'pool_session_pending', enroll_nonce_hash: null,
+        enroll_consumed_hash: 'a'.repeat(64), instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111',
+        lifecycle_job_id: '11111111-1111-4111-8111-111111111111', lifecycle_digest: 'b'.repeat(64) });
+    const fake = createFakePlacementDb({ placements: [pending] });
+    vi.stubEnv('EZIL_AWS_BROWSER_ZONE', 'preview.example');
+    const fetcher = vi.fn(async () => Response.json(ready())); vi.stubGlobal('fetch', fetcher);
+    expect(await prepareAwsPoolSession(fake.db, { userId, computerId }, options, config, 'test-secret', 'test')).toBeUndefined();
+    expect(fetcher).toHaveBeenCalledOnce();
+    for (const patch of [{ last_error: 'enroll_tunnel_pending' }, { enroll_consumed_hash: null }, { enroll_nonce_hash: 'still-unconsumed' },
+        { instance_id: null }, { volume_id: null }, { lifecycle_job_id: null }, { lifecycle_digest: null }, { state: 'STOPPING' }]) {
+        const refused = createFakePlacementDb({ placements: [{ ...pending, ...patch }] });
+        await prepareAwsPoolSession(refused.db, { userId, computerId }, options, config, 'test-secret', 'test');
+        expect(fetcher).toHaveBeenCalledOnce();
+    }
 });

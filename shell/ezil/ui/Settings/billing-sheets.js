@@ -116,7 +116,7 @@ export function openComputeUpgradeSheet (options) {
             node('p', `Due now ${money(data.amountDueCents)}`).className = 'ezil-billing-sheet-total';
             node('p', 'USD. Any applicable tax appears on the invoice.').className = 'ezil-upgrade-caption';
             if ( ! v3 ) node('p', `Adds ${stdHoursLabel(data.grantStdSeconds, { round: 'down' })} standard-hours for the rest of this period (until ${dateLabel(data.periodEnd)}). Your usage so far carries over.`);
-            node('p', v3 ? 'Your upgrade takes effect after payment. Your Mumbai computer is prepared then.' : 'Your plan changes once payment is confirmed.');
+            node('p', v3 ? 'Your upgrade takes effect after payment. Your AWS computer is prepared then.' : 'Your plan changes once payment is confirmed.');
             const actions = node('div', null);
             actions.className = 'ezil-billing-sheet-actions';
             button(`Pay ${money(data.amountDueCents)} and upgrade`, 'confirm', () => {

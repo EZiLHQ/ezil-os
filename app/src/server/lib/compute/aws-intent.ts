@@ -170,7 +170,7 @@ export function readLifecycleDeployments(
     for (const region of regions) {
         const entry = Object.prototype.hasOwnProperty.call(parsed, region) ? (parsed as Record<string, unknown>)[region] : undefined;
         const { releases, ...deployment } = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
-        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(8).safeParse(releases).success) {
+        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(9).safeParse(releases).success) {
             invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`); continue;
         }
         const d = LifecycleDeploymentSchema.safeParse(deployment);
@@ -180,7 +180,9 @@ export function readLifecycleDeployments(
     return invalid.length > 0 ? { ok: false, invalid } : { ok: true, deployments };
 }
 
-export const LIFECYCLE_OPERATIONS = ['provision', 'start', 'stop', 'replace', 'retire'] as const;
+export const LIFECYCLE_OPERATIONS = ['provision', 'start', 'stop', 'replace', 'retire', 'pool-provision', 'adopt', 'release', 'pool-retire'] as const;
+/** Matches infra's pool intent allowlist for the approved paid sizes. */
+export const POOL_LIFECYCLE_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
 export type LifecycleOperation = (typeof LIFECYCLE_OPERATIONS)[number];
 
 const uuid = RebaseUuid;
@@ -204,6 +206,8 @@ export const LifecycleIntentSchema = z
         operation: z.enum(LIFECYCLE_OPERATIONS),
         targetGeneration: positive,
         fenceToken: uuid,
+        poolHostId: uuid.optional(),
+        poolGeneration: positive.optional(),
         providerInstanceId: instance.nullable(),
         dataVolumeId: volume.nullable(),
         previousGeneration: positive.nullable(),
@@ -219,9 +223,13 @@ export const LifecycleIntentSchema = z
     .strict()
     // Same rule set as the infra refine, in the same order.
     .refine((i) => {
+        const pool = ['pool-provision', 'pool-retire', 'adopt', 'release'].includes(i.operation);
+        if (pool && !(POOL_LIFECYCLE_TYPES as readonly string[]).includes(i.instanceType)) return false;
+        if (['pool-provision', 'pool-retire', 'adopt'].includes(i.operation) !== (i.poolHostId !== undefined)) return false;
+        if (['pool-provision', 'pool-retire'].includes(i.operation) !== (i.poolGeneration !== undefined)) return false;
         if (['provision', 'replace'].includes(i.operation) !== (i.userData !== null) && i.operation !== 'start') return false;
         if (!i.deployment.instanceTypes.includes(i.instanceType)) return false;
-        if ((i.operation === 'provision') !== (i.dataVolumeGiB !== null)) return false;
+        if ((i.operation === 'provision' || (i.operation === 'adopt' && i.dataVolumeId === null)) !== (i.dataVolumeGiB !== null)) return false;
         if (i.dataVolumeGiB !== null && (i.dataVolumeGiB < i.deployment.storage.dataMinGiB || i.dataVolumeGiB > i.deployment.storage.dataMaxGiB)) return false;
         if (i.operation === 'replace') {
             return (
@@ -235,6 +243,10 @@ export const LifecycleIntentSchema = z
             );
         }
         if (i.previousGeneration !== null || i.previousInstanceId !== null || i.previousFenceToken !== null) return false;
+        if (i.operation === 'pool-provision' || i.operation === 'pool-retire') return i.dataVolumeId === null
+            && (i.operation === 'pool-provision' ? i.providerInstanceId === null : i.providerInstanceId !== null)
+            && i.computerId === i.poolHostId && i.targetGeneration === i.poolGeneration;
+        if (i.operation === 'adopt') return i.providerInstanceId !== null;
         return i.operation === 'provision' ? i.providerInstanceId === null && i.dataVolumeId === null : i.providerInstanceId !== null && i.dataVolumeId !== null;
     }, { message: 'lifecycle_intent_invalid' })
     .superRefine((i, ctx) => {
@@ -314,7 +326,9 @@ export function currentGenerationIntent(
 
 /** Validate, serialize and digest one intent. Throws `LifecycleIntentInvalidError` rather than send a document the helper would refuse. */
 export function buildLifecycleWork(candidate: LifecycleIntent): LifecycleWork {
-    const parsed = LifecycleIntentSchema.safeParse(candidate);
+    const pool = ['pool-provision', 'adopt', 'release', 'pool-retire'].includes(candidate.operation);
+    const parsed = LifecycleIntentSchema.safeParse(pool ? { ...candidate, deployment: { ...candidate.deployment,
+        storage: { rootDeviceName: '/dev/sda1', ...candidate.deployment.storage } } } : candidate);
     if (!parsed.success) throw new LifecycleIntentInvalidError();
     const intent = parsed.data;
     const document = JSON.stringify(intent);

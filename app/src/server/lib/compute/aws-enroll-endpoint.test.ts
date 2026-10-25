@@ -773,3 +773,30 @@ describe('authenticated lower-image observations', () => {
         expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE)); expect(s.tunnels).toHaveLength(0);
     });
 });
+
+it('a pool claim uses canonical instance tags and waits for session-ready after enrollment', async () => {
+    const view = liveView({ tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot',
+        'ezil:namespace': 'pilot', 'ezil:pool-host': '11111111-1111-4111-8111-111111111111',
+        'ezil:computer': C1, 'ezil:generation': '2', 'ezil:fence': FENCE } });
+    const s = setup([booting()], { view });
+    const result = await s.enroll();
+    expect(result.status).toBe(200);
+    expect(result.poolRelay).toEqual({ computerId: C1, ownerUserId: U1, generation: 2, leaseEpoch: 3,
+        instanceId: DOC.instanceId, fenceToken: FENCE });
+    expect(result.body).not.toHaveProperty('poolRelay');
+    expect(s.placements[0]!.last_error).toBe('pool_session_pending');
+    expect((await s.enroll()).poolRelay).toEqual(result.poolRelay);
+    expect(s.placements[0]!.last_error).toBe('pool_session_pending');
+    view.tags = { ...view.tags, 'ezil:computer': 'wrong' };
+    const refused = await s.enroll();
+    expect(refused.status).toBe(403); expect(refused.poolRelay).toBeUndefined();
+});
+
+it('ordinary enrollment and an uncommitted pool tunnel never trigger relay preparation', async () => {
+    expect((await setup().enroll()).poolRelay).toBeUndefined();
+    const view = liveView({ tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot',
+        'ezil:namespace': 'pilot', 'ezil:pool-host': '11111111-1111-4111-8111-111111111111',
+        'ezil:computer': C1, 'ezil:generation': '2', 'ezil:fence': FENCE } });
+    const s = setup([booting()], { view, tunnel: async () => ({ ok: false, status: 503, code: 'tunnel_transport' }) });
+    const result = await s.enroll(); expect(result.status).toBe(503); expect(result.poolRelay).toBeUndefined();
+});

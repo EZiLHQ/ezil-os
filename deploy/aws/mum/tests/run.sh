@@ -220,6 +220,8 @@ test_case 'lifecycle incomplete change-set page refused' lifecycle-page '{"lifec
 test_case 'lifecycle change-set property values checked' lifecycle-context '{"lifecycle_change":"context"}' 'refuse-lifecycle change-set values are not'
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/base-ami.py"
 python3 "$here/locking.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rebase.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rollout.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/registry_gc.py"

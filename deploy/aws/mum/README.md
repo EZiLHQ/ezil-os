@@ -55,7 +55,29 @@ DistributionConfiguration/InfrastructureConfiguration may change. The component
 and recipe must both be replaced with the new version. Additions, removals,
 unexplained properties, IAM, network, KMS, ECR, S3 and other resource changes
 are refused. All nonallowed parameters use previous values, including resolved
-SSM values; Ubuntu parent drift stops the run.
+SSM values; Ubuntu parent drift stops the run unless explicitly reviewed below.
+
+To accept a reviewed update of the Ubuntu base, add
+`--reviewed-base-ami <ami-id>` to `rebuild-ami.sh` (alongside the normal
+`--recipe-version` for the immutable recipe replacement). For example, after
+reviewing the 2026-10-23 Canonical image, add
+`--reviewed-base-ami ami-0fc5120b2d80d4749` to both the dry run and apply command.
+This flag accepts only an exact match with `UbuntuAmiId`'s new change-set
+`ResolvedValue`; its SSM parameter path must remain unchanged. On apply, the
+script uses read-only `ec2 describe-images` for the old and reviewed AMIs and
+requires the new image to have Canonical owner `099720109477`, state `available`,
+architecture `x86_64`, a creation date strictly newer than the old image, and
+a name matching
+`^ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24\.04-amd64-server-[0-9]{8}(\.[0-9]+)?$`.
+Missing or invalid image metadata refuses execution. Other parameter and
+resolved-SSM changes still refuse, as do unrelated resource changes. Without
+the flag, the existing refusal remains. Dry run prints the proposed review;
+the image checks run against the actual change set on apply.
+
+After the full change-set validation succeeds and before execution, the release
+directory receives nonsecret `base-image-review.json` containing `oldId`,
+`newId`, `name`, and `creationDate`. No review file is produced when the resolved
+base is unchanged. The fixed `bake-inputs.json` key set is unchanged.
 
 Apply saves the byte-identical old config as `previous-ami-config.json` and the
 candidate as `candidate-ami-config.json` in the release directory. **Only after
@@ -413,10 +435,14 @@ references and does not validate the live Mumbai configuration or AWS responses.
 ## Rebase release tooling (contract v1, lane E increment)
 
 The bake accepts a paired `--previous-desktop-image-ref` and
-`--previous-desktop-image-id`. Supply the retained **promoted** source manifest
-with `--previous-release` (default: `previous-rebase-release.json` in the release
-directory). The source manifest must match the current app deployment tuple,
-checked under the existing app-secret lock. A previous AMI build is insufficient.
+`--previous-desktop-image-id`. Supply the retained **image predecessor** with
+`--previous-release` (default:
+`previous-rebase-release.json` in the release directory). Its lower ID and immutable
+reference must match the previous pair, and its complete record must already be
+in the live registry. Separately supply `--deployed-release <manifest>` matching
+the current app promotion tuple. Both checks run under the app-secret lock. The
+bake retains `deployed-release.json` separately from `previous-rebase-release.json`;
+new plans hash both, even when they contain the same record.
 A new component/recipe version is required to introduce the previous parameters.
 Omitting the pair explicitly produces a bake without N−1; it does not inherit the
 last build's previous parameters.
@@ -428,6 +454,7 @@ bash deploy/aws/mum/rebuild-ami.sh \
   --previous-desktop-image-ref "$PREVIOUS_DESKTOP_REF" \
   --previous-desktop-image-id "$PREVIOUS_LOWER_ID" \
   --previous-release "$PREVIOUS_RELEASE_MANIFEST" \
+  --deployed-release "$DEPLOYED_RELEASE_MANIFEST" \
   --release-dir "$REBASE_RELEASE_DIR"
 ```
 
@@ -454,12 +481,15 @@ recovery versions in **source evidence only**. The target schema stays strict.
 Promotion and rollback append/retain complete immutable release records under
 `app-secret.lock`, preserve string/object encoding and other regions, and journal
 both full deployment entries before writing. All records are retained, including
-records referenced by placements or unfinished jobs. At eight records the tool
-refuses a ninth; it never guesses whether a record can be collected. Duplicate
-source digests refuse instead of making source resolution ambiguous.
+records referenced by placements or unfinished jobs. At nine records the tool
+refuses a tenth; it never guesses whether a record can be collected. Registry
+identity is `(lowerImageDigest, amiId)`: duplicate pairs and changes to
+an existing pair refuse, including attempts to fill historical null fields.
+Different AMIs may share a lower. The app resolver still refuses ambiguous
+shared-lower source placements; source disambiguation by observed AMI is deferred.
 
-For A3, a maintenance bake keeps the promoted lower ID, changes the reviewed
-agent commit, clears both previous parameters, and records
+For A3, a maintenance bake keeps its maintenance source lower ID, changes the
+reviewed agent commit, clears both previous parameters, and records
 `maintenance-source-release.json`. The selected commit must contain the
 maintenance implementation. Containerd's resolved child ID is compared after
 push; a different lower refuses before any AMI stack update.
@@ -467,7 +497,8 @@ push; a different lower refuses before any AMI stack update.
 ```bash
 bash deploy/aws/mum/rebuild-ami.sh --desktop-image "$CURRENT_DESKTOP_IMAGE" \
   --source-sha "$REVIEWED_SHA" --recipe-version "$NEW_RECIPE_VERSION" \
-  --maintenance-release "$CURRENT_SOURCE_MANIFEST" --release-dir "$MAINTENANCE_RELEASE_DIR"
+  --maintenance-release "$CURRENT_SOURCE_MANIFEST" \
+  --deployed-release "$DEPLOYED_RELEASE_MANIFEST" --release-dir "$MAINTENANCE_RELEASE_DIR"
 # Review, then repeat with --apply.
 ```
 
@@ -485,7 +516,8 @@ independently on the verified preview DB host, not learned through the connectio
 that this command is about to trust.
 
 The lead first synthesizes, publishes assets and **stages, but does not execute**
-three reviewed change sets. `rollout.json` has this closed shape (absolute file
+three reviewed change sets (or the verified unchanged identity review below).
+`rollout.json` has this closed shape (absolute file
 paths and actual change-set ARNs replace the placeholders):
 
 ```json
@@ -533,10 +565,68 @@ foundation map is exactly `ComputerLaunchTemplate` / Modify /
 `["LaunchTemplateData"]` / `[]`: it reuses its unchanged template and only changes
 `HostAmiId`. All other parameter values and resolved SSM values are preserved.
 
+For an identity stack with no changes, set only its `changeSetArn` to `null`
+and use exactly `{"schemaVersion":1,"changes":{}}` in `identity-review.json`.
+The before and candidate templates must be equal JSON, ignoring formatting and
+object key order. Apply the existing `json-tool.py carry-cdk-metadata` rule to
+the artifacts before review and planning; metadata differences are not ignored.
+Foundation and workflows still require reviewed change sets.
+
+The unchanged identity stack review may also include `beforeParameters`, an
+array from the reviewed stack's `Parameters`, for example
+`[{"ParameterKey":"Keep","ParameterValue":"literal","ResolvedValue":"resolved"}]`.
+`ResolvedValue` is optional; use `[]` to pin a parameterless stack. During
+`apply-identity`, the app-secret lock and admission gate still apply. The tool
+reads the live Original template and stack, requires template equality, a stable
+`*_COMPLETE` status (excluding rollback and deleted stacks), and unchanged
+parameters when pinned. It performs no CloudFormation mutation.
+
+The generated identity evidence has `changeSetArn: null`, `status: "unchanged"`,
+the pinned candidate file's `candidateSha256`, a `liveTemplateSha256` computed
+from canonical JSON (sorted keys, compact separators), and the observed
+`parameters` array, including resolved SSM values. Without `beforeParameters`,
+that array records the live baseline. Receipt validation checks both hashes
+against the reviewed candidate using their respective byte/JSON formats and
+accepts this status only for a null identity change set. Dry runs verify the
+readbacks without writing a receipt. Never create or edit receipts by hand.
+
+For a reviewed pool enablement, add the optional top-level field
+`"poolIam": "/review/pool-iam-review.json"` to `rollout.json`. Planning pins its
+absolute path and SHA-256 as `poolIam` and `poolIamSha256`; plan loading and
+CloudFormation execution recheck the artifact before use. Without it, the existing
+pool IAM refusals remain in force.
+
+The checked-in [pool IAM review](fixtures/pool-iam-review.mum.json) was derived
+from the 2026-10-23 `review-107` live identity/lifecycle templates and raw
+candidates, carrying the live `AWS::CDK::Metadata` resources into the candidates
+as `stage.sh` does. Its schema is
+`{"schemaVersion":1,"namespace":"mum","stacks":{"identity":{...},"workflows":{...}}}`.
+Each logical resource maps to `{"added":[...],"removed":[...]}` containing whole,
+exact IAM statements. It includes the shared `BoundaryEA298153` edit and the
+controller, preparation and recovery policy deltas, including changed Lambda
+version references. `ImageJobBoundary` is absent because its Action reorder is
+not an IAM change. Minimal policy projections of the same templates live in
+`tests/fixtures/pool-iam-templates.json`.
+If CloudFormation enumerates an Action reorder as a `PolicyDocument` modification,
+the separate template review may include that exact property entry; the pool IAM
+artifact still omits it.
+
+Every IAM statement delta in each phase must match that artifact exactly:
+object key order and Action list order are ignored, statement duplicates count,
+and other arrays retain their order. Added Allows for DetachVolume, DeleteTags
+or TerminateInstances must retain `StringEquals` managed-by and stage resource
+tags (`aws:ResourceTag` or `ec2:ResourceTag`). Only the shared boundary may remove
+the two DetachVolume/DeleteTags deny actions, with a matching Allow that adds
+exactly those actions under the same conditions and resources. The controller's
+pool-tagged RunInstances Deny must limit instance types to `m6i.large` and
+`m6i.xlarge`. Other forbidden actions, wildcards and resource/property fences
+remain enforced. A reviewed artifact is specific to its complete IAM delta;
+changed Lambda references or policy statements require a new reviewed artifact.
+
 The plan pins every review/template byte, config, SQL, bake/source record, and the
-checked-in staging installer. The identity validator requires A2's dedicated
+checked-in staging installer. For identity changes, the validator requires A2's dedicated
 boundary, all shared global denies, and the 6144-byte limit; the shared boundary
-can only gain DescribeSnapshots. Identity role-write conditions may admit the
+can only gain DescribeSnapshots except for the pinned pool allowance above. Identity role-write conditions may admit the
 new boundary alongside the existing one, with no other change. Workflow templates
 must bind exactly the preparation and recovery execution roles to it. Existing
 exports, conditions, storage/network resources and IAM denies remain fenced.
@@ -630,3 +720,145 @@ before another prepare can be sent. Repeated work uses the recorded job ID.
 Launch needs the preparation journal or an explicit `--job`; recover always
 needs the failed job. Terminal journals never silently create a new image job.
 No command automatically rebases a fleet or restores a volume.
+
+
+### Deployed release, predecessor, and promotion history (amendment B)
+
+For the 1.0.6 bake, the deployed record is 1.0.5, the retained image predecessor
+is 1.0.2, and the new target is 1.0.6. The target and deployed record share lower
+34ac; the previous lower is 8dbc. Use the full immutable reference and full digest
+from the reviewed 1.0.2 manifest, not those abbreviated IDs:
+
+```bash
+# Use the reviewed release tooling in the checkout pinned by the 1.0.5 plan.
+(
+  cd /data/openclaw/projects/ezil/EZiL-OS.worktrees/billing-staging-20261020
+  bash deploy/aws/mum/rebase-release.sh ledger-init \
+    --manifest /root/ezil-aws-mum/releases/1.0.5/rebase-release.json
+  # Review, then repeat this command here with --apply before planning 1.0.6.
+)
+
+bash deploy/aws/mum/rebuild-ami.sh \
+  --desktop-image "$NEW_DESKTOP_IMAGE" --source-sha "$REVIEWED_SHA" \
+  --recipe-version 1.0.6 \
+  --previous-desktop-image-ref "$PREVIOUS_DESKTOP_REF" \
+  --previous-desktop-image-id "$PREVIOUS_LOWER_ID" \
+  --previous-release /root/ezil-aws-mum/releases/1.0.2/rebase-release.json \
+  --deployed-release /root/ezil-aws-mum/releases/1.0.5/rebase-release.json \
+  --release-dir /root/ezil-aws-mum/releases/1.0.6
+# Review, then repeat with --apply.
+
+bash deploy/aws/mum/rebase-release.sh plan \
+  --release-dir /root/ezil-aws-mum/releases/1.0.6 \
+  --config "$CANDIDATE_LIFECYCLE_CONFIG" --identity-config "$IDENTITY_CONFIG" \
+  --expect-system-id "$VERIFIED_DB_SYSTEM_ID" --rollout "$REVIEWED_ROLLOUT"
+```
+
+The deployed record supplies the launch-template baseline, promotion journal
+`before` and `source`, and rollback readbacks. The predecessor supplies only image
+lineage. Promotion and rollback retain deployed, predecessor, and target records.
+Rollback restores the invoking plan's deployed tuple and installs the invoking
+plan's `rollout.app` artifact. Maintenance releases still cannot promote.
+
+The durable local ledger defaults to
+`/root/ezil-aws-mum/releases/promotion-ledger.json`. All release CLI operations
+accept `--ledger /absolute/path/promotion-ledger.json` for isolated fixtures or an
+explicitly selected ledger; use the same path for planning and every operation.
+Do not create a separate ledger per release. Use this revised release tooling
+for old and new plans; older tooling without ledger admission cannot enforce
+the pending fence. The ledger is a schemaVersion 1
+object with an `entries` array. Before an apply-app, promote-canary, or rollback
+can install an app or write the secret, it appends a `pending` entry under
+`app-secret.lock`: generation, planSha256, operation, state, `before`
+(secretVersionId, tuple, registrySha256, appGitSha), and `expected`
+(tuple, registrySha256, appGitSha). Verified
+success appends a `completed` entry for that operation with the observed
+secretVersionId, tuple, registrySha256, and appGitSha. `registrySha256` hashes the
+region's exact `releases` list as canonical JSON (sorted object keys, compact
+separators, preserved list order). Each append increments generation;
+completion does not replace the pending entry. Legacy entries without a state
+are read as completed. Legacy missing tuple fields are null in ledger snapshots.
+All entries are retained; each write uses temp-file fsync, rename, and directory
+fsync under the lock. Keep this ledger durable and back it up with release evidence.
+
+`ledger-init --manifest <promoted-manifest> [--apply] [--ledger <path>]` requires
+the matching promoted journal and live tuple, and refuses an existing ledger.
+Dry run checks the retained apply-app receipt. Apply reads the running app gitSha
+through the existing read-only gate and imports generation 1 as a completed
+`promote-canary`. Run the 1.0.5 migration from
+`/data/openclaw/projects/ezil/EZiL-OS.worktrees/billing-staging-20261020`, using the
+reviewed release tooling in that checkout, where the plan's `schemaPath`
+resolves. Merely invoking a script located in another checkout does not satisfy
+the pin. Do not edit `schemaPath` or relax its validation. The legacy plan has no
+generation pin; deployed equals predecessor when only the previous-release
+artifact exists. New plans pin the latest completed generation.
+
+A pending entry fences other plans; only the same plan and operation can resume,
+or the owning plan can run `ledger-reconcile`. New planning also refuses while
+an operation is pending. With no pending operation, the live promotion tuple,
+registry hash, and running gitSha (when observed) must match the latest completed
+state. VersionId remains evidence; gate close/reopen changes alone do not cause
+ledger drift. Legacy entries without a registry hash compare tuple and gitSha
+only and are never rewritten. All in-operation VersionId CAS checks under the
+app-secret lock remain mandatory. With a pending operation,
+live state must match its before or expected snapshot. Otherwise operations
+refuse `ledger drift`. A first operation requires the completed generation pin;
+later operations and legacy plans must own the latest completed entry. Rollback
+requires an own completed promotion and refuses a second completed rollback.
+Aborted attempts count as no change for admission. Thus a completed 1.0.6
+apply-app supersedes 1.0.5 even after rollback to its tuple, and a pending 1.0.6
+operation fences 1.0.5 before any remote mutation.
+
+SSM install and verification journals include the pending generation, for
+example `apply-app-g2-ssm.json` and `apply-app-g2-verify-ssm.json`. The same pending
+generation resumes the same input/command. A new admitted attempt uses a new
+journal, including apply-app after promotion or rollback. An admitted legacy
+plan can import its own unsuffixed journal into a generation journal when the
+payload hash matches; the original remains intact. New plans never import these
+legacy journals.
+
+For a lost response, crash, failed verification, or failed completion append,
+retain the ledger and all phase/transport journals. Use the owning plan and its
+pinned checkout, keeping admission gated:
+
+```bash
+bash deploy/aws/mum/rebase-release.sh ledger-reconcile \
+  --plan /root/ezil-aws-mum/releases/1.0.6/rebase-plan.json
+# Review the outcome, then append the recovery entry:
+bash deploy/aws/mum/rebase-release.sh ledger-reconcile \
+  --plan /root/ezil-aws-mum/releases/1.0.6/rebase-plan.json --apply
+```
+
+Both commands hold the app-secret lock. Before comparing live state, they read
+every SSM attempt in the pending generation's journals, including historical
+retry IDs and verification commands. Both the invocation and parent command
+must be `Success`, `Failed`, `Cancelled`, or `TimedOut`. A running, unknown, or
+unreadable status refuses with `remote command not terminal; wait or cancel`,
+even when live state already matches expected. Keep the fence and wait for
+completion or cancel the command through the normal SSM operator procedure;
+reconciliation still requires terminal readbacks after cancellation.
+
+A lost submission is looked up by its journal's unique comment and host. An
+empty or incomplete SSM listing cannot prove absence because SSM is eventually
+consistent, so the fence remains. An uploading journal with no command ID
+records that submission never began; any older retry IDs still need terminal
+readbacks. Never remove journals or replace their status to bypass this check.
+
+After terminal checks, reconciliation inspects the live secret plus running
+app gitSha and deployment through read-only SSM. Dry run may write readback transport journals
+and submit read-only gate commands; it never installs, changes the secret, or
+appends to the ledger. If the live tuple/registry hash/gitSha equal expected, promotion and rollback
+also require the running public deployment to equal the deployment derived from
+the expected tuple. A written secret with a stale running deployment refuses
+`secret written; app not yet adopted — resume the same operation`. Resume the
+owning plan's promote-canary or rollback operation: CAS skips the already-equal
+secret, refreshes the app, and completes the same pending generation. Verified
+completion appends `completed` with the observed VersionId and repairs local phase evidence. If
+live tuple/registry hash/gitSha equal before, apply appends `aborted` and the plan may
+retry with a new generation. Expected wins if both snapshots match. Any other
+state refuses `manual reconciliation required` and prints only differing tuple
+key names, source SHAs, and whether the secret version changed. Preserve the
+fence and investigate that evidence; do not delete, reset, or hand-edit history.
+Reconciliation also covers a successful secret write followed by failed ledger
+completion. It does not verify the canary or open admission. The app secret and
+app reader gain no new fields.

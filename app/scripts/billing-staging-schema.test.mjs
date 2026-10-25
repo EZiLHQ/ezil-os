@@ -330,3 +330,30 @@ test('aws-production accepts only the DB container namespace and needs a system-
         assert.throws(() => validateDatabaseUrl(bad, 'aws-production'), bad);
     }
 });
+
+test('pool v2 is registered after its prerequisite and preserves service-only RLS', () => {
+    const file = 'docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('docs/aws-computers/sql/0002_ready_pool.sql.txt') + 1);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /REVOKE ALL ON TABLE public.ezil_compute_pool_hosts FROM public, anon, authenticated/);
+    assert.match(sql, /ALTER TABLE public.ezil_compute_pool_hosts ENABLE ROW LEVEL SECURITY/);
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY|DROP TABLE|DROP COLUMN/);
+    assert.equal((sql.match(/ADD COLUMN IF NOT EXISTS/g) || []).length, 7);
+    assert.equal((sql.match(/CREATE INDEX IF NOT EXISTS/g) || []).length, 3);
+});
+
+test('pool v2 production apply and baseline refuse before any connection while other baselines still work', () => {
+    for (const mode of [['apply', '--yes'], ['baseline', '0003_pool_hosts_v2.sql.txt', '--yes'],
+        ['baseline', './docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+    const plan = previewHarness();
+    plan.options.env.BILLING_STAGING_DATABASE_URL = 'postgres://postgres@localhost:5432/postgres';
+    assert.equal(run(['plan', '--target', 'aws-production', '--expect-system-id', previewId], plan.options), 0);
+    const h = previewHarness();
+    h.options.env.BILLING_STAGING_DATABASE_URL = 'postgres://postgres@localhost:5432/postgres';
+    assert.equal(run(['baseline', files[0].file, '--yes', '--target', 'aws-production', '--expect-system-id', previewId], h.options), 0);
+});

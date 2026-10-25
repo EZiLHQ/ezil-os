@@ -24,7 +24,7 @@ push('🔴 reads off: the hint separates configured routing from verification',
 push('🔴 reads off: no Cloudflare size is presented', describeMachine(readsOff).value === '—', describeMachine(readsOff));
 
 push('actual Cloudflare line never fabricates Mumbai', describeRunningOn(cf).value === 'Cloudflare Containers (2 vCPU / 6 GiB)');
-push('plan line separates entitlement and preparation', describePlan({ ...cf, plan: { vcpu: 2, memoryGB: 8, status: 'preparing' } }).value === '2 vCPU / 8 GB in Mumbai — being prepared');
+push('plan line separates entitlement and preparation', describePlan({ ...cf, plan: { vcpu: 2, memoryGB: 8, status: 'preparing' } }).value === '2 vCPU / 8 GB on AWS (India) — being prepared');
 push('paused plan explains operations', describePlan({ plan: { vcpu: 2, memoryGB: 8, status: 'blocked', reason: 'AWS paused by operations' } }).hint === 'AWS paused by operations');
 
 // Image

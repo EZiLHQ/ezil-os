@@ -211,7 +211,9 @@ export function billingV2EntitlementReader(getDeps: () => BillingDeps = getBilli
             const state = await loadComputeBillingState(deps, userId, deps.now());
             return {
                 source: 'billing_v2', planId: state.planSku,
-                status: state.paymentIssue ? 'past_due' : state.planActive ? 'active' : 'expired',
+                // A provider-active subscription alone is not a paid compute entitlement.
+                // Reuse the period-isolated grant/reversal calculation used for admission.
+                status: state.paymentIssue ? 'past_due' : state.planActive && (state.provider !== 'aws' || state.allowanceStdSeconds > 0) ? 'active' : 'expired',
                 size: state.entitledSize, provider: state.provider, paymentIssue: state.paymentIssue,
             };
         },

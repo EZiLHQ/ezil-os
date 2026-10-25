@@ -80,8 +80,11 @@ async function run(f = fixture(), options: { lose?: string; noEffect?: string; s
     return { error: result.error, cause: result.cause, receipt: result.output, calls, f };
 }
 
-for (const operation of ['pool-provision', 'adopt', 'release'] as const) test(`historical recovery refuses ${operation} without mutation or a false fencing receipt`, async () => {
-    const result = await run(fixture(operation));
+for (const operation of ['pool-provision', 'pool-retire', 'adopt', 'release'] as const) test(`historical recovery refuses ${operation} without mutation or a false fencing receipt`, async () => {
+    const f = fixture(operation), history = f.deps.history; let historyReads = 0;
+    f.deps.history = async (...args) => { historyReads++; return history(...args); };
+    const result = await run(f);
+    assert.equal(historyReads, 0, 'pool intents must not enter historical cleanup');
     assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined); assert.deepEqual(result.calls, []);
 });
 for (const operation of ['provision', 'start', 'stop', 'replace', 'retire'] as const) test(`recovery fences ${operation} writers and retains their data disk`, async () => {
@@ -96,6 +99,46 @@ test('a failure before any allocation can prove no resource effects', async () =
     const result = await run(fixture('provision', false)); assert.equal(result.error, undefined);
     assert.equal(result.receipt.volumeId, null); assert.deepEqual(result.receipt.instances, []); assert.deepEqual(result.calls, []);
 });
+test('a terminated source without subnet or placement still allows stop-target with the original disk attached', async () => {
+    const f = fixture('replace'), source = f.state.instances[0]!, target = f.state.instances[1]!;
+    delete source.SubnetId; delete source.Placement;
+    assert.equal(source.State?.Name, 'terminated'); assert.equal(target.State?.Name, 'running');
+    assert.equal(f.state.volumes[0]!.Attachments![0]!.InstanceId, target.InstanceId);
+    assert.deepEqual(await createRecoveryHelper(f.settings, f.deps)({ executionArn: f.arn, phase: 'initial' }), {
+        decision: 'stop-target', parameters: { InstanceIds: [target.InstanceId], Force: false, Hibernate: false, SkipOsShutdown: false },
+    });
+    const result = await run(f);
+    assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced');
+    assert.deepEqual(result.calls.map(c => c.action), ['stopInstances', 'terminateInstances']);
+    assert.ok(result.calls.every(c => c.parameters.InstanceIds[0] === target.InstanceId));
+    assert.equal(f.state.volumes[0]!.VolumeId, f.i.dataVolumeId); assert.equal(f.state.volumes[0]!.State, 'available');
+});
+test('a terminated target without subnet or placement can confirm fencing once its disk is free', async () => {
+    const f = fixture(), target = f.state.instances[0]!;
+    target.State = { Name: 'terminated' }; target.BlockDeviceMappings = [];
+    delete target.SubnetId; delete target.Placement;
+    f.state.volumes[0]!.State = 'available'; f.state.volumes[0]!.Attachments = [];
+    const result = await run(f);
+    assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced'); assert.deepEqual(result.calls, []);
+});
+for (const state of ['terminated', 'running', 'stopped', 'stopping', 'pending', 'shutting-down'] as const) {
+    for (const field of ['subnet', 'zone'] as const) test(`recovery refuses a ${state} instance with a wrong present ${field}`, async () => {
+        const f = fixture('replace'), source = f.state.instances[0]!;
+        source.State = { Name: state };
+        if (field === 'subnet') source.SubnetId = 'subnet-99999999999999999';
+        else source.Placement = { AvailabilityZoneId: 'aps1-az2' };
+        const result = await run(f);
+        assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+    });
+}
+for (const state of ['running', 'stopped', 'stopping', 'pending', 'shutting-down'] as const) {
+    test(`recovery refuses a ${state} target with a missing subnet`, async () => {
+        const f = fixture(), target = f.state.instances[0]!;
+        target.State = { Name: state }; delete target.SubnetId;
+        const result = await run(f);
+        assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+    });
+}
 for (const rootDeviceName of ['/dev/sda1', '/dev/xvda'] as const) test(`recovery honors configured ${rootDeviceName} root`, async () => {
     const result = await run(fixture('provision', true, 'runInstances', rootDeviceName));
     assert.equal(result.error, undefined);

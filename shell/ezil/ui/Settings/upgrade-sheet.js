@@ -134,7 +134,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     if ( v3 ) {
         lines = offer.bullets;
         const included = doc.createElement('p');
-        included.textContent = `${allowance}. Your plan takes effect after payment. Your Mumbai computer is prepared then.`;
+        included.textContent = `${allowance}. Your plan takes effect after payment. Your AWS computer is prepared then.`;
         dialog.querySelector('.ezil-upgrade-allowances').before(included);
     } else {
         const offeredSizes = offer.sizes.map(code => sizes.find(size => size.code === code));

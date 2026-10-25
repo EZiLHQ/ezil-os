@@ -2,6 +2,7 @@ import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { resumeImageRecovery } from './aws-rebase-recover-orchestrator';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { isAwsComputersEnabled, readAwsEnrollUrl, meteredSizeForInstanceType, type Env } from './aws-config';
 import { buildEnrollmentUserData, issueEnrollmentNonce, type Ec2EnrollmentDescriber } from './aws-enroll';
@@ -11,7 +12,7 @@ import type { LifecycleExecutionReader } from './aws-receipts';
 import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV } from './aws-intent';
 import { buildRebasePreparation, validateRebaseSnapshotReceipt } from './aws-rebase-preparation';
 import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
-import { resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
+import { rebaseSourceRequiresAmi, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
 import { createImageJobStore, IMAGE_JOB_FAILURE_CODES, isTerminalImageJob, newReservedImageJob, type ImageJob } from './aws-rebase-store';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema, type RebaseSnapshotDescriber, type Execution } from './aws-rebase-evidence';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
@@ -69,21 +70,40 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (result.child) await handleImageRebase(deps, { schemaVersion: 1, operation: 'prepare', computerId, jobId: result.child.jobId });
             return reply(isTerminalImageJob(j.phase) || j.phase === 'failed' ? 200 : 202, j.failureCode === null);
         }
-        const resolve = () => {
+        const resolve = async () => {
             const map = parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>;
-            try { return resolveRebaseReleases(map[p.region!], p.lowerImageDigest); }
+            const entry = map[p.region!];
+            let needsAmi: boolean;
+            try { needsAmi = rebaseSourceRequiresAmi(entry, p.lowerImageDigest); }
+            catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
+            let imageId: string | undefined;
+            if (needsAmi) {
+                if (!p.instanceId) throw new Error('source_identity_mismatch');
+                const host = await deps.describer.describeForEnrollment(p.region!, p.instanceId);
+                // Observation is outside the lock. Never use it for a placement that changed meanwhile.
+                const fresh = await deps.store.inspect(p.computerId);
+                if (!isDeepStrictEqual(p, fresh.placement)) throw new ImageJobConflictError();
+                const namespace = (entry as { namespace: string }).namespace;
+                const tags = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': namespace,
+                    'ezil:computer-id': p.computerId, 'ezil:generation': String(p.generation), 'ezil:fence-token': p.fenceToken };
+                if (!host || host.instanceId !== p.instanceId || !['running', 'stopped'].includes(host.state)
+                    || host.availabilityZoneId !== p.zoneId || Object.entries(tags).some(([k, v]) => host.tags[k] !== v))
+                    throw new Error('source_identity_mismatch');
+                imageId = host.imageId;
+            }
+            try { return resolveRebaseReleases(entry, p.lowerImageDigest, imageId); }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
         };
         if (input.operation === 'plan') {
             if (j) return reply(200, !['failed', 'unconfirmed'].includes(j.phase));
-            resolve();
+            await resolve();
             if (p.lifecycleJobId || !['STOPPED', 'RUNNING'].includes(p.state)) return reply(200, false, 'image_job_conflict');
             return reply(200, true, null);
         }
         if (!j) {
             if (input.operation === 'verify') return reply(200, false, null);
             if (input.operation !== 'prepare') throw new ImageJobConflictError();
-            const r = resolve();
+            const r = await resolve();
             if (!p.instanceId || !p.volumeId || !p.fsUuid || !p.fenceToken || !p.instanceType) return reply(409, false, 'source_identity_mismatch');
             const volume = await deps.describer.describeVolume(p.region, p.volumeId);
             if (!volume || !volume.sizeGiB) return reply(503, false, 'volume_not_available');

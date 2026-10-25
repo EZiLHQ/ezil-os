@@ -25,7 +25,7 @@ import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import { readEnrollmentPlacement as readPlacement, consumeMigrationEnrollment as consumeEnrollmentNonce, finishMigrationEnrollment as finishEnrollment } from './provider-migrate-provision';
-import { ImageJobConflictError, checkEnrollmentDigest, ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { ImageJobConflictError, checkEnrollmentDigest, POOL_SESSION_PENDING, ENROLLABLE_STATES, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, type Placement, type PlacementDb, type PlacementState } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
@@ -119,6 +119,8 @@ export function buildEnrollmentUserData(i: EnrollmentUserDataInput): string {
 /** What a live EC2 describe shows about the enrolling instance (C-6 step 3, last check). */
 export interface Ec2EnrollmentView {
     instanceId: string;
+    /** EC2 ImageId, when supplied; shared-lower rebase resolution requires it. */
+    imageId?: string;
     instanceType?: string;
     /** EC2 state name: only `running` enrolls. */
     state: string;
@@ -129,8 +131,9 @@ export interface Ec2EnrollmentView {
     availabilityZoneId: string;
     publicIp: string | null;
     tags: Readonly<Record<string, string>>;
+    rootDeviceName?: string;
     /** Every EBS volume attached to the instance. */
-    volumes: readonly { volumeId: string; deleteOnTermination: boolean; tags: Readonly<Record<string, string>> }[];
+    volumes: readonly { volumeId: string; deviceName?: string; deleteOnTermination: boolean; tags: Readonly<Record<string, string>> }[];
 }
 
 /** Injected: a read-only EC2 describe in the placement's region. null = no such instance. */
@@ -279,7 +282,11 @@ export interface EnrollDeps {
 export interface EnrollResponse {
     status: number;
     body: Record<string, unknown>;
+    /** Server-only trigger, never included in the host's response body. */
+    poolRelay?: PoolRelayEnrollment;
 }
+
+export type PoolRelayEnrollment = Pick<Placement, 'computerId' | 'ownerUserId' | 'generation' | 'leaseEpoch' | 'instanceId' | 'fenceToken'>;
 
 const CONTROL_KEY_INFO = 'ezil-aws-control-key-v1';
 
@@ -382,7 +389,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     // This epoch's enrollment already completed (nonce consumed, tunnel created, success recorded)
     // and the host is retrying because the 200 never reached it. Its nonce can no longer be checked
     // here; the Worker checks it instead, through the derived key (`deriveControlKey`).
-    const replay = !p.enrollNonceHash && (p.lastError === ENROLLMENT_SUCCEEDED || (body.ebsRestore && p.lastError === 'maintenance_accepted')) && p.instanceId !== null;
+    const replay = !p.enrollNonceHash && (p.lastError === ENROLLMENT_SUCCEEDED || p.lastError === POOL_SESSION_PENDING || (body.ebsRestore && p.lastError === 'maintenance_accepted')) && p.instanceId !== null;
     // The nonce was consumed but completion was never recorded (the completion write failed after
     // the Worker created the tunnel, or the consume's own response was lost). The consuming
     // instance, authenticated below by its AWS-signed identity and the live describe, may finish it.
@@ -436,7 +443,13 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     if (view.state !== 'running') return refuse(403, 'enroll_instance_not_running');
     if (view.availabilityZone !== doc.availabilityZone || view.availabilityZoneId !== p.zoneId) return refuse(403, 'enroll_zone_mismatch');
     const tags = expectedTags(p, deployment.namespace);
-    if (!carries(view.tags, tags)) return refuse(403, 'enroll_instance_mismatch');
+    const poolClaim = view.tags['ezil:pool-host'] !== undefined;
+    const instanceTags = poolClaim ? { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': deployment.namespace,
+        'ezil:namespace': deployment.namespace, 'ezil:computer': p.computerId.toLowerCase(),
+        'ezil:generation': String(p.generation), 'ezil:fence': p.fenceToken } : tags;
+    if (!carries(view.tags, instanceTags) || (poolClaim && (view.tags['ezil:pool'] !== undefined
+        || (view.tags['ezil:computer-id'] !== undefined && view.tags['ezil:computer-id'] !== p.computerId.toLowerCase()))))
+        return refuse(403, 'enroll_instance_mismatch');
     if (!body.ebsRestore && !view.publicIp!) return refuse(403, 'enroll_instance_mismatch');
     let volumeId: string;
     if (p.volumeId) {
@@ -467,7 +480,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         } catch (error) { if (error instanceof ImageJobConflictError) return refuse(403, 'enroll_refused'); throw error; }
     }
     const finishBoot: typeof finishEnrollment = async (database, input) => {
-        if (!imageJob) return finishEnrollment(database, input);
+        if (!imageJob) return finishEnrollment(database, { ...input, poolClaim: view.tags['ezil:pool-host'] !== undefined });
         const latest = await images.read((imageJob as ImageJob).jobId);
         if (!latest) return { ok: false, reason: 'cas_conflict' };
         const placement = await images.finishEnroll(latest, { instanceId: doc.instanceId, success: input.success }, deps.now());
@@ -495,7 +508,9 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     });
     const success = (tunnelToken: string): EnrollResponse =>
         // sandboxId + zone let the host's edge recognise its own browser hosts (edge.py).
-        ({ status: 200, body: { tunnelToken, controlKey: keyB64, sandboxId, zone: browserZone } });
+        ({ status: 200, body: { tunnelToken, controlKey: keyB64, sandboxId, zone: browserZone },
+            ...(poolClaim && !imageJob ? { poolRelay: { computerId: p.computerId, ownerUserId: p.ownerUserId,
+                generation: p.generation, leaseEpoch: p.leaseEpoch, instanceId: doc.instanceId, fenceToken: p.fenceToken } } : {}) });
 
     if (replay) {
         // Read-only: the Worker returns this epoch's existing tunnel token only for the exact record
@@ -546,7 +561,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         if (!done.ok) {
             // A concurrent completion may already have recorded this epoch's success.
             const { record: current } = await readBoot();
-            const recorded = current && current.generation === p.generation && current.leaseEpoch === p.leaseEpoch && current.lastError === ENROLLMENT_SUCCEEDED;
+            const recorded = current && current.generation === p.generation && current.leaseEpoch === p.leaseEpoch && (current.lastError === ENROLLMENT_SUCCEEDED || current.lastError === POOL_SESSION_PENDING);
             if (!recorded) return refuse(409, 'enroll_conflict');
         }
         return success(t.tunnelToken);

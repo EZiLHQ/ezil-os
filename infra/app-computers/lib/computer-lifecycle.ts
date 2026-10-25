@@ -99,6 +99,7 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
     const region={'aws:RequestedRegion':r};
     const managed={'ec2:ResourceTag/ezil:managed-by':'app-computer-platform','ec2:ResourceTag/ezil:stage':d.namespace};
     const existing={StringEquals:{...region,...managed}};
+    const poolManaged={...managed,'aws:ResourceTag/ezil:namespace':d.namespace};
     const requestTags={...region,'aws:RequestTag/ezil:managed-by':'app-computer-platform','aws:RequestTag/ezil:stage':d.namespace};
     const template={ArnEquals:{'ec2:LaunchTemplate':arn('launch-template',d.launchTemplateId)}};
     const poolTypes=POOL_IAM_TYPES.filter(t=>d.instanceTypes.includes(t));
@@ -111,18 +112,30 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
     return [
         // ModifyInstanceAttribute is never allowed for type, disk flags or
         // anything but userData (R10, C-6).
-        new iam.PolicyStatement({actions:['ec2:StartInstances','ec2:StopInstances','ec2:TerminateInstances'],
-            resources:[arn('instance')],conditions:{...existing,Null:{'aws:ResourceTag/ezil:computer-id':'false','aws:ResourceTag/ezil:pool':'true'}}}),
+        // DetachVolume authorizes BOTH host and volume. Reuse the existing
+        // host identity grants to stay within the controller's inline quota.
+        // The volume-side grants below retain the availability-zone condition.
+        new iam.PolicyStatement({actions:['ec2:StartInstances','ec2:StopInstances','ec2:TerminateInstances','ec2:DetachVolume'],
+            resources:[arn('instance')],conditions:{...existing,Null:{'aws:ResourceTag/ezil:computer-id':'false','aws:ResourceTag/ezil:computer':'true','aws:ResourceTag/ezil:pool':'true'}}}),
         new iam.PolicyStatement({actions:['ec2:AttachVolume'],resources:[arn('instance'),arn('volume')],
             conditions:{StringEquals:{...region,...managed,'ec2:AvailabilityZoneId':d.zoneId},Null:{'aws:ResourceTag/ezil:computer-id':'false','aws:ResourceTag/ezil:pool':'true'}}}),
         // AttachVolume authorizes the instance AND volume separately. A pool
         // host has no tenant identity; its volume must already have one.
         ...pool(new iam.PolicyStatement({actions:['ec2:AttachVolume'],resources:[arn('instance')],conditions:{
-            StringEquals:{...region,...managed,'aws:ResourceTag/ezil:pool':'1','ec2:AvailabilityZoneId':d.zoneId,
+            StringEquals:{...region,...poolManaged,'aws:ResourceTag/ezil:pool':'1','ec2:AvailabilityZoneId':d.zoneId,
                 'ec2:InstanceType':poolTypes}}})),
-        ...pool(new iam.PolicyStatement({actions:['ec2:StopInstances','ec2:TerminateInstances'],resources:[arn('instance')],conditions:{
-            StringEquals:{...region,...managed,'ec2:InstanceType':poolTypes},
-            Null:{'aws:ResourceTag/ezil:computer':'false'}}})),
+        ...pool(new iam.PolicyStatement({actions:['ec2:StopInstances','ec2:TerminateInstances','ec2:DetachVolume'],resources:[arn('instance')],conditions:{
+            StringEquals:{...region,...poolManaged,'ec2:InstanceType':poolTypes},
+            Null:{'aws:ResourceTag/ezil:computer':'false','aws:ResourceTag/ezil:pool':'true'}}})),
+        // Unclaimed spares have no tenant identity. Claimed hosts must finish
+        // adoption and use release; neither termination grant covers both tags.
+        ...pool(new iam.PolicyStatement({actions:['ec2:TerminateInstances'],resources:[arn('instance')],conditions:{
+            StringEquals:{...region,...poolManaged,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
+            Null:{'aws:ResourceTag/ezil:computer':'true','aws:ResourceTag/ezil:computer-id':'true'}}})),
+        // Cold fallback data has the original computer-id tag.
+        new iam.PolicyStatement({actions:['ec2:DetachVolume'],resources:[arn('volume')],conditions:{
+            StringEquals:{...region,...managed,'ec2:AvailabilityZoneId':d.zoneId},
+            Null:{'aws:ResourceTag/ezil:computer-id':'false','aws:ResourceTag/ezil:computer':'true'}}}),
         new iam.PolicyStatement({actions:['ec2:DetachVolume'],resources:[arn('volume')],conditions:{
             StringEquals:{...region,...managed,'ec2:AvailabilityZoneId':d.zoneId},Null:{'aws:ResourceTag/ezil:computer':'false'}}}),
         // R1/R11: data volumes only in the configured ZoneId, encrypted with the
@@ -142,6 +155,9 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
                 'ec2:InstanceMetadataTags':'disabled','ec2:AvailabilityZoneId':d.zoneId},
             NumericLessThanEquals:{'ec2:MetadataHttpPutResponseHopLimit':'1'},
             Null:{'ec2:InstanceProfile':'true'},...template}}),
+        // The shared cold launch grant must never admit a larger pool host.
+        new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:RunInstances'],resources:[arn('instance')],conditions:{
+            Null:{'aws:RequestTag/ezil:pool':'false'},StringNotEquals:{'ec2:InstanceType':[...POOL_IAM_TYPES]}}}),
         // The disposable root disk: encrypted gp3 no larger than configured.
         new iam.PolicyStatement({actions:['ec2:RunInstances'],resources:[arn('volume')],conditions:{
             StringEquals:{...requestTags,'ec2:VolumeType':'gp3'},Bool:{'ec2:Encrypted':'true'},
@@ -157,10 +173,10 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
             'ForAllValues:StringEquals':{'aws:TagKeys':[...POOL_CLAIM_KEYS,'ezil:fence-token']},
             Null:{'aws:TagKeys':'false','aws:ResourceTag/ezil:computer-id':'false'}}}),
         ...pool(new iam.PolicyStatement({actions:['ec2:CreateTags'],resources:[arn('instance')],conditions:{
-            StringEquals:{...region,...managed,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
+            StringEquals:{...region,...poolManaged,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
             'ForAllValues:StringEquals':{'aws:TagKeys':[...POOL_CLAIM_KEYS]},Null:{'aws:TagKeys':'false'}}})),
         ...pool(new iam.PolicyStatement({actions:['ec2:DeleteTags'],resources:[arn('instance')],conditions:{
-            StringEquals:{...region,...managed,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
+            StringEquals:{...region,...poolManaged,'aws:ResourceTag/ezil:pool':'1','ec2:InstanceType':poolTypes},
             'ForAllValues:StringEquals':{'aws:TagKeys':['ezil:pool']},Null:{'aws:TagKeys':'false','aws:ResourceTag/ezil:computer':'false'}}})),
         new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:CreateTags'],resources:['*'],conditions:{
             'ForAnyValue:StringEquals':{'aws:TagKeys':[...IDENTITY_TAG_KEYS]},Null:{'ec2:CreateAction':'true'}}}),

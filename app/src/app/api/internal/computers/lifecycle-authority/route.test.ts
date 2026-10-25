@@ -251,3 +251,19 @@ describe('placement is the authority', () => {
         await refused(request(), 503);
     });
 });
+
+it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes the exact durable %s authority', async operation => {
+    const { fixturePoolIntent } = await import('@/server/lib/compute/aws-intent.test-support');
+    const { buildLifecycleWork } = await import('@/server/lib/compute/aws-intent');
+    const w = buildLifecycleWork(fixturePoolIntent(operation)), i = w.intent;
+    execute.mockResolvedValue([{ id: i.poolHostId, generation: i.poolGeneration, region: i.deployment.region,
+        zone_id: i.deployment.zoneId, instance_type: i.instanceType, instance_id: i.providerInstanceId,
+        leased_computer_id: null, state: operation === 'pool-provision' ? 'booting' : 'retiring',
+        lifecycle_job_id: i.jobId, lifecycle_digest: w.digest, lifecycle_input: w.input }]);
+    const a = { schemaVersion: 1, computerId: i.computerId, jobId: i.jobId, leaseEpoch: i.leaseEpoch, digest: w.digest,
+        operation, poolHostId: i.poolHostId, poolGeneration: i.poolGeneration };
+    const res = await POST(request(JSON.stringify(a)));
+    expect(res.status).toBe(200); expect(await res.json()).toEqual({ authorized: true, ...a });
+    for (const patch of [{ poolGeneration: 2 }, { operation: undefined }, { poolHostId: undefined }, { imageJobId: i.jobId, imageJobPhase: 'launch' }])
+        expect((await POST(request(JSON.stringify({ ...a, ...patch })))).status).toBe(403);
+});

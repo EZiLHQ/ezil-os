@@ -54,10 +54,12 @@ export interface EnsureOptions {
  */
 export type EnsureResult =
     | { ok: true }
-    | { ok: false; error: string; errorCode: string; retryable: boolean };
+    | { ok: false; error: string; errorCode: string; retryable: boolean; computeLaunching?: boolean };
 
 export interface ComputeStatus {
     ok: boolean;
+    /** A fresh replacement instance is still starting, independently of migration. */
+    computeLaunching?: boolean;
     error?: string;
 }
 

@@ -35,7 +35,7 @@ save("calls.jsonl", [])
 params = {
     "AssetBucketName": "ezil-mum-deploy-assets-452630323510",
     "ApplicationImageRepositoryUri": "452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6",
-    "SubnetId": "subnet-example", "SecurityGroupId": "sg-example", "UbuntuAmiId": "/aws/example",
+    "SubnetId": "subnet-example", "SecurityGroupId": "sg-example", "UbuntuAmiId": "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
     "AgentSrcS3Uri": "s3://example/old.tgz", "DesktopImageDigest": "sha256:" + "0" * 64,
     "DesktopImageId": "sha256:" + "1" * 64, "CloudflaredVersion": "2026.10.2",
     "CloudflaredSha256": "0" * 64, "EnrollUrl": "https://os-staging.ezil.work/api/compute/aws/enroll",
@@ -44,6 +44,10 @@ params = {
 save("stack.json", {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", **({} if json.loads(sys.argv[2]).get("no_stack_role") else {"RoleARN": "arn:aws:iam::452630323510:role/ezil/identity/ezil-mum-cfn-exec"}), "Parameters": [
     {"ParameterKey": k, "ParameterValue": v, **({"ResolvedValue": "ami-" + "1" * 17} if k == "UbuntuAmiId" else {})} for k, v in params.items()
 ], "Outputs": [{"OutputKey": "PipelineArn", "OutputValue": "arn:aws:imagebuilder:ap-south-1:452630323510:image-pipeline/ezil-host-mum"}]}]})
+if json.loads(sys.argv[2]).get("other_ssm"):
+    value = json.loads((root / "stack.json").read_text())
+    next(p for p in value["Stacks"][0]["Parameters"] if p["ParameterKey"] == json.loads(sys.argv[2])["other_ssm"])["ResolvedValue"] = "ami-" + "1" * 17
+    save("stack.json", value)
 save("ami-config.json", {"namespace": "mum", "accountId": "452630323510", "region": "ap-south-1", "version": "1.0.1"})
 shutil.copyfile(root / "ami-config.json", root / "original-ami-config.json")
 save("template.json", {"TemplateBody": {"Parameters": {k: {"Type": "String"} for k in params}, "Resources": {

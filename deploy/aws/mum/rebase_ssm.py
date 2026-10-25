@@ -28,6 +28,55 @@ def host_identity(aws):
          'prod' not in tags.get('Name', '').lower(), 'staging host identity mismatch')
 
 
+def submitted_command(state, aws):
+    response = aws('ssm', 'list-commands', '--instance-id', HOST,
+                   '--filters', json.dumps([{'key': 'DocumentName', 'value': 'AWS-RunShellScript'}]))
+    need(not response.get('NextToken'), 'incomplete SSM reconciliation')
+    matches = [c for c in response['Commands'] if c.get('Comment') == state['comment'] and c.get('InstanceIds') == [HOST]]
+    # SSM is eventually consistent: an empty listing cannot prove a lost send
+    # never happened. Preserve the fence, just as transport resume does.
+    need(len(matches) == 1, 'uncertain SSM submission; reconcile command before retry')
+    return matches[0]['CommandId']
+
+
+def generation_terminal(directory, generation, aws):
+    """Read every recorded attempt, including retries and verification gates.
+
+    Only an uploading journal with no current ID proves no send was attempted.
+    Local complete/failed labels are not evidence of remote terminal status.
+    """
+    terminal = ('Success', 'Failed', 'Cancelled', 'TimedOut')
+    try:
+        for path in sorted(Path(directory).glob('*-ssm.json')):
+            if not re.search(r'-g' + str(generation) + r'(?:-.*)?-ssm\.json$', path.name):
+                continue
+            state = manifest.read(path)
+            if (path.is_symlink() or state['host'] != HOST or state['operation'] + '-ssm.json' != path.name or
+                    state['status'] not in ('uploading', 'submitting', 'complete', 'failed')):
+                return False
+            commands = list(state['attempts'])
+            if state['commandId']:
+                commands.append(state['commandId'])
+            elif state['status'] != 'uploading':
+                commands.append(submitted_command(state, aws))
+            for command_id in commands:
+                if not isinstance(command_id, str) or not re.fullmatch(r'[0-9a-f-]{36}', command_id):
+                    return False
+                invocation = aws('ssm', 'get-command-invocation', '--command-id', command_id, '--instance-id', HOST)
+                if invocation['Status'] not in terminal:
+                    return False
+                response = aws('ssm', 'list-commands', '--command-id', command_id)
+                records = response['Commands']
+                if response.get('NextToken') or len(records) != 1 or records[0]['CommandId'] != command_id:
+                    return False
+                if records[0]['Status'] not in terminal:
+                    return False
+        return True
+    except Exception:
+        # Keep provider details (including remote stdout) out of diagnostics.
+        return False
+
+
 def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=False):
     """Journal before submission; reconcile ambiguous sends by the unique comment.
 
@@ -71,12 +120,7 @@ def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=F
         state['commandId'] = response['Command']['CommandId']
         write(path, state)
     if not state['commandId']:
-        response = aws('ssm', 'list-commands', '--instance-id', HOST,
-                       '--filters', json.dumps([{'key': 'DocumentName', 'value': 'AWS-RunShellScript'}]))
-        need(not response.get('NextToken'), 'incomplete SSM reconciliation')
-        matches = [c for c in response['Commands'] if c.get('Comment') == comment and c.get('InstanceIds') == [HOST]]
-        need(len(matches) == 1, 'uncertain SSM submission; reconcile command before retry')
-        state['commandId'] = matches[0]['CommandId']; write(path, state)
+        state['commandId'] = submitted_command(state, aws); write(path, state)
     need(re.fullmatch(r'[0-9a-f-]{36}', state['commandId']) is not None, 'invalid SSM command ID')
     for _ in range(180):
         result = aws('ssm', 'get-command-invocation', '--command-id', state['commandId'], '--instance-id', HOST)

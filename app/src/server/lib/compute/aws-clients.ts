@@ -28,7 +28,7 @@ import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
 import { DescribeSnapshotsCommand, DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
-import { DescribeExecutionCommand, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
+import { DescribeExecutionCommand, GetExecutionHistoryCommand, type GetExecutionHistoryCommandOutput, type HistoryEvent, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
 import { AssumeRoleCommand, AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 
 import { AWS_REGION_PATTERN, isAwsComputersEnabled, readAwsRegions, type Env } from './aws-config';
@@ -253,6 +253,32 @@ export function createSfnLifecycleStarter(sfnFor: (region: string) => RegionalCl
 /** `DescribeExecution` of one computer job, in `region`, under the caller role's account. */
 export function createSfnExecutionReader(sfnFor: (region: string) => RegionalClient): LifecycleExecutionReader {
     return {
+        async history(region, executionArn) {
+            assertRegion(region);
+            const m = EXECUTION_ARN.exec(executionArn);
+            if (!m) throw new AwsClientError('aws_config', false, 'ExecutionArnInvalid');
+            const { client, account } = sfnFor(region);
+            if (m[1] !== region) throw new AwsClientError('aws_config', false, 'ExecutionRegionMismatch');
+            if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
+            const events: HistoryEvent[] = [], tokens = new Set<string>();
+            let nextToken: string | undefined, bytes = 0;
+            for (let page = 0; page < 100; page++) {
+                let out: GetExecutionHistoryCommandOutput;
+                try {
+                    out = await client.send(new GetExecutionHistoryCommand({ executionArn, nextToken,
+                        maxResults: 1000, reverseOrder: false, includeExecutionData: true })) as GetExecutionHistoryCommandOutput;
+                } catch (error) { throw toAwsClientError(error); }
+                bytes += Buffer.byteLength(JSON.stringify(out));
+                if (!Array.isArray(out.events) || events.length + out.events.length > 10000 || bytes > 8 * 1024 * 1024)
+                    throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound');
+                events.push(...out.events);
+                if (out.nextToken === undefined) return events;
+                if (typeof out.nextToken !== 'string' || !out.nextToken || tokens.has(out.nextToken))
+                    throw new AwsClientError('aws_error', true, 'ExecutionHistoryPagination');
+                tokens.add(out.nextToken); nextToken = out.nextToken;
+            }
+            throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound');
+        },
         async describe(region, executionArn) {
             assertRegion(region);
             const m = EXECUTION_ARN.exec(executionArn);
@@ -367,13 +393,15 @@ export function createEc2EnrollmentDescriber(
             const { client } = ec2For(region);
             type Instance = {
                 InstanceId?: string;
+                ImageId?: string;
                 InstanceType?: string;
                 State?: { Name?: string };
                 StateTransitionReason?: string;
+                RootDeviceName?: string;
                 Placement?: { AvailabilityZone?: string; AvailabilityZoneId?: string };
                 PublicIpAddress?: string;
                 Tags?: Ec2Tag[];
-                BlockDeviceMappings?: { Ebs?: { VolumeId?: string; DeleteOnTermination?: boolean } }[];
+                BlockDeviceMappings?: { DeviceName?: string; Ebs?: { VolumeId?: string; DeleteOnTermination?: boolean } }[];
             };
             let instances: Instance[];
             try {
@@ -423,6 +451,8 @@ export function createEc2EnrollmentDescriber(
             const transitionAt = stamp ? new Date(`${stamp[1]}T${stamp[2]}Z`) : null;
             const view: Ec2EnrollmentView = {
                 instanceId,
+                ...(inst.RootDeviceName ? { rootDeviceName: inst.RootDeviceName } : {}),
+                ...(inst.ImageId ? { imageId: inst.ImageId } : {}),
                 ...(inst.InstanceType ? { instanceType: inst.InstanceType } : {}),
                 state: inst.State?.Name ?? 'unknown',
                 ...(transitionAt && Number.isFinite(transitionAt.getTime()) ? { stateTransitionAt: transitionAt } : {}),
@@ -432,6 +462,7 @@ export function createEc2EnrollmentDescriber(
                 tags: tagMap(inst.Tags),
                 volumes: mappings.map((b) => ({
                     volumeId: b.Ebs!.VolumeId!,
+                    ...(b.DeviceName ? { deviceName: b.DeviceName } : {}),
                     // Only an explicit `false` is false: an unknown flag never passes as "kept on terminate".
                     deleteOnTermination: b.Ebs!.DeleteOnTermination !== false,
                     tags: volumeTags.get(b.Ebs!.VolumeId!) ?? {},

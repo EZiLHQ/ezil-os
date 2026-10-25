@@ -218,7 +218,7 @@ export function summaryV3Html (summary) {
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
             ${machineV3Html(summary)}
             ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
-            ${plan.sku !== 'free_v3' ? paragraph('Your own computer in Mumbai') : ''}
+            ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
         </section>
         <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
         <p class="ezil-billing-note">Prices before tax.</p>
