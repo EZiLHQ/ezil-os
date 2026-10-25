@@ -207,7 +207,7 @@ async function adoptResourceEvidence(deps: ReceiptDeps, p: Placement, s: Lifecyc
     guardRecovery(v!.state === 'in-use' && v!.attachments?.length === 1
         && v!.attachments[0]!.instanceId === p.instanceId && v!.attachments[0]!.state === 'attached');
     const h = await deps.describer!.describeForEnrollment(p.region!, p.instanceId!);
-    guardRecovery(h && h.instanceId === p.instanceId && h.state === 'running' && h.imageId === d.amiId && h.instanceType === p.instanceType
+    guardRecovery(h && h.instanceId === p.instanceId && (h.state === 'running' || h.state === 'stopped') && h.imageId === d.amiId && h.instanceType === p.instanceType
         && h.availabilityZoneId === d.zoneId && h.rootDeviceName === (d.storage.rootDeviceName ?? '/dev/sda1')
         && Object.entries({ 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': d.namespace, 'ezil:namespace': d.namespace,
             'ezil:pool': '1', 'ezil:pool-host': s.poolHostId!, 'aws:ec2launchtemplate:id': d.launchTemplateId }).every(([k, value]) => h.tags[k] === value)
@@ -295,5 +295,9 @@ export async function reconcileAdoptRecovery(deps: AdoptRecoveryDeps, p: Placeme
         await saveAdoptRecovery(deps, p, w, false);
         await startLifecycleJob(deps.starter!, p.region!, w, deps.sleep);
         return true;
-    } catch { return handled; }
+    } catch (error) {
+        console.warn('adopt-recovery guard', { reason: error instanceof Error && error.message === 'adopt_recovery_guard'
+            ? 'adopt_recovery_guard' : 'adopt_recovery_error' });
+        return handled;
+    }
 }

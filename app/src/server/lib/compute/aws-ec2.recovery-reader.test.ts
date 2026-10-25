@@ -4,7 +4,7 @@ import { createAwsEc2Provider } from './aws-ec2';
 import { LIFECYCLE_DEPLOYMENTS_ENV } from './aws-intent';
 import { adoptRecoverySetup, RECOVERY_NOW } from './aws-pool-adopt-recovery.test-support';
 import { DEFAULT_OWNER } from './fake-placement-db.test-support';
-import type { LifecycleExecutionReader } from './aws-receipts';
+import { lifecycleExecutionArn, type LifecycleExecutionReader } from './aws-receipts';
 
 function setup(entry: 'status' | 'open', withHistory: boolean) {
     const s = adoptRecoverySetup();
@@ -37,9 +37,12 @@ function setup(entry: 'status' | 'open', withHistory: boolean) {
     return { s, history, poll };
 }
 
-it.each(['status', 'open'] as const)('%s reconciliation forwards complete failed-adopt history with its receiver', async entry => {
+for (const hostState of ['running', 'stopped']) it.each(['status', 'open'] as const)(`%s reconciliation of ${hostState} host forwards complete failed-adopt history with its receiver`, async entry => {
     const { s, history, poll } = setup(entry, true);
-    await poll();
+    s.host.state = hostState;
+    expect(await poll()).toMatchObject(entry === 'open'
+        ? { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true }
+        : { ok: true, state: 'starting', placementState: 'RECOVERING' });
     expect(history).toHaveBeenCalledWith(s.original.intent.deployment.region, s.originalExecution.executionArn);
     expect(s.historyCalls).toHaveLength(2);
     expect(s.starts).toHaveLength(1);
@@ -55,7 +58,9 @@ it.each(['status', 'open'] as const)('%s reconciliation forwards complete failed
 it.each(['status', 'open'] as const)('%s reconciliation without history remains fail-closed', async entry => {
     const { s, history, poll } = setup(entry, false);
     const before = await s.current();
-    await poll();
+    expect(await poll()).toMatchObject(entry === 'open'
+        ? { ok: false, error: 'computer_recovering', errorCode: 'computer_recovering', retryable: false }
+        : { ok: false, state: 'error', error: 'placement_unconfirmed' });
     expect(history).not.toHaveBeenCalled();
     expect(s.historyCalls).toEqual([]);
     expect(s.starts).toEqual([]);
@@ -65,3 +70,41 @@ it.each(['status', 'open'] as const)('%s reconciliation without history remains 
     expect(s.meter.ready).not.toHaveBeenCalled();
     expect(s.meter.stopped).not.toHaveBeenCalled();
 });
+
+for (const state of ['RECOVERING', 'UNCONFIRMED']) it.each(['status', 'open'] as const)(`%s keeps waiting for a saved in-flight recovery in ${state}`, async entry => {
+    const { s, poll } = setup(entry, true); await s.tick();
+    s.placements[0]!.state = state;
+    expect(await poll()).toMatchObject(entry === 'open'
+        ? { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true }
+        : { ok: true, state: 'starting', placementState: state });
+    expect(s.starts).toHaveLength(1); expect(s.usage).toEqual([]);
+});
+
+for (const terminal of ['FAILED', 'TIMED_OUT', 'ABORTED']) it.each(['status', 'open'] as const)(`%s preserves the non-retryable hold after recovery ${terminal}`, async entry => {
+    const { s, poll } = setup(entry, true); await s.tick();
+    const saved = (await s.current()).lastError; s.finish(terminal);
+    for (let n = 0; n < 2; n++) {
+        expect(await poll()).toMatchObject(entry === 'open'
+            ? { ok: false, error: 'computer_recovering', errorCode: 'computer_recovering', retryable: false }
+            : { ok: false, state: 'error', error: 'placement_unconfirmed' });
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: saved });
+    }
+    expect(s.starts).toHaveLength(1);
+});
+
+for (const invalid of ['placement', 'input', 'version', 'arn', 'alias', 'redrive', 'absent'])
+    it.each(['status', 'open'] as const)(`%s refuses UNCONFIRMED recovery with ${invalid} evidence`, async entry => {
+        const { s, poll } = setup(entry, true); await s.tick(); s.placements[0]!.state = 'UNCONFIRMED';
+        const w = s.starts[0]!, arn = lifecycleExecutionArn(w.intent.deployment, w.intent.jobId), e = s.executions.get(arn)!;
+        if (invalid === 'placement') s.placements[0]!.lifecycle_digest = '00'.repeat(32);
+        if (invalid === 'input') e.input = '{}';
+        if (invalid === 'version') e.stateMachineVersionArn = s.original.stateMachineArn;
+        if (invalid === 'arn') e.executionArn += '9';
+        if (invalid === 'alias') e.stateMachineAliasArn = 'alias';
+        if (invalid === 'redrive') e.redriveCount = 1;
+        if (invalid === 'absent') s.executions.delete(arn);
+        expect(await poll()).toMatchObject(entry === 'open'
+            ? { ok: false, errorCode: 'computer_recovering', retryable: false }
+            : { ok: false, state: 'error', error: 'placement_unconfirmed' });
+        expect(s.starts).toHaveLength(1);
+    });

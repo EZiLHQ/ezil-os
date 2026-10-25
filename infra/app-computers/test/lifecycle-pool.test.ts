@@ -668,6 +668,34 @@ test('RECADOPT3 live generation 5 epoch 6 old pinned AMI: claim then release, ne
     assert.equal(r.output.state, 'retired'); assert.equal(f.state.volumes[0]!.State, 'available');
     assert.deepEqual(f.state.volumes[0]!.Attachments, []);
 });
+test('RECADOPT3 stopped unclaimed host: claim, unpool, fenced detach and terminate without stop', async () => {
+    const f = recoveryFixture(); f.state.instances[0]!.State = { Name: 'stopped' };
+    const r = await run(f);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.deepEqual(r.calls.map(c => c.step), ['claimInstance', 'deleteTags', 'detachVolume', 'terminateInstances']);
+    assert.deepEqual(r.calls[2]!.parameters, { Device: '/dev/sdf', InstanceId: f.i.providerInstanceId, VolumeId: f.i.dataVolumeId, Force: false });
+    assert.ok(r.visited.indexOf('Observe-stopped') < r.visited.indexOf('detachVolume'));
+    assert.equal(r.output.state, 'retired'); assert.equal(f.state.volumes[0]!.State, 'available');
+    assert.deepEqual(f.state.volumes[0]!.Attachments, []);
+});
+test('RECADOPT3 stopped host still requires authority before detaching', async () => {
+    const f = recoveryFixture(); f.state.instances[0]!.State = { Name: 'stopped' };
+    const r = await run(f, { revokeAfter: 'deleteTags' });
+    assert.equal(r.error, 'LifecycleUnconfirmed');
+    assert.deepEqual(r.calls.map(c => c.step), ['claimInstance', 'deleteTags']);
+    assert.equal(f.state.volumes[0]!.Attachments!.length, 1);
+});
+test('RECADOPT3 stopped host refuses a foreign attachment without mutation', async () => {
+    const f = recoveryFixture(); f.state.instances[0]!.State = { Name: 'stopped' };
+    f.state.volumes[0]!.Attachments![0]!.InstanceId = 'i-99999999999999999';
+    const r = await run(f); assert.ok(r.error, JSON.stringify(r)); assert.deepEqual(r.calls, []);
+});
+for (const state of ['stopping', 'pending', 'shutting-down', 'terminated'] as const)
+    test(`RECADOPT3 refuses unclaimed host ${state}`, async () => {
+        const f = recoveryFixture(); f.state.instances[0]!.State = { Name: state };
+        await assert.rejects(createLifecycleHelper(f.settings, f.deps)({ executionArn: f.executionArn, phase: 'attached' }), /lifecycle_instance_invalid/);
+        const r = await run(f); assert.ok(r.error, JSON.stringify(r)); assert.deepEqual(r.calls, []);
+    });
 for (const phase of ['initial', 'attached', 'claimed', 'unpooled'] as const)
     test(`RECADOPT3 empty available after attach acknowledgement preserves ${phase} until deadline`, async () => {
         const f = recoveryFixture(); f.state.volumes[0]!.State = 'available'; f.state.volumes[0]!.Attachments = [];

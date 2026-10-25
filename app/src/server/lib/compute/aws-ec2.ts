@@ -1,7 +1,7 @@
 import { POOL_TYPES, type PoolClass } from './ready-pool';
 import { isPoolReleaseRecovering } from './aws-pool-release-recovery';
 import { settleReplacementGeneration } from './aws-rebase-generation';
-import { failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
+import { adoptRecoveryReplay, matchesAdoptRecovery, failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
 import { writePoolOpen } from './placement';
 /**
  * aws-ec2 provider (docs/AWS-COMPUTERS.md C-1, C-3).
@@ -61,7 +61,7 @@ import { ENROLLMENT_FAILED, INSTANCE_LOST, reservePoolHostForBoot, markLifecycle
 import type { Ec2ComputerResourceFinder, Ec2ReplacementDescriber, Ec2VolumeDescriber } from './aws-clients';
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
-import { applyLifecycleReceipt, isPoolMode, POOL_RELEASED, sessionEndWork, type PoolDeps, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
+import { applyLifecycleReceipt, isPoolMode, lifecycleExecutionArn, POOL_RELEASED, sessionEndWork, type PoolDeps, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 import { requestAwsRestart } from './aws-restart';
@@ -309,6 +309,22 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
     const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter, pool: deps.pool });
+
+    const isAdoptRecoveryStarting = async (p: Placement): Promise<boolean> => {
+        if (p.state !== 'RECOVERING' && p.state !== 'UNCONFIRMED') return false;
+        const saved = adoptRecoveryReplay(p);
+        if (!saved || !matchesAdoptRecovery(p, saved)) return false;
+        if (p.state === 'RECOVERING') return true;
+        // Failed recovery keeps its replay marker too. Only a matching live
+        // execution makes an UNCONFIRMED placement a retryable wait.
+        if (!deps.executions) return false;
+        try {
+            const arn = lifecycleExecutionArn(saved.intent.deployment, saved.intent.jobId);
+            const e = await deps.executions.describe(saved.intent.deployment.region, arn);
+            return e.status === 'RUNNING' && e.input === saved.input && e.executionArn === arn
+                && e.stateMachineVersionArn === saved.stateMachineArn && !e.stateMachineAliasArn && e.redriveCount === 0;
+        } catch { return false; }
+    };
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
@@ -591,6 +607,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 case 'STOPPED': {
                     if (placement.state === 'UNCONFIRMED' && placement.lastError !== ENROLLMENT_FAILED) {
                         if (placement.lastError?.startsWith('capacity:')) return notReady('capacity_unavailable', false, placement.lastError);
+                        if (await isAdoptRecoveryStarting(placement)) return notReady('computer_starting', true);
                         return notReady('computer_recovering');
                     }
                     if (!placement.instanceId || !placement.volumeId || !placement.instanceType || !placement.region || !placement.fsUuid || !placement.fenceToken) {
@@ -703,7 +720,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
                 }
                 default: {
-                    if (isPoolOpenRelease(placement) || isPoolReleaseRecovering(placement)) return notReady('computer_starting', true);
+                    if (isPoolOpenRelease(placement) || isPoolReleaseRecovering(placement) || await isAdoptRecoveryStarting(placement)) return notReady('computer_starting', true);
                     const state = AWS_STATE_FOR[placement.state];
                     if (state === 'starting') return { ...notReady('computer_starting', true), ...(reconciled?.computeLaunching ? { computeLaunching: true } : {}) };
                     if (state === 'stopping') return notReady('computer_stopping', true);
@@ -720,7 +737,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             // A status poll is not presence: it renews nothing, and a lapsed lease or a reached cap stops here.
             const settled = await reconcileOwn(c, p, cfg.deployments, cfg.e);
             p = settled.placement;
-            const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) ? 'starting' : AWS_STATE_FOR[p.state];
+            const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p) ? 'starting' : AWS_STATE_FOR[p.state];
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}) };
         },
 

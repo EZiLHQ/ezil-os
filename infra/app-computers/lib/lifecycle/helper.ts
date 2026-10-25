@@ -282,7 +282,7 @@ async function observeAdoptRecovery(i:LifecycleIntent,digest:string,phase:Phase,
     if(v.Attachments.length===0)return wait(phase);
     assertAttached(host,v,host.InstanceId!);
     if(!claimed){
-        if(host.State?.Name!=='running')return fail('lifecycle_instance_invalid');
+        if(host.State?.Name!=='running'&&host.State?.Name!=='stopped')return fail('lifecycle_instance_invalid');
         if(phase!=='attached')return wait(phase);
         return action('claimInstance',{Resources:[host.InstanceId],Tags:tagList(claim)});
     }

@@ -3,9 +3,23 @@ vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw ne
 import { createHash } from 'node:crypto';
 import { adoptRecoverySetup, RECOVERY_OTHER } from './aws-pool-adopt-recovery.test-support';
 import { adoptRecoveryReplay, authorizeAdoptRecovery, buildAdoptRecoveryWork, proveFailedAdoptHistory } from './aws-pool-recovery';
-import { lifecycleExecutionArn } from './aws-receipts';
+import { lifecycleExecutionArn, POOL_RELEASED } from './aws-receipts';
 
 type Fixture = ReturnType<typeof adoptRecoverySetup>;
+it('stopped unclaimed host releases on the newer version to STOPPED and retired pool without usage', async () => {
+    const s = adoptRecoverySetup(); s.host.state = 'stopped'; await s.tick();
+    expect(s.starts).toHaveLength(1); const w = s.starts[0]!;
+    expect(w.intent.operation).toBe('release');
+    expect(w.stateMachineArn).toBe(s.currentDeployment.stateMachineVersionArn);
+    expect(w.stateMachineArn).not.toBe(s.original.stateMachineArn);
+    expect((await s.current()).state).toBe('RECOVERING');
+    expect(await authorizeAdoptRecovery(s.db, await s.current())).toBe(true);
+    s.finish(); await s.tick();
+    expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED, generation: s.original.intent.targetGeneration });
+    expect(s.pool.state).toBe('retired'); expect(s.volume.state).toBe('available');
+    expect(s.usage).toEqual([]); expect(s.meter.stopped).not.toHaveBeenCalled();
+    expect(s.statements.filter(q => q.sql.includes('usage-'))).toEqual([]);
+});
 it('live old-AMI failed adopt: atomic replay, successful release, STOPPED and retired pool, zero usage', async () => {
     const s = adoptRecoverySetup(); await s.tick();
     expect(s.starts).toHaveLength(1); const w = s.starts[0]!;
@@ -66,7 +80,10 @@ const guards: [string, (s: Fixture) => void][] = [
     ['history ACK resource', s => { s.history[25]!.taskSucceededEventDetails!.resource = 'createTags'; }],
     ['wrong original AMI', s => { s.host.imageId = s.currentDeployment.amiId; }],
     ['host instance', s => { s.host.instanceId = 'i-99999999999999999'; }],
-    ['host stopped', s => { s.host.state = 'stopped'; }],
+    ['host stopping', s => { s.host.state = 'stopping'; }],
+    ['host pending', s => { s.host.state = 'pending'; }],
+    ['host shutting-down', s => { s.host.state = 'shutting-down'; }],
+    ['host terminated', s => { s.host.state = 'terminated'; }],
     ['host zone', s => { s.host.availabilityZoneId = 'aps1-az9'; }],
     ['host type', s => { s.host.instanceType = 'm6i.xlarge'; }],
     ['host root', s => { s.host.rootDeviceName = '/dev/sdb'; }],
@@ -100,8 +117,23 @@ for (const key of ['ezil:managed-by', 'ezil:stage', 'ezil:namespace', 'ezil:pool
 for (const key of ['ezil:computer-id', 'ezil:generation', 'ezil:fence-token', 'ezil:managed-by', 'ezil:stage', 'ezil:computer', 'ezil:fence'])
     guards.push([`volume ownership ${key}`, s => { s.volume.tags[key] = 'foreign'; }]);
 it.each(guards)('refuses %s without mutation', async (_name, change) => {
-    const s = adoptRecoverySetup(); change(s); await s.tick(); expect(s.starts).toHaveLength(0);
+    const s = adoptRecoverySetup(); change(s); const before = await s.current(), pool = { ...s.pool };
+    await s.tick(); expect(s.starts).toHaveLength(0);
+    expect(await s.current()).toEqual(before); expect(s.pool).toEqual(pool);
+    expect(s.statements.filter(q => /\b(UPDATE|INSERT|DELETE)\b/i.test(q.sql))).toEqual([]);
     expect(s.usage).toEqual([]); expect(s.meter.stopped).not.toHaveBeenCalled();
+});
+it.each(['guard', 'dependency'] as const)('logs one safe reason for a %s refusal', async kind => {
+    const s = adoptRecoverySetup(), warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+        if (kind === 'guard') s.host.state = 'pending';
+        else vi.mocked(s.deps.describer!.describeVolume!).mockRejectedValueOnce(new Error(`failed ${s.host.instanceId} ${s.original.intent.fenceToken} secret`));
+        await s.tick();
+        expect(warn).toHaveBeenCalledExactlyOnceWith('adopt-recovery guard', {
+            reason: kind === 'guard' ? 'adopt_recovery_guard' : 'adopt_recovery_error',
+        });
+        expect(s.starts).toEqual([]); expect((await s.current()).state).toBe('UNCONFIRMED');
+    } finally { warn.mockRestore(); }
 });
 it.each(['lease_token', 'instance_id', 'leased_generation', 'claim_fence', 'session_ready_at'])('atomic lock revalidation catches racing %s', async key => {
     const s = adoptRecoverySetup(); s.race(() => { s.pool[key] = key === 'leased_generation' ? 9 : s.original.intent.jobId; });
