@@ -20,7 +20,7 @@ import { applyLifecycleReceipt, lifecycleExecutionArn, type LifecycleExecutionRe
 import type { Placement, PlacementDb, PlacementExecutor } from './placement';
 import { lockImagePlacement, lockPoolClaimPlacement, pinCloudflarePlacement, readAdmissionCounters, readImageAdmissionCounters, readPlacement, savePoolEnrollmentNonce, withAdmission } from './placement';
 import { cancelComputerDemand, reservePoolDemand, type PoolDemandDeps } from './aws-pool-demand';
-import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest } from './capacity-demand';
+import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest, hasDemandHoldForRouting } from './capacity-demand';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { createPoolDeps } from './aws-pool-runtime';
 import * as poolData from './ready-pool';
@@ -984,6 +984,32 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             expect((await demands()).map(d => d.state).sort()).toEqual(['cancelled', 'expired']); // the expired record is kept
             expect(await reservePoolDemand(deps, want(430))).toBe('waiting'); // a fresh attempt
             expect(await cancelComputerDemand(db, uuid(430), uuid(999))).toBe(false); // never another owner's
+        });
+        it('routing hold: an unclosed demand holds across its deadline before any sweep, the expired attempt until released; a placement blocks release', async () => {
+            const { deps } = runtime();
+            await runB(); await host(326, xl, 'ready'); await requester(432);
+            expect(await reservePoolDemand(deps, want(432))).toBe('waiting');
+            const hold = (owner = 432) => hasDemandHoldForRouting(db, uuid(432), uuid(owner));
+            const states = async () => (await demands()).map(d => d.state).sort();
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() + interval '1 second', created_at = now() - interval '2 seconds'`);
+            expect(await hold()).toBe(true); // immediately before the deadline
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second'`);
+            expect(await states()).toEqual(['active']); // the deadline passed and no sweep ran
+            expect(await hold()).toBe(true);
+            expect(await hold(999)).toBe(false); // never another owner's
+            expect(await reservePoolDemand(deps, want(432))).toBe('refused'); // the sweep closes it as expired; terminal
+            expect(await states()).toEqual(['expired']);
+            expect(await hold()).toBe(true);
+            // A placement admitted before the stop's locks: the stop does not release the attempt.
+            await db.execute(sql`INSERT INTO public.ezil_computer_placements
+                (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type, instance_id, updated_at)
+                VALUES (${uuid(432)}::uuid, ${uuid(432)}::uuid, 'aws-ec2', 'ebs', 1, 1, 'UNCONFIRMED', ${c.region}, ${c.zoneId}, 'm6i.large', NULL, ${NOW.toISOString()}::timestamptz)`);
+            expect(await cancelComputerDemand(db, uuid(432), uuid(432))).toBe(false);
+            expect(await states()).toEqual(['expired']);
+            await db.execute(sql`DELETE FROM public.ezil_computer_placements WHERE computer_id = ${uuid(432)}::uuid`); // fixture only
+            expect(await cancelComputerDemand(db, uuid(432), uuid(432))).toBe(true);
+            expect(await states()).toEqual(['cancelled', 'expired']);
+            expect(await hold()).toBe(false);
         });
         it('size: a selection changed between the refused open and the reservation refuses (no stale retirement)', async () => {
             const { deps, starter } = runtime();

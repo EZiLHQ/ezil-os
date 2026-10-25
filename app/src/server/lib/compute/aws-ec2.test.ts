@@ -1318,4 +1318,25 @@ describe('stop releases a terminal expired capacity attempt (no placement yet)',
         await other.provider.stop(ctx, { userId: '99999999-9999-4999-8999-999999999999', computerId: C1 }, 'user').catch(() => null);
         expect(other.demands.map(d => d.state)).toEqual(['expired']);
     });
+    it('a placement admitted before the cancellation locks is never reported stopped and keeps the attempt unreleased', async () => {
+        const s = setup({ demands: [expired], placements: [stopped({ state: 'UNCONFIRMED', instance_type: 'm6i.large' })] }, { dbClock: () => NOW });
+        expect(await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ ok: false, outcome: 'placement_unconfirmed' });
+        expect(s.demands.map(d => d.state)).toEqual(['expired']);
+    });
+    it('a placement committed while the stop is in flight (after it starts, before the cancellation locks) is read, not a stale null', async () => {
+        const s = setup({ demands: [expired] }, { dbClock: () => NOW });
+        // Concurrent open: its placement commits exactly when the stop's cancellation transaction begins.
+        const db = s.db as unknown as { transaction: (...a: unknown[]) => Promise<unknown> };
+        const begin = db.transaction.bind(db);
+        let injected = false;
+        db.transaction = (...a: unknown[]) => {
+            if (!injected) { injected = true; s.placements.push(stopped({ state: 'UNCONFIRMED', instance_type: 'm6i.large' })); }
+            return begin(...a);
+        };
+        const result = await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user');
+        expect(injected).toBe(true);
+        expect(result).not.toMatchObject({ outcome: 'already_stopped' });
+        expect(result).toMatchObject({ ok: false, outcome: 'placement_unconfirmed' });
+        expect(s.demands.map(d => d.state)).toEqual(['expired']);
+    });
 });

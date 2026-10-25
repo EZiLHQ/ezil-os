@@ -135,8 +135,11 @@ export async function cancelComputerDemand(db: PlacementDb, computerId: string, 
         await lockComputerUnderAdmission(tx, lock, computerId);
         const own = await lockComputerDemand(tx, lock, computerId);
         if (own) return own.ownerUserId === ownerUserId.toLowerCase() && await closeDemand(tx, lock, own, 'cancelled');
-        // No active demand: an explicit stop also releases a terminal expired attempt (the next open is a fresh attempt).
-        return cancelExpiredAttempt(tx, lock, computerId, ownerUserId.toLowerCase());
+        // No active demand: an explicit stop also releases a terminal expired attempt (the next open is a fresh attempt), but
+        // only while no placement exists under these locks. One admitted concurrently is the caller's to stop, not released.
+        // Image reservations fail closed (no release).
+        const placed = await readPlacement(tx, computerId).then(r => r.record !== null, () => true);
+        return !placed && cancelExpiredAttempt(tx, lock, computerId, ownerUserId.toLowerCase());
     });
 }
 

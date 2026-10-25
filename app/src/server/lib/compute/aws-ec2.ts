@@ -766,9 +766,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const cfg = configured();
             if (!cfg.ok) return { ok: false, terminated: false, outcome: cfg.code, error: cfg.code };
             if (!deps.starter) return { ok: false, terminated: false, outcome: 'aws_lifecycle_unconfigured', error: 'aws_lifecycle_unconfigured' };
-            const p = await ownPlacement(c);
-            // A stop cancels the owner's pending capacity demand before any already-stopped answer.
+            // A stop cancels the owner's pending capacity demand before any already-stopped answer. The placement is read only
+            // AFTER the cancellation's locks: one admitted concurrently is stopped on its own terms, never reported stopped.
             const cancelled = await cancelComputerDemand(deps.db, c.computerId, c.userId);
+            const p = await ownPlacement(c);
             if (!p && cancelled) return { ok: true, terminated: false, outcome: 'already_stopped' };
             if (!p || p.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'aws_placement_missing', error: 'aws_placement_missing' };
             if (p.state === 'STOPPED') return { ok: true, terminated: false, outcome: 'already_stopped' };

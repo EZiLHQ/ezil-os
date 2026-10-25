@@ -125,12 +125,13 @@ export async function cancelExpiredAttempt(tx: PlacementExecutor, lock: Admissio
                 AND c.state = 'cancelled' AND c.closed_at >= d.closed_at)
         ORDER BY d.closed_at DESC LIMIT 1 RETURNING id`)).length === 1;
 }
-/** Routing only: this owner's computer holds an AWS demand (active and live) or a terminal expired attempt not yet released
- * by a stop. Either keeps the computer on the AWS path, so its open is answered by AWS and its stop can release the attempt. */
+/** Routing only: this owner's computer holds an unclosed AWS demand (whatever its deadline: a passed but not yet swept demand
+ * still holds) or a terminal expired attempt not yet released by a stop. Either keeps the computer on the AWS path, so its open
+ * is answered by AWS and its stop can release the attempt. Capacity credit keeps its own live-deadline rule. */
 export async function hasDemandHoldForRouting(db: PlacementExecutor, computerId: string, ownerUserId: string): Promise<boolean> {
     return rowsOf(await db.execute(sql`/* demand:hold */ SELECT d.id FROM public.ezil_compute_capacity_demands d
         WHERE d.computer_id = ${computerId}::uuid AND d.owner_user_id = ${ownerUserId}::uuid
-            AND ((d.closed_at IS NULL AND d.expires_at > now())
+            AND (d.closed_at IS NULL
                 OR (d.state = 'expired' AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands c
                     WHERE c.computer_id = d.computer_id AND c.state = 'cancelled' AND c.closed_at >= d.closed_at)))
         LIMIT 1`)).length > 0;
