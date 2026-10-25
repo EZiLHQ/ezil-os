@@ -332,8 +332,11 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     /**
      * The caller's own placement, settled: its current receipt applied, then a
      * guest-initiated idle stop caught (aws-receipts.ts), then — unless `limits` is
-     * off — a RUNNING one whose lease lapsed or whose hour cap is reached is stopped
-     * (`enforceSessionLimits`). Returns it re-read, with the limit acted on.
+     * off — a RUNNING one whose weighted hour cap is reached is stopped (`enforceSessionLimits`,
+     * caps only). Status, ensure and the stale heartbeat are automatic, so a lapsed technical lease
+     * alone never ends the session here (root POLICY DECISION 14:57Z / ROOT-FLEET-LEASE-INCIDENT-118:
+     * guest terminal/load/flush holds keep it up). An explicit owner Stop is unchanged.
+     * Returns it re-read, with the limit acted on.
      */
     const reconcileOwn = async (
         c: ComputerRef,
@@ -360,7 +363,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         let fresh = (await ownPlacement(c)) ?? p;
         if (await reconcileGuestStop(reconcileDeps(), fresh, deployment)) return { placement: (await ownPlacement(c)) ?? fresh, limit: null };
         if (!limits) return { placement: fresh, limit: null, computeLaunching: isReplacementLaunching(fresh, executionInput) };
-        const limit = await enforceSessionLimits(reconcileDeps(), fresh, deployment, { now: now(), caps: sessionLimitCaps(e) });
+        const limit = await enforceSessionLimits(reconcileDeps(), fresh, deployment, { now: now(), caps: sessionLimitCaps(e), enforceLeaseExpiry: false });
         if (limit) fresh = (await ownPlacement(c)) ?? fresh;
         return { placement: fresh, limit, computeLaunching: isReplacementLaunching(fresh, executionInput) };
     };

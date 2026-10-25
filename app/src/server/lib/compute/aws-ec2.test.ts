@@ -865,19 +865,32 @@ describe('Codex 4275911832: the lease deadline and hour caps bind during a sessi
         expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() + HOUR);
     });
 
-    it('status: a lapsed lease stops the instance through the ordinary lifecycle stop (lease_expired)', async () => {
-        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+    // Root POLICY DECISION 14:57Z (ROOT-OWNER-LEASE-CORRECTION-118): automatic owner paths are caps-only. A lapsed or missing
+    // technical lease alone never stops a still-running guest from status, ensure or the heartbeat; an explicit Stop still does.
+    it.each([
+        ['lapsed', { lease_until: new Date(NOW.getTime() - 1) }],
+        ['missing', { lease_until: null }],
+    ] as const)('status: a %s lease alone stops nothing and writes nothing (caps-only automatic owner path)', async (_label, lease) => {
+        const { provider, placements, calls, statements } = setup({ placements: [running(lease)] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'running', placementState: 'RUNNING' });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING', lifecycle_job_id: null });
+        expect(casCount(statements)).toBe(0);
+    });
+
+    it('status: a lapsed lease together with a reached hour cap stops with the cap reason', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })], usage: [hours(100)] });
         expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping', placementState: 'STOPPING' });
         expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
         expect(calls[0]!.intent).toMatchObject({ providerInstanceId: 'i-11111111111111111', fenceToken: FENCE, leaseEpoch: 4 });
-        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired', lifecycle_job_id: calls[0]!.intent.jobId });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'user_hours_cap', lifecycle_job_id: calls[0]!.intent.jobId });
     });
 
-    it('a RUNNING row with no lease at all is treated as lapsed (fail closed)', async () => {
-        const { provider, placements, calls } = setup({ placements: [running({ lease_until: null })] });
-        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping' });
+    it('an explicit owner Stop still ends a session whose lease lapsed', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+        expect(await provider.stop(ctx, me, 'user')).toEqual({ ok: false, terminated: false, outcome: 'stopping' }); // started, not yet confirmed
         expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
-        expect(placements[0]).toMatchObject({ last_error: 'lease_expired' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING' });
     });
 
     it('status is not presence: a live lease is neither renewed nor stopped, and nothing is written', async () => {
@@ -916,11 +929,12 @@ describe('Codex 4275911832: the lease deadline and hour caps bind during a sessi
         expect(casCount(statements)).toBe(before);
     });
 
-    it('activity: the release beat (presence 30 min ago) renews nothing, so a lapsed lease is stopped', async () => {
+    it('activity: the stale release beat (presence 30 min ago) renews nothing and, with a lapsed lease alone, stops nothing', async () => {
         const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
-        expect(await provider.activity(ctx, me, { lastInputAgoMs: 30 * 60_000 })).toEqual({ ok: false, error: 'lease_expired' });
-        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
-        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired', presence_at: null });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 30 * 60_000 })).toEqual({ ok: true });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING', presence_at: null });
+        expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() - 1); // not renewed by a stale beat
     });
 
     it('activity: an owner at the hour cap is stopped within a beat, presence notwithstanding', async () => {

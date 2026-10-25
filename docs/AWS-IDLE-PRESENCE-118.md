@@ -24,7 +24,8 @@ Root chose option (b) (`team/ROOT-IDLE-POLICY-118.md`), and after the 2026-10-25
 (`team/ROOT-FLEET-LEASE-INCIDENT-118.md`) it holds for EVERY fleet pass: `reconcileAwsFleet` (the minute route, the
 daily 04:08 UTC reap and a capacity refusal's direct reconcile) never stops a still-running guest solely because its
 technical lease lapsed. Weighted user/global hour caps still stop it, and guest-initiated stops, recorded receipts and
-deleted computers are still settled. Only the owner's own status/ensure/activity heartbeat keep the lease rule.
+deleted computers are still settled. The owner's automatic status/ensure/activity heartbeat are caps-only too (root
+POLICY DECISION 14:57Z); only an explicit owner Stop ends a session regardless of its lease.
 
 Let *P* be the last time a heartbeat carried fresh presence (sampled every 60 s, so up to 60 s after the
 last real visible+focused moment).
@@ -40,10 +41,10 @@ last real visible+focused moment).
   and the guest stops itself, the next pass settles it.
 - **Hidden tab, sockets still open (known gap):** the guest never becomes idle-due while any authenticated
   WebSocket stays open (the 30 s edge tick), and the minute pass does not enforce the lapsed lease. So this
-  case does NOT promptly downscale. It still stops when the owner's own status/ensure/heartbeat sees the lapsed
-  lease, or at an hour cap. No shutdown time is promised.
-- **Visible but unfocused:** heartbeats continue for 30 min after *P* and each enforces the default lease rule,
-  so the existing heartbeat-time lease stop can still apply in that window. The minute pass adds nothing here.
+  case does NOT promptly downscale: nothing automatic enforces the lapsed lease. It stops when the sockets close (the
+  guest idle stop, then the next minute pass), at an hour cap, or on an explicit Stop. No shutdown time is promised.
+- **Visible but unfocused:** heartbeats continue for 30 min after *P*; they enforce hour caps only, never the lapsed
+  lease, so this case behaves like the hidden tab once presence goes stale.
 
 Quiet foreground reading and active work are not stopped by this pass. Aligning guest presence with terminal
 holds (a new hold signal) is deliberately not part of 1.0.18.
