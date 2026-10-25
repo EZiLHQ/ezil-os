@@ -209,7 +209,7 @@ function stub (url, method, bodyText) {
     // the generic branch's `{guacamoleRunning:true}` shape has no `confirmed`
     // field, which `session.confirmFrame()` reads as a hard `false` (not
     // `undefined`) — silently failing frame confirmation for every window.
-    if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true };
+    if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true, status: 200 }; // real handler shape (confirmFrame returns status)
     // 🔴 The SECOND gate, and the same ordering rule for the same reason. The
     // desktop window no longer reaches full-bleed on a confirmed FRAME — a
     // Neko origin answers 200 whether or not WebRTC ever connects, so
