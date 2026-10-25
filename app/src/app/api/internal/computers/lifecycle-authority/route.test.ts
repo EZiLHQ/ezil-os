@@ -265,7 +265,7 @@ it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes th
     const demand = (standard: number) => ({ opens: 0, standard, premium: 0, boot_minutes: null, spares: 0, vcpu: 0, idle_ready: [], booting: [] });
     let eligible = 1;
     const { PgDialect } = await import('drizzle-orm/pg-core');
-    execute.mockImplementation(async (q: Parameters<PgDialect['sqlToQuery']>[0]) =>
+    execute.mockImplementation(async (q: Parameters<InstanceType<typeof PgDialect>['sqlToQuery']>[0]) =>
         new PgDialect().sqlToQuery(q).sql.includes('FROM public.ezil_compute_pool_hosts WHERE id =') ? [host] : [demand(eligible)]);
     vi.stubEnv('EZIL_AWS_LIFECYCLE_DEPLOYMENTS', JSON.stringify({ [i.deployment.region]: i.deployment }));
     vi.stubEnv('AWS_REGIONS', i.deployment.region);
