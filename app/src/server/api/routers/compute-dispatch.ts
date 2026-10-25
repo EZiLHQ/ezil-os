@@ -159,7 +159,10 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
         // Keep the existing relay preparation ahead of the hold: waiting must not
         // defer the exchange that lets the host reach session-ready.
         await preparePool?.();
-        if (hold && await hold.wait() && !hold.signal?.aborted) result = await hold.ensure();
+        if (hold && !hold.signal?.aborted && await hold.wait() && !hold.signal?.aborted) {
+            const ensured = await hold.ensure();
+            if (!hold.signal?.aborted) result = ensured;
+        }
     }
     if (!result.ok) {
         return {

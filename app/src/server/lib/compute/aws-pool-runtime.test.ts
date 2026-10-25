@@ -6,6 +6,8 @@ import { poolFixture } from './aws-pool-test-support';
 import type { PoolDispatchStore } from './aws-pool-replenish';
 import { issueEnrollmentNonce } from './aws-enroll';
 import type { Env } from './aws-config';
+import { readPoolProof } from './aws-pool-host';
+import { PollDeadline, PollStoppedError } from './poll-wait';
 const store: PoolDispatchStore = { prepare: vi.fn(), outcome: vi.fn() };
 it.each(['disabled', 'starter', 'deployments', 'regions'])('fails closed before cron dispatch when missing %s', missing => {
     const f = poolFixture(); const env: Env = { ...f.deps.env, AWS_REGIONS: 'ap-south-1' };
@@ -33,4 +35,14 @@ it('constructs the durable production store without a bridge', () => {
     const deps = createPoolReplenishDeps(f.deps.db, { ...f.deps.env, AWS_REGIONS: 'ap-south-1' });
     expect(deps.store.prepare).toBeTypeOf('function');
     expect(deps.store.reconcile).toBeTypeOf('function');
+});
+
+it('production host deps forward cancellation to the observer before its first database read', async () => {
+    const f = poolFixture(true); mocks.sdk.mockReturnValue({ describer: f.deps.describer, executions: f.deps.executions });
+    const deps = createPoolHostDeps(f.deps.db, f.deps.env);
+    const controller = new AbortController(); controller.abort();
+    await expect(deps.observeAdopt!(readPoolProof(f.request('claim')), f, new PollDeadline(5_000, controller.signal)))
+        .rejects.toBeInstanceOf(PollStoppedError);
+    expect(f.deps.db.execute).not.toHaveBeenCalled();
+    expect(f.deps.db.transaction).not.toHaveBeenCalled();
 });

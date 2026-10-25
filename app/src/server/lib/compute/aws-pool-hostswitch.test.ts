@@ -157,7 +157,8 @@ it('first-volume receipt uses the existing attachment CAS before the claim is ex
     const f = observer(); const w = buildLifecycleWork({ ...f.work.intent, dataVolumeId: null, dataVolumeGiB: 20 });
     f.p.volumeId = null; f.p.lifecycleDigest = w.digest; f.execution.input = w.input;
     f.execution.output = JSON.stringify({ ...f.receipt, digest: w.digest });
-    await f.run(); expect(f.attached).toHaveBeenCalledWith(f.deps.db, f.p, f.receipt.volumeId, expect.any(Function));
+    await f.run(); expect(f.attached).toHaveBeenCalledWith(
+        { execute: expect.any(Function), transaction: expect.any(Function) }, f.p, f.receipt.volumeId, expect.any(Function));
     expect(f.publish).toHaveBeenCalledOnce();
 });
 it('pending reads require a bound lease and all publication fields absent; retry keeps the first timestamp', async () => {

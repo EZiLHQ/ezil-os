@@ -26,7 +26,7 @@ export function createPoolHostDeps(db: PlacementDb, env: Env): PoolClaimDeps {
     const sdk = sharedAwsSdkCollaborators(env);
     const deps: PoolClaimDeps = { db, data: poolModule, env, now: () => new Date(), describer: sdk.describer ?? null, executions: sdk.executions ?? null,
         lockPlacement: lockPoolClaimPlacement, saveNonce: savePoolEnrollmentNonce };
-    deps.observeAdopt = (proof, identity) => observePoolAdopt(deps, proof, identity);
+    deps.observeAdopt = (proof, identity, poll) => observePoolAdopt(deps, proof, identity, poll);
     return deps;
 }
 

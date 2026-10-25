@@ -28,6 +28,7 @@ import { awsPreviewAnswer } from './compute-dispatch';
 import { fixtureDeployment } from '@/server/lib/compute/aws-intent.test-support';
 import { LIFECYCLE_DEPLOYMENTS_ENV } from '@/server/lib/compute/aws-intent';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
+import type { EnsureResult } from '@/server/lib/compute/provider';
 
 const U = '11111111-1111-4111-8111-111111111111';
 const C = '22222222-2222-4222-8222-222222222222';
@@ -122,5 +123,46 @@ describe('preview launch guard', () => {
     it('a ready ensure drops stale launch evidence even if the preview origin is still starting', async () => {
         expect(await awsPreviewAnswer({ ...pending, ok: true }, preview)).not.toHaveProperty('computeLaunching');
         expect(preview).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('preview cancellation across the hold', () => {
+    const pending = { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true, computeLaunching: true } as const;
+    const ready: EnsureResult = { ok: true };
+    it.each(['before', 'prepare', 'wait', 'ensure'])('retains the original starting answer on disconnect during %s', async stage => {
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        const controller = new AbortController();
+        if (stage === 'before') controller.abort();
+        const prepare = vi.fn(async () => { if (stage === 'prepare') await deferred; });
+        const wait = vi.fn(async () => { if (stage === 'wait') await deferred; return true; });
+        const ensure = vi.fn(async () => { if (stage === 'ensure') await deferred; return ready; });
+        const preview = vi.fn();
+        const answer = awsPreviewAnswer(pending, preview, prepare, { wait, ensure, signal: controller.signal });
+        // Let the real dispatch reach each deferred dependency.
+        await vi.waitFor(() => {
+            if (stage === 'ensure') expect(ensure).toHaveBeenCalledOnce();
+            else if (stage === 'wait') expect(wait).toHaveBeenCalledOnce();
+            else if (stage === 'prepare') expect(prepare).toHaveBeenCalledOnce();
+        });
+        controller.abort();
+        release();
+        expect(await answer).toMatchObject({ ok: false, error: 'computer_starting', errorCode: 'sandbox_starting',
+            retryable: true, computeLaunching: true, computeProvider: 'aws-ec2' });
+        expect(preview).not.toHaveBeenCalled();
+        if (stage === 'before') expect(prepare).not.toHaveBeenCalled();
+        if (stage === 'before' || stage === 'prepare') expect(wait).not.toHaveBeenCalled();
+        if (stage !== 'ensure') expect(ensure).not.toHaveBeenCalled();
+    });
+
+    it('requests the preview once after a healthy deferred ensure', async () => {
+        let release!: (result: EnsureResult) => void;
+        const ensure = vi.fn(() => new Promise<EnsureResult>(resolve => { release = resolve; }));
+        const preview = vi.fn(async () => ({ ok: false as const, error: 'sandbox_starting', errorCode: 'sandbox_starting' }));
+        const answer = awsPreviewAnswer(pending, preview, undefined, { wait: async () => true, ensure, signal: new AbortController().signal });
+        await vi.waitFor(() => expect(ensure).toHaveBeenCalledOnce());
+        release(ready);
+        expect(await answer).not.toHaveProperty('computeLaunching');
+        expect(preview).toHaveBeenCalledOnce();
     });
 });

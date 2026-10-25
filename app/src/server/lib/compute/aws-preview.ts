@@ -13,7 +13,7 @@ import {
 } from './placement';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
 import type { ComputerRef, EnsureOptions } from './provider';
-import { pollWait } from './poll-wait';
+import { PollDeadline, pollWait } from './poll-wait';
 
 type UnavailableReason = 'config_missing' | 'zone_invalid' | 'endpoint_invalid' | 'placement_missing'
     | 'placement_foreign' | 'placement_provider' | 'placement_not_running' | 'placement_epoch_invalid'
@@ -56,16 +56,17 @@ export async function waitForAwsPreviewPlacement(db: PlacementExecutor, computer
     const key = JSON.stringify([computer.userId.toLowerCase(), computer.computerId.toLowerCase()]);
     if (signal?.aborted || heldPreviews.has(key)) return false;
     heldPreviews.add(key);
-    const deadline = performance.now() + 8_000;
+    const poll = new PollDeadline(8_000, signal);
+    const reads: PlacementExecutor = { execute: query => poll.read(() => db.execute(query)) };
     try {
         for (let check = 0; check <= 32 && !signal?.aborted; check++) {
-            const { record } = await readPlacement(db, computer.computerId, computer.userId);
-            if (signal?.aborted) return false;
+            const { record } = await poll.read(() => readPlacement(reads, computer.computerId, computer.userId));
+            poll.check();
             const refused = placementRefusal(record);
             if (!refused) return true;
             if (refused.errorCode !== 'sandbox_starting' || !record
                 || !['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(record.state)) return false;
-            const remaining = deadline - performance.now();
+            const remaining = poll.remaining();
             if (remaining <= 0 || check === 32 || !await pollWait(Math.min(250, remaining), signal)) return false;
         }
     } catch {

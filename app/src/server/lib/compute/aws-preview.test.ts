@@ -82,7 +82,7 @@ describe('AWS preview placement hold', () => {
         await vi.advanceTimersByTimeAsync(1);
         await held;
         expect(done).toHaveBeenCalledExactlyOnceWith(false);
-        expect(fake.statements.filter(s => s.sql.includes('placement:read'))).toHaveLength(33);
+        expect(fake.statements.filter(s => s.sql.includes('placement:read'))).toHaveLength(32);
         expect(vi.getTimerCount()).toBe(0);
     });
 
@@ -131,6 +131,81 @@ describe('AWS preview placement hold', () => {
     it('does not wait for a RUNNING placement with unsettled enrollment', async () => {
         const { fake } = setup([row({ enroll_nonce_hash: 'pending' })], true);
         expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(['placement', 'reservation'])('releases the hold on abort during the %s read, even if it never answers', async stage => {
+        const { fake } = setup([row()], true);
+        const execute = fake.db.execute;
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        let calls = 0;
+        const db = { execute: vi.fn(async (query: Parameters<typeof execute>[0]) => {
+            if (++calls === (stage === 'placement' ? 1 : 2)) await deferred;
+            return execute(query);
+        }) };
+        const controller = new AbortController();
+        const held = waitForAwsPreviewPlacement(db, computer, controller.signal);
+        await vi.advanceTimersByTimeAsync(0);
+        controller.abort();
+        expect(await held).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+        // A new ask acquires the same slot before the old dependency settles.
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(true);
+        const count = db.execute.mock.calls.length;
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(db.execute).toHaveBeenCalledTimes(count);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([0, 7_750])('bounds a deferred read started at %ims by the remaining eight-second budget', async start => {
+        const { fake } = setup([row({ state: start ? 'STARTING' : 'RUNNING' })], true);
+        const execute = fake.db.execute;
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        const db = { execute: vi.fn(async (query: Parameters<typeof execute>[0]) => {
+            if (performance.now() >= start) await deferred;
+            return execute(query);
+        }) };
+        const done = vi.fn();
+        const held = waitForAwsPreviewPlacement(db, computer).then(done);
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(done).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(false);
+        fake.placements[0]!.state = 'RUNNING';
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(true);
+        const reads = db.execute.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(1);
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(done).toHaveBeenCalledExactlyOnceWith(false);
+        expect(db.execute).toHaveBeenCalledTimes(reads);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('rejects a ready result at 8001ms even before the deadline timer runs', async () => {
+        const { fake } = setup([row()], true);
+        const execute = fake.db.execute;
+        const db = { execute: async (query: Parameters<typeof execute>[0]) => {
+            const result = await execute(query);
+            vi.spyOn(performance, 'now').mockReturnValue(8_001);
+            return result;
+        } };
+        expect(await waitForAwsPreviewPlacement(db, computer)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('accepts a deferred healthy read just before the deadline and clears its timer', async () => {
+        const { fake } = setup([row()], true);
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        const held = waitForAwsPreviewPlacement({ execute: async query => { await deferred; return fake.db.execute(query); } }, computer);
+        await vi.advanceTimersByTimeAsync(7_999);
+        release();
+        expect(await held).toBe(true);
         expect(vi.getTimerCount()).toBe(0);
     });
 });
