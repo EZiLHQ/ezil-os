@@ -705,20 +705,26 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             };
             // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
-            await syncAiCredential({
+            const syncCredential = () => syncAiCredential({
                 config, hmacSecret,
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
             if (routed.kind === 'aws-ec2') {
+                // WARM-118: after the ownership and billing gates, the (never-throwing) credential sync overlaps the
+                // first ensure. Both settle before any preview or relay preparation; an ensure rejection is rethrown
+                // only once the sync has drained, so nothing is left running. Cloudflare keeps its order below.
+                const [ensured] = await Promise.allSettled([routed.provider.ensure({ correlationId }, computer, ensureOptions), syncCredential()]);
+                if (ensured.status === 'rejected') throw ensured.reason;
                 return awsPreviewAnswer(
-                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    ensured.value,
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
             }
+            await syncCredential();
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             const migrating = cloudflareMigrationAnswer(result);
             if (migrating) return migrating;

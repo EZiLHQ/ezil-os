@@ -648,3 +648,45 @@ describe('RETRY-118 capacity_attempt_expired', () => {
         }
     });
 });
+
+// WARM-118 (root ROOT-WARM-OPTIMIZATIONS-118 #2): the committed adoption is launched BEFORE the full spare
+// replenishment is awaited, so pool planning overlaps the lifecycle execution.
+describe('WARM-118 adoption launches before replenishment', () => {
+    it.each([false, true])('a held replenishment never delays the adoption, which starts exactly once (reopen=%s)', async reopen => {
+        const s = setup({ rows: reopen ? [stopped()] : [] });
+        let release!: () => void;
+        s.pool.replenish = vi.fn(() => new Promise<void>(r => { release = r; }));
+        let settled = false;
+        const pending = s.ensure().then(r => { settled = true; return r; });
+        for (let i = 0; i < 200 && vi.mocked(s.pool.replenish).mock.calls.length === 0; i++) await new Promise(r => setTimeout(r, 0));
+        expect(s.starts).toHaveLength(1); // launched BEFORE the planner was even asked, and it is still running
+        expect(s.starts[0]!.intent).toMatchObject({ operation: 'adopt', poolHostId: HOST });
+        expect(s.pool.replenish).toHaveBeenCalledOnce();
+        expect(settled).toBe(false); // the ensure still awaits the replenishment it began
+        release();
+        expect(await pending).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts).toHaveLength(1);
+        expect((await s.placement()).lifecycleJobId).toBe(s.starts[0]!.intent.jobId);
+    });
+    it.each([false, true])('a planner failure cannot undo the adoption, trigger a cold fallback or open usage early (reopen=%s)', async reopen => {
+        const s = setup({ rows: reopen ? [stopped()] : [] });
+        s.pool.replenish = vi.fn(async () => { throw new Error('planner exploded'); });
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts).toHaveLength(1);
+        expect(s.starts[0]!.intent.operation).toBe('adopt'); // never a cold provision
+        const p = await s.placement();
+        expect(p.lifecycleJobId).toBe(s.starts[0]!.intent.jobId);
+        expect(['PROVISIONING', 'LEASED', 'STARTING']).toContain(p.state); // the adopt state, never rolled back
+        expect(s.meter.ready).not.toHaveBeenCalled();
+        expect(s.usage).toHaveLength(0);
+        // A repeat open while the adoption runs does not launch again.
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.starts).toHaveLength(1);
+    });
+    it('a lost StartExecution answer still gets its replenishment, and only the same job is retried (no new launch)', async () => {
+        const s = setup({ lostStart: true });
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
+        expect(new Set(s.starts.map(w => w.intent.jobId)).size).toBe(1); // the start helper's own retries of ONE job
+        expect(s.pool.replenish).toHaveBeenCalledOnce();
+    });
+});

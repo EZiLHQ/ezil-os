@@ -454,8 +454,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
 
     /** Admission reserves a cold boot first, but no execution can start until
      * commit. A pool lease replaces that boot's work in the same transaction. */
+    /** Admits a boot. A committed pool adoption's spare REPLENISHMENT is handed back in `after` for the caller to await
+     * AFTER it launches that adoption (WARM-118): the planner's work overlaps the lifecycle execution instead of
+     * delaying it. Nothing about admission, the durable commit or the job identity changes. */
     const admitBoot = async (request: AdmissionRequest, tier: AwsTier | undefined, e: Env,
-        workRef: { get(): LifecycleWork | undefined; set(work: LifecycleWork): void }) => {
+        workRef: { get(): LifecycleWork | undefined; set(work: LifecycleWork): void },
+        after: { replenish?: () => Promise<void> } = {}) => {
         let own: CapacityDemand | null | undefined;
         const result = await reservePoolHostForBoot(deps.db,
             db => runAdmission(db, request, { env: e, now }),
@@ -506,9 +510,11 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             });
         const work = workRef.get();
         if (result.admitted && work?.intent.operation === 'adopt') {
+            const leasedClass = { region: result.placement.region!, zoneId: result.placement.zoneId!,
+                instanceType: result.placement.instanceType as PoolClass['instanceType'] };
             // Planner failure must not discard a committed adopt or enable a cold retry.
-            await deps.pool!.replenish({ region: result.placement.region!, zoneId: result.placement.zoneId!,
-                instanceType: result.placement.instanceType as PoolClass['instanceType'] }, now()).catch(() => console.error('[compute.pool] replenish failed after lease'));
+            after.replenish = () => deps.pool!.replenish(leasedClass, now()).then(() => undefined,
+                () => console.error('[compute.pool] replenish failed after lease'));
         }
         return result;
     };
@@ -560,6 +566,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 const nonce = issueEnrollmentNonce(now(), randomBytes);
                 let work: LifecycleWork | undefined;
                 let admitted;
+                const afterLaunch: { replenish?: () => Promise<void> } = {};
                 try {
                     admitted = await admitBoot(
                         {
@@ -587,25 +594,30 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 };
                             },
                         },
-                        tier, cfg.e, { get: () => work, set: value => { work = value; } },
+                        tier, cfg.e, { get: () => work, set: value => { work = value; } }, afterLaunch,
                     );
                 } catch (error) {
                     if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
                     throw error;
                 }
-                if (!admitted.admitted && admitted.reason === 'capacity_attempt_expired') return attemptExpired(admitted.capacityAttemptId);
-                if (!admitted.admitted) return admitted.reason === 'capacity_waiting' ? notReady('computer_starting', true)
-                    : capacityRefusal(admitted.reason, cfg.deployments, cfg.e);
-                const p = admitted.placement;
-                // The row must be exactly what the intent was built for (generation 1, epoch 1).
-                if (!work || p.generation !== 1 || p.leaseEpoch !== work.intent.leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
-                    await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
-                    return notReady('aws_intent_invalid');
+                try {
+                    if (!admitted.admitted && admitted.reason === 'capacity_attempt_expired') return attemptExpired(admitted.capacityAttemptId);
+                    if (!admitted.admitted) return admitted.reason === 'capacity_waiting' ? notReady('computer_starting', true)
+                        : capacityRefusal(admitted.reason, cfg.deployments, cfg.e);
+                    const p = admitted.placement;
+                    // The row must be exactly what the intent was built for (generation 1, epoch 1).
+                    if (!work || p.generation !== 1 || p.leaseEpoch !== work.intent.leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
+                        await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
+                        return notReady('aws_intent_invalid');
+                    }
+                    const r = await launch(c.userId, p, work, 'UNCONFIRMED');
+                    return r === 'started' || r === 'pending'
+                        ? notReady('computer_starting', true)
+                        : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
+                } finally {
+                    // WARM-118: the committed adoption is already launched (or refused); replenish now, overlapping it.
+                    await afterLaunch.replenish?.();
                 }
-                const r = await launch(c.userId, p, work, 'UNCONFIRMED');
-                return r === 'started' || r === 'pending'
-                    ? notReady('computer_starting', true)
-                    : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
             }
 
             if (placement.provider !== 'aws-ec2') return notReady('provider_mismatch');
@@ -699,6 +711,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         throw error;
                     }
                     let leased;
+                    const afterLaunch: { replenish?: () => Promise<void> } = {};
                     try {
                         leased = await admitBoot(
                             {
@@ -719,35 +732,40 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                     lastError: null,
                                 },
                             },
-                            poolTier, cfg.e, { get: () => work, set: value => { work = value; } },
+                            poolTier, cfg.e, { get: () => work, set: value => { work = value; } }, afterLaunch,
                         );
                     } catch (error) {
                         if (error instanceof LifecycleIntentInvalidError) return notReady('aws_intent_invalid');
                         throw error;
                     }
-                    if (!leased.admitted && leased.reason === 'capacity_waiting') return notReady('computer_starting', true);
-                    if (!leased.admitted && leased.reason === 'capacity_attempt_expired') return attemptExpired(leased.capacityAttemptId);
-                    if (!leased.admitted) return leased.reason === 'cas_conflict'
-                        ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
-                        : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
-                    const p = leased.placement;
-                    // A replace cannot be undone by compare-and-swap (the generation already moved):
-                    // a refused StartExecution leaves it for recovery (UNCONFIRMED). A start-in-place
-                    // only moved the epoch, which a later wake simply raises again: back to STOPPED.
-                    const undo: PlacementState = replace ? 'UNCONFIRMED' : 'STOPPED';
-                    if (p.generation !== generation || p.leaseEpoch !== leaseEpoch || p.lifecycleJobId !== work.intent.jobId || p.instanceType !== instanceType) {
-                        await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
-                        return notReady('aws_intent_invalid');
+                    try {
+                        if (!leased.admitted && leased.reason === 'capacity_waiting') return notReady('computer_starting', true);
+                        if (!leased.admitted && leased.reason === 'capacity_attempt_expired') return attemptExpired(leased.capacityAttemptId);
+                        if (!leased.admitted) return leased.reason === 'cas_conflict'
+                            ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
+                            : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
+                        const p = leased.placement;
+                        // A replace cannot be undone by compare-and-swap (the generation already moved):
+                        // a refused StartExecution leaves it for recovery (UNCONFIRMED). A start-in-place
+                        // only moved the epoch, which a later wake simply raises again: back to STOPPED.
+                        const undo: PlacementState = replace ? 'UNCONFIRMED' : 'STOPPED';
+                        if (p.generation !== generation || p.leaseEpoch !== leaseEpoch || p.lifecycleJobId !== work.intent.jobId || p.instanceType !== instanceType) {
+                            await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
+                            return notReady('aws_intent_invalid');
+                        }
+                        const r = await launch(c.userId, p, work, undo);
+                        if (resizeTo && (r === 'started' || r === 'pending')) await recordComputeMeter(() => deps.meter?.stopped({
+                            userId: p.ownerUserId, computerId: p.computerId, endedAt: now(), reason: 'resize',
+                        }));
+                        // Pending: the boot may be running; it stays LEASED with its job for the receipt path.
+                        if (r === 'pending') return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
+                        if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
+                        await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STARTING' });
+                        return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
+                    } finally {
+                        // WARM-118: the committed adoption is already launched (or refused); replenish now, overlapping it.
+                        await afterLaunch.replenish?.();
                     }
-                    const r = await launch(c.userId, p, work, undo);
-                    if (resizeTo && (r === 'started' || r === 'pending')) await recordComputeMeter(() => deps.meter?.stopped({
-                        userId: p.ownerUserId, computerId: p.computerId, endedAt: now(), reason: 'resize',
-                    }));
-                    // Pending: the boot may be running; it stays LEASED with its job for the receipt path.
-                    if (r === 'pending') return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
-                    if (r !== 'started') return notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
-                    await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'STARTING' });
-                    return { ...notReady('computer_starting', true), ...(replace ? { computeLaunching: true } : {}) };
                 }
                 default: {
                     if (isPoolOpenRelease(placement) || isPoolReleaseRecovering(placement) || await isAdoptRecoveryStarting(placement)) return notReady('computer_starting', true);
