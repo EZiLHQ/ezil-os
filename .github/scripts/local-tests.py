@@ -31,7 +31,8 @@ def validate_partition(files, groups):
 
 def validate_report(output, expected):
     output = ANSI.sub("", output)
-    observed = re.findall(r"^(?:\./)?(local/.+):$", output, re.MULTILINE)
+    # Raw Bun emits ::group::; downloaded Actions logs render ##[group].
+    observed = re.findall(r"^(?:::group::|##\[group\])?(?:\./)?(local/.+):$", output, re.MULTILINE)
     if Counter(observed) != Counter(expected):
         raise ValueError("Bun reported omitted, duplicate, or unexpected test files")
     passed = re.findall(r"^ +([0-9]+) pass$", output, re.MULTILINE)

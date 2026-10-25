@@ -27,7 +27,9 @@ mode = os.environ.get('STUB_MODE') if os.environ.get('STUB_GROUP') == group else
 if mode == 'omission': paths = paths[:-1]
 if mode == 'duplicate': paths += paths[:1]
 if mode == 'foreign': paths += ['local/foreign.test.ts']
-for path in paths: print(path + ':')
+for path in paths:
+    print(os.environ.get('STUB_GROUPED', '') + path + ':')
+    if os.environ.get('STUB_GROUPED'): print('::endgroup::')
 if mode == 'summary_missing': sys.exit(0)
 print(f' {len(paths)} pass')
 print(' 1 fail' if mode == 'reported_failure' else ' 0 fail')
@@ -54,10 +56,11 @@ class RunnerTests(unittest.TestCase):
         binary.write_text(STUB)
         binary.chmod(0o755)
 
-    def run_stub(self, mode="ok", group="smoke"):
+    def run_stub(self, mode="ok", group="smoke", grouped=""):
         result = subprocess.run([sys.executable, str(RUNNER.resolve())], cwd=self.root,
                                 env={**os.environ, "PATH": str(self.root / "bin") + os.pathsep + os.environ["PATH"],
-                                     "TMPDIR": str(self.root), "STUB_MODE": mode, "STUB_GROUP": group},
+                                     "TMPDIR": str(self.root), "STUB_MODE": mode, "STUB_GROUP": group,
+                                     "STUB_GROUPED": grouped},
                                 capture_output=True, text=True, timeout=10)
         receipt = self.root / "calls.jsonl"
         calls = [json.loads(line) for line in receipt.read_text().splitlines()] if receipt.exists() else []
@@ -83,6 +86,14 @@ class RunnerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, [])
 
+    def test_github_grouped_inventory_passes_with_same_exact_partition(self):
+        for grouped in ["::group::", "##[group]"]:
+            with self.subTest(grouped=grouped):
+                (self.root / "calls.jsonl").unlink(missing_ok=True)
+                result, calls = self.run_stub(grouped=grouped)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_exact_calls(calls)
+
     def test_partition_rejects_omission_duplicate_and_shared_smoke(self):
         rest = [path for path in self.files if path != runner.SMOKE]
         for groups in [[[runner.SMOKE], rest[:-1]], [[runner.SMOKE], rest + rest[:1]],
@@ -91,14 +102,15 @@ class RunnerTests(unittest.TestCase):
                 runner.validate_partition(self.files, groups)
 
     def test_each_failure_rejects_but_still_executes_both_groups_once(self):
-        for group in ["smoke", "rest"]:
-            for mode in ["exit_failure", "reported_failure", "skip", "todo", "summary_missing",
-                         "duplicate_summary", "omission", "duplicate", "foreign"]:
-                with self.subTest(group=group, mode=mode):
-                    (self.root / "calls.jsonl").unlink(missing_ok=True)
-                    result, calls = self.run_stub(mode, group)
-                    self.assertNotEqual(result.returncode, 0, result.stdout)
-                    self.assert_exact_calls(calls)
+        for grouped in ["", "::group::", "##[group]"]:
+            for group in ["smoke", "rest"]:
+                for mode in ["exit_failure", "reported_failure", "skip", "todo", "summary_missing",
+                             "duplicate_summary", "omission", "duplicate", "foreign"]:
+                    with self.subTest(grouped=grouped, group=group, mode=mode):
+                        (self.root / "calls.jsonl").unlink(missing_ok=True)
+                        result, calls = self.run_stub(mode, group, grouped)
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        self.assert_exact_calls(calls)
 
     def test_discovery_includes_new_test_and_spec_suffixes_but_not_dependencies(self):
         additions = ["local/nested/new_test.ts", "local/nested/new.spec.tsx"]
