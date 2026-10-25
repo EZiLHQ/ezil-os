@@ -81,7 +81,7 @@ describe('lifecycle authority wire contract', () => {
         const expression = source.match(/const signature=(createHmac[\s\S]*?\.digest\('hex'\));/)?.[1];
         expect(expression).toBeDefined();
         const signature = runInNewContext(expression!, {
-            createHmac, createHash, Buffer, secret: { SecretString: KEY }, body: BODY, timestamp: TIMESTAMP, AUTHORITY_PATH,
+            createHmac, createHash, Buffer, authoritySecret: { key: KEY }, body: BODY, timestamp: TIMESTAMP, AUTHORITY_PATH,
         }) as string;
         expect(signature).toBe(VECTOR_SIGNATURE);
         expect(sign(BODY)).toBe(VECTOR_SIGNATURE);
