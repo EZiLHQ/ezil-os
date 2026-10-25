@@ -44,12 +44,14 @@ import {
     type ShellBootPayload,
 } from '../../../app/src/server/shell/boot-payload.ts';
 
-// The local host has neither hosted TURN renewal nor recorded cloud machine
-// metadata. Exclude only these named operations; any other app route must
-// still pass the complete key and path comparisons below.
+// The local host has neither hosted TURN renewal, recorded cloud machine
+// metadata, nor AWS capacity attempts to reset (RETRY-118: the hosted shell's
+// explicit Retry). Exclude only these named operations; any other app route
+// must still pass the complete key and path comparisons below.
 const {
     relayRefresh: HOSTED_RELAY_ROUTE,
     system: HOSTED_SYSTEM_ROUTE,
+    capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
     ...COMMON_ROUTES
 } = APP_ROUTES;
 
@@ -65,9 +67,10 @@ describe('the route table has not drifted from the app', () => {
         // Without this, a module that somehow resolved to `{}` would make every
         // "same keys" assertion below vacuously true.
         expect(typeof APP_ROUTES).toBe('object');
-        expect(Object.keys(APP_ROUTES).length).toBe(11);
+        expect(Object.keys(APP_ROUTES).length).toBe(12);
         expect(HOSTED_RELAY_ROUTE).toBe('/api/shell/relay-refresh');
         expect(HOSTED_SYSTEM_ROUTE).toBe('/api/shell/system');
+        expect(HOSTED_CAPACITY_RETRY_ROUTE).toBe('/api/shell/capacity-retry');
         expect(typeof appSerialize).toBe('function');
     });
 

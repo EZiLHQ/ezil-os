@@ -38,12 +38,14 @@ import {
 } from './routes.ts';
 import { startLocalServer, type LocalServer } from './server.ts';
 
-// Local mode has neither hosted TURN credentials nor recorded cloud machine
-// metadata. Keep the unsupported routes explicit so new app routes still fail
-// the shared-contract comparison until their local support is decided.
+// Local mode has neither hosted TURN credentials, recorded cloud machine
+// metadata, nor AWS capacity attempts (RETRY-118's hosted explicit Retry). Keep
+// the unsupported routes explicit so new app routes still fail the
+// shared-contract comparison until their local support is decided.
 const {
     relayRefresh: HOSTED_RELAY_ROUTE,
     system: HOSTED_SYSTEM_ROUTE,
+    capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
     ...COMMON_SHELL_API_ROUTES
 } = APP_SHELL_API_ROUTES;
 
@@ -147,6 +149,13 @@ describe('the published endpoint map and the served paths are the same nine', ()
         const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
         expect(body.desktopState.endpoints.system).toBeUndefined();
         expect((await get(`${HOSTED_SYSTEM_ROUTE}?computerId=${computerId()}`)).status).toBe(404);
+    });
+
+    it('does not advertise or serve the hosted capacity Retry', async () => {
+        const res = await post(SHELL_API_ROUTES.session, {});
+        const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
+        expect(body.desktopState.endpoints.capacityRetry).toBeUndefined();
+        expect((await post(HOSTED_CAPACITY_RETRY_ROUTE, { computerId: computerId(), attemptId: computerId() })).status).toBe(404);
     });
 });
 
