@@ -16,7 +16,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 function harness() {
     vi.stubEnv('AWS_REGIONS', 'ap-south-1'); vi.stubEnv('EZIL_AWS_MAX_RUNNING_AP_SOUTH_1', '5'); vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
     const f = poolFixture(); const c = { region: f.row.region, zoneId: f.row.zoneId, instanceType: 'm6i.large' as const };
-    let row: Record<string, unknown> = { id: f.row.poolHostId, generation: 1, region: c.region, zone_id: c.zoneId,
+    const row: Record<string, unknown> = { id: f.row.poolHostId, generation: 1, region: c.region, zone_id: c.zoneId,
         instance_type: c.instanceType, instance_id: null, state: 'booting', leased_computer_id: null,
         claim_generation: null, claim_lease_epoch: null, claim_fence: null, claim_volume_serial: null,
         lifecycle_job_id: null, dispatch_status: null };
