@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { HistoryEvent } from '@aws-sdk/client-sfn';
 import { z } from 'zod';
 import { buildLifecycleWork, KNOWN_INSTANCE_TYPES, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
+import type { HistoricalSourceProof } from './aws-historical-source';
 import { parseRebaseJson, RebaseHash } from './aws-rebase-json';
 import { reconcileReplacementGeneration, type Placement } from './placement';
 import type { LifecycleExecutionReader, ReceiptDeps } from './aws-receipts';
@@ -79,9 +80,11 @@ export async function replacementNeverLaunched(deps: ReceiptDeps, p: Placement, 
 }
 
 /** No EC2 writes. Unknown, absent or contradictory evidence keeps provisional authority reserved.
- * `neverLaunched`: the execution's complete history proves no launch, so zero writers is an answer. */
+ * `neverLaunched`: the execution's complete history proves no launch, so zero writers is an answer.
+ * `historical`: an authenticated release-execution termination proof (aws-historical-source) for a
+ * source EC2 no longer lists; used only for exactly that absent source of a proven no-launch replace. */
 export async function settleReplacementGeneration(deps: ReceiptDeps, p: Placement, work: LifecycleWork,
-    startDefinitelyRefused = false, neverLaunched = false): Promise<'settled' | 'unconfirmed' | 'generation_drift'> {
+    startDefinitelyRefused = false, neverLaunched = false, historical?: HistoricalSourceProof): Promise<'settled' | 'unconfirmed' | 'generation_drift'> {
     if (!matchesPlacement(work, p) || !deps.describer?.describeVolume || !deps.describer.describeReplacementWriters) return 'unconfirmed';
     const i = work.intent;
     const common = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': i.deployment.namespace, 'ezil:computer-id': i.computerId };
@@ -104,12 +107,14 @@ export async function settleReplacementGeneration(deps: ReceiptDeps, p: Placemen
         const targets = await deps.describer.describeReplacementWriters(p.region!, token);
         // Positive source fence. An unanswered launch needs positive target termination too;
         // a tag search returning zero is not proof that an uncertain launch did nothing.
-        if (!source || source.instanceId !== i.previousInstanceId || source.availabilityZoneId !== i.deployment.zoneId || !sourceAliasesAgree(source.tags)
-            || !(tagsMatch(source.tags, i.previousGeneration!, i.previousFenceToken!) || (source.state === 'terminated' && releasedPoolSource(source.tags)))
-            || (source.state !== 'terminated' && !(startDefinitelyRefused && source.state === 'stopped'))
-            || targets.length > 1 || (!startDefinitelyRefused && !neverLaunched && targets.length !== 1)
+        // Absence alone is never termination: an unlisted source needs the historical proof for exactly it.
+        const gone = source === null && neverLaunched && !startDefinitelyRefused && historical?.instanceId === i.previousInstanceId;
+        const listed = !!source && source.instanceId === i.previousInstanceId && source.availabilityZoneId === i.deployment.zoneId && sourceAliasesAgree(source.tags)
+            && (tagsMatch(source.tags, i.previousGeneration!, i.previousFenceToken!) || (source.state === 'terminated' && releasedPoolSource(source.tags)))
+            && (source.state === 'terminated' || (startDefinitelyRefused && source.state === 'stopped'));
+        if (!(gone || listed) || targets.length > 1 || (!startDefinitelyRefused && !neverLaunched && targets.length !== 1)
             || (neverLaunched && targets.length !== 0)) return 'unconfirmed';
-        if (source.state === 'stopped' && (!source.instanceType || !KNOWN_INSTANCE_TYPES.includes(source.instanceType))) return 'unconfirmed';
+        if (source?.state === 'stopped' && (!source.instanceType || !KNOWN_INSTANCE_TYPES.includes(source.instanceType))) return 'unconfirmed';
         const target = targets[0];
         if (target && (startDefinitelyRefused || target.state !== 'terminated' || target.accountId !== i.deployment.accountId
             || target.clientToken !== token || !/^i-[0-9a-f]{17}$/.test(target.instanceId)
@@ -121,7 +126,7 @@ export async function settleReplacementGeneration(deps: ReceiptDeps, p: Placemen
         const targetPair = tagsMatch(volume.tags, i.targetGeneration, i.fenceToken);
         if (!sourcePair && !targetPair) return 'generation_drift';
         if (targetPair && !target) return 'unconfirmed';
-        const attachedToStoppedSource = startDefinitelyRefused && source.state === 'stopped' && sourcePair
+        const attachedToStoppedSource = !!source && startDefinitelyRefused && source.state === 'stopped' && sourcePair
             && volume.state === 'in-use' && volume.attachments.length === 1
             && volume.attachments[0]!.instanceId === source.instanceId && volume.attachments[0]!.state === 'attached'
             && source.volumes.some((v) => v.volumeId === volume.volumeId && v.deleteOnTermination === false);
@@ -136,9 +141,9 @@ export async function settleReplacementGeneration(deps: ReceiptDeps, p: Placemen
         const result = await reconcileReplacementGeneration(deps.db, p, {
             generation: sourcePair ? i.previousGeneration! : i.targetGeneration,
             fenceToken: sourcePair ? i.previousFenceToken! : i.fenceToken,
-            instanceId: sourcePair ? source.instanceId : target!.instanceId,
-            instanceLost: sourcePair ? source.state === 'terminated' : true,
-            ...(sourcePair && source.state === 'stopped' ? { instanceType: source.instanceType } : {}),
+            instanceId: sourcePair ? i.previousInstanceId! : target!.instanceId,
+            instanceLost: sourcePair ? gone || source?.state === 'terminated' : true,
+            ...(sourcePair && source?.state === 'stopped' ? { instanceType: source.instanceType } : {}),
         });
         return result.ok ? 'settled' : 'unconfirmed';
     } catch { return 'unconfirmed'; }

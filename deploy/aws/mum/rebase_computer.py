@@ -24,6 +24,10 @@ UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}
 PHASES = set('reserved fencing snapshot_pending snapshot_ready launch_pending verifying failed unconfirmed recovery_pending restore_pending rebind_pending succeeded recovered cancelled'.split())
 FAILURES = set('source_digest_unknown unsupported_predecessor release_mismatch image_job_conflict authority_revoked source_identity_mismatch writer_not_fenced volume_not_available generation_drift preparation_timeout preparation_failed snapshot_create_unconfirmed snapshot_pending snapshot_missing snapshot_error snapshot_ambiguous snapshot_identity_mismatch snapshot_not_fresh launch_failed launch_unconfirmed permit_invalid permit_expired enrollment_time_insufficient previous_lower_missing rebase_failed rebase_timeout marker_commit_unconfirmed host_digest_mismatch enrollment_failed desktop_unhealthy restore_failed restore_lineage_mismatch rebind_failed operator_required'.split())
 OPERATIONS = ('plan', 'prepare', 'launch', 'verify', 'recover')
+RECONCILE = 'reconcile-replacement'
+RECONCILE_OUTCOMES = {'settled', 'unconfirmed', 'generation_drift', 'not_applicable', 'launch_not_disproven', 'source_not_proven'}
+# The hint must name one execution of the staging lifecycle machine; the server re-reads and proves everything.
+SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
 
 def request(operation, computer, job):
@@ -70,6 +74,48 @@ def send(sent, secret):
         return received.status, value
     finally:
         connection.close()
+
+
+def reconcile_request(computer, job, source):
+    need(wire.matches(UUID, computer) and wire.matches(UUID, job), 'reconcile requires the exact computer and failed job UUIDs')
+    need(wire.matches(SOURCE_EXECUTION, source), 'source hint must be exactly one staging lifecycle execution ARN')
+    need(not source.endswith(':computer-' + job), 'source hint cannot be the failed job itself')
+    return dict(schemaVersion=1, operation=RECONCILE, computerId=computer, expectedJobId=job, sourceRetirementExecutionArn=source)
+
+
+def reconcile_response(value, sent):
+    need(isinstance(value, dict) and set(value) == {'schemaVersion', 'computerId', 'jobId', 'outcome'}, 'reconcile response fields mismatch')
+    need(type(value['schemaVersion']) is int and value['schemaVersion'] == 1, 'reconcile response version mismatch')
+    need(value['computerId'] == sent['computerId'] and value['jobId'] == sent['expectedJobId'], 'reconcile response names another computer or job')
+    need(value['outcome'] in RECONCILE_OUTCOMES, 'reconcile outcome mismatch')
+    return {k: value[k] for k in ('schemaVersion', 'computerId', 'jobId', 'outcome')}
+
+
+def send_reconcile(sent, secret):
+    body = json.dumps(sent, separators=(',', ':')).encode('utf-8')
+    auth = headers(body, secret, int(time.time()))
+    connection = http.client.HTTPSConnection('os-staging.ezil.work', timeout=30)
+    try:
+        connection.request('POST', PATH, body=body, headers=auth)
+        received = connection.getresponse()
+        need(received.status == 200, 'authority denied, image job conflict or dependency unavailable; nothing to retry blindly')
+        need(received.getheader('content-type', '').split(';')[0].strip().lower() == 'application/json', 'response must be JSON')
+        raw = received.read(4097)
+        need(len(raw) <= 4096, 'response too large')
+        return reconcile_response(wire.loads(raw.decode('utf-8')), sent)
+    finally:
+        connection.close()
+
+
+def reconcile(computer, job, source, apply, secret, sender=send_reconcile):
+    """Ordinary proof-driven reconciliation writes (normal CAS) on the server; dry run unless --apply."""
+    sent = reconcile_request(computer, job, source)
+    if not apply:
+        print('DRY RUN: ' + json.dumps(sent, separators=(',', ':')) + '; add --apply to submit')
+        return None
+    observed = sender(sent, secret)
+    print(json.dumps(observed, separators=(',', ':')))
+    return observed
 
 
 def operate(operation, computer, job, journal, apply, secret, sender=send):
@@ -123,14 +169,20 @@ def operate(operation, computer, job, journal, apply, secret, sender=send):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=OPERATIONS)
+    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE))
     parser.add_argument('--computer')
     parser.add_argument('--job')
+    parser.add_argument('--source-execution-arn')
     parser.add_argument('--journal', type=Path)
     parser.add_argument('--origin', default=ORIGIN)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     need(args.origin == ORIGIN, 'only os-staging is allowed; btgq/curomaa refused')
+    if args.operation == RECONCILE:
+        reconcile_request(args.computer, args.job, args.source_execution_arn)
+        reconcile(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
+        return
+    need(args.source_execution_arn is None, 'source hint is only for reconcile-replacement')
     request(args.operation, args.computer, args.job)
     journal = args.journal or Path('/root/ezil-aws-mum/rebase-computers') / ((args.computer or args.job) + '.json')
     # Use only the existing environment name; never a credential file, CLI argument or log.

@@ -641,6 +641,46 @@ class ComputerTests(unittest.TestCase):
         COMPUTER.operate('recover', None, self.job, self.journal, True, self.secret, sender)
         self.assertTrue(all(v['computerId'] is None and v['jobId'] == self.job for v in calls))
 
+    def source(self, job='33333333-3333-4333-8333-333333333333'):
+        return COMPUTER.json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-' + job
+
+    def test_reconcile_replacement_request_is_exact_and_dry_run_without_apply(self):
+        sent = COMPUTER.reconcile_request(self.computer, self.job, self.source())
+        self.assertEqual(list(sent), ['schemaVersion', 'operation', 'computerId', 'expectedJobId', 'sourceRetirementExecutionArn'])
+        calls = []
+        self.assertIsNone(COMPUTER.reconcile(self.computer, self.job, self.source(), False, self.secret, lambda v, s: calls.append(v)))
+        self.assertEqual(calls, [])
+        reply = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='settled')
+        self.assertEqual(COMPUTER.reconcile(self.computer, self.job, self.source(), True, self.secret,
+                                            lambda v, s: calls.append(v) or COMPUTER.reconcile_response(reply, v)), reply)
+        self.assertEqual(calls, [sent])
+
+    def test_reconcile_replacement_refuses_foreign_or_self_hints_and_bad_responses(self):
+        for source in (self.source().replace('ezil-mum-lifecycle', 'ezil-other-lifecycle'), self.source().replace('452630323510', '123456789012'),
+                       self.source() + 'x', self.source(self.job), self.source().replace(':execution:', ':stateMachine:'), None):
+            with self.assertRaises(ValueError):
+                COMPUTER.reconcile_request(self.computer, self.job, source)
+        for computer, job in ((None, self.job), (self.computer, None), ('not-a-uuid', self.job)):
+            with self.assertRaises(ValueError):
+                COMPUTER.reconcile_request(computer, job, self.source())
+        sent = COMPUTER.reconcile_request(self.computer, self.job, self.source())
+        good = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='source_not_proven')
+        self.assertEqual(COMPUTER.reconcile_response(good, sent), good)
+        for key, value in [('outcome', 'recovered'), ('jobId', self.computer), ('computerId', self.job), ('schemaVersion', True), ('extra', 1)]:
+            with self.assertRaises(ValueError):
+                COMPUTER.reconcile_response(dict(good, **{key: value}), sent)
+
+    def test_reconcile_replacement_cli_is_staging_only_and_hint_only_for_reconcile(self):
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'reconcile-replacement', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', self.source(), '--origin', 'https://os.ezil.work']), self.assertRaises(ValueError):
+            COMPUTER.main()
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'plan', '--computer', self.computer, '--source-execution-arn', self.source()]), self.assertRaises(ValueError):
+            COMPUTER.main()
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'reconcile-replacement', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', self.source()]), patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection:
+            COMPUTER.main()
+        connection.assert_not_called()  # no --apply: dry run, no network
+
     def test_staging_origin_refuses_btgq_and_curomaa_without_http(self):
         for origin in ('https://btgq.supabase.co', 'https://curomaa.example.com', 'https://os.ezil.work', COMPUTER.ORIGIN + '/extra'):
             with patch.object(sys, 'argv', ['rebase_computer.py', 'plan', '--computer', self.computer, '--origin', origin]), self.assertRaises(ValueError):
