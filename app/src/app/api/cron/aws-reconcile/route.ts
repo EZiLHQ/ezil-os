@@ -15,6 +15,8 @@ import type { PlacementDb } from '@/server/lib/compute/placement';
  * (team/ROOT-IDLE-DOWNSCALE-REVIEW-118.md). This route adds no new behaviour: the same
  * function, its own per-pass bounds (FLEET_RECONCILE_LIMIT / RETIRE_RECONCILE_LIMIT, with
  * SKIP LOCKED claims) and its own AWS kill switch. aws-stop-settle is unchanged.
+ * Root ROOT-IDLE-POLICY-118 option (b) holds for every fleet caller: `reconcileAwsFleet` never stops a running guest
+ * solely for a lapsed technical lease (caps and guest-stop settlement still run; ROOT-FLEET-LEASE-INCIDENT-118).
  */
 export const maxDuration = 50;
 

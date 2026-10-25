@@ -70,7 +70,7 @@ describe('GET /api/cron/aws-reconcile', () => {
         expect(await res.json()).toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 1 } });
         expect(defaultAwsCollaborators).toHaveBeenCalledExactlyOnceWith(process.env);
         expect(createPoolDeps).toHaveBeenCalledExactlyOnceWith(db, process.env);
-        // Two arguments only: no limit override, so the function's own per-pass bounds apply.
+        // Two arguments only: no limit or policy override. The fleet pass itself is caps-only (never a lapsed lease alone).
         expect(vi.mocked(runAwsBackgroundReconcile).mock.calls).toEqual([[process.env, { db, ...collaborators, pool, signal: expect.any(AbortSignal) }]]);
         const signal = vi.mocked(runAwsBackgroundReconcile).mock.calls[0]![1].signal!;
         expect(signal.aborted).toBe(false);

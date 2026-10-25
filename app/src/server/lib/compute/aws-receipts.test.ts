@@ -1187,11 +1187,11 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         return { ...fake, deps, starts };
     }
 
-    it('the cron pass stops a RUNNING computer whose lease lapsed while EC2 still says running', async () => {
+    it('incident 2026-10-25: the background pass never stops a RUNNING computer solely because its lease lapsed while EC2 still says running', async () => {
         const f = fleet([live(1, { lease_until: new Date(NOW.getTime() - 1) }), live(2)]);
-        expect(await runAwsBackgroundReconcile(env(), f.deps)).toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 1 } });
-        expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
-        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired' });
+        expect(await runAwsBackgroundReconcile(env(), f.deps)).toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 0 } });
+        expect(f.starts).toEqual([]);
+        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'RUNNING' });
         expect(f.placements.find((r) => r.computer_id === Cn(2))).toMatchObject({ state: 'RUNNING' });
     });
 
@@ -1221,6 +1221,62 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(hidden)]]);
         // Every row has now been looked at once.
         expect(f.placements.every((r) => r.reconciled_at !== null)).toBe(true);
+    });
+
+    // ROOT-IDLE-POLICY-118 (b) + ROOT-FLEET-LEASE-INCIDENT-118: every fleet pass (minute, daily reap, a capacity refusal's direct
+    // reconcileAwsFleet) never stops a still-running guest solely for a lapsed technical lease; caps and guest stops still run.
+    const lapsed = (i: number) => live(i, { lease_until: new Date(NOW.getTime() - 1) });
+    const hours = (userId: string, i: number, h: number, instanceType = 't3a.medium') => ({ computer_id: Cn(i), user_id: userId, instance_id: In(i), instance_type: instanceType,
+        started_at: new Date(NOW.getTime() - h * HOUR), stopped_at: null, egress_bytes: null, observed_by: 'x', updated_at: NOW });
+
+    it('fleet pass: a running guest with a lapsed lease and no reached cap stays RUNNING (no stop, no lifecycle start)', async () => {
+        const f = fleet([lapsed(1), live(2)]);
+        expect(await runAwsBackgroundReconcile(env(), f.deps))
+            .toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 0 } });
+        expect(f.starts).toEqual([]);
+        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'RUNNING' });
+        // A RUNNING row with no lease at all is likewise left to the default callers.
+        const g = fleet([live(3, { lease_until: null })]);
+        await runAwsBackgroundReconcile(env(), g.deps);
+        expect(g.starts).toEqual([]);
+    });
+
+    it('fleet pass: the same lapsed row still stops at the user hour cap and at the global hour cap', async () => {
+        const user = fleet([lapsed(1)]);
+        user.usage.push(hours(U1, 1, 100)); // the user's 100 h cap
+        await runAwsBackgroundReconcile(env(), user.deps);
+        expect(user.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(user.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'user_hours_cap' });
+        const global = fleet([lapsed(1)]);
+        global.usage.push(hours(U2, 9, 150, 'm6i.2xlarge')); // another user's 150 h × weight 4 reaches the 600 h global cap; U1 has none
+        await runAwsBackgroundReconcile(env(), global.deps);
+        expect(global.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(global.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'global_hours_cap' });
+    });
+
+    it('fleet pass: a guest-stopped instance is still settled through the ordinary stop', async () => {
+        const f = fleet([lapsed(1), live(2)], new Set([In(1)]));
+        expect(await runAwsBackgroundReconcile(env(), f.deps))
+            .toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 1, limitStops: 0 } });
+        expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(f.placements.find((r) => r.computer_id === Cn(2))).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it('the direct fleet call (a capacity refusal) is caps-only too, whatever policy the caller passes; the owner-scoped default still binds', async () => {
+        for (const enforceLeaseExpiry of [undefined, true]) {
+            const f = fleet([lapsed(1)]);
+            await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null, enforceLeaseExpiry });
+            expect(f.starts).toEqual([]);
+            expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'RUNNING' });
+        }
+        // enforceSessionLimits itself (owner status/ensure/heartbeat) keeps the default lease rule.
+        const own = fleet([lapsed(1)]);
+        const p1 = (await readPlacement(own.db, Cn(1))).record!;
+        expect(await enforceSessionLimits(own.deps, p1, D, { now: NOW, caps: null })).toBe('lease_expired');
+        expect(own.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired' });
+        const p = (await readPlacement(fleet([live(4, { lease_until: null })]).db, Cn(4))).record!;
+        expect(sessionLimitFor(p, { now: NOW, caps: null }, null)).toBe('lease_expired');
+        expect(sessionLimitFor(p, { now: NOW, caps: null, enforceLeaseExpiry: false }, null)).toBeNull();
     });
 });
 

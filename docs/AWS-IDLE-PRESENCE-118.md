@@ -20,46 +20,30 @@ Background: `team/ROOT-IDLE-DOWNSCALE-REVIEW-118.md`.
 
 ## Exact outcomes once the full reconcile runs every minute
 
+Root chose option (b) (`team/ROOT-IDLE-POLICY-118.md`), and after the 2026-10-25 incident
+(`team/ROOT-FLEET-LEASE-INCIDENT-118.md`) it holds for EVERY fleet pass: `reconcileAwsFleet` (the minute route, the
+daily 04:08 UTC reap and a capacity refusal's direct reconcile) never stops a still-running guest solely because its
+technical lease lapsed. Weighted user/global hour caps still stop it, and guest-initiated stops, recorded receipts and
+deleted computers are still settled. Only the owner's own status/ensure/activity heartbeat keep the lease rule.
+
 Let *P* be the last time a heartbeat carried fresh presence (sampled every 60 s, so up to 60 s after the
 last real visible+focused moment).
 
 - **Present (visible + focused):** the lease keeps renewing, and nothing in this change affects it.
-- **Hidden tab, sockets still open:** no heartbeats, so no renewal. Because of the half-lease write rule,
-  the lease expires somewhere in **(P + 30 min, P + 60 min]**. The next minute pass then starts the lease
-  stop. If more than 20 reconcilable rows exist, rotation can take more passes.
-  - The guest never becomes idle-due while any authenticated WebSocket stays open (the 30 s edge tick).
-    So in this case the control-plane lease is the only stop.
-- **Visible but unfocused:** heartbeats continue for 30 min after *P*, and each one enforces limits, but
-  none renews the lease past *P* + 60 min. The lease stop lands at the same (P + 30, P + 60] minute.
-- **Disconnected (no socket, no tab):** the edge goes silent. With no hold, the guest begins its idle stop
+- **Disconnected (no socket, no tab), no hold:** the edge goes silent and the guest begins its idle stop
   600–630 s after its last presence. The next minute pass sees the stopping/stopped instance
   (`reconcileGuestStop`) and starts the ordinary session end (release in pool mode), so accounting
   converges within about a minute instead of waiting for 04:08 UTC or an interactive call.
-  - With a terminal, load or flush hold, the guest keeps running, and the lease stop above applies at
-    (P + 30, P + 60] minutes.
+  **This is the acceptance case for the minute trigger.**
+- **Disconnected with a terminal, load or flush hold:** the guest keeps running (up to its own 8 h terminal
+  hold). The minute pass does NOT stop it for a lapsed lease; only a reached hour cap does. When the hold ends
+  and the guest stops itself, the next pass settles it.
+- **Hidden tab, sockets still open (known gap):** the guest never becomes idle-due while any authenticated
+  WebSocket stays open (the 30 s edge tick), and the minute pass does not enforce the lapsed lease. So this
+  case does NOT promptly downscale. It still stops when the owner's own status/ensure/heartbeat sees the lapsed
+  lease, or at an hour cap. No shutdown time is promised.
+- **Visible but unfocused:** heartbeats continue for 30 min after *P* and each enforces the default lease rule,
+  so the existing heartbeat-time lease stop can still apply in that window. The minute pass adds nothing here.
 
-## ⚠ Decision for the primary before deploy
-
-The guest's terminal hold (tmux or foreground job, up to 8 h) only holds the **guest's own idle stop**.
-The control-plane **lease stop** does not consult it. Until now the lease stop for an unattended computer
-ran only lazily:
-- on the owner's own status/ensure/heartbeat;
-- in a capacity refusal;
-- in the daily 04:08 UTC reap.
-
-With the minute timer, a long-running terminal job whose owner is not present (hidden tab, unfocused
-window, or closed browser) is stopped about **30–60 minutes after P** instead of surviving until one of
-those lazy triggers.
-
-This is the existing lease policy applied promptly; the stop path itself is unchanged. It can still
-interrupt work that a user considers active, e.g. watching build output in a visible but unfocused
-window. Root's review warns against this.
-
-Options, all outside this branch's files:
-- (a) Accept: the lease is the commercial/technical contract.
-- (b) Have the minute pass observe guest stops and deleted computers but leave lease-expiry stops to the
-  existing lazy triggers. This needs a policy flag in `reconcileAwsFleet`'s caller or in
-  `enforceSessionLimits` (aws-receipts.ts).
-- (c) Count terminal holds as presence for lease renewal.
-
-No presence behaviour was changed here, because none is clearly safe without that decision.
+Quiet foreground reading and active work are not stopped by this pass. Aligning guest presence with terminal
+holds (a new hold signal) is deliberately not part of 1.0.18.

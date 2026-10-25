@@ -629,11 +629,17 @@ export interface SessionLimitPolicy {
     caps: Pick<AwsAdmissionCaps, 'userMonthlyHours' | 'globalMonthlyHours'> | null;
     /** This month's usage totals, when the caller already read them (a fleet pass reads once). */
     usage?: MonthUsage;
+    /** Internal (default true). The fleet pass (`reconcileAwsFleet`, every caller: capacity refusal, daily reap, minute
+     * reconcile) always passes false: it observes and settles guest stops but never stops a still-running guest solely
+     * because its technical lease lapsed, so one user's open can never end another user's session (incident 2026-10-25,
+     * ROOT-FLEET-LEASE-INCIDENT-118; terminal/load/flush holds keep the guest up). Weighted hour caps still bind.
+     * The owner's own status/ensure/heartbeat keep the default. */
+    enforceLeaseExpiry?: boolean;
 }
 
 export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage: MonthUsage | null): SessionLimit | null {
     if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return null;
-    if (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime()) return 'lease_expired';
+    if (policy.enforceLeaseExpiry !== false && (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime())) return 'lease_expired';
     if (policy.caps && usage) {
         const totals = usageFor(usage, p.ownerUserId);
         if (totals.user.weightedSeconds >= policy.caps.userMonthlyHours * 3_600) return 'user_hours_cap';
@@ -743,7 +749,8 @@ export async function reconcileAwsFleet(
                 stopsStarted += 1;
                 continue;
             }
-            if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage }))) limitStops += 1;
+            // Caps only: a lapsed technical lease alone never stops a running guest from the fleet pass (see enforceLeaseExpiry).
+            if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage, enforceLeaseExpiry: false }))) limitStops += 1;
         } catch (error) {
             if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
@@ -979,7 +986,7 @@ export async function runAwsBackgroundReconcile(
     const d = readLifecycleDeployments(env, regions.regions.map((r) => r.name));
     if (!d.ok) return { ok: true, skipped: 'aws_config_invalid' };
     const deleted = await reconcileDeletedAwsComputers(deps, d.deployments);
-    // Lapsed leases and reached hour caps are stopped here too, for computers nobody touches.
+    // Reached hour caps are stopped here too, for computers nobody touches (a lapsed lease alone is not: reconcileAwsFleet).
     const fleet = deps.signal?.aborted
         ? { checked: 0, stopsStarted: 0, limitStops: 0 }
         : await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });

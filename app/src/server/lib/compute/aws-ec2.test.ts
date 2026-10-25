@@ -817,6 +817,34 @@ describe('Codex #6: a guest-initiated idle stop is reconciled into the placement
         expect(calls.map((c) => [c.intent.operation, c.intent.computerId])).toEqual([['stop', C2]]);
         expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'STOPPING', owner_user_id: U2 });
     });
+
+    // Incident 2026-10-25 (ROOT-FLEET-LEASE-INCIDENT-118): a refused open's fleet pass stopped another user's RUNNING computer
+    // solely because its technical lease had lapsed. The fleet pass is caps-only now; guest stops and hour caps still settle.
+    const C2 = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
+    const both = [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }];
+    const foreign = (over: Record<string, unknown>) => stopped({ computer_id: C2, owner_user_id: U2, state: 'RUNNING', lease_epoch: 2, instance_id: 'i-22222222222222222', ...over });
+    it.each([
+        ['create', 'expired', [] as Record<string, unknown>[], { lease_until: new Date(NOW.getTime() - 1) }],
+        ['create', 'missing', [] as Record<string, unknown>[], { lease_until: null }],
+        ['wake', 'expired', [stopped()], { lease_until: new Date(NOW.getTime() - 1) }],
+        ['wake', 'missing', [stopped()], { lease_until: null }],
+    ] as const)('a %s refusal never stops another user\'s physically RUNNING computer for a %s lease alone', async (_kind, _lease, mine, lease) => {
+        const { describer } = describerSaying('running');
+        const { provider, placements, calls } = setup({ placements: [...mine, foreign(lease)], computers: both }, { describer, e: env({ AWS_MAX_RUNNING: '1' }) });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable' });
+        expect(calls).toEqual([]);
+        expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'RUNNING', owner_user_id: U2, lifecycle_job_id: null });
+    });
+    it('…but the same refusal still stops another user\'s computer at its weighted hour cap (live lease)', async () => {
+        const { describer } = describerSaying('running');
+        const usage = [{ computer_id: C2, user_id: U2, instance_id: 'i-22222222222222222', instance_type: 't3a.medium',
+            started_at: new Date(NOW.getTime() - 101 * 3_600_000), stopped_at: NOW, egress_bytes: null, observed_by: 'x', updated_at: NOW }];
+        const { provider, placements, calls } = setup({ placements: [foreign({ lease_until: new Date(NOW.getTime() + 3_600_000) })], computers: both, usage },
+            { describer, e: env({ AWS_MAX_RUNNING: '1' }) });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable' });
+        expect(calls.map((c) => [c.intent.operation, c.intent.computerId])).toEqual([['stop', C2]]);
+        expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'STOPPING', last_error: 'user_hours_cap' });
+    });
 });
 
 describe('Codex 4275911832: the lease deadline and hour caps bind during a session', () => {
