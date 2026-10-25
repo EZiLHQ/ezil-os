@@ -180,15 +180,6 @@ describe('failed release whose host it already terminated (incident 2026-10-25)'
         expect(s.usage[0]!.stopped_at).toBeNull();
     });
 
-    it('after a failed replay, even a new lifecycle version never re-enters the terminated branch (its replay has no witness)', async () => {
-        const s = failedReleaseSetup(); await s.tick(); s.finish('FAILED'); await s.tick();
-        const next = { ...D, stateMachineVersionArn: D.stateMachineVersionArn.replace(':19', ':20') };
-        await applyLifecycleReceipt(s.deps, await s.current(), next);
-        expect(s.starts).toHaveLength(1);
-        expect(await s.context()).toMatchObject({ error: 'volume_attachment' });
-        expect(s.deps.executions!.history).toHaveBeenCalledTimes(1); // only the original failed release's history was ever read
-    });
-
     it('a failed STOP (not a release) never enters the terminated branch', async () => {
         const s = failedReleaseSetup();
         const stop = buildLifecycleWork({ ...fixtureIntent('stop'), deployment: D, targetGeneration: 1, leaseEpoch: 1 });

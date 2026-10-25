@@ -96,7 +96,7 @@ async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDep
  * positively `terminated` (exact id, type, zone, provenance and identity, every present alias agreeing, nothing but a
  * deleting root left mapped) or aged out of EC2, AND the failed release's own history witnesses the termination. The
  * witnessed TerminateInstances time is the physical end, never this recovery's time. `shutting-down` waits. */
-async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, e: Execution, work: LifecycleWork):
+async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, e: Execution, work: LifecycleWork, saved?: Replay):
     Promise<{ wait: true } | { error: string } | { terminatedAt: Date }> {
     if (!deps.describer?.describeVolume) return { error: 'describer_missing' };
     const host = await deps.describer.describeForEnrollment(p.region!, p.instanceId!);
@@ -118,6 +118,9 @@ async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: Lif
         if (host.volumes.length > 1 || host.volumes.some(v => v.volumeId === p.volumeId || v.deviceName !== rootName || !v.deleteOnTermination)) return { error: 'instance_disks' };
     }
     if (!deps.executions?.history) return { error: 'history_reader_missing' };
+    // A failed replay has no termination witness of its own. Revalidate the original saved source instead.
+    if (saved) return await rewitness(deps, p, saved, d)
+        ? { terminatedAt: new Date(saved.stoppedAt!) } : { error: 'replay_identity' };
     const proof = proveFailedReleaseTermination(e, await deps.executions.history(p.region!, e.executionArn!), work);
     return proof ? { terminatedAt: proof.terminatedAt } : { error: 'termination_not_proven' };
 }
@@ -242,18 +245,20 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
     // new release on every open and reconciler pass. Only a new deployment retries it.
     if (saved?.intent && saved.intent.deployment.stateMachineVersionArn === d.stateMachineVersionArn) return fail('recovery_retry_awaits_new_deployment');
     if (!deps.starter) return fail('starter_missing');
-    let evidence;
-    try { evidence = await resourceEvidence(deps, p, source, false); }
+    const retryTermination = saved?.intent && saved.basis === 'failed_release_termination' ? saved : undefined;
+    let evidence: Awaited<ReturnType<typeof resourceEvidence>>;
+    try { evidence = retryTermination ? { error: 'volume_attachment' } : await resourceEvidence(deps, p, source, false); }
     catch { return fail('describe_unavailable'); }
-    // A failed RELEASE whose disk is no longer attached: only the terminated-host branch may continue (never a retry).
+    // A saved termination retry must re-prove the ORIGINAL source and current detached resources.
     let terminatedAt: Date | null = null;
-    if (evidence.error === 'volume_attachment' && work.intent.operation === 'release' && !saved?.intent) {
+    if (evidence.error === 'volume_attachment' && work.intent.operation === 'release' && (!saved?.intent || retryTermination)) {
         let released;
-        try { released = await terminatedReleaseEvidence(deps, p, source, e, work); }
+        try { released = await terminatedReleaseEvidence(deps, p, retryTermination ? d : source, e, work, retryTermination); }
         catch { return fail('describe_unavailable'); }
         if ('wait' in released) return true; // shutting-down: no start, no write.
         if ('error' in released) return fail(released.error);
-        if (!boundedTime(released.terminatedAt, e.startDate, e.stopDate && e.stopDate < now() ? e.stopDate : now())) return fail('termination_time_invalid');
+        if (!retryTermination && !boundedTime(released.terminatedAt, e.startDate, e.stopDate && e.stopDate < now() ? e.stopDate : now())) return fail('termination_time_invalid');
+        if (retryTermination && released.terminatedAt > e.startDate!) return fail('replay_identity');
         terminatedAt = released.terminatedAt;
     } else if (evidence.error) return fail(evidence.error);
     const sourceStartedAt = saved?.intent ? saved.sourceStartedAt : e.startDate!.toISOString();
@@ -267,7 +272,9 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
     const context: Replay = { intent: next.intent, sourceStartedAt,
         basis: terminatedAt ? 'failed_release_termination' : saved?.basis === 'ec2_state_transition' || proven ? 'ec2_state_transition' : 'recovery_success',
         stoppedAt: terminatedAt ? terminatedAt.toISOString() : saved?.basis === 'ec2_state_transition' ? saved.stoppedAt : proven ? evidence.stoppedAt!.toISOString() : null,
-        ...(terminatedAt ? { sourceStoppedAt: e.stopDate!.toISOString(), sourceExecutionArn: e.executionArn!, sourceDigest: work.digest,
+        ...(retryTermination ? { sourceStoppedAt: retryTermination.sourceStoppedAt, sourceExecutionArn: retryTermination.sourceExecutionArn,
+            sourceDigest: retryTermination.sourceDigest, sourceStateMachineVersionArn: retryTermination.sourceStateMachineVersionArn }
+            : terminatedAt ? { sourceStoppedAt: e.stopDate!.toISOString(), sourceExecutionArn: e.executionArn!, sourceDigest: work.digest,
             sourceStateMachineVersionArn: work.stateMachineArn } : {}),
         sourceJobId: saved?.sourceJobId ?? p.lifecycleJobId, error: null };
     const reserved = await writeLivePoolRecovery(deps.db, p, 'RECOVERING', {
