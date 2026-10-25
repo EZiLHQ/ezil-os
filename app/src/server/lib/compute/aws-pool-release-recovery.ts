@@ -100,7 +100,7 @@ async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: Lif
     // A host EC2 still lists outside termination is the stopped/attached branch's case: keep its diagnostic.
     if (host && host.state !== 'terminated' && host.state !== 'shutting-down') return { error: 'volume_attachment' };
     const volume = await deps.describer.describeVolume(p.region!, p.volumeId!);
-    if (!volume || volume.volumeId !== p.volumeId || !ownedTags(volume.tags, p, d) || (volume.tags?.['ezil:namespace'] ?? d.namespace) !== d.namespace
+    if (!volume || volume.volumeId !== p.volumeId || !ownedTags(volume.tags, p, d)
         || volume.encrypted !== true || volume.kmsKeyId !== d.dataKeyArn || volume.zoneId !== p.zoneId) return { error: 'volume_identity' };
     if (volume.state !== 'available' || !Array.isArray(volume.attachments) || volume.attachments.length !== 0) return { error: 'volume_attachment' };
     if (volume.volumeType !== 'gp3' || !Number.isInteger(volume.sizeGiB) || volume.sizeGiB! < d.storage.dataMinGiB
@@ -108,7 +108,7 @@ async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: Lif
     if (host) {
         const rootName = d.storage.rootDeviceName ?? '/dev/sda1';
         if (host.instanceType !== p.instanceType || host.availabilityZoneId !== p.zoneId
-            || !ownedTags(host.tags, p, d) || host.tags['ezil:pool'] !== undefined || (host.tags['ezil:namespace'] ?? d.namespace) !== d.namespace
+            || !ownedTags(host.tags, p, d) || host.tags['ezil:pool'] !== undefined
             || host.tags['aws:ec2launchtemplate:id'] !== d.launchTemplateId) return { error: 'instance_identity' };
         if (host.volumes.length > 1 || host.volumes.some(v => v.volumeId === p.volumeId || v.deviceName !== rootName || !v.deleteOnTermination)) return { error: 'instance_disks' };
     }

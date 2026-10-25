@@ -97,16 +97,21 @@ describe('failed release whose host it already terminated (incident 2026-10-25)'
     });
 
     it.each([
-        ['in 2099', (c: Record<string, string>) => { c.stoppedAt = '2099-01-01T00:00:00.000Z'; }],
-        ['before the failed release started', (c: Record<string, string>) => { c.stoppedAt = new Date(START.getTime() - 1).toISOString(); }],
-        ['after the failed release stopped', (c: Record<string, string>) => { c.stoppedAt = new Date(STOP.getTime() + 1).toISOString(); }],
-        ['unparseable', (c: Record<string, string>) => { c.stoppedAt = 'not-a-time'; }],
-        ['missing the source interval', (c: Record<string, string>) => { delete c.sourceStoppedAt; }],
-        ['source interval moved', (c: Record<string, string>) => { c.sourceStartedAt = new Date(START.getTime() - 3_600_000).toISOString(); c.stoppedAt = new Date(START.getTime() - 60_000).toISOString(); }],
-    ])('a corrupted saved termination time (%s) never settles or closes usage', async (_name, corrupt) => {
+        ['in 2099', (c: Record<string, string>) => { c.stoppedAt = '2099-01-01T00:00:00.000Z'; }, true],
+        ['before the failed release started', (c: Record<string, string>) => { c.stoppedAt = new Date(START.getTime() - 1).toISOString(); }, true],
+        ['after the failed release stopped', (c: Record<string, string>) => { c.stoppedAt = new Date(STOP.getTime() + 1).toISOString(); }, true],
+        ['unparseable', (c: Record<string, string>) => { c.stoppedAt = 'not-a-time'; }, true],
+        ['missing the source interval', (c: Record<string, string>) => { delete c.sourceStoppedAt; }, true],
+        // Self-consistent but moved: only the settlement re-witness against the original release catches it.
+        ['source interval moved', (c: Record<string, string>) => { c.sourceStartedAt = new Date(START.getTime() - 3_600_000).toISOString(); c.stoppedAt = new Date(START.getTime() - 60_000).toISOString(); }, false],
+    ])('a corrupted saved termination time (%s) never settles or closes usage', async (_name, corrupt, early) => {
         const s = failedReleaseSetup(); await s.tick();
         const row = s.placements[0]!, context = JSON.parse(String(row.last_error).slice('pool_release_recovery:'.length));
         corrupt(context); row.last_error = 'pool_release_recovery:' + JSON.stringify(context);
+        if (early) { // detected before replay/settlement, while the replay is still RUNNING
+            await s.tick();
+            expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED' }); expect(await s.context()).toMatchObject({ error: 'replay_identity' });
+        }
         s.finish(); await s.tick(); await s.tick();
         expect((await s.current()).state).not.toBe('STOPPED');
         expect(s.usage[0]!.stopped_at).toBeNull(); expect(s.meter.stopped).not.toHaveBeenCalled();
@@ -123,6 +128,13 @@ describe('failed release whose host it already terminated (incident 2026-10-25)'
         expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED' });
         expect(await s.context()).toMatchObject({ error: 'replay_identity', stoppedAt: TERMINATED.toISOString() });
         expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
+    it('a replay execution that started before the witnessed termination never settles', async () => {
+        const s = failedReleaseSetup(); await s.tick();
+        const e = s.finish(); e.startDate = new Date(TERMINATED.getTime() - 1);
+        await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED'); expect(s.usage[0]!.stopped_at).toBeNull();
     });
 
     it('settlement waits (RECOVERING) while the original failed release cannot be read, then settles', async () => {
@@ -204,8 +216,20 @@ describe('failed-release termination witness (the failed execution\'s own histor
         ['no terminate call at all', h => reid(h.filter(e => !JSON.stringify(e).includes('terminateInstances')))],
         ['unanswered terminate', h => reid(h.filter(e => !(e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'terminateInstances')))],
         ['foreign region', h => { at(h, 'TaskScheduled', 'terminateInstances').taskScheduledEventDetails!.region = 'us-east-1'; }],
-        ['a non-release provider call', h => { const s = at(h, 'TaskScheduled', 'stopInstances');
-            h.find(e => e.id === s.previousEventId)!.stateEnteredEventDetails!.name = 'startInstances'; s.taskScheduledEventDetails!.resource = 'startInstances'; }],
+        ['a non-release provider call (a fully consistent startInstances chain)', h => {
+            for (const e of h) {
+                const d = (e.taskScheduledEventDetails ?? e.taskStartedEventDetails ?? e.taskSucceededEventDetails) as { resource?: string } | undefined;
+                if (d?.resource === 'stopInstances') d.resource = 'startInstances';
+                for (const n of [e.stateEnteredEventDetails, e.stateExitedEventDetails]) if (n?.name === 'stopInstances') n.name = 'startInstances';
+            } }],
+        ['a detach start naming another resource', h => { at(h, 'TaskStarted', 'detachVolume').taskStartedEventDetails!.resource = 'stopInstances'; }],
+        ['an extra TaskSubmitted event in a chain', h => { const n = h.indexOf(at(h, 'TaskStarted', 'detachVolume'));
+            const submitted = { ...structuredClone(h[n]!), type: 'TaskSubmitted' } as HistoryEvent; delete submitted.taskStartedEventDetails;
+            submitted.taskSubmittedEventDetails = { resourceType: 'aws-sdk:ec2', resource: 'detachVolume', output: '{}' };
+            const out = [...h.slice(0, n + 1), submitted, ...h.slice(n + 1)].map((e, k) => ({ ...e, id: k + 1 }));
+            // Keep every original link: shift references to ids after the insertion; the new event hangs off the TaskStarted.
+            return out.map((e, k) => k === n + 1 ? { ...e, previousEventId: n + 1 } : { ...e, previousEventId: e.previousEventId! > n ? e.previousEventId! + 1 : e.previousEventId });
+        }],
         ['an unanswered earlier terminate request, even with a later witness', h => {
             const n = h.findIndex(e => e.type === 'TaskStateEntered' && e.stateEnteredEventDetails?.name === 'terminateInstances');
             const extra = h.slice(n, n + 3).map(e => structuredClone(e)); // entered, scheduled, started; never answered
@@ -344,5 +368,76 @@ describe('reconcile-release operator consumer', () => {
         expect((await reconcileFailedRelease(s.deps, { [D.region]: D }, request(s, { expectedJobId: stop.intent.jobId,
             releaseExecutionArn: lifecycleExecutionArn(D, stop.intent.jobId) }))).outcome).toBe('not_applicable');
         expect(s.starts).toHaveLength(0);
+    });
+});
+
+// Root reviewer's exact in-memory repros (team/ROOT-CONTINUE-118-1529.md), with the "required instead" assertions.
+describe('root reviewer exact repros (ROOT-CONTINUE-118-1529)', () => {
+    const edits: [string, (h: HistoryEvent[]) => void][] = [
+        ['foreign stop output', h => {
+            h.find(e => e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'stopInstances')!
+                .taskSucceededEventDetails!.output = JSON.stringify({ StoppingInstances: [{ InstanceId: 'i-99999999999999999', CurrentState: { Code: 64, Name: 'stopping' } }] });
+        }],
+        ['foreign detach output', h => {
+            h.find(e => e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'detachVolume')!
+                .taskSucceededEventDetails!.output = JSON.stringify({ InstanceId: 'i-99999999999999999', VolumeId: 'vol-99999999999999999' });
+        }],
+        ['orphan RunInstances result (a provider result chained to a Lambda start)', h => {
+            const e = h.find(x => x.type === 'LambdaFunctionSucceeded')!;
+            e.type = 'TaskSucceeded'; delete e.lambdaFunctionSucceededEventDetails;
+            e.taskSucceededEventDetails = { resourceType: 'aws-sdk:ec2', resource: 'runInstances', output: '{"Instances":[{"InstanceId":"i-99999999999999999"}]}' };
+        }],
+        ['disconnected final failure', h => { h.at(-2)!.previousEventId = 1; }],
+    ];
+    it.each(edits)('%s: proof null, zero starts, UNCONFIRMED, usage open, no meter stop', async (_name, mutate) => {
+        const s = failedReleaseSetup();
+        const h = failedReleaseHistory(s.original);
+        mutate(h);
+        s.histories.set(s.failed.executionArn!, h);
+        const proof = proveFailedReleaseTermination(s.failed, h, s.original);
+        await s.tick();
+        expect(proof).toBeNull();
+        expect(s.starts).toHaveLength(0);
+        expect((await s.current()).state).toBe('UNCONFIRMED');
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(s.meter.stopped).not.toHaveBeenCalled();
+    });
+
+    it('preserves the legitimate AWS zero predecessor (PassStateEntered 2 -> 0)', () => {
+        const s = failedReleaseSetup();
+        const h = failedReleaseHistory(s.original);
+        expect(h[1]!.type).toBe('PassStateEntered'); h[1]!.previousEventId = 0;
+        expect(proveFailedReleaseTermination(s.failed, h, s.original)?.terminatedAt).toEqual(TERMINATED);
+    });
+
+    it.each([
+        ['future', '2099-01-01T00:00:00.000Z'],
+        ['before source start', new Date(START.getTime() - 1).toISOString()],
+    ])('%s saved termination time: never STOPPED, usage open, no meter stop, one start', async (_name, badTime) => {
+        const s = failedReleaseSetup();
+        await s.tick();
+        expect(s.starts).toHaveLength(1);
+        const context = await s.context();
+        context.stoppedAt = badTime;
+        s.placements[0]!.last_error = 'pool_release_recovery:' + JSON.stringify(context);
+        s.finish();
+        await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED');
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(s.meter.stopped).not.toHaveBeenCalled();
+        expect(s.starts).toHaveLength(1);
+    });
+
+    it('refuses a conflicting current volume namespace at settlement', async () => {
+        const s = failedReleaseSetup();
+        await s.tick();
+        expect(s.starts).toHaveLength(1);
+        (s.volume.tags as Record<string, string>)['ezil:namespace'] = 'foreign';
+        s.finish();
+        await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED');
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(s.meter.stopped).not.toHaveBeenCalled();
+        expect(s.starts).toHaveLength(1);
     });
 });
