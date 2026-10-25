@@ -481,8 +481,8 @@ recovery versions in **source evidence only**. The target schema stays strict.
 Promotion and rollback append/retain complete immutable release records under
 `app-secret.lock`, preserve string/object encoding and other regions, and journal
 both full deployment entries before writing. All records are retained, including
-records referenced by placements or unfinished jobs. At twelve records the tool
-refuses a thirteenth; it never guesses whether a record can be collected. Registry
+records referenced by placements or unfinished jobs. At thirteen records the tool
+refuses a fourteenth; it never guesses whether a record can be collected. Registry
 identity is `(lowerImageDigest, amiId)`: duplicate pairs and changes to
 an existing pair refuse, including attempts to fill historical null fields.
 Different AMIs may share a lower. The app resolver still refuses ambiguous
@@ -690,6 +690,16 @@ entry. Rollback restores the previous complete tuple and retains all registry
 records; it changes no user-data volume or digest. Cloud resources/versions stay
 retained, so rollback selects the source's published versions rather than
 reverting IAM or deleting an AMI.
+
+The 1.0.19 rollout must use full app and host artifacts from the same frozen,
+reviewed integrated SHA. After adding the thirteenth record, normal rollout
+rollback must retain the invoking 13-compatible app while restoring the previous
+deployment tuple and retaining all 13 records. The old 1.0.18 app accepts only
+12 records and cannot read this registry; do not reinstall it during rollback.
+This does not change ledger behavior or legacy GC app-478 pins. The 24,000-byte
+map/readback and 65,536-byte secret ceilings are unchanged. Synthetic capacity
+tests are not actual 1.0.19 proof: root must verify actual map, readback and secret
+byte sizes before release.
 
 **Admission stays gated.** Cloud, app and promotion phases require the existing
 `EZIL_AWS_KILL_SWITCH=1` in the app secret and verify it in the running app. No tool

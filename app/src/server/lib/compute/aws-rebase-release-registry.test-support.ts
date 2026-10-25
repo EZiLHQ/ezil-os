@@ -75,3 +75,12 @@ export function fixtureReleaseRegistry12() {
     return { ...f, retained, release116, release117, release118,
         deployment116: deploymentFor(release116), deployment117: deploymentFor(release117), deployment118: deploymentFor(release118) };
 }
+
+/** Synthetic thirteenth record; not actual 1.0.19 release proof. */
+export function fixtureReleaseRegistry13() {
+    const f = fixtureReleaseRegistry12();
+    const release119 = { ...f.release118, amiId: 'ami-00000000000000013', recipeVersion: '1.0.19',
+        createdAt: '2026-10-23T19:00:00.000Z' };
+    return { ...f, release119, retained: [...f.retained, release119],
+        deployment119: { ...f.deployment118, amiId: release119.amiId } };
+}
