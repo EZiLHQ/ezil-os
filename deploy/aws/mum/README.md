@@ -481,8 +481,8 @@ recovery versions in **source evidence only**. The target schema stays strict.
 Promotion and rollback append/retain complete immutable release records under
 `app-secret.lock`, preserve string/object encoding and other regions, and journal
 both full deployment entries before writing. All records are retained, including
-records referenced by placements or unfinished jobs. At nine records the tool
-refuses a tenth; it never guesses whether a record can be collected. Registry
+records referenced by placements or unfinished jobs. At ten records the tool
+refuses an eleventh; it never guesses whether a record can be collected. Registry
 identity is `(lowerImageDigest, amiId)`: duplicate pairs and changes to
 an existing pair refuse, including attempts to fill historical null fields.
 Different AMIs may share a lower. The app resolver still refuses ambiguous

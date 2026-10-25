@@ -230,15 +230,15 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        self.snapshot['deployment']['releases'] = self.records + [self.target, dict(self.target,amiId='ami-'+'d'*17)]
+        self.snapshot['deployment']['releases'] = self.records + [self.target, dict(self.target,amiId='ami-'+'d'*17), dict(self.target,amiId='ami-'+'e'*17)]
         self.refuse('invalid registry')
 
-    def test_nine_record_gc_removes_exactly_one_preserving_eight(self):
-        self.records.append(copy.deepcopy(self.target))
+    def test_ten_record_gc_removes_exactly_one_preserving_nine(self):
+        self.records.extend([copy.deepcopy(self.target),dict(self.target,amiId='ami-'+'d'*17,recipeVersion='1.0.13')])
         self.evidence['registrySha256']=gc.sha(self.records)
         before=copy.deepcopy(self.snapshot)
         after=self.prepare()
-        self.assertEqual(len(after['releases']),8)
+        self.assertEqual(len(after['releases']),9)
         self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
         self.assertEqual(self.snapshot,before)
         self.drops.append(gc.identity(self.records[2]))
