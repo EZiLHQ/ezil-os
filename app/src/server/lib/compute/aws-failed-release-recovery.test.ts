@@ -222,6 +222,15 @@ describe('failed-release termination witness (the failed execution\'s own histor
                 if (d?.resource === 'stopInstances') d.resource = 'startInstances';
                 for (const n of [e.stateEnteredEventDetails, e.stateExitedEventDetails]) if (n?.name === 'stopInstances') n.name = 'startInstances';
             } }],
+        ['a failed non-release provider call (startInstances, answered by TaskFailed)', h => {
+            for (const e of h) {
+                const d = (e.taskScheduledEventDetails ?? e.taskStartedEventDetails ?? e.taskSucceededEventDetails) as { resource?: string } | undefined;
+                if (d?.resource === 'stopInstances') d.resource = 'startInstances';
+                for (const n of [e.stateEnteredEventDetails, e.stateExitedEventDetails]) if (n?.name === 'stopInstances') n.name = 'startInstances';
+            }
+            const done = at(h, 'TaskSucceeded', 'startInstances');
+            done.type = 'TaskFailed'; delete done.taskSucceededEventDetails;
+            done.taskFailedEventDetails = { resourceType: 'aws-sdk:ec2', resource: 'startInstances', error: 'EC2.Error', cause: 'x' }; }],
         ['a detach start naming another resource', h => { at(h, 'TaskStarted', 'detachVolume').taskStartedEventDetails!.resource = 'stopInstances'; }],
         ['an extra TaskSubmitted event in a chain', h => { const n = h.indexOf(at(h, 'TaskStarted', 'detachVolume'));
             const submitted = { ...structuredClone(h[n]!), type: 'TaskSubmitted' } as HistoryEvent; delete submitted.taskStartedEventDetails;
@@ -434,6 +443,79 @@ describe('root reviewer exact repros (ROOT-CONTINUE-118-1529)', () => {
         expect(s.starts).toHaveLength(1);
         (s.volume.tags as Record<string, string>)['ezil:namespace'] = 'foreign';
         s.finish();
+        await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED');
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(s.meter.stopped).not.toHaveBeenCalled();
+        expect(s.starts).toHaveLength(1);
+    });
+});
+
+// Root final review P2 (team/ROOT-RECOVERY-AUTHORITY-118.md): the settlement re-witness must bind the returned source to the
+// requested/saved execution ARN, digest and state-machine version, not just to a self-consistent response.
+describe('source authority binding at settlement (ROOT-RECOVERY-AUTHORITY-118)', () => {
+    type Deployment = typeof D;
+    const substitute = (s: Setup, deployment: Deployment) => {
+        const work = buildLifecycleWork({ ...s.original.intent, deployment }), requested = s.failed.executionArn!;
+        s.executions.set(requested, { ...s.failed, input: work.input, executionArn: lifecycleExecutionArn(deployment, work.intent.jobId),
+            stateMachineVersionArn: work.stateMachineArn });
+        s.histories.set(requested, failedReleaseHistory(work));
+        return { work, requested };
+    };
+    const mutations: [string, Deployment][] = [
+        ['foreign machine/namespace', { ...D, namespace: 'other', stateMachineVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-other-lifecycle:19' }],
+        ['foreign account', { ...D, accountId: '210987654321', dataKeyArn: D.dataKeyArn.replace('123456789012', '210987654321'),
+            stateMachineVersionArn: 'arn:aws:states:ap-south-1:210987654321:stateMachine:ezil-mum-lifecycle:19' }],
+        ['same ARN, changed deployment/digest', { ...D, amiId: 'ami-99999999999999999' }],
+    ];
+    it.each(mutations)('%s substituted after the reservation never settles; usage stays open', async (_name, deployment) => {
+        const s = failedReleaseSetup();
+        await s.tick();
+        expect(s.starts).toHaveLength(1);
+        const { work, requested } = substitute(s, deployment);
+        // The substituted source is internally self-consistent: the pure proof alone accepts it.
+        expect(proveFailedReleaseTermination(s.executions.get(requested)!, s.histories.get(requested)!, work)?.terminatedAt).toEqual(TERMINATED);
+        s.finish();
+        await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED');
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(s.meter.stopped).not.toHaveBeenCalled();
+        expect(s.starts).toHaveLength(1);
+    });
+    it('the reservation records the validated source ARN, digest and version', async () => {
+        const s = failedReleaseSetup(); await s.tick();
+        expect(await s.context()).toMatchObject({ sourceExecutionArn: s.failed.executionArn, sourceDigest: s.original.digest,
+            sourceStateMachineVersionArn: s.original.stateMachineArn, sourceJobId: s.original.intent.jobId });
+    });
+    it.each(['sourceExecutionArn', 'sourceDigest', 'sourceStateMachineVersionArn'])('a saved context missing %s is refused before settlement', async key => {
+        const s = failedReleaseSetup(); await s.tick();
+        const row = s.placements[0]!, context = JSON.parse(String(row.last_error).slice('pool_release_recovery:'.length));
+        delete context[key]; row.last_error = 'pool_release_recovery:' + JSON.stringify(context);
+        s.finish(); await s.tick();
+        expect((await s.current()).state).not.toBe('STOPPED'); expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+});
+
+// Root's exact snippet (team/ROOT-RECOVERY-AUTHORITY-REPROS-118.md), with its "replace after correction" assertions.
+describe('root exact authority repros (ROOT-RECOVERY-AUTHORITY-REPROS-118)', () => {
+    it.each(['foreign_machine', 'foreign_account', 'changed_source_digest'] as const)('re-witness refuses %s', async variant => {
+        const s = failedReleaseSetup();
+        await s.tick();
+        expect(s.starts).toHaveLength(1);
+        s.finish();
+        const requestedArn = s.failed.executionArn!;
+        let deployment = { ...s.original.intent.deployment };
+        if (variant === 'foreign_machine') deployment = { ...deployment, namespace: 'foreign',
+            stateMachineVersionArn: deployment.stateMachineVersionArn.replace('ezil-mum-', 'ezil-foreign-') };
+        if (variant === 'foreign_account') deployment = { ...deployment, accountId: '999999999999',
+            dataKeyArn: deployment.dataKeyArn.replace('123456789012', '999999999999'),
+            stateMachineVersionArn: deployment.stateMachineVersionArn.replace('123456789012', '999999999999') };
+        if (variant === 'changed_source_digest') deployment = { ...deployment, securityGroupId: 'sg-99999999999999999' };
+        const changed = buildLifecycleWork({ ...s.original.intent, deployment });
+        expect(changed.digest).not.toBe(s.original.digest);
+        s.executions.set(requestedArn, { ...s.failed, input: changed.input, executionArn: lifecycleExecutionArn(deployment, changed.intent.jobId),
+            stateMachineVersionArn: changed.stateMachineArn });
+        s.histories.set(requestedArn, failedReleaseHistory(changed));
         await s.tick();
         expect((await s.current()).state).not.toBe('STOPPED');
         expect(s.usage[0]!.stopped_at).toBeNull();

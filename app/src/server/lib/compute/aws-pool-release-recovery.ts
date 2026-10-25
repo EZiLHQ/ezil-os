@@ -13,12 +13,15 @@ import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLiveP
 const PREFIX = 'pool_release_recovery:';
 type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
 type Replay = { intent: LifecycleWork['intent']; stoppedAt: string | null; sourceJobId: string; error: string | null;
-    basis?: 'ec2_state_transition' | 'recovery_success' | 'failed_release_termination'; sourceStartedAt?: string; sourceStoppedAt?: string };
+    basis?: 'ec2_state_transition' | 'recovery_success' | 'failed_release_termination'; sourceStartedAt?: string; sourceStoppedAt?: string;
+    /** failed_release_termination: the validated failed release execution the witness came from (re-proven at settlement). */
+    sourceExecutionArn?: string; sourceDigest?: string; sourceStateMachineVersionArn?: string };
 /** Bases whose saved stop time was proven (and bounded) before the reservation CAS. */
 const provenBasis = (basis: Replay['basis']) => basis === 'ec2_state_transition' || basis === 'failed_release_termination';
 /** A saved failed-release termination time must still lie inside the failed execution's own interval, never in the future. */
 function savedTerminationValid(saved: Replay, now: Date): boolean {
     if (saved.basis !== 'failed_release_termination') return true;
+    if (![saved.sourceExecutionArn, saved.sourceDigest, saved.sourceStateMachineVersionArn, saved.sourceJobId].every(v => typeof v === 'string' && v.length > 0)) return false;
     const [start, at, stop] = [saved.sourceStartedAt, saved.stoppedAt, saved.sourceStoppedAt].map(v => typeof v === 'string' ? Date.parse(v) : NaN);
     return [start, at, stop].every(Number.isFinite) && start! <= at! && at! <= stop! && stop! <= now.getTime();
 }
@@ -49,12 +52,14 @@ function matches(p: Placement, work: LifecycleWork): boolean {
         && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId;
 }
 export { replay as poolReleaseReplay, matches as matchesPoolReleaseRecovery };
-/** The failed source release's identity for this placement (its job/digest are not the placement's after the reservation). */
-function sameIdentity(p: Placement, work: LifecycleWork): boolean {
+/** The failed source release's identity for this placement (its job/digest are not the placement's after the reservation),
+ * under the same deployment authority (account, namespace, region, zone, data key) as the recovery's own deployment. */
+function sameIdentity(p: Placement, work: LifecycleWork, d: LifecycleDeployment): boolean {
     const i = work.intent;
     return i.operation === 'release' && i.computerId === p.computerId && i.targetGeneration === p.generation && i.leaseEpoch === p.leaseEpoch
         && i.fenceToken === p.fenceToken && i.providerInstanceId === p.instanceId && i.dataVolumeId === p.volumeId && i.instanceType === p.instanceType
-        && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId;
+        && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId && i.deployment.accountId === d.accountId
+        && i.deployment.namespace === d.namespace && i.deployment.region === d.region && i.deployment.dataKeyArn === d.dataKeyArn;
 }
 function executionMatches(e: Execution, work: LifecycleWork): boolean {
     return !e.stateMachineAliasArn && e.redriveCount === 0
@@ -118,11 +123,16 @@ async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: Lif
 }
 
 async function rewitness(deps: ReceiptDeps, p: Placement, saved: Replay, d: LifecycleDeployment): Promise<boolean> {
-    if (!deps.executions?.history || !saved.sourceJobId) return false;
-    const arn = lifecycleExecutionArn(d, saved.sourceJobId);
+    if (!deps.executions?.history || !saved.sourceJobId || !saved.sourceExecutionArn) return false;
+    // The saved source is this deployment machine's execution of the saved job, and the answer must be exactly that execution.
+    const arn = saved.sourceExecutionArn;
+    if (arn !== lifecycleExecutionArn(d, saved.sourceJobId)) return false;
     const source = await deps.executions.describe(p.region!, arn);
+    if (source.executionArn !== arn || source.stateMachineVersionArn !== saved.sourceStateMachineVersionArn) return false;
     const work = executionWork(source);
-    if (!work || work.intent.jobId !== saved.sourceJobId || !sameIdentity(p, work)) return false;
+    // The reconstructed source work must be the reserved one: same digest (document), same version, same job and authority.
+    if (!work || work.digest !== saved.sourceDigest || work.stateMachineArn !== saved.sourceStateMachineVersionArn
+        || work.intent.jobId !== saved.sourceJobId || !sameIdentity(p, work, d)) return false;
     const proof = proveFailedReleaseTermination(source, await deps.executions.history(p.region!, arn), work);
     return !!proof && proof.terminatedAt.toISOString() === saved.stoppedAt
         && source.startDate?.toISOString() === saved.sourceStartedAt && source.stopDate?.toISOString() === saved.sourceStoppedAt;
@@ -257,7 +267,8 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
     const context: Replay = { intent: next.intent, sourceStartedAt,
         basis: terminatedAt ? 'failed_release_termination' : saved?.basis === 'ec2_state_transition' || proven ? 'ec2_state_transition' : 'recovery_success',
         stoppedAt: terminatedAt ? terminatedAt.toISOString() : saved?.basis === 'ec2_state_transition' ? saved.stoppedAt : proven ? evidence.stoppedAt!.toISOString() : null,
-        ...(terminatedAt ? { sourceStoppedAt: e.stopDate!.toISOString() } : {}),
+        ...(terminatedAt ? { sourceStoppedAt: e.stopDate!.toISOString(), sourceExecutionArn: e.executionArn!, sourceDigest: work.digest,
+            sourceStateMachineVersionArn: work.stateMachineArn } : {}),
         sourceJobId: saved?.sourceJobId ?? p.lifecycleJobId, error: null };
     const reserved = await writeLivePoolRecovery(deps.db, p, 'RECOVERING', {
         lifecycleJobId: next.intent.jobId, lifecycleDigest: next.digest, lastError: PREFIX + JSON.stringify(context),
