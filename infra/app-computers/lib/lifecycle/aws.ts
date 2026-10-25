@@ -35,7 +35,7 @@ export function awsDependencies(settings:Settings,test?:{requestHandler:EC2Clien
     // never authority decisions, and count fetch latency within the 60-second rotation bound.
     let authoritySecret:{key:string;expiresAt:number}|undefined;
     const authorize = async (authority: object): Promise<boolean> => {
-        const now=Date.now();
+        const now=performance.now();
         if(!authoritySecret||now>=authoritySecret.expiresAt){
             authoritySecret=undefined;
             const secret=await secrets.send(new GetSecretValueCommand({SecretId:settings.authoritySecretArn,VersionStage:'AWSCURRENT'}),request());
