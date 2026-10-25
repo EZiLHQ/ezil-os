@@ -17,8 +17,12 @@ import { poolFixture } from './aws-pool-test-support';
 import { createPoolDispatchStore, poolJobAuthority, storedPoolWork } from './aws-pool-dispatch';
 import { poolWork, runPoolReplenish, withPoolReplenishLock } from './aws-pool-replenish';
 import { applyLifecycleReceipt, lifecycleExecutionArn, type LifecycleExecutionReader } from './aws-receipts';
-import type { PlacementDb, PlacementExecutor } from './placement';
-import { lockPoolClaimPlacement, readPlacement, savePoolEnrollmentNonce } from './placement';
+import type { Placement, PlacementDb, PlacementExecutor } from './placement';
+import { lockImagePlacement, lockPoolClaimPlacement, pinCloudflarePlacement, readAdmissionCounters, readImageAdmissionCounters, readPlacement, savePoolEnrollmentNonce, withAdmission } from './placement';
+import { cancelComputerDemand, reservePoolDemand, type PoolDemandDeps } from './aws-pool-demand';
+import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest } from './capacity-demand';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { createPoolDeps } from './aws-pool-runtime';
 import * as poolData from './ready-pool';
 import { leasePoolHost, markPoolHost, publishPoolClaim, readPendingPoolAdopt, readPoolClaim, readPoolDemand, recordPoolEnrollment, recordPoolReady,
     type PoolClass, type PoolHostState } from './ready-pool';
@@ -48,8 +52,12 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         for (const file of ['0001_compute_placement.sql.txt', '0002_image_rebase.sql.txt', '0002_ready_pool.sql.txt', '0003_pool_hosts_v2.sql.txt'])
             await client!.unsafe(local(readFileSync(path.join(directory, file), 'utf8')));
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0008_pool_dispatch.sql'), 'utf8')));
+        // Leasing and demand reads consult active capacity demands (0009).
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0009_capacity_demands.sql'), 'utf8')));
         // Minimal fixtures for existing billing tables; production migrations require auth.users.
-        await client!.unsafe(`CREATE TABLE ${schema}.ezil_compute_migrations (computer_id uuid, state text);
+        // The real provider-migration table: capacity-demand reauthorization reads it through the production store.
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0006_compute_migrations.sql'), 'utf8')));
+        await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz, created_at timestamptz NOT NULL DEFAULT now());
             CREATE TABLE ${schema}.test_users (id uuid PRIMARY KEY, deleted_at timestamptz, banned_until timestamptz);
             CREATE TABLE ${schema}.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);
             CREATE TABLE ${schema}.ezil_billing_grants (user_id uuid, subscription_id text, meter text, amount bigint, period_start timestamptz, period_end timestamptz);
@@ -63,7 +71,8 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
     beforeEach(async () => {
         await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_pool_hosts, ${schema}.ezil_computer_placements,
             ${schema}.ezil_billing_subscriptions, ${schema}.ezil_billing_compute_epochs, ${schema}.test_users,
-            ${schema}.ezil_billing_grants, ${schema}.ezil_billing_size_preferences, ${schema}.ezil_billing_payment_issues`);
+            ${schema}.ezil_billing_grants, ${schema}.ezil_billing_size_preferences, ${schema}.ezil_billing_payment_issues,
+            ${schema}.ezil_compute_capacity_demands, ${schema}.ezil_computers`);
     });
     afterAll(async () => { try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); } finally { await client?.end(); } });
     async function boot(n = 1) {
@@ -735,5 +744,345 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET ready_at = ${ago(1440).toISOString()}::timestamptz,
             created_at = ${ago(1500).toISOString()}::timestamptz WHERE id = ${uuid(3)}::uuid`);
         expect((await readPoolDemand(db, c, NOW)).bootMinutes).toBeCloseTo(7.6);
+    });
+
+    describe('CAPACITY durable demand on production PostgreSQL (1.0.16 run B shape: 10 vCPU cap)', () => {
+        const deployment = fixtureDeployment('ap-south-1', ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge']);
+        const xl: PoolClass = { ...c, instanceType: 'm6i.xlarge' };
+        const ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '5', AWS_REGIONS: 'ap-south-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '5',
+            EZIL_AWS_USER_MONTHLY_HOURS: '75', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '250', EZIL_AWS_USER_MONTHLY_EGRESS_GB: '100',
+            EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '1000', EZIL_AWS_KILL_SWITCH: '0' };
+        beforeEach(() => { for (const [k, v] of Object.entries(ENV)) vi.stubEnv(k, v); });
+        afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+        const computer = async (n: number, owner = n) => db.execute(sql`INSERT INTO public.ezil_computers (id, user_id) VALUES (${uuid(n)}::uuid, ${uuid(owner)}::uuid)`);
+        const live = async (n: number, state: string, instanceId: string | null, instanceType = 'm6i.large') => {
+            await computer(n);
+            await db.execute(sql`INSERT INTO public.ezil_computer_placements
+                (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type, instance_id, updated_at)
+                VALUES (${uuid(n)}::uuid, ${uuid(n)}::uuid, 'aws-ec2', 'ebs', 2, 3, ${state}, ${c.region}, ${c.zoneId}, ${instanceType}, ${instanceId}, ${NOW.toISOString()}::timestamptz)`);
+        };
+        const host = async (n: number, cls: PoolClass, state: 'booting' | 'ready') => {
+            await db.execute(sql`INSERT INTO public.ezil_compute_pool_hosts (id, region, zone_id, instance_type, created_at, updated_at)
+                VALUES (${uuid(n)}::uuid, ${cls.region}, ${cls.zoneId}, ${cls.instanceType}, ${ago(4).toISOString()}::timestamptz, ${NOW.toISOString()}::timestamptz)`);
+            if (state === 'ready') { await recordPoolEnrollment(db, uuid(n), `i-${String(n).padStart(17, '0')}`, ago(1)); await recordPoolReady(db, uuid(n), { editorOk: true }, NOW); }
+        };
+        // Other user 2 + builder 2 + phantom UNCONFIRMED 2 (no instance) = 6 vCPU of placements.
+        const paid = async (n: number) => {
+            await db.execute(sql`INSERT INTO auth.users (id) VALUES (${uuid(n)}::uuid) ON CONFLICT DO NOTHING`);
+            await db.execute(sql`INSERT INTO public.ezil_billing_grants VALUES (${uuid(n)}::uuid, ${`sub-${n}`}, 'compute_std_seconds', 3600,
+                ${ago(60).toISOString()}::timestamptz, ${ago(-60).toISOString()}::timestamptz)`);
+            await db.execute(sql`INSERT INTO public.ezil_billing_subscriptions VALUES (${`sub-${n}`}, ${uuid(n)}::uuid, 'standard_monthly_v3', 'active',
+                ${ago(60).toISOString()}::timestamptz, ${ago(-60).toISOString()}::timestamptz)`);
+        };
+        const requester = async (n: number) => { await computer(n); await paid(n); };
+        const runB = async () => { await live(201, 'RUNNING', 'i-0000000000000a201'); await live(202, 'RUNNING', 'i-0000000000000a202'); await live(203, 'UNCONFIRMED', null); };
+        const runtime = () => {
+            const starter = { start: vi.fn<LifecycleStarter['start']>(async () => {}) };
+            const store = createPoolDispatchStore(db, { EZIL_AWS_KILL_SWITCH: '0' }, { starter, executions: { describe: vi.fn() } });
+            const deps: PoolDemandDeps = { db, store, starter, env: ENV, deployments: { [c.region]: deployment }, now: () => NOW, killSwitch: () => false, sleep: async () => {} };
+            return { starter, store, deps };
+        };
+        const want = (n: number, instanceType = 'm6i.large', kind: 'create' | 'wake' = 'create', source: { generation: number; leaseEpoch: number } | null = null) => ({
+            kind, userId: uuid(n), computerId: uuid(n), requestId: randomUUID(), region: c.region, zoneId: c.zoneId, instanceType,
+            deploymentDigest: demandDeploymentDigest(deployment), source });
+        const demands = async () => await db.execute(sql`SELECT * FROM public.ezil_compute_capacity_demands ORDER BY created_at, id`) as Record<string, unknown>[];
+        const counts = async () => ({ placements: Number(((await db.execute(sql`SELECT count(*) AS n FROM public.ezil_computer_placements`)) as Record<string, unknown>[])[0]!.n),
+            usage: Number(((await db.execute(sql`SELECT count(*) AS n FROM public.ezil_compute_usage`)) as Record<string, unknown>[])[0]!.n) });
+        const validate = (n: number) => db.transaction(async () => withAdmission(db, async (tx, lock) => {
+            await tx.execute(sql`INSERT INTO public.ezil_computer_placements
+                (computer_id, owner_user_id, provider, generation, lease_epoch, state, region, zone_id, instance_type, updated_at)
+                VALUES (${uuid(n)}::uuid, ${uuid(n)}::uuid, 'aws-ec2', 1, 1, 'PROVISIONING', ${c.region}, ${c.zoneId}, 'm6i.large', ${NOW.toISOString()}::timestamptz)`);
+            // The capacity check reads only identity/region/zone/type; the raw row above is what regional accounting counts.
+            const p = { computerId: uuid(n), region: c.region, zoneId: c.zoneId, instanceType: 'm6i.large' } as Placement;
+            await createPoolDeps(db, { ...process.env, EZIL_AWS_KILL_SWITCH: '0' }).validateCapacity!(tx, p, lock);
+            throw new Error('rollback-probe-ok');
+        })).catch((e: Error) => e);
+
+        it('first-ever open: a booting xlarge spare is earmarked (never adopted), demand reserved, zero placement/usage writes', async () => {
+            await runB(); await host(301, xl, 'booting'); await requester(401);
+            const before = await counts(), { deps, starter } = runtime();
+            expect(await reservePoolDemand(deps, want(401))).toBe('waiting');
+            expect(await counts()).toEqual(before);
+            expect(starter.start).not.toHaveBeenCalled(); // booting: earmark only, its provision job and liability retained
+            const [d] = await demands();
+            expect(d).toMatchObject({ state: 'active', kind: 'create', vcpu: 2, region: c.region, instance_type: 'm6i.large', closed_at: null });
+            expect(d!.cleanup).toEqual([{ poolHostId: uuid(301), poolGeneration: 1, instanceType: 'm6i.xlarge', vcpu: 4, phase: 'booting', jobId: null }]);
+            expect(await readPoolDemand(db, c, NOW)).toMatchObject({ demandVcpu: 2, earmarked: [uuid(301)] });
+            // Even once ready, the earmarked host is never leased.
+            await recordPoolEnrollment(db, uuid(301), 'i-00000000000000301', ago(1)); await recordPoolReady(db, uuid(301), { editorOk: true }, NOW);
+            expect(await db.transaction(tx => leasePoolHost(tx, xl, uuid(999), 1, NOW))).toBeNull();
+            // Launch accounting: the earmarked host stays counted until retired; the open still cannot launch.
+            expect(await validate(401)).toMatchObject({ message: 'open_pool_capacity' });
+        });
+        it('a ready idle spare of another shape is retired through normal durable work bound to the demand; launch waits for its terminal receipt', async () => {
+            await runB(); await host(302, xl, 'ready'); await requester(402);
+            const { deps, starter } = runtime();
+            expect(await reservePoolDemand(deps, want(402))).toBe('waiting');
+            const [d] = await demands(), spare = ((await db.execute(sql`SELECT * FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(302)}::uuid`)) as Record<string, unknown>[])[0]!;
+            expect(spare).toMatchObject({ state: 'retiring', dispatch_status: 'started' });
+            expect((d!.cleanup as { jobId: string }[])[0]).toMatchObject({ poolHostId: uuid(302), phase: 'retiring', jobId: spare.lifecycle_job_id });
+            expect(starter.start).toHaveBeenCalledTimes(1);
+            expect((await readPoolDemand(db, c, NOW)).vcpuInUse).toBe(10); // still physically counted while retiring
+            expect(await validate(402)).toMatchObject({ message: 'open_pool_capacity' });
+            await markPoolHost(db, uuid(302), ['retiring'], 'retired', NOW); // the bound terminal receipt settled
+            expect(await validate(402)).toMatchObject({ message: 'rollback-probe-ok' }); // fits now and consumes the demand...
+            expect((await demands())[0]).toMatchObject({ state: 'active' }); // ...inside the probe transaction, which rolled back
+        });
+        it('the holder consumes its demand exactly once; another computer cannot take the reserved capacity', async () => {
+            await runB(); await host(303, xl, 'ready'); await requester(403); await requester(404);
+            const { deps } = runtime();
+            expect(await reservePoolDemand(deps, want(403))).toBe('waiting');
+            await markPoolHost(db, uuid(303), ['retiring'], 'retired', NOW);
+            // U = 6 placements + 2 (the other computer's own new row) and H = 2 reserved for 403: 10, so 404 still fits only if H were ignored.
+            await live(205, 'RUNNING', 'i-0000000000000a205');
+            expect(await validate(404)).toMatchObject({ message: 'open_pool_capacity' });
+            const consumed = await db.transaction(async () => withAdmission(db, async (tx, lock) => {
+                await tx.execute(sql`DELETE FROM public.ezil_computer_placements WHERE computer_id = ${uuid(205)}::uuid`);
+                await tx.execute(sql`INSERT INTO public.ezil_computer_placements
+                    (computer_id, owner_user_id, provider, generation, lease_epoch, state, region, zone_id, instance_type, updated_at)
+                    VALUES (${uuid(403)}::uuid, ${uuid(403)}::uuid, 'aws-ec2', 1, 1, 'PROVISIONING', ${c.region}, ${c.zoneId}, 'm6i.large', ${NOW.toISOString()}::timestamptz)`);
+                const pool = createPoolDeps(db, { ...process.env, ...ENV });
+                const p = { computerId: uuid(403), ownerUserId: uuid(403), region: c.region, zoneId: c.zoneId, instanceType: 'm6i.large' } as Placement;
+                // Claimed before any pool lease, bound to this exact open, then consumed by the capacity check.
+                const own = await pool.claimDemand!(tx, p, lock, { kind: 'create', source: null, deploymentDigest: demandDeploymentDigest(deployment) });
+                expect(own).toMatchObject({ computerId: uuid(403) });
+                await pool.validateCapacity!(tx, p, lock, own);
+                return true;
+            }));
+            expect(consumed).toBe(true);
+            expect((await demands())[0]).toMatchObject({ state: 'consumed', revision: 2 });
+            expect((await readPoolDemand(db, c, NOW)).demandVcpu).toBe(0);
+        });
+        it('competing owners: exactly one active regional demand under real concurrent connections', async () => {
+            await runB(); await host(304, xl, 'ready'); await host(305, xl, 'ready'); await requester(405); await requester(406);
+            const { deps } = runtime();
+            const outcomes = await Promise.all([reservePoolDemand(deps, want(405)), reservePoolDemand(deps, want(406))]);
+            expect(outcomes.sort()).toEqual(['refused', 'waiting']);
+            expect((await demands()).filter(d => d.closed_at === null)).toHaveLength(1);
+        });
+        it('an exact repeat reuses the reservation; a changed target never rewrites it; capacity that already fits retries', async () => {
+            await runB(); await host(306, xl, 'ready'); await requester(407);
+            const { deps } = runtime();
+            expect(await reservePoolDemand(deps, want(407))).toBe('waiting');
+            expect(await reservePoolDemand(deps, want(407))).toBe('waiting');
+            expect(await reservePoolDemand(deps, want(407, 'm6i.xlarge'))).toBe('refused');
+            expect(await demands()).toHaveLength(1);
+            await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_capacity_demands, ${schema}.ezil_compute_pool_hosts`);
+            await requester(408);
+            expect(await reservePoolDemand(deps, want(408))).toBe('retry'); // 6 + 2 <= 10: nothing to reclaim
+            expect(await demands()).toHaveLength(0);
+        });
+        it('no reclaimable capacity refuses without a demand; a stale wake snapshot refuses', async () => {
+            await runB(); await live(206, 'RUNNING', 'i-0000000000000a206'); await live(207, 'RUNNING', 'i-0000000000000a207'); await requester(409);
+            const { deps } = runtime();
+            expect(await reservePoolDemand(deps, want(409))).toBe('refused');
+            await db.execute(sql`UPDATE public.ezil_computer_placements SET state = 'STOPPED' WHERE computer_id = ${uuid(207)}::uuid`); await paid(207);
+            expect(await reservePoolDemand(deps, want(207, 'm6i.large', 'wake', { generation: 2, leaseEpoch: 2 }))).toBe('refused');
+            expect(await demands()).toHaveLength(0);
+        });
+        it('fixed DB-clock expiry and stop cancellation close demands; orphaned demands are cancelled', async () => {
+            await runB(); await host(307, xl, 'ready'); await requester(410);
+            const { deps } = runtime();
+            expect(await reservePoolDemand(deps, want(410))).toBe('waiting');
+            expect(await cancelComputerDemand(db, uuid(410), uuid(410))).toBe(true);
+            expect((await demands())[0]).toMatchObject({ state: 'cancelled' });
+            // Cancellation never undoes a committed retirement: it stays counted until its terminal receipt settles.
+            expect(((await db.execute(sql`SELECT state FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(307)}::uuid`)) as Record<string, unknown>[])[0]!.state).toBe('retiring');
+            await markPoolHost(db, uuid(307), ['retiring'], 'retired', NOW);
+            await host(308, xl, 'ready'); await requester(411);
+            expect(await reservePoolDemand(deps, want(411))).toBe('waiting');
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second', created_at = now() - interval '2 seconds'
+                WHERE computer_id = ${uuid(411)}::uuid`);
+            expect(await withAdmission(db, (tx, lock) => closeExpiredDemands(tx, lock))).toBe(1);
+            await markPoolHost(db, uuid(308), ['retiring'], 'retired', NOW);
+            await host(309, xl, 'ready'); await requester(412);
+            expect(await reservePoolDemand(deps, want(412))).toBe('waiting');
+            await db.execute(sql`UPDATE public.ezil_computers SET deleted_at = now() WHERE id = ${uuid(412)}::uuid`);
+            expect(await withAdmission(db, (tx, lock) => closeOrphanedDemands(tx, lock))).toBe(1);
+            expect(Object.fromEntries((await demands()).map(d => [d.computer_id, d.state])))
+                .toEqual({ [uuid(410)]: 'cancelled', [uuid(411)]: 'expired', [uuid(412)]: 'cancelled' });
+        });
+        it('a Cloudflare pin never wins against an active AWS demand', async () => {
+            await runB(); await host(310, xl, 'ready'); await requester(413);
+            expect(await reservePoolDemand(runtime().deps, want(413))).toBe('waiting');
+            expect(await pinCloudflarePlacement(db, { computerId: uuid(413), userId: uuid(413) }, { honorDemand: true }))
+                .toEqual({ provider: 'aws-ec2', store: 'ebs', record: null });
+            expect((await readPlacement(db, uuid(413))).record).toBeNull();
+        });
+        // ---- Root early capacity review 23625381 (13:04Z): focused negatives ----
+        it('P1: the reservation reauthorizes the whole open: unpaid, image-reserved, migrating, second-computer and over-cap owners never retire spares', async () => {
+            const { deps, starter } = runtime();
+            await runB(); await host(320, xl, 'ready');
+            await computer(420); // not paid
+            expect(await reservePoolDemand(deps, want(420))).toBe('refused');
+            await live(421, 'STOPPED', null); await paid(421); // an image reservation on its (wake) placement
+            await db.execute(sql`UPDATE public.ezil_computer_placements SET image_upgrade_job_id = ${randomUUID()}::uuid WHERE computer_id = ${uuid(421)}::uuid`);
+            expect(await reservePoolDemand(deps, want(421, 'm6i.large', 'wake', { generation: 2, leaseEpoch: 3 }))).toBe('refused');
+            await requester(422);
+            await db.execute(sql`INSERT INTO public.ezil_compute_migrations (user_id, computer_id, from_provider, to_provider, to_size, state)
+                VALUES (${uuid(422)}::uuid, ${uuid(422)}::uuid, 'cloudflare', 'aws-ec2', 'standard', 'requested')`);
+            expect(await reservePoolDemand(deps, want(422))).toBe('refused');
+            await requester(423); await live(424, 'STOPPED', null); // 424 is a second AWS computer of owner 423
+            await db.execute(sql`UPDATE public.ezil_computer_placements SET owner_user_id = ${uuid(423)}::uuid WHERE computer_id = ${uuid(424)}::uuid`);
+            await db.execute(sql`UPDATE public.ezil_computers SET user_id = ${uuid(423)}::uuid WHERE id = ${uuid(424)}::uuid`);
+            expect(await reservePoolDemand(deps, want(423))).toBe('refused');
+            expect(await demands()).toHaveLength(0);
+            expect(starter.start).not.toHaveBeenCalled();
+            expect(((await db.execute(sql`SELECT state FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(320)}::uuid`)) as Record<string, unknown>[])[0]!.state).toBe('ready');
+        });
+        it('P2-3: a booting host whose provision already settled with its instance is retired at once, not earmarked', async () => {
+            const { deps, starter, store } = runtime();
+            await runB(); await host(321, xl, 'booting'); await requester(425);
+            const provision = poolWork(xl, deployment, 'pool-provision', poolData.poolHostFromRow(((await db.execute(sql`SELECT * FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(321)}::uuid`)) as Record<string, unknown>[])[0]!));
+            await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET instance_id = 'i-00000000000000321', lifecycle_job_id = ${provision.intent.jobId}::uuid,
+                lifecycle_digest = ${provision.digest}, lifecycle_input = ${provision.input}, dispatch_status = 'settled' WHERE id = ${uuid(321)}::uuid`);
+            expect(await store.canRetire!(db, uuid(321))).toBe(true);
+            expect(await reservePoolDemand(deps, want(425))).toBe('waiting');
+            expect((await demands())[0]!.cleanup).toMatchObject([{ poolHostId: uuid(321), phase: 'retiring' }]);
+            expect(starter.start).toHaveBeenCalledTimes(1);
+        });
+        it('P2-4: consumption needs this open\'s own LIVE, exactly bound demand; a mismatched or expired one grants no credit', async () => {
+            const { deps } = runtime();
+            await runB(); await host(322, xl, 'ready'); await requester(426);
+            expect(await reservePoolDemand(deps, want(426))).toBe('waiting');
+            await markPoolHost(db, uuid(322), ['retiring'], 'retired', NOW);
+            const pool = createPoolDeps(db, { ...process.env, ...ENV });
+            const claim = (binding: { kind: 'create' | 'wake'; source: { generation: number; leaseEpoch: number } | null; deploymentDigest: string }, patch: Partial<Placement> = {}) =>
+                withAdmission(db, (tx, lock) => pool.claimDemand!(tx, { computerId: uuid(426), ownerUserId: uuid(426), region: c.region, zoneId: c.zoneId,
+                    instanceType: 'm6i.large', ...patch } as Placement, lock, binding));
+            const ok = { kind: 'create' as const, source: null, deploymentDigest: demandDeploymentDigest(deployment) };
+            expect(await claim(ok)).toMatchObject({ computerId: uuid(426) });
+            expect(await claim({ ...ok, deploymentDigest: 'b'.repeat(64) })).toBeNull();
+            expect(await claim({ ...ok, kind: 'wake', source: { generation: 1, leaseEpoch: 1 } })).toBeNull();
+            expect(await claim(ok, { instanceType: 'm6i.xlarge' })).toBeNull();
+            expect(await claim(ok, { ownerUserId: uuid(999) })).toBeNull();
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second', created_at = now() - interval '2 seconds'`);
+            expect(await claim(ok)).toBeNull(); // DB-clock expiry: no credit even before the sweep closes it
+            expect((await demands())[0]).toMatchObject({ state: 'active' }); // never consumed while expired
+        });
+        it('P2-5: shared admission counters (ordinary and image) count pending demand once and hold the owner\'s one-computer allowance', async () => {
+            const { deps } = runtime();
+            await runB(); await host(323, xl, 'ready'); await requester(427); await requester(428);
+            expect(await reservePoolDemand(deps, want(427))).toBe('waiting');
+            const read = (computerId: string, userId: string) => withAdmission(db, (tx, lock) => readAdmissionCounters(tx, lock, { userId, computerId, monthStart: ago(60 * 24), now: NOW }));
+            const other = await read(uuid(428), uuid(428)), mine = await read(uuid(427), uuid(427));
+            expect(other.runningVcpu - mine.runningVcpu).toBe(2); // the demand counts for everyone else, never for its own open
+            await computer(429, 427);
+            expect((await read(uuid(429), uuid(427))).userOtherAwsComputers).toBe(1); // demand holds owner 427's allowance
+        });
+        it('P2-6: an expired attempt stays terminal however long polling continues; only the owner\'s explicit stop begins a fresh attempt', async () => {
+            const { deps } = runtime();
+            await runB(); await host(324, xl, 'ready'); await requester(430);
+            expect(await reservePoolDemand(deps, want(430))).toBe('waiting');
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second', created_at = now() - interval '2 seconds'`);
+            await markPoolHost(db, uuid(324), ['retiring'], 'retired', NOW); await host(325, xl, 'ready');
+            expect(await reservePoolDemand(deps, want(430))).toBe('refused'); // the sweep closes it as expired; the attempt is terminal
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET closed_at = now() - interval '1 day',
+                expires_at = now() - interval '1 day' + interval '1 second', created_at = now() - interval '1 day'`);
+            expect(await reservePoolDemand(deps, want(430))).toBe('refused'); // elapsed time alone never restarts it
+            expect(await cancelComputerDemand(db, uuid(430), uuid(430))).toBe(true); // explicit authenticated stop
+            expect((await demands()).map(d => d.state).sort()).toEqual(['cancelled', 'expired']); // the expired record is kept
+            expect(await reservePoolDemand(deps, want(430))).toBe('waiting'); // a fresh attempt
+            expect(await cancelComputerDemand(db, uuid(430), uuid(999))).toBe(false); // never another owner's
+        });
+        it('size: a selection changed between the refused open and the reservation refuses (no stale retirement)', async () => {
+            const { deps, starter } = runtime();
+            await runB(); await host(327, xl, 'ready'); await requester(431); // Standard: resolves to m6i.large
+            expect(await reservePoolDemand(deps, want(431, 'm6i.xlarge'))).toBe('refused'); // the stale 4-vCPU request
+            expect(starter.start).not.toHaveBeenCalled();
+            expect(await demands()).toHaveLength(0);
+        });
+        it('deployment: the digest covers the complete validated deployment; a stale or foreign digest never reserves or repeats', async () => {
+            const base = demandDeploymentDigest(deployment);
+            for (const changed of [{ launchTemplateId: 'lt-22222222222222222' }, { securityGroupId: 'sg-22222222222222222' },
+                { subnetId: 'subnet-22222222222222222' }, { dataKeyArn: deployment.dataKeyArn.replace('1111', '2222') }, { storage: { ...deployment.storage, dataMaxGiB: 99 } }])
+                expect(demandDeploymentDigest({ ...deployment, ...changed })).not.toBe(base);
+            expect(demandDeploymentDigest({ ...deployment, storage: { rootDeviceName: '/dev/sda1', ...deployment.storage } })).toBe(base); // pool-work normalization
+            const { deps } = runtime();
+            await runB(); await host(328, xl, 'ready'); await requester(432);
+            expect(await reservePoolDemand(deps, { ...want(432), deploymentDigest: 'b'.repeat(64) })).toBe('refused');
+            expect(await reservePoolDemand(deps, want(432))).toBe('waiting');
+            expect(await reservePoolDemand(deps, { ...want(432), deploymentDigest: 'b'.repeat(64) })).toBe('refused');
+        });
+        it('image admission counters (readImageAdmissionCounters) count other computers\' pending demand too', async () => {
+            const { deps } = runtime();
+            await runB(); await host(329, xl, 'ready'); await requester(433);
+            expect(await reservePoolDemand(deps, want(433))).toBe('waiting');
+            await db.execute(sql`UPDATE public.ezil_computer_placements SET image_upgrade_job_id = ${randomUUID()}::uuid WHERE computer_id = ${uuid(202)}::uuid`);
+            const counts = await withAdmission(db, async (tx, lock) => {
+                const p = (await lockImagePlacement(tx, lock, uuid(202)))!;
+                return readImageAdmissionCounters(tx, lock, p, NOW);
+            });
+            const plain = await withAdmission(db, (tx, lock) => readAdmissionCounters(tx, lock, { userId: uuid(433), computerId: uuid(433), monthStart: ago(60 * 24), now: NOW }));
+            expect(counts.runningVcpu).toBe(plain.runningVcpu + 2); // 433's own admission never counts its own demand; image admission does
+        });
+        it('a downstream eligibility read failure (after inventory) refuses with no demand and no retirement', async () => {
+            const { deps, starter } = runtime();
+            await runB(); await host(330, xl, 'ready'); await requester(434);
+            const failing: PlacementDb = { execute: q => db.execute(q), transaction: fn => db.transaction(tx => fn({ execute: async q => {
+                const text = new PgDialect().sqlToQuery(q).sql;
+                if (/WITH\s+effective/.test(text) && text.includes('SELECT instance_type FROM eligible')) throw new Error('eligibility read failed');
+                return tx.execute(q);
+            } })) };
+            await expect(reservePoolDemand({ ...deps, db: failing }, want(434))).rejects.toThrow('eligibility read failed');
+            expect(await demands()).toHaveLength(0);
+            expect(starter.start).not.toHaveBeenCalled();
+            expect(((await db.execute(sql`SELECT state FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(330)}::uuid`)) as Record<string, unknown>[])[0]!.state).toBe('ready');
+        });
+        it('forced interleaving: a reservation waits behind a transaction holding the admission lock, then sees its committed lease', async () => {
+            const { deps } = runtime();
+            await runB(); await host(331, xl, 'ready'); await requester(435);
+            let release!: () => void; const held = new Promise<void>(r => { release = r; });
+            let entered!: () => void; const inside = new Promise<void>(r => { entered = r; });
+            const holder = withAdmission(db, async tx => {
+                entered(); await held;
+                await tx.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = 'leased', leased_computer_id = ${uuid(999)}::uuid,
+                    leased_at = ${NOW.toISOString()}::timestamptz, leased_generation = generation, lease_token = gen_random_uuid() WHERE id = ${uuid(331)}::uuid`);
+            });
+            await inside;
+            const reservation = reservePoolDemand(deps, want(435));
+            await new Promise(r => setTimeout(r, 150));
+            release(); await holder;
+            expect(await reservation).toBe('refused'); // the only spare was leased first; nothing reclaimable remained
+            expect(await demands()).toHaveLength(0);
+        });
+        it('the bound retirement completes through the real dispatch receipt path, after which the holder fits', async () => {
+            const { deps, store } = runtime();
+            await runB(); await host(332, xl, 'ready'); await requester(436);
+            expect(await reservePoolDemand(deps, want(436))).toBe('waiting');
+            const row = ((await db.execute(sql`SELECT * FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(332)}::uuid`)) as Record<string, unknown>[])[0]!;
+            const work = storedPoolWork(row), i = work.intent;
+            const receipt = { schemaVersion: 1, jobId: i.jobId, digest: work.digest, computerId: i.computerId, generation: i.targetGeneration,
+                leaseEpoch: i.leaseEpoch, fenceToken: i.fenceToken, poolHostId: i.poolHostId, poolGeneration: i.poolGeneration, volumeId: null,
+                instanceId: row.instance_id, state: 'retired' };
+            const executions = { describe: vi.fn(async () => ({ status: 'SUCCEEDED', input: work.input, output: JSON.stringify(receipt),
+                executionArn: lifecycleExecutionArn(deployment, i.jobId), stateMachineVersionArn: work.stateMachineArn })) };
+            await createPoolDispatchStore(db, { EZIL_AWS_KILL_SWITCH: '0' }, { starter: { start: vi.fn() }, executions }).reconcile!();
+            expect(((await db.execute(sql`SELECT state FROM public.ezil_compute_pool_hosts WHERE id = ${uuid(332)}::uuid`)) as Record<string, unknown>[])[0]!.state).toBe('retired');
+            void store;
+            expect(await validate(436)).toMatchObject({ message: 'open_pool_capacity' }); // validate() probes WITHOUT a claim: no credit
+        });
+        it('schema: a demand cannot carry a partial source pair or a create with a source', async () => {
+            const insert = (kind: string, gen: number | null, epoch: number | null) => db.execute(sql`INSERT INTO public.ezil_compute_capacity_demands
+                (request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest, source_generation, source_lease_epoch, state, expires_at)
+                VALUES (${randomUUID()}::uuid, ${randomUUID()}::uuid, ${randomUUID()}::uuid, ${kind}, ${'r-' + randomUUID()}, 'z', 'm6i.large', 2, ${'a'.repeat(64)},
+                    ${gen}::integer, ${epoch}::integer, 'active', now() + interval '1 minute')`);
+            for (const [kind, gen, epoch] of [['wake', 1, null], ['wake', null, 1], ['wake', null, null], ['create', 1, null], ['create', null, 1], ['create', 1, 1]] as const)
+                await expect(insert(kind, gen, epoch)).rejects.toThrow();
+            await expect(insert('wake', 1, 1)).resolves.toBeDefined();
+            await expect(insert('create', null, null)).resolves.toBeDefined();
+        });
+        it('replenish (admission lock first) and demand reservation run concurrently without deadlock; floors honor the reservation', async () => {
+            await runB(); await host(311, xl, 'ready'); await requester(414);
+            await paid(201);
+            const { deps, store, starter } = runtime();
+            const replenish = () => runPoolReplenish({ db, data: poolData, store, starter, classes: [c, xl], deployments: { [c.region]: deployment },
+                now: () => NOW, withLock: fn => withPoolReplenishLock(db, fn), log: () => {}, sleep: async () => {} }).catch((e: { status?: number }) => e?.status === 204 ? null : Promise.reject(e));
+            const results = await Promise.all([reservePoolDemand(deps, want(414)), replenish(), replenish()]);
+            expect(results[0]).toBe('waiting');
+            // The reserved 2 vCPU plus physical liability leaves no room for a fresh spare while the demand is active.
+            const booting = ((await db.execute(sql`SELECT count(*) AS n FROM public.ezil_compute_pool_hosts WHERE state = 'booting'`)) as Record<string, unknown>[])[0]!.n;
+            expect(Number(booting)).toBe(0);
+        });
     });
 });

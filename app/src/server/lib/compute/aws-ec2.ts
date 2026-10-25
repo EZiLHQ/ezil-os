@@ -3,6 +3,9 @@ import { isPoolReleaseRecovering } from './aws-pool-release-recovery';
 import { settleReplacementGeneration } from './aws-rebase-generation';
 import { adoptRecoveryReplay, matchesAdoptRecovery, failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
 import { writePoolOpen } from './placement';
+import { PoolCapacityPressure } from './aws-pool-errors';
+import { cancelComputerDemand } from './aws-pool-demand';
+import { demandDeploymentDigest, type CapacityDemand } from './capacity-demand';
 /**
  * aws-ec2 provider (docs/AWS-COMPUTERS.md C-1, C-3).
  *
@@ -447,6 +450,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
      * commit. A pool lease replaces that boot's work in the same transaction. */
     const admitBoot = async (request: AdmissionRequest, tier: AwsTier | undefined, e: Env,
         workRef: { get(): LifecycleWork | undefined; set(work: LifecycleWork): void }) => {
+        let own: CapacityDemand | null | undefined;
         const result = await reservePoolHostForBoot(deps.db,
             db => runAdmission(db, request, { env: e, now }),
             async (tx, p) => {
@@ -475,8 +479,23 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 workRef.set(work);
                 return { instanceId: host.instanceId, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest,
                     enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null, lastError: poolAdoptSource(cold.intent) };
-            }, async (tx, p) => {
-                if (isPoolMode(workRef.get()!.intent.deployment)) await deps.pool?.validateCapacity?.(tx, p);
+            }, async (tx, p, lock) => {
+                if (isPoolMode(workRef.get()!.intent.deployment)) await deps.pool?.validateCapacity?.(tx, p, lock, own ?? null);
+            }, async (tx, p, lock) => {
+                const work = workRef.get();
+                if (work && isPoolMode(work.intent.deployment) && deps.pool?.claimDemand)
+                    own = await deps.pool.claimDemand(tx, p, lock, { kind: request.kind === 'create' ? 'create' : 'wake',
+                        source: request.kind === 'lease' ? request.expected : null, deploymentDigest: demandDeploymentDigest(work.intent.deployment) });
+            }).catch(async (error: unknown) => {
+                // Capacity alone refused: reserve durable demand (no placement, job, nonce or usage) and keep waiting.
+                const cold = workRef.get();
+                if (!(error instanceof PoolCapacityPressure) || !deps.pool?.reserveDemand || !cold || !isPoolMode(cold.intent.deployment)) throw error;
+                const outcome = await deps.pool.reserveDemand({ kind: request.kind === 'create' ? 'create' : 'wake', userId: request.userId,
+                    computerId: error.target.computerId, requestId: newId(), region: error.target.region, zoneId: error.target.zoneId,
+                    instanceType: error.target.instanceType, deploymentDigest: demandDeploymentDigest(cold.intent.deployment),
+                    source: request.kind === 'lease' ? request.expected : null });
+                return outcome === 'refused' ? { admitted: false as const, reason: 'region_capacity' as const }
+                    : { admitted: false as const, reason: 'capacity_waiting' as const };
             });
         const work = workRef.get();
         if (result.admitted && work?.intent.operation === 'adopt') {
@@ -567,7 +586,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
                     throw error;
                 }
-                if (!admitted.admitted) return capacityRefusal(admitted.reason, cfg.deployments, cfg.e);
+                if (!admitted.admitted) return admitted.reason === 'capacity_waiting' ? notReady('computer_starting', true)
+                    : capacityRefusal(admitted.reason, cfg.deployments, cfg.e);
                 const p = admitted.placement;
                 // The row must be exactly what the intent was built for (generation 1, epoch 1).
                 if (!work || p.generation !== 1 || p.leaseEpoch !== work.intent.leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
@@ -697,6 +717,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         if (error instanceof LifecycleIntentInvalidError) return notReady('aws_intent_invalid');
                         throw error;
                     }
+                    if (!leased.admitted && leased.reason === 'capacity_waiting') return notReady('computer_starting', true);
                     if (!leased.admitted) return leased.reason === 'cas_conflict'
                         ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
                         : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
@@ -746,6 +767,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!cfg.ok) return { ok: false, terminated: false, outcome: cfg.code, error: cfg.code };
             if (!deps.starter) return { ok: false, terminated: false, outcome: 'aws_lifecycle_unconfigured', error: 'aws_lifecycle_unconfigured' };
             const p = await ownPlacement(c);
+            // A stop cancels the owner's pending capacity demand before any already-stopped answer.
+            const cancelled = await cancelComputerDemand(deps.db, c.computerId, c.userId);
+            if (!p && cancelled) return { ok: true, terminated: false, outcome: 'already_stopped' };
             if (!p || p.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'aws_placement_missing', error: 'aws_placement_missing' };
             if (p.state === 'STOPPED') return { ok: true, terminated: false, outcome: 'already_stopped' };
             if (p.state !== 'RUNNING') return { ok: false, terminated: false, outcome: `placement_${p.state.toLowerCase()}` };

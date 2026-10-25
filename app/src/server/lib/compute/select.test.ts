@@ -40,7 +40,9 @@ describe('billing v2 placement selection', () => {
         const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(createdAt) }] });
         expect((await resolveComputeProvider(db, computer, DIRECT, {}, { entitlement: paid, pinCloudflare: true })).kind).toBe('aws-ec2');
         expect(placements).toEqual([]);
-        expect(statements).toHaveLength(3); // placement, reservation and live computer reads; admission happens at ensure
+        // placement, reservation, active capacity-demand and live computer reads; admission happens at ensure
+        expect(statements).toHaveLength(4);
+        expect(statements.filter(q => q.sql.includes('/* demand:peek */'))).toHaveLength(1);
     });
 
     it.each([false, true])('(a) paid + no row + created before SINCE stays Cloudflare (pinCloudflare=%s)', async pinCloudflare => {
@@ -65,7 +67,7 @@ describe('billing v2 placement selection', () => {
         const { db, placements, statements } = createFakePlacementDb({ computers: [{ id: computerId, user_id: userId, created_at: new Date(SINCE) }] });
         expect(await resolveComputeProvider(db, computer, { ...ON, EZIL_AWS_CANARY_SINCE: since }, {}, { entitlement: paid })).toBe(cloudflareComputeProvider);
         expect(placements).toEqual([]);
-        expect(statements).toHaveLength(2);
+        expect(statements).toHaveLength(3); // + the active capacity-demand read (AWS on, no row)
     });
 
     it.each([
@@ -114,7 +116,7 @@ describe('resolveComputeProvider', () => {
     it('flag on, no row: Cloudflare', async () => {
         const { db, statements } = createFakePlacementDb();
         expect(await resolveComputeProvider(db, computer, ON)).toBe(cloudflareComputeProvider);
-        expect(statements).toHaveLength(2);
+        expect(statements).toHaveLength(3); // + the active capacity-demand read (AWS on, no row)
     });
 
     it('flag on, aws-ec2 row: the aws-ec2 provider', async () => {
@@ -159,7 +161,9 @@ describe('resolveComputeProvider', () => {
                 expect(statements).toEqual([]);
                 return;
             }
-            expect(statements).toHaveLength(2);
+            // AWS on with no row also reads the computer's active capacity demand (never a Cloudflare pin while one waits).
+            const demandRead = aws === '1' && row === 'none' ? 1 : 0;
+            expect(statements).toHaveLength(2 + demandRead);
             if (row !== 'aws-ec2') {
                 expect(provider).toBe(cloudflareComputeProvider);
                 return;

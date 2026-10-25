@@ -217,7 +217,7 @@ describe('readPoolDemand', () => {
             vi.stubEnv('EZIL_AWS_KILL_SWITCH', kill);
             expect(await readPoolDemand(capture([aggregate]).db, c, NOW)).toEqual({ ready: 0, pending: 0, opens15m: 7, activeStandard: 25, activePremium: 3,
                 bootMinutes: 4.5, spares: 2, vcpuInUse: 8, regionVcpuCap: 10, killSwitch: kill === '1',
-                idleReady: [{ poolHostId: 'r', readyAt: NOW }], booting: [{ poolHostId: 'b', createdAt: NOW }] });
+                idleReady: [{ poolHostId: 'r', readyAt: NOW }], booting: [{ poolHostId: 'b', createdAt: NOW }], demandVcpu: 0, earmarked: [] });
         }
     });
     it('unknown measurements stay null and missing/unconfigured/invalid region capacity is zero', async () => {

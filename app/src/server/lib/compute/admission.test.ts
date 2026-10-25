@@ -214,14 +214,14 @@ describe('runAdmission (transactional)', () => {
         const sqls = statements.map((s) => s.sql).filter(s => !s.includes('placement:image-reservation'));
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\), current_setting\('transaction_isolation'\) AS isolation/);
-        expect(sqls.slice(2, 10).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual([
-            'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-running-region', 'count-user', 'duplicates', 'usage-month',
+        expect(sqls.slice(2, 11).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual([
+            'computer-owner', 'read', 'usage-foreign', 'count-running', 'count-running-region', 'count-user', 'count-demand', 'duplicates', 'usage-month',
         ]);
-        expect(sqls[10]).toMatch(/placement:read/); // the lease's home region, read under the lock
-        expect(sqls[11]).toMatch(/placement:read/); // the replacement/enrollment-outcome re-read (review C1)
-        expect(sqls[12]).toMatch(/placement:read/); // the CAS duplicate pre-check
-        expect(sqls[13]).toMatch(/placement:cas/);
-        expect(sqls[14]).toBe('COMMIT');
+        expect(sqls[11]).toMatch(/placement:read/); // the lease's home region, read under the lock
+        expect(sqls[12]).toMatch(/placement:read/); // the replacement/enrollment-outcome re-read (review C1)
+        expect(sqls[13]).toMatch(/placement:read/); // the CAS duplicate pre-check
+        expect(sqls[14]).toMatch(/placement:cas/);
+        expect(sqls[15]).toBe('COMMIT');
         expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 

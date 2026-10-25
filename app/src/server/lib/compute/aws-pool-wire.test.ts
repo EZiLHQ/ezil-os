@@ -7,7 +7,7 @@ import * as data from './ready-pool';
 import { poolFixture, NOW } from './aws-pool-test-support';
 import { lifecycleExecutionArn } from './aws-receipts';
 import { AwsClientError } from './aws-errors';
-import type { PlacementDb } from './placement';
+import { withAdmission, type PlacementDb } from './placement';
 import { handlePoolSessionReady } from './aws-pool-session';
 import * as placement from './placement';
 import { handlePoolClaim } from './aws-pool-claim';
@@ -23,7 +23,7 @@ function harness() {
     const trace: string[] = []; const state = { subscribers: 1, vcpu: 0, migrations: 0, insert: true, save: true };
     const db: PlacementDb = { execute: vi.fn(async query => {
         const q = new PgDialect().sqlToQuery(query); trace.push(q.sql); const p = q.params;
-        if (q.sql.includes('WITH effective')) return [{ opens: 0, standard: state.subscribers, premium: 0, spares: 0, vcpu: state.vcpu,
+        if (/WITH\s+effective/.test(q.sql)) return [{ opens: 0, standard: state.subscribers, premium: 0, spares: 0, vcpu: state.vcpu,
             boot_minutes: null, idle_ready: [], booting: [] }];
         if (q.sql.includes('SELECT count(*) AS count')) return [{ count: state.migrations }];
         if (q.sql.includes('INSERT INTO public.ezil_compute_pool_hosts')) { row.id = p[0]; return state.insert ? [row] : []; }
@@ -67,6 +67,7 @@ function harness() {
             return !q.sql.includes('WHERE dispatch_status IN') || ['pending', 'unknown', 'started'].includes(String(row.dispatch_status)) ? [row] : [];
         }
         if (q.sql.includes('pg_try_advisory')) return [{ locked: true }];
+        if (q.sql.includes('placement:lock-admission')) return [{ pg_advisory_xact_lock: '', isolation: 'read committed' }];
         return [];
     }), transaction: async fn => { trace.push('BEGIN'); const value = await fn(db); trace.push('COMMIT'); return value; } };
     const sdk = { starter: { start: vi.fn(async () => { trace.push('START'); }) }, executions: { describe: vi.fn() } };
@@ -328,12 +329,12 @@ it.each(['spares', 'migrations', 'kill', 'invalid'])('post-bind admission refuse
     if (guard === 'migrations') { h.state.vcpu = 10; h.state.migrations = 1; }
     if (guard === 'kill') h.env.EZIL_AWS_KILL_SWITCH = '1';
     if (guard === 'invalid') h.state.migrations = NaN;
-    await expect(deps.validateCapacity!(h.db, h.f.p)).rejects.toThrow('open_pool_capacity');
+    await expect(withAdmission(h.db, (tx, lock) => deps.validateCapacity!(tx, h.f.p, lock))).rejects.toThrow('open_pool_capacity');
     expect(h.sdk.starter.start).not.toHaveBeenCalled();
 });
 it('post-bind admission accepts the exact regional cap', async () => {
     const h = harness(); h.state.vcpu = 10;
-    await expect(createPoolDeps(h.db, h.env).validateCapacity!(h.db, h.f.p)).resolves.toBeUndefined();
+    await expect(withAdmission(h.db, (tx, lock) => createPoolDeps(h.db, h.env).validateCapacity!(tx, h.f.p, lock))).resolves.toBeUndefined();
 });
 
 it('session-ready time is immutable and read only for its bound epoch', async () => {
@@ -361,13 +362,13 @@ it.each(['cancelled','deployment','unknown'])('absent provision replay rechecks 
     await h.store.reconcile!().catch(()=>{});
     expect(h.sdk.starter.start).not.toHaveBeenCalled();
     expect(h.row).toMatchObject({state:'booting',dispatch_status:'pending',lifecycle_input:w.input,lifecycle_digest:w.digest});
-    if(fault==='cancelled')expect(h.trace.filter(q=>q.includes('WITH effective')).length).toBeGreaterThan(1);
+    if(fault==='cancelled')expect(h.trace.filter(q=>/WITH\s+effective/.test(q)).length).toBeGreaterThan(1);
 });
 it.each(['cancelled','deployment','unknown'])('provision authority rechecks %s rather than trusting a stored reservation', async fault=>{
     const h=harness(),w=await h.prepare(),i=w.intent;
     if(fault==='cancelled')h.state.subscribers=0;
     if(fault==='deployment')h.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS='{}';
-    if(fault==='unknown') {const execute=h.db.execute; h.db.execute=vi.fn(q=>new PgDialect().sqlToQuery(q).sql.includes('WITH effective')?Promise.reject(new Error('unavailable')):execute(q));}
+    if(fault==='unknown') {const execute=h.db.execute; h.db.execute=vi.fn(q=>new PgDialect().sqlToQuery(q).sql.match(/WITH\s+effective/)?Promise.reject(new Error('unavailable')):execute(q));}
     expect(await poolJobAuthority(h.db,{computerId:i.computerId,jobId:i.jobId,digest:w.digest,leaseEpoch:i.leaseEpoch,
         poolHostId:i.poolHostId!,poolGeneration:i.poolGeneration!,operation:i.operation},h.env)).toBe(false);
 });

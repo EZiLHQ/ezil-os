@@ -4,6 +4,8 @@ import { runPoolReplenish, withPoolReplenishLock, type PoolReplenishDeps } from 
 import { poolFixture, demandFixture, HOST, OTHER, NOW } from './aws-pool-test-support';
 import { fixtureDeployment } from './aws-intent.test-support';
 import type { PoolClass } from './ready-pool';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { PlacementExecutor } from './placement';
 function fixture() {
     const f = poolFixture();
     const plan = { target: 4, provision: 4, retire: [] as string[], fail: [] as string[] };
@@ -144,18 +146,23 @@ it('refuses a reserved host in a different class', async () => {
     const { deps } = fixture(); deps.classes[0]!.zoneId = 'aps1-az2';
     await expect(runPoolReplenish(deps)).rejects.toThrow('work_class');
 });
+const lockAnswer = (locked: boolean) => vi.fn(async (query: Parameters<PlacementExecutor['execute']>[0]) =>
+    new PgDialect().sqlToQuery(query).sql.includes('placement:lock-admission') ? [{ pg_advisory_xact_lock: '', isolation: 'read committed' }] : [{ locked }]);
 it('performs no work during an overlapping pass', async () => {
     const { deps } = fixture(); deps.withLock = run => withPoolReplenishLock({ execute: vi.fn(),
-        transaction: async fn => fn({ execute: vi.fn(async () => [{ locked: false }]) }) }, run);
+        transaction: async fn => fn({ execute: lockAnswer(false) }) }, run);
     await expect(runPoolReplenish(deps)).rejects.toMatchObject({ status: 204 });
     expect(deps.data.readPoolDemand).not.toHaveBeenCalled();
 });
-it('holds the transaction advisory lock until dispatch ends', async () => {
+it('takes the admission lock FIRST, then holds the pool advisory lock until dispatch ends', async () => {
     let done = false;
-    const execute = vi.fn(async () => [{ locked: true }]);
+    const execute = lockAnswer(true);
     const db = { execute, transaction: async <T>(fn: (tx: { execute: typeof execute }) => Promise<T>) => {
         const value = await fn({ execute }); expect(done).toBe(true); return value;
     } };
-    expect(await withPoolReplenishLock(db, async () => { done = true; return 7; })).toBe(7);
-    expect(execute).toHaveBeenCalledOnce();
+    expect(await withPoolReplenishLock(db, async (_tx, lock) => { expect(lock).toBeDefined(); done = true; return 7; })).toBe(7);
+    const order = execute.mock.calls.map(([q]) => new PgDialect().sqlToQuery(q).sql);
+    expect(order).toHaveLength(2);
+    expect(order[0]).toContain('placement:lock-admission');
+    expect(order[1]).toContain('pg_try_advisory_xact_lock(1163554896, 0)');
 });

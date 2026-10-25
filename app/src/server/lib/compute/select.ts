@@ -111,6 +111,14 @@ export async function resolveComputeProvider(
         return providerForPlacement({ provider: 'aws-ec2' }, mumbaiEnv, deps ? { ...deps, env: () => mumbaiEnv } : undefined);
     };
     if (!placement.record) {
+        // An active AWS capacity demand keeps this computer on the AWS waiting/refusal path even if
+        // eligibility or gates changed since it was reserved, AWS disabled included (never a Cloudflare pin
+        // meanwhile). Environments with no AWS deployment configured have no demand table to read.
+        if (awsDemandCapable(env)) {
+            const { readActiveDemandForComputer } = await import('./capacity-demand');
+            const demand = await readActiveDemandForComputer(db, computer.computerId);
+            if (demand && demand.ownerUserId === computer.userId.toLowerCase()) return freshAwsProvider();
+        }
         const { createProviderMigrationStore } = await import('./provider-migrate-store');
         const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId);
         // A proven-empty predecessor is eligible regardless of its creation date.
@@ -134,7 +142,7 @@ export async function resolveComputeProvider(
         // No row and in the canary cohort: the aws-ec2 provider, whose ensure() admits and provisions it.
         if (await isAwsCanary(db, computer, env)) return providerForPlacement({ provider: 'aws-ec2' }, env, deps);
         if (options.pinCloudflare && isPlacementDb(db)) {
-            placement = await pinCloudflare(db, computer);
+            placement = await pinCloudflare(db, computer, env);
             assertPlacementOwner(placement, computer);
             options.onPlacement?.(placement);
             if (!placement.record && placement.provider === 'aws-ec2') return freshAwsProvider();
@@ -158,8 +166,12 @@ function assertPlacementOwner(placement: ResolvedPlacement, computer: ComputerRe
  * lifecycle lives in the Worker); STOPPED keeps it out of every running-class count.
  * A concurrent writer's row wins (`placement_exists` → re-read), whatever its provider.
  */
-async function pinCloudflare(db: PlacementDb, computer: ComputerRef): Promise<ResolvedPlacement> {
-    return pinCloudflarePlacement(db, computer);
+async function pinCloudflare(db: PlacementDb, computer: ComputerRef, env: Env): Promise<ResolvedPlacement> {
+    return pinCloudflarePlacement(db, computer, { honorDemand: awsDemandCapable(env) });
+}
+/** Capacity demands exist only where an AWS lifecycle deployment is configured; disabling AWS keeps them honored. */
+function awsDemandCapable(env: Env): boolean {
+    return isAwsComputersEnabled(env) || !!env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS?.trim();
 }
 
 /**

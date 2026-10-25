@@ -554,8 +554,13 @@ async function takeAdmissionLock(tx: PlacementExecutor): Promise<AdmissionLock> 
  * would be released as soon as the statement ended.
  */
 export function withAdmission<T>(db: PlacementDb, fn: (tx: PlacementExecutor, lock: AdmissionLock) => Promise<T>): Promise<T> {
+    // A scope minted by an enclosing withAdmission (reservePoolHostForBoot) reuses its transaction
+    // and lock: admission never re-locks or nests a second admission transaction.
+    const held = ADMISSION_SCOPES.get(db);
+    if (held) return fn(held.tx, held.lock);
     return db.transaction(async (tx) => fn(tx, await takeAdmissionLock(tx)));
 }
+const ADMISSION_SCOPES = new WeakMap<PlacementDb, { tx: PlacementExecutor; lock: AdmissionLock }>();
 
 /** Reserve the host and its boot authority before admission's transaction commits.
  * Admission remains the only ticket issuer. A failed host reservation rolls back
@@ -565,19 +570,25 @@ export function reservePoolHostForBoot(
     db: PlacementDb,
     admit: (db: PlacementDb) => Promise<import('./admission').AdmissionOutcome>,
     fieldsFor: (tx: PlacementExecutor, placement: Placement) => Promise<PlacementFields | null>,
-    validate?: (tx: PlacementExecutor, placement: Placement) => Promise<void>,
+    validate?: (tx: PlacementExecutor, placement: Placement, lock: AdmissionLock) => Promise<void>,
+    /** Runs after admission and BEFORE any pool row lease (admission -> computer -> demand -> pool rows). */
+    beforeLease?: (tx: PlacementExecutor, placement: Placement, lock: AdmissionLock) => Promise<void>,
 ): Promise<import('./admission').AdmissionOutcome> {
-    return db.transaction(async tx => {
+    // The admission lock is this transaction's first statement; admission re-asserts it (re-entrant
+    // in the same session) and capacity validation receives the proof for demand reads/writes.
+    return withAdmission(db, async (tx, lock) => {
         const scoped: PlacementDb = { execute: query => tx.execute(query), transaction: fn => fn(tx) };
+        ADMISSION_SCOPES.set(scoped, { tx, lock });
         const result = await admit(scoped);
         if (!result.admitted) return result;
+        await beforeLease?.(tx, result.placement, lock);
         const fields = await fieldsFor(tx, result.placement);
-        if (fields === null) { await validate?.(tx, result.placement); return result; }
+        if (fields === null) { await validate?.(tx, result.placement, lock); return result; }
         const bound = await casInTx(tx, result.placement.computerId, result.placement, result.placement.state,
             { generation: 0, leaseEpoch: 0 }, fields, { ownerUserId: result.placement.ownerUserId,
                 provider: 'aws-ec2', lifecycleJobId: result.placement.lifecycleJobId!, lifecycleDigest: result.placement.lifecycleDigest! });
         if (!bound.ok) throw new Error('pool_reservation_conflict');
-        await validate?.(tx, bound.placement);
+        await validate?.(tx, bound.placement, lock);
         return { admitted: true, placement: bound.placement };
     });
 }
@@ -599,6 +610,30 @@ function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
     if (!lock || typeof lock !== 'object' || MINTED_LOCKS.get(lock) !== tx) {
         throw new Error('admission lock is not held by this transaction');
     }
+}
+/** For other admission-ordered stores (capacity-demand.ts): the same proof check, never a way to mint a lock. */
+export const assertHeldAdmissionLock = assertAdmissionLock;
+/** Capacity demand (aws-pool-demand.ts): unleased, unclaimed ready or booting pool hosts in `region` with no live placement
+ * reference and no other active demand's earmark, row-locked in stable id order (admission -> computer -> demand -> pool rows). */
+export async function lockReclaimablePoolHosts(tx: PlacementExecutor, lock: AdmissionLock, region: string):
+    Promise<{ id: string; generation: number; instanceType: string; state: 'ready' | 'booting' }[]> {
+    assertAdmissionLock(tx, lock);
+    return rowsOf(await tx.execute(sql`/* placement:demand-reclaimable */ SELECT h.id, h.generation, h.instance_type, h.state
+        FROM public.ezil_compute_pool_hosts h
+        WHERE h.region = ${region} AND h.state IN ('ready', 'booting')
+            AND h.leased_computer_id IS NULL AND h.leased_at IS NULL AND h.leased_generation IS NULL AND h.lease_token IS NULL
+            AND h.claim_generation IS NULL AND h.claim_lease_epoch IS NULL AND h.claim_fence IS NULL AND h.claim_volume_serial IS NULL
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.provider = 'aws-ec2'
+                AND p.state NOT IN ('RETIRED', 'PURGE_ELIGIBLE') AND h.instance_id IS NOT NULL AND p.instance_id = h.instance_id)
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands d, jsonb_array_elements(d.cleanup) t
+                WHERE d.closed_at IS NULL AND t->>'poolHostId' = h.id::text)
+        ORDER BY h.id FOR UPDATE OF h`)).map(r => ({ id: String(r.id), generation: Number(r.generation),
+            instanceType: String(r.instance_type), state: r.state === 'ready' ? 'ready' as const : 'booting' as const }));
+}
+/** Admission -> computer lock order for demand writers (aws-pool-demand.ts). */
+export async function lockComputerUnderAdmission(tx: PlacementExecutor, lock: AdmissionLock, computerId: string): Promise<void> {
+    assertAdmissionLock(tx, lock);
+    await lockComputer(tx, canonicalId(computerId));
 }
 
 declare const TICKET_BRAND: unique symbol;
@@ -787,11 +822,18 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
 }
 
 /** A concurrent first open cannot re-pin CF after empty-workspace cutover. */
-export async function pinCloudflarePlacement(db: PlacementDb, computer: { computerId: string; userId: string }): Promise<ResolvedPlacement> {
+export async function pinCloudflarePlacement(db: PlacementDb, computer: { computerId: string; userId: string },
+    options: { honorDemand?: boolean } = {}): Promise<ResolvedPlacement> {
     return db.transaction(async tx => {
         await lockComputer(tx, computer.computerId);
         const existing = await readPlacement(tx, computer.computerId, computer.userId);
         if (existing.record) return existing;
+        // Under the computer lock (demand writers hold it too): an active AWS demand is never re-pinned to Cloudflare.
+        if (options.honorDemand) {
+            const { readActiveDemandForComputer } = await import('./capacity-demand');
+            const demand = await readActiveDemandForComputer(tx, computer.computerId);
+            if (demand && demand.ownerUserId === canonicalId(computer.userId)) return { provider: 'aws-ec2', store: 'ebs', record: null };
+        }
         const { createProviderMigrationStore } = await import('./provider-migrate-store');
         const m = await createProviderMigrationStore(tx).readByComputer(computer.computerId);
         if (m?.userId === computer.userId.toLowerCase() && m.state === 'committed' && m.lastError === 'fresh_provision')
@@ -1646,6 +1688,16 @@ async function readCounters(
               AND (p.owner_user_id = ${input.userId}::uuid
                 OR EXISTS (SELECT 1 FROM public.ezil_compute_usage u WHERE u.computer_id = p.computer_id AND u.user_id = ${input.userId}::uuid))`),
     );
+    // Active capacity demands are promised future liability: every admission (ordinary and image) counts them once,
+    // excluding this computer's own demand, which its own admission consumes. The owner's other demand-holding
+    // computers also hold the one-AWS-computer allowance.
+    const demandRows = rowsOf(
+        await tx.execute(sql`/* placement:count-demand */ SELECT region, count(*)::int AS n, COALESCE(SUM(vcpu), 0)::text AS vcpu,
+                (count(*) FILTER (WHERE owner_user_id = ${input.userId}::uuid))::int AS own
+            FROM public.ezil_compute_capacity_demands
+            WHERE closed_at IS NULL AND expires_at > now() AND computer_id <> ${input.computerId}::uuid
+            GROUP BY region`),
+    );
     const duplicates = await findDuplicatePlacements(tx);
     const usage = await readMonthUsage(tx, input.now, input.monthStart);
     const count = (rows: Record<string, unknown>[]) => {
@@ -1657,7 +1709,7 @@ async function readCounters(
     const runningVcpuByRegion: Record<string, number> = {};
     let runningUnplaced = 0;
     let runningVcpuUnplaced = 0;
-    const runningVcpu = counter(runningRows[0]?.vcpu);
+    let runningVcpu = counter(runningRows[0]?.vcpu);
     if (runningVcpu === null) throw new Error('admission counter query returned no vcpu');
     for (const r of regionRows) {
         const n = counter(r.n);
@@ -1673,19 +1725,27 @@ async function readCounters(
         }
         else throw new Error('admission region counter returned a duplicate or invalid region');
     }
+    let demandRunning = 0, ownDemands = 0;
+    for (const r of demandRows) {
+        const n = counter(r.n), vcpu = counter(r.vcpu), own = counter(r.own);
+        if (n === null || vcpu === null || own === null || typeof r.region !== 'string') throw new Error('admission demand counter invalid');
+        runningByRegion[r.region] = (runningByRegion[r.region] ?? 0) + n;
+        runningVcpuByRegion[r.region] = (runningVcpuByRegion[r.region] ?? 0) + vcpu;
+        runningVcpu += vcpu; demandRunning += n; ownDemands += own;
+    }
     const owner = ownerRows[0];
     return {
         targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
         targetPlacementOwnerId: target.record?.ownerUserId ?? null,
         targetDeleted: owner?.deleted === true,
         targetForeignUsage: count(foreignRows),
-        runningCount: count(runningRows),
+        runningCount: count(runningRows) + demandRunning,
         runningVcpu,
         runningByRegion,
         runningUnplaced,
         runningVcpuByRegion,
         runningVcpuUnplaced,
-        userOtherAwsComputers: count(userRows),
+        userOtherAwsComputers: count(userRows) + ownDemands,
         duplicates,
         usage,
     };

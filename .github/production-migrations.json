@@ -50,6 +50,11 @@
       "path": "app/drizzle/0008_pool_dispatch.sql",
       "sha256": "df828c288e32608131ed13d3eb144e6e3c25dcea92c4a3b6fd10c09b4f87cca0",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0009_capacity_demands.sql",
+      "sha256": "d52111be3828a0712d0136c0755894013c4e90797d2e42e48281f42fd245511d",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

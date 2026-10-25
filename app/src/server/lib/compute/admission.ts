@@ -175,7 +175,7 @@ export type AdmissionRequest =
 
 export type AdmissionOutcome =
     | { admitted: true; placement: Placement }
-    | { admitted: false; reason: AdmissionRefusal | 'cas_conflict' | 'placement_exists'; reasons?: AdmissionRefusal[] };
+    | { admitted: false; reason: AdmissionRefusal | 'cas_conflict' | 'placement_exists' | 'capacity_waiting'; reasons?: AdmissionRefusal[] };
 
 export interface AdmissionDeps {
     env?: Env;

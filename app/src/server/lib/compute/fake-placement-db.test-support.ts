@@ -72,6 +72,8 @@ export interface FakeSeed {
     imageJobs?: Row[];
     usage?: Row[];
     computers?: { id: string; user_id: string; deleted_at?: Date | null; created_at?: Date }[];
+    /** ezil_compute_capacity_demands rows (capacity-demand.ts). */
+    demands?: Row[];
 }
 
 export interface FakeOptions {
@@ -125,6 +127,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     const imageJobs: Row[] = (seed.imageJobs ?? []).map(r => ({ ...r }));
     const usage: Row[] = (seed.usage ?? []).map((r) => ({ ...r }));
     const computers = seed.computers ?? [];
+    const demands: Row[] = (seed.demands ?? []).map(r => ({ ...r }));
     const statements: Statement[] = [];
     const locks = new Map<string, Mutex>();
     let txSeq = 0;
@@ -170,9 +173,76 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         if (text.startsWith('SELECT lower_image_digest')) return { rows: placements.filter(r => r.computer_id === params[0]
             && r.generation === params[1] && r.lease_epoch === params[2] && r.enroll_consumed_hash === params[3]
             && r.image_upgrade_job_id == null).map(r => ({ lower_image_digest: r.lower_image_digest })) };
+        const demandTag = text.match(/\/\* demand:([a-z]+) \*\//)?.[1];
+        if (demandTag) {
+            // In-memory capacity demands: the statement shapes capacity-demand.ts issues, under the same clock.
+            const now = clock().getTime(), active = (d: Row) => d.closed_at == null;
+            const close = (d: Row, state: string) => { const before = { ...d }; Object.assign(d, { state, closed_at: clock(), revision: Number(d.revision) + 1 });
+                tx?.undo.push(() => Object.assign(d, before)); return d; };
+            switch (demandTag) {
+                case 'peek': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d) && new Date(d.expires_at as string).getTime() > now).slice(0, 2) };
+                case 'computer': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d)) };
+                case 'region': return { rows: demands.filter(d => d.region === params[0] && active(d)) };
+                case 'expire': return { rows: demands.filter(d => active(d) && new Date(d.expires_at as string).getTime() <= now).map(d => close(d, 'expired')) };
+                case 'orphan': return { rows: demands.filter(d => active(d) && !computers.some(c => uuidEq(c.id, d.computer_id)
+                    && uuidEq(c.user_id, d.owner_user_id) && c.deleted_at == null)).map(d => close(d, 'cancelled')) };
+                case 'close': {
+                    const d = demands.find(x => x.id === params[1] && Number(x.revision) === Number(params[2]) && active(x));
+                    return { rows: d ? [close(d, String(params[0]))] : [] };
+                }
+                case 'insert': {
+                    const [request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest,
+                        source_generation, source_lease_epoch, cleanup, ttl] = params as unknown[];
+                    if (demands.some(d => active(d) && (d.region === region || uuidEq(d.computer_id, computer_id) || uuidEq(d.owner_user_id, owner_user_id))))
+                        throw new Error('fake db: duplicate key value violates unique constraint (active demand)');
+                    const row: Row = { id: `00000000-0000-4000-8000-${String(demands.length + 1).padStart(12, '0')}`, request_id, owner_user_id,
+                        computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest, source_generation, source_lease_epoch,
+                        state: 'active', revision: 1, cleanup: JSON.parse(String(cleanup)), created_at: clock(),
+                        expires_at: new Date(now + Number(ttl) * 1000), closed_at: null };
+                    demands.push(row); tx?.undo.push(() => { demands.splice(demands.indexOf(row), 1); });
+                    return { rows: [row] };
+                }
+                case 'cleanup': {
+                    const d = demands.find(x => x.id === params[1] && Number(x.revision) === Number(params[2]) && active(x));
+                    if (!d) return { rows: [] };
+                    const before = { ...d }; Object.assign(d, { cleanup: JSON.parse(String(params[0])), revision: Number(d.revision) + 1 });
+                    tx?.undo.push(() => Object.assign(d, before)); return { rows: [d] };
+                }
+                case 'terminal': {
+                    const [computerId, kind, gen, epoch] = params as unknown[];
+                    const same = (d: Row) => uuidEq(d.computer_id, computerId) && d.kind === kind
+                        && (d.source_generation ?? null) === (gen ?? null) && (d.source_lease_epoch ?? null) === (epoch ?? null);
+                    const cancelledAfter = (d: Row) => demands.some(c => uuidEq(c.computer_id, d.computer_id) && c.state === 'cancelled'
+                        && new Date(c.closed_at as string).getTime() >= new Date(d.closed_at as string).getTime());
+                    return { rows: demands.filter(d => same(d) && d.state === 'expired' && !cancelledAfter(d)).slice(0, 1) };
+                }
+                case 'cancelexpired': {
+                    const [computerId, owner] = params as unknown[];
+                    const expired = demands.filter(d => uuidEq(d.computer_id, computerId) && uuidEq(d.owner_user_id, owner) && d.state === 'expired'
+                        && !demands.some(c => uuidEq(c.computer_id, d.computer_id) && c.state === 'cancelled'
+                            && new Date(c.closed_at as string).getTime() >= new Date(d.closed_at as string).getTime()))
+                        .sort((a, b) => new Date(b.closed_at as string).getTime() - new Date(a.closed_at as string).getTime())[0];
+                    if (!expired) return { rows: [] };
+                    const row: Row = { ...expired, id: `00000000-0000-4000-8000-${String(demands.length + 1).padStart(12, '0')}`, state: 'cancelled',
+                        cleanup: [], created_at: clock(), expires_at: new Date(now + 1000), closed_at: clock(), revision: 1 };
+                    demands.push(row); tx?.undo.push(() => { demands.splice(demands.indexOf(row), 1); });
+                    return { rows: [{ id: row.id }] };
+                }
+                default: throw new Error(`fake db: unsupported demand statement ${demandTag}`);
+            }
+        }
         const tag = imageTable && text.startsWith('INSERT') ? 'insert' : imageTable && text.startsWith('UPDATE') ? 'cas'
             : text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
         switch (tag) {
+            case 'demand-reclaimable':
+                return { rows: [] };
+            case 'count-demand': {
+                const [userId, computerId] = params as string[];
+                const live = demands.filter(d => d.closed_at == null && new Date(d.expires_at as string).getTime() > clock().getTime() && !uuidEq(d.computer_id, computerId));
+                const regions = [...new Set(live.map(d => String(d.region)))];
+                return { rows: regions.map(region => { const r = live.filter(d => d.region === region);
+                    return { region, n: r.length, vcpu: String(r.reduce((x, d) => x + Number(d.vcpu), 0)), own: r.filter(d => uuidEq(d.owner_user_id, userId)).length }; }) };
+            }
             case 'image-reservation':
                 return { rows: placements.filter(r => r.image_upgrade_job_id != null && r.computer_id === params[0]).map(r => ({ job_id: r.image_upgrade_job_id })) };
             case 'lock-computer':
@@ -463,5 +533,5 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         },
     };
 
-    return { db, placements, imageJobs, usage, statements, runningExcluded: RUNNING_EXCLUDED };
+    return { db, placements, imageJobs, usage, demands, statements, runningExcluded: RUNNING_EXCLUDED };
 }

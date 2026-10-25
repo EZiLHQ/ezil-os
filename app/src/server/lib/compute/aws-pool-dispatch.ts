@@ -62,7 +62,7 @@ export function createPoolDispatchStore(db: PlacementDb, env: Env,
                     && demand.activeStandard + demand.activePremium > 0
                     && c.region === 'ap-south-1' && POOL_TYPES.includes(c.instanceType)
                     && Number.isSafeInteger(migrations) && migrations >= 0
-                    && demand.vcpuInUse + migrations * 2 + instanceVcpu(c.instanceType) <= demand.regionVcpuCap, 503);
+                    && demand.vcpuInUse + (demand.demandVcpu ?? 0) + migrations * 2 + instanceVcpu(c.instanceType) <= demand.regionVcpuCap, 503);
                 const id = randomUUID();
                 const inserted = rows(await tx.execute(sql`INSERT INTO public.ezil_compute_pool_hosts
                     (id, generation, region, zone_id, instance_type, state, health, created_at, updated_at)

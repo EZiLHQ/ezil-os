@@ -16,6 +16,10 @@ export interface PoolHostRow {
 export interface PoolDemand {
     pending?: number; opens15m: number; activeStandard: number; activePremium: number; bootMinutes: number | null;
     ready?: number; spares: number; vcpuInUse: number; regionVcpuCap: number; killSwitch: boolean;
+    /** Active capacity demands' reserved vCPU in this region (capacity-demand.ts). Future demand, not physical liability. */
+    demandVcpu?: number;
+    /** Pool hosts an active demand needs gone: never adopted, retired once their provision settles. */
+    earmarked?: string[];
     idleReady: { poolHostId: string; readyAt: Date; obsolete?: boolean; unusable?: boolean }[];
     booting: { poolHostId: string; createdAt: Date }[];
 }
@@ -52,7 +56,7 @@ function compatibleDeployment(c: PoolClass) {
     return c.deployment ? sql`(lifecycle_input::jsonb->>'document')::jsonb->'deployment' = ${JSON.stringify({...c.deployment, storage: {rootDeviceName:'/dev/sda1', ...c.deployment.storage}})}::jsonb` : sql`TRUE`;
 }
 /** Identical readiness predicate for leasing and counting usable warm capacity. */
-function usableReady(at: string) {
+function usableReady(at: string, host: ReturnType<typeof sql> = sql`ezil_compute_pool_hosts.id`) {
     return sql`state = 'ready' AND health = 'healthy'
                 AND instance_id IS NOT NULL
                 AND editor_ready_at IS NOT NULL AND editor_ready_at <= ${at}::timestamptz
@@ -60,7 +64,9 @@ function usableReady(at: string) {
                 AND enrolled_at > ${at}::timestamptz - interval '10 minutes' AND enrolled_at <= ${at}::timestamptz
                 AND generation > 0 AND generation <= ${Number.MAX_SAFE_INTEGER}
                 AND leased_computer_id IS NULL AND leased_at IS NULL
-                AND leased_generation IS NULL AND lease_token IS NULL`;
+                AND leased_generation IS NULL AND lease_token IS NULL
+                AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands demand, jsonb_array_elements(demand.cleanup) target
+                    WHERE demand.closed_at IS NULL AND target->>'poolHostId' = (${host})::text)`;
 }
 const date = (value: unknown) => value == null ? null : new Date(value as string | Date);
 const nullableString = (value: unknown) => value == null ? null : String(value);
@@ -182,7 +188,7 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     const pending = count(d.pending ?? 0);
     const eligible = d.activeStandard + d.activePremium > 0;
     const desired = eligible ? Math.min(policy.maxSpares, Math.max(policy.minSpares, base, recent, pending + policy.minSpares)) : 0;
-    const capacity = Math.floor((d.regionVcpuCap - d.vcpuInUse) / instanceVcpu(c.instanceType)) + d.spares;
+    const capacity = Math.floor((d.regionVcpuCap - d.vcpuInUse - count(d.demandVcpu ?? 0)) / instanceVcpu(c.instanceType)) + d.spares;
     const target = d.killSwitch ? 0 : Math.max(0, Math.min(desired, capacity));
     const excess = Math.max(0, d.spares - target);
     const aged = d.idleReady.filter(h => d.killSwitch || now.getTime() - h.readyAt.getTime() > 30 * MINUTE)
@@ -195,18 +201,12 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     return { target, provision: Math.min(2, Math.max(0, target - d.spares)), retire, fail };
 }
 
-/** One snapshot: billing epochs measure recent demand, never subscription eligibility.
- * Paid subscribers use their stored size selection and sticky placement zone; new users default to Mumbai.
- * Hosts linked to a live placement count only once in regional capacity, including during adoption.
- */
-export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: Date): Promise<PoolDemand> {
-    checkClass(c);
-    const at = now.toISOString();
-    const vcpu = (column: ReturnType<typeof sql>) => sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU)
-        .map(([type, n]) => sql`WHEN ${type} THEN ${n}::int`), sql` `)} ELSE 8 END`;
-    const running = sql.join(RUNNING_CLASS_STATES.map(state => sql`${state}`), sql`, `);
-    const row = rowsOf(await db.execute(sql`
-        WITH effective AS (
+/** The paid-pool eligibility CTEs (effective subscription per user, then eligible), shared by demand planning and
+ * capacity-demand reauthorization. `user` narrows to one subject. Ends inside the WITH list (caller continues it). */
+function eligibleCtes(at: string, user?: string) {
+    const only = user ? sql` AND s.user_id = ${user}::uuid` : sql``;
+    return sql`
+        effective AS (
             SELECT DISTINCT ON (s.user_id) s.user_id, s.sku, s.status, s.stripe_subscription_id, s.current_period_start, s.current_period_end,
                 CASE WHEN s.sku = 'standard_monthly_v3' THEN 'm6i.large'
                     WHEN pref.size = 'cmp-4' THEN 'm6i.xlarge'
@@ -214,7 +214,7 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
             FROM public.ezil_billing_subscriptions s
             JOIN auth.users u ON u.id = s.user_id
             LEFT JOIN public.ezil_billing_size_preferences pref ON pref.user_id = s.user_id
-            WHERE s.status IN ('active','trialing') AND s.sku IN ('standard_monthly_v3', 'premium_monthly_v3',
+            WHERE s.status IN ('active','trialing')${only} AND s.sku IN ('standard_monthly_v3', 'premium_monthly_v3',
                 'standard_monthly_v2','compute_monthly_v2','pro_monthly_v1')
                 AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
                 AND s.current_period_start <= ${at}::timestamptz AND s.current_period_end > ${at}::timestamptz
@@ -229,7 +229,30 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
                 AND NOT EXISTS (SELECT 1 FROM public.ezil_billing_payment_issues issue
                     WHERE issue.user_id = s.user_id AND issue.subscription_id = s.stripe_subscription_id
                         AND issue.invoice_kind = 'subscription' AND issue.resolved_at IS NULL AND issue.issue <> 'voided')
-        ), subscribers AS (
+        )`;
+}
+/** Capacity-demand reauthorization: the owner's paid-pool eligibility right now (active v3 period, compute grant, no
+ * open payment issue, live auth user) and the instance type their CURRENT plan/size selection resolves to — the same
+ * predicate and mapping pool planning uses. null when not eligible. */
+export async function readPaidPoolEligibility(db: PlacementExecutor, userId: string, now: Date): Promise<{ instanceType: string } | null> {
+    const at = now.toISOString();
+    const rows = rowsOf(await db.execute(sql`WITH ${eligibleCtes(at, userId)} SELECT instance_type FROM eligible`));
+    if (rows.length > 1) throw new Error('pool_eligibility_ambiguous');
+    return rows[0] ? { instanceType: String(rows[0].instance_type) } : null;
+}
+
+/** One snapshot: billing epochs measure recent demand, never subscription eligibility.
+ * Paid subscribers use their stored size selection and sticky placement zone; new users default to Mumbai.
+ * Hosts linked to a live placement count only once in regional capacity, including during adoption.
+ */
+export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: Date): Promise<PoolDemand> {
+    checkClass(c);
+    const at = now.toISOString();
+    const vcpu = (column: ReturnType<typeof sql>) => sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU)
+        .map(([type, n]) => sql`WHEN ${type} THEN ${n}::int`), sql` `)} ELSE 8 END`;
+    const running = sql.join(RUNNING_CLASS_STATES.map(state => sql`${state}`), sql`, `);
+    const row = rowsOf(await db.execute(sql`
+        WITH ${eligibleCtes(at)}, subscribers AS (
             SELECT s.* FROM eligible s WHERE s.instance_type = ${c.instanceType}
                 AND (EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.owner_user_id = s.user_id
                     AND p.provider = 'aws-ec2' AND p.region = ${c.region} AND p.zone_id = ${c.zoneId}
@@ -264,18 +287,22 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
             (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (ready_at - created_at)) / 60)
                 FROM class_hosts WHERE ready_at > ${at}::timestamptz - interval '24 hours'
                     AND ready_at <= ${at}::timestamptz AND ready_at > created_at) AS boot_minutes,
-            (SELECT count(*) FROM class_hosts WHERE state = 'booting' OR (${usableReady(at)})) AS spares,
-            (SELECT count(*) FROM class_hosts WHERE ${usableReady(at)}) AS ready,
+            (SELECT count(*) FROM class_hosts WHERE state = 'booting' OR (${usableReady(at, sql`class_hosts.id`)})) AS spares,
+            (SELECT count(*) FROM class_hosts WHERE ${usableReady(at, sql`class_hosts.id`)}) AS ready,
             COALESCE((SELECT sum(${vcpu(sql`instance_type`)}) FROM live_placements), 0)
                 + COALESCE((SELECT sum(${vcpu(sql`h.instance_type`)}) FROM public.ezil_compute_pool_hosts h
                     WHERE h.region = ${c.region} AND h.state <> 'retired'
                         AND NOT EXISTS (SELECT 1 FROM live_placements p WHERE p.instance_id = h.instance_id
                             OR (p.computer_id = h.leased_computer_id AND p.instance_id IS NULL))), 0) AS vcpu,
-            (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'readyAt', ready_at, 'obsolete', NOT compatible, 'unusable', NOT COALESCE((${usableReady(at)}),false))), '[]')
+            (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'readyAt', ready_at, 'obsolete', NOT compatible, 'unusable', NOT COALESCE((${usableReady(at, sql`all_class_hosts.id`)}),false))), '[]')
                 FROM all_class_hosts WHERE state = 'ready' AND leased_at IS NULL AND leased_computer_id IS NULL AND ready_at IS NOT NULL) AS idle_ready,
             (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'createdAt', created_at)), '[]')
                 FROM all_class_hosts WHERE state = 'booting' AND leased_computer_id IS NULL AND leased_at IS NULL
-                    AND claim_generation IS NULL AND claim_lease_epoch IS NULL AND claim_fence IS NULL AND claim_volume_serial IS NULL) AS booting
+                    AND claim_generation IS NULL AND claim_lease_epoch IS NULL AND claim_fence IS NULL AND claim_volume_serial IS NULL) AS booting,
+            COALESCE((SELECT sum(demand.vcpu) FROM public.ezil_compute_capacity_demands demand
+                WHERE demand.region = ${c.region} AND demand.closed_at IS NULL AND demand.expires_at > ${at}::timestamptz), 0) AS demand_vcpu,
+            (SELECT COALESCE(json_agg(target->>'poolHostId'), '[]') FROM public.ezil_compute_capacity_demands demand, jsonb_array_elements(demand.cleanup) target
+                WHERE demand.region = ${c.region} AND demand.closed_at IS NULL) AS earmarked
     `))[0];
     if (!row) throw new Error('pool_demand_missing');
     const regions = readAwsRegions(process.env);
@@ -284,6 +311,7 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
         pending: count(row.pending ?? 0), opens15m: count(row.opens), activeStandard: count(row.standard), activePremium: count(row.premium),
         bootMinutes: row.boot_minutes == null ? null : Number(row.boot_minutes), spares: count(row.spares), ready: count(row.ready ?? 0),
         vcpuInUse: count(row.vcpu), regionVcpuCap, killSwitch: process.env.EZIL_AWS_KILL_SWITCH === '1',
+        demandVcpu: count(row.demand_vcpu ?? 0), earmarked: ((row.earmarked ?? []) as unknown[]).map(String),
         idleReady: (row.idle_ready as { poolHostId: string; readyAt: string; obsolete?: boolean; unusable?: boolean }[]).map(h => ({ poolHostId:h.poolHostId, readyAt: new Date(h.readyAt), ...(h.obsolete ? {obsolete:true} : {}), ...(h.unusable ? {unusable:true} : {}) })),
         booting: (row.booting as { poolHostId: string; createdAt: string }[]).map(h => ({ ...h, createdAt: new Date(h.createdAt) })),
     };

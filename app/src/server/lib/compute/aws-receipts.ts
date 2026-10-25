@@ -123,7 +123,14 @@ export type { PoolClass, PoolHostRow } from './ready-pool';
 import type { PoolClass } from './ready-pool';
 export interface PoolDeps {
     readyAt?: typeof import('./ready-pool').readPoolSessionReadyAt;
-    validateCapacity?(tx: PlacementExecutor, p: Placement): Promise<void>;
+    /** Throws PoolCapacityPressure when only capacity refuses; consumes the computer's own demand once it fits. */
+    validateCapacity?(tx: PlacementExecutor, p: Placement, lock: import('./placement').AdmissionLock,
+        own?: import('./capacity-demand').CapacityDemand | null): Promise<void>;
+    /** Lock this computer's active demand and return it only if live (DB clock) and bound to this exact open. */
+    claimDemand?(tx: PlacementExecutor, p: Placement, lock: import('./placement').AdmissionLock,
+        binding: { kind: 'create' | 'wake'; source: { generation: number; leaseEpoch: number } | null; deploymentDigest: string }): Promise<import('./capacity-demand').CapacityDemand | null>;
+    /** After a PoolCapacityPressure rollback: reserve durable demand, or report why not (never launches). */
+    reserveDemand?(request: import('./aws-pool-demand').DemandRequest): Promise<import('./aws-pool-demand').DemandOutcome>;
     leasePoolHost: typeof import('./ready-pool').leasePoolHost;
     retireLease?: typeof import('./ready-pool').retirePoolLease;
     publishPoolClaim: typeof import('./ready-pool').publishPoolClaim;

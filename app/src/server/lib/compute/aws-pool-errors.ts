@@ -1,6 +1,11 @@
 export class PoolError extends Error {
     constructor(readonly status: number, code: string) { super(code); }
 }
+/** Admission could not fit this open only because of capacity; the open may reserve demand
+ * (capacity-demand.ts) instead of failing. Same code/status as the original guard. */
+export class PoolCapacityPressure extends PoolError {
+    constructor(readonly target: { computerId: string; region: string; zoneId: string; instanceType: string }) { super(503, 'open_pool_capacity'); }
+}
 /** Named guards are individually removed by the offline mutation check. */
 export function poolGuard(name: string, allowed: unknown, status = 403): asserts allowed {
     if (!allowed) throw new PoolError(status, name);

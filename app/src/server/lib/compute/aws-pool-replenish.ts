@@ -3,7 +3,8 @@ import { sql } from 'drizzle-orm';
 import type { LifecycleStarter } from './aws-ec2';
 import { buildLifecycleWork, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import { startLifecycleJob } from './aws-receipts';
-import type { PlacementDb, PlacementExecutor } from './placement';
+import { withAdmission, type AdmissionLock, type PlacementDb, type PlacementExecutor } from './placement';
+import { closeExpiredDemands, closeOrphanedDemands, lockRegionDemands, updateDemandCleanup } from './capacity-demand';
 import { instanceVcpu } from './aws-config';
 import { poolGuard } from './aws-pool-errors';
 import type { PoolClass, PoolData, PoolHostRow, PoolReadinessDiagnostic } from './ready-pool';
@@ -30,20 +31,24 @@ export interface PoolPassRecord {
 export interface PoolReplenishDeps {
     db: PlacementDb; data: PoolData; store: PoolDispatchStore; starter: LifecycleStarter;
     classes: PoolClass[]; deployments: Record<string, LifecycleDeployment>; now(): Date;
-    withLock<T>(run: (tx?: PlacementExecutor) => Promise<T>): Promise<T | null>;
+    withLock<T>(run: (tx?: PlacementExecutor, lock?: AdmissionLock) => Promise<T>): Promise<T | null>;
     log(record: PoolPassRecord): void;
     sleep?: (ms: number) => Promise<void>;
 }
 /** Transaction lock works through transaction poolers; the transaction stays open
- * throughout demand reads and reservations. Dispatch begins after commit. */
-export function withPoolReplenishLock<T>(db: PlacementDb, run: (tx?: PlacementExecutor) => Promise<T>): Promise<T | null> {
-    return db.transaction(async tx => {
+ * throughout demand reads and reservations. Dispatch begins after commit. The global
+ * admission lock is taken FIRST (admission -> computer -> demand -> pool rows), so
+ * replenishment and demand reservation never lock pool rows in opposite orders. */
+export function withPoolReplenishLock<T>(db: PlacementDb, run: (tx?: PlacementExecutor, lock?: AdmissionLock) => Promise<T>): Promise<T | null> {
+    return withAdmission(db, async (tx, lock) => {
         const result = await tx.execute(sql`SELECT pg_try_advisory_xact_lock(1163554896, 0) AS locked`);
         const rows = Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows;
         poolGuard('replenish_locked', (rows?.[0] as { locked?: boolean } | undefined)?.locked === true, 204);
-        return run(tx);
+        return run(tx, lock);
     });
 }
+/** Reserved demand is future liability for planning: fold it into the in-use vCPU exactly once. */
+const withDemand = <D extends { vcpuInUse: number; demandVcpu?: number }>(d: D): D => ({ ...d, vcpuInUse: d.vcpuInUse + (d.demandVcpu ?? 0), demandVcpu: 0 });
 export function poolWork(c: PoolClass, d: LifecycleDeployment, operation: 'pool-provision' | 'pool-retire', host: PoolHostRow): LifecycleWork {
     poolGuard('work_class', host.region === c.region && host.zoneId === c.zoneId && host.instanceType === c.instanceType
         && d.region === c.region && d.zoneId === c.zoneId);
@@ -57,14 +62,17 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
     await deps.store.reconcile?.();
     const records: PoolPassRecord[] = [];
     let prepared;
-    try { prepared = await deps.withLock(async locked => {
+    try { prepared = await deps.withLock(async (locked, lock) => {
         let provisionBudget = 2, retireBudget = 2;
+        // Demand hygiene under the same admission-ordered transaction: fixed DB-clock expiry, and
+        // demands whose computer was deleted or changed hands are cancelled (committed retirements continue).
+        if (locked && lock) { await closeExpiredDemands(locked, lock); await closeOrphanedDemands(locked, lock); }
         const jobs: { work: LifecycleWork; record: PoolPassRecord }[] = [];
         const reservedRetirements = new Set<string>();
         const db = locked ?? deps.db;
         // Protect per-shape minimums before weighted/recent-demand surplus. Snapshots
         // choose priority only; demand/capacity are reread after earlier reservations.
-        const snapshots = await Promise.all(deps.classes.map(async c => ({c, demand:await deps.data.readPoolDemand(db,c,deps.now()), minimum:0})));
+        const snapshots = await Promise.all(deps.classes.map(async c => ({c, demand:withDemand(await deps.data.readPoolDemand(db,c,deps.now())), minimum:0})));
         const floorCapacity = new Map<string,number>();
         for (const s of snapshots) {
             const reservedSpares=snapshots.filter(p=>p.c.region===s.c.region)
@@ -78,7 +86,7 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
         snapshots.sort((a,b)=>Number(b.minimum>b.demand.spares)-Number(a.minimum>a.demand.spares));
         for (const snapshot of snapshots) {
             const {c}=snapshot, now=deps.now();
-            const demand = await deps.data.readPoolDemand(db, c, now);
+            const raw = await deps.data.readPoolDemand(db, c, now), demand = withDemand(raw);
             const peers=snapshots.filter(s=>s.c.region===c.region);
             const floorMissing=peers.some(s=>!s.demand.killSwitch && s.demand.activeStandard+s.demand.activePremium>0
                 && (deps.data.POOL_POLICY[`${s.c.region}:${s.c.instanceType}`]?.minSpares ?? 0)>0 && s.demand.spares<1);
@@ -104,11 +112,12 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
                 base: Math.ceil(.04 * demand.activeStandard + .10 * demand.activePremium), spares: demand.spares, provisioned: 0, retired: 0,
                 retirements: [], slowHosts: await deps.data.readPoolReadinessDiagnostics(db, c, now) };
             records.push(record);
-            const reserve = async (operation: 'pool-provision' | 'pool-retire', id?: string) => {
+            const reserve = async (operation: 'pool-provision' | 'pool-retire', id?: string,
+                from: import('./ready-pool').PoolHostState[] = ['ready', 'failed', 'retiring']) => {
                 if (id && reservedRetirements.has(id)) return false;
                 const prepare = async (tx: PlacementExecutor) => {
                     if (id && deps.store.canRetire && !await deps.store.canRetire(tx, id)) return null;
-                    const host = id ? await deps.data.markPoolHost(tx, id, ['ready', 'failed', 'retiring'], 'retiring', now) : undefined;
+                    const host = id ? await deps.data.markPoolHost(tx, id, from, 'retiring', now) : undefined;
                     if (id && !host) return null;
                     return deps.store.prepare(tx, c, operation, h => poolWork(c, deps.deployments[c.region]!, operation, h), host ?? undefined);
                 };
@@ -124,6 +133,21 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
             // Reserve all stranded retirements under the same lock. Active/unknown
             // jobs retain their stored identity and are handled by reconcile().
             for (const id of await deps.store.retirementCandidates?.(db, c, 'retiring') ?? []) await reserve('pool-retire', id);
+            // A demand's earmarked booting host whose provision settled (ready/failed) is retired now: the demand's
+            // pressure exception to the floor and the 30-minute idle age. Its retirement job is bound to the demand.
+            if (locked && lock) for (const d of await lockRegionDemands(locked, lock, c.region)) {
+                let cleanup = d.cleanup, changed = false;
+                for (const t of d.cleanup) {
+                    // Retire once provision settled with an instance identity (canRetire), ready or not: never wait
+                    // for readiness or the boot timeout. Pending/unknown provision jobs are left untouched.
+                    if (t.phase !== 'booting' || t.instanceType !== c.instanceType || reservedRetirements.has(t.poolHostId)) continue;
+                    if (!deps.store.canRetire || !await deps.store.canRetire(locked, t.poolHostId)) continue;
+                    if (!await reserve('pool-retire', t.poolHostId, ['booting', 'ready', 'failed'])) continue;
+                    const job = record.retirements.find(x => x.poolHostId === t.poolHostId)?.jobId ?? null;
+                    cleanup = cleanup.map(x => x.poolHostId === t.poolHostId ? { ...x, phase: 'retiring' as const, jobId: job } : x); changed = true;
+                }
+                if (changed) poolGuard('replenish_demand_cleanup', await updateDemandCleanup(locked, lock, d, cleanup), 503);
+            }
             for (const id of plan.fail) await deps.data.markPoolHost(db, id, ['booting'], 'failed', now);
             const failed = await deps.store.retirementCandidates?.(db, c, 'failed') ?? [];
             for (const id of new Set([...failed, ...plan.fail, ...plan.retire])) {
