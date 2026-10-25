@@ -164,7 +164,7 @@ describe('replace after a pool release that never launched (1.0.16 canary)', () 
         ['a negative predecessor', h => h.map(e => e.id === 3 ? { ...e, previousEventId: -1 } : e)],
         ['a forward predecessor', h => h.map(e => e.id === 3 ? { ...e, previousEventId: 3 } : e)],
         ['a first event with a predecessor', h => h.map(e => e.id === 1 ? { ...e, previousEventId: 1 } : e)],
-        ['an entered state without a name', h => h.map(e => e.id === 4 ? { ...e, stateEnteredEventDetails: {} } : e)],
+        ['an entered state without a name', h => h.map(e => e.id === 4 ? { ...e, stateEnteredEventDetails: {} as HistoryEvent['stateEnteredEventDetails'] } : e)],
         ['an exited state without a name', h => h.map(e => e.id === 8 ? { ...e, stateExitedEventDetails: undefined } : e)],
         ['an orphan runInstances exit', h => h.map(e => e.id === 8 ? { ...e, stateExitedEventDetails: { name: 'runInstances' } } : e)],
         ['a runInstances entry', h => h.map(e => e.id === 4 ? { ...e, stateEnteredEventDetails: { name: 'runInstances' } } : e)],
@@ -197,7 +197,7 @@ describe('replace after a pool release that never launched (1.0.16 canary)', () 
         ['a source in another zone', s => { s.source.availabilityZoneId = 'use1-az1'; }],
         ['a released source with a foreign cold-launch alias', s => { s.source.tags = { ...s.source.tags, 'ezil:computer-id': '22222222-2222-4222-8222-222222222222' }; }],
         ['a released source still pooled', s => { s.source.tags = { ...s.source.tags, 'ezil:pool': '1' }; }],
-        ['a released source without pool-host', s => { const { ['ezil:pool-host']: _gone, ...rest } = s.source.tags; s.source.tags = rest; }],
+        ['a released source without pool-host', s => { s.source.tags = Object.fromEntries(Object.entries(s.source.tags).filter(([k]) => k !== 'ezil:pool-host')); }],
         ['a released source with another fence', s => { s.source.tags = { ...s.source.tags, 'ezil:fence': '22222222-2222-4222-8222-222222222222' }; }],
         ['a released source in another namespace', s => { s.source.tags = { ...s.source.tags, 'ezil:namespace': 'other' }; }],
         // A fully valid terminated writer (job client token, target tags, account) still contradicts the no-launch proof.
