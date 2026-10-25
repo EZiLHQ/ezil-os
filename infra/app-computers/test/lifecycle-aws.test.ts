@@ -40,6 +40,65 @@ test('actual lifecycle read clients serialize bounded requests and sign the appl
     assert.equal((await deps.template(f.i.deployment.launchTemplateId,'1'))?.VersionNumber,1);
     assert.deepEqual(calls,['DescribeExecution','GetSecretValue','DescribeInstances','DescribeVolumes','DescribeImages','DescribeLaunchTemplateVersions']);
 });
+
+test('authority secret cache expires at 60 seconds including fetch time; every check signs and POSTs live', async t => {
+    const f = lifecycleFixture(), start = Date.now();
+    let now = start, reads = 0, posts = 0, key = 'ab'.repeat(32), signingKey = key, allowed = true;
+    t.mock.method(Date, 'now', () => now);
+    const deps = awsDependencies(f.settings, { credentials, requestHandler: { async handle(r: any) {
+        assert.equal(r.headers['x-amz-target'].split('.').at(-1), 'GetSecretValue');
+        assert.deepEqual(JSON.parse(String(r.body)), { SecretId: f.settings.authoritySecretArn, VersionStage: 'AWSCURRENT' });
+        reads++; signingKey = key; now += 2000;
+        return json({ ARN: f.settings.authoritySecretArn, SecretString: key, VersionStages: ['AWSCURRENT'] });
+    } }, fetcher: (async (url, init) => {
+        posts++;
+        assert.equal(url, f.settings.authorityOrigin + AUTHORITY_PATH); assert.equal(init!.method, 'POST');
+        assert.equal(init!.redirect, 'error');
+        const headers = new Headers(init!.headers), timestamp = String(Math.floor(now / 1000)), body = String(init!.body);
+        assert.equal(headers.get('x-ezil-workflow-timestamp'), timestamp);
+        const signature = createHmac('sha256', Buffer.from(signingKey, 'hex')).update([
+            'ezil-lifecycle-authority-v1', 'POST', AUTHORITY_PATH, timestamp, createHash('sha256').update(body).digest('hex'),
+        ].join('\n')).digest('hex');
+        assert.equal(headers.get('x-ezil-workflow-signature'), signature);
+        return allowed ? Response.json({ authorized: true, ...JSON.parse(body) }) : Response.json({}, { status: 403 });
+    }) as typeof fetch });
+    assert.equal(await deps.authority(f.i, f.digest), true); assert.equal(reads, 1); assert.equal(posts, 1);
+    // Rotation is visible at expiry, while revocation is checked live even with a cached key.
+    key = 'cd'.repeat(32); allowed = false; now = start + 59999;
+    assert.equal(await deps.authority(f.i, f.digest), false); assert.equal(reads, 1); assert.equal(posts, 2);
+    allowed = true;
+    assert.equal(await deps.imageAuthority!({ schemaVersion: 1, computerId: f.i.computerId, jobId: f.i.jobId,
+        leaseEpoch: f.i.leaseEpoch, digest: f.digest, imageJobId: f.i.jobId, imageJobPhase: 'launch' }), true);
+    assert.equal(reads, 1); assert.equal(posts, 3);
+    now = start + 60000;
+    assert.equal(await deps.authority(f.i, f.digest), true); assert.equal(reads, 2); assert.equal(posts, 4);
+    assert.equal(signingKey, key);
+    now = start + 120000;
+    assert.equal(await deps.authority(f.i, f.digest), true); assert.equal(reads, 3); assert.equal(posts, 5);
+});
+
+for (const cached of [false, true]) for (const failure of ['fetch', 'validation'] as const)
+    test(`authority secret ${failure} failure is not cached (${cached ? 'expired entry' : 'cold container'})`, async t => {
+        const f = lifecycleFixture(); let now = Date.now(), reads = 0, posts = 0, failing = false;
+        t.mock.method(Date, 'now', () => now);
+        const deps = awsDependencies(f.settings, { credentials, requestHandler: { async handle() {
+            reads++;
+            if (failing && failure === 'fetch') throw new Error('secret_fetch_failed');
+            return json({ ARN: f.settings.authoritySecretArn, SecretString: failing ? 'invalid' : 'ab'.repeat(32), VersionStages: ['AWSCURRENT'] });
+        } }, fetcher: (async (_url, init) => {
+            posts++; return Response.json({ authorized: true, ...JSON.parse(String(init!.body)) });
+        }) as typeof fetch });
+        if (cached) { assert.equal(await deps.authority(f.i, f.digest), true); now += 60000; }
+        failing = true;
+        await assert.rejects(deps.authority(f.i, f.digest), failure === 'fetch' ? /secret_fetch_failed/ : /authority_unavailable/);
+        assert.equal(reads, cached ? 2 : 1); assert.equal(posts, cached ? 1 : 0, 'failed refresh must not POST with the expired key');
+        failing = false;
+        assert.equal(await deps.authority(f.i, f.digest), true);
+        assert.equal(reads, cached ? 3 : 2, 'retry immediately fetches again without advancing time');
+        assert.equal(await deps.authority(f.i, f.digest), true);
+        assert.equal(reads, cached ? 3 : 2); assert.equal(posts, cached ? 3 : 2);
+    });
+
 test('the actual EC2 SDK accepts allocation parameters and omits any invented StartInstances ClientToken',async()=>{
     const f=lifecycleFixture(),helper=createLifecycleHelper(f.settings,f.deps),requests:URLSearchParams[]=[];
     const client=new EC2Client({region:'ap-south-1',credentials,maxAttempts:1,requestHandler:{async handle(r:any){

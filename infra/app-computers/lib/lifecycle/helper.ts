@@ -15,7 +15,8 @@ const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases
 export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
     actual?.filter(t=>t.Key===k).length===1&&actual.find(t=>t.Key===k)?.Value===v);
 const fail=(code='lifecycle_unconfirmed'):never=>{throw new Error(code)};
-const wait=(phase:Phase)=>({decision:'wait',phase});
+// Preserve phase memory through stale Describe views; only attach observations poll faster.
+const wait=(phase:Phase)=>({decision:'wait',phase,delaySeconds:phase==='attached'?1:2});
 /** Only the throttled action is known not to have happened. Preserve earlier
  * progress when re-arming it; resetting to initial can repeat an attachment
  * if a later tag/termination request was rejected and Describe regresses. */

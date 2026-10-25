@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { lifecycleDefinition } from '../lib/lifecycle/definition.js';
 import { createLifecycleHelper } from '../lib/lifecycle/helper.js';
-import { afterAction, type Action } from '../lib/lifecycle/contract.js';
+import { afterAction, phases, type Action } from '../lib/lifecycle/contract.js';
 import { MAX_THROTTLE_RETRIES, NO_ERROR, throttleDelaySeconds, toLambdaError } from '../lib/lifecycle/errors.js';
 import { validateLifecycleReceipt } from '../lib/lifecycle/intent.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
@@ -117,6 +117,7 @@ const cases: [Fixture['i']['operation'], Action, Parameters<typeof lifecycleFixt
 for (const [operation, action, options] of cases) test(`${operation}: confirmed ${action}, ${LAG} unchanged observations, no second call`, async () => {
     const r = await run(lifecycleFixture(operation, options), { after: action });
     assert.equal(r.error, undefined, r.cause); assert.ok(r.output); assert.equal(r.observations, LAG);
+    assert.equal(r.elapsed, r.visited.filter(state => state === 'Wait').length * (action === 'attachVolume' ? 1000 : 2000));
     for (const name of new Set(r.calls.map(c => c.action))) assert.equal(r.calls.filter(c => c.action === name).length, 1, name);
 });
 
@@ -135,7 +136,7 @@ for (const [operation, after] of attachmentCases) {
     for (const lost of [false, true]) test(`ATTACHWAIT ${operation}: ${after} ${lost ? 'lost' : 'acknowledged'}, empty in-use observations converge`, async () => {
         const r = await run(lifecycleFixture(operation), { after, lost, snapshot: emptyAttachments });
         assert.equal(r.error, undefined, r.cause); assert.ok(r.output); assert.equal(r.observations, LAG);
-        assert.equal(r.elapsed, LAG * 2000 + (lost ? 1000 : 0));
+        assert.equal(r.elapsed, LAG * (after === 'attachVolume' ? 1000 : 2000) + (lost ? 1000 : 0));
         for (const action of new Set(r.calls.map(c => c.action)))
             assert.equal(r.calls.filter(c => c.action === action).length, 1, action);
         const index = r.visited.indexOf(after);
@@ -145,7 +146,8 @@ for (const [operation, after] of attachmentCases) {
     test(`ATTACHWAIT ${operation}: ${after} empty observations expire without repeating actions`, async () => {
         const r = await run(lifecycleFixture(operation), { after, snapshot: emptyAttachments, observations: Infinity });
         assert.equal(r.error, 'LifecycleUnconfirmed'); assert.equal(r.output, undefined);
-        assert.match(r.cause!, /lifecycle_expired/); assert.equal(r.elapsed, 902000);
+        assert.match(r.cause!, /lifecycle_expired/); assert.equal(r.elapsed, after === 'attachVolume' ? 901000 : 902000);
+        assert.ok(r.visited.length < 10000, 'bounded below the interpreter step limit even at one-second cadence');
         for (const action of new Set(r.calls.map(c => c.action)))
             assert.equal(r.calls.filter(c => c.action === action).length, 1, action);
     });
@@ -268,9 +270,9 @@ test('warm adopt and already-stopped release have no fixed waits when first obse
     const release = await run(f); assert.equal(release.error, undefined); assert.equal(release.calls.length, 2); assert.equal(release.elapsed, 0);
 });
 
-test('an incomplete first adopt observation falls back to the ordinary two-second wait', async () => {
+test('an incomplete first adopt attach observation waits only one second', async () => {
     const r = await run(lifecycleFixture('adopt'), { after: 'attachVolume', observations: 1 });
-    assert.equal(r.error, undefined); assert.equal(r.observations, 1); assert.equal(r.elapsed, 2000);
+    assert.equal(r.error, undefined); assert.equal(r.observations, 1); assert.equal(r.elapsed, 1000);
     assert.equal(r.calls.length, 4);
     const attempt = r.visited.indexOf('attachVolume');
     assert.deepEqual(r.visited.slice(attempt, attempt + 6),
@@ -295,10 +297,31 @@ test('new actions retain the 870-second deadline at its boundary', async () => {
     await assert.rejects(helper({ executionArn: f.executionArn, phase: 'initial' }), /lifecycle_expired/);
 });
 
-test('immediate success observation keeps retry waits and Standard history within 25,000 events', () => {
+test('phase-scoped attach polling keeps retry waits and Standard history within 25,000 events', async () => {
     const g = lifecycleDefinition('helper', { userDataNonce: true });
     assert.equal(g.TimeoutSeconds, 960);
-    assert.deepEqual(g.States.Wait, { Type: 'Wait', Seconds: 2, Next: 'Resume' });
+    assert.deepEqual(g.States.Wait, { Type: 'Wait', SecondsPath: '$.step.delaySeconds', Next: 'Resume' });
+    // Read the actual helper's delays in every phase, including initial and
+    // stale views after claim/unpool. Faster polling must never rewind a phase.
+    const f = lifecycleFixture('adopt'), helper = createLifecycleHelper(f.settings, f.deps);
+    f.state.volumes[0]!.State = 'creating';
+    const pollWaits: number[] = [];
+    for (const phase of phases) {
+        const step = await helper({ executionArn: f.executionArn, phase });
+        assert.deepEqual(step, { decision: 'wait', phase, delaySeconds: phase === 'attached' ? 1 : 2 });
+        pollWaits.push(step.delaySeconds as number);
+        const waits: number[] = []; let observations = 0;
+        const result = await runAsl({ ...g, StartAt: 'Observe-' + phase }, {
+            input: { ctl: { lastError: NO_ERROR, observeError: NO_ERROR, throttles: 0 } }, executionArn: f.executionArn,
+            sleep: seconds => { waits.push(seconds); }, invoke: async (_resource, input) => {
+                assert.equal(input.phase, phase);
+                return observations++ === 0 ? step : { decision: 'success', receipt: {} };
+            },
+        });
+        assert.equal(result.error, undefined);
+        assert.deepEqual(waits, [phase === 'attached' ? 1 : 2]);
+        assert.deepEqual(result.visited, ['Observe-' + phase, 'Decide', 'Wait', 'Resume', 'Observe-' + phase, 'Decide', 'Succeeded']);
+    }
     assert.deepEqual(g.States.Backoff, { Type: 'Wait', SecondsPath: '$.step.delaySeconds', Next: 'Rearm' });
     assert.deepEqual(g.States.Rearm, { Type: 'Pass', Parameters: { lastError: NO_ERROR,
         'observeError.$': '$.ctl.observeError', 'throttles.$': 'States.MathAdd($.ctl.throttles, 1)' }, ResultPath: '$.ctl', Next: 'Resume' });
@@ -312,13 +335,13 @@ test('immediate success observation keeps retry waits and Standard history withi
     // A direct Lambda task emits enter/schedule/start/success/exit (5).
     // Each retry adds schedule/start/failure (3); assume zero jitter delay.
     const observationEvents = 5 + 3 * g.States['Observe-initial'].Retry[0].MaxAttempts;
-    // Recurring segments still wait: observation polling takes 2s, caught
+    // Recurring segments still wait: attach polling takes 1s (all others 2s), caught
     // errors take 1s (including lost allocation/nonce retries), and throttle
     // backoff takes >=2s. Overcharge each segment as Resume(2), Observe(14),
     // Decide(2), EC2(5), Wait(2) = 25, at the minimum wait cadence.
     const backoffWaits = Array.from({ length: MAX_THROTTLE_RETRIES }, (_, n) => throttleDelaySeconds(n, () => 0));
     assert.deepEqual(backoffWaits, [2, 2, 2, 2, 2]);
-    const minWait = Math.min(g.States.Wait.Seconds, ...actions.map(a => g.States['After-' + a].Seconds), ...backoffWaits);
+    const minWait = Math.min(...pollWaits, ...actions.map(a => g.States['After-' + a].Seconds), ...backoffWaits);
     assert.ok(minWait > 0, 'retry cycles must always wait');
     const recurringEvents = (Math.floor(g.TimeoutSeconds / minWait) + 1) * (observationEvents + 11);
     // Successful actions bypass waits, so account for them separately. Phase
@@ -328,5 +351,5 @@ test('immediate success observation keeps retry waits and Standard history withi
     const immediateEvents = actions.length * (5 + observationEvents + 2);
     const allEvents = recurringEvents + immediateEvents + 2 * MAX_THROTTLE_RETRIES + 6;
     assert.equal(immediateEvents, 252);
-    assert.equal(allEvents, 24293); assert.ok(allEvents < 25000);
+    assert.equal(allEvents, 24293); assert.equal(25000 - allEvents, 707); assert.ok(allEvents < 25000);
 });

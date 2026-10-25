@@ -33,7 +33,7 @@ export function lifecycleDefinition(helperArn:string,features:{userDataNonce?:bo
             {Variable:'$.step.decision',StringEquals:'refused',Next:'Refused'},
             {Variable:'$.step.decision',StringEquals:'rejected',Next:'Rejected'},
             {Variable:'$.step.decision',StringEquals:'success',Next:'Succeeded'}],Default:'Unconfirmed'},
-        Wait:{Type:'Wait',Seconds:2,Next:'Resume'},
+        Wait:{Type:'Wait',SecondsPath:'$.step.delaySeconds',Next:'Resume'},
         Backoff:{Type:'Wait',SecondsPath:'$.step.delaySeconds',Next:'Rearm'},
         Rearm:{Type:'Pass',Parameters:{lastError:NO_ERROR,'observeError.$':'$.ctl.observeError','throttles.$':'States.MathAdd($.ctl.throttles, 1)'},ResultPath:'$.ctl',Next:'Resume'},
         Resume:{Type:'Choice',Choices:phases.map(phase=>({Variable:'$.step.phase',StringEquals:phase,Next:'Observe-'+phase})),Default:'Unconfirmed'},

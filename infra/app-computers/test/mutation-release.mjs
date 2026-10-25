@@ -70,7 +70,8 @@ change('disk diagnostics contain data identity', 'matchesData:!!dataVolumeId&&m.
 function fast(name, before, after, file = helper) {
     add(name, file, source => replace(source, before, after), 'fast');
 }
-fast('fast observation poll', "Wait:{Type:'Wait',Seconds:2,Next:'Resume'}", "Wait:{Type:'Wait',Seconds:5,Next:'Resume'}", definition);
+fast('fast observation poll', "delaySeconds:phase==='attached'?1:2", "delaySeconds:phase==='attached'?1:5");
+fast('attach observation poll', "delaySeconds:phase==='attached'?1:2", "delaySeconds:phase==='attached'?2:2");
 fast('caught actions retain one-second wait', "States[next]={Type:'Wait',Seconds:1", "States[next]={Type:'Wait',Seconds:5", definition);
 const immediateSuccess = "ResultSelector:NO_ERROR,ResultPath:'$.ctl.lastError',Next:'Observe-'+afterAction[name as Action]";
 for (const action of ['createVolume', 'runInstances', 'runBurstableInstances', 'attachVolume', 'detachVolume',
@@ -84,8 +85,7 @@ fast('immediate success clears the previous error', immediateSuccess,
 fast('caught errors keep the After path', "Catch:[{ErrorEquals:['States.ALL'],ResultPath:'$.ctl.lastError',Next:next}]",
     "Catch:[{ErrorEquals:['States.ALL'],ResultPath:'$.ctl.lastError',Next:'Observe-'+afterAction[name as Action]}]", definition);
 fast('caught errors cannot introduce a zero-wait retry loop', "States[next]={Type:'Wait',Seconds:1", "States[next]={Type:'Wait',Seconds:0", definition);
-fast('lagging observations cannot introduce a zero-wait retry loop', "Wait:{Type:'Wait',Seconds:2,Next:'Resume'}",
-    "Wait:{Type:'Wait',Seconds:0,Next:'Resume'}", definition);
+fast('lagging observations cannot introduce a zero-wait retry loop', "delaySeconds:phase==='attached'?1:2", "delaySeconds:phase==='attached'?1:0");
 const allocations = ['createVolume', 'runInstances', 'runBurstableInstances'];
 const allocationList = "['createVolume','runInstances','runBurstableInstances']";
 for (const action of allocations)

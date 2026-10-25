@@ -31,12 +31,20 @@ export function awsDependencies(settings:Settings,test?:{requestHandler:EC2Clien
     const sfn=new SFNClient({...opts,endpoint:`https://states.${region}.amazonaws.com`});
     const secrets=new SecretsManagerClient({...opts,endpoint:`https://secretsmanager.${region}.amazonaws.com`});
     const request=()=>({abortSignal:AbortSignal.timeout(6000)});
+    // awsDependencies lives with the container's helper. Cache only validated key material,
+    // never authority decisions, and count fetch latency within the 60-second rotation bound.
+    let authoritySecret:{key:string;expiresAt:number}|undefined;
     const authorize = async (authority: object): Promise<boolean> => {
-        const secret=await secrets.send(new GetSecretValueCommand({SecretId:settings.authoritySecretArn,VersionStage:'AWSCURRENT'}),request());
-        if(secret.ARN!==settings.authoritySecretArn||secret.SecretBinary||!secret.SecretString||!secret.VersionStages?.includes('AWSCURRENT')
-            ||!/^[a-f0-9]{64}$/.test(secret.SecretString))throw new Error('authority_unavailable');
+        const now=Date.now();
+        if(!authoritySecret||now>=authoritySecret.expiresAt){
+            authoritySecret=undefined;
+            const secret=await secrets.send(new GetSecretValueCommand({SecretId:settings.authoritySecretArn,VersionStage:'AWSCURRENT'}),request());
+            if(secret.ARN!==settings.authoritySecretArn||secret.SecretBinary||!secret.SecretString||!secret.VersionStages?.includes('AWSCURRENT')
+                ||!/^[a-f0-9]{64}$/.test(secret.SecretString))throw new Error('authority_unavailable');
+            authoritySecret={key:secret.SecretString,expiresAt:now+60000};
+        }
         const body=canonical(authority),timestamp=String(Math.floor(Date.now()/1000));
-        const signature=createHmac('sha256',Buffer.from(secret.SecretString,'hex')).update([
+        const signature=createHmac('sha256',Buffer.from(authoritySecret.key,'hex')).update([
             'ezil-lifecycle-authority-v1','POST',AUTHORITY_PATH,timestamp,createHash('sha256').update(body).digest('hex')].join('\n')).digest('hex');
         const r=await(test?.fetcher??fetch)(settings.authorityOrigin+AUTHORITY_PATH,{method:'POST',redirect:'error',signal:AbortSignal.timeout(6000),
             headers:{'content-type':'application/json','x-ezil-workflow-timestamp':timestamp,'x-ezil-workflow-signature':signature},body});

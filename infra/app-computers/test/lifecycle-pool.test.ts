@@ -531,7 +531,7 @@ for (const status of ['stopping', 'stopped'] as const) for (const [label, change
         host.State = { Name: status }; change(f);
         const helper = createLifecycleHelper(f.settings, f.deps);
         for (const phase of ['stopped', 'detached'] as const)
-            assert.deepEqual(await helper({ executionArn: f.executionArn, phase }), { decision: 'wait', phase });
+            assert.deepEqual(await helper({ executionArn: f.executionArn, phase }), { decision: 'wait', phase, delaySeconds: 2 });
         host.BlockDeviceMappings = maps; host.State = { Name: 'stopped' };
         const r = await run(f);
         assert.equal(r.error, undefined, r.cause); assert.equal(r.output.state, 'retired');
@@ -598,7 +598,7 @@ for (const [label, change] of Object.entries(transitionalDisks)) test(`release f
     const f = lifecycleFixture('release'); f.state.instances[0]!.State = { Name: 'stopped' }; change(f);
     f.state.volumes[0]!.State = 'available'; f.state.volumes[0]!.Attachments = [];
     assert.deepEqual(await createLifecycleHelper(f.settings, f.deps)({ executionArn: f.executionArn, phase: 'detached' }),
-        { decision: 'wait', phase: 'detached' });
+        { decision: 'wait', phase: 'detached', delaySeconds: 2 });
 });
 
 for (const [label, change] of Object.entries(unexpectedDisks).slice(0, 5)) test(`release free volume: ${label} still fails before termination`, async () => {
@@ -700,7 +700,8 @@ for (const phase of ['initial', 'attached', 'claimed', 'unpooled'] as const)
     test(`RECADOPT3 empty available after attach acknowledgement preserves ${phase} until deadline`, async () => {
         const f = recoveryFixture(); f.state.volumes[0]!.State = 'available'; f.state.volumes[0]!.Attachments = [];
         const h = createLifecycleHelper(f.settings, f.deps);
-        assert.deepEqual(await h({ executionArn: f.executionArn, phase }), { decision: 'wait', phase: phase === 'initial' ? 'attached' : phase });
+        assert.deepEqual(await h({ executionArn: f.executionArn, phase }), { decision: 'wait', phase: phase === 'initial' ? 'attached' : phase,
+            delaySeconds: phase === 'initial' || phase === 'attached' ? 1 : 2 });
         f.state.now += 901000;
         await assert.rejects(h({ executionArn: f.executionArn, phase }), /lifecycle_expired/);
     });
