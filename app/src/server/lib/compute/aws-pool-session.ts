@@ -18,16 +18,21 @@ export async function primePoolRelay(deps: { db: PlacementExecutor; env: Env; fe
     nowMs?: () => number; sleep?: (ms: number) => Promise<void> }, expected: PoolRelayEnrollment): Promise<void> {
     const now = deps.nowMs ?? (() => performance.now());
     const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
-    const deadline = now() + 30_000;
-    const PRIME_BACKOFF_MS = [500, 1000, 1000, 1500, 2000, 2500, 3000, 3000, 3000];  // at most 10 probes
+    const started = now();
+    const deadline = started + 30_000;
+    const PRIME_BACKOFF_MS = [500, 1000, 1000, 1500, 2000, 2500, 3000, 3000, 3000];
+    const PRIME_FAST_MS = 500;
+    const PRIME_FAST_WINDOW_MS = 10_000;
+    const PRIME_MAX_PROBES = 30;
+    let backoff = 0;
     try {
         const secret = deps.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim();
         if (!isAwsComputersEnabled(deps.env) || !secret) return;
         const endpoint = new URL(`${deps.env.CLOUDFLARE_GUACAMOLE_WORKER_URL?.trim().replace(/\/$/, '')}/sandbox/preview`);
         if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return;
-        // Each probe may mint generic TURN credentials in the Worker before AWS routing,
-        // so probes are few and back off; the browser wake loop remains the fallback.
-        for (let attempt = 0; attempt < PRIME_BACKOFF_MS.length + 1 && now() < deadline; attempt++) {
+        // Probe frequently while the tunnel connects, then use the existing backoff.
+        // Both elapsed request time and total probe count bound the work.
+        for (let attempt = 0; attempt < PRIME_MAX_PROBES && now() < deadline; attempt++) {
             const { record: p } = await readPlacement(deps.db, expected.computerId, expected.ownerUserId);
             if (!p || p.provider !== 'aws-ec2' || p.generation !== expected.generation || p.leaseEpoch !== expected.leaseEpoch
                 || p.instanceId !== expected.instanceId || !p.instanceId || p.fenceToken !== expected.fenceToken || !p.fenceToken
@@ -48,7 +53,11 @@ export async function primePoolRelay(deps: { db: PlacementExecutor; env: Env; fe
             // Only a connector/control service still starting warrants another probe.
             // aws_desktop_starting means the existing exchange has done its work.
             if (response.status !== 503 || !['aws_origin_starting', 'aws_desktop_unreachable'].includes(String(result?.error))) return;
-            if (attempt < PRIME_BACKOFF_MS.length && now() < deadline) await sleep(Math.min(PRIME_BACKOFF_MS[attempt]!, deadline - now()));
+            if (attempt + 1 < PRIME_MAX_PROBES && now() < deadline) {
+                const delay = now() - started < PRIME_FAST_WINDOW_MS ? PRIME_FAST_MS
+                    : PRIME_BACKOFF_MS[Math.min(backoff++, PRIME_BACKOFF_MS.length - 1)]!;
+                await sleep(Math.min(delay, deadline - now()));
+            }
         }
     } catch {
         // Never log Worker bodies or exceptions. The normal browser wake loop remains

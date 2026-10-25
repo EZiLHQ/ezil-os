@@ -21,14 +21,14 @@ const pending = () => placementRow({ computer_id: computerId, owner_user_id: own
     last_error: POOL_SESSION_PENDING, lifecycle_job_id: '44444444-4444-4444-8444-444444444444', lifecycle_digest: 'b'.repeat(64) });
 function setup(over = {}) {
     const row = { ...pending(), ...over };
-    const fake = createFakePlacementDb({ placements: [row] });
+    const fake = createFakePlacementDb({ placements: [row] }, { yield: async () => {} });
     let now = 0;
     const sleep = vi.fn(async (ms: number) => { now += ms; });
     const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async () => Response.json({ error: 'aws_desktop_starting', reason: 'config_pushed' }, { status: 503 }));
     const deps = { db: fake.db, env, fetch, sleep, nowMs: () => now };
     return { fake, row, deps, sleep, fetch, run: () => primePoolRelay(deps, expected) };
 }
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('enrollment-triggered pool relay preparation', () => {
     it('starts immediately, signs the existing Worker route, discards the response and stops once config is pushed', async () => {
@@ -99,10 +99,44 @@ describe('enrollment-triggered pool relay preparation', () => {
     it('caps retries and elapsed time, including request time', async () => {
         const s = setup();
         s.fetch.mockImplementation(async () => Response.json({ error: 'aws_origin_starting' }, { status: 503 }));
-        await s.run(); expect(s.fetch).toHaveBeenCalledTimes(10);  // bounded probes: each may mint TURN credentials
+        await s.run(); expect(s.fetch).toHaveBeenCalledTimes(30);  // fast window plus bounded backoff
         const slow = setup();
         slow.fetch.mockImplementation(async () => { await slow.sleep(30_000); return Response.json({ error: 'aws_origin_starting' }, { status: 503 }); });
         await slow.run(); expect(slow.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('probes every 500ms through ten seconds, then uses the existing backoff', async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        const times: number[] = [];
+        s.fetch.mockImplementation(async () => {
+            times.push(performance.now());
+            return Response.json({ error: 'aws_origin_starting' }, { status: 503 });
+        });
+        const run = primePoolRelay({ db: s.fake.db, env, fetch: s.fetch }, expected);
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(times).toEqual(Array.from({ length: 21 }, (_, n) => n * 500));
+        await vi.runAllTimersAsync();
+        await run;
+        expect(times.slice(21)).toEqual([10_500, 11_500, 12_500, 14_000, 16_000, 18_500, 21_500, 24_500, 27_500]);
+        expect(times).toHaveLength(30);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('counts slow probe time against the fast window and total deadline', async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        const times: number[] = [];
+        s.fetch.mockImplementation(async () => {
+            times.push(performance.now());
+            await new Promise(resolve => setTimeout(resolve, 6_000));
+            return Response.json({ error: 'aws_origin_starting' }, { status: 503 });
+        });
+        const run = primePoolRelay({ db: s.fake.db, env, fetch: s.fetch }, expected);
+        await vi.runAllTimersAsync();
+        await run;
+        expect(times).toEqual([0, 6_500, 13_000, 20_000, 27_000]);
+        expect(vi.getTimerCount()).toBe(0);
     });
 
     it('does not retry ambiguous transport or parsing failures; the browser remains the fallback', async () => {
@@ -159,8 +193,8 @@ describe('relay preparation guard mutants', () => {
     it('kills an increased attempt cap', async () => {
         const changed = setup();
         changed.fetch.mockImplementation(async () => Response.json({ error: 'aws_origin_starting' }, { status: 503 }));
-        await mutant('attempt < PRIME_BACKOFF_MS.length + 1', 'attempt < PRIME_BACKOFF_MS.length + 2')(changed.deps, expected);
-        expect(changed.fetch).toHaveBeenCalledTimes(11); // baseline contract allows at most 10
+        await mutant('attempt < PRIME_MAX_PROBES', 'attempt < PRIME_MAX_PROBES + 1')(changed.deps, expected);
+        expect(changed.fetch).toHaveBeenCalledTimes(31); // baseline contract allows at most 30
     });
 
     it.each([

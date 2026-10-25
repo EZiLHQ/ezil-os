@@ -51,11 +51,12 @@ beforeEach(() => {
     fetcher = vi.fn(async () => { throw new Error('Unexpected network request'); });
     vi.stubGlobal('fetch', fetcher);
 });
-afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('real preview/open replacement answers', () => {
     for (const surface of ['previewUrl', 'appPreviewUrl', 'codePreviewUrl'] as const) {
         it.each(['replace', 'uncertain replace', 'start', 'provision', 'refused'])(`${surface}: %s grants only an admitted replacement the launch budget`, async mode => {
+            vi.useFakeTimers();
             if (mode === 'start') vi.stubEnv('EZIL_AWS_WAKE_MODE', 'start');
             if (mode === 'refused') effects.start.mockRejectedValue(Object.assign(new Error('refused'), {
                 name: 'ExecutionLimitExceeded', $metadata: { httpStatusCode: 400 },
@@ -66,11 +67,13 @@ describe('real preview/open replacement answers', () => {
                 ...(mode === 'provision' ? { state: 'PROVISIONING', lifecycle_job_id: F, lifecycle_digest: 'a'.repeat(64) }
                     : { instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111',
                     fs_uuid: F, fence_token: F }),
-            })] });
+            })] }, { yield: async () => {} });
             const db = { ...f.db, query: { computers: { findFirst: async () => ({ id: C }) } } };
-            const open = () => {
+            const open = async () => {
                 const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: U }, db } as never);
-                return surface === 'previewUrl' ? caller.previewUrl({ computerId: C, sessionId: F }) : caller[surface]({ computerId: C });
+                const response = surface === 'previewUrl' ? caller.previewUrl({ computerId: C, sessionId: F }) : caller[surface]({ computerId: C });
+                await vi.runAllTimersAsync();
+                return response;
             };
             const answer = await open();
             const replacing = mode === 'replace' || mode === 'uncertain replace';

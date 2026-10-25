@@ -153,9 +153,15 @@ function awsMigrationAnswer(result: ComputeStatus) {
  * Ready → ask the Worker's AWS route for the current placement's URLs.
  * The callback is lazy: an ensure refusal must never issue a preview request.
  */
-export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>, preparePool?: () => Promise<void>) {
+export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>, preparePool?: () => Promise<void>,
+    hold?: { wait(): Promise<boolean>; ensure(): Promise<EnsureResult>; signal?: AbortSignal }) {
+    if (!result.ok && result.errorCode === 'computer_starting' && result.retryable && !hold?.signal?.aborted) {
+        // Keep the existing relay preparation ahead of the hold: waiting must not
+        // defer the exchange that lets the host reach session-ready.
+        await preparePool?.();
+        if (hold && await hold.wait() && !hold.signal?.aborted) result = await hold.ensure();
+    }
     if (!result.ok) {
-        if (result.errorCode === 'computer_starting' && result.retryable) await preparePool?.();
         return {
             ok: false as const,
             error: result.errorCode,

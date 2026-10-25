@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
-import { AWS_BROWSER_ROUTE_TOKEN, prepareAwsPoolSession, requestAwsPreview } from './aws-preview';
+import { AWS_BROWSER_ROUTE_TOKEN, prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { EnsureOptions } from './provider';
 import { ENROLLMENT_FAILED, ENROLLMENT_PENDING } from './placement';
@@ -28,8 +28,8 @@ const ready = () => ({
     expiresAt: NOW + 3_600_000,
     relay: { runtimeId: 'a'.repeat(32), expiresAt: NOW + 600_000 }, turnRelay: true,
 });
-function setup(placements = [row()]) {
-    const fake = createFakePlacementDb({ placements });
+function setup(placements = [row()], instant = false) {
+    const fake = createFakePlacementDb({ placements }, instant ? { yield: async () => {} } : {});
     return {
         fake,
         open: (cfg = config, secret = 'test-secret', opts: EnsureOptions = options) =>
@@ -52,6 +52,87 @@ afterEach(() => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+});
+
+describe('AWS preview placement hold', () => {
+    const computer = { userId, computerId };
+    beforeEach(() => { vi.useRealTimers(); vi.useFakeTimers(); vi.setSystemTime(NOW); });
+
+    it('observes readiness on the next 250ms poll without opening a transaction or signing', async () => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const done = vi.fn();
+        const held = waitForAwsPreviewPlacement(fake.db, computer).then(done);
+        await vi.advanceTimersByTimeAsync(249);
+        expect(done).not.toHaveBeenCalled();
+        fake.placements[0]!.state = 'RUNNING';
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(true);
+        expect(fake.statements.filter(s => s.sql.includes('placement:read'))).toHaveLength(2);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('expires at eight seconds with a bounded number of placement reads', async () => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const done = vi.fn();
+        const held = waitForAwsPreviewPlacement(fake.db, computer).then(done);
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(done).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(false);
+        expect(fake.statements.filter(s => s.sql.includes('placement:read'))).toHaveLength(33);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('holds only one ask per owner/computer, normalizes UUID case, and releases on abort', async () => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const controller = new AbortController();
+        const held = waitForAwsPreviewPlacement(fake.db, computer, controller.signal);
+        await vi.advanceTimersByTimeAsync(0);
+        const reads = fake.statements.length;
+        expect(await waitForAwsPreviewPlacement(fake.db, { userId, computerId: computerId.toUpperCase() })).toBe(false);
+        expect(fake.statements).toHaveLength(reads);
+        controller.abort();
+        expect(await held).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+        fake.placements[0]!.state = 'RUNNING';
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(true);
+    });
+
+    it('allows independent computers to wait concurrently', async () => {
+        const secondId = '22222222-2222-4222-8222-222222222222';
+        const { fake } = setup([row({ state: 'STARTING' }), row({ state: 'STARTING', computer_id: secondId })], true);
+        const first = waitForAwsPreviewPlacement(fake.db, computer);
+        const second = waitForAwsPreviewPlacement(fake.db, { userId, computerId: secondId });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(2);
+        fake.placements.forEach(p => { p.state = 'RUNNING'; });
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await Promise.all([first, second])).toEqual([true, true]);
+    });
+
+    it.each([
+        { state: 'STOPPING' }, { provider: 'cloudflare' }, { last_error: ENROLLMENT_FAILED },
+        { owner_user_id: '22222222-2222-4222-8222-222222222222' }, { generation: 0 },
+        { image_upgrade_job_id: computerId },
+    ])('ends the hold on a new refusal: %j', async patch => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const held = waitForAwsPreviewPlacement(fake.db, computer);
+        await vi.advanceTimersByTimeAsync(0);
+        Object.assign(fake.placements[0]!, patch);
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await held).toBe(false);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('does not wait for a RUNNING placement with unsettled enrollment', async () => {
+        const { fake } = setup([row({ enroll_nonce_hash: 'pending' })], true);
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+    });
 });
 
 describe('AWS preview handoff', () => {

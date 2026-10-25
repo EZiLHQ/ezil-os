@@ -75,7 +75,7 @@ import {
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
-import { prepareAwsPoolSession, requestAwsPreview } from '@/server/lib/compute/aws-preview';
+import { prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from '@/server/lib/compute/aws-preview';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer } from './compute-dispatch';
@@ -186,7 +186,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 screen: z.unknown().optional(),
             }),
         )
-        .query(async ({ ctx, input }) => {
+        .query(async ({ ctx, input, signal }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
             // Starting this computer's desktop is choosing it: remember it.
             await stampOpened(ctx.db, ctx.user.id, input.computerId, { throttled: false });
@@ -242,6 +242,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
+                        ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
@@ -676,7 +678,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      */
     codePreviewUrl: protectedProcedure
         .input(z.object({ computerId: z.string().uuid() }))
-        .query(async ({ ctx, input }) => {
+        .query(async ({ ctx, input, signal }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
             const config = resolveCloudflareGuacamoleConfig();
@@ -712,6 +714,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
+                        ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);

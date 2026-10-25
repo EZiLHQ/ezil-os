@@ -1,8 +1,9 @@
 import { initTRPC } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BOOT_FAILURE_COPY, computeBootUiState, isRetryableBootErrorCode, type BootErrorCode } from '@/components/desktop/boot-phases';
+import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 
-const mocks = vi.hoisted(() => ({ route: vi.fn(), ensure: vi.fn(), preview: vi.fn(), restart: vi.fn() }));
+const mocks = vi.hoisted(() => ({ route: vi.fn(), ensure: vi.fn(), preview: vi.fn(), restart: vi.fn(), prepare: vi.fn() }));
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string }; db: unknown }>().create();
     return { createTRPCRouter: t.router, protectedProcedure: t.procedure };
@@ -16,7 +17,9 @@ vi.mock('@/server/lib/ai-credential', () => ({ syncAiCredential: vi.fn(async () 
 vi.mock('@/server/lib/compute/aws-clients', () => ({
     sharedAwsSdkCollaborators: () => { throw new Error('Unexpected AWS client construction'); },
 }));
-vi.mock('@/server/lib/compute/aws-preview', () => ({ requestAwsPreview: mocks.preview }));
+vi.mock('@/server/lib/compute/aws-preview', async original => ({
+    ...await original<Record<string, unknown>>(), requestAwsPreview: mocks.preview, prepareAwsPoolSession: mocks.prepare,
+}));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', async importOriginal => ({
     ...await importOriginal<Record<string, unknown>>(),
     resolveCloudflareGuacamoleConfig: () => ({ isConfigured: true, hasHmacSecret: true }),
@@ -30,9 +33,94 @@ beforeEach(() => {
     mocks.ensure.mockReset();
     mocks.restart.mockReset();
     mocks.preview.mockReset();
+    mocks.prepare.mockReset().mockResolvedValue(undefined);
     mocks.route.mockReset().mockResolvedValue({ kind: 'aws-ec2', provider: { ensure: mocks.ensure, restart: mocks.restart }, instanceType: 't3a.medium' });
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe('AWS Code and desktop preview holds', () => {
+    const starting = { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true, computeLaunching: true };
+    const waitingAnswer = { ...starting, errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' };
+    function setup(signal?: AbortSignal) {
+        vi.useFakeTimers();
+        const userId = '11111111-1111-4111-8111-111111111111';
+        const fake = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, owner_user_id: userId,
+            state: 'STARTING', generation: 1, lease_epoch: 1 })] }, { yield: async () => {} });
+        const caller = cloudflareGuacamoleRouter.createCaller({ user: { id: userId }, db: { ...fake.db,
+            query: { computers: { findFirst: async () => ({ id: computerId }) } } } } as never, { signal });
+        mocks.ensure.mockImplementation(async () => fake.placements[0]!.state === 'RUNNING' ? { ok: true } : starting);
+        mocks.preview.mockResolvedValue({ ok: true, codePreviewUrl: 'https://preview.test/code', guacamoleUrl: 'https://preview.test/desktop' });
+        return { fake, caller };
+    }
+
+    it.each(['codePreviewUrl', 'previewUrl'] as const)('%s hands off within the held ask when placement becomes ready', async surface => {
+        const { fake, caller } = setup();
+        const done = vi.fn();
+        const held = (surface === 'previewUrl' ? caller.previewUrl({ computerId, sessionId: computerId })
+            : caller.codePreviewUrl({ computerId })).then(done);
+        await vi.advanceTimersByTimeAsync(249);
+        expect(done).not.toHaveBeenCalled();
+        expect(mocks.preview).not.toHaveBeenCalled();
+        fake.placements[0]!.state = 'RUNNING';
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledWith(expect.objectContaining({ ok: true, computeProvider: 'aws-ec2' }));
+        expect(mocks.ensure).toHaveBeenCalledTimes(2);
+        expect(mocks.preview).toHaveBeenCalledOnce();
+        expect(mocks.prepare).toHaveBeenCalledOnce();
+    });
+
+    it('shares the concurrency bound between Code and desktop and returns the existing answer to further asks', async () => {
+        const { fake, caller } = setup();
+        const held = caller.codePreviewUrl({ computerId });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await caller.previewUrl({ computerId, sessionId: computerId })).toEqual(waitingAnswer);
+        expect(vi.getTimerCount()).toBe(1);
+        fake.placements[0]!.state = 'RUNNING';
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await held).toMatchObject({ ok: true });
+        expect(mocks.ensure).toHaveBeenCalledTimes(3);
+        expect(mocks.preview).toHaveBeenCalledOnce();
+    });
+
+    it('returns the exact existing starting response after eight seconds', async () => {
+        const { caller } = setup();
+        const done = vi.fn();
+        const held = caller.codePreviewUrl({ computerId }).then(done);
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(done).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(waitingAnswer);
+        expect(mocks.ensure).toHaveBeenCalledOnce();
+        expect(mocks.preview).not.toHaveBeenCalled();
+        expect(mocks.prepare).toHaveBeenCalledOnce();
+    });
+
+    it('keeps a fresh ensure refusal after readiness, without minting', async () => {
+        const { fake, caller } = setup();
+        const held = caller.codePreviewUrl({ computerId });
+        await vi.advanceTimersByTimeAsync(0);
+        fake.placements[0]!.state = 'RUNNING';
+        mocks.ensure.mockResolvedValue({ ok: false, error: 'kill_switch', errorCode: 'kill_switch', retryable: false });
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await held).toMatchObject({ ok: false, errorCode: 'kill_switch', retryable: false });
+        expect(mocks.preview).not.toHaveBeenCalled();
+    });
+
+    it('forwards the tRPC disconnect signal and does no further work after abort', async () => {
+        const controller = new AbortController();
+        const { caller } = setup(controller.signal);
+        const held = caller.codePreviewUrl({ computerId });
+        await vi.advanceTimersByTimeAsync(0);
+        controller.abort();
+        expect(await held).toEqual(waitingAnswer);
+        expect(mocks.ensure).toHaveBeenCalledOnce();
+        expect(mocks.prepare).toHaveBeenCalledOnce();
+        expect(mocks.preview).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});
 
 describe.each(['previewUrl', 'codePreviewUrl', 'appPreviewUrl'] as const)('%s AWS refusal pass-through', surface => {
     it.each([

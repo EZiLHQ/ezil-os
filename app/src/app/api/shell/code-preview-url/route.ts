@@ -41,7 +41,7 @@ async function shellCaller(req: Request) {
     const headers = new Headers(req.headers);
     headers.set('x-trpc-source', 'shell-http');
     const ctx = await createTRPCContext({ headers });
-    return { ctx, caller: appRouter.createCaller(ctx) };
+    return { ctx, caller: appRouter.createCaller(ctx, { signal: req.signal }) };
 }
 
 /**

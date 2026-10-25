@@ -13,6 +13,7 @@ import {
 } from './placement';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
 import type { ComputerRef, EnsureOptions } from './provider';
+import { pollWait } from './poll-wait';
 
 type UnavailableReason = 'config_missing' | 'zone_invalid' | 'endpoint_invalid' | 'placement_missing'
     | 'placement_foreign' | 'placement_provider' | 'placement_not_running' | 'placement_epoch_invalid'
@@ -44,6 +45,35 @@ function placementRefusal(p: Placement | null, preparePool = false) {
     // Do not sign an epoch whose enrollment or receipt is still being settled.
     if (p.enrollNonceHash || p.lastError === ENROLLMENT_PENDING || p.lifecycleJobId || p.lifecycleDigest) return starting();
     return null;
+}
+
+// Shared by Code and desktop asks in this server process. Always released, including
+// on disconnect/refusal. No transaction or database lock spans a polling delay.
+const holdKey = Symbol.for('ezil.aws-preview-holds');
+const processHolds = globalThis as typeof globalThis & { [holdKey]?: Set<string> };
+const heldPreviews = processHolds[holdKey] ??= new Set<string>();
+export async function waitForAwsPreviewPlacement(db: PlacementExecutor, computer: ComputerRef, signal?: AbortSignal): Promise<boolean> {
+    const key = JSON.stringify([computer.userId.toLowerCase(), computer.computerId.toLowerCase()]);
+    if (signal?.aborted || heldPreviews.has(key)) return false;
+    heldPreviews.add(key);
+    const deadline = performance.now() + 8_000;
+    try {
+        for (let check = 0; check <= 32 && !signal?.aborted; check++) {
+            const { record } = await readPlacement(db, computer.computerId, computer.userId);
+            if (signal?.aborted) return false;
+            const refused = placementRefusal(record);
+            if (!refused) return true;
+            if (refused.errorCode !== 'sandbox_starting' || !record
+                || !['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(record.state)) return false;
+            const remaining = deadline - performance.now();
+            if (remaining <= 0 || check === 32 || !await pollWait(Math.min(250, remaining), signal)) return false;
+        }
+    } catch {
+        // The ordinary ensure/preview path retains its existing refusal response.
+    } finally {
+        heldPreviews.delete(key);
+    }
+    return false;
 }
 
 function workerStarting(status: number, data: unknown): boolean {

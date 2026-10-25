@@ -76,6 +76,8 @@ export interface FakeSeed {
 
 export interface FakeOptions {
     clock?: () => Date;
+    /** Fake-timer polling tests may replace the database's event-loop yield. */
+    yield?: () => Promise<void>;
     /** What `current_setting('transaction_isolation')` answers. */
     isolation?: string;
 }
@@ -116,6 +118,7 @@ export function placementRow(over: Row & { computer_id: string }): Row {
 const uuidEq = (a: unknown, b: unknown) => String(a).toLowerCase() === String(b).toLowerCase();
 
 export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions = {}) {
+    const yieldStatement = options.yield ?? tick;
     const clock = options.clock ?? (() => new Date('2026-10-13T12:00:00Z'));
     const isolation = options.isolation ?? 'read committed';
     const placements: Row[] = (seed.placements ?? []).map((r) => ({ ...r }));
@@ -150,7 +153,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     async function run(query: SQL, tx: Tx | null): Promise<{ rows: Row[] }> {
         const { sql: text, params } = dialect.sqlToQuery(query);
         statements.push({ sql: text, params, tx: tx?.id ?? null });
-        await tick();
+        await yieldStatement();
         // Existing placement-only fixtures have no migration intent; migration tests wrap this executor.
         if (text.startsWith('SELECT') && text.includes('FROM public.ezil_compute_migrations')) return { rows: [] };
         const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');

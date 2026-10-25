@@ -15,7 +15,7 @@ import { z } from 'zod';
  * under the placement lock before issuing the epoch's one-time nonce.
  */
 export async function observePoolAdopt(deps: PoolClaimDeps, proof: PoolProof,
-    identity: Awaited<ReturnType<typeof authenticatePoolHost>>): Promise<void> {
+    identity: Awaited<ReturnType<typeof authenticatePoolHost>>): Promise<void | 'pending'> {
     const row = await pool.readPendingPoolAdopt(deps.db, proof.poolHostId, identity.doc.instanceId);
     if (!row) return;
     bindPoolRow(row, proof, identity);
@@ -29,6 +29,7 @@ export async function observePoolAdopt(deps: PoolClaimDeps, proof: PoolProof,
         || !p.lifecycleJobId || !p.lifecycleDigest || !deps.executions) return;
     const arn = lifecycleExecutionArn(identity.deployment, p.lifecycleJobId);
     const e = await deps.executions.describe(row.region, arn);
+    if (e.status === 'RUNNING') return 'pending';
     if (e.status !== 'SUCCEEDED') return;
     const observed = performance.now();
     poolGuard('observe_execution', e.executionArn === arn
@@ -44,6 +45,8 @@ export async function observePoolAdopt(deps: PoolClaimDeps, proof: PoolProof,
         && JSON.stringify(work.intent.deployment) === JSON.stringify({ ...identity.deployment,
             storage: { rootDeviceName: '/dev/sda1', ...identity.deployment.storage } }));
     const receipt = LifecycleReceiptSchema.parse(parseRebaseJson(e.output ?? '', 16384));
+    // The host may have been adopted since authentication at the start of a hold.
+    identity = await authenticatePoolHost(deps, proof, true);
     poolGuard('observe_attached', identity.view.tags['ezil:pool'] === undefined
         && identity.view.tags['ezil:computer'] === p.computerId
         && identity.view.tags['ezil:generation'] === String(p.generation)

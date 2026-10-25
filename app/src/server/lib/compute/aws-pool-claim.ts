@@ -7,10 +7,11 @@ import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
 import { ENROLLABLE_STATES, type Placement, type PlacementExecutor } from './placement';
 import { authenticatePoolHost, bindPoolRow, readPoolProof, type PoolHostDeps, type PoolProof } from './aws-pool-host';
 import { POOL_NO_STORE, poolErrorResponse, poolGuard } from './aws-pool-errors';
+import { pollWait } from './poll-wait';
 
 export interface PoolClaimDeps extends PoolHostDeps {
     executions: LifecycleExecutionReader | null;
-    observeAdopt?(proof: PoolProof, identity: Awaited<ReturnType<typeof authenticatePoolHost>>): Promise<void>;
+    observeAdopt?(proof: PoolProof, identity: Awaited<ReturnType<typeof authenticatePoolHost>>): Promise<void | 'pending'>;
     /** Locks the placement until the nonce hash is stored. */
     lockPlacement(tx: PlacementExecutor, computerId: string): Promise<Placement | null>;
     saveNonce(tx: PlacementExecutor, p: Placement, nonce: EnrollmentNonce): Promise<boolean>;
@@ -20,8 +21,23 @@ const claimSchema = z.object({ computerId: RebaseUuid, generation: z.number().in
 export async function handlePoolClaim(req: Request, deps: PoolClaimDeps): Promise<Response> {
     try {
         const proof = readPoolProof(req);
-        const identity = await authenticatePoolHost(deps, proof, true);
-        await deps.observeAdopt?.(proof, identity);
+        let identity = await authenticatePoolHost(deps, proof, true);
+        const deadline = performance.now() + 5_000;
+        let held = false;
+        for (let check = 0; ; check++) {
+            if (req.signal.aborted) return new Response(null, { status: 204, headers: POOL_NO_STORE });
+            const observation = await deps.observeAdopt?.(proof, identity);
+            if (observation !== 'pending') break;
+            const remaining = deadline - performance.now();
+            if (remaining <= 0 || check === 20 || !await pollWait(Math.min(250, remaining), req.signal))
+                return new Response(null, { status: 204, headers: POOL_NO_STORE });
+            held = true;
+        }
+        // Never issue a nonce using the pre-hold EC2 view. All original guards below
+        // run again in a fresh transaction; no lock was held during the wait.
+        if (req.signal.aborted) return new Response(null, { status: 204, headers: POOL_NO_STORE });
+        if (held) identity = await authenticatePoolHost(deps, proof, true);
+        if (req.signal.aborted) return new Response(null, { status: 204, headers: POOL_NO_STORE });
         const claim = await deps.db.transaction(async tx => {
             const row = await deps.data.readPoolClaim(tx, proof.poolHostId, identity.doc.instanceId);
             poolGuard('claim_published', row, 204);
