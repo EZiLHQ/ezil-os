@@ -53,7 +53,7 @@ python3 - "$temporary/$tag.runtime.tar.gz" <<'PY'
 import pathlib, tarfile, sys
 names = {"compose.yaml", "Caddyfile", "render-env.py"}
 names |= {f"cron/ezil-os-staging-{job}.{kind}" for job in
-          ("telemetry-maintenance", "sandbox-reap", "billing-session-sweep", "aws-stop-settle", "pool-replenish")
+          ("telemetry-maintenance", "sandbox-reap", "billing-session-sweep", "aws-stop-settle", "pool-replenish", "aws-reconcile")
           for kind in ("service", "timer")}
 with tarfile.open(sys.argv[1]) as bundle:
     members = [m for m in bundle.getmembers() if not (m.name == "cron" and m.isdir())]
@@ -65,7 +65,7 @@ with tarfile.open(sys.argv[1]) as bundle:
         path.write_bytes(bundle.extractfile(member).read())
 PY
 # Stop cron clients before rotating their environment; server work may continue.
-jobs=(telemetry-maintenance sandbox-reap billing-session-sweep aws-stop-settle pool-replenish)
+jobs=(telemetry-maintenance sandbox-reap billing-session-sweep aws-stop-settle pool-replenish aws-reconcile)
 for job in "${jobs[@]}"; do
     if [[ -f /etc/systemd/system/ezil-os-staging-$job.timer ]]; then
         systemctl stop "ezil-os-staging-$job.timer" "ezil-os-staging-$job.service"
