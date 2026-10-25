@@ -232,7 +232,11 @@ describe('billing v2 dispatch wiring', () => {
             subscriptionsFor: vi.fn(async () => [{ stripeSubscriptionId: 'sub_a', sku: 'compute_monthly_v2', status: 'active',
                 currentPeriodStart: new Date('2026-10-01T00:00:00Z'), currentPeriodEnd: new Date('2026-11-01T00:00:00Z'), cancelAtPeriodEnd: false }]),
             userCreatedAt: vi.fn(async () => null), openPlanChanges: vi.fn(async () => []), epochsFor: vi.fn(async () => []),
-            grantsForPeriod: vi.fn(async () => []), latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
+            // A paid compute entitlement needs the period's invoice-backed allowance grant (compute-access.ts).
+            grantsForPeriod: vi.fn(async () => [{ id: 'grant_a', userId: U1, subscriptionId: 'sub_a', meter: 'compute_std_seconds',
+                kind: 'plan_period', amount: BigInt(2000), periodStart: new Date('2026-10-01T00:00:00Z'), periodEnd: new Date('2026-11-01T00:00:00Z'),
+                sourceType: 'invoice', sourceId: 'in_a', createdAt: new Date('2026-10-01T00:00:00Z') }]),
+            latestConsent: vi.fn(async () => null), openPaymentIssues: vi.fn(async () => []),
             sizePreference: vi.fn(async () => 'cmp-8' as const),
         };
         captured.billingDeps.mockReturnValue({ config: readBillingConfig({ BILLING_TAB_ENABLED: '1' }), store: store as unknown as BillingStore,

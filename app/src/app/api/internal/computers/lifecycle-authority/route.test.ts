@@ -256,14 +256,30 @@ it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes th
     const { fixturePoolIntent } = await import('@/server/lib/compute/aws-intent.test-support');
     const { buildLifecycleWork } = await import('@/server/lib/compute/aws-intent');
     const w = buildLifecycleWork(fixturePoolIntent(operation)), i = w.intent;
-    execute.mockResolvedValue([{ id: i.poolHostId, generation: i.poolGeneration, region: i.deployment.region,
+    const host = { id: i.poolHostId, generation: i.poolGeneration, region: i.deployment.region,
         zone_id: i.deployment.zoneId, instance_type: i.instanceType, instance_id: i.providerInstanceId,
         leased_computer_id: null, state: operation === 'pool-provision' ? 'booting' : 'retiring',
-        lifecycle_job_id: i.jobId, lifecycle_digest: w.digest, lifecycle_input: w.input }]);
+        lifecycle_job_id: i.jobId, lifecycle_digest: w.digest, lifecycle_input: w.input };
+    // Provision authority replays against the CURRENT validated deployment and requires eligible
+    // subscriber demand (aws-pool-dispatch.ts provisionEligible); retire needs neither.
+    const demand = (standard: number) => ({ opens: 0, standard, premium: 0, boot_minutes: null, spares: 0, vcpu: 0, idle_ready: [], booting: [] });
+    let eligible = 1;
+    const { PgDialect } = await import('drizzle-orm/pg-core');
+    execute.mockImplementation(async (q: Parameters<PgDialect['sqlToQuery']>[0]) =>
+        new PgDialect().sqlToQuery(q).sql.includes('FROM public.ezil_compute_pool_hosts WHERE id =') ? [host] : [demand(eligible)]);
+    vi.stubEnv('EZIL_AWS_LIFECYCLE_DEPLOYMENTS', JSON.stringify({ [i.deployment.region]: i.deployment }));
+    vi.stubEnv('AWS_REGIONS', i.deployment.region);
+    vi.stubEnv(`EZIL_AWS_MAX_RUNNING_${i.deployment.region.toUpperCase().replace(/-/g, '_')}`, '5');
+    vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
     const a = { schemaVersion: 1, computerId: i.computerId, jobId: i.jobId, leaseEpoch: i.leaseEpoch, digest: w.digest,
         operation, poolHostId: i.poolHostId, poolGeneration: i.poolGeneration };
     const res = await POST(request(JSON.stringify(a)));
     expect(res.status).toBe(200); expect(await res.json()).toEqual({ authorized: true, ...a });
     for (const patch of [{ poolGeneration: 2 }, { operation: undefined }, { poolHostId: undefined }, { imageJobId: i.jobId, imageJobPhase: 'launch' }])
-        expect((await POST(request(JSON.stringify({ ...a, ...patch })))).status).toBe(403);
+        expect((await POST(request(JSON.stringify({ ...a, ...patch })))).status).toBe(403);    if (operation === 'pool-provision') {
+        // No eligible active subscriber: the same exact durable provision is refused.
+        eligible = 0;
+        expect((await POST(request(JSON.stringify(a)))).status).toBe(403);
+    }
+    vi.unstubAllEnvs();
 });
