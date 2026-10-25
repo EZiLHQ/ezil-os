@@ -173,7 +173,7 @@ await page.route('**/*', async (route) => {
             frame: { confirmed: true },
         });
     }
-    if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true });
+    if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true, status: 200 });
     // Server evidence is diagnostic; this viewer's frame progress establishes ready.
     if ( url.includes('confirm=display') ) return json({ ok: true, display: 'live' });
     if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });

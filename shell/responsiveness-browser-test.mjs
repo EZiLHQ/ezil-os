@@ -253,7 +253,7 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
                 ...(state.applied ? { screen: { ...state.applied, source: 'snapped' } } : {}),
             });
         }
-        if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true });
+        if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true, status: 200 });
         if ( url.includes('confirm=display') ) return json({ ok: true, display: 'live' });
         if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
         if ( url.includes('/api/') ) return json({ ok: true });

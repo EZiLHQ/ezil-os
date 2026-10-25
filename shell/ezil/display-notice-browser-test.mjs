@@ -129,7 +129,7 @@ for ( const vp of VIEWPORTS ) {
                 frame: { confirmed: true },
             });
         }
-        if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true });
+        if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true, status: 200 });
         // An unknown server answer cannot reveal a viewer. The current iframe
         // supplies layout-fixture frame evidence independently above.
         if ( url.includes('confirm=display') ) return json({ ok: true, display: 'something-we-do-not-recognise' });
