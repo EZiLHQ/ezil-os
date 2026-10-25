@@ -4715,11 +4715,12 @@ async function handlePreview(
       // would hang indefinitely for clients behind symmetric NAT.
       return json({ ok: false, error: ice.error, mode }, 412);
     }
-    // When a TURN provider is configured, mint per-session ephemeral
+    // AWS mints through awsRelayMint after identity binding and host-state checks.
+    // For Cloudflare, when a TURN provider is configured, mint per-session ephemeral
     // credentials NOW and pass them into the sandbox. A generation failure is
     // fatal for a relay-requiring policy (fail closed) but non-fatal for the
     // default diagnostic policy (which tolerates a relay-less session).
-    if (hasTurnConfigured(env)) {
+    if (hasTurnConfigured(env) && auth.v2?.provider !== 'aws-ec2') {
       try {
         iceEnv = await resolveNekoIceEnv(env);
       } catch (err) {
