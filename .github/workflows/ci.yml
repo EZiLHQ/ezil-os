@@ -207,7 +207,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          for t in shell/ezil/apps/desktop-screen-test.mjs \
+          for t in shell/fixture-url-test.mjs \
+                   shell/ezil/apps/desktop-screen-test.mjs \
                    shell/ezil/boot-test.mjs \
                    shell/ezil/apps/desktop-close-test.mjs \
                    shell/ezil/apps/relay-renewal-test.mjs \

@@ -62,6 +62,7 @@
 // too. Nothing here reimplements `minimize_window`, `minimise_to_taskbar` or
 // `exit_fullpage_mode`.
 
+import { fixtureUrl } from './fixture-url-test-support.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -163,23 +164,24 @@ await page.route('**/*', async (route) => {
     const req = route.request();
     const url = req.url();
     const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
-        if (new URL(url).origin === new URL(DESKTOP_URL).origin) return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
-    if ( url === `${HOST}/os` ) {
+    if (fixtureUrl(url, DESKTOP_URL)?.pathname === '/') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
+    const target = fixtureUrl(url, HOST);
+    if ( ! target ) return route.abort();
+    if ( target.pathname === '/os' ) {
         return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
     }
-    if ( url.includes('/api/shell/desktop') && req.method() === 'POST' ) {
+    if ( target.pathname === '/api/shell/desktop' && req.method() === 'POST' ) {
         return json({
             ok: true, guacamoleUrl: DESKTOP_URL, controlMode: 'interactive', mode: 'neko',
             frame: { confirmed: true },
         });
     }
-    if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true, status: 200 });
+    if ( target.pathname === '/api/shell/desktop' && target.searchParams.get('confirm') === 'frame' ) return json({ ok: true, confirmed: true, status: 200 });
     // Server evidence is diagnostic; this viewer's frame progress establishes ready.
-    if ( url.includes('confirm=display') ) return json({ ok: true, display: 'live' });
-    if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
-    if ( url.includes('/api/') ) return json({ ok: true });
-    if ( url.startsWith(HOST) ) return route.fulfill({ status: 404, body: '' });
-    return route.continue();
+    if ( target.pathname === '/api/shell/desktop' && target.searchParams.get('confirm') === 'display' ) return json({ ok: true, display: 'live' });
+    if ( target.pathname === '/api/shell/desktop' ) return json({ ok: true, guacamoleRunning: true });
+    if ( ['/api/shell/session', '/api/shell/focus', '/api/shell/telemetry'].includes(target.pathname) ) return json({ ok: true });
+    return route.fulfill({ status: 404, body: '' });
 });
 
 await page.goto(`${HOST}/os`, { waitUntil: 'load' });
