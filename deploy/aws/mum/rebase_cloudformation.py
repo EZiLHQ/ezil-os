@@ -87,11 +87,33 @@ def pool_resource_tags(statement,namespace):
                for tag,value in (('managed-by','app-computer-platform'),('stage',namespace)))
 
 
-def pool_type_deny():
+def pool_type_deny(premium=False):
     return {'Effect':'Deny','Action':'ec2:RunInstances',
             'Resource':'arn:aws:ec2:ap-south-1:452630323510:instance/*',
             'Condition':{'Null':{'aws:RequestTag/ezil:pool':'false'},
-                         'StringNotEquals':{'ec2:InstanceType':['m6i.large','m6i.xlarge']}}}
+                         'StringNotEquals':{'ec2:InstanceType':['m6i.large','m6i.xlarge'] + (['m6i.2xlarge'] if premium else [])}}}
+
+
+def pool_type_pair(delta):
+    """The exact reviewed two-to-three-type statement replacement, never a general expansion."""
+    old,new=statement_key(pool_type_deny()),statement_key(pool_type_deny(True))
+    removed=Counter(statement_key(s) for s in delta.get('removed',[]))
+    added=Counter(statement_key(s) for s in delta.get('added',[]))
+    return removed[old]==added[new]==1 and not removed[new] and not added[old]
+
+
+def pool_type_count(resource,premium=False):
+    properties={'PolicyName':POOL_CONTROLLER,'Roles':[{'Ref':'LifecycleControllerRole1FB8E154'}]}
+    if (resource.get('Type')!='AWS::IAM::Policy' or {k:v for k,v in resource.get('Properties',{}).items()
+            if k!='PolicyDocument'}!=properties):return 0
+    policy=resource.get('Properties',{}).get('PolicyDocument',{}).get('Statement',[])
+    return sum(statement_key(s)==statement_key(pool_type_deny(premium)) for s in statements(policy))
+
+
+def pool_type_upgrade(left,right,delta):
+    # Bind the exception to the same controller attachment, not just a decoy statement.
+    return (pool_type_pair(delta) and pool_type_count(left)==pool_type_count(right,True)==1
+            and pool_type_count(left,True)==pool_type_count(right)==0)
 
 
 def same_except_action(a,b):
@@ -116,9 +138,16 @@ def validate_pool_iam(phase,before,after,review):
                 if s.get('Effect')=='Allow' and action_set(s) & POOL_SCOPED_ACTIONS:
                     need(pool_resource_tags(s,review['namespace']),'pool IAM Allow requires managed-by and stage resource conditions')
     type_deny=statement_key(pool_type_deny())
-    need(not any(statement_key(s)==type_deny for delta in review['stacks']['workflows'].values()
-                 for s in delta['removed']), 'pool IAM RunInstances type Deny removal refused')
+    premium_deny=statement_key(pool_type_deny(True))
     controller=after['Resources'].get(POOL_CONTROLLER,{})
+    prior_controller=before['Resources'].get(POOL_CONTROLLER,{})
+    upgrade=phase=='workflows' and pool_type_upgrade(prior_controller,controller,
+        review['stacks']['workflows'].get(POOL_CONTROLLER,{}))
+    need(not any(statement_key(s)==premium_deny or statement_key(s)==type_deny
+                 and not (logical==POOL_CONTROLLER and pool_type_pair(delta) and (phase!='workflows' or upgrade))
+                 for logical,delta in review['stacks']['workflows'].items() for s in delta['removed']),
+         'pool IAM RunInstances type Deny removal refused')
+    steady_premium=pool_type_count(prior_controller,True)==pool_type_count(controller,True)==1
     # Incremental review (pool already enabled): identity cannot inspect workflows, so it may
     # proceed only with an empty identity delta; the workflows phase proves the Deny is live.
     need((any(logical==POOL_CONTROLLER
@@ -126,8 +155,8 @@ def validate_pool_iam(phase,before,after,review):
              for logical,delta in review['stacks']['workflows'].items())
           or phase=='identity' and not review['stacks']['identity']
           or phase not in ('identity','workflows')  # the artifact grants other phases nothing
-          or phase=='workflows' and any(statement_key(s)==type_deny for s in statements(
-              controller.get('Properties',{}).get('PolicyDocument',{}).get('Statement',[]))))
+          or phase=='workflows' and (upgrade or steady_premium or any(statement_key(s)==type_deny for s in statements(
+              controller.get('Properties',{}).get('PolicyDocument',{}).get('Statement',[])))))
          and (phase!='workflows' or after['Resources'].get(POOL_CONTROLLER,{}).get('Type')=='AWS::IAM::Policy'),
          'pool IAM RunInstances type Deny required')
     if phase not in ('identity','workflows'):return {}
@@ -139,6 +168,7 @@ def validate_pool_iam(phase,before,after,review):
         left=before['Resources'].get(logical);right=after['Resources'].get(logical)
         candidates=list(statements(right))
         for deny in (s for s in delta['removed'] if s.get('Effect')=='Deny'):
+            if upgrade and logical==POOL_CONTROLLER and statement_key(deny)==type_deny:continue
             baseline=image_boundary_condition(deny) if phase=='identity' and _a2_role_write(left,right) else deny
             if any(same_except_action(s,baseline) and action_set(s)>=action_set(deny) for s in candidates):continue
             need(phase=='identity' and is_shared_boundary(logical,left) and is_shared_boundary(logical,right)

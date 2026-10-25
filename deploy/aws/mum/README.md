@@ -618,8 +618,20 @@ or TerminateInstances must retain `StringEquals` managed-by and stage resource
 tags (`aws:ResourceTag` or `ec2:ResourceTag`). Only the shared boundary may remove
 the two DetachVolume/DeleteTags deny actions, with a matching Allow that adds
 exactly those actions under the same conditions and resources. The controller's
-pool-tagged RunInstances Deny must limit instance types to `m6i.large` and
-`m6i.xlarge`. Other forbidden actions, wildcards and resource/property fences
+pool-tagged RunInstances Deny initially limits instance types to `m6i.large` and
+`m6i.xlarge`. One explicit reviewed transition may add `m6i.2xlarge`: the artifact
+must remove exactly the original statement and add exactly the three-type statement
+in `LifecycleControllerRoleDefaultPolicy31C0D948`. Both templates must attach that
+exact policy to `LifecycleControllerRole1FB8E154`; the Action remains only
+`ec2:RunInstances`, Resource remains
+`arn:aws:ec2:ap-south-1:452630323510:instance/*`, and Condition remains exactly
+`Null: {aws:RequestTag/ezil:pool: "false"}` plus `StringNotEquals` on
+`ec2:InstanceType`. No other statement fields or types may change through this
+exception. Later releases may retain the exact three-type Deny; its removal or
+further expansion is refused. The initial checked-in enablement artifact is not
+an approval of this later transition: independently review and hash-pin a new
+complete statement delta using the same schema. Without the artifact, the
+transition still fails `existing IAM deny weakened`. Other forbidden actions, wildcards and resource/property fences
 remain enforced. A reviewed artifact is specific to its complete IAM delta;
 changed Lambda references or policy statements require a new reviewed artifact.
 

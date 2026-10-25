@@ -1046,6 +1046,80 @@ class PoolIamIncrementalTests(unittest.TestCase):
             cfn.validate_pool_iam('foundation',f['before'],f['after'],removal)
 
 
+class PoolIamPremiumTests(unittest.TestCase):
+    """Actual full validator, with the approved replacement on an existing pool."""
+    controller=PoolIamIncrementalTests.controller
+    policy=PoolIamIncrementalTests.policy
+    repin=PoolIamIncrementalTests.repin
+    exact_review=staticmethod(PoolIamIncrementalTests.exact_review)
+    validate=PoolIamIncrementalTests.validate
+
+    def setUp(self):
+        PoolIamIncrementalTests.setUp(self)
+        policy=self.policy('workflows',self.controller)
+        deny=next(s for s in policy if cfn.statement_key(s)==cfn.statement_key(cfn.pool_type_deny()))
+        deny['Condition']['StringNotEquals']['ec2:InstanceType'].append('m6i.2xlarge')
+        self.repin('workflows')
+
+    def test_premium_transition_requires_explicit_exact_review(self):
+        self.validate('identity');self.validate('workflows')
+        with self.assertRaisesRegex(ValueError,'existing IAM deny weakened'):self.validate('workflows',False)
+        self.artifact['stacks']['workflows'][self.controller]['added'].pop()
+        with self.assertRaises(ValueError):self.validate('workflows')
+
+    def test_premium_steady_state_and_fourth_type_refusal(self):
+        prior=next(s for s in self.policy('workflows',self.controller,'before')
+                   if cfn.statement_key(s)==cfn.statement_key(cfn.pool_type_deny()))
+        prior['Condition']['StringNotEquals']['ec2:InstanceType'].append('m6i.2xlarge')
+        self.repin('workflows');self.validate('workflows')
+        deny=next(s for s in self.policy('workflows',self.controller) if cfn.statement_key(s)==cfn.statement_key(cfn.pool_type_deny(True)))
+        deny['Condition']['StringNotEquals']['ec2:InstanceType'].append('m6i.4xlarge')
+        self.repin('workflows')
+        with self.assertRaises(ValueError):self.validate('workflows')
+
+    def test_premium_exact_statement_and_controller_matrix(self):
+        for change in ('action','extra-action','not-action','resource','not-resource','tag','null','extra-condition',
+                       'fourth-type','partial-types','effect','extra-field','other-controller','attachment','duplicate-old'):
+            with self.subTest(change=change):
+                self.setUp()
+                policy=self.policy('workflows',self.controller)
+                deny=next(s for s in policy if cfn.statement_key(s)==cfn.statement_key(cfn.pool_type_deny(True)))
+                if change=='action':deny['Action']='ec2:StartInstances'
+                elif change=='extra-action':deny['Action']=['ec2:RunInstances','ec2:StartInstances']
+                elif change=='not-action':deny['NotAction']=deny.pop('Action')
+                elif change=='resource':deny['Resource']='*'
+                elif change=='not-resource':deny['NotResource']=deny.pop('Resource')
+                elif change=='tag':deny['Condition']['Null']={'aws:RequestTag/ezil:other':'false'}
+                elif change=='null':deny['Condition']['Null']['aws:RequestTag/ezil:pool']='true'
+                elif change=='extra-condition':deny['Condition']['StringEquals']={'aws:RequestTag/ezil:stage':'mum'}
+                elif change=='fourth-type':deny['Condition']['StringNotEquals']['ec2:InstanceType'].append('m6i.4xlarge')
+                elif change=='partial-types':deny['Condition']['StringNotEquals']['ec2:InstanceType'].remove('m6i.large')
+                elif change=='effect':deny['Effect']='Allow'
+                elif change=='extra-field':deny['Sid']='not-the-exact-reviewed-deny'
+                elif change=='other-controller':
+                    policy.remove(deny)
+                    self.fixtures['workflows']['after']['Resources']['OtherController']={'Type':'AWS::IAM::Policy',
+                        'Properties':{'PolicyDocument':{'Statement':[deny]}}}
+                elif change=='attachment':
+                    self.fixtures['workflows']['after']['Resources'][self.controller]['Properties']['Roles']=[{'Ref':'OtherRole'}]
+                else:self.policy('workflows',self.controller,'before').append(copy.deepcopy(cfn.pool_type_deny()))
+                self.repin('workflows')
+                with self.assertRaises(ValueError):self.validate('workflows')
+
+    def test_premium_does_not_exempt_other_denies_or_inverse_wildcard_grants(self):
+        for change in ('other-deny','inverse','wildcard','forbidden'):
+            with self.subTest(change=change):
+                self.setUp()
+                if change=='other-deny':
+                    self.policy('workflows',self.controller,'before').append({'Effect':'Deny','Action':'ec2:DeleteVolume','Resource':'*'})
+                else:
+                    self.policy('workflows',self.controller).append({'Effect':'Allow',
+                        ('NotAction' if change=='inverse' else 'Action'): 'ec2:DescribeInstances' if change=='inverse' else 'ec2:*' if change=='wildcard' else 'ec2:DeleteVolume',
+                        'Resource':'*'})
+                self.repin('workflows')
+                with self.assertRaises(ValueError):self.validate('workflows')
+
+
 class IntegrationTests(unittest.TestCase):
     cli=stage1.ReleaseTests.cli
 
