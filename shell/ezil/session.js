@@ -569,6 +569,7 @@ async function openDesktopOnce (computerId, screen) {
             computeProvider: data.computeProvider,
             ...(data.computeMigrating === true ? { computeMigrating: true } : {}),
             ...(data.computeLaunching === true ? { computeLaunching: true } : {}),
+            ...capacityAttemptOf(data),
             message: typeof data.error === 'string' ? data.error : undefined,
         };
     }
@@ -635,7 +636,14 @@ async function openDesktopOnce (computerId, screen) {
 export function pendingOrRefused (data) {
     return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
         ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
-        ...(data?.computeLaunching === true ? { computeLaunching: true } : {}) };
+        ...(data?.computeLaunching === true ? { computeLaunching: true } : {}),
+        ...capacityAttemptOf(data) };
+}
+
+/** RETRY-118: only a `capacity_attempt_expired` answer carries the attempt an explicit Retry may reset. */
+function capacityAttemptOf (data) {
+    return data?.errorCode === 'capacity_attempt_expired' && typeof data.capacityAttemptId === 'string'
+        && data.capacityAttemptId !== '' ? { capacityAttemptId: data.capacityAttemptId } : {};
 }
 
 export async function previewUrl (computerId) {
@@ -894,6 +902,114 @@ export async function restartDesktop (computerId) {
         return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message };
     }
     return { ok: true };
+}
+
+/**
+ * RETRY-118. Is the explicit capacity Retry route published by THIS deployment?
+ * Feature-detected exactly like `restartEndpoint()`: the payload only, never an
+ * invented path. Absent → a Retry simply reopens (the pre-RETRY-118 behaviour).
+ *
+ * @returns {string|null}
+ */
+export function capacityRetryEndpoint () {
+    const url = payload()?.desktopState?.endpoints?.capacityRetry;
+    return typeof url === 'string' && url !== '' ? url : null;
+}
+
+const capacityResetsInFlight = new Map();
+
+/** The only reset outcomes the server can answer, and the app-level `ok` each must carry. */
+const CAPACITY_RESET_OUTCOMES = { reset: true, already_reset: true, superseded: true, not_found: false };
+
+/**
+ * Strictly read a `POST <endpoints.capacityRetry>` reply. Only an app-level `ok`
+ * consistent with a known outcome counts; anything else (an `ok:false` claiming
+ * `reset`, a missing or unknown outcome, a non-object body) is `malformed_reply`.
+ * Exported for tests.
+ *
+ * @returns {{reset: boolean, outcome?: string, errorCode?: string}}
+ */
+export function readCapacityResetReply (data) {
+    const outcome = data && typeof data === 'object' ? data.outcome : undefined;
+    if ( typeof outcome !== 'string' || ! Object.prototype.hasOwnProperty.call(CAPACITY_RESET_OUTCOMES, outcome)
+        || data.ok !== CAPACITY_RESET_OUTCOMES[outcome] ) {
+        return { reset: false, errorCode: 'malformed_reply' };
+    }
+    return { reset: outcome === 'reset', outcome };
+}
+
+/**
+ * RETRY-118: the ONE place an explicit user "Try again" resets an expired capacity
+ * attempt. Call it ONLY from a user's Retry handler, with the failure that is on
+ * screen; never from polling, the wake loop or a transport retry (those keep
+ * `capacity_attempt_expired` terminal: `isRetryableBootErrorCode` is false for it).
+ *
+ * - Not a `capacity_attempt_expired` failure with a stored id, or the route not
+ *   published: no request (`{ reset: false }`), and the caller reopens as before.
+ * - Otherwise exactly one `POST <endpoints.capacityRetry>` per computer AND attempt
+ *   at a time: every caller for that attempt (any window) joins the same request.
+ * - The reply is read strictly (`readCapacityResetReply`); a transport failure is
+ *   `{ reset: false, errorCode }`. Callers reopen whatever this answers: the
+ *   server's next answer is the truth, never this one.
+ *
+ * @returns {Promise<{reset: boolean, outcome?: string, errorCode?: string}>}
+ */
+export function retryCapacityAttempt (computerId, failure) {
+    const attemptId = failure?.errorCode === 'capacity_attempt_expired' ? failure.capacityAttemptId : null;
+    const url = capacityRetryEndpoint();
+    if ( ! computerId || typeof attemptId !== 'string' || attemptId === '' || ! url ) {
+        return Promise.resolve({ reset: false });
+    }
+    const key = `${computerId}|${attemptId}`;
+    const inFlight = capacityResetsInFlight.get(key);
+    if ( inFlight ) return inFlight;
+    const pending = request(url, { method: 'POST', body: { computerId, attemptId }, timeoutMs: STATUS_TIMEOUT_MS })
+        .then((res) => {
+            if ( ! res.ok ) {
+                return { reset: false, errorCode: res.code === 'TIMEOUT' ? 'timeout' : res.code === 'NETWORK' ? 'fetch_failed'
+                    : res.code === 'UNAUTHORIZED' ? 'unauthorized' : 'request_failed' };
+            }
+            return readCapacityResetReply(res.data);
+        }, () => ({ reset: false, errorCode: 'fetch_failed' }))
+        .finally(() => capacityResetsInFlight.delete(key));
+    capacityResetsInFlight.set(key, pending);
+    return pending;
+}
+
+/** computer|attempt -> the reopen callbacks still owed one reopen when that reset settles. */
+const reopensOwed = new Map();
+
+/**
+ * RETRY-118: what every surface's user-facing "Try again" calls, with the failure it
+ * is showing and ITS OWN stable reopen callback (defined once per window, so a double
+ * click is recognisable). Shared so Desktop, Code and Preview behave identically.
+ * - Anything but `capacity_attempt_expired` with a stored id (or no published route):
+ *   reopens immediately, exactly as before.
+ * - Otherwise the RESET is shared per computer+attempt (one request, whichever window
+ *   clicks), and every window whose Retry was clicked is reopened exactly once after
+ *   it settles, whatever the outcome. A second click in the same window while that
+ *   is pending joins it (no second reset, no second reopen). A window closed in the
+ *   meantime is skipped by its own callback (`disposed`), never at another's expense.
+ * Never call this from polling, a wake loop or an automatic retry.
+ *
+ * @returns {Promise<{reset: boolean, outcome?: string, errorCode?: string}>}
+ */
+export function userRetry (computerId, failure, reopen) {
+    const expired = failure?.errorCode === 'capacity_attempt_expired' && typeof failure.capacityAttemptId === 'string'
+        && failure.capacityAttemptId !== '' && capacityRetryEndpoint() !== null && !! computerId;
+    if ( ! expired ) { reopen(); return Promise.resolve({ reset: false }); }
+    const key = `${computerId}|${failure.capacityAttemptId}`;
+    const shared = retryCapacityAttempt(computerId, failure);
+    let owed = reopensOwed.get(key);
+    if ( owed?.has(reopen) ) return shared; // the same window's second click: joined
+    if ( ! owed ) { owed = new Set(); reopensOwed.set(key, owed); }
+    owed.add(reopen);
+    return shared.then((result) => {
+        owed.delete(reopen);
+        if ( owed.size === 0 && reopensOwed.get(key) === owed ) reopensOwed.delete(key);
+        reopen();
+        return result;
+    });
 }
 
 /**
@@ -1202,6 +1318,7 @@ export default {
     openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
     previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
+    capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
     withWakeAndOneRetry, isComputeMigrating, isComputeLaunching,

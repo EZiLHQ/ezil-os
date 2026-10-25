@@ -166,3 +166,20 @@ describe('preview cancellation across the hold', () => {
         expect(preview).toHaveBeenCalledOnce();
     });
 });
+
+// RETRY-118: the expired attempt id reaches the shell and React clients unchanged, and only on that code.
+describe('capacity_attempt_expired passthrough', () => {
+    const ATTEMPT = '0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e';
+    const preview = vi.fn(async () => ({ ok: false as const, error: 'aws_origin_starting', errorCode: 'sandbox_starting' }));
+    const expired = { ok: false, error: 'capacity_attempt_expired', errorCode: 'capacity_attempt_expired', retryable: false,
+        capacityAttemptId: ATTEMPT } as const;
+    it('carries capacityAttemptId as a value, never retryable, without asking the preview', async () => {
+        expect(await awsPreviewAnswer(expired, preview)).toEqual({ ok: false, error: 'capacity_attempt_expired',
+            errorCode: 'capacity_attempt_expired', retryable: false, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2',
+            capacityAttemptId: ATTEMPT });
+        expect(preview).not.toHaveBeenCalled();
+    });
+    it.each(['capacity_unavailable', 'computer_starting', 'region_capacity'])('never attaches an attempt id to %s', async errorCode => {
+        expect(await awsPreviewAnswer({ ...expired, errorCode } as never, preview)).not.toHaveProperty('capacityAttemptId');
+    });
+});

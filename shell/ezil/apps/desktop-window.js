@@ -1045,7 +1045,12 @@ export async function openDesktopWindow (ctx = {}) {
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
-    const progress = BootProgress({ onRetry: () => { void start_boot(); } });
+    /** RETRY-118: the failure on screen, so an explicit Retry can reset an expired capacity attempt. */
+    let last_failure = null;
+    /** The user's own "Try again" (never the automatic paths above): see `session.userRetry`. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); }; // stable: identifies this window to userRetry
+    const user_retry = () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); };
+    const progress = BootProgress({ onRetry: user_retry });
     el_body.appendChild(progress.el);
 
     // ── W3: opens showing this, not the phase panel ─────────────────────────
@@ -1059,7 +1064,7 @@ export async function openDesktopWindow (ctx = {}) {
         label: `Opening ${ctx.appName || title}…`,
         isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        onRetry: () => { void start_boot(); },
+        onRetry: user_retry,
     });
     el_body.appendChild(spinner.el);
 
@@ -1149,6 +1154,7 @@ export async function openDesktopWindow (ctx = {}) {
     async function perform_boot () {
         if ( disposed ) return;
         const my_attempt = ++attempt;
+        last_failure = null;
         neko_reachable = false;
         screen_ctl.cancel();
         active_display_gate?.stop();
@@ -1283,6 +1289,7 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         if ( ! res.ok ) {
+            last_failure = res;
             console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`
                 + `${res.message ? ` (${res.message})` : ''}`);
             telemetry.capture({

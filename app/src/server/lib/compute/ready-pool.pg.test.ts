@@ -19,7 +19,7 @@ import { poolWork, runPoolReplenish, withPoolReplenishLock } from './aws-pool-re
 import { applyLifecycleReceipt, lifecycleExecutionArn, type LifecycleExecutionReader } from './aws-receipts';
 import type { Placement, PlacementDb, PlacementExecutor } from './placement';
 import { lockImagePlacement, lockPoolClaimPlacement, pinCloudflarePlacement, readAdmissionCounters, readImageAdmissionCounters, readPlacement, savePoolEnrollmentNonce, withAdmission } from './placement';
-import { cancelComputerDemand, reservePoolDemand, type PoolDemandDeps } from './aws-pool-demand';
+import { cancelComputerDemand, reservePoolDemand, resetCapacityAttempt, type PoolDemandDeps } from './aws-pool-demand';
 import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest, hasDemandHoldForRouting } from './capacity-demand';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { createPoolDeps } from './aws-pool-runtime';
@@ -976,14 +976,71 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             expect(await reservePoolDemand(deps, want(430))).toBe('waiting');
             await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second', created_at = now() - interval '2 seconds'`);
             await markPoolHost(db, uuid(324), ['retiring'], 'retired', NOW); await host(325, xl, 'ready');
-            expect(await reservePoolDemand(deps, want(430))).toBe('refused'); // the sweep closes it as expired; the attempt is terminal
+            // RETRY-118: the terminal answer is the distinct expired outcome carrying that attempt's id (was 'refused').
+            const expiredId = async (n: number) => (await demands()).find(d => d.computer_id === uuid(n) && d.state === 'expired')?.id;
+            expect(await reservePoolDemand(deps, want(430))).toEqual({ outcome: 'expired', attemptId: await expiredId(430) }); // the sweep closes it as expired; the attempt is terminal
             await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET closed_at = now() - interval '1 day',
                 expires_at = now() - interval '1 day' + interval '1 second', created_at = now() - interval '1 day'`);
-            expect(await reservePoolDemand(deps, want(430))).toBe('refused'); // elapsed time alone never restarts it
+            expect(await reservePoolDemand(deps, want(430))).toEqual({ outcome: 'expired', attemptId: await expiredId(430) }); // elapsed time alone never restarts it
             expect(await cancelComputerDemand(db, uuid(430), uuid(430))).toBe(true); // explicit authenticated stop
             expect((await demands()).map(d => d.state).sort()).toEqual(['cancelled', 'expired']); // the expired record is kept
             expect(await reservePoolDemand(deps, want(430))).toBe('waiting'); // a fresh attempt
             expect(await cancelComputerDemand(db, uuid(430), uuid(999))).toBe(false); // never another owner's
+        });
+        it('RETRY-118: an explicit Retry resets only the owner\'s newest unreleased expired attempt; foreign, duplicate, placement, active and newer attempts touch nothing', async () => {
+            const { deps } = runtime();
+            await runB(); await host(340, xl, 'ready'); await requester(440); await requester(441);
+            expect(await reservePoolDemand(deps, want(440))).toBe('waiting');
+            await db.execute(sql`UPDATE public.ezil_compute_capacity_demands SET expires_at = now() - interval '1 second', created_at = now() - interval '2 seconds'
+                WHERE computer_id = ${uuid(440)}::uuid`);
+            // As in P2-6: the first reservation's reclaim settles; fresh idle capacity exists for the eventual reopen.
+            await markPoolHost(db, uuid(340), ['retiring'], 'retired', NOW); await host(341, xl, 'ready');
+            const outcome = await reservePoolDemand(deps, want(440));
+            expect(outcome).toMatchObject({ outcome: 'expired' });
+            const attemptId = (outcome as { attemptId: string }).attemptId;
+            const rows = async () => (await demands()).filter(d => d.computer_id === uuid(440)).map(d => ({ id: d.id, state: d.state, closed_at: d.closed_at, revision: d.revision }));
+            const snapshot = await rows();
+            expect(snapshot).toEqual([expect.objectContaining({ id: attemptId, state: 'expired' })]);
+            const reset = (over: Partial<{ computerId: string; ownerUserId: string; attemptId: string }> = {}) =>
+                resetCapacityAttempt(db, { computerId: uuid(440), ownerUserId: uuid(440), attemptId, ...over });
+            // Foreign owner, unknown id, another computer: not_found, no write.
+            expect(await reset({ ownerUserId: uuid(441) })).toBe('not_found');
+            expect(await reset({ attemptId: randomUUID() })).toBe('not_found');
+            expect(await reset({ computerId: uuid(441), ownerUserId: uuid(441) })).toBe('not_found');
+            expect(await rows()).toEqual(snapshot);
+            // A placement admitted first: superseded, untouched.
+            await db.execute(sql`INSERT INTO public.ezil_computer_placements
+                (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type, instance_id, updated_at)
+                VALUES (${uuid(440)}::uuid, ${uuid(440)}::uuid, 'aws-ec2', 'ebs', 1, 1, 'UNCONFIRMED', ${c.region}, ${c.zoneId}, 'm6i.large', NULL, ${NOW.toISOString()}::timestamptz)`);
+            expect(await reset()).toBe('superseded');
+            expect(await rows()).toEqual(snapshot);
+            await db.execute(sql`DELETE FROM public.ezil_computer_placements WHERE computer_id = ${uuid(440)}::uuid`); // fixture only
+            // An active demand appearing first: superseded, untouched.
+            const copy = (state: string, closed: string, expires: string, created = 'now()') => db.execute(sql.raw(`INSERT INTO ${schema}.ezil_compute_capacity_demands
+                (request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest, source_generation, source_lease_epoch,
+                 state, cleanup, created_at, expires_at, closed_at)
+                SELECT gen_random_uuid(), owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest, source_generation, source_lease_epoch,
+                    '${state}', '[]'::jsonb, ${created}, ${expires}, ${closed} FROM ${schema}.ezil_compute_capacity_demands WHERE id = '${attemptId}' RETURNING id`)) as Promise<Record<string, unknown>[]>;
+            const [active] = await copy('active', 'NULL', "now() + interval '5 minutes'");
+            expect(await reset()).toBe('superseded');
+            await db.execute(sql`DELETE FROM public.ezil_compute_capacity_demands WHERE id = ${active!.id as string}::uuid`); // fixture only
+            expect(await rows()).toEqual(snapshot);
+            // A newer expired attempt exists: the older one is superseded.
+            const [newer] = await copy('expired', "now() + interval '1 second'", "now() - interval '1 second'", "now() - interval '2 seconds'");
+            expect(await reset()).toBe('superseded');
+            await db.execute(sql`DELETE FROM public.ezil_compute_capacity_demands WHERE id = ${newer!.id as string}::uuid`); // fixture only
+            expect(await rows()).toEqual(snapshot);
+            // The owner's Retry: exactly one closed 'cancelled' marker; the expired record itself is kept unchanged.
+            expect(await reset()).toBe('reset');
+            const after = await rows();
+            expect(after.filter(r => r.id === attemptId)).toEqual(snapshot);
+            expect(after.map(r => r.state).sort()).toEqual(['cancelled', 'expired']);
+            // A duplicate click: already_reset, no further row.
+            expect(await reset()).toBe('already_reset');
+            expect(await rows()).toEqual(after);
+            // The reopen admits a fresh attempt; other computers' rows were never touched.
+            expect(await reservePoolDemand(deps, want(440))).toBe('waiting');
+            expect((await demands()).filter(d => d.computer_id === uuid(441))).toEqual([]);
         });
         it('routing hold: an unclosed demand holds across its deadline before any sweep, the expired attempt until released; a placement blocks release', async () => {
             const { deps } = runtime();
@@ -997,7 +1054,7 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             expect(await states()).toEqual(['active']); // the deadline passed and no sweep ran
             expect(await hold()).toBe(true);
             expect(await hold(999)).toBe(false); // never another owner's
-            expect(await reservePoolDemand(deps, want(432))).toBe('refused'); // the sweep closes it as expired; terminal
+            expect(await reservePoolDemand(deps, want(432))).toMatchObject({ outcome: 'expired' }); // the sweep closes it as expired; terminal (RETRY-118: distinct outcome)
             expect(await states()).toEqual(['expired']);
             expect(await hold()).toBe(true);
             // A placement admitted before the stop's locks: the stop does not release the attempt.

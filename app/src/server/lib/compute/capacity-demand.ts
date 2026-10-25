@@ -99,17 +99,64 @@ export async function lockComputerDemandLive(tx: PlacementExecutor, lock: Admiss
 }
 /** A stable open attempt (computer + kind + source snapshot) whose reservation EXPIRED stays terminal: polling the same
  * attempt can never restart the fixed deadline, however much time passes. Only an explicit authenticated owner
- * cancellation (stop) after that expiry — recorded as a later closed 'cancelled' marker — begins a fresh attempt. */
+ * cancellation (stop) or Retry (resetExpiredAttempt) after that expiry — recorded as a later closed 'cancelled'
+ * marker — begins a fresh attempt. Returns the newest such expired attempt's id, or null. */
 export async function terminalExpiredAttempt(tx: PlacementExecutor, lock: AdmissionLock, key: {
-    computerId: string; kind: 'create' | 'wake'; sourceGeneration: number | null; sourceLeaseEpoch: number | null }): Promise<boolean> {
+    computerId: string; kind: 'create' | 'wake'; sourceGeneration: number | null; sourceLeaseEpoch: number | null }): Promise<string | null> {
     assertHeldAdmissionLock(tx, lock);
-    return rowsOf(await tx.execute(sql`/* demand:terminal */ SELECT d.id FROM public.ezil_compute_capacity_demands d
+    const id = rowsOf(await tx.execute(sql`/* demand:terminal */ SELECT d.id::text AS id FROM public.ezil_compute_capacity_demands d
         WHERE d.computer_id = ${key.computerId}::uuid AND d.kind = ${key.kind}
             AND d.source_generation IS NOT DISTINCT FROM ${key.sourceGeneration}::integer
             AND d.source_lease_epoch IS NOT DISTINCT FROM ${key.sourceLeaseEpoch}::integer AND d.state = 'expired'
             AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands c WHERE c.computer_id = d.computer_id
                 AND c.state = 'cancelled' AND c.closed_at >= d.closed_at)
-        LIMIT 1`)).length > 0;
+        ORDER BY d.closed_at DESC, d.id DESC LIMIT 1`))[0]?.id;
+    return typeof id === 'string' ? id : null;
+}
+
+export type ExpiredAttemptReset = 'reset' | 'already_reset' | 'superseded' | 'not_found';
+
+/**
+ * The owner's explicit Retry of ONE expired attempt (RETRY-118). Under the admission and computer locks, it inserts
+ * the existing closed 'cancelled' marker only when `attemptId` is this owner's, expired, not yet released, the newest
+ * expired attempt of the computer, with no active demand and no placement. It never closes, alters or deletes a row.
+ * - already_reset: that attempt was already released (a duplicate click), nothing written.
+ * - superseded: a placement, an active demand or a newer expired attempt exists: nothing written, the client rereads.
+ * - not_found: unknown id, another computer's, another owner's, or not expired: nothing written.
+ */
+export async function resetExpiredAttempt(tx: PlacementExecutor, lock: AdmissionLock, key: {
+    computerId: string; ownerUserId: string; attemptId: string; hasPlacement: boolean }): Promise<ExpiredAttemptReset> {
+    assertHeldAdmissionLock(tx, lock);
+    const target = rowsOf(await tx.execute(sql`/* demand:resetread */ SELECT d.id::text AS id,
+            EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands c WHERE c.computer_id = d.computer_id
+                AND c.state = 'cancelled' AND c.closed_at >= d.closed_at) AS released,
+            EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands n WHERE n.computer_id = d.computer_id
+                AND n.state = 'expired' AND (n.closed_at, n.id) > (d.closed_at, d.id)) AS newer,
+            EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands a WHERE a.computer_id = d.computer_id
+                AND a.closed_at IS NULL) AS active
+        FROM public.ezil_compute_capacity_demands d
+        WHERE d.id = ${key.attemptId}::uuid AND d.computer_id = ${key.computerId}::uuid
+            AND d.owner_user_id = ${key.ownerUserId}::uuid AND d.state = 'expired'`))[0];
+    if (!target) return 'not_found';
+    if (target.released === true) return 'already_reset';
+    if (key.hasPlacement || target.newer === true || target.active === true) return 'superseded';
+    // The same conditions again in the write itself: exactly this row's marker, or nothing.
+    const written = rowsOf(await tx.execute(sql`/* demand:reset */ INSERT INTO public.ezil_compute_capacity_demands
+        (request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest,
+         source_generation, source_lease_epoch, state, cleanup, created_at, expires_at, closed_at)
+        SELECT gen_random_uuid(), d.owner_user_id, d.computer_id, d.kind, d.region, d.zone_id, d.instance_type, d.vcpu, d.deployment_digest,
+            d.source_generation, d.source_lease_epoch, 'cancelled', '[]'::jsonb, now(), now() + interval '1 second', now()
+        FROM public.ezil_compute_capacity_demands d
+        WHERE d.id = ${key.attemptId}::uuid AND d.computer_id = ${key.computerId}::uuid
+            AND d.owner_user_id = ${key.ownerUserId}::uuid AND d.state = 'expired'
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands c WHERE c.computer_id = d.computer_id
+                AND c.state = 'cancelled' AND c.closed_at >= d.closed_at)
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands n WHERE n.computer_id = d.computer_id
+                AND n.state = 'expired' AND (n.closed_at, n.id) > (d.closed_at, d.id))
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands a WHERE a.computer_id = d.computer_id
+                AND a.closed_at IS NULL)
+        RETURNING id`));
+    return written.length === 1 ? 'reset' : 'superseded';
 }
 /** The owner's explicit cancellation of an expired attempt: a closed 'cancelled' marker row (the expired record is kept). */
 export async function cancelExpiredAttempt(tx: PlacementExecutor, lock: AdmissionLock, computerId: string, ownerUserId: string): Promise<boolean> {

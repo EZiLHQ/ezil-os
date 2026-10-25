@@ -173,6 +173,9 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
             provider: 'cloudflare-guacamole' as const,
             computeProvider: 'aws-ec2' as const,
             ...awsMigrationAnswer(result),
+            // RETRY-118: the expired attempt an explicit user Retry may reset; nothing else carries it.
+            ...(result.errorCode === 'capacity_attempt_expired' && result.capacityAttemptId
+                ? { capacityAttemptId: result.capacityAttemptId } : {}),
             ...(result.errorCode === 'computer_starting' && result.retryable === true && result.computeLaunching === true
                 ? { computeLaunching: true as const } : {}),
         };

@@ -286,6 +286,10 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
+    let last_failure = null;
+    /** Stable per window, so `session.userRetry` reopens THIS window exactly once. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
     let stop_confirmation = () => {};
 
@@ -299,7 +303,7 @@ export async function openCodeWindow (ctx = {}) {
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ label: 'Opening Code…', isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
+        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -354,6 +358,7 @@ export async function openCodeWindow (ctx = {}) {
     const show_unavailable = () => { progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
+        last_failure = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -403,6 +408,7 @@ export async function openCodeWindow (ctx = {}) {
         stop_timers();
 
         if ( ! res.ok ) {
+            last_failure = res;
             if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(res.errorCode));
             // `code_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve code-server at all" — the

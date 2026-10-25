@@ -3,6 +3,7 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import type { Ec2EnrollmentView } from './aws-enroll';
 import type { Ec2VolumeView } from './aws-clients';
 import { POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
+import { PoolCapacityPressure } from './aws-pool-errors';
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('inject billing'); }) }));
 import { createAwsEc2Provider, type AwsProviderDeps } from './aws-ec2';
@@ -600,5 +601,50 @@ describe('RECOVER-UNCONF product open', () => {
         s.execution('SUCCEEDED'); s.executionFields({ startDate: new Date(stopDate.getTime() - 60_000), stopDate }); await s.status();
         expect(s.usage[0].stopped_at).toEqual(stopDate);
         expect(s.meter.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U, computerId: C, endedAt: stopDate, reason: 'user_stop' });
+    });
+});
+
+// RETRY-118: an open whose capacity attempt expired answers a distinct, non-retryable code carrying
+// that attempt's id (the only thing an explicit user Retry may reset), for create and wake alike.
+describe('RETRY-118 capacity_attempt_expired', () => {
+    const ATTEMPT = '0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e';
+    const pressured = (s: ReturnType<typeof setup>) => {
+        s.pool.validateCapacity = vi.fn(async () => {
+            throw new PoolCapacityPressure({ computerId: C, region: D.region, zoneId: D.zoneId, instanceType: 'm6i.large' });
+        });
+        s.pool.reserveDemand = vi.fn(async () => ({ outcome: 'expired' as const, attemptId: ATTEMPT }));
+    };
+    it('first-ever create: the expired attempt id, no placement, no launch', async () => {
+        const s = setup();
+        pressured(s);
+        expect(await s.ensure()).toEqual({ ok: false, error: 'capacity_attempt_expired', errorCode: 'capacity_attempt_expired',
+            retryable: false, capacityAttemptId: ATTEMPT });
+        expect(s.pool.reserveDemand).toHaveBeenCalledOnce();
+        expect(vi.mocked(s.pool.reserveDemand!).mock.calls[0]![0]).toMatchObject({ kind: 'create', computerId: C, userId: U, source: null });
+        expect(s.placements).toEqual([]);
+        expect(s.starts).toEqual([]);
+    });
+    it('wake of a stopped computer: the expired attempt id, the placement untouched, no launch', async () => {
+        const row = stopped();
+        const s = setup({ rows: [row] });
+        const before = structuredClone(s.placements[0]);
+        pressured(s);
+        expect(await s.ensure()).toEqual({ ok: false, error: 'capacity_attempt_expired', errorCode: 'capacity_attempt_expired',
+            retryable: false, capacityAttemptId: ATTEMPT });
+        expect(vi.mocked(s.pool.reserveDemand!).mock.calls[0]![0]).toMatchObject({ kind: 'wake', computerId: C,
+            source: { generation: 3, leaseEpoch: 4 } });
+        expect(s.placements[0]).toEqual(before);
+        expect(s.starts).toEqual([]);
+    });
+    it('every other demand outcome is unchanged (no attempt id leaks)', async () => {
+        for (const [outcome, expected] of [['refused', { errorCode: 'capacity_unavailable', error: 'region_capacity', retryable: false }],
+            ['waiting', { errorCode: 'computer_starting', retryable: true }]] as const) {
+            const s = setup();
+            pressured(s);
+            s.pool.reserveDemand = vi.fn(async () => outcome);
+            const result = await s.ensure();
+            expect(result).toMatchObject({ ok: false, ...expected });
+            expect(result).not.toHaveProperty('capacityAttemptId');
+        }
     });
 });

@@ -162,6 +162,16 @@ export const SHELL_API_ROUTES = {
      * Xvfb, whose framebuffer is fixed at process start).
      */
     screen: '/api/shell/screen',
+    /**
+     * POST = the owner's explicit "Try again" after `capacity_attempt_expired`
+     * (`{ computerId, attemptId }`): resets ONLY that expired capacity attempt
+     * (RETRY-118), then the client reopens through the normal boot. Same
+     * feature-detection contract as `restart`: `shell/ezil/session.js`'s
+     * `resetCapacityAttempt()` reads `desktopState.endpoints.capacityRetry`
+     * fresh and, when absent, the Retry simply reopens (the old behaviour).
+     * Present only while `src/app/api/shell/capacity-retry/route.ts` exists.
+     */
+    capacityRetry: '/api/shell/capacity-retry',
 } as const;
 
 export interface ShellBootUser {

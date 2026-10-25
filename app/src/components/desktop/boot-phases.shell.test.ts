@@ -399,6 +399,7 @@ describe('the port is a module-format conversion and nothing more', () => {
         'kill_switch',
         'aws_disabled',
         'capacity_unavailable',
+        'capacity_attempt_expired',
         'region_capacity',
         'max_running',
         'user_hours_cap',

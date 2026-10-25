@@ -300,6 +300,7 @@ export type BootErrorCode =
     | 'kill_switch'
     | 'aws_disabled'
     | 'capacity_unavailable'
+    | 'capacity_attempt_expired'
     | 'region_capacity'
     | 'max_running'
     | 'user_hours_cap'
@@ -344,6 +345,8 @@ const AWS_REFUSAL_ERROR_CODES: readonly string[] = [
     'kill_switch',
     'aws_disabled',
     'capacity_unavailable',
+    // RETRY-118: never automatic; only an explicit user Retry resets the expired attempt.
+    'capacity_attempt_expired',
     'region_capacity',
     'max_running',
     'user_hours_cap',
@@ -413,6 +416,7 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
         case 'aws_disabled':
             return 'operations_paused';
         case 'capacity_unavailable':
+        case 'capacity_attempt_expired':
         case 'region_capacity':
         case 'max_running':
             return 'capacity_unavailable';

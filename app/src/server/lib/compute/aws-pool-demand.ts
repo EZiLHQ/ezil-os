@@ -15,7 +15,7 @@ import { createPoolDispatchStore } from './aws-pool-dispatch';
 import { poolWork, type PoolDispatchStore } from './aws-pool-replenish';
 import { startLifecycleJob } from './aws-receipts';
 import { cancelExpiredAttempt, closeDemand, closeExpiredDemands, demandDeploymentDigest, insertDemand, lockComputerDemand, lockRegionDemands,
-    terminalExpiredAttempt, type CleanupTarget } from './capacity-demand';
+    resetExpiredAttempt, terminalExpiredAttempt, type CleanupTarget, type ExpiredAttemptReset } from './capacity-demand';
 import { decideAdmission } from './admission';
 import { readAwsAdmissionConfig } from './aws-config';
 import { createProviderMigrationStore } from './provider-migrate-store';
@@ -30,9 +30,12 @@ export interface DemandRequest {
     /** wake: the exact STOPPED placement generation/epoch the open read; create: null (no placement). */
     source: { generation: number; leaseEpoch: number } | null;
 }
+/** This exact attempt's reservation expired and is terminal until the owner explicitly retries or stops (RETRY-118). */
+export interface ExpiredAttemptOutcome { outcome: 'expired'; attemptId: string }
 /** waiting: demand reserved (or already reserved for this exact target); retry: capacity fits now;
- * refused: no reclaimable capacity, another demand holds the region, or the snapshot changed. */
-export type DemandOutcome = 'waiting' | 'retry' | 'refused';
+ * refused: no reclaimable capacity, another demand holds the region, or the snapshot changed;
+ * expired: this attempt expired (carrying its id, for an explicit user Retry only). */
+export type DemandOutcome = 'waiting' | 'retry' | 'refused' | ExpiredAttemptOutcome;
 export interface PoolDemandDeps {
     db: PlacementDb; store: PoolDispatchStore; starter?: LifecycleStarter; env: Env;
     deployments: Record<string, LifecycleDeployment>; now(): Date; killSwitch(): boolean; sleep?: (ms: number) => Promise<void>;
@@ -90,8 +93,9 @@ export async function reservePoolDemand(deps: PoolDemandDeps, r: DemandRequest):
             && own.deploymentDigest === r.deploymentDigest
             && own.sourceGeneration === (r.source?.generation ?? null) && own.sourceLeaseEpoch === (r.source?.leaseEpoch ?? null) ? 'waiting' : 'refused');
         if ((await lockRegionDemands(tx, lock, r.region)).length > 0) return none('refused');
-        if (await terminalExpiredAttempt(tx, lock, { computerId: r.computerId, kind: r.kind,
-            sourceGeneration: r.source?.generation ?? null, sourceLeaseEpoch: r.source?.leaseEpoch ?? null })) return none('refused');
+        const expired = await terminalExpiredAttempt(tx, lock, { computerId: r.computerId, kind: r.kind,
+            sourceGeneration: r.source?.generation ?? null, sourceLeaseEpoch: r.source?.leaseEpoch ?? null });
+        if (expired) return none({ outcome: 'expired', attemptId: expired });
         const c: poolModule.PoolClass = { region: r.region, zoneId: r.zoneId, instanceType: r.instanceType as poolModule.PoolClass['instanceType'] };
         const demand = await poolModule.readPoolDemand(tx, c, deps.now());
         const migrations = await readPoolMigrationReservations(tx);
@@ -140,6 +144,17 @@ export async function cancelComputerDemand(db: PlacementDb, computerId: string, 
         // Image reservations fail closed (no release).
         const placed = await readPlacement(tx, computerId).then(r => r.record !== null, () => true);
         return !placed && cancelExpiredAttempt(tx, lock, computerId, ownerUserId.toLowerCase());
+    });
+}
+
+/** The owner's explicit Retry of one expired attempt (RETRY-118), in the lock order admission -> computer -> demand. */
+export async function resetCapacityAttempt(db: PlacementDb, key: { computerId: string; ownerUserId: string; attemptId: string }): Promise<ExpiredAttemptReset> {
+    return withAdmission(db, async (tx, lock) => {
+        await lockComputerUnderAdmission(tx, lock, key.computerId);
+        // An image reservation makes readPlacement fail closed: treat it like a placement (touch nothing).
+        const hasPlacement = await readPlacement(tx, key.computerId).then(r => r.record !== null, () => true);
+        return resetExpiredAttempt(tx, lock, { computerId: key.computerId, ownerUserId: key.ownerUserId.toLowerCase(),
+            attemptId: key.attemptId.toLowerCase(), hasPlacement });
     });
 }
 

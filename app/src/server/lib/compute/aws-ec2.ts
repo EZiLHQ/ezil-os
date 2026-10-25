@@ -206,6 +206,9 @@ function isReplacementLaunching(p: Placement, input?: string): boolean {
 const CAPACITY_REFUSALS: readonly AdmissionRefusal[] = ['max_running', 'region_capacity'];
 
 const notReady = (errorCode: string, retryable = false, error = errorCode): EnsureResult => ({ ok: false, error, errorCode, retryable });
+/** RETRY-118: this open's capacity attempt expired. Not retryable automatically; only an explicit user Retry resets it. */
+const attemptExpired = (capacityAttemptId: string): EnsureResult =>
+    ({ ok: false, error: 'capacity_attempt_expired', errorCode: 'capacity_attempt_expired', retryable: false, capacityAttemptId });
 
 export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & { status(ctx: ComputeCtx, c: ComputerRef): Promise<AwsComputeStatus> } {
     const env = deps.env ?? (() => process.env);
@@ -497,6 +500,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     computerId: error.target.computerId, requestId: newId(), region: error.target.region, zoneId: error.target.zoneId,
                     instanceType: error.target.instanceType, deploymentDigest: demandDeploymentDigest(cold.intent.deployment),
                     source: request.kind === 'lease' ? request.expected : null });
+                if (typeof outcome === 'object') return { admitted: false as const, reason: 'capacity_attempt_expired' as const, capacityAttemptId: outcome.attemptId };
                 return outcome === 'refused' ? { admitted: false as const, reason: 'region_capacity' as const }
                     : { admitted: false as const, reason: 'capacity_waiting' as const };
             });
@@ -589,6 +593,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
                     throw error;
                 }
+                if (!admitted.admitted && admitted.reason === 'capacity_attempt_expired') return attemptExpired(admitted.capacityAttemptId);
                 if (!admitted.admitted) return admitted.reason === 'capacity_waiting' ? notReady('computer_starting', true)
                     : capacityRefusal(admitted.reason, cfg.deployments, cfg.e);
                 const p = admitted.placement;
@@ -721,6 +726,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         throw error;
                     }
                     if (!leased.admitted && leased.reason === 'capacity_waiting') return notReady('computer_starting', true);
+                    if (!leased.admitted && leased.reason === 'capacity_attempt_expired') return attemptExpired(leased.capacityAttemptId);
                     if (!leased.admitted) return leased.reason === 'cas_conflict'
                         ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
                         : capacityRefusal(leased.reason, cfg.deployments, cfg.e);

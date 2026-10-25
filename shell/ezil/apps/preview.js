@@ -191,6 +191,10 @@ export async function openPreviewWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
+    let last_failure = null;
+    /** Stable per window, so `session.userRetry` reopens THIS window exactly once. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
     let stop_confirmation = () => {};
 
@@ -202,7 +206,7 @@ export async function openPreviewWindow (ctx = {}) {
     };
 
     const progress = AppSpinner({ label: 'Opening Preview…', isMigrating: () => session.isComputeMigrating(computer.id),
-        isLaunching: () => session.isComputeLaunching(computer.id), onRetry: () => { void start_boot(); },
+        isLaunching: () => session.isComputeLaunching(computer.id), onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); },
         failureCopy: nativeSurface ? { title: 'Preview is unavailable', body: 'Start your development server in Code, register its port in Settings, then try again.' } : undefined });
     el_body.appendChild(progress.el);
 
@@ -238,6 +242,7 @@ export async function openPreviewWindow (ctx = {}) {
     const show_unavailable = () => { progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
+        last_failure = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -298,6 +303,7 @@ export async function openPreviewWindow (ctx = {}) {
         stop_timers();
 
         if ( ! res.ok ) {
+            last_failure = res;
             // `app_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve a preview at all" rather than
             // "something went wrong": the port could not be exposed, or the

@@ -7,6 +7,8 @@ describe.each([['app', app], ['shell', shell]] as const)('%s AWS refusal copy', 
         ['kill_switch', 'operations_paused', 'Your AWS computer is paused by operations', 'Only operations can resume'],
         ['aws_disabled', 'operations_paused', 'Your AWS computer is paused by operations', 'Only operations can resume'],
         ['capacity_unavailable', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
+        // RETRY-118: same copy and an enabled Try again; never retried automatically.
+        ['capacity_attempt_expired', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
         ['region_capacity', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
         ['max_running', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
         ['user_hours_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your monthly computer hours renew next month'],

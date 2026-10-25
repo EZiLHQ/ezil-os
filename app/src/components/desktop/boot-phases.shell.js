@@ -300,7 +300,7 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  *   | 'custom_domain_required' | 'connection_refused' | 'fetch_failed'
  *   | 'sandbox_runtime_blocked' | 'sandbox_start_failed' | 'sandbox_starting'
  *   | 'worker_http_error' | 'desktop_unreachable' | 'timeout'
- *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'region_capacity'
+ *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'capacity_attempt_expired' | 'region_capacity'
  *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'unknown'} BootErrorCode
  */
 
@@ -332,6 +332,8 @@ const AWS_REFUSAL_ERROR_CODES = [
     'kill_switch',
     'aws_disabled',
     'capacity_unavailable',
+    // RETRY-118: never automatic; only an explicit user Retry resets the expired attempt.
+    'capacity_attempt_expired',
     'region_capacity',
     'max_running',
     'user_hours_cap',
@@ -390,6 +392,7 @@ function classifyFailure(errorCode) {
         case 'aws_disabled':
             return 'operations_paused';
         case 'capacity_unavailable':
+        case 'capacity_attempt_expired':
         case 'region_capacity':
         case 'max_running':
             return 'capacity_unavailable';

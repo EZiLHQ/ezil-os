@@ -78,6 +78,7 @@ import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-c
 import { prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from '@/server/lib/compute/aws-preview';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { resetCapacityAttempt } from '@/server/lib/compute/aws-pool-demand';
 import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer } from './compute-dispatch';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
@@ -1422,5 +1423,24 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 correlationId,
                 provider: 'cloudflare-guacamole' as const,
             };
+        }),
+
+    /**
+     * RETRY-118: the owner's explicit "Try again" after `capacity_attempt_expired`. Resets ONLY the
+     * stated expired capacity attempt of this owned computer, and only while it is the newest,
+     * unreleased one with no placement and no active demand (capacity-demand.ts
+     * `resetExpiredAttempt`). It never starts anything: the client reopens through the normal
+     * boot afterwards. Ownership is checked here, once, like `restartDesktop`.
+     * - `reset`: released; the reopen begins a fresh attempt.
+     * - `already_reset` / `superseded`: nothing written; the client just reopens and rereads.
+     * - `not_found`: unknown id, another computer's or owner's, or not expired; nothing written.
+     */
+    resetCapacityAttempt: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid(), attemptId: z.string().uuid() }))
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+            const outcome = await resetCapacityAttempt(ctx.db as unknown as Parameters<typeof resetCapacityAttempt>[0],
+                { computerId: input.computerId, ownerUserId: ctx.user.id, attemptId: input.attemptId });
+            return { ok: outcome !== 'not_found', outcome, provider: 'cloudflare-guacamole' as const };
         }),
 });
