@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('inject billing'); }) }));
-import { D, failedReleaseSetup, TERMINATED } from './aws-failed-release.test-support';
+import { D, failedReleaseSetup, START, STOP, TERMINATED } from './aws-failed-release.test-support';
 import { reconcileFailedRelease, reconcilePoolReleaseRecovery } from './aws-pool-release-recovery';
-import { lifecycleExecutionArn, POOL_RELEASED } from './aws-receipts';
+import { applyLifecycleReceipt, lifecycleExecutionArn, POOL_RELEASED } from './aws-receipts';
 
 afterEach(() => vi.restoreAllMocks());
 const currentDeployment = { ...D, stateMachineVersionArn: D.stateMachineVersionArn.replace(':19', ':20') };
@@ -61,6 +61,68 @@ describe('failed termination replay on a promoted deployment', () => {
         s.finish('FAILED'); await reconcilePoolReleaseRecovery(s.deps, await s.current(), currentDeployment);
         await reconcilePoolReleaseRecovery(s.deps, await s.current(), currentDeployment);
         expect(s.starts).toHaveLength(2); expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
+    it.each([false, true])('preserves original version-19 proof through failed 19 and 20 replays, then settles on 21; absent=%s', async absent => {
+        const s = await failedReplay();
+        if (absent) vi.mocked(s.deps.describer!.describeForEnrollment).mockResolvedValue(null);
+        const originalProof = { basis: 'failed_release_termination', sourceJobId: s.original.intent.jobId,
+            sourceExecutionArn: s.failed.executionArn, sourceDigest: s.original.digest, sourceStateMachineVersionArn: D.stateMachineVersionArn,
+            sourceStartedAt: START.toISOString(), sourceStoppedAt: STOP.toISOString(), stoppedAt: TERMINATED.toISOString() };
+        const unchangedIdentity = { generation: 1, leaseEpoch: 1, instanceId: s.original.intent.providerInstanceId,
+            volumeId: s.original.intent.dataVolumeId, fenceToken: s.original.intent.fenceToken };
+        const stillOpen = async (starts: number) => {
+            expect(s.starts).toHaveLength(starts);
+            expect(proof(await s.context())).toEqual(originalProof);
+            expect(await s.current()).toMatchObject(unchangedIdentity);
+            expect(s.usage[0]!.stopped_at).toBeNull();
+            expect(s.meter.stopped).not.toHaveBeenCalled();
+        };
+        await stillOpen(1); // original release -> failed version-19 replay
+        for (let n = 0; n < 3; n++) {
+            await s.tick();
+            expect(await s.context()).toMatchObject({ error: 'recovery_retry_awaits_new_deployment' });
+            await stillOpen(1);
+        }
+        // Infrastructure may already be 21, but the installed app still selects 20 during rollout.
+        expect(await s.retry()).toEqual({ outcome: 'recovering', error: null });
+        expect(s.starts[1]!.stateMachineArn).toBe(currentDeployment.stateMachineVersionArn);
+        await stillOpen(2);
+        await applyLifecycleReceipt(s.deps, await s.current(), currentDeployment); // running version 20
+        await stillOpen(2);
+        const failed20 = s.finish('FAILED');
+        failed20.error = 'LifecycleUnconfirmed'; failed20.cause = 'initial Lambda explicitDeny';
+        s.histories.set(failed20.executionArn!, []); // neither replay supplies a termination witness
+        await applyLifecycleReceipt(s.deps, await s.current(), currentDeployment);
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED' });
+        await stillOpen(2);
+        for (let n = 0; n < 3; n++) { // minute reconciler before app promotion must not create more version-20 jobs
+            await applyLifecycleReceipt(s.deps, await s.current(), currentDeployment);
+            expect(await s.context()).toMatchObject({ error: 'recovery_retry_awaits_new_deployment' });
+            await stillOpen(2);
+        }
+        const promoted = { ...D, stateMachineVersionArn: D.stateMachineVersionArn.replace(':19', ':21') };
+        const request20 = { ...s.request, expectedJobId: s.starts[1]!.intent.jobId, releaseExecutionArn: failed20.executionArn! };
+        expect(await reconcileFailedRelease(s.deps, { [D.region]: promoted }, request20)).toEqual({ outcome: 'recovering', error: null });
+        await stillOpen(3);
+        expect(s.starts.map(w => w.stateMachineArn)).toEqual([D.stateMachineVersionArn, currentDeployment.stateMachineVersionArn, promoted.stateMachineVersionArn]);
+        expect(new Set(s.starts.map(w => w.intent.jobId)).size).toBe(3);
+        expect(s.starts.every(w => w.intent.operation === 'release')).toBe(true);
+        expect(await reconcileFailedRelease(s.deps, { [D.region]: promoted }, request20)).toEqual({ outcome: 'not_applicable', error: null });
+        await applyLifecycleReceipt(s.deps, await s.current(), promoted); // running version 21
+        await stillOpen(3);
+        const historyReads = vi.mocked(s.deps.executions.history!).mock.calls.length;
+        s.finish();
+        const request21 = { ...s.request, expectedJobId: s.starts[2]!.intent.jobId,
+            releaseExecutionArn: lifecycleExecutionArn(promoted, s.starts[2]!.intent.jobId) };
+        expect(await reconcileFailedRelease(s.deps, { [D.region]: promoted }, request21)).toEqual({ outcome: 'settled', error: null });
+        expect(await s.current()).toMatchObject({ ...unchangedIdentity, state: 'STOPPED', lastError: POOL_RELEASED, lifecycleJobId: null });
+        expect(s.deps.executions.history).toHaveBeenCalledTimes(historyReads + 1); // settlement re-witnesses the original again
+        expect(vi.mocked(s.deps.executions.history!).mock.calls.every(([, arn]) => arn === originalProof.sourceExecutionArn)).toBe(true);
+        expect(s.usage[0]!.stopped_at).toEqual(TERMINATED);
+        expect(s.meter.stopped).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ endedAt: TERMINATED }));
+        expect(await reconcileFailedRelease(s.deps, { [D.region]: promoted }, request21)).toEqual({ outcome: 'not_applicable', error: null });
+        expect(s.starts).toHaveLength(3); expect(s.meter.stopped).toHaveBeenCalledTimes(1);
     });
 
     it('a moved epoch defeats the existing CAS', async () => {
