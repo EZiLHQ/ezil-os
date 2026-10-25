@@ -1,0 +1,501 @@
+{
+  "model": "qwen.qwen3-coder-next",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspect the project."
+        }
+      ]
+    }
+  ],
+  "max_tokens": 8192,
+  "stream": true,
+  "tools": [
+    {
+      "name": "tool_0",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_1",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_3",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_4",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_5",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_6",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_7",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_8",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_9",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_10",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_11",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_12",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_13",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_14",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_15",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_16",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_17",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_18",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_19",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_20",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_21",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_22",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_23",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_24",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_25",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_26",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_27",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_28",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_29",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_30",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_31",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_32",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_33",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_34",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_35",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_36",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_37",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_38",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    },
+    {
+      "name": "tool_39",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Read a file"
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  }
+}

@@ -127,6 +127,25 @@ function fakeHost(over: Partial<HostState> = {}) {
 
 // ------------------------------------------------------------------------------ tests
 describe('buildAwsDesktopConfig: relay only, fail closed', () => {
+  it('renewal preserves the boot TURN-only backend, including mixed STUN/TURN entries', async () => {
+    const h = fakeHost();
+    const servers = [{ urls: ['stun:s.example:3478', 'turn:t.example:3478'], username: TURN_USER, credential: TURN_PASS }];
+    await awsRelayRefresh({ record: record(), zone: ZONE, fetch: h.fetch, nowMs: () => NOW, admin: NEKO.admin,
+      runtimeId: h.st.relay.runtimeId, mint: async () => ({ servers, expiresAt: NOW + 1_740_000 }) });
+    const posted = JSON.parse(h.calls.find(c => c.method === 'POST' && c.path.endsWith('/api/relay'))!.body!);
+    const boot = buildAwsDesktopConfig(servers, NOW + 1_740_000, NEKO, NOW);
+    expect(posted.backend).toEqual(boot.backend);
+    expect(posted.frontend).toEqual(boot.frontend);
+    expect(posted.backend.flatMap((s: AwsDesktopConfig['backend'][number]) => s.urls)).toEqual(['turn:t.example:3478']);
+  });
+  it('renewal with no authenticated TURN backend never posts a replacement config', async () => {
+    for (const servers of [[{ urls: ['stun:s.example:3478'] }], [{ urls: ['turn:t.example:3478'] }]]) {
+      const h = fakeHost();
+      await expect(awsRelayRefresh({ record: record(), zone: ZONE, fetch: h.fetch, nowMs: () => NOW, admin: NEKO.admin,
+        runtimeId: h.st.relay.runtimeId, mint: async () => ({ servers, expiresAt: NOW + 1_740_000 }) })).rejects.toThrow('turn_unavailable');
+      expect(h.calls.some(c => c.method === 'POST' && c.path.endsWith('/api/relay'))).toBe(false);
+    }
+  });
   it('backend is TURN-only (no STUN, so no server-reflexive gathering); frontend is browser-safe', () => {
     const c = buildAwsDesktopConfig(cloudflareServers(), NOW + 1_800_000, NEKO, NOW);
     const backendUrls = c.backend.flatMap((s) => s.urls);

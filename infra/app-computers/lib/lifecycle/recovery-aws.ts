@@ -2,7 +2,8 @@ import { SFNClient, GetExecutionHistoryCommand, type HistoryEvent } from '@aws-s
 import { awsDependencies, type Dependencies } from './aws.js';
 import type { RecoverySettings } from './recovery-contract.js';
 
-export interface RecoveryDependencies extends Pick<Dependencies, 'execution' | 'instances' | 'volumes' | 'now'> {
+export interface RecoveryDependencies extends Pick<Dependencies, 'execution' | 'instances' | 'volumes' | 'now'>,
+    Partial<Pick<Dependencies, 'image' | 'template' | 'snapshots' | 'imageAuthority' | 'restoredVolumes'>> {
     history(arn: string): Promise<HistoryEvent[]>;
 }
 export function recoveryDependencies(settings: RecoverySettings): RecoveryDependencies {

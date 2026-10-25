@@ -11,7 +11,7 @@
  * schedule to the route, or the route to the drain.
  *
  * So this file tests the seams rather than the parts:
- *   1. `vercel.json` declares at most two crons, and every declared path is a
+ *   1. `vercel.json` declares the three required crons, and every declared path is a
  *      real route module that exports `GET` and an explicit `maxDuration`.
  *   2. Driving the REAL `/api/cron/telemetry-maintenance` handler with a real
  *      `Request` and the right bearer actually issues the Worker drain call —
@@ -23,7 +23,7 @@
  * the route module, the handler, the transport and the token minter are all
  * the shipped ones.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -42,12 +42,14 @@ function vercelCrons(): CronEntry[] {
 }
 
 describe('vercel.json cron manifest', () => {
-    it('🔴 declares at most TWO crons — the plan ceiling that silently dropped the third', () => {
-        // The third entry (`/api/cron/telemetry-drain`, `43 3 * * *`) was
-        // registered here and never invoked: zero hour-03 Worker requests from
-        // it since 2026-08-09, while the other two kept firing. The drain now
-        // rides along with `telemetry-maintenance`, which is proven to fire.
-        expect(vercelCrons().length).toBeLessThanOrEqual(2);
+    it('declares the existing maintenance jobs and the minute-by-minute billing session sweep', () => {
+        // Billing enforcement requires a plan that supports this frequency and
+        // three schedules. The standalone drain still rides with maintenance.
+        expect(vercelCrons()).toEqual([
+            { path: '/api/cron/telemetry-maintenance', schedule: '17 3 * * *' },
+            { path: '/api/cron/sandbox-reap', schedule: '8 4 * * *' },
+            { path: '/api/cron/billing-session-sweep', schedule: '* * * * *' },
+        ]);
     });
 
     it('points every declared schedule at a route that exists and declares its own maxDuration', () => {
@@ -68,6 +70,37 @@ describe('vercel.json cron manifest', () => {
         // Removed from the schedule, NOT from the app: it is the only way to
         // force a drain between daily runs.
         expect(existsSync(path.join(APP_ROOT, 'src', 'app', 'api', 'cron', 'telemetry-drain', 'route.ts'))).toBe(true);
+    });
+});
+
+describe('os-staging systemd cron set (deploy/aws/os-staging)', () => {
+    const STAGING = path.resolve(APP_ROOT, '..', 'deploy', 'aws', 'os-staging');
+    const installer = () => readFileSync(path.join(STAGING, 'install-host.sh'), 'utf8');
+    const enabledJobs = () => installer().match(/^jobs=\(([a-z -]+)\)$/m)?.[1]?.split(' ') ?? [];
+    const allowlisted = () => (installer().match(/\(("[a-z-]+"(?:, "[a-z-]+")*)\)\s*\n\s*for kind in/)?.[1] ?? '')
+        .split(', ').map((j) => j.replace(/"/g, ''));
+    const unitJobs = (kind: 'service' | 'timer') => readdirSync(path.join(STAGING, 'cron'))
+        .filter((f) => f.endsWith(`.${kind}`)).map((f) => f.replace(/^ezil-os-staging-/, '').replace(`.${kind}`, '')).sort();
+
+    it('ships one service+timer per enabled job, and the bundle allowlist is exactly that set', () => {
+        const jobs = [...enabledJobs()].sort();
+        expect(jobs).toContain('aws-reconcile');
+        expect(unitJobs('service')).toEqual(jobs);
+        expect(unitJobs('timer')).toEqual(jobs);
+        expect([...allowlisted()].sort()).toEqual(jobs);
+    });
+
+    it('points every staging service at a real GET route with its own maxDuration', () => {
+        for (const job of enabledJobs()) {
+            const service = readFileSync(path.join(STAGING, 'cron', `ezil-os-staging-${job}.service`), 'utf8');
+            expect(service, job).toContain(`https://os-staging.ezil.work/api/cron/${job}`);
+            expect(service, job).toContain('Authorization: Bearer ${CRON_SECRET}');
+            const route = path.join(APP_ROOT, 'src', 'app', 'api', 'cron', job, 'route.ts');
+            expect(existsSync(route), `${job} has no route.ts`).toBe(true);
+            const src = readFileSync(route, 'utf8');
+            expect(src, job).toMatch(/export async function GET\b/);
+            expect(src, job).toMatch(/export const maxDuration\s*=\s*\d+/);
+        }
     });
 });
 

@@ -23,6 +23,7 @@ export default function LegalLayout({ children }: { children: ReactNode }) {
                 <nav aria-label="Legal footer">
                     <Link href="/terms" prefetch={false}>Terms</Link>
                     <Link href="/privacy" prefetch={false}>Privacy</Link>
+                    <Link href="/refunds" prefetch={false}>Refunds</Link>
                     <a href="mailto:contact@ezil.work">Contact</a>
                 </nav>
             </footer>

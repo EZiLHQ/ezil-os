@@ -57,6 +57,7 @@ const KNOWN_UNCOVERED: Record<string, string> = {
     'cloudflareGuacamole.reportActivity': 'the shell\'s presence heartbeat against the idle reaper',
     'cloudflareGuacamole.relayState': 'runtime-scoped relay metadata for the hosted shell viewer',
     'cloudflareGuacamole.refreshRelay': 'renews the hosted shell viewer\'s active TURN session',
+    'cloudflareGuacamole.resetCapacityAttempt': 'the shell\'s explicit Retry of its own expired capacity attempt (RETRY-118); never an SDK action',
 };
 
 describe('SDK surface vs. the real routers', () => {

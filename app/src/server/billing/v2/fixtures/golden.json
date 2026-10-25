@@ -1,0 +1,1948 @@
+{
+ "contract": "billing-v2",
+ "generatedBy": "independent python oracle (not the implementation)",
+ "rateWindow": [
+  {
+   "name": "standard_59h59m24s",
+   "note": "36 std-s left of 216,000",
+   "input": {
+    "epochs": [
+     {
+      "id": "e0",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T00:00:00Z",
+      "endedAt": "2026-11-02T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e1",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T07:00:00Z",
+      "endedAt": "2026-11-02T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e2",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T14:00:00Z",
+      "endedAt": "2026-11-02T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e3",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T21:00:00Z",
+      "endedAt": "2026-11-03T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e4",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T04:00:00Z",
+      "endedAt": "2026-11-03T10:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e5",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T11:00:00Z",
+      "endedAt": "2026-11-03T17:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e6",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T18:00:00Z",
+      "endedAt": "2026-11-04T00:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e7",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T01:00:00Z",
+      "endedAt": "2026-11-04T07:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e8",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T08:00:00Z",
+      "endedAt": "2026-11-04T14:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e9",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T15:00:00Z",
+      "endedAt": "2026-11-04T20:59:24Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 40
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 215964
+    },
+    "stdSeconds": 215964
+   }
+  },
+  {
+   "name": "standard_60h_exact",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "e0",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T00:00:00Z",
+      "endedAt": "2026-11-02T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e1",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T07:00:00Z",
+      "endedAt": "2026-11-02T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e2",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T14:00:00Z",
+      "endedAt": "2026-11-02T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e3",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T21:00:00Z",
+      "endedAt": "2026-11-03T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e4",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T04:00:00Z",
+      "endedAt": "2026-11-03T10:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e5",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T11:00:00Z",
+      "endedAt": "2026-11-03T17:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e6",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T18:00:00Z",
+      "endedAt": "2026-11-04T00:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e7",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T01:00:00Z",
+      "endedAt": "2026-11-04T07:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e8",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T08:00:00Z",
+      "endedAt": "2026-11-04T14:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e9",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T15:00:00Z",
+      "endedAt": "2026-11-04T21:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 216000
+    },
+    "stdSeconds": 216000
+   }
+  },
+  {
+   "name": "compute_cmp8_499_99_std_hours",
+   "note": "1,799,964 std-s",
+   "input": {
+    "epochs": [
+     {
+      "id": "e0",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T00:00:00Z",
+      "endedAt": "2026-11-02T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e1",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T07:00:00Z",
+      "endedAt": "2026-11-02T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e2",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T14:00:00Z",
+      "endedAt": "2026-11-02T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e3",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T21:00:00Z",
+      "endedAt": "2026-11-03T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e4",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-03T04:00:00Z",
+      "endedAt": "2026-11-03T10:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e5",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-03T11:00:00Z",
+      "endedAt": "2026-11-03T17:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e6",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-03T18:00:00Z",
+      "endedAt": "2026-11-04T00:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e7",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T01:00:00Z",
+      "endedAt": "2026-11-04T07:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e8",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T08:00:00Z",
+      "endedAt": "2026-11-04T14:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e9",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T15:00:00Z",
+      "endedAt": "2026-11-04T21:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e10",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T22:00:00Z",
+      "endedAt": "2026-11-05T04:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e11",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-05T05:00:00Z",
+      "endedAt": "2026-11-05T11:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e12",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-05T12:00:00Z",
+      "endedAt": "2026-11-05T18:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e13",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-05T19:00:00Z",
+      "endedAt": "2026-11-06T01:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e14",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T02:00:00Z",
+      "endedAt": "2026-11-06T08:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e15",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T09:00:00Z",
+      "endedAt": "2026-11-06T15:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e16",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T16:00:00Z",
+      "endedAt": "2026-11-06T22:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e17",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T23:00:00Z",
+      "endedAt": "2026-11-07T05:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e18",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-07T06:00:00Z",
+      "endedAt": "2026-11-07T12:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e19",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-07T13:00:00Z",
+      "endedAt": "2026-11-07T19:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e20",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-07T20:00:00Z",
+      "endedAt": "2026-11-08T00:59:51Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 40
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "cmp-8": 449991
+    },
+    "stdSeconds": 1799964
+   }
+  },
+  {
+   "name": "compute_cmp8_150h_is_600_std_hours",
+   "note": "2,160,000 std-s; 100 std-h over = $25",
+   "input": {
+    "epochs": [
+     {
+      "id": "e0",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T00:00:00Z",
+      "endedAt": "2026-11-02T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e1",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T07:00:00Z",
+      "endedAt": "2026-11-02T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e2",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T14:00:00Z",
+      "endedAt": "2026-11-02T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e3",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-02T21:00:00Z",
+      "endedAt": "2026-11-03T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e4",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-03T04:00:00Z",
+      "endedAt": "2026-11-03T10:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e5",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-03T11:00:00Z",
+      "endedAt": "2026-11-03T17:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e6",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-03T18:00:00Z",
+      "endedAt": "2026-11-04T00:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e7",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T01:00:00Z",
+      "endedAt": "2026-11-04T07:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e8",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T08:00:00Z",
+      "endedAt": "2026-11-04T14:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e9",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T15:00:00Z",
+      "endedAt": "2026-11-04T21:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e10",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-04T22:00:00Z",
+      "endedAt": "2026-11-05T04:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e11",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-05T05:00:00Z",
+      "endedAt": "2026-11-05T11:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e12",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-05T12:00:00Z",
+      "endedAt": "2026-11-05T18:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e13",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-05T19:00:00Z",
+      "endedAt": "2026-11-06T01:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e14",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T02:00:00Z",
+      "endedAt": "2026-11-06T08:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e15",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T09:00:00Z",
+      "endedAt": "2026-11-06T15:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e16",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T16:00:00Z",
+      "endedAt": "2026-11-06T22:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e17",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T23:00:00Z",
+      "endedAt": "2026-11-07T05:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e18",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-07T06:00:00Z",
+      "endedAt": "2026-11-07T12:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e19",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-07T13:00:00Z",
+      "endedAt": "2026-11-07T19:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e20",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-07T20:00:00Z",
+      "endedAt": "2026-11-08T02:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e21",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-08T03:00:00Z",
+      "endedAt": "2026-11-08T09:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e22",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-08T10:00:00Z",
+      "endedAt": "2026-11-08T16:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e23",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-08T17:00:00Z",
+      "endedAt": "2026-11-08T23:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "e24",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-09T00:00:00Z",
+      "endedAt": "2026-11-09T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "cmp-8": 540000
+    },
+    "stdSeconds": 2160000
+   }
+  },
+  {
+   "name": "mixed_sizes_100h_std2_50h_cmp4_25h_cmp8",
+   "note": "360,000 + 360,000 + 360,000",
+   "input": {
+    "epochs": [
+     {
+      "id": "a0",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-01T00:00:00Z",
+      "endedAt": "2026-11-01T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a1",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-01T07:00:00Z",
+      "endedAt": "2026-11-01T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a2",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-01T14:00:00Z",
+      "endedAt": "2026-11-01T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a3",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-01T21:00:00Z",
+      "endedAt": "2026-11-02T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a4",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T04:00:00Z",
+      "endedAt": "2026-11-02T10:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a5",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T11:00:00Z",
+      "endedAt": "2026-11-02T17:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a6",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-02T18:00:00Z",
+      "endedAt": "2026-11-03T00:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a7",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T01:00:00Z",
+      "endedAt": "2026-11-03T07:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a8",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T08:00:00Z",
+      "endedAt": "2026-11-03T14:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a9",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T15:00:00Z",
+      "endedAt": "2026-11-03T21:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a10",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T22:00:00Z",
+      "endedAt": "2026-11-04T04:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a11",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T05:00:00Z",
+      "endedAt": "2026-11-04T11:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a12",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T12:00:00Z",
+      "endedAt": "2026-11-04T18:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a13",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-04T19:00:00Z",
+      "endedAt": "2026-11-05T01:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a14",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-05T02:00:00Z",
+      "endedAt": "2026-11-05T08:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a15",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-05T09:00:00Z",
+      "endedAt": "2026-11-05T15:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "a16",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-05T16:00:00Z",
+      "endedAt": "2026-11-05T20:00:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b0",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-12T00:00:00Z",
+      "endedAt": "2026-11-12T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b1",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-12T07:00:00Z",
+      "endedAt": "2026-11-12T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b2",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-12T14:00:00Z",
+      "endedAt": "2026-11-12T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b3",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-12T21:00:00Z",
+      "endedAt": "2026-11-13T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b4",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-13T04:00:00Z",
+      "endedAt": "2026-11-13T10:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b5",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-13T11:00:00Z",
+      "endedAt": "2026-11-13T17:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b6",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-13T18:00:00Z",
+      "endedAt": "2026-11-14T00:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b7",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-14T01:00:00Z",
+      "endedAt": "2026-11-14T07:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "b8",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-14T08:00:00Z",
+      "endedAt": "2026-11-14T10:00:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "c0",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-20T00:00:00Z",
+      "endedAt": "2026-11-20T06:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "c1",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-20T07:00:00Z",
+      "endedAt": "2026-11-20T13:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "c2",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-20T14:00:00Z",
+      "endedAt": "2026-11-20T20:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "c3",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-20T21:00:00Z",
+      "endedAt": "2026-11-21T03:00:00Z",
+      "endReason": "session_max",
+      "overheadSeconds": 40
+     },
+     {
+      "id": "c4",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-21T04:00:00Z",
+      "endedAt": "2026-11-21T05:00:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 40
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 360000,
+     "cmp-4": 180000,
+     "cmp-8": 90000
+    },
+    "stdSeconds": 1080000
+   }
+  },
+  {
+   "name": "period_boundary_split_november_side",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "x",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-30T23:30:00Z",
+      "endedAt": "2026-12-01T00:30:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-12-02T00:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 1800
+    },
+    "stdSeconds": 1800
+   }
+  },
+  {
+   "name": "period_boundary_split_december_side",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "x",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-30T23:30:00Z",
+      "endedAt": "2026-12-01T00:30:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-12-01T00:00:00Z",
+     "end": "2027-01-01T00:00:00Z"
+    },
+    "now": "2026-12-02T00:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 1800
+    },
+    "stdSeconds": 1800
+   }
+  },
+  {
+   "name": "free_utc_month_boundary_november_side",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "f",
+      "size": "free-cf",
+      "weight": 1,
+      "readyAt": "2026-10-31T23:15:00Z",
+      "endedAt": "2026-11-01T00:45:00Z",
+      "endReason": "idle_sleep",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-02T00:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "free-cf": 2700
+    },
+    "stdSeconds": 2700
+   }
+  },
+  {
+   "name": "resize_std2_to_cmp4_splits_epoch",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "r1",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-03T10:00:00Z",
+      "endedAt": "2026-11-03T11:00:00Z",
+      "endReason": "resize",
+      "overheadSeconds": 0
+     },
+     {
+      "id": "r2",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-03T11:00:00Z",
+      "endedAt": "2026-11-03T12:00:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 3600,
+     "cmp-4": 3600
+    },
+    "stdSeconds": 10800
+   }
+  },
+  {
+   "name": "open_epoch_counts_to_now",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "o",
+      "size": "cmp-4",
+      "weight": 2,
+      "readyAt": "2026-11-08T00:00:00Z",
+      "endedAt": null,
+      "endReason": null,
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-08T01:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "cmp-4": 3600
+    },
+    "stdSeconds": 7200
+   }
+  },
+  {
+   "name": "open_epoch_past_session_bound_is_capped",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "o2",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-05T00:00:00Z",
+      "endedAt": null,
+      "endReason": null,
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-05T08:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 21600
+    },
+    "stdSeconds": 21600
+   }
+  },
+  {
+   "name": "missed_stop_closed_late_is_capped",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "m",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-11-06T00:00:00Z",
+      "endedAt": "2026-11-06T07:00:00Z",
+      "endReason": "provider_stop",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "cmp-8": 21600
+    },
+    "stdSeconds": 86400
+   }
+  },
+  {
+   "name": "millisecond_instants_round_in_customer_favour",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "ms",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-07T00:00:00.400Z",
+      "endedAt": "2026-11-07T01:00:00.900Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 3599
+    },
+    "stdSeconds": 3599
+   }
+  },
+  {
+   "name": "epoch_outside_window_counts_zero",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "z",
+      "size": "cmp-8",
+      "weight": 4,
+      "readyAt": "2026-10-10T00:00:00Z",
+      "endedAt": "2026-10-10T05:00:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 0
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {},
+    "stdSeconds": 0
+   }
+  },
+  {
+   "name": "overhead_is_never_billed",
+   "note": "",
+   "input": {
+    "epochs": [
+     {
+      "id": "oh",
+      "size": "std-2",
+      "weight": 1,
+      "readyAt": "2026-11-09T00:00:00Z",
+      "endedAt": "2026-11-09T00:10:00Z",
+      "endReason": "user_stop",
+      "overheadSeconds": 900
+     }
+    ],
+    "window": {
+     "start": "2026-11-01T00:00:00Z",
+     "end": "2026-12-01T00:00:00Z"
+    },
+    "now": "2026-11-30T12:00:00Z"
+   },
+   "expected": {
+    "actualSecondsBySize": {
+     "std-2": 600
+    },
+    "stdSeconds": 600
+   }
+  }
+ ],
+ "ratePeriod": [
+  {
+   "name": "standard_59h59m24s_left_36",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 215964,
+    "allowanceStdSeconds": 216000,
+    "overage": null
+   },
+   "expected": {
+    "allowanceStdSeconds": 216000,
+    "usedStdSeconds": 215964,
+    "remainingStdSeconds": 36,
+    "overStdSeconds": 0,
+    "overageCents": 0,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "standard_exhausted_at_60h",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 216000,
+    "allowanceStdSeconds": 216000,
+    "overage": null
+   },
+   "expected": {
+    "allowanceStdSeconds": 216000,
+    "usedStdSeconds": 216000,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 0,
+    "overageCents": 0,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "standard_never_bills_overage",
+   "note": "late stop: over is recorded, never billed",
+   "input": {
+    "usedStdSeconds": 216500,
+    "allowanceStdSeconds": 216000,
+    "overage": null
+   },
+   "expected": {
+    "allowanceStdSeconds": 216000,
+    "usedStdSeconds": 216500,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 500,
+    "overageCents": 3,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "compute_499_99_no_overage_yet",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 1799964,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 1799964,
+    "remainingStdSeconds": 36,
+    "overStdSeconds": 0,
+    "overageCents": 0,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "compute_600_std_hours_is_25_dollars",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 2160000,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 2160000,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 360000,
+    "overageCents": 2500,
+    "billableOverageCents": 2500
+   }
+  },
+  {
+   "name": "compute_600_std_hours_with_overage_off_bills_nothing",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 2160000,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": false,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 2160000,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 360000,
+    "overageCents": 2500,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "over_by_1s_is_0_cents",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 1800001,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 1800001,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 1,
+    "overageCents": 0,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "over_by_143s_is_0_cents",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 1800143,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 1800143,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 143,
+    "overageCents": 0,
+    "billableOverageCents": 0
+   }
+  },
+  {
+   "name": "over_by_144s_is_1_cent",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 1800144,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 1800144,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 144,
+    "overageCents": 1,
+    "billableOverageCents": 1
+   }
+  },
+  {
+   "name": "over_cap_is_clamped_to_cap",
+   "note": "400,000 over = 2,777c, billed 2,500c",
+   "input": {
+    "usedStdSeconds": 2200000,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 2200000,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 400000,
+    "overageCents": 2777,
+    "billableOverageCents": 2500
+   }
+  },
+  {
+   "name": "higher_cap_bills_more",
+   "note": "",
+   "input": {
+    "usedStdSeconds": 2200000,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 10000
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1800000,
+    "usedStdSeconds": 2200000,
+    "remainingStdSeconds": 0,
+    "overStdSeconds": 400000,
+    "overageCents": 2777,
+    "billableOverageCents": 2777
+   }
+  },
+  {
+   "name": "upgrade_mid_period_allowance",
+   "note": "standard grant + prorated upgrade grant",
+   "input": {
+    "usedStdSeconds": 300000,
+    "allowanceStdSeconds": 1272000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    }
+   },
+   "expected": {
+    "allowanceStdSeconds": 1272000,
+    "usedStdSeconds": 300000,
+    "remainingStdSeconds": 972000,
+    "overStdSeconds": 0,
+    "overageCents": 0,
+    "billableOverageCents": 0
+   }
+  }
+ ],
+ "upgradeGrant": [
+  {
+   "name": "upgrade_at_period_start",
+   "note": "",
+   "input": {
+    "fromSku": "standard_monthly_v2",
+    "toSku": "compute_monthly_v2",
+    "periodStart": "2026-11-01T00:00:00Z",
+    "periodEnd": "2026-12-01T00:00:00Z",
+    "effectiveAt": "2026-11-01T00:00:00Z"
+   },
+   "expected": 1584000
+  },
+  {
+   "name": "upgrade_after_10_days",
+   "note": "",
+   "input": {
+    "fromSku": "standard_monthly_v2",
+    "toSku": "compute_monthly_v2",
+    "periodStart": "2026-11-01T00:00:00Z",
+    "periodEnd": "2026-12-01T00:00:00Z",
+    "effectiveAt": "2026-11-11T00:00:00Z"
+   },
+   "expected": 1056000
+  },
+  {
+   "name": "upgrade_non_exact_rounds_down",
+   "note": "",
+   "input": {
+    "fromSku": "standard_monthly_v2",
+    "toSku": "compute_monthly_v2",
+    "periodStart": "2026-11-01T00:00:00Z",
+    "periodEnd": "2026-12-01T00:00:00Z",
+    "effectiveAt": "2026-11-11T00:00:07Z"
+   },
+   "expected": 1055995
+  },
+  {
+   "name": "upgrade_15d16h_in",
+   "note": "",
+   "input": {
+    "fromSku": "standard_monthly_v2",
+    "toSku": "compute_monthly_v2",
+    "periodStart": "2026-11-01T00:00:00Z",
+    "periodEnd": "2026-12-01T00:00:00Z",
+    "effectiveAt": "2026-11-16T08:00:00Z"
+   },
+   "expected": 774400
+  },
+  {
+   "name": "upgrade_last_second_grants_0",
+   "note": "",
+   "input": {
+    "fromSku": "standard_monthly_v2",
+    "toSku": "compute_monthly_v2",
+    "periodStart": "2026-11-01T00:00:00Z",
+    "periodEnd": "2026-12-01T00:00:00Z",
+    "effectiveAt": "2026-11-30T23:59:59Z"
+   },
+   "expected": 0
+  },
+  {
+   "name": "upgrade_effective_after_period_end_grants_0",
+   "note": "",
+   "input": {
+    "fromSku": "standard_monthly_v2",
+    "toSku": "compute_monthly_v2",
+    "periodStart": "2026-11-01T00:00:00Z",
+    "periodEnd": "2026-12-01T00:00:00Z",
+    "effectiveAt": "2026-12-01T00:00:05Z"
+   },
+   "expected": 0
+  }
+ ],
+ "admitStart": [
+  {
+   "name": "no_plan_refused",
+   "input": {
+    "planSku": null,
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 0,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "no_plan"
+   }
+  },
+  {
+   "name": "inactive_plan_refused",
+   "input": {
+    "planSku": "standard_monthly_v2",
+    "planActive": false,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 216000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "no_plan"
+   }
+  },
+  {
+   "name": "standard_36s_left_refused",
+   "input": {
+    "planSku": "standard_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 215964,
+    "allowanceStdSeconds": 216000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "allowance_exhausted"
+   }
+  },
+  {
+   "name": "standard_60s_left_admitted_for_60s",
+   "input": {
+    "planSku": "standard_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 215940,
+    "allowanceStdSeconds": 216000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": true,
+    "size": "std-2",
+    "weight": 1,
+    "maxRunSeconds": 60,
+    "deadline": "2026-11-10T09:01:00Z"
+   }
+  },
+  {
+   "name": "standard_fresh_admitted_for_6h",
+   "input": {
+    "planSku": "standard_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 216000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": true,
+    "size": "std-2",
+    "weight": 1,
+    "maxRunSeconds": 21600,
+    "deadline": "2026-11-10T15:00:00Z"
+   }
+  },
+  {
+   "name": "standard_cmp4_not_allowed",
+   "input": {
+    "planSku": "standard_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "cmp-4",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 216000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "size_not_allowed"
+   }
+  },
+  {
+   "name": "standard_cmp8_while_upgrade_pending",
+   "input": {
+    "planSku": "standard_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": true,
+    "size": "cmp-8",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 216000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "upgrade_pending"
+   }
+  },
+  {
+   "name": "compute_cmp8_36_std_left_no_overage_refused",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "cmp-8",
+    "usedStdSeconds": 1799964,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": false,
+     "capCents": 2500
+    },
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "allowance_exhausted"
+   }
+  },
+  {
+   "name": "compute_cmp8_with_overage_admitted",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "cmp-8",
+    "usedStdSeconds": 1799964,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    },
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": true,
+    "size": "cmp-8",
+    "weight": 4,
+    "maxRunSeconds": 21600,
+    "deadline": "2026-11-10T15:00:00Z"
+   }
+  },
+  {
+   "name": "compute_cmp8_at_cap_refused",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "cmp-8",
+    "usedStdSeconds": 2160000,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    },
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "overage_cap_reached"
+   }
+  },
+  {
+   "name": "compute_cmp8_near_cap_short_run",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "cmp-8",
+    "usedStdSeconds": 2148000,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    },
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": true,
+    "size": "cmp-8",
+    "weight": 4,
+    "maxRunSeconds": 3000,
+    "deadline": "2026-11-10T09:50:00Z"
+   }
+  },
+  {
+   "name": "compute_cmp8_near_cap_below_minimum",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "cmp-8",
+    "usedStdSeconds": 2159800,
+    "allowanceStdSeconds": 1800000,
+    "overage": {
+     "enabled": true,
+     "capCents": 2500
+    },
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "overage_cap_reached"
+   }
+  },
+  {
+   "name": "compute_free_size_not_allowed",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "free-cf",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 1800000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "size_not_allowed"
+   }
+  },
+  {
+   "name": "second_computer_refused",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 1800000,
+    "overage": null,
+    "runningComputers": 1,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "concurrent_limit"
+   }
+  },
+  {
+   "name": "payment_issue_refused",
+   "input": {
+    "planSku": "compute_monthly_v2",
+    "planActive": true,
+    "paymentIssue": true,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 1800000,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "payment_issue"
+   }
+  },
+  {
+   "name": "free_v2_fresh",
+   "input": {
+    "planSku": "free_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "free-cf",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 7200,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": true,
+    "size": "free-cf",
+    "weight": 1,
+    "maxRunSeconds": 7200,
+    "deadline": "2026-11-10T11:00:00Z"
+   }
+  },
+  {
+   "name": "free_legacy_fresh",
+   "input": {
+    "planSku": "free_v1_legacy",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "free-cf",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 28800,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": true,
+    "size": "free-cf",
+    "weight": 1,
+    "maxRunSeconds": 21600,
+    "deadline": "2026-11-10T15:00:00Z"
+   }
+  },
+  {
+   "name": "free_std2_not_allowed",
+   "input": {
+    "planSku": "free_v2",
+    "planActive": true,
+    "paymentIssue": false,
+    "upgradePending": false,
+    "size": "std-2",
+    "usedStdSeconds": 0,
+    "allowanceStdSeconds": 7200,
+    "overage": null,
+    "runningComputers": 0,
+    "now": "2026-11-10T09:00:00Z"
+   },
+   "expected": {
+    "admit": false,
+    "reason": "size_not_allowed"
+   }
+  }
+ ]
+}

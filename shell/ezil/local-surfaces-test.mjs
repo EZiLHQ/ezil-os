@@ -27,7 +27,7 @@ for (const surface of ['code', 'preview']) {
             await wait(10); running = true;
             body = { ok: true, guacamoleUrl: 'http://127.0.0.1:8181/', frame: { confirmed: true } };
         } else if (url.searchParams.get('confirm') === 'frame') {
-            body = { ok: true, confirmed: url.searchParams.get('surface') === surface };
+            body = { ok: true, confirmed: url.searchParams.get('surface') === surface, status: 200 };
         } else if (url.pathname === '/api/shell/desktop') body = { ok: true, guacamoleRunning: running };
         else {
             assert.equal(running, true, `${surface} minted before cold start completed`);
@@ -50,6 +50,8 @@ for (const surface of ['code', 'preview']) {
     assert.equal(requests[0].method, 'POST'); assert.equal(requests[0].url.pathname, '/api/shell/desktop');
     frame.dispatchEvent(new window.Event('load')); await wait(40);
     assert.ok(requests.some(request => request.url.searchParams.get('surface') === surface));
+    assert.equal(window.document.querySelector(`.window[data-app="${surface}"] .ezil-app-spinner`).hidden, true,
+        'valid local confirmation reveals the surface');
     console.log(`PASS local ${surface}-first cold start: ensure before mint and surface-specific confirmation`);
 }
 process.exit(0);

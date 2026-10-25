@@ -1,0 +1,41 @@
+-- OFFLINE ready-pool and global migration writer-lease model.
+-- NOT A REGISTERED MIGRATION. Registration follows README.md.
+-- additiveSQL has no PRIMARY KEY syntax: NOT NULL plus UNIQUE indexes preserve keys.
+-- CHECKs/defaults live in ready-pool.ts (insert validation and atomic lease guards).
+-- The candidate index is full; leasePoolHost retains its readiness predicates.
+-- Writer region/generation are validated by aws-migrate.ts before lease acquisition.
+
+CREATE TABLE public.ezil_compute_pool_hosts (
+  id uuid NOT NULL,
+  region text NOT NULL,
+  zone_id text NOT NULL,
+  instance_id text NOT NULL,
+  instance_type text NOT NULL,
+  state text NOT NULL,
+  health text NOT NULL,
+  editor_ready_at timestamptz NULL,
+  generation bigint NOT NULL,
+  leased_computer_id uuid NULL,
+  leased_generation bigint NULL,
+  lease_token uuid NULL,
+  leased_at timestamptz NULL,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL
+);
+CREATE UNIQUE INDEX ezil_compute_pool_hosts_pkey ON public.ezil_compute_pool_hosts (id);
+CREATE UNIQUE INDEX ezil_compute_pool_hosts_instance_id_key ON public.ezil_compute_pool_hosts (instance_id);
+CREATE INDEX ezil_compute_pool_hosts_candidate_idx ON public.ezil_compute_pool_hosts (region, instance_type, state, health, editor_ready_at);
+REVOKE ALL ON TABLE public.ezil_compute_pool_hosts FROM public, anon, authenticated;
+ALTER TABLE public.ezil_compute_pool_hosts ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE public.ezil_compute_writer_leases (
+  computer_id uuid NOT NULL,
+  region text NOT NULL,
+  generation bigint NOT NULL,
+  holder text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  fenced_at timestamptz NULL
+);
+CREATE UNIQUE INDEX ezil_compute_writer_leases_pkey ON public.ezil_compute_writer_leases (computer_id);
+REVOKE ALL ON TABLE public.ezil_compute_writer_leases FROM public, anon, authenticated;
+ALTER TABLE public.ezil_compute_writer_leases ENABLE ROW LEVEL SECURITY;

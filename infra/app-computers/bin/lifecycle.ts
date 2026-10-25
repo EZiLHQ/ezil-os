@@ -24,5 +24,6 @@ try {
     if(config.recoveryVersionArn)new ComputerLifecycleRecovery(stack,'Recovery',{
         settings:{lifecycle:config.settings,recoveryVersionArn:config.recoveryVersionArn},
         sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled});
-    if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn});
+    // appCaller includes optional ec2CallerRoleArns; an absent/empty list keeps OIDC-only trust.
+    if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,ec2CallerRoleArns:config.appCaller.ec2CallerRoleArns,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn});
 }catch(cause){throw new Error("EZIL_LIFECYCLE_CONFIG is missing or invalid; supply reviewed references without credentials",{cause})}

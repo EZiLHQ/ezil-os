@@ -20,8 +20,11 @@
 
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { parseEnrollmentUserData } from './aws-rebase-lease';
+import { parseRebaseJson, RebaseDigest, RebaseHash, RebaseUuid } from './aws-rebase-json';
 
 import { AWS_REGION_PATTERN, type Env } from './aws-config';
+import { RebaseSourceReleaseSchema } from './aws-rebase-release';
 
 /** JSON object: region → that region's lifecycle deployment (the infra stack's outputs). */
 export const LIFECYCLE_DEPLOYMENTS_ENV = 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS';
@@ -31,7 +34,7 @@ export const LIFECYCLE_DEPLOYMENTS_ENV = 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS';
  * type a tier may record, plus the benchmark type. A deployment may narrow it,
  * never extend it. aws-intent.test.ts checks that every tier type is listed.
  */
-export const KNOWN_INSTANCE_TYPES: readonly string[] = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'];
+export const KNOWN_INSTANCE_TYPES: readonly string[] = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'];
 
 const ZONE_ID_PATTERN = /^[a-z]{2,4}\d-az\d+$/;
 const DIRECTION: Record<string, string> = {
@@ -92,11 +95,26 @@ export const LifecycleDeploymentSchema = z
             .max(KNOWN_INSTANCE_TYPES.length),
         storage: StorageSchema,
         dataKeyArn: z.string(),
-        stateMachineVersionArn: z.string(),
+        stateMachineVersionArn: z.string().max(300),
+        lowerImageDigest: RebaseDigest.optional(),
+        previousLowerImageDigest: RebaseDigest.nullable().optional(),
+        preparationStateMachineVersionArn: z.string().max(300).optional(),
+        recoveryStateMachineVersionArn: z.string().max(300).optional(),
     })
     .strict()
     // Same refinements as infra's LifecycleDeploymentSchema, in the same order.
     .superRefine((d, ctx) => {
+        const tuple = [d.lowerImageDigest, d.previousLowerImageDigest, d.preparationStateMachineVersionArn, d.recoveryStateMachineVersionArn];
+        if (tuple.some((v) => v !== undefined)) {
+            if (tuple.some((v) => v === undefined) || d.lowerImageDigest === d.previousLowerImageDigest)
+                ctx.addIssue({ code: 'custom', message: 'incomplete_image_deployment' });
+            for (const [field, name] of [['stateMachineVersionArn', 'lifecycle'], ['preparationStateMachineVersionArn', 'rebase-preparation'], ['recoveryStateMachineVersionArn', 'recovery']] as const) {
+                const prefix = `arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:`;
+                const arn = d[field];
+                if (!arn?.startsWith(prefix) || !/^[1-9][0-9]*$/.test(arn.slice(prefix.length)))
+                    ctx.addIssue({ code: 'custom', path: [field], message: 'invalid_deployment_reference' });
+            }
+        }
         if (!zoneIdMatchesRegion(d.zoneId, d.region)) ctx.addIssue({ code: 'custom', path: ['zoneId'], message: 'zone_not_in_region' });
         // Exec-role IAM scopes state machines to ezil-<ns>-* names.
         if (!machineName(d.stateMachineVersionArn).startsWith(`ezil-${d.namespace}-`))
@@ -112,6 +130,24 @@ export const LifecycleDeploymentSchema = z
     });
 export type LifecycleDeployment = z.infer<typeof LifecycleDeploymentSchema>;
 
+/** Legacy source deployments carry the observed lower but cannot authorize a launch. */
+export const SourceLifecycleDeploymentSchema = LifecycleDeploymentSchema.innerType().extend({
+    preparationStateMachineVersionArn: z.string().max(300).nullable().optional(),
+    recoveryStateMachineVersionArn: z.string().max(300).nullable().optional(),
+}).superRefine((d, ctx) => {
+    const legacy = d.preparationStateMachineVersionArn === null || d.recoveryStateMachineVersionArn === null;
+    const { lowerImageDigest, previousLowerImageDigest, preparationStateMachineVersionArn, recoveryStateMachineVersionArn, ...base } = d;
+    if (!(legacy ? LifecycleDeploymentSchema.safeParse(base) : LifecycleDeploymentSchema.safeParse(d)).success
+        || (legacy && (!lowerImageDigest || previousLowerImageDigest === undefined || preparationStateMachineVersionArn === undefined || recoveryStateMachineVersionArn === undefined
+            || lowerImageDigest === previousLowerImageDigest)))
+        ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    if (legacy) for (const [arn, name] of [[preparationStateMachineVersionArn, 'rebase-preparation'], [recoveryStateMachineVersionArn, 'recovery']] as const) {
+        if (arn !== null && (typeof arn !== 'string' || !new RegExp(`^arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-${name}:[1-9][0-9]*$`).test(arn)))
+            ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
+    }
+});
+export type SourceLifecycleDeployment = z.infer<typeof SourceLifecycleDeploymentSchema>;
+
 /**
  * Every configured region's deployment, or the reason none is usable.
  * A configured region with no deployment, or one whose `region` differs from
@@ -124,7 +160,7 @@ export function readLifecycleDeployments(
     const raw = env[LIFECYCLE_DEPLOYMENTS_ENV];
     let parsed: unknown;
     try {
-        parsed = raw === undefined ? undefined : JSON.parse(raw);
+        parsed = raw === undefined ? undefined : parseRebaseJson(raw, 65536);
     } catch {
         return { ok: false, invalid: [LIFECYCLE_DEPLOYMENTS_ENV] };
     }
@@ -133,21 +169,32 @@ export function readLifecycleDeployments(
     const invalid: string[] = [];
     for (const region of regions) {
         const entry = Object.prototype.hasOwnProperty.call(parsed, region) ? (parsed as Record<string, unknown>)[region] : undefined;
-        const d = LifecycleDeploymentSchema.safeParse(entry);
+        const { releases, ...deployment } = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(13).safeParse(releases).success) {
+            invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`); continue;
+        }
+        const d = LifecycleDeploymentSchema.safeParse(deployment);
         if (!d.success || d.data.region !== region) invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`);
         else deployments[region] = d.data;
     }
     return invalid.length > 0 ? { ok: false, invalid } : { ok: true, deployments };
 }
 
-export const LIFECYCLE_OPERATIONS = ['provision', 'start', 'stop', 'replace', 'retire'] as const;
+export const LIFECYCLE_OPERATIONS = ['provision', 'start', 'stop', 'replace', 'retire', 'pool-provision', 'adopt', 'release', 'pool-retire'] as const;
+/** Matches infra's pool intent allowlist for the approved paid sizes. */
+export const POOL_LIFECYCLE_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
 export type LifecycleOperation = (typeof LIFECYCLE_OPERATIONS)[number];
 
-const uuid = z.string().regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/);
+const uuid = RebaseUuid;
 const positive = z.number().int().min(1).max(2147483647);
 const instance = z.string().regex(/^i-[a-f0-9]{17}$/);
 const volume = z.string().regex(/^vol-[a-f0-9]{17}$/);
 const base64 = /^(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$|^(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$/;
+
+export const RebasePreparationReferenceSchema = z.object({
+    v: z.literal(1), preparationJobId: RebaseUuid,
+    executionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/), digest: RebaseHash,
+}).strict();
 
 /** Field order is the document's key order (it is part of the pinned fixtures). */
 export const LifecycleIntentSchema = z
@@ -159,6 +206,8 @@ export const LifecycleIntentSchema = z
         operation: z.enum(LIFECYCLE_OPERATIONS),
         targetGeneration: positive,
         fenceToken: uuid,
+        poolHostId: uuid.optional(),
+        poolGeneration: positive.optional(),
         providerInstanceId: instance.nullable(),
         dataVolumeId: volume.nullable(),
         previousGeneration: positive.nullable(),
@@ -169,13 +218,18 @@ export const LifecycleIntentSchema = z
         dataVolumeGiB: z.number().int().min(1).max(16384).nullable(),
         leaseEpoch: positive,
         userData: z.string().max(4096).regex(base64).nullable(),
+        rebasePreparation: RebasePreparationReferenceSchema.optional(),
     })
     .strict()
     // Same rule set as the infra refine, in the same order.
     .refine((i) => {
+        const pool = ['pool-provision', 'pool-retire', 'adopt', 'release'].includes(i.operation);
+        if (pool && !(POOL_LIFECYCLE_TYPES as readonly string[]).includes(i.instanceType)) return false;
+        if (['pool-provision', 'pool-retire', 'adopt'].includes(i.operation) !== (i.poolHostId !== undefined)) return false;
+        if (['pool-provision', 'pool-retire'].includes(i.operation) !== (i.poolGeneration !== undefined)) return false;
         if (['provision', 'replace'].includes(i.operation) !== (i.userData !== null) && i.operation !== 'start') return false;
         if (!i.deployment.instanceTypes.includes(i.instanceType)) return false;
-        if ((i.operation === 'provision') !== (i.dataVolumeGiB !== null)) return false;
+        if ((i.operation === 'provision' || (i.operation === 'adopt' && i.dataVolumeId === null)) !== (i.dataVolumeGiB !== null)) return false;
         if (i.dataVolumeGiB !== null && (i.dataVolumeGiB < i.deployment.storage.dataMinGiB || i.dataVolumeGiB > i.deployment.storage.dataMaxGiB)) return false;
         if (i.operation === 'replace') {
             return (
@@ -189,8 +243,33 @@ export const LifecycleIntentSchema = z
             );
         }
         if (i.previousGeneration !== null || i.previousInstanceId !== null || i.previousFenceToken !== null) return false;
+        if (i.operation === 'pool-provision' || i.operation === 'pool-retire') return i.dataVolumeId === null
+            && (i.operation === 'pool-provision' ? i.providerInstanceId === null : i.providerInstanceId !== null)
+            && i.computerId === i.poolHostId && i.targetGeneration === i.poolGeneration;
+        if (i.operation === 'adopt') return i.providerInstanceId !== null;
         return i.operation === 'provision' ? i.providerInstanceId === null && i.dataVolumeId === null : i.providerInstanceId !== null && i.dataVolumeId !== null;
-    }, { message: 'lifecycle_intent_invalid' });
+    }, { message: 'lifecycle_intent_invalid' })
+    .superRefine((i, ctx) => {
+        const fail = () => ctx.addIssue({ code: 'custom', message: 'lifecycle_lease_invalid' });
+        try {
+            if (i.userData === null) { if (i.rebasePreparation) fail(); return; }
+            const l = parseEnrollmentUserData(i.userData);
+            if (l.computerId !== i.computerId || l.generation !== i.targetGeneration || l.leaseEpoch !== i.leaseEpoch
+                || l.provision !== (i.operation === 'provision') || (l.volumeId ?? null) !== i.dataVolumeId) fail();
+            const permit = l.rebasePermit ?? l.ebsRestore;
+            if (!!permit !== !!i.rebasePreparation) fail();
+            if (permit) {
+                const ref = i.rebasePreparation;
+                const d = i.deployment;
+                if (i.operation !== 'replace' || !ref || !d.lowerImageDigest || !d.preparationStateMachineVersionArn
+                    || permit.launchJobId !== i.jobId || permit.fenceToken !== i.fenceToken
+                    || permit.preparationJobId !== ref.preparationJobId
+                    || ref.executionArn !== `arn:aws:states:${d.region}:${d.accountId}:execution:ezil-${d.namespace}-rebase-preparation:computer-${ref.preparationJobId}`) fail();
+                if (l.rebase && (l.rebase.fromDigest !== d.previousLowerImageDigest || l.rebase.toDigest !== d.lowerImageDigest)) fail();
+                if (l.ebsRestore && (l.ebsRestore.fromDigest !== d.lowerImageDigest || l.ebsRestore.sourceGeneration !== i.previousGeneration)) fail();
+            }
+        } catch { fail(); }
+    });
 export type LifecycleIntent = z.infer<typeof LifecycleIntentSchema>;
 
 export class LifecycleIntentInvalidError extends Error {
@@ -247,15 +326,19 @@ export function currentGenerationIntent(
 
 /** Validate, serialize and digest one intent. Throws `LifecycleIntentInvalidError` rather than send a document the helper would refuse. */
 export function buildLifecycleWork(candidate: LifecycleIntent): LifecycleWork {
-    const parsed = LifecycleIntentSchema.safeParse(candidate);
+    const pool = ['pool-provision', 'adopt', 'release', 'pool-retire'].includes(candidate.operation);
+    const parsed = LifecycleIntentSchema.safeParse(pool ? { ...candidate, deployment: { ...candidate.deployment,
+        storage: { rootDeviceName: '/dev/sda1', ...candidate.deployment.storage } } } : candidate);
     if (!parsed.success) throw new LifecycleIntentInvalidError();
     const intent = parsed.data;
     const document = JSON.stringify(intent);
     const digest = createHash('sha256').update(document, 'utf8').digest('hex');
     if (Buffer.byteLength(document) > 16384) throw new LifecycleIntentInvalidError();
+    const input = JSON.stringify({ schemaVersion: 1, document, digest });
+    if (Buffer.byteLength(input) > 20000) throw new LifecycleIntentInvalidError();
     return {
         intent,
-        input: JSON.stringify({ schemaVersion: 1, document, digest }),
+        input,
         digest,
         name: `computer-${intent.jobId}`,
         stateMachineArn: intent.deployment.stateMachineVersionArn,

@@ -322,7 +322,7 @@ describe('hydrateWorkspace store wiring', () => {
 
 describe('ensureWorkspaceMount store gate', () => {
   const loadMount = async () =>
-    (await import('./index')).ensureWorkspaceMount as unknown as (
+    (await import('./index-test-helpers.test')).ensureWorkspaceMount as unknown as (
       s: unknown,
       e: unknown,
       p: unknown,

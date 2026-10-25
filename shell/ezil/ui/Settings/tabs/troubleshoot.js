@@ -229,6 +229,7 @@ function reasonCopy (errorCode) {
         case 'boot_failed': return 'The desktop stopped, but did not come back up. Try again in a moment.';
         case 'unsupported_mode': return 'This desktop runs on an older stack that cannot be restarted in place.';
         case 'restart_in_progress': return 'A restart is already running. Give it a few seconds.';
+        case 'restart_unavailable': return 'The desktop restart could not be confirmed. Try again in a moment.';
         case 'provider_not_configured': return "This deployment hasn't turned on desktop restarts yet.";
         default: return 'Something went wrong. Please try again.';
     }
@@ -247,7 +248,7 @@ function render ($win) {
         // confirm it is gone (`RESTART_STOP_DEADLINE_MS`) BEFORE it starts the
         // ~22s boot. Quoting only the boot half would make a normal restart
         // look overdue while it is still going fine.
-        statusHtml = '<p class="ezil-settings-muted">Restarting… this can take up to about 45 seconds.</p>';
+        statusHtml = '<p class="ezil-settings-muted">Restarting… this usually takes about 45 seconds and can take up to 3 minutes.</p>';
     } else if ( status === 'restarted' ) {
         statusHtml = '<p class="ezil-settings-muted">Restart requested. Give it a few seconds, then reopen the '
             + 'desktop from the taskbar or Start menu if it does not reconnect on its own.</p>';
@@ -329,7 +330,7 @@ async function handleRestart ($win) {
     if ( ! computerId ) return;
 
     const confirmed = await confirmRestart();
-    if ( ! confirmed ) return;
+    if ( ! confirmed || status === 'restarting' ) return;
 
     status = 'restarting';
     render($win);
@@ -338,6 +339,9 @@ async function handleRestart ($win) {
 
     if ( res.ok ) {
         status = 'restarted';
+        // The AWS route now waits for the new runtime (including code-server's startup gate).
+        // Notify once, only after completion; a queue acknowledgment alone is not readiness.
+        window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } }));
     } else {
         status = 'failed';
         failReason = reasonCopy(res.errorCode);

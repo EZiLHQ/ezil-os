@@ -12,6 +12,7 @@ import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
 import { applyWorkloadIdentity, tagWorkload, workloadSynthesizer } from '../lib/workload-identity.js';
+import { preparationFixture } from './preparation-fixture.js';
 
 type Resource = { Type: string; Properties?: Record<string, any> };
 type Template = { Resources?: Record<string, Resource> };
@@ -120,8 +121,13 @@ function checkStack(stack: Stack): string[] {
                 break;
             case 'AWS::IAM::ManagedPolicy':
                 limit(id + '/managed', documentSize(p.PolicyDocument, resources), 6144);
-                if (p.ManagedPolicyName?.endsWith('-boundary'))
-                    limit(id + '/boundary headroom', documentSize(p.PolicyDocument, resources), 5600);
+                // Billing v2 adds exactly 27 serialized characters for the two
+                // paid Compute type names, and the first live Mumbai launch fix exactly
+                // 59 for create-time ENI tags (RunInstances' primary ENI must carry the
+                // compute tags). DescribeSnapshots adds exactly 24 characters;
+                // preserve the hard 6144 quota and the remaining headroom.
+                if (p.ManagedPolicyName?.endsWith('-boundary') && !p.ManagedPolicyName.endsWith('-image-job-boundary'))
+                    limit(id + '/boundary headroom', documentSize(p.PolicyDocument, resources), 5710);
                 break;
             case 'AWS::IAM::Role':
                 limit(id + '/trust', documentSize(p.AssumeRolePolicyDocument, resources), 2048);
@@ -199,11 +205,30 @@ for (const killSwitch of [false, true]) for (const userDataNonce of [false, true
         });
     }
 
-test('identity policies retain headroom with the longest accepted namespace/region and largest volume cap', () => {
+for (const poolLifecycle of [false, true]) test(`identity policies retain headroom with the longest accepted namespace/region and largest volume cap (poolLifecycle=${poolLifecycle})`, () => {
     const config = IdentityConfigSchema.parse({ ...identity, namespace: 'a'.repeat(21), region: 'ap-northeast-1',
-        maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true });
+        maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true, poolLifecycle });
     const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'IdentityMaximumSize', {
         config, env: { account: config.accountId, region: config.region }, synthesizer: new BootstraplessSynthesizer(),
     });
+    assert.deepEqual(checkStack(stack), []);
+});
+
+test('preparation, launch observers and app caller stay within IAM and KMS policy quotas', () => {
+    const f = preparationFixture(), stack = new Stack(new App({ autoSynth: false }), 'PreparationQuota', { env });
+    applyWorkloadIdentity(stack, f.settings.deployment.accountId, f.settings.deployment.namespace);
+    const controller = new ComputerLifecycle(stack, 'Lifecycle', { settings: f.settings, authorityKeyArn: lifecycle.authorityKeyArn });
+    new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: f.settings, recoveryVersionArn: f.settings.deployment.recoveryStateMachineVersionArn! }, sourceHistoryKey: controller.historyKey });
+    new AppCaller(stack, 'AppCaller', { config: AppCallerConfigSchema.parse({ ...lifecycle.appCaller, enabled: true }),
+        region: f.settings.deployment.region, versionArns: [f.settings.deployment.stateMachineVersionArn], historyKeyArn: controller.historyKey.keyArn });
+    assert.deepEqual(checkStack(stack), []);
+});
+
+for (const poolLifecycle of [false, true]) test(`founder image boundary and deployment-policy aggregate quotas with the longest scope (poolLifecycle=${poolLifecycle})`, () => {
+    const f = preparationFixture(), namespace = 'a'.repeat(21), region = 'ap-northeast-1';
+    const deployment = JSON.parse(JSON.stringify(f.settings.deployment).replaceAll('pilot', namespace).replaceAll('ap-south-1', region).replaceAll('aps1-az1', 'apne1-az1'));
+    deployment.storage.dataMinGiB = 16384; deployment.storage.dataMaxGiB = 16384;
+    const config = IdentityConfigSchema.parse({ ...identity, namespace, region, imageJobDeployment: deployment, maxVolumeGiB: 16384, killSwitch: true, userDataAttributeKeyVerified: true, poolLifecycle });
+    const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'ImageIdentityMaximum', { config, env: { account: config.accountId, region } });
     assert.deepEqual(checkStack(stack), []);
 });

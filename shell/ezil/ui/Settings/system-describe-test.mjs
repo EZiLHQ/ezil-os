@@ -1,6 +1,6 @@
 // system-describe-test.mjs — EZiL-authored. Pure wording tests for Settings → System.
 // Run: node shell/ezil/ui/Settings/system-describe-test.mjs   (exit 0 pass, 1 fail)
-import { describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
+import { describeRunningOn, describePlan, describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
 
 const results = [];
 const push = (name, ok, detail) => results.push({ name, ok: !! ok, detail });
@@ -22,6 +22,10 @@ push('🔴 reads off: the hint separates configured routing from verification',
     /configured to start computers on Cloudflare/.test(describeProvider(readsOff).hint) && /not verified/.test(describeProvider(readsOff).hint)
     && ! /Every computer/.test(describeProvider(readsOff).hint));
 push('🔴 reads off: no Cloudflare size is presented', describeMachine(readsOff).value === '—', describeMachine(readsOff));
+
+push('actual Cloudflare line never fabricates Mumbai', describeRunningOn(cf).value === 'Cloudflare Containers (2 vCPU / 6 GiB)');
+push('plan line separates entitlement and preparation', describePlan({ ...cf, plan: { vcpu: 2, memoryGB: 8, status: 'preparing' } }).value === '2 vCPU / 8 GB on AWS (India) — being prepared');
+push('paused plan explains operations', describePlan({ plan: { vcpu: 2, memoryGB: 8, status: 'blocked', reason: 'AWS paused by operations' } }).hint === 'AWS paused by operations');
 
 // Image
 const imageId = 'EZiL_os-2026.10:abcdef0123456789';

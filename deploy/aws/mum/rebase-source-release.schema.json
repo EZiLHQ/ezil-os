@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EZiL rebase source release v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "accountId",
+    "region",
+    "namespace",
+    "amiId",
+    "recipeVersion",
+    "lowerImageDigest",
+    "lowerImageRef",
+    "previousLowerImageDigest",
+    "previousLowerImageRef",
+    "agentCommit",
+    "stateMachineVersionArn",
+    "preparationStateMachineVersionArn",
+    "recoveryStateMachineVersionArn",
+    "launchTemplateId",
+    "launchTemplateVersion",
+    "createdAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "accountId": {
+      "type": "string",
+      "pattern": "^[0-9]{12}$"
+    },
+    "region": {
+      "type": "string",
+      "pattern": "^[a-z]{2}-(north|south|east|west|central|northeast|southeast|northwest|southwest)-[1-9]$"
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]{0,20}$"
+    },
+    "amiId": {
+      "type": "string",
+      "pattern": "^ami-[0-9a-f]{17}$"
+    },
+    "recipeVersion": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "lowerImageDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "lowerImageRef": {
+      "$ref": "#/$defs/ref"
+    },
+    "previousLowerImageDigest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/digest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "previousLowerImageRef": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ref"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "agentCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "stateMachineVersionArn": {
+      "$ref": "#/$defs/version"
+    },
+    "preparationStateMachineVersionArn": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/version"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "recoveryStateMachineVersionArn": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/version"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "launchTemplateId": {
+      "type": "string",
+      "pattern": "^lt-[0-9a-f]{17}$"
+    },
+    "launchTemplateVersion": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,9}$"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "ref": {
+      "type": "string",
+      "maxLength": 512,
+      "pattern": "^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
+    },
+    "version": {
+      "type": "string",
+      "maxLength": 300,
+      "pattern": "^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$"
+    }
+  }
+}

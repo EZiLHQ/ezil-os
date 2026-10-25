@@ -595,6 +595,13 @@ export async function openDesktopWindow (ctx = {}) {
     document.addEventListener('visibilitychange',on_relay_return);
     window.addEventListener('online',on_relay_online);
     const el_iframe = el_window.querySelector('.window-app-iframe');
+    // Scope delegation to this desktop's src origin. The app response also
+    // delegates these features; neither layer bypasses browser permission.
+    el_iframe.setAttribute('allow', 'autoplay; fullscreen; clipboard-read; clipboard-write');
+    el_iframe.setAttribute('tabindex', '0');
+    // Cross-origin autofocus is browser-restricted; there is no iframe
+    // allow-autofocus token. The Neko overlay takes focus on a pointer click.
+    el_iframe.removeAttribute('autofocus');
 
     // ── the desktop's ACTUAL size, and the live-resize path ────────────────
     // ADDED BY EZIL 2026-08-19. See `./desktop-screen.js` and the header block
@@ -1038,7 +1045,12 @@ export async function openDesktopWindow (ctx = {}) {
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
-    const progress = BootProgress({ onRetry: () => { void start_boot(); } });
+    /** RETRY-118: the failure on screen, so an explicit Retry can reset an expired capacity attempt. */
+    let last_failure = null;
+    /** The user's own "Try again" (never the automatic paths above): see `session.userRetry`. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); }; // stable: identifies this window to userRetry
+    const user_retry = () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); };
+    const progress = BootProgress({ onRetry: user_retry });
     el_body.appendChild(progress.el);
 
     // ── W3: opens showing this, not the phase panel ─────────────────────────
@@ -1050,7 +1062,9 @@ export async function openDesktopWindow (ctx = {}) {
     // sequence in which one shows a claim the other has not also made.
     const spinner = AppSpinner({
         label: `Opening ${ctx.appName || title}…`,
-        onRetry: () => { void start_boot(); },
+        isMigrating: () => session.isComputeMigrating(computer.id),
+        isLaunching: () => session.isComputeLaunching(computer.id),
+        onRetry: user_retry,
     });
     el_body.appendChild(spinner.el);
 
@@ -1068,6 +1082,7 @@ export async function openDesktopWindow (ctx = {}) {
         last_kind = state.kind;
         progress.render(state);
         spinner.render(state);
+        if (state.kind === 'progress') show_panel();
     }
 
     // The `ready_unverified` strip. Attached up front, hidden, for the same
@@ -1087,8 +1102,10 @@ export async function openDesktopWindow (ctx = {}) {
      * function's decision (the reveal/failure code paths own it directly).
      */
     const show_panel = () => {
-        progress.el.hidden = ! show_phase_list;
-        spinner.el.hidden = show_phase_list;
+        // Migration and fresh launch copy stay visible on the shared warm path too.
+        const show_phases = show_phase_list && !session.isComputeMigrating(computer.id) && !session.isComputeLaunching(computer.id);
+        progress.el.hidden = ! show_phases;
+        spinner.el.hidden = show_phases;
     };
 
     /**
@@ -1137,6 +1154,7 @@ export async function openDesktopWindow (ctx = {}) {
     async function perform_boot () {
         if ( disposed ) return;
         const my_attempt = ++attempt;
+        last_failure = null;
         neko_reachable = false;
         screen_ctl.cancel();
         active_display_gate?.stop();
@@ -1271,6 +1289,7 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         if ( ! res.ok ) {
+            last_failure = res;
             console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`
                 + `${res.message ? ` (${res.message})` : ''}`);
             telemetry.capture({
@@ -1391,6 +1410,16 @@ export async function openDesktopWindow (ctx = {}) {
         viewer_attempt = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${my_attempt}-${Date.now()}-${Math.random()}`;
         viewer_origin = viewer_url.origin;
         viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
+        // AWS bootstrap redirects to `path`, discarding its outer query. The
+        // viewer reads its navigation ID from the final document URL; without
+        // it every frame report (including renewal confirmation) is rejected.
+        if (viewer_url.pathname === '/preview-bootstrap') {
+            const destination = new URL(viewer_url.searchParams.get('path') || '/', viewer_url);
+            if (destination.origin === viewer_url.origin) {
+                destination.searchParams.set('ezilAttempt', viewer_attempt);
+                viewer_url.searchParams.set('path', destination.pathname + destination.search + destination.hash);
+            }
+        }
         el_iframe.src = viewer_url.href;
         // 🔴 THE GATE STARTS HERE, NOT AFTER THE FRAME CHECK. Asking Neko
         // whether a peer is connected is independent of everything

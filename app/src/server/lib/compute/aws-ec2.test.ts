@@ -5,17 +5,19 @@
  * same instance in the SAME region; a full home region refuses, never hops.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AWS_RETIREMENT_UNDERWAY, AWS_RETIRING, AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
 import { START_ATTEMPTS } from './aws-receipts';
 import type { AwsTier } from './aws-config';
-import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
+import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { nonceHashOf } from './aws-enroll';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { ENROLLMENT_FAILED, PLACEMENT_STATES, PlacementOwnerError, readPlacement, RELEASED_NO_RESOURCES, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
 import { AwsClientError } from './aws-errors';
+import type { EntitlementRecord } from './tier';
+import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -81,7 +83,9 @@ function setup(
         newId: () => crypto.randomUUID(),
         starter: 'starter' in over ? over.starter : rec.starter,
         tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
+        entitlement: over.entitlement,
         randomBytes: over.randomBytes ?? (() => Buffer.from(NONCE_BYTES)),
+        meter: over.meter,
         sleep: over.sleep ?? (async () => {}),
         ...(over.executions ? { executions: over.executions } : {}),
         ...(over.describer ? { describer: over.describer } : {}),
@@ -99,6 +103,28 @@ const stopped = (over: Record<string, unknown> = {}) =>
         fs_uuid: FS, fence_token: FENCE, ...over,
     });
 const startMode = (over: Record<string, string> = {}) => env({ EZIL_AWS_WAKE_MODE: 'start', EZIL_AWS_LIFECYCLE_USERDATA_NONCE: '1', ...over });
+
+describe('stopped Mumbai computer admission refusals', () => {
+    it.each([
+        ['kill_switch', { EZIL_AWS_KILL_SWITCH: '1' }],
+        ['aws_disabled', { EZIL_AWS_COMPUTERS_ENABLED: '0' }],
+        ['user_hours_cap', { EZIL_AWS_USER_MONTHLY_HOURS: '1' }],
+        ['global_hours_cap', { EZIL_AWS_GLOBAL_MONTHLY_HOURS: '1' }],
+    ] as const)('%s keeps its distinct non-retryable code, disk and stopped placement', async (code, overrides) => {
+        const row = stopped();
+        const before = structuredClone(row);
+        const s = setup({ placements: [row], usage: [{
+            computer_id: C1, user_id: U1, instance_id: 'i-1', instance_type: 't3a.medium',
+            started_at: new Date(NOW.getTime() - 2 * 3_600_000), stopped_at: NOW,
+            egress_bytes: null, observed_by: 'test', updated_at: NOW,
+        }] }, { e: startMode(overrides) });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({
+            ok: false, error: code, errorCode: code, retryable: false,
+        });
+        expect(s.placements).toEqual([before]);
+        expect(s.calls).toEqual([]);
+    });
+});
 
 describe('configuration refusals happen before any statement', () => {
     it.each([
@@ -128,6 +154,30 @@ describe('configuration refusals happen before any statement', () => {
 });
 
 describe('ensure: a new computer', () => {
+    it('a cmp-8 billing record provisions m6i.2xlarge with a 50 GiB data volume', async () => {
+        const entitlement: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false };
+        const { provider, placements, calls } = setup({}, { entitlement, tierFor: undefined, e: env({
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+            [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']) }),
+        }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(placements[0]).toMatchObject({ instance_type: 'm6i.2xlarge', region: 'ap-south-1' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'provision', instanceType: 'm6i.2xlarge', dataVolumeGiB: 50 });
+    });
+
+    it.each(['start', 'replace'] as const)('waking in %s mode replaces at the entitled cmp-8 size', async operation => {
+        const { provider, calls } = setup({ placements: [stopped()] }, {
+            entitlement: { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws' },
+            tierFor: async () => { throw new Error('Use the resolved entitlement'); },
+            e: (operation === 'start' ? startMode : env)({
+                EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+                [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.2xlarge']) }),
+            }),
+        });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.2xlarge' });
+    });
+
     it('Mumbai full → provisioned in the US region with the free tier (2 vCPU / 4 GiB) and its own deployment', async () => {
         const { provider, placements, calls } = setup({}, { e: env({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0' }) });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
@@ -288,10 +338,123 @@ describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fen
     });
 });
 
+describe('ensure: resize to the current paid plan', () => {
+    const paid = (size: SizeCode): EntitlementRecord => ({
+        source: 'billing_v2', status: 'active', planId: size === 'std-2' ? 'standard_monthly_v2' : 'compute_monthly_v2',
+        size, provider: 'aws', paymentIssue: false,
+    });
+    const resizeEnv = (over: Record<string, string> = {}) => startMode({
+        AWS_MAX_RUNNING: '2', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
+        [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.xlarge']) }),
+        ...over,
+    });
+    const meter = () => ({ ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) });
+
+    it.each([
+        ['STOPPED', 'std-2', 'cmp-4'], ['RUNNING', 'std-2', 'cmp-4'],
+        ['STOPPED', 'cmp-4', 'std-2'], ['RUNNING', 'cmp-4', 'std-2'],
+    ] as const)('%s %s → %s replaces on the same volume and closes the epoch with resize', async (state, from, to) => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({
+            state, instance_type: SIZES[from].machine, generation: 3, lease_epoch: 7,
+            lease_until: new Date(NOW.getTime() + 3_600_000), enroll_consumed_hash: 'a'.repeat(64),
+        })] }, { entitlement: paid(to), meter: billing, e: resizeEnv({
+            AWS_MAX_RUNNING: to === 'std-2' ? '1' : '2', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: to === 'std-2' ? '1' : '2',
+        }) });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(s.calls).toHaveLength(1);
+        const intent = s.calls[0]!.intent;
+        expect(intent).toMatchObject({
+            operation: 'replace', instanceType: SIZES[to].machine, targetGeneration: 4, leaseEpoch: 8,
+            previousGeneration: 3, previousFenceToken: FENCE, previousInstanceId: 'i-11111111111111111',
+            dataVolumeId: 'vol-11111111111111111', dataVolumeGiB: null,
+        });
+        expect(intent.fenceToken).not.toBe(FENCE);
+        expect(leaseOf(intent.userData)).toMatchObject({ generation: 4, leaseEpoch: 8, nonce: NONCE, fsUuid: FS, provision: false });
+        expect(s.placements[0]).toMatchObject({
+            state: 'STARTING', instance_type: SIZES[to].machine, generation: 4, lease_epoch: 8,
+            region: 'ap-south-1', volume_id: 'vol-11111111111111111', instance_id: null,
+            fence_token: intent.fenceToken, enroll_nonce_hash: nonceHashOf(NONCE), enroll_consumed_hash: null,
+            lifecycle_job_id: intent.jobId, lifecycle_digest: s.calls[0]!.digest,
+        });
+        const lease = s.statements.find(st => st.sql.includes('placement:cas') && st.params.includes('LEASED'))!;
+        expect(lease.sql).toMatch(/instance_type =/);
+        expect(lease.sql).toMatch(/WHERE computer_id = .* AND generation = .* AND lease_epoch =/);
+        expect(lease.params).toContain(SIZES[to].machine);
+        expect(billing.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: NOW, reason: 'resize' });
+        expect(billing.ready).not.toHaveBeenCalled();
+        // Polling the in-flight replacement does not launch or close billing twice.
+        await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(s.calls).toHaveLength(1);
+        expect(billing.stopped).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['STOPPED', 'RUNNING'] as const)('%s upgrade without regional capacity keeps the old type and epoch', async state => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ state, instance_type: 'm6i.large', lease_until: new Date(NOW.getTime() + 3_600_000) })] }, {
+            entitlement: paid('cmp-4'), meter: billing, e: resizeEnv({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1' }),
+        });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable', error: 'region_capacity' });
+        expect(s.placements[0]).toMatchObject({ state, instance_type: 'm6i.large', generation: 1, lease_epoch: 0, fence_token: FENCE });
+        expect(s.calls).toEqual([]);
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('global capacity checks the new vCPU, even with room in the home region', async () => {
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), e: resizeEnv({ AWS_MAX_RUNNING: '1' }) });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable', error: 'max_running' });
+        expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', generation: 1, lease_epoch: 0 });
+        expect(s.calls).toEqual([]);
+    });
+
+    it.each(['generation', 'lease_epoch'] as const)('a competing %s update refuses the resize without launching or closing billing', async counter => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, {
+            entitlement: paid('cmp-4'), meter: billing, e: resizeEnv(),
+            randomBytes: () => { s.placements[0]![counter] = 9; return Buffer.from(NONCE_BYTES); },
+        });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'cas_conflict' });
+        expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', [counter]: 9, fence_token: FENCE });
+        expect(s.calls).toEqual([]);
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('resolves the legacy lazy tier source on open', async () => {
+        const tierFor = vi.fn(async () => 'compute4' as const);
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { tierFor, e: resizeEnv() });
+        await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(tierFor).toHaveBeenCalledWith(U1);
+        expect(s.calls[0]!.intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.xlarge' });
+    });
+
+    it('an unchanged paid size keeps start-in-place and does not close billing', async () => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('std-2'), meter: billing, e: resizeEnv() });
+        await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(s.calls[0]!.intent).toMatchObject({ operation: 'start', instanceType: 'm6i.large', targetGeneration: 1 });
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('a type outside the deployment allowlist refuses before the placement changes', async () => {
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), e: startMode() });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_intent_invalid' });
+        expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', generation: 1 });
+        expect(s.calls).toEqual([]);
+    });
+
+    it('a refused lifecycle start is never reported as a successful resize', async () => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), meter: billing, e: resizeEnv(), failStart: true });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_lifecycle_start_failed' });
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+});
+
 describe('ensure: wake by replace (default): a NEW instance on the SAME volume, same region', () => {
     it('STOPPED → leased (generation + 1, epoch + 1, new fence, nonce hash) → replace intent → STARTING', async () => {
         const { provider, placements, calls, statements } = setup({ placements: [stopped({ generation: 3, lease_epoch: 7, enroll_consumed_hash: 'c'.repeat(64), enroll_expires_at: new Date('2026-10-14T12:00:00Z') })] });
-        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true, computeLaunching: true });
         expect(calls).toHaveLength(1);
         expect(calls[0]).toMatchObject({ region: 'ap-south-1', stateMachineArn: DEPLOYMENTS['ap-south-1'].stateMachineVersionArn });
         const i = calls[0]!.intent;
@@ -495,7 +658,7 @@ describe('stop and status', () => {
         const { provider, placements } = setup({ placements: [stopped()] });
         expect(await provider.activity(ctx, { userId: U1, computerId: C1 }, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'placement_stopped' });
         expect(placements[0]).toMatchObject({ lease_until: null, presence_at: null });
-        expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'aws_not_supported' });
+        expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'restart_unavailable' });
     });
 });
 
@@ -654,6 +817,34 @@ describe('Codex #6: a guest-initiated idle stop is reconciled into the placement
         expect(calls.map((c) => [c.intent.operation, c.intent.computerId])).toEqual([['stop', C2]]);
         expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'STOPPING', owner_user_id: U2 });
     });
+
+    // Incident 2026-10-25 (ROOT-FLEET-LEASE-INCIDENT-118): a refused open's fleet pass stopped another user's RUNNING computer
+    // solely because its technical lease had lapsed. The fleet pass is caps-only now; guest stops and hour caps still settle.
+    const C2 = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
+    const both = [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }];
+    const foreign = (over: Record<string, unknown>) => stopped({ computer_id: C2, owner_user_id: U2, state: 'RUNNING', lease_epoch: 2, instance_id: 'i-22222222222222222', ...over });
+    it.each([
+        ['create', 'expired', [] as Record<string, unknown>[], { lease_until: new Date(NOW.getTime() - 1) }],
+        ['create', 'missing', [] as Record<string, unknown>[], { lease_until: null }],
+        ['wake', 'expired', [stopped()], { lease_until: new Date(NOW.getTime() - 1) }],
+        ['wake', 'missing', [stopped()], { lease_until: null }],
+    ] as const)('a %s refusal never stops another user\'s physically RUNNING computer for a %s lease alone', async (_kind, _lease, mine, lease) => {
+        const { describer } = describerSaying('running');
+        const { provider, placements, calls } = setup({ placements: [...mine, foreign(lease)], computers: both }, { describer, e: env({ AWS_MAX_RUNNING: '1' }) });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable' });
+        expect(calls).toEqual([]);
+        expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'RUNNING', owner_user_id: U2, lifecycle_job_id: null });
+    });
+    it('…but the same refusal still stops another user\'s computer at its weighted hour cap (live lease)', async () => {
+        const { describer } = describerSaying('running');
+        const usage = [{ computer_id: C2, user_id: U2, instance_id: 'i-22222222222222222', instance_type: 't3a.medium',
+            started_at: new Date(NOW.getTime() - 101 * 3_600_000), stopped_at: NOW, egress_bytes: null, observed_by: 'x', updated_at: NOW }];
+        const { provider, placements, calls } = setup({ placements: [foreign({ lease_until: new Date(NOW.getTime() + 3_600_000) })], computers: both, usage },
+            { describer, e: env({ AWS_MAX_RUNNING: '1' }) });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable' });
+        expect(calls.map((c) => [c.intent.operation, c.intent.computerId])).toEqual([['stop', C2]]);
+        expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'STOPPING', last_error: 'user_hours_cap' });
+    });
 });
 
 describe('Codex 4275911832: the lease deadline and hour caps bind during a session', () => {
@@ -674,19 +865,32 @@ describe('Codex 4275911832: the lease deadline and hour caps bind during a sessi
         expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() + HOUR);
     });
 
-    it('status: a lapsed lease stops the instance through the ordinary lifecycle stop (lease_expired)', async () => {
-        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+    // Root POLICY DECISION 14:57Z (ROOT-OWNER-LEASE-CORRECTION-118): automatic owner paths are caps-only. A lapsed or missing
+    // technical lease alone never stops a still-running guest from status, ensure or the heartbeat; an explicit Stop still does.
+    it.each([
+        ['lapsed', { lease_until: new Date(NOW.getTime() - 1) }],
+        ['missing', { lease_until: null }],
+    ] as const)('status: a %s lease alone stops nothing and writes nothing (caps-only automatic owner path)', async (_label, lease) => {
+        const { provider, placements, calls, statements } = setup({ placements: [running(lease)] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'running', placementState: 'RUNNING' });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING', lifecycle_job_id: null });
+        expect(casCount(statements)).toBe(0);
+    });
+
+    it('status: a lapsed lease together with a reached hour cap stops with the cap reason', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })], usage: [hours(100)] });
         expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping', placementState: 'STOPPING' });
         expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
         expect(calls[0]!.intent).toMatchObject({ providerInstanceId: 'i-11111111111111111', fenceToken: FENCE, leaseEpoch: 4 });
-        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired', lifecycle_job_id: calls[0]!.intent.jobId });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'user_hours_cap', lifecycle_job_id: calls[0]!.intent.jobId });
     });
 
-    it('a RUNNING row with no lease at all is treated as lapsed (fail closed)', async () => {
-        const { provider, placements, calls } = setup({ placements: [running({ lease_until: null })] });
-        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping' });
+    it('an explicit owner Stop still ends a session whose lease lapsed', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+        expect(await provider.stop(ctx, me, 'user')).toEqual({ ok: false, terminated: false, outcome: 'stopping' }); // started, not yet confirmed
         expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
-        expect(placements[0]).toMatchObject({ last_error: 'lease_expired' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING' });
     });
 
     it('status is not presence: a live lease is neither renewed nor stopped, and nothing is written', async () => {
@@ -725,11 +929,12 @@ describe('Codex 4275911832: the lease deadline and hour caps bind during a sessi
         expect(casCount(statements)).toBe(before);
     });
 
-    it('activity: the release beat (presence 30 min ago) renews nothing, so a lapsed lease is stopped', async () => {
+    it('activity: the stale release beat (presence 30 min ago) renews nothing and, with a lapsed lease alone, stops nothing', async () => {
         const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
-        expect(await provider.activity(ctx, me, { lastInputAgoMs: 30 * 60_000 })).toEqual({ ok: false, error: 'lease_expired' });
-        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
-        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired', presence_at: null });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 30 * 60_000 })).toEqual({ ok: true });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING', presence_at: null });
+        expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() - 1); // not renewed by a stale beat
     });
 
     it('activity: an owner at the hour cap is stopped within a beat, presence notwithstanding', async () => {
@@ -830,10 +1035,14 @@ describe('Codex 4277262199: a StartExecution whose answer is lost is not a refus
                 throw Object.assign(new Error('refused'), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 400 } });
             },
         };
-        const { provider, placements } = setup({ placements: [stopped()] }, { e: startMode(), starter });
+        const openUsage = { computer_id: C1, user_id: U1, instance_id: 'i-previous', instance_type: 't3a.medium',
+            started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: null, observed_by: 'receipt', updated_at: NOW };
+        const { provider, placements, usage } = setup({ placements: [stopped()], usage: [openUsage] }, { e: startMode(), starter });
         expect(await provider.ensure(ctx, me, opts)).toMatchObject({ errorCode: 'aws_lifecycle_start_failed' });
         expect(n).toBe(2);
         expect(placements[0]).toMatchObject({ state: 'STOPPED', generation: 1 });
+        expect(usage[0]!.stopped_at).toBeInstanceOf(Date);
+        expect(usage[0]!.observed_by).toBe('placement-transition');
     });
 });
 
@@ -1036,3 +1245,140 @@ describe('Codex 4278130068: an answered throttle is retried, never treated as a 
     });
 });
 
+
+
+describe('fresh replacement launch status', () => {
+    const me = { userId: U1, computerId: C1 };
+    for (const failStart of [false, 'lost'] as const) {
+        it.each([
+            ['wake mode', {}, { e: env({ EZIL_AWS_WAKE_MODE: 'replace' }) }],
+            ['enrollment failure', { state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED }, { e: startMode() }],
+            ['lost instance', { last_error: 'instance_lost' }, { e: startMode() }],
+            ['stopped resize', {}, { e: startMode(), tier: 'plus' as AwsTier }],
+            ['running resize', { state: 'RUNNING' }, { e: startMode(), tier: 'plus' as AwsTier }],
+        ])(`%s flags the first and repeated ensure/status (start answer lost: ${failStart})`, async (_name, row, over) => {
+            const s = setup({ placements: [stopped(row)] }, { ...over, failStart });
+            const first = await s.provider.ensure(ctx, me, opts);
+            expect(s.calls[0]!.intent.operation).toBe('replace');
+            expect(first).toMatchObject({ ok: false, errorCode: 'computer_starting', computeLaunching: true });
+            const calls = s.calls.length;
+            // A new provider represents another request/process, with no in-memory launch history.
+            const another = createAwsEc2Provider({ db: s.db, env: () => startMode(), now: () => NOW, starter: s.starter });
+            expect(await another.ensure(ctx, me, opts)).toMatchObject({ computeLaunching: true });
+            expect(await another.status(ctx, me)).toMatchObject({ state: 'starting', computeLaunching: true });
+            expect(s.calls).toHaveLength(calls);
+            expect(first).not.toHaveProperty('computeMigrating');
+        });
+    }
+
+    it.each([false, 'lost'] as const)('an existing stopped instance starts without launch status (lost: %s)', async failStart => {
+        const s = setup({ placements: [stopped({ generation: 4 })] }, { e: startMode(), failStart });
+        for (let i = 0; i < 2; i++) {
+            expect(await s.provider.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+            expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+        }
+        expect(s.calls[0]!.intent.operation).toBe('start');
+    });
+
+    it.each(['start', 'replace'])('a running host has no launch status in %s mode', async mode => {
+        const s = setup({ placements: [stopped({ state: 'RUNNING', generation: 4 })] }, { e: startMode({ EZIL_AWS_WAKE_MODE: mode }) });
+        expect(await s.provider.ensure(ctx, me, opts)).toEqual({ ok: true });
+        expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+        expect(s.calls).toHaveLength(0);
+    });
+
+    it('a refused replacement has no launch status', async () => {
+        const s = setup({ placements: [stopped()] }, { failStart: true });
+        expect(await s.provider.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+        expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+    });
+
+    it.each([
+        ['first provision', { state: 'PROVISIONING', generation: 1 }],
+        ['first generation', { state: 'STARTING', generation: 1 }],
+        ['stopping', { state: 'STOPPING', generation: 4 }],
+        ['no job', { state: 'STARTING', generation: 4, lifecycle_job_id: null }],
+        ['no digest', { state: 'STARTING', generation: 4, lifecycle_digest: null }],
+    ])('%s cannot claim replacement launch status from a missing instance alone', async (_name, row) => {
+        const s = setup({ placements: [stopped({ instance_id: null, lifecycle_job_id: crypto.randomUUID(), lifecycle_digest: 'a'.repeat(64), ...row })] });
+        expect(await s.provider.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+        expect(await s.provider.status(ctx, me)).not.toHaveProperty('computeLaunching');
+    });
+
+    for (const operation of ['replace', 'start'] as const) {
+        it.each(['LEASED', 'STARTING', 'MOUNTING'])(`%s after enrollment derives ${operation} from the recorded execution`, async state => {
+            const s = setup({ placements: [stopped({ generation: 3 })] }, { e: operation === 'start' ? startMode() : env() });
+            await s.provider.ensure(ctx, me, opts);
+            const work = buildLifecycleWork(s.calls[0]!.intent);
+            Object.assign(s.placements[0]!, { state, instance_id: 'i-22222222222222222', last_error: 'enroll_succeeded' });
+            const describe = vi.fn(async () => ({ status: 'RUNNING', input: work.input }));
+            const another = createAwsEc2Provider({ db: s.db, env: () => startMode(), now: () => NOW, starter: s.starter, executions: { describe } });
+            const ensured = await another.ensure(ctx, me, opts);
+            const status = await another.status(ctx, me);
+            expect(('computeLaunching' in ensured && ensured.computeLaunching) === true).toBe(operation === 'replace');
+            expect(status.computeLaunching === true).toBe(operation === 'replace');
+            expect(describe).toHaveBeenCalledTimes(2); // reuse receipt reads, no additional AWS request
+            Object.assign(s.placements[0]!, { state: 'RUNNING', lifecycle_job_id: null, lifecycle_digest: null });
+            expect(await another.ensure(ctx, me, opts)).toEqual({ ok: true });
+            expect(await another.status(ctx, me)).not.toHaveProperty('computeLaunching');
+        });
+    }
+
+    it.each(['missing input', 'malformed input', 'digest', 'job', 'computer', 'generation', 'epoch'])('%s cannot grant an enrolled instance launch status', async mismatch => {
+        const s = setup({ placements: [stopped()] });
+        await s.provider.ensure(ctx, me, opts);
+        const work = buildLifecycleWork(s.calls[0]!.intent);
+        Object.assign(s.placements[0]!, { instance_id: 'i-22222222222222222',
+            ...(mismatch === 'digest' ? { lifecycle_digest: 'a'.repeat(64) } : {}),
+            ...(mismatch === 'job' ? { lifecycle_job_id: crypto.randomUUID() } : {}),
+            ...(mismatch === 'generation' ? { generation: 3 } : {}),
+            ...(mismatch === 'epoch' ? { lease_epoch: 4 } : {}),
+        });
+        const input = mismatch === 'missing input' ? undefined : mismatch === 'malformed input' ? '{' : mismatch === 'computer'
+            ? buildLifecycleWork({ ...work.intent, computerId: U2, userData: Buffer.from(JSON.stringify({ ...leaseOf(work.intent.userData), computerId: U2 })).toString('base64') }).input : work.input;
+        if (mismatch === 'computer') s.placements[0]!.lifecycle_digest = buildLifecycleWork({ ...work.intent, computerId: U2, userData: Buffer.from(JSON.stringify({ ...leaseOf(work.intent.userData), computerId: U2 })).toString('base64') }).digest;
+        const another = createAwsEc2Provider({ db: s.db, env: () => env(), now: () => NOW, starter: s.starter,
+            executions: { describe: async () => ({ status: 'RUNNING', input }) } });
+        expect(await another.ensure(ctx, me, opts)).not.toHaveProperty('computeLaunching');
+        expect(await another.status(ctx, me)).not.toHaveProperty('computeLaunching');
+    });
+});
+
+// Capacity demand (1.0.18): the public stop is the explicit release of a terminal expired first-open attempt.
+describe('stop releases a terminal expired capacity attempt (no placement yet)', () => {
+    const expired = { id: '00000000-0000-4000-8000-000000000001', request_id: '33333333-3333-4333-8333-333333333333', owner_user_id: U1, computer_id: C1,
+        kind: 'create', region: 'ap-south-1', zone_id: 'aps1-az1', instance_type: 'm6i.large', vcpu: 2, deployment_digest: 'a'.repeat(64),
+        source_generation: null, source_lease_epoch: null, state: 'expired', revision: 2, cleanup: [],
+        created_at: new Date(NOW.getTime() - 600_000), expires_at: new Date(NOW.getTime() - 300_000), closed_at: new Date(NOW.getTime() - 299_000) };
+    it('answers already_stopped and records the cancellation marker exactly once; another user cannot release it', async () => {
+        const s = setup({ demands: [expired] }, { dbClock: () => NOW });
+        expect(await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toEqual({ ok: true, terminated: false, outcome: 'already_stopped' });
+        expect(s.demands.map(d => d.state)).toEqual(['expired', 'cancelled']);
+        expect(await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ outcome: 'aws_placement_missing' }); // nothing left to release
+        expect(s.demands).toHaveLength(2);
+        const other = setup({ demands: [expired] }, { dbClock: () => NOW });
+        await other.provider.stop(ctx, { userId: '99999999-9999-4999-8999-999999999999', computerId: C1 }, 'user').catch(() => null);
+        expect(other.demands.map(d => d.state)).toEqual(['expired']);
+    });
+    it('a placement admitted before the cancellation locks is never reported stopped and keeps the attempt unreleased', async () => {
+        const s = setup({ demands: [expired], placements: [stopped({ state: 'UNCONFIRMED', instance_type: 'm6i.large' })] }, { dbClock: () => NOW });
+        expect(await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ ok: false, outcome: 'placement_unconfirmed' });
+        expect(s.demands.map(d => d.state)).toEqual(['expired']);
+    });
+    it('a placement committed while the stop is in flight (after it starts, before the cancellation locks) is read, not a stale null', async () => {
+        const s = setup({ demands: [expired] }, { dbClock: () => NOW });
+        // Concurrent open: its placement commits exactly when the stop's cancellation transaction begins.
+        const db = s.db as unknown as { transaction: (...a: unknown[]) => Promise<unknown> };
+        const begin = db.transaction.bind(db);
+        let injected = false;
+        db.transaction = (...a: unknown[]) => {
+            if (!injected) { injected = true; s.placements.push(stopped({ state: 'UNCONFIRMED', instance_type: 'm6i.large' })); }
+            return begin(...a);
+        };
+        const result = await s.provider.stop(ctx, { userId: U1, computerId: C1 }, 'user');
+        expect(injected).toBe(true);
+        expect(result).not.toMatchObject({ outcome: 'already_stopped' });
+        expect(result).toMatchObject({ ok: false, outcome: 'placement_unconfirmed' });
+        expect(s.demands.map(d => d.state)).toEqual(['expired']);
+    });
+});

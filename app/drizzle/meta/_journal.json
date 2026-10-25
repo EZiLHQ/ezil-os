@@ -22,6 +22,41 @@
       "when": 1788515890576,
       "tag": "0002_os_access",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791748623479,
+      "tag": "0003_billing",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792349482153,
+      "tag": "0004_billing_v2",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1792375794210,
+      "tag": "0005_billing_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1792375800210,
+      "tag": "0006_compute_migrations",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1792375801210,
+      "tag": "0007_paid_session_deadlines",
+      "breakpoints": true
     }
   ]
 }

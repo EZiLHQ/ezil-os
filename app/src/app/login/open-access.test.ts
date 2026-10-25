@@ -74,9 +74,10 @@ describe('🔴 no surface consults an allow-list', () => {
 });
 
 describe('/login never redirects, so nothing can loop through it', () => {
-    it('/ sends a signed-in visitor to /os and everyone else to /login', () => {
-        // Also pinned by `../page-entry.test.ts`.
+    it('/ sends signed-in visitors to the OS and everyone else to the login', () => {
+        // Both cases are exercised by `../page-entry.test.ts`.
         expect(code(rootPage)).toMatch(/redirect\(user \? Routes\.OS : Routes\.LOGIN\)/);
+        expect(code(rootPage)).not.toMatch(/MarketingHome/);
     });
 
     it('/login performs no redirect of its own', () => {

@@ -1,0 +1,221 @@
+import { describe, expect, it } from 'vitest';
+import { readLifecycleDeployments } from './aws-intent';
+import { parseRebaseRelease, parseRebaseSourceRelease, RebaseReleaseSchema, RebaseSourceReleaseSchema,
+    resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
+import { fixtureReleaseRegistry106, fixtureReleaseRegistry13, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
+
+describe('B2/B4/B5 retained 1.0.6 release registry', () => {
+    it('resolves 8dbc to 1.0.6 while preserving the entire legacy 1.0.2 source deployment', () => {
+        const f = fixtureReleaseRegistry106();
+        const resolved = resolveRebaseReleases(f.entry, LOWER_102);
+        expect(resolved).toEqual({ source: f.release102, target: f.release106,
+            deployment: f.deployment106, repository: f.repository });
+        const source = sourceDeploymentFor(resolved.deployment, resolved.source);
+        expect(source).toEqual(f.deployment102);
+        expect(source).toMatchObject({ amiId: 'ami-22222222222222222', launchTemplateVersion: '3',
+            lowerImageDigest: LOWER_102, previousLowerImageDigest: null,
+            preparationStateMachineVersionArn: null, recoveryStateMachineVersionArn: null });
+        expect(parseRebaseSourceRelease(f.release102, source, f.repository)).toEqual(f.release102);
+        expect(parseRebaseRelease(JSON.stringify(f.release106), resolved.deployment, f.repository)).toEqual(f.release106);
+    });
+
+    it('refuses shared lower 34ac without observed AMI evidence', () => {
+        const f = fixtureReleaseRegistry106();
+        expect(f.release105.amiId).not.toBe(f.release106.amiId);
+        expect(() => resolveRebaseReleases(f.entry, LOWER_105)).toThrow('release_mismatch');
+    });
+
+    it('accepts the rolled-back 1.0.5 tuple with 1.0.6 retained and resolves 8dbc to 1.0.5', () => {
+        const f = fixtureReleaseRegistry106();
+        const entry = { ...f.deployment105, releases: f.releases };
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]))
+            .toEqual({ ok: true, deployments: { [entry.region]: f.deployment105 } });
+        const resolved = resolveRebaseReleases(entry, LOWER_102);
+        expect(resolved).toEqual({ source: f.release102, target: f.release105,
+            deployment: f.deployment105, repository: f.repository });
+        expect(parseRebaseRelease(f.release105, resolved.deployment, f.repository)).toEqual(f.release105);
+        expect(sourceDeploymentFor(resolved.deployment, resolved.source)).toEqual(f.deployment102);
+    });
+
+    it.each([
+        ['unregistered premium 0769', PREMIUM_LOWER, 'release_mismatch'],
+        ['unknown source digest', null, 'source_digest_unknown'],
+    ] as const)('refuses %s', (_label, lower, error) => {
+        expect(() => resolveRebaseReleases(fixtureReleaseRegistry106().entry, lower)).toThrow(error);
+    });
+
+    it('refuses two records with the same full target tuple even if their provenance differs', () => {
+        const f = fixtureReleaseRegistry106();
+        const duplicate = { ...f.release106, agentCommit: 'f'.repeat(40) };
+        expect(RebaseReleaseSchema.parse(duplicate)).toEqual(duplicate);
+        expect(() => resolveRebaseReleases({ ...f.entry, releases: [...f.releases, duplicate] }, LOWER_102))
+            .toThrow('release_mismatch');
+    });
+
+    it.each(['preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const)
+    ('refuses a target with null %s, although it is valid source evidence', field => {
+        const f = fixtureReleaseRegistry106();
+        const target = { ...f.release106, [field]: null };
+        expect(RebaseSourceReleaseSchema.parse(target)).toEqual(target);
+        expect(RebaseReleaseSchema.safeParse(target).success).toBe(false);
+        expect(() => parseRebaseRelease(target, f.deployment106, f.repository)).toThrow();
+        expect(() => resolveRebaseReleases({ ...f.entry, releases: [f.release102, f.release105, target] }, LOWER_102))
+            .toThrow('release_mismatch');
+    });
+
+    it('refuses a target with no predecessor even when its workflow pins match the region tuple', () => {
+        const f = fixtureReleaseRegistry106();
+        const target = { ...f.release106, previousLowerImageDigest: null, previousLowerImageRef: null };
+        expect(RebaseReleaseSchema.parse(target)).toEqual(target);
+        expect(() => resolveRebaseReleases({ ...f.entry, previousLowerImageDigest: null,
+            releases: [f.release102, f.release105, target] }, LOWER_102)).toThrow('unsupported_predecessor');
+    });
+
+    it.each([{ order: [1, 0, 2] }, { order: [0, 2, 1] }])('refuses out-of-order createdAt at registry indexes $order', ({ order }) => {
+        const f = fixtureReleaseRegistry106();
+        expect(() => resolveRebaseReleases({ ...f.entry, releases: order.map(i => f.releases[i]!) }, LOWER_102))
+            .toThrow('release_mismatch');
+    });
+
+    it.each([
+        ['account', { accountId: '999999999999' }],
+        ['region', { region: 'us-east-1' }],
+        ['namespace', { namespace: 'foreign' }],
+        ['repository', {}],
+    ] as const)('refuses a schema-valid foreign %s source', (boundary, identity) => {
+        const f = fixtureReleaseRegistry106();
+        const source = { ...f.release102, ...identity };
+        const repository = `${source.accountId}.dkr.ecr.${source.region}.amazonaws.com/${boundary === 'repository' ? 'foreign' : 'desktop'}`;
+        source.lowerImageRef = `${repository}@${f.release102.lowerImageRef.split('@')[1]}`;
+        source.stateMachineVersionArn = `arn:aws:states:${source.region}:${source.accountId}:stateMachine:ezil-${source.namespace}-lifecycle:8`;
+        // Do not let malformed evidence mask the resolver's source/target boundary check.
+        expect(RebaseSourceReleaseSchema.parse(source)).toEqual(source);
+        expect(() => resolveRebaseReleases({ ...f.entry, releases: [source, f.release105, f.release106] }, LOWER_102))
+            .toThrow('release_mismatch');
+    });
+
+    it('refuses a unique registered source that is not the target predecessor', () => {
+        const f = fixtureReleaseRegistry106();
+        const target = { ...f.release106, previousLowerImageDigest: PREMIUM_LOWER,
+            previousLowerImageRef: `${f.repository}@${PREMIUM_LOWER}` };
+        expect(RebaseReleaseSchema.parse(target)).toEqual(target);
+        expect(() => resolveRebaseReleases({ ...f.entry, previousLowerImageDigest: PREMIUM_LOWER,
+            releases: [f.release102, f.release105, target] }, LOWER_102)).toThrow('unsupported_predecessor');
+    });
+
+    it.each([
+        ['amiId', 'ami-55555555555555555'],
+        ['launchTemplateId', 'lt-22222222222222222'],
+        ['launchTemplateVersion', '4'],
+        ['stateMachineVersionArn', ':9'],
+        ['preparationStateMachineVersionArn', ':1'],
+        ['recoveryStateMachineVersionArn', ':1'],
+    ] as const)('requires the target %s pin in both resolution and parsing', (field, value) => {
+        const f = fixtureReleaseRegistry106();
+        const deployment = { ...f.deployment106, [field]: value.startsWith(':')
+            ? f.release106[field].replace(/:[0-9]+$/, value) : value };
+        expect(() => resolveRebaseReleases({ ...deployment, releases: f.releases }, LOWER_102)).toThrow('release_mismatch');
+        expect(() => parseRebaseRelease(f.release106, deployment, f.repository)).toThrow('release_mismatch');
+    });
+
+    it('requires the approved repository when parsing the selected 1.0.6 release', () => {
+        const f = fixtureReleaseRegistry106();
+        expect(() => parseRebaseRelease(f.release106, f.deployment106, f.repository + '-foreign')).toThrow('release_mismatch');
+    });
+});
+
+describe('B2 shared lower resolved by observed AMI', () => {
+    it.each(['release105', 'release106'] as const)('selects exactly %s for an eligible successor', key => {
+        const f = fixtureSharedLowerSuccessor();
+        expect(resolveRebaseReleases(f.entry, LOWER_105, f[key].amiId)).toEqual({
+            source: f[key], target: f.target, deployment: f.deployment, repository: f.repository });
+    });
+    it.each(['release105', 'release106'] as const)('still refuses %s on 34ac for target 1.0.6 (previous 8dbc)', key => {
+        const f = fixtureReleaseRegistry106();
+        expect(() => resolveRebaseReleases(f.entry, LOWER_105, f[key].amiId)).toThrow('unsupported_predecessor');
+    });
+    it.each([undefined, '', 'ami-99999999999999999', 'ami-22222222222222222'])('refuses a missing, unknown or different-lower AMI %s', amiId => {
+        expect(() => resolveRebaseReleases(fixtureSharedLowerSuccessor().entry, LOWER_105, amiId)).toThrow('release_mismatch');
+    });
+    it.each([{}, { agentCommit: 'f'.repeat(40) }])('refuses a duplicate selected (lower, AMI) pair %#', patch => {
+        const f = fixtureSharedLowerSuccessor();
+        f.entry.releases.splice(2, 0, { ...f.release105, ...patch });
+        expect(() => resolveRebaseReleases(f.entry, LOWER_105, f.release105.amiId)).toThrow('release_mismatch');
+    });
+    it.each(['account', 'region', 'namespace', 'repository'] as const)('refuses a schema-valid shared-lower source in a foreign %s', boundary => {
+        const f = fixtureSharedLowerSuccessor(), source = { ...f.release105 };
+        if (boundary === 'account') source.accountId = '999999999999';
+        if (boundary === 'region') source.region = 'us-east-1';
+        if (boundary === 'namespace') source.namespace = 'foreign';
+        const repository = `${source.accountId}.dkr.ecr.${source.region}.amazonaws.com/${boundary === 'repository' ? 'foreign' : 'desktop'}`;
+        source.lowerImageRef = `${repository}@${LOWER_105}`;
+        source.previousLowerImageRef = `${repository}@${LOWER_102}`;
+        for (const [key, name] of [['stateMachineVersionArn', 'lifecycle'], ['preparationStateMachineVersionArn', 'rebase-preparation'],
+            ['recoveryStateMachineVersionArn', 'recovery']] as const)
+            source[key] = `arn:aws:states:${source.region}:${source.accountId}:stateMachine:ezil-${source.namespace}-${name}:1`;
+        expect(RebaseSourceReleaseSchema.parse(source)).toEqual(source);
+        f.entry.releases[1] = source;
+        expect(() => resolveRebaseReleases(f.entry, LOWER_105, source.amiId)).toThrow('release_mismatch');
+    });
+    it('keeps unique 8dbc resolution independent of AMI evidence', () => {
+        const f = fixtureReleaseRegistry106();
+        expect(resolveRebaseReleases(f.entry, LOWER_102, 'ami-99999999999999999').source).toEqual(f.release102);
+    });
+});
+
+describe('thirteen-record registry capacity and rollback compatibility', () => {
+    it('accepts promotion through 1.0.19 and rollback with all thirteen immutable records', () => {
+        const f = fixtureReleaseRegistry13();
+        for (const [deployment, releases, target] of [
+            [f.deployment116, f.retained.slice(0, 10), f.release116],
+            [f.deployment117, f.retained.slice(0, 11), f.release117],
+            [f.deployment116, f.retained.slice(0, 11), f.release116],
+            [f.deployment118, f.retained.slice(0, 12), f.release118],
+            [f.deployment119, f.retained, f.release119],
+            [f.deployment118, f.retained, f.release118],
+            [f.deployment117, f.retained, f.release117],
+        ] as const) {
+            const entry = { ...deployment, releases };
+            const original = JSON.stringify(entry);
+            expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]))
+                .toEqual({ ok: true, deployments: { [entry.region]: deployment } });
+            const resolved = resolveRebaseReleases(entry, LOWER_102);
+            expect(resolved.target).toEqual(target);
+            expect(sourceDeploymentFor(resolved.deployment, resolved.source)).toEqual(f.deployment102);
+            expect(parseRebaseRelease(target, deployment, f.repository)).toEqual(target);
+            expect(JSON.stringify(entry)).toBe(original);
+        }
+        expect(f.retained).toHaveLength(13);
+        expect(f.retained.slice(0, 3)).toEqual(f.releases);
+    });
+
+    it('refuses fourteen records in both validators even when all identities are valid', () => {
+        const f = fixtureReleaseRegistry13(), entry = { ...f.deployment118,
+            releases: [...f.retained, { ...f.release118, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.20' }] };
+        expect(entry.releases).toHaveLength(14);
+        entry.releases.forEach(r => expect(RebaseSourceReleaseSchema.safeParse(r).success).toBe(true));
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]).ok).toBe(false);
+        expect(() => resolveRebaseReleases(entry, LOWER_102)).toThrow();
+    });
+
+    it.each(['duplicate source', 'duplicate target', 'foreign source', 'malformed record', 'mutable workflow', 'out of order'])
+    ('still rejects %s within the thirteen-record limit', kind => {
+        const f = fixtureReleaseRegistry13(), releases = structuredClone(f.retained);
+        if (kind === 'duplicate source') releases[1] = { ...f.release102 };
+        if (kind === 'duplicate target') releases[10] = { ...f.release118 };
+        if (kind === 'foreign source') releases[0] = { ...f.release102, lowerImageRef: f.release102.lowerImageRef.replace('/desktop@', '/foreign@') };
+        if (kind === 'malformed record') releases[4] = { ...releases[4]!, amiId: 'malformed' };
+        if (kind === 'mutable workflow') releases[4] = { ...releases[4]!, stateMachineVersionArn: releases[4]!.stateMachineVersionArn.replace(/:[0-9]+$/, ':latest') };
+        if (kind === 'out of order') [releases[3], releases[4]] = [releases[4]!, releases[3]!];
+        expect(releases).toHaveLength(13);
+        expect(() => resolveRebaseReleases({ ...f.deployment118, releases }, LOWER_102)).toThrow();
+    });
+
+    it('keeps the 65,536-byte deployment-map ceiling at thirteen records', () => {
+        const f = fixtureReleaseRegistry13(), entry = { ...f.deployment118, releases: f.retained };
+        const raw = JSON.stringify({ [entry.region]: entry });
+        const atLimit = raw + ' '.repeat(65536 - Buffer.byteLength(raw));
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: atLimit }, [entry.region]).ok).toBe(true);
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: atLimit + ' ' }, [entry.region]).ok).toBe(false);
+    });
+});

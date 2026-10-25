@@ -10,13 +10,15 @@ import { describe, expect, it } from 'vitest';
 
 import { AWS_TIERS } from './aws-config';
 import { buildLifecycleWork, KNOWN_INSTANCE_TYPES, LIFECYCLE_DEPLOYMENTS_ENV, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleIntent } from './aws-intent';
-import { fixtureDeployment, fixtureIntent } from './aws-intent.test-support';
+import { fixtureDeployment, fixtureIntent, fixtureRebaseIntent } from './aws-intent.test-support';
 import fixtures from './aws-intent.fixtures.json';
 
 const FREE_TIER_DEPLOYMENT_TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
 
 describe('buildLifecycleWork', () => {
     it.each([
+        ['rebase-replace', fixtureRebaseIntent()],
+        ['ebs-restore-rebind', fixtureRebaseIntent(true)],
         ['start-ap-south-1', fixtureIntent('start')],
         ['provision-ap-south-1', fixtureIntent('provision')],
         ['stop-us-east-1', fixtureIntent('stop', 'us-east-1')],

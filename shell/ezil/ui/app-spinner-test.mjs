@@ -130,6 +130,45 @@ const { AppSpinner } = await import('./app-spinner.js');
         && spinner.el.querySelector('.ezil-app-spinner-sub').hidden);
 }
 
+// A replacement is distinct from a migration, including malformed observations.
+for (const flag of [undefined, null, false, 'true', 'false', 1, 0, {}, [], true]) {
+    const spinner = AppSpinner({ label: 'Opening Preview…', isLaunching: () => flag });
+    spinner.render({ kind: 'progress' });
+    push(`launch copy requires boolean true (${JSON.stringify(flag)})`,
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent
+            === (flag === true ? 'Starting a fresh computer…' : 'Opening Preview…')
+        && spinner.el.querySelector('.ezil-app-spinner-sub').hidden === (flag !== true)
+        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent
+            === (flag === true ? 'This start can take a few minutes.' : ''));
+}
+{
+    let launching = true, migrating = true;
+    const spinner = AppSpinner({ label: 'Opening Code…', isLaunching: () => launching, isMigrating: () => migrating });
+    spinner.render({ kind: 'progress' });
+    push('migration wins when both flags are true, with unchanged copy',
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Moving your computer to AWS (India)'
+        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === 'This first start takes a few minutes. Your files come with you.');
+    migrating = false;
+    spinner.render({ kind: 'progress' });
+    push('a remaining launch shows neutral copy without Retry',
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Starting a fresh computer…'
+        && spinner.el.querySelector('.ezil-app-spinner-ring').hidden === false
+        && spinner.el.querySelector('.ezil-boot-actions').hidden === true);
+    spinner.render({ kind: 'failed', reason: 'timeout' });
+    push('launch flag does not override timeout or Retry',
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'This is taking too long'
+        && spinner.el.querySelector('.ezil-boot-actions').hidden === false);
+    spinner.render({ kind: 'not_configured' });
+    push('launch flag does not override unconfigured copy',
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'EZiL OS desktop');
+    launching = false;
+    spinner.render({ kind: 'progress' });
+    push('clearing observations restores the app label and hides the body',
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Opening Code…'
+        && spinner.el.querySelector('.ezil-app-spinner-sub').hidden === true
+        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === '');
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 const failed = checks.filter(c => !c.pass);
 for (const c of checks) {

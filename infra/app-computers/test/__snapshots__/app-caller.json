@@ -1,0 +1,276 @@
+{
+  "oidcOnly": {
+    "Resources": {
+      "AppCallerRoleEA1CB1F0": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Statement": [
+              {
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "oidc.vercel.com/ezil-team:aud": "https://vercel.com/ezil-team",
+                    "oidc.vercel.com/ezil-team:sub": "owner:ezil-team:project:ezil-os:environment:production"
+                  }
+                },
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.vercel.com/ezil-team"
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "Description": "EZiL app: start exact lifecycle versions, read their computer executions, describe EC2"
+        }
+      },
+      "AppCallerRoleDefaultPolicy61BE57D2": {
+        "Type": "AWS::IAM::Policy",
+        "Properties": {
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Action": "states:StartExecution",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle"
+              },
+              {
+                "Action": "states:DescribeExecution",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+              },
+              {
+                "Action": "states:GetExecutionHistory",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+              },
+              {
+                "Action": "kms:Decrypt",
+                "Condition": {
+                  "StringEquals": {
+                    "kms:ViaService": "states.ap-south-1.amazonaws.com",
+                    "kms:EncryptionContext:aws:states:stateMachineArn": [
+                      "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle",
+                      "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
+                    ]
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": "arn:aws:kms:ap-south-1:123456789012:key/33333333-3333-4333-8333-333333333333"
+              },
+              {
+                "Action": [
+                  "ec2:DescribeInstances",
+                  "ec2:DescribeVolumes",
+                  "ec2:DescribeAvailabilityZones"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1"
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": "*"
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "PolicyName": "AppCallerRoleDefaultPolicy61BE57D2",
+          "Roles": [
+            {
+              "Ref": "AppCallerRoleEA1CB1F0"
+            }
+          ]
+        }
+      }
+    },
+    "Outputs": {
+      "AppCallerRoleArn23874049": {
+        "Value": {
+          "Fn::GetAtt": [
+            "AppCallerRoleEA1CB1F0",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "Parameters": {
+      "BootstrapVersion": {
+        "Type": "AWS::SSM::Parameter::Value<String>",
+        "Default": "/cdk-bootstrap/hnb659fds/version",
+        "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+      }
+    },
+    "Rules": {
+      "CheckBootstrapVersion": {
+        "Assertions": [
+          {
+            "Assert": {
+              "Fn::Not": [
+                {
+                  "Fn::Contains": [
+                    [
+                      "1",
+                      "2",
+                      "3",
+                      "4",
+                      "5"
+                    ],
+                    {
+                      "Ref": "BootstrapVersion"
+                    }
+                  ]
+                }
+              ]
+            },
+            "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+          }
+        ]
+      }
+    }
+  },
+  "withEc2Caller": {
+    "Resources": {
+      "AppCallerRoleEA1CB1F0": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Statement": [
+              {
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "oidc.vercel.com/ezil-team:aud": "https://vercel.com/ezil-team",
+                    "oidc.vercel.com/ezil-team:sub": "owner:ezil-team:project:ezil-os:environment:production"
+                  }
+                },
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.vercel.com/ezil-team"
+                }
+              },
+              {
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "aws:PrincipalTag/ezil:env": "billing-staging"
+                  }
+                },
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": "arn:aws:iam::123456789012:role/ezil-os-staging-host"
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "Description": "EZiL app: start exact lifecycle versions, read their computer executions, describe EC2"
+        }
+      },
+      "AppCallerRoleDefaultPolicy61BE57D2": {
+        "Type": "AWS::IAM::Policy",
+        "Properties": {
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Action": "states:StartExecution",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle"
+              },
+              {
+                "Action": "states:DescribeExecution",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+              },
+              {
+                "Action": "states:GetExecutionHistory",
+                "Effect": "Allow",
+                "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*"
+              },
+              {
+                "Action": "kms:Decrypt",
+                "Condition": {
+                  "StringEquals": {
+                    "kms:ViaService": "states.ap-south-1.amazonaws.com",
+                    "kms:EncryptionContext:aws:states:stateMachineArn": [
+                      "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle",
+                      "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:1"
+                    ]
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": "arn:aws:kms:ap-south-1:123456789012:key/33333333-3333-4333-8333-333333333333"
+              },
+              {
+                "Action": [
+                  "ec2:DescribeInstances",
+                  "ec2:DescribeVolumes",
+                  "ec2:DescribeAvailabilityZones"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1"
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": "*"
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "PolicyName": "AppCallerRoleDefaultPolicy61BE57D2",
+          "Roles": [
+            {
+              "Ref": "AppCallerRoleEA1CB1F0"
+            }
+          ]
+        }
+      }
+    },
+    "Outputs": {
+      "AppCallerRoleArn23874049": {
+        "Value": {
+          "Fn::GetAtt": [
+            "AppCallerRoleEA1CB1F0",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "Parameters": {
+      "BootstrapVersion": {
+        "Type": "AWS::SSM::Parameter::Value<String>",
+        "Default": "/cdk-bootstrap/hnb659fds/version",
+        "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+      }
+    },
+    "Rules": {
+      "CheckBootstrapVersion": {
+        "Assertions": [
+          {
+            "Assert": {
+              "Fn::Not": [
+                {
+                  "Fn::Contains": [
+                    [
+                      "1",
+                      "2",
+                      "3",
+                      "4",
+                      "5"
+                    ],
+                    {
+                      "Ref": "BootstrapVersion"
+                    }
+                  ]
+                }
+              ]
+            },
+            "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+          }
+        ]
+      }
+    }
+  }
+}

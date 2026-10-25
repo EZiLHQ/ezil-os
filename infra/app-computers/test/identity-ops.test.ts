@@ -13,6 +13,7 @@ import { applyWorkloadIdentity, tagWorkload, workloadSynthesizer } from '../lib/
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
 import { LifecycleDeploymentSchema } from '../lib/lifecycle/deployment.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
+import { evaluate, list, starExample } from './iam-evaluate.js';
 
 const A = '123456789012', R = REGION;
 const cfg = IdentityConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R,
@@ -27,7 +28,7 @@ const BASIC = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
 const EC2 = (kind: string) => `arn:aws:ec2:${R}:${A}:${kind}/*`;
 const NS = (k: string) => ({ [`aws:${k}Tag/ezil:namespace`]: 'pilot' });
 const COMPUTE = (k: string) => ({ [`aws:${k}Tag/ezil:managed-by`]: 'app-computer-platform', [`aws:${k}Tag/ezil:stage`]: 'pilot' });
-function expectedBoundary(killSwitch: boolean, userData = false) {
+function expectedBoundary(killSwitch: boolean, userData = false, poolLifecycle = false) {
     return [
         { Effect: 'Allow', Action: 'lambda:InvokeFunction', Resource: `arn:aws:lambda:${R}:${A}:function:ezil-pilot-*` },
         { Effect: 'Allow', Action: ['states:StartExecution', 'states:ListExecutions'], Resource: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-*` },
@@ -35,6 +36,7 @@ function expectedBoundary(killSwitch: boolean, userData = false) {
         { Effect: 'Allow', Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'], Resource: `arn:aws:logs:${R}:${A}:log-group:ezil-pilot-*` },
         { Effect: 'Allow', Action: 'sqs:SendMessage', Resource: `arn:aws:sqs:${R}:${A}:ezil-pilot-*` },
         { Effect: 'Allow', Resource: '*', Action: ['ec2:DescribeInstances', 'ec2:DescribeVolumes', 'ec2:DescribeImages',
+            'ec2:DescribeSnapshots',
             'ec2:DescribeLaunchTemplateVersions', 'ec2:DescribeAvailabilityZones', 'logs:DescribeLogGroups', 'logs:CreateLogDelivery',
             'logs:GetLogDelivery', 'logs:UpdateLogDelivery', 'logs:DeleteLogDelivery', 'logs:ListLogDeliveries',
             'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies'] },
@@ -43,7 +45,7 @@ function expectedBoundary(killSwitch: boolean, userData = false) {
             'kms:GenerateDataKeyWithoutPlaintext', 'kms:DescribeKey', 'kms:CreateGrant'], Resource: `arn:aws:kms:${R}:${A}:key/*`,
             Condition: { StringEquals: NS('Resource') } },
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('instance'),
-            Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:InstanceType': ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'] } } },
+            Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:InstanceType': ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge', 'm6i.xlarge', 'm6i.2xlarge'] } } },
         { Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: EC2('volume'),
             Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
                 NumericLessThanEquals: { 'ec2:VolumeSize': '100' } } },
@@ -51,16 +53,18 @@ function expectedBoundary(killSwitch: boolean, userData = false) {
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: [EC2('subnet'), EC2('security-group'), EC2('launch-template')],
             Condition: { StringEquals: NS('Resource') } },
         { Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${R}::image/*` },
-        { Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags'],
+        { Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateTags',
+            ...(poolLifecycle ? ['ec2:DetachVolume', 'ec2:DeleteTags'] : [])],
             Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
         ...(userData ? [{ Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: EC2('instance'),
             Condition: { StringEquals: { ...COMPUTE('Resource'), 'ec2:Attribute': 'userData' } } }] : []),
-        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume')],
+        { Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume'), EC2('network-interface')],
             Condition: { StringEquals: { 'ec2:CreateAction': ['RunInstances', 'CreateVolume'] } } },
         { Effect: 'Deny', Resource: '*', Action: ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2:CreateCapacityReservation*',
             'ec2:CreateReservedInstancesListing', 'ec2:AcceptReservedInstancesExchangeQuote', 'ec2:RequestSpot*', 'ec2:CreateFleet',
             'savingsplans:*', 'rds:*', 'elasticache:*', 'redshift:*', 'es:*', 'dynamodb:*', 'aws-marketplace:*',
-            'ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume', 'ec2:DeleteTags',
+            'ec2:DeleteVolume', 'ec2:DeleteSnapshot',
+            ...(!poolLifecycle ? ['ec2:DetachVolume', 'ec2:DeleteTags'] : []),
             ...(!userData ? ['ec2:ModifyInstanceAttribute'] : []),
             ...(killSwitch ? ['ec2:RunInstances', 'ec2:StartInstances', 'ec2:AttachVolume', 'ec2:CreateVolume',
                 'states:StartExecution', 'states:StartSyncExecution', 'states:RedriveExecution', 'lambda:InvokeFunction', 'events:PutTargets'] : []),
@@ -87,6 +91,50 @@ test('I5 boundary: every allow is scoped by name, namespace tag or compute tag; 
         if (s.Effect === 'Allow') for (const a of [s.Action].flat()) assert.doesNotMatch(a, /[*?]/);
     }
 });
+test('identity poolLifecycle is an optional strict JSON boolean defaulting to false', () => {
+    const { poolLifecycle: _, ...absent } = cfg;
+    assert.equal(IdentityConfigSchema.parse(absent).poolLifecycle, false);
+    for (const value of [false, true]) assert.equal(IdentityConfigSchema.parse({ ...absent, poolLifecycle: value }).poolLifecycle, value);
+    for (const value of ['false', 'true', 0, 1, null, {}])
+        assert.equal(IdentityConfigSchema.safeParse({ ...absent, poolLifecycle: value }).success, false);
+});
+for (const poolLifecycle of [undefined, false, true]) for (const killSwitch of [false, true])
+    for (const userDataAttributeKeyVerified of [false, true]) {
+        test(`synthesized identity boundary retains live denies unless poolLifecycle=true: ${JSON.stringify({ poolLifecycle, killSwitch, userDataAttributeKeyVerified })}`, () => {
+            const { poolLifecycle: _, ...absent } = cfg;
+            const config = IdentityConfigSchema.parse({ ...absent, killSwitch, userDataAttributeKeyVerified,
+                ...(poolLifecycle === undefined ? {} : { poolLifecycle }) });
+            const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'PoolIdentity', {
+                config, env: { account: A, region: R }, synthesizer: new BootstraplessSynthesizer(),
+            });
+            const policies = Object.values(assertions.Template.fromStack(stack).findResources('AWS::IAM::ManagedPolicy'));
+            const statements: any[] = policies.find(p => p.Properties.ManagedPolicyName === 'ezil-pilot-boundary')!.Properties.PolicyDocument.Statement;
+            // Exact statement comparison also freezes the pre-flag pool behaviour when true.
+            assert.deepEqual(statements, expectedBoundary(killSwitch, userDataAttributeKeyVerified, poolLifecycle === true));
+            for (const action of ['ec2:DetachVolume', 'ec2:DeleteTags']) {
+                const direct: any[] = statements.filter((s: any) => list(s.Action).includes(action));
+                if (poolLifecycle === true) {
+                    assert.equal(direct.length, 1);
+                    assert.equal(direct[0].Effect, 'Allow');
+                    assert.deepEqual(direct[0].Resource, [EC2('instance'), EC2('volume')]);
+                    assert.deepEqual(direct[0].Condition, { StringEquals: COMPUTE('Resource') });
+                } else {
+                    assert.deepEqual(direct.map((s: any) => ({ Effect: s.Effect, Resource: s.Resource, Condition: s.Condition })),
+                        [{ Effect: 'Deny', Resource: '*', Condition: undefined }]);
+                }
+                for (const kind of ['instance', 'volume']) {
+                    const resource = starExample(EC2(kind), 'test');
+                    const context = { 'aws:RequestedRegion': R, ...COMPUTE('Resource') };
+                    assert.deepEqual(evaluate(statements, action, resource, context),
+                        { allowed: poolLifecycle === true, denied: poolLifecycle !== true });
+                    for (const patch of [{ 'aws:ResourceTag/ezil:stage': 'foreign' }, { 'aws:ResourceTag/ezil:stage': undefined },
+                        { 'aws:ResourceTag/ezil:managed-by': 'foreign' }, { 'aws:ResourceTag/ezil:managed-by': undefined },
+                        { 'aws:RequestedRegion': 'us-east-1' }])
+                        assert.equal(evaluate(statements, action, resource, { ...context, ...patch }).allowed, false);
+                }
+            }
+        });
+    }
 test('I5 boundary: the founder kill switch merges compute and invocation denies', () => {
     const on = IdentityConfigSchema.parse({ ...cfg, killSwitch: true });
     assert.deepEqual(json(boundaryStatements(on)), expectedBoundary(true));

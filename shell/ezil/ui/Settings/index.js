@@ -21,7 +21,9 @@
 // Account/Security — 7,000+ LOC, already recorded as removed in
 // `PUTER-PROVENANCE.md`) and everything else that shape doesn't need:
 //   - the `dashboard-will-open`/`dashboard-ready` extension events — no
-//     extension system here; this fork's three tabs are hard-coded.
+//     extension system here; tabs are hard-coded, with Billing feature-gated.
+//   - Settings accepts `ctx.initialTab` for return links; unavailable tabs
+//     fall back to Computers, the ordinary entry point.
 //   - hash-based routing (`dashboard_initial_route`, `parseDashboardRoute`,
 //     `hashchange`/`popstate` handlers) — this fork does not own the `/os`
 //     address bar, and a Settings window is not a page of its own.
@@ -55,6 +57,7 @@
 import UIWindow from '../../../src/UI/UIWindow.js';
 import telemetry from '../../telemetry.js';
 import TabAccount from './tabs/account.js';
+import TabBilling from './tabs/billing.js';
 import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';
 import TabSystem from './tabs/system.js';
@@ -71,7 +74,7 @@ const PHASE = 'ezil-os:settings';
  * the control-drawer button `drawer-action.js` injects into a full-bleed
  * window) — see `tabs/troubleshoot.js`'s header.
  */
-const TABS = [TabAccount, TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot];
+const TABS = [TabAccount, TabBilling, TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot];
 
 /**
  * The tab Settings opens on. Account sits at the top of the sidebar (where
@@ -107,14 +110,14 @@ function sidebarItemHtml (tab, isActive) {
         </button>`;
 }
 
-function buildHtml (tabs) {
+function buildHtml (tabs, activeTab) {
     let h = '<div class="ezil-settings">';
     h += '<nav class="ezil-settings-sidebar" role="tablist" aria-label="Settings">';
-    for ( const tab of tabs ) h += sidebarItemHtml(tab, tab === DEFAULT_TAB);
+    for ( const tab of tabs ) h += sidebarItemHtml(tab, tab === activeTab);
     h += '</nav>';
     h += '<div class="ezil-settings-content">';
     for ( const tab of tabs ) {
-        h += `<div class="ezil-settings-pane${tab === DEFAULT_TAB ? ' active' : ''}" data-pane="${tab.id}" role="tabpanel">`;
+        h += `<div class="ezil-settings-pane${tab === activeTab ? ' active' : ''}" data-pane="${tab.id}" role="tabpanel">`;
         h += tab.html();
         h += '</div>';
     }
@@ -133,11 +136,12 @@ function buildHtml (tabs) {
  */
 export async function openSettingsWindow (ctx = {}) {
     const tabs = tabsFor(ctx);
+    const activeTab = tabs.find(tab => tab.id === ctx.initialTab) ?? DEFAULT_TAB;
     const el_window = await UIWindow({
         title: 'Settings',
         app: 'settings',
         icon: ctx.icon,
-        body_content: buildHtml(tabs),
+        body_content: buildHtml(tabs, activeTab),
         width: 760,
         height: 560,
         is_resizable: true,
@@ -177,6 +181,7 @@ export async function openSettingsWindow (ctx = {}) {
     }
 
     const $win = $(el_window);
+    previousTabId = activeTab.id;
 
     // The one piece of behaviour every tab shares: switching the sidebar's
     // `.active` item and the matching pane, then telling the tab it became
@@ -234,6 +239,18 @@ export async function openSettingsWindow (ctx = {}) {
                 detail: `${String(tab.id)}: ${err?.message ?? err}`,
             });
         }
+    }
+
+    // Tabs that load only while visible must also run on a direct entry,
+    // after every pane has had its per-window handlers installed.
+    try {
+        activeTab.onActivate?.($win, ctx);
+    } catch ( err ) {
+        console.error(`[${PHASE}] tab "${activeTab.id}" failed to activate`, err);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:settings#activate', code: 'tab_activate_threw',
+            detail: `${activeTab.id}: ${err?.message ?? err}`,
+        });
     }
 
     return el_window;

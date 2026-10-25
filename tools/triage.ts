@@ -43,10 +43,11 @@
  * blindly. `container (real image)`, `local (typecheck + unit + smoke)` and
  * `Vercel` are deliberately NOT in the set: a fork PR cannot pull the private
  * desktop image, so those go red on every outside contribution -- see
- * `.github/workflows/ci.yml` lines 62-72. A red check outside the required set
- * is `not-required-red`, and that classification takes precedence over
- * `ci-flaky` (a non-required check that happens to be green on `main` is still
- * the fork limitation, not a flake).
+ * `.github/workflows/ci.yml`'s private-package paragraph, cited by `TEMPLATES`
+ * and checked against the real workflow by `triage.test.ts`. A red check
+ * outside the required set is `not-required-red`, and that classification
+ * takes precedence over `ci-flaky` (a non-required check that happens to be
+ * green on `main` is still the fork limitation, not a flake).
  *
  * The DCO rule is a faithful re-implementation of `.github/workflows/dco.yml`:
  * merge commits are skipped; the three bot authors it names are skipped by the
@@ -200,6 +201,10 @@ export type Finding = (typeof FINDING_ORDER)[number];
 
 const REPO_BLOB = "https://github.com/EZiLHQ/ezil-os/blob/main";
 
+// Keep the link label and URL in sync; triage.test.ts validates this exact
+// paragraph against ci.yml so moving or rewriting it fails the tools CI job.
+const CI_PRIVATE_PACKAGE_LINES = { start: 332, end: 342 } as const;
+
 /**
  * The findings that carry a contributor-facing comment. `CommentFinding` is the
  * key type of `TEMPLATES`; the two status findings are excluded by omission.
@@ -232,7 +237,7 @@ A check failed here that is currently green on \`main\` for the same name, and i
 
 	"not-required-red": `### A non-required check is red
 
-A check failed here that is not among the fifteen required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines 65–78](${REPO_BLOB}/.github/workflows/ci.yml#L65-L78)). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
+A check failed here that is not among the fifteen required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines ${CI_PRIVATE_PACKAGE_LINES.start}–${CI_PRIVATE_PACKAGE_LINES.end}](${REPO_BLOB}/.github/workflows/ci.yml#L${CI_PRIVATE_PACKAGE_LINES.start}-L${CI_PRIVATE_PACKAGE_LINES.end})). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
 
 	"size-xl": `### This pull request is large (size/XL)
 

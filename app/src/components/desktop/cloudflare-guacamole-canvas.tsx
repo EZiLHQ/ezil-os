@@ -19,6 +19,7 @@ import {
     type BootProgressState,
     type PhaseVisualState,
 } from './boot-phases';
+import { retryAfterCapacityExpiry, type CapacityRetryResult } from './capacity-retry';
 import { desktopSurfaceStatus, useReportDesktopStatus } from './desktop-status';
 
 /**
@@ -129,6 +130,8 @@ function toBootErrorCode(raw: string | undefined): BootErrorCode {
         case 'desktop_unreachable':
         case 'worker_http_error':
         case 'timeout':
+        // RETRY-118: renders the capacity copy; only the explicit Retry resets it.
+        case 'capacity_attempt_expired':
             return raw;
         default:
             return 'unknown';
@@ -407,6 +410,16 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         void frameQuery.refetch();
     }, [previewQuery, frameQuery]);
 
+    // RETRY-118: the failed panel's "Try again" resets an expired capacity attempt once, then reloads.
+    const resetCapacityAttempt = api.cloudflareGuacamole.resetCapacityAttempt.useMutation();
+    const capacityRetryInFlight = useRef<Promise<CapacityRetryResult> | null>(null);
+    const handleRetry = useCallback(() => {
+        void retryAfterCapacityExpiry({
+            computerId, failure: previewQuery.data, reset: (input) => resetCapacityAttempt.mutateAsync(input),
+            reload: handleReload, inFlight: capacityRetryInFlight,
+        });
+    }, [computerId, previewQuery.data, resetCapacityAttempt, handleReload]);
+
     if (bootUiState.kind === 'not_configured') {
         return (
             <Panel testId="cf-guacamole-not-configured" tone="neutral">
@@ -427,7 +440,7 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         const copy = BOOT_FAILURE_COPY[bootUiState.reason];
         const tone = bootUiState.reason === 'sandbox_crashed' ? 'warning' : 'error';
         return (
-            <Panel testId={`cf-guacamole-failed-${bootUiState.reason}`} tone={tone} onRetry={handleReload}>
+            <Panel testId={`cf-guacamole-failed-${bootUiState.reason}`} tone={tone} onRetry={handleRetry}>
                 <p className="mb-2 font-semibold text-white">{copy.title}</p>
                 <p className="text-xs text-neutral-400">{copy.body}</p>
             </Panel>

@@ -11,8 +11,9 @@
  * (`EZIL_COMPUTE_PLACEMENT_READS` and `EZIL_AWS_COMPUTERS_ENABLED` unset — the
  * production default until the founder registers the placement SQL) this does
  * NOT touch the database and returns exactly what `selectComputeProvider`
- * returned before P3. With reads on, a computer with no placement row, or a
- * `cloudflare` row, gets that same Cloudflare adapter instance.
+ * returned before P3. With reads on, an active provider migration gets an
+ * AWS-labelled waiting adapter. Otherwise a computer with no placement row,
+ * or a `cloudflare` row, gets that same Cloudflare adapter instance.
  *
  * A placement owned by someone else is NOT_FOUND — the same anti-enumeration
  * answer `assertOwnedComputer` gives — and it is raised BEFORE any provider is
@@ -21,20 +22,25 @@
 
 import { TRPCError } from '@trpc/server';
 
+import { billingV2EntitlementReader } from '@/server/billing/v2/compute-access';
+import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
+import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
+import type { PlacementDb } from '@/server/lib/compute/placement';
 import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
-import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
-import { resolveTier, type EntitlementReader } from '@/server/lib/compute/tier';
+import { migrationStartingAnswer } from '@/server/lib/compute/provider-migrate-placement';
+import { plusPlanIds, resolveEntitlement, tierForEntitlement, type EntitlementReader, type EntitlementRecord } from '@/server/lib/compute/tier';
 
 export type RoutedComputer =
     | { kind: 'cloudflare'; provider: CloudflareComputeProvider }
-    | { kind: 'aws-ec2'; provider: ComputeProvider };
+    | { kind: 'aws-ec2'; provider: ComputeProvider; instanceType: string | null };
 
 /**
  * The AWS provider's runtime collaborators: the Step Functions starter and
@@ -45,11 +51,13 @@ export type RoutedComputer =
  * `ensure`/`stop` refuse BEFORE any write (`aws_lifecycle_unconfigured`) —
  * never Cloudflare. This is the ONE place the routers get them from.
  */
-export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer'> {
+export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter'> {
     if (!isAwsComputersEnabled(env)) return {};
     const { starter, executions, describer } = sharedAwsSdkCollaborators(env);
     const tunnels = workerTunnelClientFromEnv(env) ?? undefined;
     return {
+        // Shared by router dispatch and sandbox-reap's background reconcile.
+        meter: billingComputeMeter(),
         ...(starter ? { starter } : {}), ...(executions ? { executions } : {}), ...(tunnels ? { tunnels } : {}),
         // The read-only EC2 describe that catches a guest-initiated idle stop (R9).
         ...(describer ? { describer } : {}),
@@ -58,33 +66,42 @@ export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProvide
 
 export interface RouteOptions {
     env?: Env;
-    /** Where a user's paid entitlement is read from. None in this app today → every AWS computer is `free`. */
+    /** Defaults to billing v2, whose reader touches no store while billing is off. */
     entitlements?: EntitlementReader;
     /** Overrides `defaultAwsCollaborators(env)` (tests). */
-    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
+    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
     /** The caller starts a sandbox: pin a no-row Cloudflare computer first (select.ts `ResolveOptions`). */
     pinCloudflare?: boolean;
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */
-export function awsDepsFor(env: Env, entitlements: EntitlementReader | undefined, aws: RouteOptions['aws'] = {}) {
+export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | undefined | (() => Promise<EntitlementRecord | null>), aws: RouteOptions['aws'] = {}) {
     return {
         ...aws,
-        // The size this user's computer gets: `free` unless a paid entitlement proves `plus`.
-        tierFor: (userId: string) => resolveTier(userId, entitlements, env),
+        entitlement: typeof entitlement === 'function' ? undefined : entitlement,
+        tierFor: async () => tierForEntitlement(typeof entitlement === 'function' ? await entitlement() : entitlement, plusPlanIds(env)),
     };
 }
 
 export async function routeComputer(
     db: unknown,
     computer: ComputerRef,
-    { env = process.env, entitlements, aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
+    { env = process.env, entitlements = billingV2EntitlementReader(), aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
 ): Promise<RoutedComputer> {
     // Flag off: no database read at all — the pre-P3 call, unchanged.
     if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
     let provider: ComputeProvider;
+    let instanceType: string | null = null;
+    let entitlement: Promise<EntitlementRecord | null> | undefined;
+    const getEntitlement = () => entitlement ??= resolveEntitlement(computer.userId, entitlements);
     try {
-        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, awsDepsFor(env, entitlements, aws), { pinCloudflare });
+        // Gate routing with the authenticated owner before any reservation read.
+        // The resolver repeats this check for its own fresh placement read.
+        await readPlacement(db as PlacementExecutor, computer.computerId, computer.userId);
+        provider = await resolveComputeProvider(db as PlacementExecutor, computer, env, { ...awsDepsFor(env, getEntitlement, aws), pool: createPoolDeps(db as PlacementDb, env) }, {
+            pinCloudflare, resolveEntitlement: getEntitlement,
+            onPlacement: placement => { instanceType = placement.record?.instanceType ?? null; },
+        });
     } catch (err) {
         if (err instanceof PlacementOwnerError) {
             // NOT_FOUND, never FORBIDDEN — a foreign computer must look absent.
@@ -94,7 +111,7 @@ export async function routeComputer(
     }
     // A cloudflare placement keeps the exact pre-P3 adapter (and its richer result type).
     if (provider.kind === 'cloudflare') return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
-    return { kind: 'aws-ec2', provider };
+    return { kind: 'aws-ec2', provider, instanceType };
 }
 
 /**
@@ -111,20 +128,56 @@ export function shellCodeForAwsEnsure(result: Extract<EnsureResult, { ok: false 
     return result.retryable && AWS_WAKING_CODES.has(result.errorCode) ? 'sandbox_starting' : result.errorCode;
 }
 
+/** The migration may begin after dispatch read Cloudflare. Preserve the Worker's
+ * fence refusal as an AWS-budget wait, including when placement reads are disabled.
+ * Do not classify unrelated conflicts or ordinary Cloudflare cold starts as AWS.
+ */
+export function cloudflareMigrationAnswer(result: ComputeStatus) {
+    const prefix = 'worker_http_409: ';
+    if (result.ok || !result.error?.startsWith(prefix)) return null;
+    try {
+        if (JSON.parse(result.error.slice(prefix.length))?.error !== 'migrating') return null;
+    } catch { return null; }
+    return { ...migrationStartingAnswer(), computeMigrating: true as const, provider: 'cloudflare-guacamole' as const };
+}
+
+/** Only MIGOPEN's waiting provider emits this error; ordinary AWS wakes do not. */
+function awsMigrationAnswer(result: ComputeStatus) {
+    return !result.ok && result.error === 'computer_migrating'
+        ? { computeMigrating: true as const } : {};
+}
+
 /**
  * The preview answer for an AWS computer. Not-ready → a VALUE (never a throw:
  * a thrown error is what TanStack retries, and the wake loop already re-asks).
  * Ready → ask the Worker's AWS route for the current placement's URLs.
  * The callback is lazy: an ensure refusal must never issue a preview request.
  */
-export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>) {
+export async function awsPreviewAnswer(result: EnsureResult, preview: () => Promise<AwsPreviewResult>, preparePool?: () => Promise<void>,
+    hold?: { wait(): Promise<boolean>; ensure(): Promise<EnsureResult>; signal?: AbortSignal }) {
+    if (!result.ok && result.errorCode === 'computer_starting' && result.retryable && !hold?.signal?.aborted) {
+        // Keep the existing relay preparation ahead of the hold: waiting must not
+        // defer the exchange that lets the host reach session-ready.
+        await preparePool?.();
+        if (hold && !hold.signal?.aborted && await hold.wait() && !hold.signal?.aborted) {
+            const ensured = await hold.ensure();
+            if (!hold.signal?.aborted) result = ensured;
+        }
+    }
     if (!result.ok) {
         return {
             ok: false as const,
             error: result.errorCode,
             errorCode: shellCodeForAwsEnsure(result),
+            retryable: result.retryable,
             provider: 'cloudflare-guacamole' as const,
             computeProvider: 'aws-ec2' as const,
+            ...awsMigrationAnswer(result),
+            // RETRY-118: the expired attempt an explicit user Retry may reset; nothing else carries it.
+            ...(result.errorCode === 'capacity_attempt_expired' && result.capacityAttemptId
+                ? { capacityAttemptId: result.capacityAttemptId } : {}),
+            ...(result.errorCode === 'computer_starting' && result.retryable === true && result.computeLaunching === true
+                ? { computeLaunching: true as const } : {}),
         };
     }
     return {
@@ -182,5 +235,6 @@ export async function confirmAwsStop(
  */
 export function awsStatusAnswer(status: ComputeStatus) {
     const state = (status as AwsComputeStatus).state;
-    return { ...status, guacamoleRunning: status.ok === true && state === 'running', computeProvider: 'aws-ec2' as const };
+    return { ...status, guacamoleRunning: status.ok === true && state === 'running', computeProvider: 'aws-ec2' as const,
+        ...awsMigrationAnswer(status) };
 }

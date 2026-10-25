@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-    CfnOutput, CfnParameter, Fn, Stack, type StackProps,
+    CfnCondition, CfnOutput, CfnParameter, CfnRule, Fn, Stack, type StackProps,
     aws_iam as iam, aws_imagebuilder as imagebuilder,
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
@@ -75,6 +75,32 @@ export class AmiPipelineStack extends Stack {
         parameters.push({ name: 'DesktopImageRef', value: [Fn.sub('${RepositoryUri}@${Digest}', {
             RepositoryUri: repository.valueAsString, Digest: desktopDigest.valueAsString,
         })] });
+        const previousDigest = new CfnParameter(this, 'PreviousDesktopImageDigest', {
+            type: 'String', default: '', allowedPattern: '^(sha256:[0-9a-f]{64})?$',
+        });
+        const previousId = new CfnParameter(this, 'PreviousDesktopImageId', {
+            type: 'String', default: '', allowedPattern: '^(sha256:[0-9a-f]{64})?$',
+        });
+        new CfnRule(this, 'PreviousDesktopImagePair', { assertions: [{
+            assert: Fn.conditionOr(
+                Fn.conditionAnd(Fn.conditionEquals(previousDigest.valueAsString, ''),
+                    Fn.conditionEquals(previousId.valueAsString, '')),
+                Fn.conditionAnd(Fn.conditionNot(Fn.conditionEquals(previousDigest.valueAsString, '')),
+                    Fn.conditionNot(Fn.conditionEquals(previousId.valueAsString, '')))),
+            assertDescription: 'Previous desktop digest and ID must be supplied together',
+        }, {
+            assert: Fn.conditionOr(Fn.conditionEquals(previousId.valueAsString, ''),
+                Fn.conditionNot(Fn.conditionEquals(previousId.valueAsString, Fn.ref('DesktopImageId')))),
+            assertDescription: 'Previous and current lower IDs must differ',
+        }] });
+        new CfnCondition(this, 'HasPreviousDesktopImage', {
+            expression: Fn.conditionNot(Fn.conditionEquals(previousDigest.valueAsString, '')),
+        });
+        parameters.push({ name: 'PreviousDesktopImageRef', value: [Fn.conditionIf('HasPreviousDesktopImage',
+            Fn.sub('${RepositoryUri}@${Digest}', {
+                RepositoryUri: repository.valueAsString, Digest: previousDigest.valueAsString,
+            }), '').toString()] });
+        parameters.push({ name: 'PreviousDesktopImageId', value: [previousId.valueAsString] });
 
         const role = new iam.CfnRole(this, 'BuildRole', {
             roleName: `ezil-${c.namespace}-ami-build`, path: workloadPath(c.namespace),

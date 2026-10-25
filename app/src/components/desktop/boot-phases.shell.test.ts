@@ -224,7 +224,7 @@ describe('computeBootUiState — never fabricates progress', () => {
         }
     });
 
-    it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
+    it('covers the complete failure vocabulary, including AWS admission refusals', () => {
         expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
             // 🔴 `display_not_streaming` is reachable ONLY through
             // `applyDisplayEvidence`. It is deliberately absent from
@@ -232,11 +232,15 @@ describe('computeBootUiState — never fabricates progress', () => {
             // preview request cannot fail this way — the request succeeds and
             // then no picture arrives. The sweep above proves the deterministic
             // error codes still land on `unknown` rather than reaching for it.
+            'capacity_unavailable',
             'desktop_unreachable',
             'display_not_streaming',
+            'global_hours_cap',
+            'operations_paused',
             'sandbox_crashed',
             'timeout',
             'unknown',
+            'user_hours_cap',
             'worker_unreachable',
         ]);
     });
@@ -392,6 +396,14 @@ describe('the port is a module-format conversion and nothing more', () => {
     const REQUEST_STATUSES = ['not_configured', 'pending', 'success', 'error'] as const;
     const CONFIRMED = [undefined, false, true] as const;
     const ERROR_CODES = [
+        'kill_switch',
+        'aws_disabled',
+        'capacity_unavailable',
+        'capacity_attempt_expired',
+        'region_capacity',
+        'max_running',
+        'user_hours_cap',
+        'global_hours_cap',
         undefined,
         'bad_request',
         'unauthorized',

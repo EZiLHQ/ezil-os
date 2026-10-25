@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule EZiL OS staging telemetry-maintenance
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+AccuracySec=1s
+Persistent=true
+Unit=ezil-os-staging-telemetry-maintenance.service
+
+[Install]
+WantedBy=timers.target

@@ -7,6 +7,7 @@ import {
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { defaultAwsCollaborators } from '@/server/api/routers/compute-dispatch';
 import { isAwsComputersEnabled, isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
 import { runAwsBackgroundReconcile } from '@/server/lib/compute/aws-receipts';
 import { createCloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { noNonCloudflarePlacement, readPlacement, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
@@ -137,7 +138,7 @@ export async function GET(req: Request): Promise<Response> {
             : {}),
         // AWS on: drive deleted AWS computers to RETIRED and settle the fleet (its own job).
         ...(isAwsComputersEnabled(process.env)
-            ? { awsReconcile: (signal: AbortSignal) => runAwsBackgroundReconcile(process.env, { db: db as unknown as PlacementDb, ...defaultAwsCollaborators(process.env), signal }) }
+            ? { awsReconcile: (signal: AbortSignal) => runAwsBackgroundReconcile(process.env, { db: db as unknown as PlacementDb, ...defaultAwsCollaborators(process.env), pool: createPoolDeps(db as unknown as PlacementDb, process.env), signal }) }
             : {}),
         deriveSandboxName: (userId, computerId) => {
             const sandboxName = deriveGuacamoleSandboxId(userId, computerId);

@@ -4,9 +4,10 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
-import { AWS_BROWSER_ROUTE_TOKEN, requestAwsPreview } from './aws-preview';
+import { AWS_BROWSER_ROUTE_TOKEN, prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { EnsureOptions } from './provider';
+import { ENROLLMENT_FAILED, ENROLLMENT_PENDING } from './placement';
 
 const NOW = Date.parse('2026-10-14T12:00:00Z');
 const userId = '11111111-1111-4111-8111-111111111111';
@@ -15,6 +16,7 @@ const sandboxId = deriveGuacamoleSandboxId(userId, computerId);
 const config = { workerUrl: 'https://worker.preview.example/', isConfigured: true, hasHmacSecret: true };
 const options = { sessionId: 'session', desktopMode: 'neko' as const };
 const failure = { ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable' };
+const waking = { ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting' };
 const row = (over: Record<string, unknown> = {}) => placementRow({
     computer_id: computerId, owner_user_id: userId, state: 'RUNNING', generation: 7, lease_epoch: 11, ...over,
 });
@@ -26,8 +28,8 @@ const ready = () => ({
     expiresAt: NOW + 3_600_000,
     relay: { runtimeId: 'a'.repeat(32), expiresAt: NOW + 600_000 }, turnRelay: true,
 });
-function setup(placements = [row()]) {
-    const fake = createFakePlacementDb({ placements });
+function setup(placements = [row()], instant = false) {
+    const fake = createFakePlacementDb({ placements }, instant ? { yield: async () => {} } : {});
     return {
         fake,
         open: (cfg = config, secret = 'test-secret', opts: EnsureOptions = options) =>
@@ -43,12 +45,169 @@ beforeEach(() => {
     vi.stubEnv('EZIL_AWS_BROWSER_ZONE', 'preview.example');
     fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json(ready()));
     vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+});
+
+describe('AWS preview placement hold', () => {
+    const computer = { userId, computerId };
+    beforeEach(() => { vi.useRealTimers(); vi.useFakeTimers(); vi.setSystemTime(NOW); });
+
+    it('observes readiness on the next 250ms poll without opening a transaction or signing', async () => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const done = vi.fn();
+        const held = waitForAwsPreviewPlacement(fake.db, computer).then(done);
+        await vi.advanceTimersByTimeAsync(249);
+        expect(done).not.toHaveBeenCalled();
+        fake.placements[0]!.state = 'RUNNING';
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(true);
+        expect(fake.statements.filter(s => s.sql.includes('placement:read'))).toHaveLength(2);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('expires at eight seconds with a bounded number of placement reads', async () => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const done = vi.fn();
+        const held = waitForAwsPreviewPlacement(fake.db, computer).then(done);
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(done).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(false);
+        expect(fake.statements.filter(s => s.sql.includes('placement:read'))).toHaveLength(32);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('holds only one ask per owner/computer, normalizes UUID case, and releases on abort', async () => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const controller = new AbortController();
+        const held = waitForAwsPreviewPlacement(fake.db, computer, controller.signal);
+        await vi.advanceTimersByTimeAsync(0);
+        const reads = fake.statements.length;
+        expect(await waitForAwsPreviewPlacement(fake.db, { userId, computerId: computerId.toUpperCase() })).toBe(false);
+        expect(fake.statements).toHaveLength(reads);
+        controller.abort();
+        expect(await held).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+        fake.placements[0]!.state = 'RUNNING';
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(true);
+    });
+
+    it('allows independent computers to wait concurrently', async () => {
+        const secondId = '22222222-2222-4222-8222-222222222222';
+        const { fake } = setup([row({ state: 'STARTING' }), row({ state: 'STARTING', computer_id: secondId })], true);
+        const first = waitForAwsPreviewPlacement(fake.db, computer);
+        const second = waitForAwsPreviewPlacement(fake.db, { userId, computerId: secondId });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(2);
+        fake.placements.forEach(p => { p.state = 'RUNNING'; });
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await Promise.all([first, second])).toEqual([true, true]);
+    });
+
+    it.each([
+        { state: 'STOPPING' }, { provider: 'cloudflare' }, { last_error: ENROLLMENT_FAILED },
+        { owner_user_id: '22222222-2222-4222-8222-222222222222' }, { generation: 0 },
+        { image_upgrade_job_id: computerId },
+    ])('ends the hold on a new refusal: %j', async patch => {
+        const { fake } = setup([row({ state: 'STARTING' })], true);
+        const held = waitForAwsPreviewPlacement(fake.db, computer);
+        await vi.advanceTimersByTimeAsync(0);
+        Object.assign(fake.placements[0]!, patch);
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await held).toBe(false);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('does not wait for a RUNNING placement with unsettled enrollment', async () => {
+        const { fake } = setup([row({ enroll_nonce_hash: 'pending' })], true);
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(['placement', 'reservation'])('releases the hold on abort during the %s read, even if it never answers', async stage => {
+        const { fake } = setup([row()], true);
+        const execute = fake.db.execute;
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        let calls = 0;
+        const db = { execute: vi.fn(async (query: Parameters<typeof execute>[0]) => {
+            if (++calls === (stage === 'placement' ? 1 : 2)) await deferred;
+            return execute(query);
+        }) };
+        const controller = new AbortController();
+        const held = waitForAwsPreviewPlacement(db, computer, controller.signal);
+        await vi.advanceTimersByTimeAsync(0);
+        controller.abort();
+        expect(await held).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+        // A new ask acquires the same slot before the old dependency settles.
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(true);
+        const count = db.execute.mock.calls.length;
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(db.execute).toHaveBeenCalledTimes(count);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([0, 7_750])('bounds a deferred read started at %ims by the remaining eight-second budget', async start => {
+        const { fake } = setup([row({ state: start ? 'STARTING' : 'RUNNING' })], true);
+        const execute = fake.db.execute;
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        const db = { execute: vi.fn(async (query: Parameters<typeof execute>[0]) => {
+            if (performance.now() >= start) await deferred;
+            return execute(query);
+        }) };
+        const done = vi.fn();
+        const held = waitForAwsPreviewPlacement(db, computer).then(done);
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(done).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await held;
+        expect(done).toHaveBeenCalledExactlyOnceWith(false);
+        fake.placements[0]!.state = 'RUNNING';
+        expect(await waitForAwsPreviewPlacement(fake.db, computer)).toBe(true);
+        const reads = db.execute.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(1);
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(done).toHaveBeenCalledExactlyOnceWith(false);
+        expect(db.execute).toHaveBeenCalledTimes(reads);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('rejects a ready result at 8001ms even before the deadline timer runs', async () => {
+        const { fake } = setup([row()], true);
+        const execute = fake.db.execute;
+        const db = { execute: async (query: Parameters<typeof execute>[0]) => {
+            const result = await execute(query);
+            vi.spyOn(performance, 'now').mockReturnValue(8_001);
+            return result;
+        } };
+        expect(await waitForAwsPreviewPlacement(db, computer)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('accepts a deferred healthy read just before the deadline and clears its timer', async () => {
+        const { fake } = setup([row()], true);
+        let release!: () => void;
+        const deferred = new Promise<void>(resolve => { release = resolve; });
+        const held = waitForAwsPreviewPlacement({ execute: async query => { await deferred; return fake.db.execute(query); } }, computer);
+        await vi.advanceTimersByTimeAsync(7_999);
+        release();
+        expect(await held).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+    });
 });
 
 describe('AWS preview handoff', () => {
@@ -76,7 +235,7 @@ describe('AWS preview handoff', () => {
         expect(signature).toBe(createHmac('sha256', 'test-secret').update([
             'v2', NOW, 'POST', '/sandbox/preview', sandboxId, computerId, userId, 'aws-ec2', '', 7, 11, digest,
         ].join('|')).digest('hex'));
-        expect(fake.statements).toHaveLength(1);
+        expect(fake.statements).toHaveLength(4);
         expect(fake.statements[0]!.sql).toContain('placement:read');
     });
 
@@ -114,12 +273,48 @@ describe('AWS preview handoff', () => {
         ['foreign', [row({ owner_user_id: '22222222-2222-4222-8222-222222222222' })]],
         ['cloudflare', [row({ provider: 'cloudflare', workspace_store: 'r2' })]],
         ['stopping', [row({ state: 'STOPPING' })]],
+        ['stopped', [row({ state: 'STOPPED' })]],
+        ['unconfirmed', [row({ state: 'UNCONFIRMED' })]],
+        ['retired', [row({ state: 'RETIRED' })]],
+        ['failed enrollment', [row({ last_error: ENROLLMENT_FAILED })]],
         ['zero generation', [row({ generation: 0 })]],
         ['zero lease', [row({ lease_epoch: 0 })]],
         ['duplicate', [row(), row()]],
     ] as const)('refuses a %s placement before fetch', async (_name, placements) => {
         await expect(setup([...placements]).open()).resolves.toEqual(failure);
         expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'])('keeps an owned %s placement waking without signing', async (state) => {
+        const { fake, open } = setup([row({ state })]);
+        await expect(open()).resolves.toEqual(waking);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(fake.placements[0]).toMatchObject({ state, generation: 7, lease_epoch: 11 });
+    });
+
+    it.each([
+        { enroll_nonce_hash: 'pending-nonce' }, { last_error: ENROLLMENT_PENDING },
+        { lifecycle_job_id: computerId }, { lifecycle_digest: 'a'.repeat(64) },
+    ])('waits for enrollment and receipt settlement before signing: %j', async (over) => {
+        await expect(setup([row(over)]).open()).resolves.toEqual(waking);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('checks ownership before reservations, without leaking the reservation or owner', async () => {
+        const { fake, open } = setup([row({ owner_user_id: '22222222-2222-4222-8222-222222222222' })]);
+        await expect(open()).resolves.toEqual(failure);
+        expect(fake.statements).toHaveLength(1);
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-preview] unavailable reason=placement_foreign');
+    });
+
+    it('refuses an image reservation without guessing or advancing its target generation', async () => {
+        const { fake, open } = setup();
+        fake.placements[0]!.image_upgrade_job_id = computerId;
+        fake.imageJobs.push({ computer_id: computerId, job_id: computerId, phase: 'verifying', target_generation: 8 });
+        await expect(open()).resolves.toEqual(failure);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(fake.placements[0]).toMatchObject({ generation: 7, lease_epoch: 11 });
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-preview] unavailable reason=placement_reserved');
     });
 
     it('reads the current epoch on every handoff', async () => {
@@ -140,7 +335,7 @@ describe('AWS preview handoff', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it.each(['aws_desktop_starting', 'aws_origin_starting'])('maps only HTTP 503 %s to waking', async (error) => {
+    it.each(['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'])('maps only HTTP 503 %s to waking', async (error) => {
         fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status: 503 }));
         await expect(setup().open()).resolves.toEqual({
             ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
@@ -149,7 +344,62 @@ describe('AWS preview handoff', () => {
         await expect(setup().open()).resolves.toEqual(failure);
     });
 
-    it.each([201, 401, 403, 404, 500, 502, 503])('refuses HTTP %s even with a success-shaped body', async (status) => {
+    it.each([
+        [502, 'aws_origin_unavailable'], [409, 'relay_busy'], [409, 'relay_runtime_changed'],
+        [409, 'relay_negotiation_busy'], [504, 'relay_timeout'],
+    ])('retries the documented Worker transient %s %s', async (status, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status }));
+        await expect(setup().open()).resolves.toEqual(waking);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+        [502, 'tunnel_origin_mismatch'], [502, 'aws_desktop_failed'], [502, 'aws_desktop_config_refused'],
+        [401, 'aws_preview_auth_required'], [403, 'aws_origin_starting'], [409, 'unknown_conflict'],
+        [503, 'unknown_starting'], [409, 'aws_desktop_unreachable'],
+    ])('keeps the invalid Worker state %s %s unavailable', async (status, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status }));
+        await expect(setup().open()).resolves.toEqual(failure);
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith(`[aws-preview] unavailable reason=worker_status_${status}`);
+    });
+
+    it.each(['success', 'epoch refusal'] as const)('discards a %s for an epoch replaced during the Worker request and signs the current pair next time', async (answer) => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            fake.placements[0]!.generation = 8;
+            fake.placements[0]!.lease_epoch = 12;
+            return answer === 'success' ? Response.json(ready())
+                : Response.json({ ok: false, error: 'aws_origin_unavailable' }, { status: 502 });
+        });
+        await expect(open()).resolves.toEqual(waking);
+        fetchMock.mockResolvedValue(Response.json({ ...ready(), generation: 8, leaseEpoch: 12 }));
+        await expect(open()).resolves.toMatchObject({ ok: true, generation: 8, leaseEpoch: 12 });
+        const token = new Headers(fetchMock.mock.calls[1]![1]!.headers).get('x-ezil-auth')!;
+        expect(JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString())).toMatchObject({ generation: 8, leaseEpoch: 12 });
+    });
+
+    it.each([
+        ['STARTING', waking], ['MOUNTING', waking], ['STOPPING', failure], ['UNCONFIRMED', failure],
+    ])('rechecks a concurrent %s transition before returning URLs', async (state, result) => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            fake.placements[0]!.state = state;
+            return Response.json(ready());
+        });
+        await expect(open()).resolves.toEqual(result);
+    });
+
+    it.each(['owner', 'reservation'])('refuses a concurrent %s change before returning URLs', async (change) => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            if (change === 'owner') fake.placements[0]!.owner_user_id = '22222222-2222-4222-8222-222222222222';
+            else fake.placements[0]!.image_upgrade_job_id = computerId;
+            return Response.json(ready());
+        });
+        await expect(open()).resolves.toEqual(failure);
+    });
+
+    it.each([201, 401, 403, 404, 409, 500, 502, 503, 504])('refuses HTTP %s even with a success-shaped body', async (status) => {
         fetchMock.mockResolvedValue(Response.json({ ...ready(), error: 'LEAK' }, { status }));
         await expect(setup().open()).resolves.toEqual(failure);
     });
@@ -188,7 +438,11 @@ describe('AWS preview handoff', () => {
         else if (kind === 'fetch') fetchMock.mockRejectedValue(new Error('LEAK'));
         else if (kind === 'timeout') fetchMock.mockRejectedValue(new DOMException('LEAK', 'TimeoutError'));
         else fetchMock.mockResolvedValue(kind === 'json' ? new Response('LEAK') : Response.json(kind === 'null' ? null : []));
-        await expect(open()).resolves.toEqual(failure);
+        const transport = kind === 'fetch' || kind === 'timeout';
+        await expect(open()).resolves.toEqual(transport ? waking : failure);
+        if (!transport) expect(console.warn).toHaveBeenCalledExactlyOnceWith(
+            `[aws-preview] unavailable reason=${kind === 'database' ? 'placement_read_failed' : 'parse_failed'}`,
+        );
     });
 });
 
@@ -253,4 +507,21 @@ describe('AWS browser route token', () => {
         expect(worker).toContain(`export const AWS_BROWSER_ROUTE_TOKEN = '${AWS_BROWSER_ROUTE_TOKEN}';`);
         expect(worker).toContain('https://aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}.${zoneRoot}/preview-bootstrap');
     });
+});
+
+it('pool relay preparation sends only an enrolled pending epoch and never returns user URLs', async () => {
+    const pending = row({ state: 'MOUNTING', last_error: 'pool_session_pending', enroll_nonce_hash: null,
+        enroll_consumed_hash: 'a'.repeat(64), instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111',
+        lifecycle_job_id: '11111111-1111-4111-8111-111111111111', lifecycle_digest: 'b'.repeat(64) });
+    const fake = createFakePlacementDb({ placements: [pending] });
+    vi.stubEnv('EZIL_AWS_BROWSER_ZONE', 'preview.example');
+    const fetcher = vi.fn(async () => Response.json(ready())); vi.stubGlobal('fetch', fetcher);
+    expect(await prepareAwsPoolSession(fake.db, { userId, computerId }, options, config, 'test-secret', 'test')).toBeUndefined();
+    expect(fetcher).toHaveBeenCalledOnce();
+    for (const patch of [{ last_error: 'enroll_tunnel_pending' }, { enroll_consumed_hash: null }, { enroll_nonce_hash: 'still-unconsumed' },
+        { instance_id: null }, { volume_id: null }, { lifecycle_job_id: null }, { lifecycle_digest: null }, { state: 'STOPPING' }]) {
+        const refused = createFakePlacementDb({ placements: [{ ...pending, ...patch }] });
+        await prepareAwsPoolSession(refused.db, { userId, computerId }, options, config, 'test-secret', 'test');
+        expect(fetcher).toHaveBeenCalledOnce();
+    }
 });

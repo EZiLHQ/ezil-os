@@ -30,6 +30,13 @@ did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
 
 ### Changed
 
+- **EZiL Chat in the desktop editor.** Pin code-server 4.141.0 and adapt its
+  bundled MIT Copilot Chat 0.69.0 to the built-in EZiL Models gateway provider.
+  Qwen is the default; Kimi uses non-streaming responses. Boot seeds preserve
+  user settings, hide GitHub sign-in UI and clear gateway credentials from
+  integrated terminals. Image e2e covers agent edits, approval, Keep/Undo and
+  blocked-host traffic with a strict messages mock.
+
 - **The hosted product moves to `https://os.ezil.org`, open to everyone.**
   The first "Continue with Google" creates the account; the invite gate is
   removed. CI verifies `os.ezil.org` as the canonical production host and

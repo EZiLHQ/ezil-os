@@ -113,8 +113,10 @@ describe('relay operations and checkpoint contention', () => {
     expect(source).toContain('return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint())));');
     expect(source).toContain('return this.withRuntimeMutation(() => this.withRuntimeTransition(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true))));');
     expect(source).toMatch(/this\.restartInProgress = true;\n    return this\.withRuntimeMutation\(\(\) => this\.withRuntimeTransition\(async \(\) => \{/);
+    // Migration begin stops the runtime inside the same transition fence (C-7 writer fence).
+    expect(source).toContain('if (this.containerIsRunning()) await this.withRuntimeTransition(async () => {\n            await this.stop();');
     // No other path stops the runtime outside the fence.
-    expect(source.match(/await this\.stop\(\)/g)).toBeNull();
+    expect(source.match(/await this\.stop\(\)/g)).toHaveLength(1);
     expect(source.match(/=> this\.stop\(\)/g)).toHaveLength(1);
   });
 });

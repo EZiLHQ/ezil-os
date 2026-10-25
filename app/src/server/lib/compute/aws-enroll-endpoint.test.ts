@@ -742,3 +742,61 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
         expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_SUCCEEDED });
     });
 });
+
+describe('authenticated lower-image observations', () => {
+    const digest = 'sha256:' + 'a'.repeat(64);
+    it('backfills an ordinary host in the nonce transaction and rejects a different replay digest', async () => {
+        const s = setup();
+        expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
+        expect(s.placements[0]).toMatchObject({ lower_image_digest: digest, enroll_nonce_hash: null });
+        // The production driver binds ISO text; compare the instant, not the JS representation.
+        expect(new Date(s.placements[0]!.lower_digest_observed_at as string | Date).getTime()).toBe(NOW.getTime());
+        expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
+        expect((await s.enroll(hostBody({ lowerImageDigest: 'sha256:' + 'b'.repeat(64) }))).body).toMatchObject({ error: 'host_digest_mismatch' });
+        expect(s.placements[0]!.lower_image_digest).toBe(digest);
+    });
+    it('rolls back nonce consumption if digest evidence cannot be persisted', async () => {
+        const s = setup();
+        const db = s.deps.db;
+        s.deps.db = { ...db, transaction: fn => db.transaction(tx => fn({ execute: async query => {
+            const { PgDialect } = await import('drizzle-orm/pg-core');
+            if (new PgDialect().sqlToQuery(query).sql.includes('placement:enroll-digest')) throw new Error('write failed');
+            return tx.execute(query);
+        } })) };
+        await expect(s.enroll(hostBody({ lowerImageDigest: digest }))).rejects.toThrow('write failed');
+        expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE)); expect(s.tunnels).toHaveLength(0);
+    });
+    it('does not observe a lower when the live data volume tags differ', async () => {
+        const view = liveView(); view.volumes = view.volumes.map(v => ({ ...v, tags: { ...v.tags, 'ezil:fence-token': C1 } }));
+        const s = setup([booting()], { view });
+        expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).body).toMatchObject({ error: 'enroll_volume_mismatch' });
+        expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE)); expect(s.tunnels).toHaveLength(0);
+    });
+});
+
+it('a pool claim uses canonical instance tags and waits for session-ready after enrollment', async () => {
+    const view = liveView({ tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot',
+        'ezil:namespace': 'pilot', 'ezil:pool-host': '11111111-1111-4111-8111-111111111111',
+        'ezil:computer': C1, 'ezil:generation': '2', 'ezil:fence': FENCE } });
+    const s = setup([booting()], { view });
+    const result = await s.enroll();
+    expect(result.status).toBe(200);
+    expect(result.poolRelay).toEqual({ computerId: C1, ownerUserId: U1, generation: 2, leaseEpoch: 3,
+        instanceId: DOC.instanceId, fenceToken: FENCE });
+    expect(result.body).not.toHaveProperty('poolRelay');
+    expect(s.placements[0]!.last_error).toBe('pool_session_pending');
+    expect((await s.enroll()).poolRelay).toEqual(result.poolRelay);
+    expect(s.placements[0]!.last_error).toBe('pool_session_pending');
+    view.tags = { ...view.tags, 'ezil:computer': 'wrong' };
+    const refused = await s.enroll();
+    expect(refused.status).toBe(403); expect(refused.poolRelay).toBeUndefined();
+});
+
+it('ordinary enrollment and an uncommitted pool tunnel never trigger relay preparation', async () => {
+    expect((await setup().enroll()).poolRelay).toBeUndefined();
+    const view = liveView({ tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot',
+        'ezil:namespace': 'pilot', 'ezil:pool-host': '11111111-1111-4111-8111-111111111111',
+        'ezil:computer': C1, 'ezil:generation': '2', 'ezil:fence': FENCE } });
+    const s = setup([booting()], { view, tunnel: async () => ({ ok: false, status: 503, code: 'tunnel_transport' }) });
+    const result = await s.enroll(); expect(result.status).toBe(503); expect(result.poolRelay).toBeUndefined();
+});

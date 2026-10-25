@@ -254,6 +254,8 @@ describe('toShellDesktopState — never implies an observation it does not have'
             // it still opens the desktop at the right shape — it just cannot
             // change it afterwards.
             screen: '/api/shell/screen',
+            // RETRY-118: explicit user Retry after an expired capacity attempt.
+            capacityRetry: '/api/shell/capacity-retry',
         });
     });
 

@@ -38,6 +38,10 @@ const form = read('./login-form.tsx');
 const callback = read('../auth/callback/route.ts');
 const osPage = read('../os/page.tsx');
 const loginPage = read('./page.tsx');
+const pricingPage = read('../(marketing)/pricing/page.tsx');
+const marketingLayout = read('../(marketing)/layout.tsx');
+const marketingHome = read('../(marketing)/_components/home-page.tsx');
+const rootPage = read('../page.tsx');
 
 /** The body of one exported function, from its signature to the next one. */
 function functionBody(source: string, name: string): string {
@@ -113,8 +117,19 @@ describe('/os checks its own arrival, because senders are a convention', () => {
         // server-action redirect. If one is ever added deliberately, the
         // watchdog turns it into one reload rather than a dead page — but it
         // should be a deliberate act, so this fails first.
-        for (const [name, source] of Object.entries({ form, callback, osPage, actions, loginPage })) {
-            expect(code(source), name).not.toMatch(/<Link[^>]*href=["'{]*\/os["'}]/);
+        const clientOsLink = /<Link[^>]*href=["'{]*\/os["'}]/;
+        expect(clientOsLink.test('<Link href="/os">Open</Link>')).toBe(true);
+        for (const [name, source] of Object.entries({ form, callback, osPage, actions, loginPage, pricingPage, marketingLayout, marketingHome, rootPage })) {
+            expect(code(source), name).not.toMatch(clientOsLink);
+        }
+    });
+
+    it('marketing entry links remain document loads even when destinations come from copy', () => {
+        const clientLink = /<Link\b/;
+        expect(clientLink.test('<Link href="/login?next=/os">Upgrade</Link>')).toBe(true);
+        expect(code(marketingHome)).toMatch(/<a\b/);
+        for (const source of [pricingPage, marketingLayout, marketingHome, rootPage]) {
+            expect(code(source)).not.toMatch(clientLink);
         }
     });
 });
@@ -141,9 +156,14 @@ describe('/ redirects into /os, so its one known client-side sender must be a re
 });
 
 /**
- * 🔴 EZiL OS IS INVITE-ONLY, AND THAT IS AN ENTRY CONTRACT TOO.
+ * 🔴 NO PASSWORD SELF-SIGNUP: auth.signUp remains forbidden.
  *
- * Accounts are created by `bun tools/invite.ts add <email>`, which writes the
+ * Founder decision (2026-10-20): server-only admin createUser is allowed for
+ * an Auth0 identity after its ID token and verified email pass validation.
+ * Supabase OAuth and the invite tool also create accounts; this exception
+ * does not permit a client or password auth.signUp call.
+ *
+ * Invited accounts use `bun tools/invite.ts add <email>`, which writes the
  * `ezil_os_access` row and then asks Supabase to send an invite; an invited
  * person sets their password on `/auth/invited`. `signUpWithPassword` and the
  * form's `'sign-up'` mode were deleted for this (row A2).
@@ -152,7 +172,7 @@ describe('/ redirects into /os, so its one known client-side sender must be a re
  * three files this row touched, because the failure it guards is somebody
  * adding a NEW surface with a sign-up call on it — which no assertion against
  * a fixed list of files can see. It is a decision, not a lint rule: if
- * self-service sign-up ever becomes the intent, delete this block deliberately.
+ * password self-service sign-up ever becomes the intent, revisit this block deliberately.
  */
 const APP_SRC = path.resolve(here, '../..');
 
@@ -170,7 +190,7 @@ function* sourceFilesUnder(dir: string): Generator<string> {
     }
 }
 
-describe('there is no way to create an account from the app', () => {
+describe('there is no password self-signup in the app', () => {
     it('🔴 nothing under app/src calls auth.signUp(', () => {
         const offenders: string[] = [];
         let scanned = 0;
