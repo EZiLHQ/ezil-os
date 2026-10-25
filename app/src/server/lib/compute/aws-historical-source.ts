@@ -42,14 +42,21 @@ function releaseWork(input: string | undefined): LifecycleWork | null {
     } catch { return null; }
 }
 
-/** Strict, complete history of a SUCCEEDED release with a positive termination witness for `instanceId`. */
-export function terminationWitnessed(events: readonly HistoryEvent[], input: string, instanceId: string): boolean {
-    if (events.length < 2 || events[0]?.type !== 'ExecutionStarted' || events[0].executionStartedEventDetails?.input !== input
-        || events.at(-1)?.type !== 'ExecutionSucceeded') return false;
+/** The recorded execution this history must match: input, output and its own start/stop interval. */
+export interface WitnessBounds { input: string; output: string; startedAt: Date; stoppedAt: Date; region: string }
+/** Strict, complete history of a SUCCEEDED release with a positive termination witness for `instanceId`: its first input and
+ * final output equal the recorded execution's, every event lies inside the execution's own interval, and the connected EC2
+ * terminateInstances chain (scheduled/started/succeeded) names this region, resource and resource type throughout. */
+export function terminationWitnessed(events: readonly HistoryEvent[], bounds: WitnessBounds, instanceId: string): boolean {
+    const from = bounds.startedAt.getTime(), to = bounds.stoppedAt.getTime();
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) return false;
+    if (events.length < 2 || events[0]?.type !== 'ExecutionStarted' || events[0].executionStartedEventDetails?.input !== bounds.input
+        || events.at(-1)?.type !== 'ExecutionSucceeded' || events.at(-1)!.executionSucceededEventDetails?.output !== bounds.output) return false;
     const valid = events.every((event, index) => {
         const type = event.type ?? '';
         if (event.id !== index + 1 || !Number.isInteger(event.previousEventId) || event.previousEventId! < 0 || event.previousEventId! >= event.id
             || (index === 0 && event.previousEventId !== 0) || !(event.timestamp instanceof Date) || !Number.isFinite(event.timestamp.getTime())
+            || event.timestamp.getTime() < from || event.timestamp.getTime() > to
             || !KNOWN.has(type) || type.startsWith('Execution') !== (index === 0 || index === events.length - 1) || truncated(event)) return false;
         if (type.endsWith('StateEntered') && !named(event.stateEnteredEventDetails?.name)) return false;
         if (type.endsWith('StateExited') && !named(event.stateExitedEventDetails?.name)) return false;
@@ -64,16 +71,18 @@ export function terminationWitnessed(events: readonly HistoryEvent[], input: str
         const d = s.taskScheduledEventDetails!;
         const parameters = parse(d.parameters) as { InstanceIds?: unknown } | undefined;
         const entered = events.find(e => e.id === s.previousEventId);
-        if (d.resource !== 'terminateInstances' || d.resourceType !== 'aws-sdk:ec2' || entered?.type !== 'TaskStateEntered'
+        if (d.resource !== 'terminateInstances' || d.resourceType !== 'aws-sdk:ec2' || d.region !== bounds.region || entered?.type !== 'TaskStateEntered'
             || entered.stateEnteredEventDetails?.name !== 'terminateInstances'
             || !Array.isArray(parameters?.InstanceIds) || parameters.InstanceIds.length !== 1 || parameters.InstanceIds[0] !== instanceId) return false;
         const started = events.find(e => e.type === 'TaskStarted' && e.previousEventId === s.id);
-        const done = started && events.find(e => e.previousEventId === started.id && e.type?.startsWith('Task') && e.type !== 'TaskStateExited');
+        if (started?.taskStartedEventDetails?.resource !== 'terminateInstances' || started.taskStartedEventDetails.resourceType !== 'aws-sdk:ec2') return false;
+        const done = events.find(e => e.previousEventId === started.id && e.type?.startsWith('Task') && e.type !== 'TaskStateExited');
         if (!done) return false;
         if (done.type !== 'TaskSucceeded') continue;
         const out = parse(done.taskSucceededEventDetails?.output) as { TerminatingInstances?: { InstanceId?: unknown; CurrentState?: { Code?: unknown; Name?: unknown } }[] } | undefined;
         const items = out?.TerminatingInstances;
-        if (done.taskSucceededEventDetails?.resource !== 'terminateInstances' || !Array.isArray(items) || items.length !== 1
+        if (done.taskSucceededEventDetails?.resource !== 'terminateInstances' || done.taskSucceededEventDetails.resourceType !== 'aws-sdk:ec2'
+            || !Array.isArray(items) || items.length !== 1
             || items[0]?.InstanceId !== instanceId) return false;
         if (items[0]?.CurrentState?.Code === 48 && items[0]?.CurrentState?.Name === 'terminated') witnessed = true;
     }
@@ -81,12 +90,14 @@ export function terminationWitnessed(events: readonly HistoryEvent[], input: str
 }
 
 /** Binds the release to the replace's source identity and timing; see HistoricalSourceProof. */
-export function proveHistoricalSource(source: Execution, events: readonly HistoryEvent[], replace: LifecycleWork, replaceStartedAt: Date | null | undefined): HistoricalSourceProof | null {
+export function proveHistoricalSource(source: Execution, events: readonly HistoryEvent[], replace: LifecycleWork, replaceStartedAt: Date | null | undefined,
+    requestedArn: string): HistoricalSourceProof | null {
     const r = replace.intent;
     if (r.operation !== 'replace' || r.rebasePreparation || !r.previousInstanceId || !r.previousFenceToken || !r.previousGeneration || !r.dataVolumeId) return null;
-    if (source.status !== 'SUCCEEDED' || source.redriveCount !== 0 || source.stateMachineAliasArn || !source.input || !source.output
-        || !(source.stopDate instanceof Date) || !(replaceStartedAt instanceof Date) || !Number.isFinite(source.stopDate.getTime())
-        || !(source.stopDate.getTime() <= replaceStartedAt.getTime())) return null;
+    if (source.executionArn !== requestedArn || source.status !== 'SUCCEEDED' || source.redriveCount !== 0 || source.stateMachineAliasArn
+        || !source.input || !source.output || !(source.startDate instanceof Date) || !(source.stopDate instanceof Date) || !(replaceStartedAt instanceof Date)
+        || !Number.isFinite(source.startDate.getTime()) || !Number.isFinite(source.stopDate.getTime())
+        || !(source.startDate.getTime() <= source.stopDate.getTime()) || !(source.stopDate.getTime() < replaceStartedAt.getTime())) return null;
     const work = releaseWork(source.input);
     if (!work) return null;
     const i = work.intent, d = i.deployment;
@@ -100,7 +111,8 @@ export function proveHistoricalSource(source: Execution, events: readonly Histor
     if (x.jobId !== i.jobId || x.digest !== work.digest || x.computerId !== i.computerId || x.generation !== i.targetGeneration
         || x.leaseEpoch !== i.leaseEpoch || x.fenceToken !== i.fenceToken || x.instanceId !== i.providerInstanceId
         || x.volumeId !== i.dataVolumeId || x.state !== 'retired' || x.instanceLost) return null;
-    if (!terminationWitnessed(events, source.input, r.previousInstanceId)) return null;
+    if (!terminationWitnessed(events, { input: source.input, output: source.output, startedAt: source.startDate, stoppedAt: source.stopDate,
+        region: d.region }, r.previousInstanceId)) return null;
     return { instanceId: r.previousInstanceId, releaseExecutionArn: source.executionArn };
 }
 
@@ -139,7 +151,8 @@ export async function reconcileReplacementWithHistoricalSource(deps: ReconcileRe
     const job = /:computer-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.exec(request.sourceRetirementExecutionArn)?.[1];
     if (!job || job === work.intent.jobId || lifecycleExecutionArn(work.intent.deployment, job) !== request.sourceRetirementExecutionArn) return 'source_not_proven';
     const source = await deps.executions.describe(p.region!, request.sourceRetirementExecutionArn);
-    const proof = proveHistoricalSource(source, await deps.executions.history(p.region!, request.sourceRetirementExecutionArn), work, e.startDate);
+    const proof = proveHistoricalSource(source, await deps.executions.history(p.region!, request.sourceRetirementExecutionArn), work, e.startDate,
+        request.sourceRetirementExecutionArn);
     if (!proof) return 'source_not_proven';
     return settleReplacementGeneration(settleDeps, p, work, false, true, proof);
 }

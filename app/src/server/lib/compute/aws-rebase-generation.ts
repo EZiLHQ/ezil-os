@@ -122,6 +122,9 @@ export async function settleReplacementGeneration(deps: ReceiptDeps, p: Placemen
         const volume = await deps.describer.describeVolume(p.region!, i.dataVolumeId!);
         if (!volume || volume.volumeId !== i.dataVolumeId || volume.encrypted !== true || volume.kmsKeyId !== i.deployment.dataKeyArn
             || !volume.attachments || volume.tags?.['ezil:backup'] !== i.deployment.namespace) return 'unconfirmed';
+        // Historical (absent-source) settlement: the current volume must be in the intent's zone and every PRESENT identity
+        // alias must agree with the proven previous pair before anything is fenced or restored.
+        if (gone && (volume.zoneId !== i.deployment.zoneId || !sourceAliasesAgree(volume.tags ?? {}))) return 'unconfirmed';
         const sourcePair = tagsMatch(volume.tags, i.previousGeneration!, i.previousFenceToken!);
         const targetPair = tagsMatch(volume.tags, i.targetGeneration, i.fenceToken);
         if (!sourcePair && !targetPair) return 'generation_drift';

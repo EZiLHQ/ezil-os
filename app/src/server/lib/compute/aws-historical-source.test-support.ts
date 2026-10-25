@@ -20,7 +20,8 @@ const lambda = (name: string): Partial<HistoryEvent>[] => [entered('TaskStateEnt
     entered('ChoiceStateEntered', 'Decide'), exited('ChoiceStateExited', 'Decide')];
 
 /** The release's complete history, with a connected TerminateInstances chain answered `terminated` (Code 48). */
-export function releaseHistory(input: string, instanceId: string, start: Date, current: { Code: number; Name: string } = { Code: 48, Name: 'terminated' }): HistoryEvent[] {
+export function releaseHistory(input: string, output: string, instanceId: string, start: Date,
+    current: { Code: number; Name: string } = { Code: 48, Name: 'terminated' }): HistoryEvent[] {
     return chain([
         { type: 'ExecutionStarted', executionStartedEventDetails: { input } },
         entered('PassStateEntered', 'Init'), exited('PassStateExited', 'Init'),
@@ -34,7 +35,7 @@ export function releaseHistory(input: string, instanceId: string, start: Date, c
         exited('TaskStateExited', 'terminateInstances'),
         ...lambda('Observe-terminated'),
         entered('PassStateEntered', 'Succeeded'), exited('PassStateExited', 'Succeeded'),
-        { type: 'ExecutionSucceeded', executionSucceededEventDetails: { output: '{}' } },
+        { type: 'ExecutionSucceeded', executionSucceededEventDetails: { output } },
     ], start);
 }
 /** The 1.0.16 canary's failed replace: Observe-initial failed before any launch (10 events). */
@@ -56,6 +57,8 @@ export async function historicalSourceSetup() {
     await s.tick();
     const release = s.starts[0]!;
     const releaseExecution = s.finish() as Execution;
+    // The recorded release interval: every history event, including the witness, lies inside it.
+    releaseExecution.startDate = at(RECOVERY_NOW, -15_000); releaseExecution.stopDate = RECOVERY_NOW;
     await s.tick();
     const stopped = await s.current();
     const deployment = s.currentDeployment;
@@ -77,7 +80,7 @@ export async function historicalSourceSetup() {
         startDate: replaceStart, stopDate: at(replaceStart, 400) };
     const releaseArn = releaseExecution.executionArn!;
     const histories = new Map<string, HistoryEvent[]>([
-        [releaseArn, releaseHistory(release.input, stopped.instanceId!, at(RECOVERY_NOW, -15_000))],
+        [releaseArn, releaseHistory(release.input, releaseExecution.output!, stopped.instanceId!, at(RECOVERY_NOW, -15_000))],
         [replaceExecution.executionArn!, failedReplaceHistory(replace.input, replaceStart)],
     ]);
     const executionMap = new Map<string, Execution>([[releaseArn, releaseExecution], [replaceExecution.executionArn!, replaceExecution]]);

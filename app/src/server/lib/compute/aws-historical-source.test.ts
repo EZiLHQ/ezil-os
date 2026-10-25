@@ -24,7 +24,7 @@ describe('reconcile-replacement with an authenticated historical source (1.0.16 
     });
     it('the witness reads the release exactly as recorded: real adopt-recovery input, not a hint', async () => {
         const s = await historicalSourceSetup();
-        const proof = proveHistoricalSource(s.releaseExecution, s.histories.get(s.releaseArn)!, s.replace, s.replaceExecution.startDate);
+        const proof = proveHistoricalSource(s.releaseExecution, s.histories.get(s.releaseArn)!, s.replace, s.replaceExecution.startDate, s.releaseArn);
         expect(proof).toEqual({ instanceId: s.stopped.instanceId, releaseExecutionArn: s.releaseArn });
         expect(JSON.parse(JSON.parse(s.release.input).document).adoptRecoverRelease).toBeDefined();
     });
@@ -57,7 +57,18 @@ describe('reconcile-replacement with an authenticated historical source (1.0.16 
     const terminate = (h: HistoryEvent[]) => h.find(e => e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'terminateInstances')!;
     const output = (instanceId: string, code: number, name: string) => JSON.stringify({ TerminatingInstances: [{ CurrentState: { Code: code, Name: name }, InstanceId: instanceId }] });
     const sourceCases: [string, (s: Setup) => void][] = [
-        ['only shutting-down acknowledged', s => { s.histories.set(s.releaseArn, releaseHistory(s.release.input, s.stopped.instanceId!, new Date(0), { Code: 32, Name: 'shutting-down' })); }],
+        ['only shutting-down acknowledged', s => { s.histories.set(s.releaseArn, releaseHistory(s.release.input, s.releaseExecution.output!, s.stopped.instanceId!,
+            s.releaseExecution.startDate!, { Code: 32, Name: 'shutting-down' })); }],
+        // Root final review (12:43Z): contradictory execution/history bindings.
+        ['a Describe answer for another execution than the hint', s => { s.executionMap.get(s.releaseArn)!.executionArn = s.releaseArn.replace(/.$/, c => c === '0' ? '1' : '0'); }],
+        ['terminal history output that differs from the Describe receipt', s => { const h = s.histories.get(s.releaseArn)!; h.at(-1)!.executionSucceededEventDetails = { output: '{}' }; }],
+        ['a missing source start', s => { s.executionMap.get(s.releaseArn)!.startDate = undefined; }],
+        ['a source start after its stop', s => { const e = s.executionMap.get(s.releaseArn)!; e.startDate = new Date(e.stopDate!.getTime() + 1); }],
+        ['a witness timestamped after the replace started', s => { terminate(s.histories.get(s.releaseArn)!).timestamp = new Date(s.replaceExecution.startDate!.getTime() + 1); }],
+        ['a history event before the source started', s => { s.histories.get(s.releaseArn)![1]!.timestamp = new Date(s.releaseExecution.startDate!.getTime() - 1); }],
+        ['a terminate scheduled in another region', s => { s.histories.get(s.releaseArn)!.find(e => e.type === 'TaskScheduled')!.taskScheduledEventDetails!.region = 'us-east-1'; }],
+        ['a connected TaskStarted for runInstances', s => { s.histories.get(s.releaseArn)!.find(e => e.type === 'TaskStarted')!.taskStartedEventDetails = { resource: 'runInstances', resourceType: 'aws-sdk:ec2' }; }],
+        ['a TaskSucceeded of another resource type', s => { terminate(s.histories.get(s.releaseArn)!).taskSucceededEventDetails!.resourceType = 'aws-sdk:lambda'; }],
         ['Code 48 without Name terminated', s => { terminate(s.histories.get(s.releaseArn)!).taskSucceededEventDetails!.output = output(s.stopped.instanceId!, 48, 'shutting-down'); }],
         ['Name terminated without Code 48', s => { terminate(s.histories.get(s.releaseArn)!).taskSucceededEventDetails!.output = output(s.stopped.instanceId!, 32, 'terminated'); }],
         ['a witness for another instance', s => { terminate(s.histories.get(s.releaseArn)!).taskSucceededEventDetails!.output = output('i-0ffffffffffffffff', 48, 'terminated'); }],
@@ -96,6 +107,12 @@ describe('reconcile-replacement with an authenticated historical source (1.0.16 
             accountId: s.deployment.accountId, clientToken: '' }] as never[]); }],
         ['an attached volume', s => { s.volume.state = 'in-use'; s.volume.attachments = [{ instanceId: s.stopped.instanceId!, state: 'attached' }]; }],
         ['a volume tagged for another generation', s => { s.volume.tags = { ...s.volume.tags, 'ezil:generation': '9' }; }],
+        // Root final review (12:43Z): the current volume of an absent-source settlement.
+        ['a volume in another zone', s => { (s.volume as { zoneId?: string }).zoneId = 'aps1-az99'; }],
+        ['a volume without a zone', s => { delete (s.volume as { zoneId?: string }).zoneId; }],
+        ['a volume with a foreign computer alias', s => { s.volume.tags = { ...s.volume.tags, 'ezil:computer': '11111111-1111-4111-8111-111111111111' }; }],
+        ['a volume with a foreign fence alias', s => { s.volume.tags = { ...s.volume.tags, 'ezil:fence': '11111111-1111-4111-8111-111111111111' }; }],
+        ['a volume with a foreign namespace alias', s => { s.volume.tags = { ...s.volume.tags, 'ezil:namespace': 'foreign' }; }],
         ['a failed tunnel fence', s => { s.tunnels.deleteTunnel.mockResolvedValue({ ok: false } as never); }],
         ['a concurrent epoch 9', s => { const describe = s.describer.describeVolume.getMockImplementation()!;
             s.describer.describeVolume.mockImplementation(async (...args) => { s.placements[0]!.lease_epoch = 9; return describe(...args); }); }],
@@ -108,15 +125,18 @@ describe('reconcile-replacement with an authenticated historical source (1.0.16 
 
     it('the release must precede the replace epoch (never a later or equal historical lease)', async () => {
         const s = await historicalSourceSetup(), h = s.histories.get(s.releaseArn)!;
-        const at = (leaseEpoch: number) => proveHistoricalSource(s.releaseExecution, h, { ...s.replace, intent: { ...s.replace.intent, leaseEpoch } }, s.replaceExecution.startDate);
+        const at = (leaseEpoch: number) => proveHistoricalSource(s.releaseExecution, h, { ...s.replace, intent: { ...s.replace.intent, leaseEpoch } }, s.replaceExecution.startDate, s.releaseArn);
         expect(at(s.replace.intent.leaseEpoch)).not.toBeNull();
         expect(at(s.release.intent.leaseEpoch)).toBeNull();
         expect(at(s.release.intent.leaseEpoch - 1)).toBeNull();
     });
     it('terminationWitnessed requires every terminate request to be answered', async () => {
         const s = await historicalSourceSetup(), h = s.histories.get(s.releaseArn)!;
-        expect(terminationWitnessed(h, s.release.input, s.stopped.instanceId!)).toBe(true);
+        const bounds = { input: s.release.input, output: s.releaseExecution.output!, startedAt: s.releaseExecution.startDate!, stoppedAt: s.releaseExecution.stopDate!, region: s.deployment.region };
+        expect(terminationWitnessed(h, bounds, s.stopped.instanceId!)).toBe(true);
         const unanswered = h.filter(e => !(e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'terminateInstances'));
-        expect(terminationWitnessed(unanswered.map((e, n) => ({ ...e, id: n + 1, previousEventId: n })), s.release.input, s.stopped.instanceId!)).toBe(false);
+        expect(terminationWitnessed(unanswered.map((e, n) => ({ ...e, id: n + 1, previousEventId: n })), bounds, s.stopped.instanceId!)).toBe(false);
+        // Valid zero predecessors (the first state entered after ExecutionStarted) stay valid.
+        expect(terminationWitnessed(h.map(e => e.id === 2 ? { ...e, previousEventId: 0 } : e), bounds, s.stopped.instanceId!)).toBe(true);
     });
 });
