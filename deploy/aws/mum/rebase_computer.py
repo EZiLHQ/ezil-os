@@ -26,6 +26,8 @@ FAILURES = set('source_digest_unknown unsupported_predecessor release_mismatch i
 OPERATIONS = ('plan', 'prepare', 'launch', 'verify', 'recover')
 RECONCILE = 'reconcile-replacement'
 RECONCILE_OUTCOMES = {'settled', 'unconfirmed', 'generation_drift', 'not_applicable', 'launch_not_disproven', 'source_not_proven'}
+RECONCILE_RELEASE = 'reconcile-release'
+RELEASE_OUTCOMES = {'settled', 'recovering', 'waiting', 'unconfirmed', 'not_applicable', 'source_not_proven'}
 # The hint must name one execution of the staging lifecycle machine; the server re-reads and proves everything.
 SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
@@ -91,7 +93,25 @@ def reconcile_response(value, sent):
     return {k: value[k] for k in ('schemaVersion', 'computerId', 'jobId', 'outcome')}
 
 
-def send_reconcile(sent, secret):
+def release_request(computer, job, execution):
+    need(wire.matches(UUID, computer) and wire.matches(UUID, job), 'reconcile-release requires the exact computer and failed release job UUIDs')
+    # Unlike reconcile-replacement, the hint is the expected job's OWN execution (the failed release, or its reserved replay).
+    need(wire.matches(SOURCE_EXECUTION, execution) and execution.endswith(':computer-' + job),
+         "the hint must be exactly the expected job's own staging lifecycle execution ARN")
+    return dict(schemaVersion=1, operation=RECONCILE_RELEASE, computerId=computer, expectedJobId=job, releaseExecutionArn=execution)
+
+
+def release_response(value, sent):
+    need(isinstance(value, dict) and set(value) == {'schemaVersion', 'computerId', 'jobId', 'outcome', 'error'}, 'reconcile-release response fields mismatch')
+    need(type(value['schemaVersion']) is int and value['schemaVersion'] == 1, 'reconcile-release response version mismatch')
+    need(value['computerId'] == sent['computerId'] and value['jobId'] == sent['expectedJobId'], 'reconcile-release response names another computer or job')
+    need(value['outcome'] in RELEASE_OUTCOMES, 'reconcile-release outcome mismatch')
+    need(value['error'] is None or isinstance(value['error'], str) and wire.matches(r'[a-z_]{1,60}', value['error']), 'reconcile-release error code mismatch')
+    return {k: value[k] for k in ('schemaVersion', 'computerId', 'jobId', 'outcome', 'error')}
+
+
+def send_reconcile(sent, secret, validate=None):
+    validate = validate or reconcile_response
     body = json.dumps(sent, separators=(',', ':')).encode('utf-8')
     auth = headers(body, secret, int(time.time()))
     connection = http.client.HTTPSConnection('os-staging.ezil.work', timeout=30)
@@ -102,7 +122,7 @@ def send_reconcile(sent, secret):
         need(received.getheader('content-type', '').split(';')[0].strip().lower() == 'application/json', 'response must be JSON')
         raw = received.read(4097)
         need(len(raw) <= 4096, 'response too large')
-        return reconcile_response(wire.loads(raw.decode('utf-8')), sent)
+        return validate(wire.loads(raw.decode('utf-8')), sent)
     finally:
         connection.close()
 
@@ -114,6 +134,17 @@ def reconcile(computer, job, source, apply, secret, sender=send_reconcile):
         print('DRY RUN: ' + json.dumps(sent, separators=(',', ':')) + '; add --apply to submit')
         return None
     observed = sender(sent, secret)
+    print(json.dumps(observed, separators=(',', ':')))
+    return observed
+
+
+def reconcile_release(computer, job, execution, apply, secret, sender=None):
+    """The ordinary failed-release recovery on the server (normal CAS, release replay); dry run unless --apply."""
+    sent = release_request(computer, job, execution)
+    if not apply:
+        print('DRY RUN: ' + json.dumps(sent, separators=(',', ':')) + '; add --apply to submit')
+        return None
+    observed = (sender or (lambda value, key: send_reconcile(value, key, release_response)))(sent, secret)
     print(json.dumps(observed, separators=(',', ':')))
     return observed
 
@@ -169,7 +200,7 @@ def operate(operation, computer, job, journal, apply, secret, sender=send):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE))
+    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE, RECONCILE_RELEASE))
     parser.add_argument('--computer')
     parser.add_argument('--job')
     parser.add_argument('--source-execution-arn')
@@ -182,7 +213,11 @@ def main():
         reconcile_request(args.computer, args.job, args.source_execution_arn)
         reconcile(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
         return
-    need(args.source_execution_arn is None, 'source hint is only for reconcile-replacement')
+    if args.operation == RECONCILE_RELEASE:
+        release_request(args.computer, args.job, args.source_execution_arn)
+        reconcile_release(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
+        return
+    need(args.source_execution_arn is None, 'source hint is only for reconcile-replacement or reconcile-release')
     request(args.operation, args.computer, args.job)
     journal = args.journal or Path('/root/ezil-aws-mum/rebase-computers') / ((args.computer or args.job) + '.json')
     # Use only the existing environment name; never a credential file, CLI argument or log.

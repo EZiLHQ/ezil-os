@@ -335,6 +335,8 @@ export interface Ec2VolumeView {
     sizeGiB?: number;
     snapshotId?: string;
     zoneId?: string;
+    /** EC2 VolumeType (gp3 for every computer data volume), when supplied. */
+    volumeType?: string;
 }
 
 export interface Ec2VolumeDescriber {
@@ -475,7 +477,7 @@ export function createEc2EnrollmentDescriber(
             assertRegion(region);
             if (!VOLUME_ID.test(volumeId)) return null;
             const { client } = ec2For(region);
-            type Volume = { VolumeId?: string; State?: string; Tags?: Ec2Tag[]; Attachments?: { InstanceId?: string; State?: string }[]; Encrypted?: boolean; KmsKeyId?: string; Size?: number; SnapshotId?: string; AvailabilityZoneId?: string; AvailabilityZone?: string };
+            type Volume = { VolumeId?: string; State?: string; Tags?: Ec2Tag[]; Attachments?: { InstanceId?: string; State?: string }[]; Encrypted?: boolean; KmsKeyId?: string; Size?: number; SnapshotId?: string; AvailabilityZoneId?: string; AvailabilityZone?: string; VolumeType?: string };
             let volumes: Volume[];
             try {
                 const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: Volume[] };
@@ -494,6 +496,7 @@ export function createEc2EnrollmentDescriber(
                 zoneId = zones.AvailabilityZones[0]!.ZoneId;
             }
             return { volumeId, state: v.State ?? 'unknown', tags: tagMap(v.Tags), encrypted: v.Encrypted, kmsKeyId: v.KmsKeyId, sizeGiB: v.Size, snapshotId: v.SnapshotId, zoneId,
+                ...(v.VolumeType ? { volumeType: v.VolumeType } : {}),
                 attachments: v.Attachments?.map((a) => ({ instanceId: a.InstanceId ?? '', state: a.State ?? 'unknown' })) };
         },
 

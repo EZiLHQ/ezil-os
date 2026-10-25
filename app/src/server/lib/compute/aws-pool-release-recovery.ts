@@ -1,17 +1,21 @@
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { reconcileAdoptRecovery } from './aws-pool-recovery';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { awsSandboxId } from './aws-enroll';
 import { isExecutionAbsent } from './aws-errors';
+import { proveFailedReleaseTermination } from './aws-failed-release-proof';
 import { buildLifecycleWork, currentGenerationIntent, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, POOL_RELEASED, startLifecycleJob,
     USAGE_OBSERVER, type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
-import { readCanaryComputer, writeLivePoolRecovery, type Placement } from './placement';
+import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLivePoolRecovery, type Placement } from './placement';
 
 const PREFIX = 'pool_release_recovery:';
 type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
 type Replay = { intent: LifecycleWork['intent']; stoppedAt: string | null; sourceJobId: string; error: string | null;
-    basis?: 'ec2_state_transition' | 'recovery_success'; sourceStartedAt?: string };
+    basis?: 'ec2_state_transition' | 'recovery_success' | 'failed_release_termination'; sourceStartedAt?: string };
+/** Bases whose saved stop time was proven (and bounded) before the reservation CAS. */
+const provenBasis = (basis: Replay['basis']) => basis === 'ec2_state_transition' || basis === 'failed_release_termination';
 function replay(p: Placement): Replay | null {
     try { return p.lastError?.startsWith(PREFIX) ? JSON.parse(p.lastError.slice(PREFIX.length)) : null; }
     catch { return null; }
@@ -68,6 +72,36 @@ async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDep
     const data = host.volumes.filter(v => v.volumeId === p.volumeId && !v.deleteOnTermination && v.deviceName !== rootName);
     return { error: host.rootDeviceName === rootName && host.volumes.length === 2 && root.length === 1 && data.length === 1 ? null : 'instance_disks',
         stoppedAt: host.stateTransitionAt };
+}
+
+/** The failed release already terminated its host (and detached the disk): the owned data volume is free, the host is
+ * positively `terminated` (exact id, type, zone, provenance and identity, every present alias agreeing, nothing but a
+ * deleting root left mapped) or aged out of EC2, AND the failed release's own history witnesses the termination. The
+ * witnessed TerminateInstances time is the physical end, never this recovery's time. `shutting-down` waits. */
+async function terminatedReleaseEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, e: Execution, work: LifecycleWork):
+    Promise<{ wait: true } | { error: string } | { terminatedAt: Date }> {
+    if (!deps.describer?.describeVolume) return { error: 'describer_missing' };
+    const host = await deps.describer.describeForEnrollment(p.region!, p.instanceId!);
+    if (host && host.instanceId !== p.instanceId) return { error: 'instance_identity' };
+    if (host?.state === 'shutting-down') return { wait: true }; // EC2 is still finishing the termination; its disk may still detach.
+    // A host EC2 still lists outside termination is the stopped/attached branch's case: keep its diagnostic.
+    if (host && host.state !== 'terminated' && host.state !== 'shutting-down') return { error: 'volume_attachment' };
+    const volume = await deps.describer.describeVolume(p.region!, p.volumeId!);
+    if (!volume || volume.volumeId !== p.volumeId || !ownedTags(volume.tags, p, d) || (volume.tags?.['ezil:namespace'] ?? d.namespace) !== d.namespace
+        || volume.encrypted !== true || volume.kmsKeyId !== d.dataKeyArn || volume.zoneId !== p.zoneId) return { error: 'volume_identity' };
+    if (volume.state !== 'available' || !Array.isArray(volume.attachments) || volume.attachments.length !== 0) return { error: 'volume_attachment' };
+    if (volume.volumeType !== 'gp3' || !Number.isInteger(volume.sizeGiB) || volume.sizeGiB! < d.storage.dataMinGiB
+        || volume.sizeGiB! > d.storage.dataMaxGiB) return { error: 'volume_identity' };
+    if (host) {
+        const rootName = d.storage.rootDeviceName ?? '/dev/sda1';
+        if (host.instanceType !== p.instanceType || host.availabilityZoneId !== p.zoneId
+            || !ownedTags(host.tags, p, d) || host.tags['ezil:pool'] !== undefined || (host.tags['ezil:namespace'] ?? d.namespace) !== d.namespace
+            || host.tags['aws:ec2launchtemplate:id'] !== d.launchTemplateId) return { error: 'instance_identity' };
+        if (host.volumes.length > 1 || host.volumes.some(v => v.volumeId === p.volumeId || v.deviceName !== rootName || !v.deleteOnTermination)) return { error: 'instance_disks' };
+    }
+    if (!deps.executions?.history) return { error: 'history_reader_missing' };
+    const proof = proveFailedReleaseTermination(e, await deps.executions.history(p.region!, e.executionArn!), work);
+    return proof ? { terminatedAt: proof.terminatedAt } : { error: 'termination_not_proven' };
 }
 
 /** Recover only positively identified, stopped resources of a terminally failed stop.
@@ -132,8 +166,8 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
         if (error === 'volume_not_available') return fail(error, 'RECOVERING');
         if (error) return fail(error);
         // Legacy replay timestamps came from the FAILED execution and are not stop proof.
-        const basis = saved!.basis === 'ec2_state_transition' ? 'ec2_state_transition' : 'recovery_success';
-        const stoppedAt = basis === 'ec2_state_transition' ? new Date(saved!.stoppedAt!) : e.stopDate;
+        const basis = provenBasis(saved!.basis) ? saved!.basis! : 'recovery_success';
+        const stoppedAt = basis === 'recovery_success' ? e.stopDate : new Date(saved!.stoppedAt!);
         if (basis === 'recovery_success' && !boundedTime(stoppedAt, e.startDate, now())) {
             return fail('recovery_success_time_missing_or_invalid', 'RECOVERING');
         }
@@ -168,9 +202,19 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
     let evidence;
     try { evidence = await resourceEvidence(deps, p, source, false); }
     catch { return fail('describe_unavailable'); }
-    if (evidence.error) return fail(evidence.error);
+    // A failed RELEASE whose disk is no longer attached: only the terminated-host branch may continue (never a retry).
+    let terminatedAt: Date | null = null;
+    if (evidence.error === 'volume_attachment' && work.intent.operation === 'release' && !saved?.intent) {
+        let released;
+        try { released = await terminatedReleaseEvidence(deps, p, source, e, work); }
+        catch { return fail('describe_unavailable'); }
+        if ('wait' in released) return true; // shutting-down: no start, no write.
+        if ('error' in released) return fail(released.error);
+        if (!boundedTime(released.terminatedAt, e.startDate, e.stopDate && e.stopDate < now() ? e.stopDate : now())) return fail('termination_time_invalid');
+        terminatedAt = released.terminatedAt;
+    } else if (evidence.error) return fail(evidence.error);
     const sourceStartedAt = saved?.intent ? saved.sourceStartedAt : e.startDate!.toISOString();
-    const proven = boundedTime(evidence.stoppedAt, sourceStartedAt ? new Date(sourceStartedAt) : null, now());
+    const proven = !terminatedAt && boundedTime(evidence.stoppedAt, sourceStartedAt ? new Date(sourceStartedAt) : null, now());
     let next: LifecycleWork;
     try {
         next = buildLifecycleWork({ ...currentGenerationIntent(p, 'stop', d, {
@@ -178,8 +222,8 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
         }), operation: 'release' });
     } catch { return fail('release_intent_invalid'); }
     const context: Replay = { intent: next.intent, sourceStartedAt,
-        basis: saved?.basis === 'ec2_state_transition' || proven ? 'ec2_state_transition' : 'recovery_success',
-        stoppedAt: saved?.basis === 'ec2_state_transition' ? saved.stoppedAt : proven ? evidence.stoppedAt!.toISOString() : null,
+        basis: terminatedAt ? 'failed_release_termination' : saved?.basis === 'ec2_state_transition' || proven ? 'ec2_state_transition' : 'recovery_success',
+        stoppedAt: terminatedAt ? terminatedAt.toISOString() : saved?.basis === 'ec2_state_transition' ? saved.stoppedAt : proven ? evidence.stoppedAt!.toISOString() : null,
         sourceJobId: saved?.sourceJobId ?? p.lifecycleJobId, error: null };
     const reserved = await writeLivePoolRecovery(deps.db, p, 'RECOVERING', {
         lifecycleJobId: next.intent.jobId, lifecycleDigest: next.digest, lastError: PREFIX + JSON.stringify(context),
@@ -191,4 +235,46 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
         lastError: PREFIX + JSON.stringify({ ...context, error: 'start_' + outcome }),
     });
     return true;
+}
+
+const Uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+/** `reconcile-release` on the signed image-rebase operator route: run THIS recovery for one failed release. */
+export const ReconcileReleaseRequestSchema = z.object({ schemaVersion: z.literal(1), operation: z.literal('reconcile-release'),
+    computerId: Uuid, expectedJobId: Uuid, releaseExecutionArn: z.string().min(1).max(300) }).strict();
+export type ReconcileReleaseRequest = z.infer<typeof ReconcileReleaseRequestSchema>;
+export type ReconcileReleaseOutcome = 'settled' | 'recovering' | 'waiting' | 'unconfirmed' | 'not_applicable' | 'source_not_proven';
+export type ReconcileReleaseDeps = ReceiptDeps & { executions: LifecycleExecutionReader };
+
+/** Operator entry for a failed pool release named by `expectedJobId` (the placement's own current job: the failed
+ * release, or this recovery's reserved replay). The hint must be exactly that job's execution; nothing in the request
+ * is trusted beyond selecting it. Only reconcilePoolReleaseRecovery runs, with the normal reservation CAS, ordinary
+ * release replay and retired-receipt settlement: never replacement or image recovery, delete recovery, or a manual
+ * placement write. The outcome is read back from the placement afterwards. */
+export async function reconcileFailedRelease(deps: ReconcileReleaseDeps, deployments: Record<string, LifecycleDeployment>,
+    request: ReconcileReleaseRequest): Promise<{ outcome: ReconcileReleaseOutcome; error: string | null }> {
+    const none = (outcome: ReconcileReleaseOutcome, error: string | null = null) => ({ outcome, error });
+    await assertNoImageReservation(deps.db, request.computerId);
+    const computer = await readCanaryComputer(deps.db, request.computerId);
+    const p = (await readPlacement(deps.db, request.computerId)).record;
+    const d = p?.region ? deployments[p.region] : undefined;
+    if (!computer || computer.deleted || !p || !d || p.ownerUserId !== computer.userId || p.provider !== 'aws-ec2' || !isPoolMode(d)
+        || !['UNCONFIRMED', 'RECOVERING'].includes(p.state) || p.lifecycleJobId !== request.expectedJobId || !p.lifecycleDigest
+        || !deps.executions.history) return none('not_applicable');
+    if (request.releaseExecutionArn !== lifecycleExecutionArn(d, request.expectedJobId)) return none('source_not_proven');
+    const saved = replay(p);
+    if (p.state === 'RECOVERING') {
+        if (!saved?.intent) return none('not_applicable');
+    } else {
+        const work = executionWork(await deps.executions.describe(p.region!, request.releaseExecutionArn));
+        if (!work || work.intent.operation !== 'release' || !matches(p, work)) return none('not_applicable');
+    }
+    await reconcilePoolReleaseRecovery(deps, p, d);
+    const after = (await readPlacement(deps.db, p.computerId)).record;
+    if (!after) return none('not_applicable');
+    if (after.state === 'STOPPED' && after.lastError === POOL_RELEASED) return none('settled');
+    const error = replay(after)?.error ?? null;
+    if (after.state === 'RECOVERING' && !error) return none('recovering');
+    // Unchanged with no recorded error: a `shutting-down` host (or a RUNNING replay) is still being waited for.
+    if (!error && after.state === p.state && after.lastError === p.lastError && after.lifecycleJobId === p.lifecycleJobId) return none('waiting');
+    return none(error === 'termination_not_proven' || error === 'history_reader_missing' ? 'source_not_proven' : 'unconfirmed', error);
 }

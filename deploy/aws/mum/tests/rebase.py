@@ -681,6 +681,59 @@ class ComputerTests(unittest.TestCase):
             COMPUTER.main()
         connection.assert_not_called()  # no --apply: dry run, no network
 
+    def test_reconcile_release_request_is_the_expected_jobs_own_execution_and_dry_run_without_apply(self):
+        own = self.source(self.job)
+        sent = COMPUTER.release_request(self.computer, self.job, own)
+        self.assertEqual(list(sent), ['schemaVersion', 'operation', 'computerId', 'expectedJobId', 'releaseExecutionArn'])
+        self.assertEqual(sent['operation'], 'reconcile-release')
+        calls = []
+        self.assertIsNone(COMPUTER.reconcile_release(self.computer, self.job, own, False, self.secret, lambda v, s: calls.append(v)))
+        self.assertEqual(calls, [])
+        reply = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='recovering', error=None)
+        self.assertEqual(COMPUTER.reconcile_release(self.computer, self.job, own, True, self.secret,
+                                                    lambda v, s: calls.append((v, s)) or COMPUTER.release_response(reply, v)), reply)
+        self.assertEqual(calls, [(sent, self.secret)])
+
+    def test_reconcile_release_refuses_other_hints_and_bad_responses(self):
+        for execution in (self.source(), self.source(self.job).replace('ezil-mum-lifecycle', 'ezil-other-lifecycle'),
+                          self.source(self.job).replace('452630323510', '123456789012'), self.source(self.job) + 'x',
+                          self.source(self.job).replace(':execution:', ':stateMachine:'), None):
+            with self.assertRaises(ValueError):
+                COMPUTER.release_request(self.computer, self.job, execution)
+        for computer, job in ((None, self.job), (self.computer, None), ('not-a-uuid', self.job)):
+            with self.assertRaises(ValueError):
+                COMPUTER.release_request(computer, job, self.source(self.job))
+        sent = COMPUTER.release_request(self.computer, self.job, self.source(self.job))
+        good = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='source_not_proven', error='termination_not_proven')
+        self.assertEqual(COMPUTER.release_response(good, sent), good)
+        self.assertEqual(COMPUTER.release_response(dict(good, outcome='settled', error=None), sent)['outcome'], 'settled')
+        for key, value in [('outcome', 'generation_drift'), ('jobId', self.computer), ('computerId', self.job), ('schemaVersion', True),
+                           ('extra', 1), ('error', 'Not A Code'), ('error', 'x' * 61), ('error', 3)]:
+            with self.assertRaises(ValueError):
+                COMPUTER.release_response(dict(good, **{key: value}), sent)
+        with self.assertRaises(ValueError):  # a replacement-shaped reply never passes
+            COMPUTER.release_response(dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='settled'), sent)
+
+    def test_reconcile_release_cli_is_staging_only_and_dry_run_without_network(self):
+        own = self.source(self.job)
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'reconcile-release', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', own, '--origin', 'https://os.ezil.work']), self.assertRaises(ValueError):
+            COMPUTER.main()
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'reconcile-release', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', self.source()]), self.assertRaises(ValueError):
+            COMPUTER.main()
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'reconcile-release', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', own]), patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection:
+            COMPUTER.main()
+        connection.assert_not_called()  # no --apply: dry run, no network
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'reconcile-release', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', own, '--apply']), patch.dict(os.environ, {'EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET': self.secret}), \
+                patch.object(COMPUTER, 'send_reconcile', return_value=dict(schemaVersion=1, computerId=self.computer, jobId=self.job,
+                                                                             outcome='recovering', error=None)) as send:
+            COMPUTER.main()
+        self.assertEqual(send.call_args.args[0], COMPUTER.release_request(self.computer, self.job, own))
+        self.assertIs(send.call_args.args[2], COMPUTER.release_response)
+
     def test_staging_origin_refuses_btgq_and_curomaa_without_http(self):
         for origin in ('https://btgq.supabase.co', 'https://curomaa.example.com', 'https://os.ezil.work', COMPUTER.ORIGIN + '/extra'):
             with patch.object(sys, 'argv', ['rebase_computer.py', 'plan', '--computer', self.computer, '--origin', origin]), self.assertRaises(ValueError):
