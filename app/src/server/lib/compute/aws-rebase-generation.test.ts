@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { buildLifecycleWork } from './aws-intent';
 import { fixtureIntent } from './aws-intent.test-support';
-import { replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
+import type { HistoryEvent } from '@aws-sdk/client-sfn';
+import { proveReplacementNeverLaunched, replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { readPlacement } from './placement';
 import { applyLifecycleReceipt, lifecycleExecutionArn, type ReceiptDeps } from './aws-receipts';
@@ -110,4 +111,123 @@ it('reconciles an immutable failed execution after promotion changed the current
     const s = await setup();
     const promoted = { ...s.work.intent.deployment, stateMachineVersionArn: s.work.stateMachineArn.replace(/:1$/, ':2') };
     expect(replacementWorkFromExecution(s.p, promoted, s.execution)).toEqual(s.work);
+});
+
+// 1.0.16 canary cc7ef7bf (2026-10-25): cold replace 77629354 right after a pool release failed at Observe-initial,
+// before any launch. Event ids, predecessors, types and state names below mirror its real 10-event history.
+const T0 = Date.parse('2026-10-25T11:07:54.199Z');
+function canaryHistory(input: string): HistoryEvent[] {
+    const e = (id: number, previousEventId: number, type: string, ms: number, extra: Partial<HistoryEvent> = {}): HistoryEvent =>
+        ({ id, previousEventId, type: type as HistoryEvent['type'], timestamp: new Date(T0 + ms), ...extra });
+    return [
+        e(1, 0, 'ExecutionStarted', 0, { executionStartedEventDetails: { input } }),
+        e(2, 0, 'PassStateEntered', 19, { stateEnteredEventDetails: { name: 'Init' } }),
+        e(3, 2, 'PassStateExited', 19, { stateExitedEventDetails: { name: 'Init' } }),
+        e(4, 3, 'TaskStateEntered', 19, { stateEnteredEventDetails: { name: 'Observe-initial' } }),
+        e(5, 4, 'LambdaFunctionScheduled', 19, { lambdaFunctionScheduledEventDetails: { resource: 'arn:aws:lambda:ap-south-1:123456789012:function:helper' } }),
+        e(6, 5, 'LambdaFunctionStarted', 40),
+        e(7, 6, 'LambdaFunctionFailed', 380, { lambdaFunctionFailedEventDetails: { error: 'LifecycleFailure', cause: 'lifecycle_instance_invalid' } }),
+        e(8, 7, 'TaskStateExited', 380, { stateExitedEventDetails: { name: 'Observe-initial' } }),
+        e(9, 8, 'FailStateEntered', 380, { stateEnteredEventDetails: { name: 'Unconfirmed' } }),
+        e(10, 9, 'ExecutionFailed', 400, { executionFailedEventDetails: { error: 'LifecycleUnconfirmed' } }),
+    ];
+}
+async function releasedSetup(placementState: 'STARTING' | 'UNCONFIRMED' = 'UNCONFIRMED') {
+    const s = await setup('source'), i = s.work.intent;
+    s.fake.placements[0]!.state = placementState;
+    const p = (await readPlacement(s.fake.db, i.computerId)).record!;
+    // The released pool host: claim identity, pool tag removed at claim, no cold-launch keys.
+    s.source.tags = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot', 'ezil:namespace': 'pilot',
+        'ezil:pool-host': '98703145-8dff-4138-b632-cc3584321bc9', 'ezil:computer': i.computerId,
+        'ezil:generation': String(i.previousGeneration), 'ezil:fence': i.previousFenceToken! };
+    s.targets.length = 0;
+    const history = canaryHistory(s.work.input);
+    const deps: ReceiptDeps = { ...s.deps, executions: { describe: async () => s.execution, history: async () => history } };
+    return { ...s, p, history, deps };
+}
+
+describe('replace after a pool release that never launched (1.0.16 canary)', () => {
+    it.each(['UNCONFIRMED', 'STARTING'] as const)('%s: settles to the proven previous generation, preserving the epoch and revoking job authority', async (state) => {
+        const s = await releasedSetup(state), i = s.work.intent;
+        await applyLifecycleReceipt(s.deps, s.p, i.deployment);
+        const p = (await readPlacement(s.fake.db, i.computerId)).record!;
+        expect(p).toMatchObject({ state: 'STOPPED', generation: i.previousGeneration, fenceToken: i.previousFenceToken,
+            instanceId: i.previousInstanceId, leaseEpoch: s.p.leaseEpoch, lastError: 'instance_lost' });
+        expect([p.lifecycleJobId, p.lifecycleDigest, p.enrollNonceHash, p.enrollConsumedHash, p.enrollExpiresAt]).toEqual([null, null, null, null, null]);
+    });
+    it('the real canary history structure is a no-launch proof; it is no proof for another input', async () => {
+        const s = await releasedSetup();
+        expect(proveReplacementNeverLaunched(s.execution, s.work, s.history)).toBe(true);
+        expect(proveReplacementNeverLaunched({ ...s.execution, input: s.execution.input + ' ' }, s.work, s.history)).toBe(false);
+    });
+    const malformed: [string, (h: HistoryEvent[]) => HistoryEvent[]][] = [
+        ['a negative predecessor', h => h.map(e => e.id === 3 ? { ...e, previousEventId: -1 } : e)],
+        ['a forward predecessor', h => h.map(e => e.id === 3 ? { ...e, previousEventId: 3 } : e)],
+        ['a first event with a predecessor', h => h.map(e => e.id === 1 ? { ...e, previousEventId: 1 } : e)],
+        ['an entered state without a name', h => h.map(e => e.id === 4 ? { ...e, stateEnteredEventDetails: {} } : e)],
+        ['an exited state without a name', h => h.map(e => e.id === 8 ? { ...e, stateExitedEventDetails: undefined } : e)],
+        ['an orphan runInstances exit', h => h.map(e => e.id === 8 ? { ...e, stateExitedEventDetails: { name: 'runInstances' } } : e)],
+        ['a runInstances entry', h => h.map(e => e.id === 4 ? { ...e, stateEnteredEventDetails: { name: 'runInstances' } } : e)],
+        ['a runBurstableInstances entry', h => h.map(e => e.id === 4 ? { ...e, stateEnteredEventDetails: { name: 'runBurstableInstances' } } : e)],
+        ['a scheduled launch call', h => [...h.slice(0, 5), { ...h[5]!, type: 'TaskScheduled', taskScheduledEventDetails: { resource: 'runInstances',
+            resourceType: 'aws-sdk:ec2', region: 'ap-south-1', parameters: '{}' } }, ...h.slice(6)]],
+        ['a task event without its details', h => [...h.slice(0, 5), { ...h[5]!, type: 'TaskStarted' }, ...h.slice(6)]],
+        ['an unknown event type', h => h.map(e => e.id === 6 ? { ...e, type: 'MapRunStarted' as HistoryEvent['type'] } : e)],
+        ['a redrive', h => h.map(e => e.id === 6 ? { ...e, type: 'ExecutionRedriven' as HistoryEvent['type'] } : e)],
+        ['a second ExecutionStarted', h => h.map(e => e.id === 6 ? { ...e, type: 'ExecutionStarted' as HistoryEvent['type'] } : e)],
+        ['a missing terminal event', h => h.slice(0, -1)],
+        ['an id gap', h => h.filter(e => e.id !== 6)],
+        ['a missing timestamp', h => h.map(e => e.id === 6 ? { ...e, timestamp: undefined } : e)],
+        ['truncated output', h => h.map(e => e.id === 7 ? { ...e, lambdaFunctionFailedEventDetails: { error: 'x', cause: 'y' },
+            taskSucceededEventDetails: { resource: 'r', resourceType: 't', outputDetails: { truncated: true } } } : e)],
+        ['another started input', h => h.map(e => e.id === 1 ? { ...e, executionStartedEventDetails: { input: '{}' } } : e)],
+    ];
+    it.each(malformed)('%s is not a no-launch proof and settles nothing', async (_label, edit) => {
+        const s = await releasedSetup(), i = s.work.intent, bad = edit(structuredClone(s.history));
+        expect(proveReplacementNeverLaunched(s.execution, s.work, bad)).toBe(false);
+        await applyLifecycleReceipt({ ...s.deps, executions: { describe: async () => s.execution, history: async () => bad } }, s.p, i.deployment);
+        expect((await readPlacement(s.fake.db, i.computerId)).record).toMatchObject({ state: 'UNCONFIRMED', generation: i.targetGeneration, lifecycleJobId: i.jobId });
+    });
+    const contradictions: [string, (s: Awaited<ReturnType<typeof releasedSetup>>) => void][] = [
+        ['no history reader', s => { s.deps.executions = { describe: async () => s.execution }; }],
+        ['a history read failure', s => { s.deps.executions = { describe: async () => s.execution, history: async () => { throw new Error('throttled'); } }; }],
+        ['a VANISHED source (absence is never termination proof)', s => { s.deps.describer!.describeForEnrollment = async () => null; }],
+        ['a shutting-down released source', s => { s.source.state = 'shutting-down'; }],
+        ['a stopped released source', s => { s.source.state = 'stopped'; }],
+        ['a source in another zone', s => { s.source.availabilityZoneId = 'use1-az1'; }],
+        ['a released source with a foreign cold-launch alias', s => { s.source.tags = { ...s.source.tags, 'ezil:computer-id': '22222222-2222-4222-8222-222222222222' }; }],
+        ['a released source still pooled', s => { s.source.tags = { ...s.source.tags, 'ezil:pool': '1' }; }],
+        ['a released source without pool-host', s => { const { ['ezil:pool-host']: _gone, ...rest } = s.source.tags; s.source.tags = rest; }],
+        ['a released source with another fence', s => { s.source.tags = { ...s.source.tags, 'ezil:fence': '22222222-2222-4222-8222-222222222222' }; }],
+        ['a released source in another namespace', s => { s.source.tags = { ...s.source.tags, 'ezil:namespace': 'other' }; }],
+        // A fully valid terminated writer (job client token, target tags, account) still contradicts the no-launch proof.
+        ['a discovered writer despite the no-launch history', s => { s.targets.push({ instanceId: 'i-22222222222222222', state: 'terminated',
+            tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot', 'ezil:computer-id': s.work.intent.computerId,
+                'ezil:generation': String(s.work.intent.targetGeneration), 'ezil:fence-token': s.work.intent.fenceToken },
+            accountId: s.work.intent.deployment.accountId, clientToken: '' }); }],
+        ['a volume still attached', s => { s.volume.state = 'in-use'; s.volume.attachments = [{ instanceId: s.source.instanceId, state: 'attached' }]; }],
+    ];
+    it.each(contradictions)('%s keeps the placement UNCONFIRMED', async (_label, edit) => {
+        const s = await releasedSetup(), i = s.work.intent;
+        edit(s);
+        await applyLifecycleReceipt(s.deps, s.p, i.deployment);
+        expect((await readPlacement(s.fake.db, i.computerId)).record).toMatchObject({ state: 'UNCONFIRMED', generation: i.targetGeneration, lifecycleJobId: i.jobId });
+    });
+    it('a STOPPED released pool source is never accepted, even with a definite start refusal', async () => {
+        const s = await releasedSetup();
+        s.source.state = 'stopped'; s.source.instanceType = 't3a.medium';
+        s.source.volumes = [{ volumeId: s.volume.volumeId, deleteOnTermination: false, tags: s.volume.tags! }];
+        s.volume.state = 'in-use'; s.volume.attachments = [{ instanceId: s.source.instanceId, state: 'attached' }];
+        expect(await settleReplacementGeneration(s.deps, s.p, s.work, true)).toBe('unconfirmed');
+        expect(s.fake.placements[0]!.state).toBe('UNCONFIRMED');
+    });
+    it('a canonical-valid source carrying a foreign claim alias cannot settle even an ordinary launched replacement', async () => {
+        const s = await setup();
+        s.source.tags = { ...s.source.tags, 'ezil:computer': '22222222-2222-4222-8222-222222222222' };
+        expect(await settleReplacementGeneration(s.deps, s.p, s.work)).toBe('unconfirmed');
+        s.source.tags = { ...s.source.tags, 'ezil:computer': s.work.intent.computerId, 'ezil:fence': '22222222-2222-4222-8222-222222222222' };
+        expect(await settleReplacementGeneration(s.deps, s.p, s.work)).toBe('unconfirmed');
+        s.source.tags = { ...s.source.tags, 'ezil:fence': s.work.intent.previousFenceToken! };
+        expect(await settleReplacementGeneration(s.deps, s.p, s.work)).toBe('settled');
+    });
 });

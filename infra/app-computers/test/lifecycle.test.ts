@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import type { InstanceStateName } from '@aws-sdk/client-ec2';
 import test from 'node:test';
-import { createLifecycleHelper } from '../lib/lifecycle/helper.js';
+import { createLifecycleHelper, releasedSourceApplies } from '../lib/lifecycle/helper.js';
 import { lifecycleDefinition } from '../lib/lifecycle/definition.js';
 import { token } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
@@ -568,4 +569,96 @@ test('retire with a vanished instance refuses a foreign or missing volume',async
 test('an instance that EXISTS but is not this computer still refuses the retire',async()=>{
     const f=lifecycleFixture('retire');f.state.instances[0]!.Tags=[];
     const r=await run('retire',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
+
+// 1.0.16 canary (2026-10-25 11:07Z): a cold replace right after a pool release names the released pool host,
+// which carries the claim identity (ezil:computer / ezil:fence, pool tag removed at claim), not the cold-launch keys.
+function releasedPrevious(state:InstanceStateName='terminated',edit?:(tags:{Key:string;Value:string}[])=>{Key:string;Value:string}[]){
+    const f=lifecycleFixture('replace'),host=f.state.instances[0]!,i=f.i,ns=i.deployment.namespace;
+    host.State={Name:state};delete host.SubnetId;host.BlockDeviceMappings=[];
+    const tags=[{Key:'ezil:managed-by',Value:'app-computer-platform'},{Key:'ezil:stage',Value:ns},{Key:'ezil:namespace',Value:ns},
+        {Key:'ezil:pool-host',Value:'98703145-8dff-4138-b632-cc3584321bc9'},{Key:'ezil:computer',Value:i.computerId},
+        {Key:'ezil:generation',Value:String(i.previousGeneration)},{Key:'ezil:fence',Value:i.previousFenceToken!}];
+    host.Tags=edit?edit(tags):tags;
+    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];
+    return f;
+}
+test('replace after a pool release: a terminated released pool host is the source; relaunch onto the free volume, never stop/terminate it',async()=>{
+    const r=await run('replace',{fixture:releasedPrevious()});
+    assert.equal(r.error,undefined,r.cause);assert.equal(r.receipt?.state,'running');
+    assert.deepEqual(r.calls.map(c=>c.action),['runInstances','createTags','attachVolume']);
+    assert.equal(r.receipt.volumeId,r.f.state.volumes[0]!.VolumeId);
+});
+test('replace after a pool release: a shutting-down released pool host is waited for, then the replace relaunches',async()=>{
+    const f=releasedPrevious('shutting-down'),original=f.deps.instances;let reads=0;
+    f.deps.instances=async selector=>{const rows=await original(selector);
+        if(Array.isArray(selector)&&++reads>=3)for(const r of rows)if(r.instance.State?.Name==='shutting-down')r.instance.State={Name:'terminated'};return rows;};
+    const r=await run('replace',{fixture:f});
+    assert.equal(r.error,undefined,r.cause);assert.ok(reads>=3);
+    assert.deepEqual(r.calls.map(c=>c.action),['runInstances','createTags','attachVolume']);
+});
+test('replace after a pool release waits while the volume still claims the terminated pool host (no launch)',async()=>{
+    const f=releasedPrevious(),v=f.state.volumes[0]!;v.State='in-use';
+    v.Attachments=[{InstanceId:f.i.previousInstanceId!,VolumeId:v.VolumeId,State:'detaching',Device:'/dev/sdf',DeleteOnTermination:false}];
+    const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+});
+for(const state of ['running','pending','stopping','stopped'] as const)test(`replace after a pool release refuses a LIVE (${state}) claim-tagged source: only the pool release graph may stop it`,async()=>{
+    const f=releasedPrevious(state);f.state.instances[0]!.SubnetId=f.i.deployment.subnetId;
+    const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_instance_invalid/);assert.equal(r.calls.length,0);
+});
+const setTag=(key:string,value:string)=>(t:{Key:string;Value:string}[])=>[...t.filter(x=>x.Key!==key),{Key:key,Value:value}];
+const dropTag=(key:string)=>(t:{Key:string;Value:string}[])=>t.filter(x=>x.Key!==key);
+for(const [label,edit] of [
+    ['another computer',setTag('ezil:computer','00000000-0000-4000-8000-000000000000')],
+    ['another generation',setTag('ezil:generation','99')],
+    ['another fence',setTag('ezil:fence','00000000-0000-4000-8000-000000000000')],
+    ['another namespace',setTag('ezil:namespace','other')],
+    ['another stage',setTag('ezil:stage','other')],
+    ['not platform-managed',setTag('ezil:managed-by','someone-else')],
+    ['no pool-host',dropTag('ezil:pool-host')],
+    ['an empty pool-host',setTag('ezil:pool-host','')],
+    ['a still-pooled tag',setTag('ezil:pool','1')],
+    ['a cold-launch computer alias',setTag('ezil:computer-id','00000000-0000-4000-8000-000000000000')],
+    ['a cold-launch fence alias',setTag('ezil:fence-token','00000000-0000-4000-8000-000000000000')],
+    ['no fence',dropTag('ezil:fence')],
+    ['a duplicated claim key',(t:{Key:string;Value:string}[])=>[...t,{Key:'ezil:computer',Value:'00000000-0000-4000-8000-000000000000'}]],
+] as const)test(`replace after a pool release refuses a terminated source with ${label}`,async()=>{
+    const r=await run('replace',{fixture:releasedPrevious('terminated',edit)});
+    assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_instance_invalid/);assert.equal(r.calls.length,0);
+});
+test('a released pool host in another subnet or zone still refuses the replace',async()=>{
+    const a=releasedPrevious();a.state.instances[0]!.SubnetId='subnet-0ffffffffffffffff';
+    const b=releasedPrevious();b.state.instances[0]!.Placement={AvailabilityZoneId:'aps1-az3'};
+    for(const f of [a,b]){const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);}
+});
+for(const operation of ['retire','stop'] as const)test(`${operation}: a released (claim-tagged) source is NOT accepted outside replace`,async()=>{
+    const f=lifecycleFixture(operation),host=f.state.instances[0]!,ns=f.i.deployment.namespace;
+    host.State={Name:'terminated'};delete host.SubnetId;host.BlockDeviceMappings=[];
+    host.Tags=[{Key:'ezil:managed-by',Value:'app-computer-platform'},{Key:'ezil:stage',Value:ns},{Key:'ezil:namespace',Value:ns},
+        {Key:'ezil:pool-host',Value:'98703145-8dff-4138-b632-cc3584321bc9'},{Key:'ezil:computer',Value:f.i.computerId},
+        {Key:'ezil:generation',Value:String(f.i.targetGeneration)},{Key:'ezil:fence',Value:f.i.fenceToken}];
+    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];
+    const r=await run(operation,{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_instance_invalid/);assert.equal(r.calls.length,0);
+});
+test('the released-pool-source rule applies only to an ordinary replace (never rebase, stop, retire, start or provision)',()=>{
+    const prep={preparationJobId:'00000000-0000-4000-8000-000000000001'} as unknown as LifecycleIntent['rebasePreparation'];
+    assert.equal(releasedSourceApplies({operation:'replace'}),true);
+    assert.equal(releasedSourceApplies({operation:'replace',rebasePreparation:prep}),false);
+    for(const operation of ['provision','start','stop','retire','adopt','release','pool-provision','pool-retire'] as const)
+        assert.equal(releasedSourceApplies({operation}),false,operation);
+});
+for(const state of ['terminated','running','stopped'] as const)test(`replace refuses a ${state} canonical-valid source carrying contradictory claim/namespace aliases (checked before either identity)`,async()=>{
+    for(const alias of [{Key:'ezil:computer',Value:'00000000-0000-4000-8000-000000000000'},{Key:'ezil:fence',Value:'00000000-0000-4000-8000-000000000000'},
+        {Key:'ezil:namespace',Value:'other'}]){
+        const f=lifecycleFixture('replace'),host=f.state.instances[0]!;host.State={Name:state};host.Tags=[...host.Tags!,alias];
+        if(state==='terminated'){delete host.SubnetId;host.BlockDeviceMappings=[];const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];}
+        const r=await run('replace',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed',alias.Key);assert.match(r.cause!,/lifecycle_instance_invalid/);assert.equal(r.calls.length,0,alias.Key);
+    }
+});
+test('replace still accepts a canonical source whose claim aliases AGREE (mixed identity, same computer and fence)',async()=>{
+    const f=lifecycleFixture('replace'),host=f.state.instances[0]!,i=f.i;
+    host.State={Name:'terminated'};delete host.SubnetId;host.BlockDeviceMappings=[];
+    host.Tags=[...host.Tags!,{Key:'ezil:computer',Value:i.computerId},{Key:'ezil:fence',Value:i.previousFenceToken!},{Key:'ezil:namespace',Value:i.deployment.namespace}];
+    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];
+    const r=await run('replace',{fixture:f});assert.equal(r.error,undefined,r.cause);assert.deepEqual(r.calls.map(c=>c.action),['runInstances','createTags','attachVolume']);
 });

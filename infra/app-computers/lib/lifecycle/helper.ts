@@ -134,7 +134,11 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             return fail('source_identity_mismatch');
         const sourceIntent = preparation ? { ...i, deployment: preparation.document.sourceDeployment } : i;
         const sourceId=i.previousInstanceId??i.providerInstanceId;
-        const source=sourceId?await getInstance(sourceId,previousTags,sourceIntent,deps,['replace','retire','stop'].includes(i.operation)):undefined;
+        // An ordinary (non-rebase) replace may follow a pool release: its source is then the released
+        // pool host, identified by its claim keys. Only a terminating or terminated one is accepted.
+        const releasedSource=releasedSourceApplies(i)
+            ?(h:Instance)=>releasedPoolSource(h,i.computerId,i.deployment.namespace,i.previousGeneration!,i.previousFenceToken!):undefined;
+        const source=sourceId?await getInstance(sourceId,previousTags,sourceIntent,deps,['replace','retire','stop'].includes(i.operation),releasedSource):undefined;
         // A replace whose previous instance EC2 no longer knows (the app's instance_lost recovery)
         // has nothing to stop or terminate. The volume must not claim an attachment to it; the
         // launch below still requires the volume `available` and unattached, and its tags were
@@ -472,7 +476,7 @@ function assertRetiredDisks(host:Instance,d:Settings['deployment']){
     if(!Array.isArray(maps)||maps.length>1||maps.some(m=>m.DeviceName!==d.storage.rootDeviceName))return unexpectedDisks(host,d.storage.rootDeviceName);
 }
 /** Optional legacy/claim aliases cannot contradict the current writer. */
-function matchingPresentTags(actual:Tag[]|undefined,expected:Record<string,string>){
+export function matchingPresentTags(actual:Tag[]|undefined,expected:Record<string,string>){
     return Object.entries(expected).every(([key,value])=>!actual?.some(t=>t.Key===key)||tagged(actual,{[key]:value}));
 }
 /** Pool hosts are root-only until adoption; never terminate unexpected disks. */
@@ -521,13 +525,30 @@ function lostStop(i:LifecycleIntent,digest:string,instanceId:string,volumeId:str
     return {...done,receipt:{...done.receipt,instanceLost:true as const} satisfies LifecycleReceipt};
 }
 type InstanceIdentity = { deployment: Pick<SourceLifecycleDeployment, 'accountId' | 'subnetId' | 'zoneId'> };
-function assertIdentity(instance:Instance,tags:Record<string,string>,i:InstanceIdentity){
+/** A computer's previous host after a pool release: the claim identity (ezil:computer / ezil:fence,
+ * pool tag removed at claim) instead of the cold-launch keys. Accepted only while terminating or
+ * terminated, so neither replace nor cleanup ever stops or terminates a pool host; they wait for it.
+ * Mixed identities refuse (no cold-launch alias, no pool tag); account, id and network checks stay. */
+export const releasedSourceApplies=(i:Pick<LifecycleIntent,'operation'|'rebasePreparation'>)=>i.operation==='replace'&&!i.rebasePreparation;
+export function releasedPoolSource(instance:Instance,computerId:string,namespace:string,generation:number,fence:string):boolean{
+    const state=instance.State?.Name;
+    return (state==='terminated'||state==='shutting-down')
+        &&tagged(instance.Tags,{'ezil:managed-by':'app-computer-platform','ezil:stage':namespace,'ezil:namespace':namespace,
+            'ezil:computer':computerId,'ezil:generation':String(generation),'ezil:fence':fence})
+        &&instance.Tags?.filter(t=>t.Key==='ezil:pool-host'&&!!t.Value).length===1
+        &&!instance.Tags?.some(t=>['ezil:computer-id','ezil:fence-token','ezil:pool'].includes(t.Key??''));
+}
+function assertIdentity(instance:Instance,tags:Record<string,string>,i:InstanceIdentity,released?:(instance:Instance)=>boolean){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
     // EC2 clears SubnetId on a terminating (shutting-down) or terminated instance but keeps its id
     // and tags, so such a source is identified by those; a subnet that IS reported must still be
     // the configured one. Seen live: shutting-down with no SubnetId (2026-10-22 11:55Z).
     const terminated=instance.State?.Name==='terminated'||instance.State?.Name==='shutting-down';
-    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)
+    // Where a released pool source is also acceptable, every PRESENT identity alias (cold-launch or
+    // claim, plus namespace) must agree before either alternative is considered.
+    if(released&&!matchingPresentTags(instance.Tags,{...tags,'ezil:computer':tags['ezil:computer-id']!,'ezil:fence':tags['ezil:fence-token']!,
+        'ezil:namespace':tags['ezil:stage']!}))return fail('lifecycle_instance_invalid');
+    if(!instanceId(instance.InstanceId)||!(tagged(instance.Tags,tags)||released?.(instance))
         ||(terminated?instance.SubnetId!==undefined&&instance.SubnetId!==i.deployment.subnetId:instance.SubnetId!==i.deployment.subnetId)
         ||(instance.Placement?.AvailabilityZoneId!==undefined&&instance.Placement.AvailabilityZoneId!==i.deployment.zoneId))return fail('lifecycle_instance_invalid');
 }
@@ -541,11 +562,11 @@ export function assertOnlyExpectedDisks(instance:Instance,v:Volume,rootDeviceNam
 }
 /** `allowAbsent` (replace and retire only): EC2 no longer knowing the instance at all is an answer,
  * not a failure. Nothing else is relaxed: an instance that exists must still be exactly this one. */
-async function getInstance(id:string,tags:Record<string,string>,i:InstanceIdentity,deps:Dependencies,allowAbsent=false){
+async function getInstance(id:string,tags:Record<string,string>,i:InstanceIdentity,deps:Dependencies,allowAbsent=false,released?:(instance:Instance)=>boolean){
     const rows=await deps.instances([id]);
     if(rows.length===0&&allowAbsent)return undefined;
     if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
-    assertIdentity(rows[0].instance,tags,i);return rows[0].instance;
+    assertIdentity(rows[0].instance,tags,i,released);return rows[0].instance;
 }
 type AttachmentRejectionReason = 'claimed_host_without_attachment' | 'volume_state'
     | 'mapping_count' | 'mapping_device' | 'mapping_status' | 'mapping_deletion_policy'

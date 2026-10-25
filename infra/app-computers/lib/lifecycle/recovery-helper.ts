@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { EnvelopeSchema, LAUNCH_ACTIONS, equal, tagsFor, token } from './contract.js';
 import { toLambdaError } from './errors.js';
 import { parseLifecycleWork } from './intent.js';
-import { tagged } from './helper.js';
+import { matchingPresentTags, releasedPoolSource, releasedSourceApplies, tagged } from './helper.js';
 import { CleanupRecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
     type RecoverySettings, type RecoveryReceipt } from './recovery-contract.js';
 import { recoveryDependencies, type RecoveryDependencies } from './recovery-aws.js';
@@ -83,8 +83,15 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             // gone instance is refused by the attachment check below.
             if (rows.length === 0) gone = { instanceId: originalId, generation, fenceToken };
             else {
+                // A replace after a pool release names the released pool host: accepted by its claim
+                // identity only while terminating or terminated, so cleanup never stops or terminates it.
+                // Every present identity alias (cold-launch or claim, plus namespace) must agree first.
+                const applies = releasedSourceApplies(i), instance = rows[0]!.instance;
+                if (applies && !matchingPresentTags(instance.Tags, { ...oldTags, 'ezil:computer': i.computerId, 'ezil:fence': fenceToken,
+                    'ezil:namespace': i.deployment.namespace })) return fail();
+                const released = applies && releasedPoolSource(instance, i.computerId, i.deployment.namespace, generation, fenceToken);
                 if (rows.length !== 1 || rows[0]?.owner !== d.accountId || rows[0].instance.InstanceId !== originalId
-                    || !tagged(rows[0].instance.Tags, oldTags)) return fail();
+                    || !(tagged(rows[0].instance.Tags, oldTags) || released)) return fail();
                 targets.push({ role: 'old', instance: rows[0].instance, generation, fenceToken });
             }
         }
@@ -101,8 +108,9 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         }
         if (targets.length && !v) return fail();
         for (const { instance } of targets) {
-            // EC2 may omit networking fields after termination; reported values must still match.
-            const subnetOmitted = instance.State?.Name === 'terminated' && instance.SubnetId === undefined;
+            // EC2 may omit networking fields once termination starts (shutting-down or terminated);
+            // reported values must still match. A shutting-down instance only ever waits below.
+            const subnetOmitted = (instance.State?.Name === 'terminated' || instance.State?.Name === 'shutting-down') && instance.SubnetId === undefined;
             if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || (!subnetOmitted && instance.SubnetId !== d.subnetId)
                 || (instance.Placement?.AvailabilityZoneId !== undefined && instance.Placement.AvailabilityZoneId !== d.zoneId)) return fail();
         }

@@ -1,5 +1,5 @@
 import { reconcilePoolReleaseRecovery } from './aws-pool-release-recovery';
-import { replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
+import { replacementNeverLaunched, replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
 import { failPoolOpenRelease, isPoolOpenRelease, POOL_OPEN_RELEASE_FAILED, recoverRefusedAdopt } from './aws-pool-recovery';
 import { createProviderMigrationStore } from './provider-migrate-store';
 /**
@@ -300,7 +300,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
             }
             if (await recoverRefusedAdopt(deps, p, poolIntent, e)) return;
             const work = replacementWorkFromExecution(p, deployment, e);
-            const outcome = work ? await settleReplacementGeneration(deps, p, work) : 'unconfirmed';
+            const outcome = work ? await settleReplacementGeneration(deps, p, work, false, await replacementNeverLaunched(deps, p, work, e)) : 'unconfirmed';
             if (outcome === 'settled') return;
             if (p.state !== 'UNCONFIRMED') await step(p, 'UNCONFIRMED', {
                 lastError: outcome === 'generation_drift' ? 'generation_drift' : lifecycleFailureCode(e, p.instanceType),

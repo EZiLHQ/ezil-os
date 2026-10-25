@@ -88,6 +88,9 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
         if (p.state !== to || p.lastError !== lastError) await writeLivePoolRecovery(deps.db, p, to, { lastError });
         return true;
     };
+    // Release and stop always name their host. A placement without one (a cold replace or provision,
+    // whose admission cleared instance_id) belongs to the other recovery handlers.
+    if (!p.instanceId && !saved?.intent) return false;
     if (!p.lifecycleJobId || !p.lifecycleDigest || !p.region || !p.instanceId || !p.volumeId || !p.fenceToken) return fail('placement_identity');
     if (!deps.executions) return fail('execution_reader_missing');
     let planned: LifecycleWork | null = null;

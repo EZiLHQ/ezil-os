@@ -451,3 +451,29 @@ describe('independent historical stop-time proof', () => {
         expect(s.meter.stopped.mock.calls.some(([value]) => value.endedAt.getTime() === STOP.getTime())).toBe(false);
     });
 });
+
+// 1.0.16 canary: a cold replace admitted after a pool release clears instance_id. That placement is not a
+// release/stop recovery and must reach the replacement settlement instead of a permanent placement_identity hold.
+describe('instance-less placements belong to the other recovery handlers', () => {
+    it.each([['no marker', 'failed:LifecycleUnconfirmed'], ['the legacy canary marker', 'pool_release_recovery:{"error":"placement_identity"}']])(
+        'returns not-handled for a replace with %s, without reading the execution or rewriting the row', async (_label, lastError) => {
+            const s = setup();
+            const replace = buildLifecycleWork({ ...fixtureIntent('replace'), deployment: D, computerId: s.original.intent.computerId });
+            Object.assign(s.placements[0], { instance_id: null, last_error: lastError, lifecycle_job_id: replace.intent.jobId, lifecycle_digest: replace.digest });
+            const { reconcilePoolReleaseRecovery } = await import('./aws-pool-release-recovery');
+            const before = await s.current();
+            expect(await reconcilePoolReleaseRecovery(s.deps, before, D)).toBe(false);
+            expect(s.deps.executions!.describe).not.toHaveBeenCalled();
+            expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError, instanceId: null });
+            expect(s.starts).toHaveLength(0);
+        });
+    it('a saved release replay without an instance is still a precise placement_identity hold', async () => {
+        const s = setup();
+        Object.assign(s.placements[0], { instance_id: null,
+            last_error: 'pool_release_recovery:' + JSON.stringify({ intent: s.original.intent, stoppedAt: STOP.toISOString(), sourceJobId: s.original.intent.jobId, error: null }) });
+        const { reconcilePoolReleaseRecovery } = await import('./aws-pool-release-recovery');
+        expect(await reconcilePoolReleaseRecovery(s.deps, await s.current(), D)).toBe(true);
+        expect((await s.current()).lastError).toContain('placement_identity');
+        expect(s.starts).toHaveLength(0);
+    });
+});
