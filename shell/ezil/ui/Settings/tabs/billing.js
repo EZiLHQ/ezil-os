@@ -5,7 +5,7 @@ import { isNative } from '../../../native-runtime.js';
 import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl } from '../billing-format.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, creditsLabel } from '../billing-format.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -196,11 +196,51 @@ function machineV3Html ({ plan, computer }) {
         </label>`).join('')}</div><p data-role="machine-status" role="status" aria-live="polite"></p></fieldset>`;
 }
 
+function aiV3Html (ai) {
+    const spending = ai?.spendingState ?? 'unavailable';
+    const copy = {
+        available: ai?.balanceState === 'exhausted' ? 'No AI credits remain.'
+            : ai?.balanceState === 'low' ? 'AI credits are running low.' : 'AI spending is not paused.',
+        paused_operations: 'AI spending is paused by operations.',
+        paused_reconciliation: 'AI spending is paused while pending requests are reconciled.',
+        paused_policy: 'AI spending is paused by an account policy.',
+        unavailable: 'AI spending status is unavailable.',
+    }[spending] ?? 'AI spending status is unavailable.';
+    const limits = ai?.limits, policy = limits?.policy, counters = limits?.counters;
+    const number = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : 'Not reported';
+    const credits = value => value == null ? 'Not reported' : `${creditsLabel(value)} credits`;
+    const detail = (label, value) => `<div><dt>${encode(label)}</dt><dd>${encode(value)}</dd></div>`;
+    const recent = ai?.recentUsage;
+    return `<section class="ezil-billing-card" data-role="ai-usage" aria-label="AI credits and usage">
+        <h4>AI credits</h4>
+        ${paragraph(`Balance: ${ai?.balanceMicro != null || ai?.balance != null ? `${creditsLabel(ai.balanceMicro, ai.balance)} credits` : 'Not reported'}`, 'ezil-billing-usage')}
+        <p role="status" data-role="ai-spending" data-state="${encode(spending)}">${encode(copy)}</p>
+        ${paragraph(`Held for requests: ${credits(ai?.heldMicro)}`)}
+        ${limits?.pauses?.some(p => ['model', 'client'].includes(p.scope)) ? paragraph('Some models or clients are paused.') : ''}
+        <h4>AI limits</h4>
+        ${!limits ? paragraph('AI limits are unavailable.') : `<dl data-role="ai-limits">
+            ${detail('Requests per minute', `${number(policy?.rpm)} · service ceiling: ${number(limits.ceilings?.rpm)}`)}
+            ${detail('Concurrent requests', `${number(policy?.concurrency)} · service ceiling: ${number(limits.ceilings?.concurrency)}`)}
+            ${detail('Tokens per minute', number(policy?.tpm))}
+            ${detail('Output tokens per request', number(policy?.maxOutputTokens))}
+            ${detail('Daily commitment / budget', `${credits(counters?.dayMicro)} / ${credits(policy?.dailyBudgetMicro)}`)}
+            ${detail('Monthly commitment / budget', `${credits(counters?.monthMicro)} / ${credits(policy?.monthlyBudgetMicro)}`)}
+            ${detail('Open / pending requests', `${number(counters?.inflight)} / ${number(counters?.pending)}`)}
+        </dl>`}
+        ${paragraph('Commitments include held credits. Unreported limits are unknown.')}
+        <h4>Recent AI requests</h4>
+        ${!recent ? paragraph('Recent AI usage is unavailable.') : !recent.rows.length ? paragraph('No requests in this result.')
+            : `<ul data-role="ai-recent">${recent.rows.map(row => `<li>${encode(dateLabel(row.at, true))} · ${encode({ reserved: 'Reserved', pending: 'Pending', settled: 'Settled' }[row.status] ?? 'Unknown')}
+                · charged: ${encode(credits(row.chargedMicro))} · held: ${encode(credits(row.heldMicro))}</li>`).join('')}</ul>`}
+        ${paragraph(`Recent requests${recent ? ` (up to ${recent.limit})` : ''} are not a billing-period total.`)}
+    </section>`;
+}
+
 export function summaryV3Html (summary) {
     const { plan, computer, fairUse, actions } = summary;
     const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
     const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
-    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)} — upgrade to keep working` }[fairUse.status];
+    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status];
     const changeAction = actions.downgrade ? actionHtml('downgrade', 'Change plan')
         : actions.upgrade ? actionHtml('upgrade', 'Change plan') : actions.checkout ? actionHtml('choose', 'Change plan', true) : '';
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div>
@@ -221,6 +261,7 @@ export function summaryV3Html (summary) {
             ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
         </section>
         <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
+        ${aiV3Html(summary.ai)}
         <p class="ezil-billing-note">Prices before tax.</p>
         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3>Invoices</h3>
@@ -301,7 +342,7 @@ async function load ($win, state) {
     const history = trpc.query('billing.history').catch(() => ({ ok: false }));
     try {
         const result = await trpc.query('billing.summary');
-        if ( state.closed || ! $win.get(0).isConnected ) return;
+        if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected ) return;
         if ( ! result.ok ) throw new Error('summary failed');
         if ( result.data?.enabled === false || ! [2, 3].includes(result.data?.version) ) {
             $body.html('<p>Billing isn\'t available yet.</p>');
@@ -311,10 +352,13 @@ async function load ($win, state) {
             startCountdown($win, state);
         }
     } catch {
+        if ( request !== state.request || ! state.active || state.closed ) return;
         $body.html('<div class="ezil-billing-card ezil-settings-error" role="alert">Couldn\'t load billing. Try again. <button type="button" class="ezil-settings-btn" data-action="retry">Retry</button></div>');
     } finally {
-        state.loading = false;
-        $body.attr('aria-busy', 'false');
+        if ( request === state.request ) {
+            state.loading = false;
+            $body.attr('aria-busy', 'false');
+        }
     }
     if ( state.summary && ! state.autoOpened ) {
         state.autoOpened = true;
@@ -497,6 +541,7 @@ export default {
         });
         $win.on('remove.billing', () => {
             state.closed = true;
+            state.request++;
             stopCountdown(state);
             state.sheet?.handle?.close();
             state.sheet?.cleanup?.();
@@ -512,6 +557,6 @@ export default {
     },
     onDeactivate ($win) {
         const state = $win && windows.get($win.get(0));
-        if ( state ) { state.active = false; stopCountdown(state); }
+        if ( state ) { state.active = false; state.request++; state.loading = false; stopCountdown(state); }
     },
 };

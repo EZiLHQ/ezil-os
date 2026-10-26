@@ -65,3 +65,15 @@ export function webUrl (value) {
 }
 
 export const BANNED_COPY = ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour'];
+
+/** Format the canonical microcredit string without passing it through Number. */
+export function creditsLabel (micro, balance = null) {
+    if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) {
+        const value = BigInt(micro);
+        const fraction = String(value % 1000000n).padStart(6, '0').replace(/0+$/, '');
+        return `${(value / 1000000n).toLocaleString('en-US')}${fraction ? `.${fraction}` : ''}`;
+    }
+    return typeof balance === 'number' && Number.isFinite(balance) && balance >= 0 && balance <= Number.MAX_SAFE_INTEGER
+        && Number(balance.toFixed(6)) === balance
+        ? balance.toLocaleString('en-US', { maximumFractionDigits: 6 }) : 'Not reported';
+}
