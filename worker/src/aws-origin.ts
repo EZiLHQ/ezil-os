@@ -464,3 +464,14 @@ export async function sendAwsControl(
   return fetchFn(`https://${host}${path}`, { method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header }, redirect: 'manual',
     ...(op === 'restart-desktop' ? { signal: AbortSignal.timeout(10_000) } : {}) });
 }
+
+/** Repository body hash is signed in the path, as with the ICE control operation. */
+export async function sendAwsRepositoryOpen(record: AwsTunnelRecord, zone: string, body: string, fetchFn: FetchLike, nowSeconds: number): Promise<Response> {
+  const key = decodeControlKey(record.controlKey);
+  if (!key) throw new Error('repo_open_failed');
+  const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body))), b => b.toString(16).padStart(2, '0')).join('');
+  const path = `/__ezil/control/repo-open/${digest}`;
+  const host = awsOriginHostname(record.sandboxId, record.generation, record.leaseEpoch, zone);
+  const header = await signGatewayHeader(key, record, 'POST', path, nowSeconds);
+  return fetchFn(`https://${host}${path}`, { method: 'POST', body, headers: { [AWS_GATEWAY_HEADER]: header, 'content-type': 'application/json' }, redirect: 'manual', signal: AbortSignal.timeout(195000) });
+}

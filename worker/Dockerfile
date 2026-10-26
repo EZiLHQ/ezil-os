@@ -469,3 +469,15 @@ EXPOSE 8443
 #    (Chromium M113+ pins it there regardless of flags) and the sidecar is the
 #    only thing that talks to it.
 EXPOSE 9223
+
+# Private repository operation; CLI artifact is supplied by the reviewed staging build.
+COPY repo-open /opt/ezil-repo-open
+# Default/public builds contain no private CLI. Staging supplies the reviewed bundle
+# using --secret id=ezil_cli_bundle,src=... and --build-arg EZIL_PRIVATE_CLI=1.
+ARG EZIL_PRIVATE_CLI=0
+RUN --mount=type=secret,id=ezil_cli_bundle \
+    if [ "$EZIL_PRIVATE_CLI" = 1 ]; then \
+      node /opt/ezil-repo-open/install-cli.mjs /run/secrets/ezil_cli_bundle /opt/ezil-repo-open/cli-pin.json /opt/ezil-cli \
+      && command -v git >/dev/null \
+      && /opt/ezil-cli/ezil --version; \
+    elif [ "$EZIL_PRIVATE_CLI" != 0 ]; then exit 1; fi

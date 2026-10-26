@@ -936,7 +936,7 @@ async function build (payload) {
     }
 
     if (appLink && !billingLink) {
-        await registry.launch(appLink.id, { ...registry.launchContext(ctx), initialTab: appLink.initialTab });
+        await registry.launch(appLink.id, { ...registry.launchContext(ctx), initialTab: appLink.initialTab, repo: appLink.repo });
     }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire

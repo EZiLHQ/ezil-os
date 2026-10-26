@@ -31,6 +31,7 @@ agent socket. Stdlib only.
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -60,6 +61,7 @@ CONTROL_RE = re.compile(r"^/__ezil/control/(stop|fence)(?:/(\d{1,3}))?$")
 ICE_RE = re.compile(r"^/__ezil/control/ice/([0-9a-f]{64})$")
 DESKTOP_STATUS_PATH = "/__ezil/control/desktop"
 RESTART_RE = re.compile(r"^/__ezil/control/restart-desktop/([0-9a-f]{64})$")
+REPO_RE = re.compile(r"^/__ezil/control/repo-open/([0-9a-f]{64})$")
 MAX_ICE_BODY = 16384
 FORWARDING_HEADERS = {"forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
                       "cf-connecting-ipv6", "cf-pseudo-ipv4", "cf-visitor"}
@@ -348,6 +350,10 @@ class Edge:
             _reply(client, 401, {"ok": False, "error": err})
             return
         self.seq.presence()
+        repo = REPO_RE.fullmatch(path)
+        if repo:
+            self._repo_open(client, head, repo.group(1), query)
+            return
         restart = RESTART_RE.fullmatch(path)
         if restart:
             # Every input is in the signed path. No query/body or arbitrary command.
@@ -432,6 +438,32 @@ class Edge:
             _reply(client, 400, {"ok": False, "error": "ice_config_invalid"})
             return
         self._agent(client, "ice", config=config)
+
+    def _repo_open(self, client, head, digest, query):
+        lengths = head.get("content-length")
+        if head.method != "POST" or query or head.get("transfer-encoding") or len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= 2048:
+            _reply(client, 400, {"ok": False, "error": "repo_invalid_request"})
+            return
+        try:
+            body, extra = _recv_exact(client, int(lengths[0]), head.rest)
+            if extra or not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+                raise ValueError()
+            # Fixed private container service only. No caller port/path/command.
+            conn = http.client.HTTPConnection(self.upstream_host, 9224, timeout=190)
+            try:
+                conn.request("POST", "/open", body, {"Content-Type": "application/json"})
+                response = conn.getresponse()
+                raw = response.read(4097)
+                if len(raw) > 4096:
+                    raise ValueError()
+                result = json.loads(raw)
+                if not isinstance(result, dict):
+                    raise ValueError()
+                _reply(client, 200 if response.status == 200 else 409, result)
+            finally:
+                conn.close()
+        except (ValueError, OSError, http.client.HTTPException):
+            _reply(client, 409, {"ok": False, "error": "repo_open_failed"})
 
     def _desktop_status(self, client, head, query):
         if head.method != "GET" or query or head.get("content-length") or head.get("transfer-encoding"):

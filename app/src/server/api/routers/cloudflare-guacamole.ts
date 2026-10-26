@@ -1,3 +1,4 @@
+import { canonicalRepository, requestRepositoryOpen, withRepositoryFolder } from '@/server/lib/compute/repo-open';
 /**
  * Cloudflare Guacamole/Neko Sandbox tRPC Router
  *
@@ -678,7 +679,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * the same extended `maxDuration` as `../preview-url/route.ts`.
      */
     codePreviewUrl: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({ computerId: z.string().uuid(), repo: z.string().regex(canonicalRepository).optional() }))
         .query(async ({ ctx, input, signal }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
@@ -710,19 +711,25 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
+            const openRepo = async () => input.repo === undefined ? null : requestRepositoryOpen(
+                config.workerUrl, hmacSecret, await controlTarget(ctx.db, ctx.user.id, input.computerId), computer, input.repo);
             if (routed.kind === 'aws-ec2') {
                 // WARM-118: after the ownership and billing gates, the (never-throwing) credential sync overlaps the
                 // first ensure. Both settle before any preview or relay preparation; an ensure rejection is rethrown
                 // only once the sync has drained, so nothing is left running. Cloudflare keeps its order below.
                 const [ensured] = await Promise.allSettled([routed.provider.ensure({ correlationId }, computer, ensureOptions), syncCredential()]);
                 if (ensured.status === 'rejected') throw ensured.reason;
-                return awsPreviewAnswer(
+                const answer = await awsPreviewAnswer(
                     ensured.value,
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
+                if (!answer.ok || input.repo === undefined) return answer;
+                const opened = await openRepo();
+                if (!opened?.ok) return opened!;
+                return { ...answer, codePreviewUrl: withRepositoryFolder(answer.codePreviewUrl, opened.folder) };
             }
             await syncCredential();
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
@@ -803,11 +810,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     provider: 'cloudflare-guacamole' as const,
                 };
             }
+            const opened = await openRepo();
+            if (opened && !opened.ok) return opened;
             if (verdict.kind === 'use') {
                 return {
                     ok: true as const,
                     correlationId,
-                    codePreviewUrl: verdict.url,
+                    codePreviewUrl: opened?.ok ? withRepositoryFolder(verdict.url, opened.folder) : verdict.url,
                     expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
                     provider: 'cloudflare-guacamole' as const,
                 };
@@ -842,7 +851,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const codeFolder = result.workspace?.mounted && result.workspace.mountPath
                 ? { folder: result.workspace.mountPath }
                 : undefined;
-            const codePreviewUrl = composeAppPreviewBootstrapUrl(codePreviewOrigin, token, '/', codeFolder);
+            const codePreviewUrl = composeAppPreviewBootstrapUrl(codePreviewOrigin, token, '/', opened?.ok ? { folder: opened.folder } : codeFolder);
 
             return {
                 ok: true as const,

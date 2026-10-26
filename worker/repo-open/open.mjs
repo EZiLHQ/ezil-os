@@ -1,0 +1,52 @@
+import { createHash } from 'node:crypto';
+import { lstat, realpath, mkdir, readFile } from 'node:fs/promises';
+import { resolve, join, sep } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execute = promisify(execFile);
+const canonical = /^https:\/\/github\.ezil\.work\/[a-z0-9][a-z0-9-]{0,63}\/(?![a-z0-9._-]*\.\.)(?![a-z0-9._-]*\.git\.git$)[a-z0-9][a-z0-9._-]{0,99}\.git$/;
+export function validateIntent(input) {
+    if (!input || typeof input !== 'object' || Object.keys(input).some(k => !['repo', 'userId'].includes(k))
+        || typeof input.repo !== 'string' || !canonical.test(input.repo)
+        || typeof input.userId !== 'string' || !/^[a-f0-9-]{36}$/.test(input.userId)) throw new Error('repo_invalid_request');
+    return input;
+}
+async function safeDirectory(path, create = false) {
+    if (create) await mkdir(path, { recursive: true, mode: 0o700 });
+    const stat = await lstat(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(path) !== path) throw new Error('repo_unsafe_destination');
+}
+export async function openRepository(input, { root = process.env.EZIL_WORKSPACE_ROOT, cli = '/opt/ezil-cli/ezil', run = execute, verifyPin = true } = {}) {
+    const { repo, userId } = validateIntent(input);
+    if (!root || !root.startsWith('/') || resolve(root) !== root) throw new Error('repo_workspace_unavailable');
+    await safeDirectory(root);
+    // Each ancestor is checked before descending: recursive mkdir must not follow a hostile parent.
+    let parent = root;
+    for (const name of ['.ezil-repositories', createHash('sha256').update(userId).digest('hex')]) {
+        parent = join(parent, name);
+        await safeDirectory(parent, true);
+    }
+    const folder = join(parent, createHash('sha256').update(repo).digest('hex'));
+    try { await safeDirectory(folder); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (verifyPin) {
+        try {
+            const pin = JSON.parse(await readFile('/opt/ezil-cli/pin.json', 'utf8'));
+            const digest = createHash('sha256').update(await readFile(cli)).digest('hex');
+            if (!pin.version || digest !== pin.sha256) throw new Error();
+        } catch { throw new Error('repo_cli_unavailable'); }
+    }
+    let result;
+    try {
+        const { stdout } = await run(cli, ['clone', repo, '--directory', folder, '--json'], { timeout: 180000, maxBuffer: 65536, shell: false });
+        result = JSON.parse(stdout);
+    } catch (error) {
+        let code;
+        try { code = JSON.parse(error.stdout).error?.code; } catch { /* No raw output escapes. */ }
+        throw new Error(code === 'auth-required' ? 'repo_auth_required' : code === 'repository-not-authorized' ? 'repo_not_authorized' : 'repo_clone_failed');
+    }
+    if (result?.canonicalUrl !== repo || result.folder !== folder || typeof result.accountId !== 'string' || !result.accountId
+        || !['cloned', 'reused'].includes(result.status)) throw new Error('repo_invalid_result');
+    await safeDirectory(folder);
+    if (!folder.startsWith(root + sep)) throw new Error('repo_unsafe_destination');
+    return { ok: true, folder, canonicalUrl: repo, status: result.status };
+}

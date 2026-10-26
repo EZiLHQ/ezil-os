@@ -1067,6 +1067,12 @@ case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' |
   return 0
 }
 
+# Dedicated private repository control service, using the existing persisted workspace.
+if [ -f /opt/ezil-repo-open/server.mjs ]; then
+  node /opt/ezil-repo-open/server.mjs >/tmp/ezil-repo-open.log 2>&1 9>&- &
+  SESSION_PID+=("$!")
+fi
+
 # ── X display ────────────────────────────────────────────────────────────────
 # Neko's desktop manager connects to $DISPLAY at startup and panics if it is
 # unavailable, so the X server MUST be up before `neko serve` launches. Keyed

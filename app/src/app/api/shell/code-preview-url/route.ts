@@ -63,9 +63,9 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '' } = (body ?? {}) as { computerId?: string };
+        const { computerId = '', repo } = (body ?? {}) as { computerId?: string; repo?: string };
 
-        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId });
+        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, repo });
 
         return shellJson(preview);
     } catch (err) {
