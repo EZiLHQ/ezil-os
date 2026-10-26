@@ -1,5 +1,5 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
-// only the server's summary can confirm the purchased plan.
+// the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
 import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy } from './billing-format.js';
 
@@ -15,6 +15,7 @@ export function parseBillingDeepLink (search) {
         : upgrade === 'compute' ? 'compute_monthly_v2' : upgrade === 'pro';
     params.delete('settings');
     params.delete('upgrade');
+    if ( params.get('section') === 'ai-credits' ) params.delete('section');
     const remaining = params.toString();
     return { initialTab: 'billing', openUpgrade, search: remaining ? `?${remaining}` : '' };
 }
@@ -77,7 +78,7 @@ const checkoutStatus = result => {
 
 // Checkout completion also covers delayed bank payments. Only the webhook-backed
 // summary below establishes the plan; neither this status nor onComplete is paid.
-const PAYMENT_PENDING_COPY = 'Payment confirmation is pending. Bank payments can take a few days. Your plan updates after payment is confirmed.';
+const PAYMENT_PENDING_COPY = 'Payment confirmation is pending. Bank payments can take a few days.';
 
 // Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
 // modal frames in body portals. Validate their URL only; never inspect their DOM.
@@ -91,7 +92,7 @@ function isStripeModalFrame (iframe) {
     } catch { return false; }
 }
 
-export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
+export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -110,11 +111,14 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     let deadline = 0;
     const timers = new Set();
     const v3 = sku.endsWith('_v3');
-    const name = v3 ? offer.name : planName(offer.family);
-    const price = dollars(offer.priceCents, { compact: true });
-    const allowance = v3 ? 'Usage included' : `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
+    const name = pack ? 'AI credits' : v3 ? offer.name : planName(offer.family);
+    const price = dollars(pack ? pack.totalCents : offer.priceCents, { compact: true });
+    const allowance = pack ? `${pack.aiCredits.toLocaleString('en-US')} AI credits`
+        : v3 ? 'Usage included' : `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
+    const title = pack ? 'Add AI credits' : `Subscribe to ${name}`;
+    const paymentUpdate = pack ? 'Your AI credits update after payment is confirmed.' : 'Your plan updates after payment is confirmed.';
     const frame = openSheetFrame({
-        container, title: `Subscribe to ${name}`, role: 'upgrade-sheet', onClose,
+        container, title, role: 'upgrade-sheet', onClose,
         canDismissBackdrop: () => ! busy && ! (confirming && ! finished),
         dispose: () => {
             closed = true;
@@ -139,12 +143,12 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         <div class="ezil-upgrade-columns">
             <details class="ezil-upgrade-summary" open>
                 <summary><span id="ezil-upgrade-title"></span><span class="ezil-upgrade-compact-title" hidden></span></summary>
-                <p class="ezil-upgrade-price"><span data-role="price"></span> <span>/month</span></p>
+                <p class="ezil-upgrade-price"><span data-role="price"></span>${pack ? '' : ' <span>/month</span>'}</p>
                 <p class="ezil-upgrade-caption">USD · before applicable tax<br>Any applicable tax is shown before you pay</p>
                 <ul class="ezil-upgrade-allowances"></ul>
                 <hr>
                 <div class="ezil-upgrade-total"><strong>Due today</strong><span>Total shown in the payment form</span></div>
-                <p class="ezil-upgrade-caption">Renews monthly until you cancel in Settings → Billing.</p>
+                <p class="ezil-upgrade-caption">${pack ? 'One-time payment. ' + paymentUpdate : 'Renews monthly until you cancel in Settings → Billing.'}</p>
                 <p class="ezil-upgrade-security"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Payments are processed securely by Stripe.</span></p>
             </details>
             <section class="ezil-upgrade-payment" aria-label="Secure payment">
@@ -152,11 +156,12 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
                 <div id="ezil-embedded-checkout"></div>
             </section>
         </div>`;
-    dialog.querySelector('#ezil-upgrade-title').textContent = `Subscribe to ${name}`;
-    dialog.querySelector('.ezil-upgrade-compact-title').textContent = `${name} · ${price}/month · before applicable tax`;
+    dialog.querySelector('#ezil-upgrade-title').textContent = title;
+    dialog.querySelector('.ezil-upgrade-compact-title').textContent = `${name} · ${price}${pack ? '' : '/month'} · before applicable tax`;
     dialog.querySelector('[data-role="price"]').textContent = price;
     let lines;
-    if ( v3 ) {
+    if ( pack ) lines = [allowance];
+    else if ( v3 ) {
         lines = offer.bullets;
         const included = doc.createElement('p');
         included.textContent = `${allowance}. Your plan takes effect after payment. Your AWS computer is prepared then.`;
@@ -217,10 +222,11 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         try { onDone?.(); } finally { close(); }
     }
     function showConfirmation (timeout = false) {
-        const message = paymentStatus === 'paid' ? 'Payment received. Waiting for your plan to update.'
-            : paymentStatus === 'no_payment_required' ? 'No payment is required. Waiting for your plan to update.'
-            : paymentStatus === 'unpaid' ? 'Your payment is processing. Bank payments can take a few days. Your plan updates after payment is confirmed.'
-            : PAYMENT_PENDING_COPY;
+        const waiting = `Waiting for your ${pack ? 'AI credits' : 'plan'} to update.`;
+        const message = paymentStatus === 'paid' ? `Payment received. ${waiting}`
+            : paymentStatus === 'no_payment_required' ? `No payment is required. ${waiting}`
+            : paymentStatus === 'unpaid' ? `Your payment is processing. Bank payments can take a few days. ${paymentUpdate}`
+            : `${PAYMENT_PENDING_COPY} ${paymentUpdate}`;
         const copy = timeout ? `${message} Check Settings → Billing for updates.` : message;
         if ( confirmationCopy === copy ) return;
         confirmationCopy = copy;
@@ -237,7 +243,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         finished = true;
         clearTimers();
         mount.hidden = true;
-        show(`You're on ${name}`, 'Done', returnToBilling);
+        show(pack ? paymentStatus === 'paid' ? 'Payment received' : 'Checkout complete' : `You're on ${name}`, 'Done', returnToBilling);
         state.dataset.role = 'upgrade-success';
         state.querySelector('button').dataset.action = 'done';
         const icon = doc.createElement('span');
@@ -245,7 +251,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         icon.setAttribute('aria-hidden', 'true');
         state.prepend(icon);
         const allowances = doc.createElement('p');
-        allowances.textContent = allowance;
+        allowances.textContent = pack ? 'Check your AI credits in Billing.' : allowance;
         state.querySelector('button').before(allowances);
         state.querySelector('button').focus();
     }
@@ -273,7 +279,8 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
             const summary = unwrap(await trpc.query('billing.summary'));
             if ( closed || finished ) return;
             if ( now() >= deadline ) { timedOut(); return; }
-            if ( summary?.plan?.sku === sku ) { success(); return; }
+            if ( pack ? summary?.enabled === true && summary.version === 3 && ['paid', 'no_payment_required'].includes(paymentStatus)
+                : summary?.plan?.sku === sku ) { success(); return; }
         } catch { /* A transient read failure must not imply that payment failed. */ }
         if ( ! closed && ! finished ) later(() => { void poll(); }, CONFIRM_POLL_MS);
     }
@@ -283,7 +290,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
      * and then never calls onComplete. While the form is open the sheet also
      * asks the server about the session itself. Completion starts verification;
      * it does not establish receipt of an asynchronous bank payment. Only the
-     * webhook-backed plan can make this sheet show success.
+     * webhook-backed plan can confirm a subscription; packs confirm receipt.
      */
     async function watchSession () {
         if ( closed || polling || finished ) return;
@@ -342,8 +349,9 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         busy = true;
         show('Preparing your checkout…');
         try {
-            session = unwrap(await trpc.mutate('billing.createCheckout', { sku }));
+            session = unwrap(await trpc.mutate(pack ? 'billing.createTopupCheckout' : 'billing.createCheckout', { sku }));
             if ( closed ) return;
+            if ( pack ) session = { ...session, mode: 'embedded' };
             if ( session.mode === 'redirect' ) {
                 const url = new URL(session.url, win.location.href);
                 if ( url.protocol !== 'https:' ) throw new Error('Could not open the secure checkout. Try again.');

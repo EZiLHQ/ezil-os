@@ -19,6 +19,8 @@ const source = (await build({
 })).outputFiles[0].text;
 const css = fs.readFileSync(new URL('./upgrade-sheet.css', import.meta.url), 'utf8');
 const embedded = { mode: 'embedded', sessionId: 'cs_test', clientSecret: 'test_client_secret', publishableKey: 'pk_test' };
+const pack = { sku: 'ai_pack_10_v1', aiCredits: 2000, totalCents: 1000, currency: 'usd' };
+const topupSession = { sessionId: embedded.sessionId, clientSecret: embedded.clientSecret, publishableKey: embedded.publishableKey };
 const standard = { enabled: true, version: 2, plan: { sku: 'standard_monthly_v2' } };
 const sizes = [
     { code: 'std-2', vcpu: 2, memoryGiB: 8, weight: 1 },
@@ -754,6 +756,106 @@ test('deep-link parsing consumes only billing intent and preserves other paramet
     assert.equal(parse('?upgrade=pro'), null, 'upgrade requires matching billing intent above');
     assert.equal(parse('?settings=billing&upgrade=team').openUpgrade, false, 'pro is accepted above');
     assert.equal(parse('?settings=%62illing&upgrade=%70ro').openUpgrade, true);
+});
+
+test('AI credits deep-link cleanup preserves unrelated query parameters', async h => {
+    const parse = search => JSON.parse(JSON.stringify(h.window.sheetApi.parseBillingDeepLink(search)));
+    assert.deepEqual(parse('?settings=billing&section=ai-credits&view=files&view=recent'), {
+        initialTab: 'billing', openUpgrade: false, search: '?view=files&view=recent',
+    });
+    assert.equal(parse('?settings=billing&section=unknown').search, '?section=unknown');
+    assert.equal(parse('?settings=account&section=ai-credits'), null);
+});
+
+test('AI pack checkout uses the exact SKU and mode-free embedded response with one-time copy', async h => {
+    h.create = async () => ({ ok: true, data: topupSession });
+    const first = h.open({ sku: pack.sku, pack, offer: undefined, sizes: undefined });
+    const same = h.open({ sku: pack.sku, pack, offer: undefined, sizes: undefined });
+    await settle();
+    assert.equal(same, first);
+    assert.equal(h.count('billing.createTopupCheckout'), 1);
+    assert.equal(h.count('billing.createCheckout'), 0);
+    assert.equal(JSON.stringify(h.calls[0].input), JSON.stringify({ sku: pack.sku }));
+    assert.equal(h.mounted, 1);
+    assert.match(h.text(), /Add AI credits/);
+    assert.match(h.text(), /2,000 AI credits/);
+    assert.match(h.text(), /One-time payment/);
+    assert.equal(h.q('[data-role="price"]').textContent, '$10');
+    assert.doesNotMatch(h.text(), /Subscribe|\/month|Renews|standard-hours/);
+    assert.equal(h.opens.length, 0);
+    h.handle.close();
+    assert.equal(h.document.activeElement, h.q('#opener'));
+    assert.equal(h.destroyed, 1);
+});
+
+for ( const paymentStatus of ['paid', 'no_payment_required', 'unpaid', null] ) {
+    test(`AI pack confirmation with ${paymentStatus} refreshes the summary and only confirms settled payment`, async h => {
+        h.create = async () => topupSession;
+        h.status = async () => ({ status: 'complete', paymentStatus, sku: pack.sku });
+        h.summary = async () => summaryV3();
+        h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+        assert.equal(h.calls.find(call => call.method === 'billing.checkoutStatus').input.sessionId, topupSession.sessionId);
+        assert.equal(h.count('billing.summary'), 1);
+        assert.doesNotMatch(h.text(), /You're on|credits added|Your plan updates/);
+        if ( ['paid', 'no_payment_required'].includes(paymentStatus) ) {
+            assert.ok(h.q('[data-role="upgrade-success"]'));
+            assert.match(h.text(), paymentStatus === 'paid' ? /Payment received/ : /Checkout complete/);
+            h.click('[data-action="done"]');
+        } else {
+            assert.equal(h.q('[data-role="upgrade-success"]'), null);
+            assert.match(h.text(), /Bank payments can take a few days\. Your AI credits update after payment is confirmed/);
+            await h.tick(60000);
+            assert.match(h.text(), /Check Settings → Billing for updates/);
+            assert.doesNotMatch(h.text(), /Payment received/);
+            h.click('[data-action="return-to-billing"]');
+        }
+        assert.equal(h.count('billing.createTopupCheckout'), 1);
+        assert.equal(h.done, 1);
+        assert.equal(h.closed, 1);
+        assert.equal(h.document.activeElement, h.q('#opener'));
+    });
+}
+
+test('AI pack retries loading the same checkout and provider portals retain focus ownership', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.summary = async () => summaryV3();
+    let attempts = 0;
+    h.open({ sku: pack.sku, pack, loadStripe: async key => {
+        if ( ++attempts === 1 ) throw new Error('offline');
+        return h.loadStripe(key);
+    } });
+    await settle(); h.click('[data-action="retry"]'); await settle();
+    assert.equal(h.count('billing.createTopupCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    const embeddedFrame = h.q('#ezil-embedded-checkout iframe');
+    embeddedFrame.focus();
+    const portal = providerPortal(h); await settle();
+    assert.equal(h.document.activeElement, portal.iframe);
+    assert.ok(sheet.hasAttribute('inert'));
+    portal.root.remove(); await settle();
+    assert.equal(h.document.activeElement, embeddedFrame);
+    assert.equal(sheet.hasAttribute('inert'), false);
+    await h.tick(4000);
+    assert.ok(h.q('[data-role="upgrade-success"]'), 'session watcher confirms a pack without onComplete');
+    h.click('[data-action="done"]');
+    assert.equal(h.document.activeElement, h.q('#opener'));
+    assert.equal(h.timers.size, 0);
+});
+
+test('AI pack confirmation waits for a successful summary read and can settle after bank processing', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'unpaid', sku: pack.sku });
+    h.summary = async () => summaryV3();
+    h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.summary = async () => { throw new Error('offline'); };
+    await h.tick(1500); assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    h.summary = async () => summaryV3();
+    await h.tick(1500); assert.ok(h.q('[data-role="upgrade-success"]'));
+    assert.equal(h.count('billing.createTopupCheckout'), 1);
 });
 
 test('default loader is single-flight, times out in 15 seconds and retries without a new session', async h => {
