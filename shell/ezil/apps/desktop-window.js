@@ -1061,6 +1061,8 @@ export async function openDesktopWindow (ctx = {}) {
     // always fed the identical state, in the same call, so there is no
     // sequence in which one shows a claim the other has not also made.
     const spinner = AppSpinner({
+        computerId: computer.id,
+        onProgressChange: () => { if (last_kind === 'progress') show_panel(); },
         label: `Opening ${ctx.appName || title}…`,
         isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
@@ -1103,7 +1105,7 @@ export async function openDesktopWindow (ctx = {}) {
      */
     const show_panel = () => {
         // Migration and fresh launch copy stay visible on the shared warm path too.
-        const show_phases = show_phase_list && !session.isComputeMigrating(computer.id) && !session.isComputeLaunching(computer.id);
+        const show_phases = show_phase_list && !spinner.hasComputerProgress() && !session.isComputeMigrating(computer.id) && !session.isComputeLaunching(computer.id);
         progress.el.hidden = ! show_phases;
         spinner.el.hidden = show_phases;
     };
@@ -2210,6 +2212,7 @@ export async function openDesktopWindow (ctx = {}) {
     // ── teardown ───────────────────────────────────────────────────────────
     /** Everything that must stop, whichever way this window ends. */
     const dispose = () => {
+        spinner.dispose();
         disposed = true;
         relay_renewal?.stop();
         document.removeEventListener('visibilitychange',on_relay_return);

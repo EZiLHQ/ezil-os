@@ -205,7 +205,7 @@ export async function openPreviewWindow (ctx = {}) {
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ label: 'Opening Preview…', isMigrating: () => session.isComputeMigrating(computer.id),
+    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Preview…', isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id), onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); },
         failureCopy: nativeSurface ? { title: 'Preview is unavailable', body: 'Start your development server in Code, register its port in Settings, then try again.' } : undefined });
     el_body.appendChild(progress.el);
@@ -486,6 +486,7 @@ export async function openPreviewWindow (ctx = {}) {
     }
 
     const dispose = () => {
+        progress.dispose();
         if (disposed) return;
         disposed = true;
         nativeSurface?.dispose();

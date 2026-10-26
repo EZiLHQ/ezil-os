@@ -4,8 +4,9 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
-const bundle = readFileSync(new URL('../../../app/public/os/bundle.min.js', import.meta.url), 'utf8');
-const icons = readFileSync(new URL('../../../app/public/os/icons.js', import.meta.url), 'utf8');
+const assets = process.env.EZIL_SHELL_OUT_DIR;
+const bundle = readFileSync(assets ? `${assets}/bundle.min.js` : new URL('../../../app/public/os/bundle.min.js', import.meta.url), 'utf8');
+const icons = readFileSync(assets ? `${assets}/icons.js` : new URL('../../../app/public/os/icons.js', import.meta.url), 'utf8');
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(fn) {
     for (let i = 0; i < 400; i++) { const value = fn(); if (value) return value; await wait(5); }
@@ -13,9 +14,10 @@ async function until(fn) {
 }
 
 const copies = {
-    moving: ['Moving your computer to AWS (India)', 'This first start takes a few minutes. Your files come with you.'],
-    launching: ['Starting a fresh computer…', 'This start can take a few minutes.'],
-    both: ['Moving your computer to AWS (India)', 'This first start takes a few minutes. Your files come with you.'],
+    paused: ['Computer operations are paused', 'Check this view later. No transfer is currently running.'],
+    moving: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
+    launching: ['Starting computer', 'Startup is in progress. A finish time is not available.'],
+    both: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
 };
 
 async function open(t, app, initialMode = 'moving') {
@@ -29,7 +31,7 @@ async function open(t, app, initialMode = 'moving') {
     w.addEventListener('error', e => errors.push(e.message));
     t.after(() => assert.deepEqual(errors, []));
     const timeout = w.setTimeout.bind(w), interval = w.setInterval.bind(w);
-    w.setTimeout = (fn, ms, ...args) => timeout(fn, ms === 1500 ? 5 : ms === 4000 ? 15 : ms, ...args);
+    w.setTimeout = (fn, ms, ...args) => timeout(fn, ms === 5000 ? 5 : ms === 1500 ? 5 : ms === 4000 ? 15 : ms, ...args);
     w.setInterval = (fn, ms, ...args) => interval(fn, ms === 250 ? 5 : ms, ...args);
     w.AbortSignal = { timeout: () => undefined };
     let mode = initialMode, now = 0;
@@ -38,7 +40,10 @@ async function open(t, app, initialMode = 'moving') {
     w.fetch = async (raw, init = {}) => {
         const path = String(raw);
         let body = { ok: true };
-        if (['/api/shell/desktop', '/api/shell/code-preview-url', '/api/shell/preview-url'].includes(path) && init.method === 'POST') {
+        if (path.includes('/api/trpc/computer.progress')) {
+            const stage = mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : 'starting';
+            body = {result:{data:{json:{version:1,computerId:'computer-1',stage,recordedStage:'provisioning',operationsPaused:mode==='paused',active:mode!=='paused',operation:['moving','both','paused'].includes(mode)?'migration':'opening',durable:['moving','both','paused'].includes(mode),resumePolicy:'saved_workspace_only',bytes:{transferred:null,total:null},percent:null,etaSeconds:null}}}};
+        } else if (['/api/shell/desktop', '/api/shell/code-preview-url', '/api/shell/preview-url'].includes(path) && init.method === 'POST') {
             asks[path.includes('code') ? 'code' : path.includes('preview') ? 'preview' : 'desktop']++;
             body = mode === 'ready'
                 ? { ok: true, guacamoleUrl: 'https://viewer.example/?embed=1', codePreviewUrl: 'https://code.example/', appPreviewUrl: 'https://preview.example/', frame: { confirmed: true } }
@@ -68,6 +73,13 @@ async function open(t, app, initialMode = 'moving') {
 }
 
 for (const app of ['code', 'desktop', 'preview']) {
+    test(`${app}: authoritative pause wins over recorded migration and hides active transfer`, async t => {
+        const h = await open(t, app, 'paused');
+        assert.equal(h.spinner.querySelector('.ezil-app-spinner-ring').hidden, true);
+        assert.equal(h.spinner.querySelector('ol'), null);
+        assert.match(h.spinner.textContent, /Unsaved changes inside apps are not guaranteed/);
+        assert.doesNotMatch(h.spinner.textContent, /Moving your computer|\d+%/);
+    });
     for (const mode of ['moving', 'launching']) {
         test(`${app}: built loader shows ${mode} copy, then ordinary progress and a ready frame beyond the old deadline`, async t => {
             const h = await open(t, app, mode);
@@ -80,11 +92,11 @@ for (const app of ['code', 'desktop', 'preview']) {
             await wait(20);
             assert.equal(h.spinner.dataset.kind, 'progress');
             h.setMode('waking');
-            await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent.startsWith('Opening '));
-            assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').hidden, true);
+            await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Attaching saved workspace');
+            assert.match(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, /retained workspace volume/);
             if (app === 'desktop') {
-                assert.equal(h.spinner.hidden, true);
-                assert.equal(h.win.querySelector('.ezil-boot').hidden, false);
+                assert.equal(h.spinner.hidden, false);
+                assert.equal(h.win.querySelector('.ezil-boot').hidden, true);
             }
             h.setNow(mode === 'moving' ? 480_000 : 400_000); // Migration restarts at commit; replacement retains its original deadline.
             h.setMode('ready');
