@@ -2,7 +2,9 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
-import { aiBalanceState, enqueueFreeAiCredits, readAiBalance } from '@/server/billing/ai-balance';
+import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { readAiUsage } from '@/server/billing/ai-usage';
+import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
 import type { BillingDeps, StripeApi } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
@@ -11,7 +13,7 @@ import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/b
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3 } from '@/server/billing/v3/summary';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
-import type { BillingSummaryV3Result, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
+import type { SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
     CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
     type SizeCode,
@@ -109,10 +111,10 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference: null,
                 hasCustomer: false, computerId: input?.computerId });
         }),
-        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV3Result> => {
+        summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
             if (!deps.config.tabEnabled) return { enabled: false };
-            const aiBalance = readAiBalance({ config: deps.config, userId: ctx.user.id, headers: ctx.headers });
+            const aiRead = readAiAccount({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
             const now = deps.now();
             const [subs, userCreatedAt, planChanges] = await Promise.all([
                 deps.store.subscriptionsFor(ctx.user.id),
@@ -147,9 +149,26 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal,
             });
             await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
-            summary.ai.balance = await aiBalance;
-            summary.ai.state = aiBalanceState(summary.ai.balance, summary.ai.grant.amount);
-            return summary;
+            const ai = await aiRead;
+            ai.balanceState = aiMicroBalanceState(ai.balanceMicro, summary.ai.grant.amount);
+            return { ...summary, ai: { ...summary.ai, ...ai,
+                // Older consumers cannot describe a pause. They must not call it healthy or exhausted.
+                state: ai.spendingState === 'available' ? ai.balanceState : 'unavailable' } };
+        }),
+
+        aiUsage: protectedProcedure.input(z.object({
+            limit: z.number().int().min(1).max(50).default(20),
+            before: z.string().datetime({ offset: true }).optional(),
+        }).strict().default({ limit: 20 })).query(async ({ ctx, input, signal }) => {
+            const deps = getDeps();
+            if (!deps.config.tabEnabled) return { state: 'unavailable' as const, recentUsage: null };
+            return readAiUsage({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal }, input);
+        }),
+
+        aiLimits: protectedProcedure.query(async ({ ctx, signal }) => {
+            const deps = getDeps();
+            if (!deps.config.tabEnabled) return { state: 'unavailable' as const, limits: null };
+            return readAiLimits({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
         }),
 
         createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
