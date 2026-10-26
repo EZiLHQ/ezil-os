@@ -48,13 +48,14 @@ for(const [stage,title] of [['operations_paused','Computer startup is temporaril
  assert.equal(value.active,false);
  assert.equal(value.steps.length,0,'underlying recordedStage never drives the paused display');
  assert.equal(value.transfer,null);
- if(stage!=='queued')assert.equal(value.guidance,'');
- else assert.match(value.guidance,/You can close this window/);
+ // A paused, operator-held or waiting move never claims the files keep moving.
+ assert.equal(value.guidance,stage!=='failed_reopened'&&moving.durable===true&&moving.resumePolicy==='saved_workspace_only'?'You can reopen this view to check the saved migration. Unsaved changes inside apps are not guaranteed. Progress resumes only when operations allow it.':'');
+ assert.doesNotMatch(value.guidance,/keep moving/);
 }
 for(const override of [{operationsPaused:true,needsOperator:true},{paused:true,needsOperator:true},{stage:'operations_paused',needsOperator:true}]) {
  const value=progressView({...moving,...override},'qa-computer');
  assert.equal(value.stage,'operations_paused');assert.equal(value.active,false);
- assert.equal(value.steps.length,0);assert.equal(value.transfer,null);assert.equal(value.guidance,'');
+ assert.equal(value.steps.length,0);assert.equal(value.transfer,null);assert.doesNotMatch(value.guidance,/keep moving/);
 }
 assert.equal(progressView({...base,needsOperator:true},'qa-computer').stage,'needs_operator');
 assert.equal(progressView(base,'someone-else'),null);

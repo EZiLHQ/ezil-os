@@ -17,9 +17,9 @@ const copies = {
     attention: ['Computer needs attention', 'Check the computer’s current status before trying again.'],
     unavailable: ['Opening', 'Detailed computer progress is unavailable.'],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
-    moving: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
+    moving: ['Getting your AWS computer', 'Waiting for the new computer before restoring the saved workspace.'],
     launching: ['Starting computer', 'Startup is in progress. A finish time is not available.'],
-    both: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
+    both: ['Getting your AWS computer', 'Waiting for the new computer before restoring the saved workspace.'],
 };
 
 async function open(t, app, initialMode = 'moving') {

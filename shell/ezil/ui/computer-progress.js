@@ -59,8 +59,12 @@ export function progressView(data, computerId) {
         active: data.active === true && !['operations_paused', 'needs_operator', 'queued', 'unavailable', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
         steps: current >= 0 ? migrationSteps.map((label, i) => ({ label, state: i < current ? 'complete' : i === current ? 'current' : 'pending' })) : [],
         transfer,
-        guidance: data.operation === 'migration' && (current >= 0 || stage === 'queued')
-            ? `Moving your files to AWS. ${duration}. You can close this window — your files keep moving, and your computer will be ready when you come back.` : '',
+        // Only a running move may promise the files keep moving; a paused or waiting one says so honestly.
+        guidance: data.operation !== 'migration' ? ''
+            : ['operations_paused', 'needs_operator', 'queued'].includes(stage)
+                ? data.durable === true && data.resumePolicy === 'saved_workspace_only'
+                    ? 'You can reopen this view to check the saved migration. Unsaved changes inside apps are not guaranteed. Progress resumes only when operations allow it.' : ''
+                : current >= 0 ? `Moving your files to AWS. ${duration}. You can close this window — your files keep moving, and your computer will be ready when you come back.` : '',
         next,
         updated: typeof data.updatedAt === 'string' && Number.isFinite(Date.parse(data.updatedAt))
             ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(data.updatedAt)) : null,
