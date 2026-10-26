@@ -44,7 +44,7 @@ async function fixture(privateInput = false) {
     } }), { mode: 0o600 });
     if (privateInput) await rm(join(auth, 'cli-session.json'));
     const git = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-    const source = join(root, 'source'); execFileSync(git, ['init', '-q', source]);
+    const source = join(root, 'source'); execFileSync(git, ['init', '-q', '-b', 'main', source]);
     await writeFile(join(source, 'fixture.txt'), 'known fixture\n');
     execFileSync(git, ['-C', source, 'add', 'fixture.txt']);
     execFileSync(git, ['-C', source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture']);
