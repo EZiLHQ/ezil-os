@@ -52,6 +52,17 @@ export async function proxyMigrationRestore(req: Request, params: RestoreParams)
             const value = result.data.headers.get(name);
             if (value !== null) headers.set(name, value);
         }
+        if (params.index !== undefined && result.data.status === 200 && result.data.body) {
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await Promise.race([
+                    store.recordRestoreChunk(migration, params.kind, Number(params.index)),
+                    new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('restore_progress_timeout')), 250); }),
+                ]);
+            } catch {
+                console.warn('[compute.migration.restore] progress unavailable', { migrationId: migration.id });
+            } finally { clearTimeout(timeout); }
+        }
         return new Response(result.data.body, { headers });
     } catch {
         return new Response(null, { status: 503, headers: noStore });
