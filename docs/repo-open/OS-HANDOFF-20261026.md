@@ -98,3 +98,43 @@ two Worker wire cases and five app handoff cases. Both TypeScript checks pass. N
 The real-Git supervisor fixture models cooperative CLI cleanup; exact rebuilt CLI integration remains a separate gate.
 Full Next build compiled and passed TypeScript but page collection failed for missing server environment variables.
 No AWS, lease, deployment, or credential actions were taken for this correction.
+
+## Final reviewed CLI integration (supersedes pending CLI metadata above)
+
+Coordinator reports independent final CLI review passed at ee2e552bc7eba3aaa2de0ab37fe0d9a6d1705140,
+version 0.2.1-repo-url-open.20261026.4.1. The OS pin now names that exact source/artifact:
+- tarball SHA256 a51b3b4032b4e70c32db9bf3959d6f7f398f5e2035cc0a2252612393faf50ee9
+- bundled executable SHA256 5356e5ebadff4872e699cd1d4589eaab8311e657dc2b69d07c37e4e18bdb4e98
+- private directory /data/openclaw/projects/ezil/EZiL-CLI-private-artifacts/repo-url-open-20261026-v4-r2
+
+Installer validation accepts the reviewed revision suffix. Supervisor retains bounded cancellation output
+only to recognize the pinned CLI's exact clone-failed/recovery-required envelope. CLI self-escalation maps
+to repo_recovery_required even when CLI exits normally; forced OS termination has the same classification.
+Timeout output never becomes a successful handoff. No lock/temp cleanup was added to the supervisor.
+
+Validation on Node v24.15.0: 11 focused Node tests passed with zero skips, including three runs of the exact
+checksum-verified packaged CLI through openRepository and the real OS Python supervisor. Synthetic local
+whoami/grant responses and a test Git shim isolate network/auth: graceful cancellation blocks a real Git HTTP
+child; retry performs a real local Git clone. Tests verify known fixture/origin handling, grant cancellation
+on an existing dirty checkout, successful reuse, all captured child PIDs absent, unrelated process and dirty
+repository untouched, and preserved unknown lock/temp state after both CLI and OS forced termination.
+
+Measured operation totals with a shortened 1200ms deadline and unchanged production 3000ms grace:
+- normal cancellation approximately 1.28s (then successful clone/reuse and dirty-state preservation)
+- CLI 500ms self-escalation approximately 1.79s, recovery required
+- OS forced termination approximately 4.30s total, exercising the entire 3s grace, recovery required
+The test asserts deadline+grace+500ms scheduling allowance; normal operation deadline remains 180000ms.
+Command: EZIL_TEST_PRIVATE_CLI_BUNDLE=<private-v4-r2>/package/dist/ezil.js node --test
+worker/repo-open/open.test.mjs worker/repo-open/supervise.test.mjs worker/repo-open/packaged-cli.test.mjs
+
+No-network/read-only local desktop image smoke used temporary /opt/ezil-cli storage and read-only artifact
+mounts: installer accepted v4-r2, CLI reported exact version, installed bundle hash matched. Image tested:
+sha256:34acdd284c19d826f93979d857f875c8e3896aea6dff87f5c3dfeafd25f297f3.
+This is a cached local image smoke, not a build of the final release image or deployed-runtime evidence.
+Python3 is explicitly installed in worker/Dockerfile; local image reports 3.10.12 with working subreaper prctl.
+AWS uses the selected desktop rootfs by digest; its host build also pins Python3 and seccomp permits prctl.
+Final image/host packaging and live target remain unverified. No AWS calls, lease writes or deployment occurred.
+
+Remaining gates: independent final OS delta review, final private staging image/host build, refreshed AWS access,
+lease/target/isolation/fixture verification, deployed artifact/rollback inventory and actual authenticated staging
+VS Code exact-folder/reopen/access-control acceptance. Goal remains paused per coordinator.
