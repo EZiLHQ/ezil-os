@@ -148,7 +148,7 @@ Responses:
   - Gateway seams: `src/store.ts` RPC methods `operatorSessionCreate/Resolve/Revoke` (`operator_session_*`), `adminDirectory` (`admin_directory`), `integrationBalance` (`integration_balance`, v1.1), and `EntitlementEventArgs.action` widened to `"grant"|"revoke"|"restore"`;
   - `src/app.ts` routes `GET /auth/auth0/login`, `GET /auth/auth0/callback`, `POST /auth/logout`, `POST /v1/integrations/balance`, `GET /v1/admin/directory`, all 501 stubs, plus a `principalFor` hook calling `operatorSessionPrincipal()` (stub returns null);
   - `Principal.via` += `"auth0_operator"`;
-  - console splice of `DIRECTORY_JS` and `PLAYGROUND_JS` (empty stub modules);
+  - console splice of `DIRECTORY_JS` and `PLAYGROUND_JS` (empty stub modules) and the Controls nav entries `directory` and `playground` (`src/console/observe.ts`, W0.1);
   - `test/live/lib.mjs` route list;
   - this contract (Gateway `docs/UNIFIED-CREDITS-CONTRACT-v1.md`; OS `docs/billing/UNIFIED-CREDITS-CONTRACT-v1.md`).
 - **Lead (integration)**:
@@ -157,8 +157,8 @@ Responses:
   - `scripts/os-staging/sql/30_operator_auth0{,.rollback}.sql`;
   - `.github/production-migrations.json` snapshot registration; integration of all lanes.
 - **Existing auth worker** (prod-lineage RAM worktree): standalone portable C1 helper modules + tests only.
-- **New G2 DIRECTORY**: `src/admin/directory.ts`, `src/console/directory.ts` (+1 tab line in `src/console/script.ts`), `scripts/os-staging/sql/31_admin_directory{,.rollback}.sql`, new tests.
-- **New G3 PLAYGROUND**: `src/console/playground.ts` (+1 tab line in `src/console/script.ts`), new tests.
+- **New G2 DIRECTORY**: `src/admin/directory.ts`, `src/console/directory.ts` (defines `VIEWS.directory`), `scripts/os-staging/sql/31_admin_directory{,.rollback}.sql`, new tests.
+- **New G3 PLAYGROUND**: `src/console/playground.ts` (defines `VIEWS.playground`), new tests.
 - **New G4 ENROLLMENT**: `scripts/os-staging/sql/20_enroll_members{,.rollback}.sql`, `docs/OS-STAGING.md` (enrollment section only), new tests.
 - **New G5 LEDGER**: `src/entitlements.ts` (accept `restore`), `scripts/os-staging/sql/32_entitlement_restore{,.rollback}.sql`, new tests. `src/integrations-balance.ts` stays a 501 seam (v1.1).
 - **Existing O-credits worker**: v1 delivery retry (`no_ai_account` → retry), top-up nullable guard (explicit configuration + synthetic fixtures, live fail-closed), Stripe inbox payload-digest conflict, narrow ports and webhook changes. Follow-up after G5 lands: OS `ai_restore` enqueue/delivery per §5 (root scopes it).
