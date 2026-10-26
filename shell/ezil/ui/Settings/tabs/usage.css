@@ -2,34 +2,51 @@
 .ezil-settings-usage { container-type: inline-size; min-width: 0; padding-bottom: 12px; }
 .ezil-settings-usage .usage-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .ezil-settings-usage .usage-heading h3 { margin: 0; }
-.ezil-settings-usage .usage-refresh-status { min-height: 18px; margin: 4px 0; font-size: 12px; color: var(--muted); }
-
-.ezil-settings-usage .usage-section { padding: 16px 0; border-bottom: 1px solid var(--border); }
-.ezil-settings-usage h4 { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
-.ezil-settings-usage .usage-unit { font-size: 12px; font-weight: 400; text-transform: none; letter-spacing: normal; }
-.ezil-settings-usage .usage-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
-.ezil-settings-usage .usage-label { display: block; font-size: 12px; color: var(--muted); }
-.ezil-settings-usage .usage-metrics strong { display: block; font-size: 26px; line-height: 1.3; font-weight: 600; overflow-wrap: anywhere; }
+.ezil-settings-usage .usage-refresh-status { min-height: 18px; margin: 4px 0 12px; font-size: 12px; color: var(--muted); }
+.ezil-settings-usage .usage-plan { display: flex; justify-content: space-between; gap: 12px; padding: 12px; margin-bottom: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.ezil-settings-usage .usage-plan-copy { min-width: 0; }
+.ezil-settings-usage .usage-plan-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.ezil-settings-usage [data-action="usage-billing"] { padding: 0; border: 0; background: none; color: var(--muted); font-size: 12px; }
+.ezil-settings-usage .ezil-settings-btn { display: inline-block; max-width: 100%; white-space: normal; text-align: center; text-decoration: none; }
+.ezil-settings-usage h4 { margin: 0; color: var(--text); font-size: 14px; font-weight: 600; line-height: 20px; text-transform: none; letter-spacing: normal; }
+.ezil-settings-usage .usage-meters { display: grid; gap: 16px; }
+.ezil-settings-usage .usage-section { min-width: 0; }
+.ezil-settings-usage .usage-meter-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 6px; }
+.ezil-settings-usage .usage-value { text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .ezil-settings-usage .usage-capacity { height: 6px; border-radius: 3px; overflow: hidden; background: var(--surface-2); }
-.ezil-settings-usage .usage-capacity > span { display: block; height: 100%; background: var(--accent); }
-.ezil-settings-usage .usage-capacity-full > span { background: var(--warn); }
-.ezil-settings-usage .usage-capacity-caption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; font-size: 12px; color: var(--muted); margin: 8px 0 10px; }
-.ezil-settings-usage .usage-session-line { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin: 8px 0; }
-.ezil-settings-usage .usage-runtime { font-size: 20px; line-height: 1.4; font-weight: 600; }
-.ezil-settings-usage .usage-meter { font-size: 12px; color: var(--muted); }
-.ezil-settings-usage .usage-note, .ezil-settings-usage .usage-updated { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 6px 0; }
-.ezil-settings-usage .usage-updated { margin-top: 12px; }
-.ezil-settings-usage .usage-warning { color: var(--warn); font-size: 12px; }
+.ezil-settings-usage .usage-capacity > span { display: block; height: 100%; background: var(--accent); transition: none; }
+.ezil-settings-usage .usage-fill { min-width: 2px; }
+.ezil-settings-usage .usage-caption { display: flex; justify-content: space-between; align-items: baseline; gap: 4px 12px; margin-top: 4px; }
+.ezil-settings-usage .usage-caption .ezil-settings-btn { flex-shrink: 0; }
+.ezil-settings-usage .usage-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
+.ezil-settings-usage .usage-warn .usage-capacity > span { background: var(--warn); }
+.ezil-settings-usage .usage-danger .usage-capacity > span { background: var(--danger); }
+.ezil-settings-usage .usage-warn :is(.usage-value, .usage-note), .ezil-settings-usage .usage-warning { color: var(--warn); }
+.ezil-settings-usage .usage-danger :is(.usage-value, .usage-note) { color: var(--danger); }
+.ezil-settings-usage .usage-unavailable .usage-value { color: var(--muted); }
+.ezil-settings-usage .usage-banner { padding: 12px; margin-bottom: 12px; border: 1px solid var(--danger); border-radius: 8px; background: var(--surface); }
+.ezil-settings-usage .usage-banner strong { color: var(--danger); }
+.ezil-settings-usage .usage-banner p { margin: 4px 0 8px; font-size: 12px; }
+.ezil-settings-usage .usage-session-line { border-top: 1px solid var(--border); padding-top: 12px; margin: 16px 0 12px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.ezil-settings-usage .usage-details { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.ezil-settings-usage details { min-width: 0; max-width: 100%; }
+.ezil-settings-usage details[open] { flex-basis: 100%; }
 .ezil-settings-usage dl { margin: 0; }
 .ezil-settings-usage .usage-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 8px; margin: 6px 0; font-size: 12px; line-height: 1.5; }
 .ezil-settings-usage dt { color: var(--muted); overflow-wrap: anywhere; }
 .ezil-settings-usage dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
 .ezil-settings-usage summary { cursor: pointer; color: var(--muted); font-size: 12px; width: fit-content; max-width: 100%; }
 .ezil-settings-usage summary:hover { color: var(--text); }
-.ezil-settings-usage summary:focus-visible, .ezil-settings-usage button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.ezil-settings-usage :is(summary, button, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .ezil-settings-usage details[open] summary { margin-bottom: 8px; }
-@container (max-width: 290px) {
-    .ezil-settings-usage .usage-metrics { grid-template-columns: 1fr; }
-    .ezil-settings-usage .usage-row { grid-template-columns: 1fr; gap: 2px; }
-    .ezil-settings-usage dd { text-align: left; }
+.ezil-settings-usage .usage-announcement { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@container ezil-settings-window (max-width: 600px) {
+    .ezil-settings-usage .usage-plan { padding: 0; border: 0; border-radius: 0; background: none; }
+}
+@container (max-width: 420px) {
+    .ezil-settings-usage .usage-plan, .ezil-settings-usage .usage-caption { flex-direction: column; align-items: stretch; }
+    .ezil-settings-usage .usage-plan-actions { align-items: stretch; }
+    .ezil-settings-usage .usage-plan-actions .ezil-settings-btn-primary,
+    .ezil-settings-usage .usage-caption .ezil-settings-btn,
+    .ezil-settings-usage .usage-banner .ezil-settings-btn-primary { width: 100%; }
 }
