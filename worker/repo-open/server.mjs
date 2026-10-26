@@ -7,7 +7,7 @@ const server = createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/open') { res.writeHead(404); return res.end('{}'); }
     try {
         let raw = '';
-        for await (const chunk of req) { raw += chunk; if (Buffer.byteLength(raw) > 2048) throw new Error('repo_invalid_request'); }
+        for await (const chunk of req) { raw += chunk; if (Buffer.byteLength(raw) > 16384) throw new Error('repo_invalid_request'); }
         res.end(JSON.stringify(await openRepository(JSON.parse(raw))));
     } catch (error) {
         const allowed = ['repo_timeout', 'repo_recovery_required', 'repo_auth_required', 'repo_not_authorized', 'repo_invalid_request', 'repo_workspace_unavailable', 'repo_unsafe_destination', 'repo_cli_unavailable', 'repo_clone_failed', 'repo_invalid_result'];

@@ -1,3 +1,4 @@
+import { launchGrant } from '@/server/project-repositories/session';
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
@@ -63,12 +64,22 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', repo } = (body ?? {}) as { computerId?: string; repo?: string };
+        const { computerId = '', repo, projectLaunch } = (body ?? {}) as { computerId?: string; repo?: string; projectLaunch?: boolean };
 
-        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, repo });
+        // Ownership is verified before redemption; never redeem for an arbitrary computer.
+        await caller.computer.get({ id: computerId });
+        if (projectLaunch !== undefined && projectLaunch !== true) return shellJson({ error: { code: 'BAD_REQUEST', message: 'Invalid repository launch.' } }, 400);
+        const projectGrant = projectLaunch ? await launchGrant(ctx.user.id, computerId) : undefined;
+        if (projectLaunch && !projectGrant) return shellJson({ error: { code: 'project_repo_not_authorized', message: 'Repository launch expired. Open the project again.' } }, 403);
+        if (projectGrant && repo !== undefined && projectGrant.binding.canonicalURL !== repo) {
+            return shellJson({ error: { code: 'project_repo_not_authorized' } }, 403);
+        }
+        const authorized = appRouter.createCaller({ ...ctx, projectGrant }, { signal: req.signal });
+        const preview = await authorized.cloudflareGuacamole.codePreviewUrl({ computerId, repo: projectGrant?.binding.canonicalURL ?? repo });
 
         return shellJson(preview);
     } catch (err) {
+        if (err instanceof Error && /^project_repo_/.test(err.message)) return shellJson({ error: { code: err.message, message: 'Repository launch could not be authorized. Open the project again.' } }, ['project_repo_configuration_required', 'project_repo_identity_unavailable'].includes(err.message) ? 503 : 403);
         return shellErrorResponse(err, 'POST /api/shell/code-preview-url');
     }
 }

@@ -441,7 +441,7 @@ class Edge:
 
     def _repo_open(self, client, head, digest, query):
         lengths = head.get("content-length")
-        if head.method != "POST" or query or head.get("transfer-encoding") or len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= 2048:
+        if head.method != "POST" or query or head.get("transfer-encoding") or len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= 16384:
             _reply(client, 400, {"ok": False, "error": "repo_invalid_request"})
             return
         try:

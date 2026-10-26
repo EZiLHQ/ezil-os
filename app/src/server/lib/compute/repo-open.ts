@@ -1,3 +1,4 @@
+import type { PrivateGrant } from '@/server/project-repositories/contract';
 import { createHash } from 'node:crypto';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
 import type { ControlTarget } from './aws-control-auth';
@@ -13,7 +14,7 @@ export function withRepositoryFolder(url: string, folder: string): string {
     parsed.searchParams.set('folder', folder);
     return parsed.toString();
 }
-export async function requestRepositoryOpen(workerUrl: string, secret: string, target: ControlTarget, computer: ComputerRef, repo: string) {
+export async function requestRepositoryOpen(workerUrl: string, secret: string, target: ControlTarget, computer: ComputerRef, repo: string, grant?: PrivateGrant) {
     const failure = (error = 'repo_open_failed') => ({ ok: false as const, error, errorCode: error,
         message: error === 'repo_recovery_required' ? 'Repository operation was forcibly stopped. Verified recovery is required before retrying.'
             : error === 'repo_timeout' ? 'Repository operation timed out and stopped. Retry the request.'
@@ -21,7 +22,7 @@ export async function requestRepositoryOpen(workerUrl: string, secret: string, t
     if (!canonicalRepository.test(repo) || !secret) return failure('repo_invalid_request');
     try {
         const endpoint = new URL(`/sandbox/${target.sandboxName}/repo-open`, workerUrl);
-        const body = JSON.stringify({ repo, userId: computer.userId });
+        const body = JSON.stringify({ repo, userId: computer.userId, ...(grant ? { grant } : {}) });
         const claims = target.auth.kind === 'v2' ? target.auth.claims : {
             sandboxId: target.sandboxName, computerId: computer.computerId, userId: computer.userId,
             provider: 'cloudflare' as const, store: '' as const, generation: 0, leaseEpoch: 0,
