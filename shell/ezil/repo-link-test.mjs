@@ -9,3 +9,6 @@ assert.deepEqual(parseAppLink('?app=code&repo=', apps), { id: 'code', repo: '' }
 assert.equal(parseAppLink('?app=code&repo=a&repo=b', apps), null);
 assert.deepEqual(parseAppLink('?app=browser&repo=' + encodeURIComponent(repo), apps), { id: 'desktop' });
 console.log('repo-link checks passed');
+
+assert.deepEqual(parseAppLink('?app=code&projectLaunch=1', apps), { id: 'code', projectLaunch: true });
+assert.deepEqual(parseAppLink('?app=code&projectLaunch=', apps), { id: 'code', projectLaunch: true }); // missing server state must fail closed

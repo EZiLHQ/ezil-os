@@ -1,3 +1,4 @@
+vi.mock('@/server/project-repositories/session', () => ({ retainProjectIdentity: vi.fn(async () => {}) }));
 import { createHmac, hkdfSync } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';

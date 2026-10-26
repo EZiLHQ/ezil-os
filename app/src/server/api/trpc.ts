@@ -14,6 +14,7 @@ import { initTRPC, TRPCError } from '@trpc/server';
 import superjson from 'superjson';
 import { ZodError } from 'zod';
 
+import type { PrivateGrant } from '@/server/project-repositories/contract';
 import type { User } from '@supabase/supabase-js';
 
 import { db } from '@/server/db';
@@ -46,7 +47,7 @@ export const createTRPCContext = async (opts: { headers: Headers }) => {
             ? (await supabase.auth.getUser()).data.user
             : bearerUser;
 
-    return { db, user, headers: opts.headers };
+    return { db, user, headers: opts.headers, ...({} as { projectGrant?: PrivateGrant }) };
 };
 
 const t = initTRPC.context<typeof createTRPCContext>().create({

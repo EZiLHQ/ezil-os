@@ -712,7 +712,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
             const openRepo = async () => input.repo === undefined ? null : requestRepositoryOpen(
-                config.workerUrl, hmacSecret, await controlTarget(ctx.db, ctx.user.id, input.computerId), computer, input.repo);
+                config.workerUrl, hmacSecret, await controlTarget(ctx.db, ctx.user.id, input.computerId), computer, input.repo, ctx.projectGrant);
             if (routed.kind === 'aws-ec2') {
                 // WARM-118: after the ownership and billing gates, the (never-throwing) credential sync overlaps the
                 // first ensure. Both settle before any preview or relay preparation; an ensure rejection is rethrown

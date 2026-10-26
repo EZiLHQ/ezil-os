@@ -5,7 +5,7 @@ vi.mock('server-only', () => ({}));
 const jar = vi.hoisted(() => ({ set: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => jar }));
 
-import { AUTH0_COOKIE, AUTH0_ISSUER, auth0Enabled, buildAuthorizeUrl, exchangeCode, readTransaction, verifyIdToken } from './auth0';
+import { AUTH0_COOKIE, AUTH0_ISSUER, auth0Enabled, buildAuthorizeUrl, exchangeCode, readTransaction, verifyIdToken, verifyProjectIdToken } from './auth0';
 
 const secret = 'test-client-secret-do-not-log';
 const clientId = 'test-client';
@@ -204,5 +204,20 @@ describe('code exchange', () => {
         if (failure === 'network') fetchMock.mockRejectedValue(new Error(secret));
         else fetchMock.mockResolvedValue(Response.json({ error_description: secret }, { status: failure === 'http' ? 400 : 200 }));
         await expect(exchangeCode('code', { origin: 'https://os-staging.ezil.work', codeVerifier: 'verifier' })).rejects.toThrow(/^token_exchange_failed$/);
+    });
+});
+
+
+describe('Works ID-token identity verification', () => {
+    it('accepts a single exact audience without azp and returns no email identity', async () => {
+        expect(await verifyProjectIdToken(await token())).toEqual({issuer: AUTH0_ISSUER, subject: 'auth0|one', expiresAt: (now + 300) * 1000});
+    });
+    it.each([{aud:'foreign'}, {iss:'https://other.invalid/'}, {azp:'foreign'}, {aud:[clientId,'another']}, {aud:[clientId,'*'],azp:clientId}, {exp:now-1}, {iat:now+100}, {gty:'client-credentials'}])('rejects invalid exchange claims %j', async claims => {
+        await expect(verifyProjectIdToken(await token(claims))).rejects.toMatchObject({code:'invalid_id_token'});
+    });
+    it('accepts proper multi-audience azp and refuses a tampered signature', async () => {
+        await expect(verifyProjectIdToken(await token({aud:[clientId,'another'],azp:clientId}))).resolves.toMatchObject({subject:'auth0|one'});
+        const t = await token();
+        await expect(verifyProjectIdToken(t.slice(0,-10)+'AAAAAAAAAA')).rejects.toMatchObject({code:'invalid_id_token'});
     });
 });

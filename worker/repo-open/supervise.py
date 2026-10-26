@@ -42,7 +42,10 @@ def main():
     if stopping:
         return 124
     child = subprocess.Popen(sys.argv[3:], start_new_session=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             pass_fds=(3,) if '--grant-fd=3' in sys.argv[3:] else ())
+    if '--grant-fd=3' in sys.argv[3:]:
+        os.close(3)
     if stopping:  # signal during Popen must not leave its just-created group running
         try:
             os.killpg(child.pid, signal.SIGTERM)

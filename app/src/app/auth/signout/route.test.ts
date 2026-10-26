@@ -1,3 +1,4 @@
+vi.mock('@/server/project-repositories/session', () => ({ clearProjectIdentity: vi.fn(async () => {}) }));
 /**
  * `POST /auth/signout`. The Supabase client is stubbed at the module boundary,
  * as in `../confirm/confirm-route.test.ts`, so these prove control flow — the

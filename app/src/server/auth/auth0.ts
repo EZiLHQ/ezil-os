@@ -168,3 +168,28 @@ export function logoutUrl(origin: string): URL {
     url.search = new URLSearchParams({ client_id: config().clientId, post_logout_redirect_uri: `${new URL(origin).origin}/login` }).toString();
     return url;
 }
+
+/** Independent ID-token verification for the Works v1.1 exchange, with no expiry leeway. */
+export async function verifyProjectIdToken(token: string) {
+    const { clientId } = config();
+    try {
+        if (token.length > 16384) throw new Error();
+        const parts = token.split('.');
+        if (parts.length !== 3 || !parts.every(p => /^[\w-]+$/.test(p))) throw new Error();
+        const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+        if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid || header.crit) throw new Error();
+        let key = (await signingKeys()).find(k => k.kid === header.kid);
+        if (!key) key = (await signingKeys(true)).find(k => k.kid === header.kid);
+        if (!key || key.kty !== 'RSA' || (key.alg && key.alg !== 'RS256') || (key.use && key.use !== 'sig')) throw new Error();
+        const publicKey = await crypto.subtle.importKey('jwk', key, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, new Uint8Array(Buffer.from(parts[2], 'base64url')), new TextEncoder().encode(`${parts[0]}.${parts[1]}`))) throw new Error();
+        const c = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+        const audiences = typeof c.aud === 'string' ? [c.aud] : c.aud;
+        const now = Date.now() / 1000;
+        if (c.iss !== AUTH0_ISSUER || !Array.isArray(audiences) || !audiences.length || !audiences.every(a => typeof a === 'string' && a && !a.includes('*'))
+            || !audiences.includes(clientId) || (audiences.length > 1 && c.azp !== clientId) || (c.azp !== undefined && c.azp !== clientId)
+            || c.gty === 'client-credentials' || typeof c.sub !== 'string' || !c.sub || c.sub.length > 255
+            || !Number.isFinite(c.exp) || c.exp <= now || !Number.isFinite(c.iat) || c.iat > now || c.iat >= c.exp) throw new Error();
+        return { issuer: AUTH0_ISSUER, subject: c.sub as string, expiresAt: c.exp * 1000 };
+    } catch { throw new Auth0Error('invalid_id_token'); }
+}

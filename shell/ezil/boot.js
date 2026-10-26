@@ -840,7 +840,7 @@ async function build (payload) {
         appLinkListenerBound = true;
         window.addEventListener('popstate', () => {
             const link = parseAppLink(window.location.search, current_apps);
-            if (link) void registry.launch(link.id, { ...registry.launchContext(current_ctx), initialTab: link.initialTab });
+            if (link) void registry.launch(link.id, { ...registry.launchContext(current_ctx), initialTab: link.initialTab, repo: link.repo, projectLaunch: link.projectLaunch });
         });
     }
 
@@ -936,7 +936,7 @@ async function build (payload) {
     }
 
     if (appLink && !billingLink) {
-        await registry.launch(appLink.id, { ...registry.launchContext(ctx), initialTab: appLink.initialTab, repo: appLink.repo });
+        await registry.launch(appLink.id, { ...registry.launchContext(ctx), initialTab: appLink.initialTab, repo: appLink.repo, projectLaunch: appLink.projectLaunch });
     }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire

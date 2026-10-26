@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
 import { AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, auth0Enabled, exchangeCode, readTransaction, verifyIdToken } from '@/server/auth/auth0';
+import { retainProjectIdentity } from '@/server/project-repositories/session';
 import { bridgeAuth0Identity } from '@/server/auth/bridge';
 import { safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
@@ -16,6 +17,8 @@ export async function GET(request: NextRequest) {
         const token = await exchangeCode(code, { origin: ownedPublicOrigin(request.headers, request.url), codeVerifier: transaction.codeVerifier });
         const identity = await verifyIdToken(token, { nonce: transaction.nonce });
         await bridgeAuth0Identity(identity);
+        // Additive: failures cannot turn a normal OS login into a Works authorization.
+        try { await retainProjectIdentity(token); } catch { /* launch fails closed without retained identity */ }
         destination = safeReturnUrl(transaction.returnUrl);
     } catch (error) {
         const code = error instanceof Auth0Error ? error.code : 'auth0_failed';

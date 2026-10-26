@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 
 import { isCrossOriginWrite, isDocumentNavigation } from '@/utils/request-origin';
+import { trustedOrigin } from '@/server/project-repositories/contract';
 import { updateSession } from '@/utils/supabase/middleware';
 
 /**
@@ -10,6 +11,9 @@ import { updateSession } from '@/utils/supabase/middleware';
  * convention is deprecated" build warning.
  */
 export async function proxy(request: NextRequest) {
+    // The launch form creates only an opaque pending intent, never an authenticated operation.
+    if (request.method === 'POST' && request.nextUrl.pathname === '/api/project-repositories/launch'
+        && !request.nextUrl.search && trustedOrigin(request.headers.get('origin'), process.env.PROJECT_REPO_CALLER_ORIGINS)) return NextResponse.next();
     // Before the session is touched: a refused request must not refresh it.
     if (isCrossOriginWrite(request)) {
         // A refused form submission is a page the user is looking at; give it
