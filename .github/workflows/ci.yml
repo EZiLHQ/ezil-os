@@ -220,6 +220,7 @@ jobs:
                    shell/ezil/native-test.mjs \
                    shell/ezil/native-persistence-test.mjs \
                    shell/ezil/app-link-test.mjs \
+                   shell/ezil/ui/Settings/sheet-frame-test.mjs \
                    shell/ezil/ui/Settings/usage-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \

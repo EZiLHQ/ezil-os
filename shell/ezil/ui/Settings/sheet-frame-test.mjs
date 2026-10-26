@@ -1,14 +1,19 @@
 // Simulated provider portals in jsdom; no Stripe transport or cross-origin DOM.
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
-const require = createRequire(import.meta.url);
-const { build } = require(require.resolve('esbuild', { paths: [fileURLToPath(new URL('../../../../app/', import.meta.url))] }));
-const source = (await build({ stdin: {
-    contents: "import { openSheetFrame } from './sheet-frame.js'; window.openSheetFrame = openSheetFrame;",
-    resolveDir: fileURLToPath(new URL('.', import.meta.url)),
-}, bundle: true, write: false, format: 'iife', target: 'es2022' })).outputFiles[0].text;
+// Use the pinned Bun already available in the shell CI lane.
+const buildDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sheet-frame-source-'));
+let source;
+try {
+    const entry = path.join(buildDir, 'entry.js');
+    await fs.writeFile(entry, `import { openSheetFrame } from ${JSON.stringify(fileURLToPath(new URL('./sheet-frame.js', import.meta.url)))}; window.openSheetFrame = openSheetFrame;`);
+    source = execFileSync('bun', ['build', entry, '--target=browser', '--format=iife'], { encoding: 'utf8' });
+} finally { await fs.rm(buildDir, { recursive: true, force: true }); }
 const settle = async () => { for ( let i = 0; i < 10; i++ ) await Promise.resolve(); };
 const turn = () => new Promise(resolve => setTimeout(resolve, 10));
 const providerURL = 'https://js.stripe.com/v3/linked-accounts-inner-0123456789abcdef0123456789abcdef.html';
