@@ -1,47 +1,17 @@
-// app-spinner.js — EZiL-authored. Not Puter code.
-//
-// "Opening an app" instead of "booting a machine": a rotating ring and one
-// line of copy, no phase list, no "waking your machine" / "mounting your
-// files" vocabulary. The owner, directly: "The user doesn't care about any
-// of that... App opening should be like opening an app — a circular thing
-// rotates a few seconds, then it opens."
-//
-// ── Who uses this, and why it is not just a smaller BootProgress ──────────
-// `preview.js` and `code.js` are plain HTTP iframes with no machine to boot —
-// they used `BootProgress` anyway, rendering "Waking your machine" and four
-// container phases describing nothing that is actually happening to an HTML
-// document. They now use this instead, exclusively. An observed upgrade
-// migration or fresh replacement launch gets its own copy while observed.
-//
-// `apps/desktop-window.js` (a REAL streamed container) keeps `BootProgress`
-// too, but opens showing THIS component and only reveals the phase panel
-// after `PHASE_LIST_AFTER_MS` — see that file. A warm open never sees a
-// phase list; a genuinely long cold boot earns the detail because it is
-// genuinely taking longer.
-//
-// ── Same input, same honesty rules, deliberately no new ones ──────────────
-// This takes the exact same `BootUiState` `computeBootUiState` produces and
-// draws the same `BOOT_FAILURE_COPY` / `BOOT_NOT_CONFIGURED_COPY` any other
-// boot surface in this codebase draws. It invents nothing of its own: for an
-// HTML document (Preview, Code) "the origin answered without an error
-// status" genuinely is the whole question, and this component's honesty
-// obligation stops exactly where `computeBootUiState`'s does.
-//
-// ── 🔴 NO TIMERS OF ITS OWN ──────────────────────────────────────────────
-// The caller owns the clock — the same rule `boot-progress.js` follows, for
-// the same reason: a component that can start its own timer can eventually
-// be tempted to invent progress on one. The ring's rotation is pure CSS
-// (`@keyframes` in `ezil-shell.css`), and `render()` never schedules a
-// callback of any kind. `app-spinner-test.mjs` asserts this file's source
-// contains none of the browser's deferred-callback APIs, so it is physically
-// unable to regress. (That sentence is phrased this way, rather than naming
-// the two APIs outright, so the guard's own grep does not trip over its own
-// doc comment.)
+// EZiL app loading surface. Physical app readiness remains owned by the caller.
+// Hosted computers also show protected, read-only computer.progress observations.
+// Paused/operator/queued states override recorded migration intent; none animate.
+// The separate observer owns polling and disposal, never allocation or fake progress.
+// Without an authoritative observation, do not infer a transfer from launch flags.
+// Native/local callers retain the original BootUiState and retry behavior.
 
 import {
     BOOT_FAILURE_COPY,
     BOOT_NOT_CONFIGURED_COPY,
 } from '../boot-phases.js';
+
+import { observeComputerProgress } from './computer-progress.js';
+import { isNative } from '../native-runtime.js';
 
 import { LAUNCH_COPY } from '../launch-copy.js';
 
@@ -66,7 +36,7 @@ const MIGRATION_COPY = {
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific
  *   failure guidance. Changes wording only, never readiness or retry behavior.
  */
-export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
+export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', onRetry, failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     root.setAttribute('role', 'status');
@@ -77,6 +47,7 @@ export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigr
             <div class="ezil-app-spinner-ring" aria-hidden="true"></div>
             <h1 class="ezil-boot-title ezil-app-spinner-label"></h1>
             <p class="ezil-boot-sub ezil-app-spinner-sub" hidden></p>
+            <div class="ezil-computer-progress" hidden></div>
             <div class="ezil-boot-actions">
                 <button type="button" class="ezil-boot-retry">Try again</button>
             </div>
@@ -88,6 +59,13 @@ export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigr
     const el_actions = root.querySelector('.ezil-boot-actions');
     const el_retry = root.querySelector('.ezil-boot-retry');
 
+    const el_detail = root.querySelector('.ezil-computer-progress');
+    let observation = null, latestState = null, progressChecked = false, paintedObservation = null;
+    const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, onChange: value => {
+        observation = value; progressChecked = true;
+        if (latestState) render(latestState);
+        onProgressChange?.();
+    } }) : null;
     el_label.textContent = label;
     el_actions.hidden = true;
 
@@ -101,8 +79,49 @@ export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigr
      * @param {import('../boot-phases.js').BootUiState} state
      */
     function render (state) {
+        latestState = state;
         root.setAttribute('data-kind', state.kind);
+        const pending = state.kind === 'progress' || state.kind === 'failed';
+        if (pending) observer?.start(); else {
+            observer?.stop(); observation = null; progressChecked = false;
+        }
+        const showObservation = pending && observation && (state.kind === 'progress' || ['operations_paused', 'needs_operator', 'queued'].includes(observation.stage));
+        const fingerprint = showObservation ? JSON.stringify([state.kind, observation]) : null;
+        if (fingerprint !== null && fingerprint === paintedObservation) return;
+        paintedObservation = fingerprint;
+        el_detail.hidden = true;
+        if (showObservation) {
+            el_ring.hidden = !observation.active;
+            el_label.textContent = observation.title;
+            el_sub.hidden = false; el_sub.textContent = observation.body;
+            el_actions.hidden = !(observation.stage === 'failed_reopened'
+                || (state.kind === 'failed' && observation.stage === 'needs_operator' && !observation.manualAttention));
+            el_detail.replaceChildren(); el_detail.hidden = false;
+            if (observation.steps.length) {
+                const list = document.createElement('ol'); list.setAttribute('aria-label', 'Saved migration stages');
+                for (const step of observation.steps) {
+                    const item = document.createElement('li'); item.textContent = step.label; item.dataset.state = step.state;
+                    if (step.state === 'current') item.setAttribute('aria-current', 'step');
+                    list.appendChild(item);
+                }
+                el_detail.appendChild(list);
+            }
+            for (const text of [observation.guidance, observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : '']) {
+                if (!text) continue;
+                const line = document.createElement('p'); line.textContent = text; el_detail.appendChild(line);
+            }
+            return;
+        }
 
+        if (state.kind === 'progress' && observer) {
+            // Optional AWS/migration metadata must not replace physical app startup.
+            el_ring.hidden = false;
+            el_label.textContent = label;
+            el_sub.hidden = !progressChecked;
+            el_sub.textContent = progressChecked ? 'Detailed computer progress is unavailable.' : '';
+            el_actions.hidden = true;
+            return;
+        }
         if ( state.kind === 'progress' ) {
             const copy = isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
             el_ring.hidden = false;
@@ -142,7 +161,7 @@ export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy, isMigr
         // "did pixels arrive" question).
     }
 
-    return { el: root, render };
+    return { el: root, render, hasComputerProgress: () => observation !== null, dispose: () => observer?.stop() };
 }
 
 export default AppSpinner;

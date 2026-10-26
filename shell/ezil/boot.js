@@ -86,9 +86,11 @@ import registry from './apps/registry.js';
 import { watchBillingSessionEnd } from './ui/Settings/session-end.js';
 import { parseBillingDeepLink } from './ui/Settings/upgrade-sheet.js';
 import { warm } from './warm.js';
+import { parseAppLink } from './app-link.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
 let nativePersistence = null;
 let billingDeepLinkHandled = false;
+let appLinkListenerBound = false;
 let stopBillingSessionEnd = null;
 
 const PHASE = 'ezil-os:boot';
@@ -833,6 +835,14 @@ async function build (payload) {
     const apps = registry.resolve(payload);
     current_apps = apps;
     current_ctx = ctx;
+    const appLink = parseAppLink(window.location.search, apps);
+    if (!appLinkListenerBound) {
+        appLinkListenerBound = true;
+        window.addEventListener('popstate', () => {
+            const link = parseAppLink(window.location.search, current_apps);
+            if (link) void registry.launch(link.id, { ...registry.launchContext(current_ctx), initialTab: link.initialTab });
+        });
+    }
 
     // The taskbar. Built BEFORE the window, so it exists for
     // `exit_fullpage_mode` to un-hide rather than have to re-create, and so
@@ -894,7 +904,7 @@ async function build (payload) {
     }
 
     console.info(`[${PHASE}] desktop + taskbar painted in ${(performance.now() - t0).toFixed(1)}ms`);
-    if (nativeDesktop) nativePersistence = await restoreNativeDesktop(nativeDesktop, ctx, registry.launch);
+    if (nativeDesktop) nativePersistence = await restoreNativeDesktop(nativeDesktop, ctx, registry.launch, { onlyApp: appLink?.id });
 
     // 🔴 LOGIN OPENS NOTHING (W3). The wallpaper and dock above ARE the boot —
     // nobody asked to watch a machine start. The owner, directly: "The moment
@@ -913,17 +923,20 @@ async function build (payload) {
 
     // A return link is explicit launch intent. Reserve it before awaiting the
     // launcher so a shell rebuild cannot open the same checkout twice.
-    const billingLink = ! billingDeepLinkHandled && parseBillingDeepLink(window.location.search);
+    const billingLink = appLink?.id === 'settings' && ! billingDeepLinkHandled && parseBillingDeepLink(window.location.search);
     if ( billingLink ) {
         billingDeepLinkHandled = true;
         const { initialTab, openUpgrade, search } = billingLink;
         try {
-            if ( payload.features?.billing === true ) {
-                await registry.launch('settings', { ...ctx, initialTab, openUpgrade });
-            }
+            await registry.launch('settings', { ...ctx, initialTab,
+                openUpgrade: payload.features?.billing === true ? openUpgrade : false });
         } finally {
             window.history.replaceState(window.history.state, '', `${window.location.pathname}${search}${window.location.hash}`);
         }
+    }
+
+    if (appLink && !billingLink) {
+        await registry.launch(appLink.id, { ...registry.launchContext(ctx), initialTab: appLink.initialTab });
     }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire

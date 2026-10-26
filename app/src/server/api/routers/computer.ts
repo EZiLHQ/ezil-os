@@ -35,6 +35,7 @@ import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare'
 import { AWS_RETIREMENT_UNDERWAY } from '@/server/lib/compute/aws-ec2';
 import type { PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
+import { readComputerProgress } from '@/server/lib/compute/progress';
 import { readSystemInfo } from '@/server/lib/compute/system-info';
 import { routeComputer } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
@@ -222,6 +223,19 @@ export const computerRouter = createTRPCRouter({
             const info = await readSystemInfo(ctx.db as unknown as PlacementExecutor, { computerId: input.computerId, userId: ctx.user.id });
             if (!info) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
             return info;
+        }),
+
+    /** Recorded progress only: this query cannot start or reconcile a computer. */
+    progress: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            const owned = await ctx.db.query.computers.findFirst({
+                where: liveOwnedComputer(ctx.user.id, input.computerId), columns: { id: true },
+            });
+            if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            const progress = await readComputerProgress(ctx.db as unknown as PlacementExecutor, { computerId: input.computerId, userId: ctx.user.id });
+            if (!progress) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            return progress;
         }),
 
     /** Rename a computer. Ownership-scoped. */

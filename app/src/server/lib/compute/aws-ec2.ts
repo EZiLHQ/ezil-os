@@ -639,10 +639,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             }
             switch (placement.state) {
                 case 'RUNNING':
-                    if (!resizeTo) return { ok: true };
-                    // The replace workflow gracefully stops the old running instance.
-                    // Admission below credits its slot and reserves the new type atomically.
-                    // falls through
+                    // A size preference applies to the next session, not a refresh or app open.
+                    // Retain this session's hardware and billing epoch until normal Stop.
+                    return { ok: true };
                 case 'UNCONFIRMED':
                 case 'STOPPED': {
                     if (placement.state === 'UNCONFIRMED' && placement.lastError !== ENROLLMENT_FAILED) {
@@ -815,15 +814,25 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
          * host's own idle stop (600 s without gateway presence) is unchanged.
          */
         async activity(_ctx, c, s): Promise<ActivityResult> {
+            const presenceAt = new Date(now().getTime() - s.lastInputAgoMs);
             const cfg = configured();
             if (!cfg.ok) return { ok: false, error: cfg.code };
             const found = await ownPlacement(c);
             if (!found || found.provider !== 'aws-ec2') return { ok: false, error: 'aws_placement_missing' };
             let p = (await reconcileOwn(c, found, cfg.deployments, cfg.e, false)).placement;
             if (p.state !== 'RUNNING') return { ok: false, error: `placement_${p.state.toLowerCase()}` };
-            p = await renewLease(c, p, new Date(now().getTime() - s.lastInputAgoMs));
-            const { limit } = await reconcileOwn(c, p, cfg.deployments, cfg.e);
-            return limit ? { ok: false, error: limit } : { ok: true };
+            p = await renewLease(c, p, presenceAt);
+            const { limit, placement: current } = await reconcileOwn(c, p, cfg.deployments, cfg.e);
+            if (limit) return { ok: false, error: limit };
+            if (current.state !== 'RUNNING') return { ok: false, error: `placement_${current.state.toLowerCase()}` };
+            // Only accepted fresh owner presence observes an active billing epoch.
+            // A release/stale beat must not make an unattended session look active.
+            if (s.lastInputAgoMs < AWS_PRESENCE_FRESH_MS) {
+                await recordComputeMeter(() => deps.meter?.heartbeat({
+                    ...c, at: presenceAt,
+                }));
+            }
+            return { ok: true };
         },
         restart: (ctx, c) => requestAwsRestart(deps.db, c, ctx.correlationId, env()),
         /**

@@ -1,0 +1,6 @@
+.ezil-computer-progress { max-width: 440px; margin: 16px auto 0; font-size: 13px; line-height: 1.5; text-align: left; overflow-wrap: anywhere; }
+.ezil-computer-progress ol { padding-left: 24px; margin: 0 0 12px; }
+.ezil-computer-progress li { margin: 4px 0; opacity: .65; }
+.ezil-computer-progress li[data-state="complete"] { opacity: .85; }
+.ezil-computer-progress li[aria-current="step"] { font-weight: 600; opacity: 1; }
+.ezil-computer-progress p { margin: 8px 0; }

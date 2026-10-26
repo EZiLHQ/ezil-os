@@ -23,7 +23,10 @@ for (const surface of ['code', 'preview']) {
     window.fetch = async (raw, init = {}) => {
         const url = new URL(raw, window.location.origin); requests.push({ url, method: init.method ?? 'GET' });
         let body;
-        if (url.pathname === '/api/shell/desktop' && init.method === 'POST') {
+        if (url.pathname === '/api/trpc/computer.progress') {
+            assert.equal(init.method ?? 'GET', 'GET', 'progress is strictly read-only');
+            body = { result: { data: { json: { version: 1, stage: 'unavailable', operation: 'none' } } } };
+        } else if (url.pathname === '/api/shell/desktop' && init.method === 'POST') {
             await wait(10); running = true;
             body = { ok: true, guacamoleUrl: 'http://127.0.0.1:8181/', frame: { confirmed: true } };
         } else if (url.searchParams.get('confirm') === 'frame') {
@@ -47,7 +50,9 @@ for (const surface of ['code', 'preview']) {
         await wait(20);
     }
     assert.ok(frame?.src.startsWith(surface === 'code' ? 'http://127.0.0.1:8443/' : 'http://127.0.0.1:3002/'));
-    assert.equal(requests[0].method, 'POST'); assert.equal(requests[0].url.pathname, '/api/shell/desktop');
+    const physicalRequests = requests.filter(request => request.url.pathname !== '/api/trpc/computer.progress');
+    assert.equal(physicalRequests[0].method, 'POST'); assert.equal(physicalRequests[0].url.pathname, '/api/shell/desktop');
+    assert.equal(physicalRequests.filter(request => request.method === 'POST' && request.url.pathname === '/api/shell/desktop').length, 1, 'exactly one normal cold start');
     frame.dispatchEvent(new window.Event('load')); await wait(40);
     assert.ok(requests.some(request => request.url.searchParams.get('surface') === surface));
     assert.equal(window.document.querySelector(`.window[data-app="${surface}"] .ezil-app-spinner`).hidden, true,

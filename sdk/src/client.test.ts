@@ -11,7 +11,7 @@ import superjson from 'superjson';
 
 import { createEzilClient } from './client';
 import { EzilError } from './errors';
-import type { SystemInfo } from './types';
+import type { SystemInfo, ComputerProgress } from './types';
 
 /** A `fetch` that records what it was asked and replies with a canned body. */
 const stub = (reply: { status?: number; body: unknown }) => {
@@ -85,6 +85,25 @@ describe('createEzilClient', () => {
         expect(url.pathname).toBe('/api/trpc/computer.systemInfo');
         expect(JSON.parse(url.searchParams.get('input')!)).toEqual({ json: { computerId: 'c1' } });
         expect(got).toEqual(info);
+    });
+
+    it('reads computer progress with one authenticated GET and preserves unavailable measurements', async () => {
+        const progress = { version: 1, computerId: 'c1', observedAt: '2026-10-26T11:00:00Z',
+            operation: 'migration', stage: 'operations_paused', recordedStage: 'provisioning',
+            lifecycleState: 'STOPPED', paused: true, operationsPaused: true, needsOperator: false,
+            active: false, startedAt: null, updatedAt: null, durable: true, resumePolicy: 'saved_workspace_only',
+            bytes: { transferred: null, total: null }, percent: null, etaSeconds: null,
+            hardware: { instanceType: 'm6i.large', source: 'placement' }, selectedNextOpenHardware: null,
+        } satisfies ComputerProgress;
+        const { fetchImpl, seen } = stub({ body: ok(progress) });
+        expect(await client(fetchImpl).computers.progress('c1')).toEqual(progress);
+        expect(seen).toHaveLength(1);
+        const request = seen[0]!;
+        expect(request.init.method).toBe('GET');
+        expect(new Headers(request.init.headers).get('authorization')).toBe('Bearer tok');
+        const url = new URL(request.url);
+        expect(url.pathname).toBe('/api/trpc/computer.progress');
+        expect(JSON.parse(url.searchParams.get('input')!)).toEqual({ json: { computerId: 'c1' } });
     });
 
     it('sends mutations as POST with the input in the body', async () => {

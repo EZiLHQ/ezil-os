@@ -353,7 +353,7 @@ describe('billing router', () => {
         const f = fixture();
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, clientReferenceId: owner });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(1, session.id);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(2, session.id);
@@ -361,9 +361,25 @@ describe('billing router', () => {
 
     it.each(['open', 'complete', 'expired'] as const)('maps %s from a fresh Stripe read', async status => {
         const f = fixture();
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status, paymentStatus: 'paid' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: status === 'open' ? 'pending' : status });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledWith(session.id);
+    });
+
+    it('keeps a completed delayed payment pending until the actual payment succeeds, without granting', async () => {
+        const f = fixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'unpaid' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
+        expect(f.store.insertGrant).not.toHaveBeenCalled();
+        expect(f.store.upsertSubscription).not.toHaveBeenCalled();
+    });
+
+    it('allows a complete receipt that requires no payment', async () => {
+        const f = fixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'no_payment_required' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
     });
 
     it.each(['', 'cs_', 'pi_fixture', 'cs_bad/path', 'cs_bad?query'])('rejects malformed session id %s before reading Stripe', async sessionId => {
@@ -938,5 +954,29 @@ describe('v3 Premium machine selection', () => {
         const f = fixture();
         await expect(f.router.createCaller({ ...f.ctx, user: null }).selectMachine({ size: 'cmp-8' })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
+    });
+});
+
+describe('billing.usage read-only boundary', () => {
+    it('authenticates, scopes all reads and has no external or write effects', async () => {
+        const f = fixture();
+        const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('No external calls allowed'));
+        const result = await f.caller.usage();
+        expect(result).toMatchObject({ enabled: true, version: 1, egress: { state: 'unavailable', usedBytes: null } });
+        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor'] as const)
+            expect(f.store[name].mock.calls[0][0]).toBe(userId);
+        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor']);
+        for (const [name, method] of Object.entries(f.store)) if (!reads.has(name)) expect(method).not.toHaveBeenCalled();
+        for (const method of Object.values(f.stripe)) expect(method).not.toHaveBeenCalled();
+        expect(fetch).not.toHaveBeenCalled();
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).usage()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+    it('does not reveal a foreign computer and makes no reads when disabled', async () => {
+        const f = fixture(); f.store.computerOwner.mockResolvedValue('another-user');
+        await expect(f.caller.usage({ computerId: '22222222-2222-4222-8222-222222222222' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(f.store.epochsFor).not.toHaveBeenCalled();
+        f.deps.config.tabEnabled = false;
+        await expect(f.caller.usage()).resolves.toEqual({ enabled: false });
+        expect(f.store.subscriptionsFor).not.toHaveBeenCalled();
     });
 });

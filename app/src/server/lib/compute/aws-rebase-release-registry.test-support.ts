@@ -84,3 +84,30 @@ export function fixtureReleaseRegistry13() {
     return { ...f, release119, retained: [...f.retained, release119],
         deployment119: { ...f.deployment118, amiId: release119.amiId } };
 }
+
+/** Synthetic fourteenth record; not actual 1.0.20 release proof. */
+export function fixtureReleaseRegistry14() {
+    const f = fixtureReleaseRegistry13();
+    const release120 = { ...f.release119, amiId: 'ami-00000000000000014', recipeVersion: '1.0.20',
+        createdAt: '2026-10-23T20:00:00.000Z' };
+    return { ...f, release120, retained: [...f.retained, release120],
+        deployment120: { ...f.deployment119, amiId: release120.amiId } };
+}
+
+/** Synthetic fifteenth record; not actual 1.0.21 release proof. */
+export function fixtureReleaseRegistry15() {
+    const f = fixtureReleaseRegistry14();
+    const release121 = { ...f.release120, amiId: 'ami-00000000000000015', recipeVersion: '1.0.21',
+        createdAt: '2026-10-24T20:00:00.000Z' };
+    return { ...f, release121, retained: [...f.retained, release121],
+        deployment121: { ...f.deployment120, amiId: release121.amiId } };
+}
+
+/** Synthetic sixteenth record; not actual 1.0.22 release proof. */
+export function fixtureReleaseRegistry16() {
+    const f = fixtureReleaseRegistry15();
+    const release122 = { ...f.release121, amiId: 'ami-00000000000000016', recipeVersion: '1.0.22',
+        createdAt: '2026-10-25T20:00:00.000Z' };
+    return { ...f, release122, retained: [...f.retained, release122],
+        deployment122: { ...f.deployment121, amiId: release122.amiId } };
+}
