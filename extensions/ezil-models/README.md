@@ -77,9 +77,25 @@ request logging is enabled. Cancellation aborts fetch, stops reporting parts,
 and logs `cancelled; may still be charged (request …)`.
 
 The model picker optionally reconciles disabled entries using `/models`, cached
-for five minutes per base URL and auth context. `EZiL Models: Show AI Credits`
-(`ezil-models.showCredits`) reads `/me/balance` and `/models` for credit/pause
-states. No other network paths are used by this provider.
+for five minutes per base URL and auth context. The EZiL AI status item,
+`Show AI Status` and `EZiL Models: Show AI Credits` read `/me/balance`,
+`/me/limits`, `/me/usage?limit=5` and the global `/models` pause catalog using
+the same boot bearer. All four reads bypass HTTP caches, refuse redirects and
+share refresh cancellation, with a five-second deadline per read. They show
+window credits and reset time,
+effective account limits capped by platform ceilings, per-model limits,
+entitlement, scoped pauses and recent usage. Model/client pause targets are
+not returned by the member endpoint, so those pauses are shown as potentially
+applicable. Global pauses use the transport's shared reconciliation/operations
+classification. Failed, missing or malformed reads replace the affected values
+with unknown/unavailable states while retaining other valid data. Sign-in and
+expired-session failures show guidance without raw error codes. Zero and held
+credits and exhausted windows/budgets come from server values, with exact
+microcredit formatting and local reset times. Status refreshes at startup,
+after requests, on config changes and once a minute; the popover and tooltip
+share the same snapshot. Cancelled, superseded and stale-auth responses cannot
+publish. These are source changes; the bundled VSIX and image must be rebuilt
+and verified separately before the new status is live.
 
 Source of truth: EZiL AI Gateway `src/providers/bedrock-converse-request.ts`,
 `src/providers/bedrock-converse-response.ts`, `src/protocols/anthropic/validate.ts`

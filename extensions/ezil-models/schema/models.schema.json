@@ -73,7 +73,7 @@
             "azure-openai",
             "openai-compatible"
           ],
-          "markdownDescription": "- `anthropic`: api.anthropic.com Messages API (`x-api-key`).\n- `anthropic-foundry`: Claude on Microsoft Foundry, `https://<resource>.services.ai.azure.com/anthropic/v1/messages` (`x-api-key`).\n- `openai`: api.openai.com chat completions (Bearer).\n- `azure-openai`: `https://<resource>.openai.azure.com/openai/v1/chat/completions` or a Foundry `openai/v1` baseUrl (`api-key`).\n- `openai-compatible`: any `<baseUrl>/chat/completions` server (Bearer if a key is set).\n- `ezil-gateway`: EZiL Worker proxy `/ai/v1/messages` (Bearer). No custom headers or beta flags are forwarded."
+          "markdownDescription": "- `anthropic`: api.anthropic.com Messages API (`x-api-key`).\n- `anthropic-foundry`: Claude on Microsoft Foundry, `https://<resource>.services.ai.azure.com/anthropic/v1/messages` (`x-api-key`).\n- `openai`: api.openai.com chat completions (Bearer).\n- `azure-openai`: `https://<resource>.openai.azure.com/openai/v1/chat/completions` or a Foundry `openai/v1` baseUrl (`api-key`).\n- `openai-compatible`: any `<baseUrl>/chat/completions` server (Bearer if a key is set).\n- `ezil-gateway`: EZiL Worker proxy `/ai/v1/messages` or `/ai/v1/responses`, selected by each model's gatewayProtocol (Bearer). No custom headers or beta flags are forwarded."
         },
         "apiKey": {
           "$ref": "#/definitions/secretString",
@@ -274,12 +274,12 @@
         },
         "temperature": {
           "type": "number",
-          "description": "Gateway sampling temperature, clamped to [0,1]."
+          "description": "Gateway sampling temperature: Messages clamps to [0,1], Responses to [0,2]."
         },
         "stream": {
           "type": "boolean",
           "default": true,
-          "description": "Use Anthropic SSE. Kimi K3 always uses JSON, even if true."
+          "description": "Use streaming responses. Legacy Anthropic Kimi K3 uses JSON, even if true."
         },
         "toolReserve": {
           "type": "integer",
@@ -323,6 +323,14 @@
         "model": {
           "type": "string",
           "description": "Provider model id (claude-opus-5-5, gpt-5.5...) or the Azure deployment name."
+        },
+        "gatewayProtocol": {
+          "type": "string",
+          "enum": [
+            "anthropic-messages",
+            "openai-responses"
+          ],
+          "description": "ezil-gateway only. Omitted entries use Anthropic Messages. Responses requires this field on the model and openai-responses advertised by the Gateway catalog; model aliases never select a protocol."
         },
         "family": {
           "type": "string",
@@ -382,12 +390,12 @@
         },
         "temperature": {
           "type": "number",
-          "description": "Gateway sampling temperature, clamped to [0,1]."
+          "description": "Gateway sampling temperature: Messages clamps to [0,1], Responses to [0,2]."
         },
         "stream": {
           "type": "boolean",
           "default": true,
-          "description": "Use Anthropic SSE. Kimi K3 always uses JSON, even if true."
+          "description": "Use streaming responses. Legacy Anthropic Kimi K3 uses JSON, even if true."
         },
         "toolReserve": {
           "type": "integer",

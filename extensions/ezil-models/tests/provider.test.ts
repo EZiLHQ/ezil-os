@@ -462,3 +462,174 @@ describe('EZiL gateway VS Code bridge', () => {
         } finally { mock.module('vscode', () => fakeVscode); }
     });
 });
+
+describe('Gateway Responses VS Code bridge', () => {
+    beforeEach(() => { forgetGatewayModels(); showRetryError.mockClear(); retryCommand.mockClear(); });
+
+    const textOutput = (text: string) => ({ type: 'message' as const, id: 'msg_1', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text, annotations: [] }] });
+    const callOutput = (args = '{"filePath":"hello.txt","content":"hi"}') => ({ type: 'function_call' as const, id: 'fc_1',
+        call_id: 'call_1', name: 'create_file', arguments: args, status: 'completed' });
+    const completed = (output: unknown[]) => ({ object: 'response', id: 'resp_1', status: 'completed', output,
+        usage: { input_tokens: 100, output_tokens: 12, input_tokens_details: { cached_tokens: 7 }, output_tokens_details: { reasoning_tokens: 0 } } });
+    const frame = (type: string, fields: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
+    function streamFrames(output: ReturnType<typeof textOutput> | ReturnType<typeof callOutput>) {
+        const initial = output.type === 'message' ? { ...output, status: 'in_progress', content: [] }
+            : { ...output, status: 'in_progress', arguments: '' };
+        return [frame('response.created', { response: { object: 'response', id: 'resp_1', status: 'in_progress', output: [] } }),
+            frame('response.output_item.added', { output_index: 0, item: initial }),
+            ...(output.type === 'message' ? [
+                frame('response.content_part.added', { item_id: output.id, output_index: 0, content_index: 0,
+                    part: { type: 'output_text', text: '', annotations: [] } }),
+                frame('response.output_text.delta', { item_id: output.id, output_index: 0, content_index: 0, delta: output.content[0]!.text }),
+                frame('response.output_text.done', { item_id: output.id, output_index: 0, content_index: 0, text: output.content[0]!.text }),
+                frame('response.content_part.done', { item_id: output.id, output_index: 0, content_index: 0, part: output.content[0] }),
+            ] : [
+                frame('response.function_call_arguments.delta', { item_id: output.id, output_index: 0, delta: output.arguments.slice(0, 12) }),
+                frame('response.function_call_arguments.delta', { item_id: output.id, output_index: 0, delta: output.arguments.slice(12) }),
+                frame('response.function_call_arguments.done', { item_id: output.id, output_index: 0, arguments: output.arguments }),
+            ]),
+            frame('response.output_item.done', { output_index: 0, item: output }),
+            frame('response.completed', { response: completed([output]) })];
+    }
+    function responsesHost(reply: (body: Record<string, unknown>, index: number) => Response, stream = true,
+        catalogValue: unknown = { data: [{ id: 'reviewed-azure', enabled: true, max_input_tokens: 131072, max_output_tokens: 4096, protocols: ['openai-responses'] }] }) {
+        const model = { ...gw('reviewed-azure'), gatewayProtocol: 'openai-responses' as const, stream };
+        const models: ResolvedModel[] = [model];
+        const requests: { url: string; init: RequestInit; body: Record<string, unknown> }[] = [];
+        const reads: { url: string; init: RequestInit }[] = [];
+        const lines: string[] = []; const usage: Usage[] = [];
+        const requestFinished = mock((_model: ResolvedModel) => {});
+        return { models: () => models, configError: () => undefined, secrets: () => ['synthetic-proxy-token'], logRequests: () => true,
+            log: (line: string) => lines.push(line), recordUsage: (_model: ResolvedModel, value: Usage) => usage.push(value), requestFinished,
+            fetch: (async (input: string | URL | Request, init: RequestInit = {}) => {
+                init.signal?.throwIfAborted();
+                const url = String(input);
+                if (url.endsWith('/models')) { reads.push({ url, init }); return Response.json(catalogValue); }
+                const body = JSON.parse(new TextDecoder().decode(init.body as Uint8Array));
+                requests.push({ url, init, body });
+                return reply(body, requests.length - 1);
+            }) as typeof fetch,
+            requests, reads, lines, usage };
+    }
+    const streamResponse = (wire: string[]) => new Response(wire.join(''), { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'response-request' } });
+    async function sendResponses(host: ReturnType<typeof responsesHost>, messages: unknown[], tools: unknown[] = [],
+        report: (part: unknown) => void = () => {}, cancellation = token(), modelOptions = {}) {
+        const provider = new EZiLModelsProvider(host);
+        await provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), messages as never,
+            { tools, modelOptions } as never, { report }, cancellation as never);
+    }
+
+    for (const catalogValue of [undefined, {}, { data: [] },
+        { data: [{ id: 'reviewed-azure', enabled: true, max_input_tokens: 131072, max_output_tokens: 4096 }] },
+        { data: [{ id: 'reviewed-azure', enabled: true, max_input_tokens: 131072, max_output_tokens: 4096, protocols: ['anthropic-messages'] }] },
+        { data: [{ id: 'reviewed-azure', enabled: false, max_input_tokens: 131072, max_output_tokens: 4096, protocols: ['openai-responses'] }] },
+    ]) test(`Responses model requires enabled advertised protocol: ${JSON.stringify(catalogValue)}`, async () => {
+        const host = responsesHost(() => { throw new Error('unexpected inference'); }, true, catalogValue ?? null);
+        const provider = new EZiLModelsProvider(host);
+        expect(await provider.provideLanguageModelChatInformation({} as never, token() as never)).toEqual([]);
+        await expect(sendResponses(host, [message(1, [new TextPart('q')])])).rejects.toThrow('not available');
+        expect(host.requests).toHaveLength(0);
+        expect(host.requestFinished).toHaveBeenCalledTimes(1);
+    });
+
+    test('protocol is not inferred from an Azure alias or a Responses-only catalog advertisement', async () => {
+        const host = responsesHost(() => { throw new Error('unexpected inference'); });
+        delete host.models()[0]!.gatewayProtocol;
+        const provider = new EZiLModelsProvider(host);
+        expect(await provider.provideLanguageModelChatInformation({} as never, token() as never)).toEqual([]);
+        await expect(sendResponses(host, [message(1, [new TextPart('q')])])).rejects.toThrow('not available');
+        expect(host.requests).toHaveLength(0);
+    });
+
+    for (const stream of [false, true]) test(`${stream ? 'SSE' : 'JSON'} tool-call round trip uses flat function tools and one operation per turn`, async () => {
+        const host = responsesHost((_body, index) => stream ? streamResponse(streamFrames(index ? textOutput('Created hello.txt.') : callOutput()))
+            : Response.json(completed([index ? textOutput('Created hello.txt.') : callOutput()])), stream);
+        const provider = new EZiLModelsProvider(host);
+        const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+        expect(infos[0]).toMatchObject({ id: 'reviewed-azure', maxOutputTokens: 4096, capabilities: { imageInput: false } });
+        const parts: unknown[] = [];
+        const first = message(1, [new TextPart('Create hello.txt containing hi')]);
+        await sendResponses(host, [message(3, [new TextPart('You write files.')]), first], [CREATE_FILE], part => parts.push(part));
+        expect(parts).toEqual([new ToolCallPart('call_1', 'create_file', { filePath: 'hello.txt', content: 'hi' })]);
+        const call = parts[0] as ToolCallPart;
+        parts.length = 0;
+        await sendResponses(host, [first, message(2, [call]), message(1, [new ToolResultPart(call.callId, [new TextPart('File created')])])],
+            [CREATE_FILE], part => parts.push(part));
+        expect(parts).toEqual([new TextPart('Created hello.txt.')]);
+        expect(host.requests).toHaveLength(2);
+        const [request1, request2] = host.requests;
+        expect(request1!.url).toBe('https://proxy.invalid/ai/v1/responses');
+        expect(request1!.body).toMatchObject({ model: 'reviewed-azure', stream, store: false, max_output_tokens: 4096,
+            tools: [{ type: 'function', name: CREATE_FILE.name, description: CREATE_FILE.description, parameters: CREATE_FILE.inputSchema }] });
+        expect(request2!.body.input).toEqual(expect.arrayContaining([
+            { type: 'function_call', call_id: call.callId, name: call.name, arguments: JSON.stringify(call.input) },
+            { type: 'function_call_output', call_id: call.callId, output: 'File created' },
+        ]));
+        expect(new Headers(request1!.init.headers).get('authorization')).toBe('Bearer synthetic-proxy-token');
+        expect(new Headers(request1!.init.headers).get('idempotency-key')).not.toBe(new Headers(request2!.init.headers).get('idempotency-key'));
+        expect(host.reads).toHaveLength(1);
+        expect(new Headers(host.reads[0]!.init.headers).get('authorization')).toBe('Bearer synthetic-proxy-token');
+        expect(host.usage).toEqual(Array(2).fill({ inputTokens: 100, outputTokens: 12, cacheReadTokens: 7, cacheWriteTokens: 0 }));
+        expect(host.requestFinished).toHaveBeenCalledTimes(2);
+        expect(host.lines.join()).not.toMatch(/Create hello|File created|synthetic-proxy-token/);
+    });
+
+    test('text without tools is emitted once; explicit Responses utility stays on its selected model', async () => {
+        const host = responsesHost(() => streamResponse(streamFrames(textOutput('A title'))));
+        host.models().push({ ...gw(), provider: host.models()[0]!.provider });
+        const parts: unknown[] = [];
+        await sendResponses(host, [message(1, [new TextPart('Summarize this')])], [], part => parts.push(part), token(), { requestInitiator: 'title' });
+        expect(parts).toEqual([new TextPart('A title')]);
+        expect(host.requests).toHaveLength(1);
+        expect(host.requests[0]!.body.model).toBe('reviewed-azure');
+        expect(host.requests[0]!.body.tools).toBeUndefined();
+        expect(host.requests[0]!.body).not.toHaveProperty('messages');
+    });
+
+    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav']) test(`refuses ${mimeType} before sending a Responses operation`, async () => {
+        const host = responsesHost(() => { throw new Error('unexpected inference'); });
+        await expect(sendResponses(host, [message(1, [new TextPart('Inspect this'), new DataPart(new Uint8Array([1, 2]), mimeType)])])).rejects.toThrow();
+        expect(host.requests).toHaveLength(0); expect(host.usage).toHaveLength(0);
+    });
+
+    test('terminal incomplete preserves partial output and usage while ending as truncation without retry', async () => {
+        const output = textOutput('Partial answer');
+        const wire = streamFrames(output);
+        wire[wire.length - 1] = frame('response.incomplete', { response: { ...completed([output]), status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } });
+        const host = responsesHost(() => streamResponse(wire)); const parts: unknown[] = [];
+        await expect(sendResponses(host, [message(1, [new TextPart('q')])], [], part => parts.push(part))).rejects.toThrow('truncated');
+        expect(parts).toEqual([new TextPart('Partial answer')]);
+        expect(host.usage).toHaveLength(1); expect(host.requests).toHaveLength(1);
+        expect(host.requestFinished).toHaveBeenCalledTimes(1); expect(retryCommand).not.toHaveBeenCalled();
+    });
+
+    for (const ending of ['eof', 'missing-usage', 'failed', 'malformed'] as const) test(`${ending} never turns partial output into success or retries inference`, async () => {
+        const output = textOutput('Partial answer');
+        const wire = streamFrames(output);
+        wire.pop();
+        if (ending === 'missing-usage') wire.push(frame('response.completed', { response: { ...completed([output]), usage: null } }));
+        if (ending === 'failed') wire.push(frame('response.failed', { response: { ...completed([output]), status: 'failed', error: { code: 'server_error', message: 'never display provider detail' } } }));
+        if (ending === 'malformed') wire.push('event: response.completed\ndata: {\n\n');
+        const host = responsesHost(() => streamResponse(wire)); const parts: unknown[] = [];
+        const failure = await sendResponses(host, [message(1, [new TextPart('q')])], [], part => parts.push(part)).then(() => undefined, error => error as Error);
+        expect(failure).toBeInstanceOf(Error); expect(failure!.message).not.toContain('never display provider detail');
+        expect(parts).toEqual([new TextPart('Partial answer')]);
+        expect(host.usage).toHaveLength(ending === 'failed' ? 1 : 0); expect(host.requests).toHaveLength(1);
+        expect(host.requestFinished).toHaveBeenCalledTimes(1); expect(retryCommand).not.toHaveBeenCalled();
+    });
+
+    test('cancelling after the first text aborts the body and reports no later usage or tool call', async () => {
+        const cancellation = token(); let wireCancelled = false;
+        const wire = streamFrames(textOutput('Partial answer'));
+        const host = responsesHost(() => new Response(new ReadableStream({
+            start(controller) { controller.enqueue(new TextEncoder().encode(wire.slice(0, 4).join(''))); },
+            cancel() { wireCancelled = true; },
+        }), { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'cancel-responses' } }));
+        const parts: unknown[] = [];
+        await sendResponses(host, [message(1, [new TextPart('q')])], [], part => { parts.push(part); cancellation.cancel(); }, cancellation);
+        expect(parts).toEqual([new TextPart('Partial answer')]);
+        expect(wireCancelled).toBe(true); expect(host.usage).toHaveLength(0); expect(host.requests).toHaveLength(1);
+        expect(host.requestFinished).toHaveBeenCalledTimes(1); expect(host.lines.join()).toContain('cancelled; may still be charged');
+    });
+});
