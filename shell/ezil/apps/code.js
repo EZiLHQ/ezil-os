@@ -122,7 +122,7 @@ const FRAME_RECOVERY_ATTEMPTS = 12;
  * @returns {Promise<{ok: true, url: string, expiresAt?: number}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId, repo) {
+async function mintCodePreviewUrl (computerId, repo, projectLaunch) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -132,13 +132,17 @@ async function mintCodePreviewUrl (computerId, repo) {
     // 187505ms with `errorCode: unknown`; retry two seconds later resolved in
     // 5460ms). Re-implementing the loop here is how the two surfaces would
     // stop waiting for the same length of time — see `withWakeAndOneRetry`.
-    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId, repo), 'codePreviewUrl', computerId);
+    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId, repo, projectLaunch), 'codePreviewUrl', computerId);
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
-async function mintCodePreviewUrlOnce (computerId, repo) {
-    const started = await session.ensureLocalDesktop(computerId);
-    if ( ! started.ok ) return started;
+async function mintCodePreviewUrlOnce (computerId, repo, projectLaunch) {
+    // Redeem the 60-second launch before waiting for a cold computer. The
+    // protected preview handler performs the existing ownership/billing/ensure gates.
+    if (!projectLaunch) {
+        const started = await session.ensureLocalDesktop(computerId);
+        if ( ! started.ok ) return started;
+    }
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
         ?? '/api/shell/code-preview-url';
 
@@ -148,7 +152,7 @@ async function mintCodePreviewUrlOnce (computerId, repo) {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ computerId, ...(repo !== undefined ? { repo } : {}) }),
+            body: JSON.stringify({ computerId, ...(projectLaunch ? { projectLaunch: true } : {}), ...(repo !== undefined ? { repo } : {}) }),
             signal: AbortSignal.timeout(DESKTOP_BOOT_TIMEOUT_MS),
         });
     } catch ( err ) {
@@ -225,6 +229,7 @@ export async function openCodeWindow (ctx = {}) {
     // point is safe.
     const trace = ctx.trace ?? { step () {}, end () {} };
     let repository = ctx.repo;
+    let projectLaunch = ctx.projectLaunch === true;
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
     const nativeSurface = selectRuntimeAdapter(ctx)?.surface('code');
@@ -403,7 +408,7 @@ export async function openCodeWindow (ctx = {}) {
         // 🔴 THE MINT. Exactly once per genuine window-open — see the file
         // header for the three structural properties this depends on.
         console.info(`[${PHASE}] minting a code-preview URL for computer ${computer.id} (budget ${DESKTOP_BOOT_TIMEOUT_MS}ms)`);
-        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, repository));
+        const res = await (nativeSurface && projectLaunch ? { ok: false, errorCode: 'project_repo_unavailable', message: 'Open this project in your hosted computer.' } : nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, repository, projectLaunch));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -680,9 +685,10 @@ export async function openCodeWindow (ctx = {}) {
     window.addEventListener('ezil:teardown', dispose);
     window.addEventListener('ezil:desktop-restarted', on_restarted);
 
-    el_window.ezilOpenRepository = repo => {
-        if (repo === undefined || disposed) return;
+    el_window.ezilOpenRepository = (repo, launch) => {
+        if ((repo === undefined && !launch) || disposed) return;
         repository = repo;
+        projectLaunch = launch === true;
         void start_boot();
     };
     void start_boot();

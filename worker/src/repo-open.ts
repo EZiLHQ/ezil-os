@@ -1,10 +1,10 @@
 /** Narrow wire contract shared by both computer providers. No caller path is accepted. */
 export const REPO_OPEN_PORT = 9224;
 const canonical = /^https:\/\/github\.ezil\.work\/[a-z0-9][a-z0-9-]{0,63}\/(?![a-z0-9._-]*\.\.)(?![a-z0-9._-]*\.git\.git$)[a-z0-9][a-z0-9._-]{0,99}\.git$/;
-export function validRepoIntent(value: unknown): value is { repo: string; userId: string } {
+export function validRepoIntent(value: unknown): value is { repo: string; userId: string; grant?: unknown } {
     if (!value || typeof value !== 'object') return false;
     const v = value as Record<string, unknown>;
-    return Object.keys(v).every(k => k === 'repo' || k === 'userId') && typeof v.repo === 'string' && canonical.test(v.repo)
+    return Object.keys(v).every(k => k === 'repo' || k === 'userId' || k === 'grant') && typeof v.repo === 'string' && canonical.test(v.repo)
         && typeof v.userId === 'string' && /^[a-f0-9-]{36}$/.test(v.userId);
 }
 export function validRepoFolder(value: unknown): value is string {

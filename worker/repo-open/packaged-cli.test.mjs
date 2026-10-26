@@ -16,7 +16,7 @@ const repo = 'https://github.ezil.work/team/fixture.git';
 const intent = { repo, userId: '11111111-1111-4111-8111-111111111111' };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const missing = pid => assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
-async function fixture() {
+async function fixture(privateInput = false) {
     assert.equal(createHash('sha256').update(await readFile(bundle)).digest('hex'), pin.sha256, 'test exact pinned private bundle');
     assert.equal(execFileSync(process.execPath, [bundle, '--version'], { encoding: 'utf8' }).trim(), 'ezil ' + pin.version);
     const root = await mkdtemp(join(tmpdir(), 'os-packaged-cli-'));
@@ -24,8 +24,10 @@ async function fixture() {
     for (const path of [workspace, auth, scratch, bin]) await mkdir(path);
     const serverSockets = new Set();
     let stallGrant = false;
+    let apiCalls = 0;
     const server = createServer((req, res) => {
-        if (req.url.startsWith('/stall.git')) return; // a real Git HTTP transport blocks here
+        if (req.url.startsWith('/stall.git')) return;
+        apiCalls++; // a real Git HTTP transport blocks here
         const data = req.url === '/cli/whoami' ? {
             account: { id: 'synthetic-works-account', email: 'test@example.invalid', role: 'builder' },
             session: { id: '11111111-1111-4111-8111-111111111111', device: 'isolated', os: 'linux', expiresAt: '2100-01-01T00:00:00.000Z' },
@@ -40,6 +42,7 @@ async function fixture() {
     await writeFile(join(auth, 'cli-session.json'), JSON.stringify({ [origin]: {
         apiOrigin: origin, sessionId: 'synthetic', accessToken: 'eca_synthetic', refreshToken: 'ecr_synthetic', accessExpiresAt: '2100-01-01T00:00:00.000Z',
     } }), { mode: 0o600 });
+    if (privateInput) await rm(join(auth, 'cli-session.json'));
     const git = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     const source = join(root, 'source'); execFileSync(git, ['init', '-q', source]);
     await writeFile(join(source, 'fixture.txt'), 'known fixture\n');
@@ -53,6 +56,9 @@ const args=process.argv.slice(2),git=${JSON.stringify(git)};
 if(!args.includes('clone')) process.exit(cp.spawnSync(git,args,{stdio:'inherit'}).status??1);
 const target=args.at(-1);
 if(process.env.OS_TEST_MODE==='success') {
+ const credential=cp.spawnSync(git,[...args.slice(0,args.indexOf('clone')),'credential','fill'],{input:'protocol=https\\nhost=github.ezil.work\\npath=team/fixture.git\\n\\n',encoding:'utf8'});
+ if(credential.status!==0 || !credential.stdout.includes('password='))process.exit(12);
+
  let r=cp.spawnSync(git,['clone','--no-hardlinks','--',${JSON.stringify(source)},target],{stdio:'ignore'});
  if(r.status===0)r=cp.spawnSync(git,['-C',target,'remote','set-url','origin',${JSON.stringify(repo)}],{stdio:'ignore'});
  process.exit(r.status??1);
@@ -75,18 +81,25 @@ setInterval(()=>{},1000);
     });
     const folder = join(workspace, '.ezil-repositories', createHash('sha256').update(intent.userId).digest('hex'), createHash('sha256').update(repo).digest('hex'));
     const lock = join(dirname(folder), '.' + basename(folder) + '.ezil-clone-lock');
-    return { root, folder, lock, scratch, options, setStallGrant: value => { stallGrant = value; },
+    return { root, folder, lock, scratch, options, apiCalls: () => apiCalls, setStallGrant: value => { stallGrant = value; },
         async pids() { for (let i=0;i<100;i++) { try { return JSON.parse(await readFile(join(root,'pids'),'utf8')); } catch { await sleep(10); } } throw Error('CLI child barrier not reached'); },
         async preserved() { process.kill(unrelated.pid,0); assert.equal(await readFile(join(root,'unrelated.txt'),'utf8'),'preserve unrelated'); assert.equal(await readFile(join(source,'fixture.txt'),'utf8'),'unrelated dirty source\n'); },
         async close() { unrelated.kill(); await once(unrelated,'close'); for(const s of serverSockets)s.destroy(); await new Promise(resolve=>server.close(resolve)); await rm(root,{recursive:true,force:true}); },
     };
 }
-for (const mode of ['normal', 'stubborn', 'os-forced']) test(`packaged CLI: ${mode} through OS supervisor`, { skip: !bundle, timeout: 15000 }, async () => {
-    const f = await fixture();
+for (const privateInput of [false, true]) for (const mode of ['normal', 'stubborn', 'os-forced']) test(`packaged CLI: ${privateInput ? 'private FD' : 'legacy session'} ${mode} through OS supervisor`, { skip: !bundle, timeout: 15000 }, async () => {
+    const f = await fixture(privateInput);
+    const operationIntent = privateInput ? { ...intent, grant: {version:1,
+        binding:{projectId:'11111111-1111-4111-8111-111111111111',repositoryId:'22222222-2222-4222-8222-222222222222',canonicalURL:repo,ref:'refs/heads/main',bindingVersion:'a'.repeat(64)},
+        identity:{issuer:'https://id.ezil.work/',subject:'auth0|synthetic'},
+        git:{username:'ezil',token:'egg_'+'a'.repeat(64),expiresAt:new Date(Date.now()+120000).toISOString(),scope:'read'}}} : intent;
     try {
         const started = performance.now();
-        const operation = openRepository(intent, f.options(mode === 'normal' ? 'block' : 'stubborn')).catch(error => error);
+        const operation = openRepository(operationIntent, f.options(mode === 'normal' ? 'block' : 'stubborn')).catch(error => error);
         const pids = await f.pids();
+        if (privateInput) for (const pid of pids) {
+            for (const field of ['cmdline','environ']) assert.ok(!(await readFile(`/proc/${pid}/${field}`)).includes(Buffer.from(operationIntent.grant.git.token)), 'secret absent from process metadata');
+        }
         if (mode === 'os-forced') process.kill(pids[0], 'SIGSTOP'); // only the proven test CLI PID
         const result = await operation;
         const elapsed = performance.now() - started;
@@ -96,24 +109,27 @@ for (const mode of ['normal', 'stubborn', 'os-forced']) test(`packaged CLI: ${mo
         if (mode === 'normal') {
             assert.equal((await readdir(dirname(f.folder))).length, 0, 'owned lock/temp cleaned');
             assert.deepEqual(await readdir(f.scratch), []);
-            const first = await openRepository(intent, f.options('success'));
+            const first = await openRepository(operationIntent, f.options('success'));
             assert.equal(first.status, 'cloned');
             assert.equal(await readFile(join(first.folder,'fixture.txt'),'utf8'),'known fixture\n');
             await writeFile(join(first.folder,'fixture.txt'),'dirty fixture\n');
+            if (!privateInput) {
             f.setStallGrant(true);
-            await assert.rejects(openRepository(intent,f.options('success')), /repo_timeout/);
+            await assert.rejects(openRepository(operationIntent,f.options('success')), /repo_timeout/);
             assert.equal(await readFile(join(first.folder,'fixture.txt'),'utf8'),'dirty fixture\n');
             f.setStallGrant(false);
-            assert.equal((await openRepository(intent,f.options('success'))).status,'reused');
+            }
+            assert.equal((await openRepository(operationIntent,f.options('success'))).status,'reused');
             assert.equal(await readFile(join(first.folder,'fixture.txt'),'utf8'),'dirty fixture\n');
         } else {
             assert.ok((await readdir(dirname(f.folder))).includes(basename(f.lock)));
             const before = await readdir(dirname(f.folder));
             const temp = before.find(name=>name.startsWith('.ezil-clone-'));
             assert.equal(await readFile(join(dirname(f.folder),temp,'checkout','partial'),'utf8'),'preserve owned state');
-            await assert.rejects(openRepository(intent,f.options('success')), /repo_timeout/);
+            await assert.rejects(openRepository(operationIntent,f.options('success')), /repo_timeout/);
             assert.deepEqual(await readdir(dirname(f.folder)),before, 'cancelled retry must preserve unknown lock/temp');
         }
+        if (privateInput) assert.equal(f.apiCalls(), 0, 'no CLI session/whoami/grant login calls');
         // Production grace is exactly 3000ms. Deadline is shortened only for this test.
         assert.ok(elapsed < 1200 + 3000 + 500, `deadline + grace exceeded: ${elapsed}`);
         if(mode==='os-forced') assert.ok(elapsed >= 1200+2900, `forced branch did not exercise 3s grace: ${elapsed}`);

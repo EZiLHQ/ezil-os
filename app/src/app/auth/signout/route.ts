@@ -1,3 +1,4 @@
+import { clearProjectIdentity } from '@/server/project-repositories/session';
 import { eq } from 'drizzle-orm';
 import { type NextRequest, NextResponse } from 'next/server';
 
@@ -38,6 +39,7 @@ const isAuthCookie = (name: string) => name.startsWith(SECURE_AUTH_COOKIE_NAME) 
  * by hand on that path.
  */
 export async function POST(request: NextRequest) {
+    await clearProjectIdentity();
     const supabase = await createClient();
     // Revoke before signOut removes the identity. The total budget is three seconds,
     // independent of whether Supabase subsequently succeeds or throws.

@@ -623,7 +623,7 @@ export async function launch (id, ctx = {}) {
     if (opening.has(id)) {
         const el = await opening.get(id);
         if (id === 'settings') el?.ezilActivateSettings?.(ctx.initialTab);
-        if (id === 'code') el?.ezilOpenRepository?.(ctx.repo);
+        if (id === 'code') el?.ezilOpenRepository?.(ctx.repo, ctx.projectLaunch);
         return el;
     }
     const pending = launchOnce(id, ctx);

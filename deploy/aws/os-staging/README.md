@@ -116,3 +116,5 @@ services, run Compose down with `--env-file /opt/ezil-os-staging/compose.env`,
 then remove this host's units, env files and optional Caddy volumes. S9b removes
 the staging instance, IP, DNS and dedicated IAM/network resources. Retire only
 the staging secret/artifacts when no rollback is needed; preserve PREVIEW data.
+
+Repository launch additionally needs server-only `PROJECT_REPO_WORKS_ORIGIN` (exact approved HTTPS Works staging API origin) and `PROJECT_REPO_CALLER_ORIGINS` (comma-separated exact approved HTTPS caller origins). Missing settings disable launch; they do not disable unrelated OS login. Never infer these from a caller URL.
