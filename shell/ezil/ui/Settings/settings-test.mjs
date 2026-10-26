@@ -233,17 +233,19 @@ const tabIds = qa('.window[data-app="settings"] .ezil-settings-tab').map(t => t.
 // `account` joined at the top: EZiL's own profile + Sign out tab
 // (`tabs/account.js`), not upstream's Dashboard account page — the Dashboard
 // check below still refuses the rest of that set.
-push('six tabs, and only six', tabIds.length === 6, JSON.stringify(tabIds));
-push('tabs are Account / Computers / System / Appearance / About / Troubleshoot',
-    JSON.stringify(tabIds) === JSON.stringify(['account', 'computers', 'system', 'appearance', 'about', 'troubleshoot']),
+push('seven authored tabs', tabIds.length === 7, JSON.stringify(tabIds));
+push('tabs are Account / Usage / Computers / System / Appearance / About / Troubleshoot',
+    JSON.stringify(tabIds) === JSON.stringify(['account', 'usage', 'computers', 'system', 'appearance', 'about', 'troubleshoot']),
     JSON.stringify(tabIds));
 push('no upstream Dashboard tab survived',
-    ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'security'].includes(id)));
-push('Settings still opens on Computers',
-    q('.window[data-app="settings"] .ezil-settings-pane[data-pane="computers"]')?.classList.contains('active'));
+    ! tabIds.some(id => ['home', 'apps', 'files', 'security'].includes(id)));
+push('Settings opens on Account',
+    q('.window[data-app="settings"] .ezil-settings-pane[data-pane="account"]')?.classList.contains('active'));
 push('flag-off Settings still loads Computers without requesting billing',
     calls.some(c => c.url.includes('/api/trpc/computer.list'))
     && ! calls.some(c => c.url.includes('/api/trpc/billing.')));
+click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+await settle();
 
 // ── Computers tab ──────────────────────────────────────────────────────────
 const rows = qa('.window[data-app="settings"] .ezil-settings-row');
@@ -558,6 +560,9 @@ await ezil.registry.launch('settings', ctx);
 await settle();
 const win2 = q('.window[data-app="settings"]');
 push('Settings reopens', !! win2);
+push('reopened Settings returns to Account', !!win2?.querySelector('[data-pane="account"].active'));
+click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+await settle();
 push('reopened Settings still renders two slot rows',
     qa('.window[data-app="settings"] .ezil-settings-row').length === 2);
 push('reopened Settings does not carry stale edit state',

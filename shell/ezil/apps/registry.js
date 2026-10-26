@@ -616,7 +616,21 @@ function ensureOnTop (el_window) {
     setTimeout(assertTop, 120);
 }
 
+// Coalesce overlapping opens before UIWindow has appended the first window.
+const opening = new Map();
 export async function launch (id, ctx = {}) {
+    if (!getApp(id)?.single_instance) return launchOnce(id, ctx);
+    if (opening.has(id)) {
+        const el = await opening.get(id);
+        if (id === 'settings') el?.ezilActivateSettings?.(ctx.initialTab);
+        return el;
+    }
+    const pending = launchOnce(id, ctx);
+    opening.set(id, pending);
+    try { return await pending; } finally { opening.delete(id); }
+}
+
+async function launchOnce (id, ctx = {}) {
     const app = getApp(id);
     if (app?.native_only && !isNative(ctx)) return null;
     if ( ! app ) {
@@ -647,6 +661,7 @@ export async function launch (id, ctx = {}) {
             log.info(`[${PHASE}] "${id}" is already open; restoring it`);
             $existing.showWindow();
             const el_existing = $existing.get(0);
+            if (id === 'settings') el_existing?.ezilActivateSettings?.(ctx.initialTab);
             // Belt and braces: the first open already did this, but a window
             // that somehow lost its button (a re-attached drawer, a rebuild)
             // must not stay without one. Idempotent — see drawer-action.js.

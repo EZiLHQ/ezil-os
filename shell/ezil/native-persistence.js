@@ -47,7 +47,7 @@ export async function prepareNativePersistence (ctx) {
     return { workspaceId, preferences };
 }
 
-export async function restoreNativeDesktop (saved, ctx, launch) {
+export async function restoreNativeDesktop (saved, ctx, launch, { onlyApp } = {}) {
     if (!saved) return null;
     ctx.browserTabs = safeBrowserTabs(saved.preferences.browser) ?? undefined;
     let browser = ctx.browserTabs;
@@ -60,7 +60,12 @@ export async function restoreNativeDesktop (saved, ctx, launch) {
         }
     };
     const remembered = new WeakMap();
+    // An app-targeted tab must not replay every saved window, or erase the
+    // unopened layout on its next preference write. Once opened here, a
+    // window is owned by this renderer and its close is captured normally.
+    const opened = new Set(onlyApp ? [onlyApp] : Object.values(APPS));
     for (const row of saved.preferences.layout ?? []) {
+        if (onlyApp && APPS[row.app] !== onlyApp) continue;
         let el;
         try { el = await launch(APPS[row.app], ctx); } catch { continue; }
         if (!el?.isConnected) continue;
@@ -70,6 +75,21 @@ export async function restoreNativeDesktop (saved, ctx, launch) {
         if (row.minimized) window.$(el).hideWindow();
     }
     let timer, stopped = false, queue = Promise.resolve(), last = JSON.stringify(saved.preferences);
+    let committed = saved.preferences;
+    const observeWindow = el => {
+        const id = el?.getAttribute?.('data-app');
+        const owner = el?.getAttribute?.('data-ezil-computer-id');
+        if (Object.values(APPS).includes(id) && (!owner || owner === saved.workspaceId)) opened.add(id);
+    };
+    const observeRecords = records => {
+        for (const record of records) {
+            if (record.type !== 'childList') continue;
+            for (const node of [...record.addedNodes, ...record.removedNodes]) {
+                if (node.matches?.('.window')) observeWindow(node);
+                for (const el of node.querySelectorAll?.('.window') ?? []) observeWindow(el);
+            }
+        }
+    };
     const capture = () => {
         rememberBrowser();
         const layout = [];
@@ -77,6 +97,7 @@ export async function restoreNativeDesktop (saved, ctx, launch) {
             const app = Object.keys(APPS).find(key => APPS[key] === el.getAttribute('data-app'));
             if (!app) continue;
             const owner = el.getAttribute('data-ezil-computer-id'); if (owner && owner !== saved.workspaceId) continue;
+            opened.add(APPS[app]);
             const minimized = ['true', '1'].includes(el.getAttribute('data-is_minimized'));
             const rect = el.getBoundingClientRect();
             const previous = remembered.get(el);
@@ -85,18 +106,47 @@ export async function restoreNativeDesktop (saved, ctx, launch) {
                 : { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
             const row = { app, ...bounds, minimized }; remembered.set(el, row); layout.push(row);
         }
+        for (const row of saved.preferences.layout ?? []) {
+            if (!opened.has(APPS[row.app])) layout.push(row);
+        }
         let previewPort;
         try { previewPort = Number(localStorage.getItem(`ezil:preview-port:${saved.workspaceId}`)); } catch { /* Optional preference. */ }
         return safeDesktopPreferences({ wallpaper: session.get('settings.wallpaper'), accent: session.get('settings.accent'), previewPort, browser, layout }, window.innerWidth, window.innerHeight);
     };
     const flush = () => {
         clearTimeout(timer);
+        observeRecords(observer.takeRecords());
         const preferences = capture(), serialized = JSON.stringify(preferences);
         if (serialized === last) return queue;
         last = serialized;
         queue = queue.then(async () => {
-            try { const result = await window.ezilNative.operation({ op: 'desktop.write', workspaceId: saved.workspaceId, preferences });
-                if (!result?.ok && last === serialized) last = null;
+            const save = async () => {
+                // Merge this renderer's changes with the latest host state. A
+                // stale untouched row must not resurrect another tab's close.
+                const latest = await window.ezilNative.operation({ op: 'desktop.read', workspaceId: saved.workspaceId });
+                if (!latest?.ok) throw Error('Desktop read unavailable');
+                const merged = safeDesktopPreferences(latest.preferences, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+                for (const key of ['wallpaper', 'accent', 'previewPort', 'browser']) {
+                    if (JSON.stringify(preferences[key]) === JSON.stringify(committed[key])) continue;
+                    if (preferences[key] === undefined) delete merged[key]; else merged[key] = preferences[key];
+                }
+                const before = new Map((committed.layout ?? []).map(row => [row.app, row]));
+                const after = new Map((preferences.layout ?? []).map(row => [row.app, row]));
+                const layout = new Map((merged.layout ?? []).map(row => [row.app, row]));
+                for (const app of new Set([...before.keys(), ...after.keys()])) {
+                    if (JSON.stringify(before.get(app)) === JSON.stringify(after.get(app))) continue;
+                    if (after.has(app)) layout.set(app, after.get(app)); else layout.delete(app);
+                }
+                merged.layout = [...layout.values()];
+                const result = await window.ezilNative.operation({ op: 'desktop.write', workspaceId: saved.workspaceId, preferences: merged });
+                if (!result?.ok) throw Error('Desktop write unavailable');
+                committed = preferences;
+            };
+            try {
+                // Same-origin renderers share Web Locks, serializing read/merge/write.
+                // Hosts without Web Locks still merge, but cannot guarantee atomicity.
+                if (window.navigator?.locks) await window.navigator.locks.request(`ezil-desktop:${saved.workspaceId}`, save);
+                else await save();
             } catch { if (last === serialized) last = null; }
         });
         return queue;
@@ -105,12 +155,14 @@ export async function restoreNativeDesktop (saved, ctx, launch) {
     const composition = event => {
         // Capture pre-animation geometry synchronously before minimize mutates it.
         const el = event.detail?.window;
+        observeWindow(el);
         if (el && event.detail.visible === false && !['true', '1'].includes(el.getAttribute('data-is_minimized'))) {
             const r = el.getBoundingClientRect(); remembered.set(el, { x: r.x, y: r.y, width: r.width, height: r.height });
         }
         schedule();
     };
     const observer = new MutationObserver(records => {
+        observeRecords(records);
         if (records.some(record => record.type === 'childList' ? [...record.addedNodes, ...record.removedNodes].some(node => node.matches?.('.window') || node.querySelector?.('.window')) : record.target.matches?.('.window'))) schedule();
     });
     observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['style', 'data-is_minimized'] });
