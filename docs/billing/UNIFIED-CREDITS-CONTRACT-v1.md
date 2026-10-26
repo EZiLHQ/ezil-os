@@ -114,14 +114,23 @@ Production is out of scope for v1 (later port: Gateway prod migrations `0028+`).
     - expired → `restore_expired`;
     - nothing unspent → `restore_nothing_forfeited`.
   - **Restore amount** = the revoked head's unspent value: its `credits_micro` minus every debit ever posted to it (the revoke forfeiture plus any remainder stranded on it when open holds settled). It mints **one** new head with the root grant's `expires_at`, `source 'entitlement'`, entitlement id = the restore eventId. A replay → `already_restored`, never mints.
+  - **Revocation markers on an already-revoked head (W0.4).** A revoke event that reaches a head which is already revoked is **recorded**, not dropped:
+    - a refund (`E:revoke:refund:<R>`) or legacy revoke marks that head **terminal** (outcome `terminalized`). Every later restore of it is `restore_refused_terminal`, even for the dispute that revoked it first;
+    - a dispute (`E:revoke:dispute:<D2>`) adds an **unresolved dispute marker** (outcome `dispute_recorded`).
+    - Replays of the same eventId stay idempotent.
+  - **Overlapping disputes (W0.4).** A restore `E:restore:<D1>` is refused with 409 `restore_review_required` (no grant, fail closed) while the head carries any unresolved dispute marker other than `D1`, or whenever the restorable revocation is otherwise ambiguous. Resolution is an operator review; no amount is ever guessed. A restore for `D2` likewise requires `D1` to be resolved.
   - **Invariant** (tested): for every chain, Σ debits over all generations + Σ remaining over unrevoked generations ≤ the root grant's credits, and at most one generation is unrevoked.
+  - **W0.4 tests:**
+    - dispute `D` revokes → refund `R` on the revoked head → `terminalized` → restore `D` → `restore_refused_terminal`, no grant;
+    - `D1` revokes → `D2` recorded → restore `D1` → 409 `restore_review_required`;
+    - an identical replay of each event changes nothing.
   - Revoke and restore on the same chain serialize: lock on the root entitlement id.
   - The hook body is unchanged; `credits` must equal the root grant's whole credits, else 409 `event_conflict`.
   - **Gateway work (G5):** `src/entitlements.ts` accepts `restore`, `32_entitlement_restore.sql` implements the above, and new tests. The previous `entitlement_event` md5 is recorded; the rollback refuses if any chain generation ≥ 1 exists.
   - **OS follow-up (O-credits, after G5 lands):**
     - refund revokes emit `E:revoke:refund:<refundId>`; dispute revokes emit `E:revoke:dispute:<disputeId>`; a won dispute emits `restore` with `E:restore:<disputeId>`, always for the **root** `E` (the Gateway resolves the head);
     - the delivery check accepts exactly these grammars;
-    - `ai_restore` is claimed only after the matching dispute revoke is delivered;
+    - `ai_restore` is claimed only after the matching dispute revoke is delivered; `terminalized`, `restore_refused_terminal` and `restore_review_required` (409, no retry beyond the existing bound; review log) are final for that row;
     - refund receipts never produce a restore.
 - **Stripe inbox:** the same Stripe event id with a different payload sha256 → reject (HTTP 409 `event_conflict`, no processing, review log). An identical replay stays idempotent.
 
