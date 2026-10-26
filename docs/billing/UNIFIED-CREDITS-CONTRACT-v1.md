@@ -38,6 +38,8 @@ Production is out of scope for v1 (later port: Gateway prod migrations `0028+`).
   - no `Authorization` header is present (a request with both is refused 400 `ambiguous_credentials`);
   - same-origin is proven (`Sec-Fetch-Site: same-origin`, or `Origin` equals own origin).
   - It returns `{via:"auth0_operator", role:"operations", adminAllowed:true, authUserId: actor, publicId: <member public_id or null>, email, expiresAt}`.
+  - **CSRF (hard rule).** Every `*.ezil.work` host is same-site, including user-controlled `*-app.ezil.work` previews, so SameSite=Strict alone protects nothing. Cookie auth requires `Sec-Fetch-Site: same-origin`, or, only when `Sec-Fetch-Site` is absent, `Origin` exactly equal to the own origin. `Sec-Fetch-Site: same-site`, `cross-site` or `none` is refused even with a valid cookie; for example `Sec-Fetch-Site: same-site` + `Origin: https://x-app.ezil.work` → 403. A state-changing method (POST/PUT/PATCH/DELETE) carrying neither header is refused.
+  - Without the cookie the hook makes **no** database call. Routes outside the list below (for example `/v1/me/assignments/:id/usage`) never accept the cookie principal.
 - Routes accepting the cookie principal (exact): `/v1/admin/*`, `GET /v1/models`, `POST /v1/messages`, `POST /v1/responses`, `GET /v1/requests/:id`, `GET /v1/me/balance`, `GET /v1/me/usage`, `GET /v1/me/limits`. Metered and `/v1/me/*` routes still require an enrolled member row (else 403 `not_a_member`).
 - `admin()` admits **only** `via:"auth0_operator"` AND DB `assert_operator(actor)`. Google operator admission and legacy operations-member admin are removed.
 - Console: the sign-in button goes to `/auth/auth0/login`; the Supabase GoTrue PKCE flow is removed; `api()` uses `credentials:'same-origin'` and sends no bearer.
@@ -95,8 +97,9 @@ Production is out of scope for v1 (later port: Gateway prod migrations `0028+`).
   - Refund revokes are terminal: never restored.
   - On `restore` (dispute won), for each AI receipt revoked by **that dispute**, enqueue kind `ai_restore`, action `restore`, `eventId = <entitlementId>:restore:<disputeId>`, with the original entitlementId, credits and expiresAt.
   - Delivery claims an `ai_restore` row only after that entitlement's `ai_revoke` row is delivered. Delivery timestamps are never used for ordering.
+  - OS delivery's event check today requires `eventId === entitlementId + ':' + action`; for `restore` the rule is `eventId === entitlementId + ':restore:' + disputeId` (O-credits follow-up).
 - **Gateway `restore` action** (ledger lane G5; `32_entitlement_restore.sql` widens the event action check and replaces `ezil_ai.entitlement_event`, recording the previous md5 for rollback):
-  - for an entitlement whose grant was revoked by a prior event, create **one new grant** whose `credits_micro` equals exactly the micro amount that revoke forfeited (its `revoke` ledger row, i.e. remaining value after usage and reservations), with the original `expires_at`;
+  - for an entitlement whose grant was revoked by a prior event, and only once **no reservation on that grant is open** (else 409 `restore_hold_pending`; the OS retries), create **one new grant**. Its `credits_micro` = the micro forfeited by the revoke row(s) **plus** any positive remainder later stranded on the revoked grant when holds that were open at revoke time settled. Equivalently, the original credits minus everything actually debited. It keeps the original `expires_at`;
   - the new grant is addressable as entitlement `<entitlementId>:restore:<disputeId>`, so a later revoke can target it;
   - idempotent per eventId: a replay returns `already_restored` and **never mints**; the ledger stays append-only (no un-revoke);
   - outcomes `restored` | `already_restored` | 409 `restore_not_revoked` (OS retries) | `restore_expired` (OS done; no grant) | `restore_nothing_forfeited` (OS done; no grant).
