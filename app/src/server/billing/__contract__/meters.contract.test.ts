@@ -180,6 +180,7 @@ describe('billing summary wire contract', () => {
         // Contract §5.1: the portal is for a Pro or past-due plan only — a Free
         // user with checkout available has nothing to manage yet.
         expect(enabled.actions.portal).toBe(false);
+        // Legacy summaries do not offer the Stripe-managed pack catalog.
         expect(enabled.actions.topup).toBe(false);
         const pro = summary({ config: readBillingConfig({ ...keys, BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1' }), subs: [subscription()] });
         expect(pro.actions.portal).toBe(true);

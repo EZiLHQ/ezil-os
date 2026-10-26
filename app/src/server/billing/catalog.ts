@@ -1,13 +1,6 @@
 import type { CatalogPack, CatalogPro } from './types';
 
-/**
- * Billing catalog, version 1 — the pilot offer recorded in
- * `docs/billing/CONTRACT.md` §2. Prices and allowances come ONLY from here;
- * a client-supplied amount is never read.
- *
- * These are pilot terms. Changing one is a new catalog version, never an
- * in-place edit of a SKU that customers already bought.
- */
+/** Legacy plan and historical pack terms; offered packs are read from Stripe. */
 export const CATALOG_VERSION = 1;
 
 /**
@@ -60,13 +53,26 @@ export function serviceFeeCents(creditCents: number): number {
 
 function pack(sku: string, creditCents: number): CatalogPack {
     const fee = serviceFeeCents(creditCents);
-    return { sku, aiCredits: null, creditCents, serviceFeeCents: fee, totalCents: creditCents + fee };
+    return { sku, aiCredits: null, creditCents, discountPercent: 0, serviceFeeCents: fee, totalCents: creditCents + fee };
 }
 
-export const AI_PACKS: readonly CatalogPack[] = Object.freeze([
+const LEGACY_AI_PACKS: readonly CatalogPack[] = Object.freeze([
     pack('ai_pack_10_v1', 1000),
     pack('ai_pack_25_v1', 2500),
 ]);
+
+/** Legacy summaries offer no packs; v3 reads the Stripe catalog. */
+export const AI_PACKS: readonly CatalogPack[] = Object.freeze([]);
+
+export const CUSTOM_TOPUP = Object.freeze({ minCents: 1000, maxCents: 1_000_000, centsPerCredit: 10 } as const);
+export const CUSTOM_TOPUP_SKU = 'ai_custom_v2';
+
+export function customTopupPack(amountCents: number): CatalogPack | undefined {
+    if (!Number.isSafeInteger(amountCents) || amountCents % 100 !== 0
+        || amountCents < CUSTOM_TOPUP.minCents || amountCents > CUSTOM_TOPUP.maxCents) return undefined;
+    return { sku: CUSTOM_TOPUP_SKU, aiCredits: amountCents / CUSTOM_TOPUP.centsPerCredit,
+        creditCents: amountCents, discountPercent: 0, serviceFeeCents: 0, totalCents: amountCents };
+}
 
 export function catalogPro(): CatalogPro {
     return {
@@ -78,7 +84,7 @@ export function catalogPro(): CatalogPro {
 }
 
 export function findPack(sku: string): CatalogPack | undefined {
-    return AI_PACKS.find(p => p.sku === sku);
+    return LEGACY_AI_PACKS.find(p => p.sku === sku);
 }
 
 /** Additional purchase gate: callers must also check their existing checkout flags. */

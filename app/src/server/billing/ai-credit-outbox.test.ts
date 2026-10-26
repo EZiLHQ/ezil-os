@@ -36,7 +36,7 @@ describe('AI credit outbox delivery', () => {
         expect(await f.run()).toEqual({ claimed: 1, done: 1, failed: 0, retry: 0, skipped: 0 });
         const body = JSON.parse(f.fetcher.mock.calls[0]![1]!.body as string);
         expect(body).toEqual({ eventId: row().eventKey, entitlementId: row().payload.entitlementId, action: 'grant',
-            credits: 4000, expiresAt: '2026-11-04T00:00:00.000Z', accountPublicId: 'works-public-id' });
+            credits: 200, expiresAt: '2026-11-04T00:00:00.000Z', accountPublicId: 'works-public-id' });
         expect(f.store.finish).toHaveBeenCalledWith(expect.anything(), { status: 'done', reason: null }, NOW);
     });
     it('preserves a frozen account id on retry without looking up a changed mapping', async () => {

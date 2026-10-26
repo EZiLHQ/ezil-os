@@ -68,6 +68,7 @@ export interface CatalogPack {
     /** Whole Gateway credits; null until this pack has an approved credit policy. */
     aiCredits: number | null;
     creditCents: number;
+    discountPercent: number;
     serviceFeeCents: number;
     totalCents: number;
 }

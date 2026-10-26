@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, aiCreditRestoreItem, parseAiCreditEventId } from './ai-credits';
-import { AI_PACKS } from './catalog';
+import { findPack, customTopupPack } from './catalog';
 
 const input = { userId: 'user', sku: 'standard_monthly_v3' as const, subscriptionId: 'sub',
     periodStart: new Date('2026-10-01T00:00:00Z'), periodEnd: new Date('2026-11-01T00:00:00Z'), invoiceId: 'invoice' };
 
 describe('AI credit planning', () => {
     it('requires explicit pack credits and preserves the v1 topup receipt when reversing', () => {
-        const pack = { ...AI_PACKS[0]!, aiCredits: 1234 };
-        expect(aiTopupOutboxItem('user', AI_PACKS[0]!, 'pi_fixture', input.periodEnd)).toBeNull();
+        const pack = { ...findPack('ai_pack_10_v1')!, aiCredits: 1234 };
+        expect(aiTopupOutboxItem('user', findPack('ai_pack_10_v1')!, 'pi_fixture', input.periodEnd)).toBeNull();
         const grant = aiTopupOutboxItem('user', pack, 'pi_fixture', input.periodEnd)!;
         expect(grant).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_pack_10_v1:pi_fixture:grant',
             payload: { protocol: 'ezil-ai-credits-v1', credits: 1234, amountUsdMicro: '10000000',
@@ -17,6 +17,13 @@ describe('AI credit planning', () => {
         pack.aiCredits = 9999;
         expect(aiCreditRevokeItem(grant)).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_pack_10_v1:pi_fixture:revoke',
             payload: { credits: 1234, expiresAt: input.periodEnd.toISOString(), accountPublicId: 'pinned-account', paymentIntentId: 'pi_fixture' } });
+    });
+    it('uses the custom SKU in the immutable grant and reversal root', () => {
+        const receipt = aiTopupOutboxItem('user', customTopupPack(2500)!, 'pi_custom', input.periodEnd)!;
+        expect(receipt).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_custom_v2:pi_custom:grant',
+            payload: { credits: 250, amountUsdMicro: '25000000', packSku: 'ai_custom_v2' } });
+        expect(aiCreditRevokeItem(receipt)).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_custom_v2:pi_custom:revoke',
+            payload: { credits: 250 } });
     });
     it('reverses the immutable receipt and strips grant delivery metadata', () => {
         const grant = aiCreditOutboxItem('user', aiCreditEntitlement(input), 'grant', 'invoice');
@@ -27,7 +34,7 @@ describe('AI credit planning', () => {
         expect(revoke.payload).not.toHaveProperty('delivery');
         expect(grant.payload.action).toBe('grant');
     });
-    it.each([['standard_monthly_v3', 4000], ['premium_monthly_v3', 20000]] as const)('plans %s with deterministic period ids and grace', (sku, credits) => {
+    it.each([['standard_monthly_v3', 200], ['premium_monthly_v3', 1000]] as const)('plans %s with deterministic period ids and grace', (sku, credits) => {
         const grant = aiCreditEntitlement({ ...input, sku });
         expect(grant).toEqual({ entitlementId: `ezil-os:v1:${sku}:sub:2026-10-01T00:00:00.000Z`, credits,
             expiresAt: '2026-11-04T00:00:00.000Z' });
@@ -55,7 +62,7 @@ describe('AI credit planning', () => {
 
 
 describe('W0.3 canonical root event grammar', () => {
-    const grant = aiTopupOutboxItem('user', { ...AI_PACKS[0]!, aiCredits: 1234 }, 'pi_test', new Date('2027-01-01Z'))!;
+    const grant = aiTopupOutboxItem('user', { ...findPack('ai_pack_10_v1')!, aiCredits: 1234 }, 'pi_test', new Date('2027-01-01Z'))!;
     it('retains root terms and payer across dispute, refund, and restore events', () => {
         grant.payload.accountPublicId = 'frozen-account';
         for (const item of [aiCreditRevokeItem(grant, { type: 'dispute', id: 'dp_D' }),
