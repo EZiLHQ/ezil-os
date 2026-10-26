@@ -203,7 +203,7 @@ const REPO_BLOB = "https://github.com/EZiLHQ/ezil-os/blob/main";
 
 // Keep the link label and URL in sync; triage.test.ts validates this exact
 // paragraph against ci.yml so moving or rewriting it fails the tools CI job.
-const CI_PRIVATE_PACKAGE_LINES = { start: 341, end: 351 } as const;
+const CI_PRIVATE_PACKAGE_LINES = { start: 345, end: 355 } as const;
 
 /**
  * The findings that carry a contributor-facing comment. `CommentFinding` is the

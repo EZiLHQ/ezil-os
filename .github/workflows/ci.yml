@@ -199,6 +199,10 @@ jobs:
         shell: bash
         working-directory: shell
         run: bun install --frozen-lockfile
+      - name: Install app build tools for source browser fixtures
+        shell: bash
+        working-directory: app
+        run: bun install --frozen-lockfile
       - name: Setup Playwright
         uses: ./.github/actions/setup-playwright
         with:
