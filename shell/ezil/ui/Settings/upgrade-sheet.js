@@ -71,6 +71,18 @@ const checkoutStatus = result => {
     return typeof data === 'string' ? data : data?.status;
 };
 
+// Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
+// modal frames in body portals. Validate their URL only; never inspect their DOM.
+function isStripeModalFrame (iframe) {
+    try {
+        if ( iframe.hasAttribute('srcdoc') ) return false;
+        const url = new URL(iframe.getAttribute('src'));
+        return url.origin === 'https://js.stripe.com' && ! url.username && ! url.password
+            && (/^\/v3\/(?:linked-accounts|universal-link-modal)-inner-[a-f0-9]{32}\.html$/.test(url.pathname)
+                || /^\/v3\/embedded-checkout-modal-[a-f0-9]{40}\.html$/.test(url.pathname));
+    } catch { return false; }
+}
+
 export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
@@ -78,6 +90,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     const controller = new win.AbortController();
     let closed = false;
     let checkout = null;
+    let releaseProviderPortals = null;
     let session = null;
     let busy = false;
     let polling = false;
@@ -99,6 +112,8 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
             controller.abort();
             destroy(checkout);
             checkout = null;
+            releaseProviderPortals?.();
+            releaseProviderPortals = null;
         },
         onCompact: (matches, dialog) => {
             const summary = dialog.querySelector('details');
@@ -270,6 +285,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         busy = true;
         show('Loading the secure payment form…');
         try {
+            releaseProviderPortals = frame.registerProviderPortals({ matchesFrame: isStripeModalFrame });
             const stripe = await loadStripe(session.publishableKey, { signal: controller.signal });
             if ( closed ) return;
             // Stripe.js renamed initEmbeddedCheckout to createEmbeddedCheckoutPage
@@ -291,6 +307,8 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
             if ( closed ) return;
             destroy(checkout);
             checkout = null;
+            releaseProviderPortals?.();
+            releaseProviderPortals = null;
             show("Couldn't load the secure payment form — Try again", 'Try again', () => { void embed(); });
         } finally { busy = false; }
     }

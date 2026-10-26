@@ -13,7 +13,8 @@
     position: fixed;
     inset: 0;
     /* UIWindow's raised windows and taskbar drag helpers reach 999999999. */
-    z-index: 2147483647;
+    /* Above OS windows, below the provider-owned body lightboxes. */
+    z-index: 1000000000;
     display: flex;
     align-items: center;
     justify-content: center;
