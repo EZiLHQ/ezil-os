@@ -666,6 +666,11 @@
 
 .ezil-billing-meter p { margin: 8px 0 0; }
 .ezil-billing-usage { font-size: 28px; font-weight: 600; line-height: 34px; }
+.ezil-billing-ai-credits { margin-bottom: 16px; }
+.ezil-billing-credit-balance { margin: 12px 0 0; }
+.ezil-billing-credit-balance strong { font-size: 32px; line-height: 40px; font-variant-numeric: tabular-nums; }
+.ezil-billing-credit-balance span { color: var(--muted); }
+.ezil-billing-ai-credits h4:focus { outline: 2px solid var(--accent); outline-offset: 4px; }
 /* "Coming soon" is a label, not a number: keep it from dominating the row. */
 .ezil-billing-meter.is-unavailable .ezil-billing-usage { font-size: 18px; line-height: 34px; color: var(--muted, #9aa3ad); }
 .ezil-billing-allowance,
