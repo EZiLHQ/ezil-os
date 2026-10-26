@@ -82,11 +82,12 @@ async function proxyAuth(sandboxId = SANDBOX): Promise<string> {
 }
 
 describe('route allow-list', () => {
-  it('forwards exactly the five member routes', () => {
+  it('forwards exactly the six member routes', () => {
     expect(matchAiRoute('GET', '/ai/v1/requests/1b4e28ba-2fa1-11d2-883f-0016d3cca427')?.upstreamPath).toBe('/v1/requests/:id');
     expect(matchAiRoute('GET', '/ai/v1/models')?.upstreamPath).toBe('/v1/models');
     expect(matchAiRoute('POST', '/ai/v1/messages')?.upstreamPath).toBe('/v1/messages');
     expect(matchAiRoute('GET', '/ai/v1/me/balance')?.upstreamPath).toBe('/v1/me/balance');
+    expect(matchAiRoute('GET', '/ai/v1/me/limits')).toEqual({ method: 'GET', upstreamPath: '/v1/me/limits', query: [], label: 'GET /v1/me/limits' });
     expect(matchAiRoute('GET', '/ai/v1/me/usage')?.upstreamPath).toBe('/v1/me/usage');
   });
 
@@ -118,6 +119,26 @@ describe('route allow-list', () => {
     expect(isAiProxyPath('/ai/v1/admin/pending')).toBe(true);
     expect(isAiProxyPath('/aiv1')).toBe(false);
     expect(isAiProxyPath('/preview/ai/v1/models')).toBe(false);
+  });
+
+  it('allows only exact GET limits, refusing mutations and lookalikes before credentials or upstream', async () => {
+    const gw = mockGateway(() => Response.json({}));
+    let credentialReads = 0;
+    const d = await deps({ fetch: gw.fetch, credential: async () => { credentialReads++; return USER_JWT; } });
+    const denied = [
+      ...['POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map(method => [method, '/ai/v1/me/limits']),
+      ...['/ai/v1/me/limits/', '/ai/v1/me/limits/extra', '/ai/v1/me/limits-other', '/ai/v1/me//limits',
+        '/ai/v1/me/%6cimits', '/ai/v1/me/limits%2f', '/ai/v1/me/limits/../admin', '/ai/v1/admin/limits',
+        '/ai/v1/me/consumer-limits', '/ai/v1/me/Limits'].map(path => ['GET', path]),
+    ];
+    for (const [method, path] of denied) {
+      expect(matchAiRoute(method!, path!)).toBeNull();
+      const response = await handleAiProxyRequest(new Request(`${HOST}${path}`, { method }), d);
+      expect(response.status).toBe(404);
+      await response.text();
+    }
+    expect(credentialReads).toBe(0);
+    expect(gw.calls).toHaveLength(0);
   });
 
   it('answers 404 for an unlisted route before any auth or upstream call', async () => {
@@ -183,6 +204,35 @@ describe('proxy authentication', () => {
 });
 
 describe('forwarding', () => {
+  it('forwards member limits once with the stored bearer, dropping all caller queries and private headers', async () => {
+    const body = '{"policy":{"policy":{"rpm":3},"sources":{"rpm":"user"}},"ceilings":{"rpm":60,"concurrency":2}}';
+    const gw = mockGateway(() => new Response(body, { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
+    const d = await deps({ fetch: gw.fetch });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/limits?user=other&account=other&model=other&limit=5&before=now`, {
+      headers: { authorization: await proxyAuth(), cookie: 'session=private', 'x-api-key': 'private' },
+    }), d);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(body);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(gw.calls).toHaveLength(1);
+    expect(gw.calls[0]).toMatchObject({ url: 'https://ai.ezil.work/v1/me/limits', method: 'GET', headers: { authorization: `Bearer ${USER_JWT}` } });
+    expect(gw.calls[0]!.body.byteLength).toBe(0);
+    expect(gw.calls[0]!.headers.cookie).toBeUndefined();
+    expect(gw.calls[0]!.headers['x-api-key']).toBeUndefined();
+    expect(d.logs.at(-1)).toMatchObject({ route: 'GET /v1/me/limits', status: 200 });
+    expect(JSON.stringify(d.logs)).not.toContain(USER_JWT);
+    expect(JSON.stringify(d.logs)).not.toContain(body);
+
+    const unauthorized = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/limits`), d);
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized' } });
+    const missing = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/limits`, { headers: { authorization: await proxyAuth() } }),
+      await deps({ fetch: gw.fetch, credential: async () => null }));
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toMatchObject({ error: { code: 'os_session_missing' } });
+    expect(gw.calls).toHaveLength(1);
+  });
+
   it('sends only the user bearer, content-type and the client Idempotency-Key, with the body bytes unchanged', async () => {
     const gw = mockGateway(() => new Response('{"id":"resp_1"}', {
       status: 200,
