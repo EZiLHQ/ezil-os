@@ -333,6 +333,7 @@ GEOMETRY_SUITES=(
 PORTABLE_SUITES=(
     "shell/touch-focus-browser-test.mjs"
     "shell/ezil/context-menu-stack-browser-test.mjs"
+    "shell/ezil/app-link-browser-test.mjs"
     "shell/ezil/launcher-toggle-browser-test.mjs"
     "shell/ezil/apps/app-store-browser-test.mjs"
     "shell/ezil/apps/os-chrome-browser-test.mjs"

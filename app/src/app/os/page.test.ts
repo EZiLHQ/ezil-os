@@ -62,7 +62,7 @@ describe('OS entry URL', () => {
         expect(mocks.defaultComputer).not.toHaveBeenCalled();
     });
     it('keeps ordinary default-computer entry working', async () => {
-        await Page();
+        await Page({});
         expect(mocks.defaultComputer).toHaveBeenCalledTimes(1);
         expect(mocks.get).not.toHaveBeenCalled();
     });

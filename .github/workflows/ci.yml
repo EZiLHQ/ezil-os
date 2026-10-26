@@ -218,6 +218,9 @@ jobs:
                    shell/ezil/apps/frame-confirmation-test.mjs \
                    shell/ezil/apps/registry-trace-test.mjs \
                    shell/ezil/native-test.mjs \
+                   shell/ezil/native-persistence-test.mjs \
+                   shell/ezil/app-link-test.mjs \
+                   shell/ezil/ui/Settings/usage-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
                    shell/ezil/ui/Settings/current-computer-test.mjs \
@@ -236,6 +239,7 @@ jobs:
           set -e
           for t in shell/touch-focus-browser-test.mjs \
                    shell/ezil/context-menu-stack-browser-test.mjs \
+                   shell/ezil/app-link-browser-test.mjs \
                    shell/ezil/launcher-toggle-browser-test.mjs \
                    shell/ezil/apps/app-store-browser-test.mjs \
                    shell/ezil/apps/os-chrome-browser-test.mjs \
