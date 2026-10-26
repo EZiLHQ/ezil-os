@@ -150,25 +150,31 @@ function announce(state, body) {
     state.meterStates = next;
     if (changes.length) state.win.find('[data-role="usage-announcement"]').text(changes.join(' '));
 }
+const SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
 async function load(state, manual = false) {
     if (!state.visible || document.hidden || !state.win.get(0).isConnected) return;
     clearTimeout(state.timer);
     const generation = ++state.generation, requested = scope(state);
     const body = state.win.find('[data-role="usage-body"]'), status = state.win.find('[data-role="usage-refresh-status"]');
     if (!sameScope(state.observedScope, requested)) {
-        state.usage = null; state.summary = null; state.meterStates = null; state.observedScope = requested;
+        state.usage = null; state.summary = null; state.summaryAt = undefined; state.meterStates = null; state.observedScope = requested;
         body.html(usageHtml(null)); state.win.find('[data-role="usage-announcement"]').empty();
     }
     status.removeAttr('role').removeClass('usage-warning').text(state.usage ? 'Refreshing…' : 'Loading usage…');
     body.attr('aria-busy', 'true');
     if (state.usage?.session.state === 'recording') body.find('.usage-session-line').html(`This session: ${duration(state.usage.session.elapsedSeconds)} so far · Update delayed`);
-    const pending = new Set(['usage', 'summary']), failed = new Set();
+    // billing.summary has side effects (Stripe renewal preview, Gateway balance read, free-credit enqueue):
+    // read it on open, on manual Refresh, or when older than five minutes. The 30 s poll reads usage only.
+    const summaryDue = manual || state.summaryAt === undefined || Date.now() - state.summaryAt > SUMMARY_MAX_AGE_MS;
+    if (summaryDue) state.summaryAt = Date.now();
+    const sources = summaryDue ? ['usage', 'summary'] : ['usage'];
+    const pending = new Set(sources), failed = new Set();
     const currentRequest = () => {
         if (generation !== state.generation || !state.visible || document.hidden || !state.win.get(0).isConnected) return false;
         if (!sameScope(requested, scope(state))) { void load(state); return false; }
         return true;
     };
-    await Promise.all(['usage', 'summary'].map(async source => {
+    await Promise.all(sources.map(async source => {
         let timeout;
         try {
             const result = await Promise.race([
