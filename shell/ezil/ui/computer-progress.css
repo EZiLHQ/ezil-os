@@ -4,3 +4,4 @@
 .ezil-computer-progress li[data-state="complete"] { opacity: .85; }
 .ezil-computer-progress li[aria-current="step"] { font-weight: 600; opacity: 1; }
 .ezil-computer-progress p { margin: 8px 0; }
+.ezil-computer-progress progress { display: block; width: 100%; margin: 8px 0; }

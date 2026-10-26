@@ -4,25 +4,67 @@ import { progressView, observeComputerProgress } from './computer-progress.js';
 import { AppSpinner } from './app-spinner.js';
 const dom = new JSDOM('<!doctype html><body></body>', {pretendToBeVisual:true});
 globalThis.document = dom.window.document;
-const base={version:1,computerId:'qa-computer',stage:'provisioning',recordedStage:'exported',operation:'migration',active:true,durable:true,resumePolicy:'saved_workspace_only',updatedAt:'2026-10-26T10:00:00Z',bytes:{transferred:null,total:null},percent:null,etaSeconds:null,selectedNextOpenHardware:{size:'xlarge',vcpu:4,memoryGiB:16,effective:'next_open'}};
+const base={version:2,computerId:'qa-computer',stage:'provisioning',recordedStage:'exported',operation:'migration',active:true,durable:true,resumePolicy:'saved_workspace_only',updatedAt:'2026-10-26T10:00:00Z',bytes:{transferred:null,total:null},percent:null,etaSeconds:null,transferStartedAt:null,transferUpdatedAt:null,typicalSeconds:null,selectedNextOpenHardware:{size:'xlarge',vcpu:4,memoryGiB:16,effective:'next_open'}};
 let view=progressView(base,'qa-computer');
-assert.equal(view.title,'Preparing computer');
+assert.equal(view.title,'Getting your AWS computer');
 assert.equal(view.steps.filter(s=>s.state==='current').length,1);
-assert.match(view.guidance,/Unsaved changes inside apps are not guaranteed/);
+assert.equal(view.guidance,'Moving your files to AWS. This can take a few minutes. You can close this window — your files keep moving, and your computer will be ready when you come back.');
 assert.match(view.next,/4 vCPU · 16 GiB/);
-assert.doesNotMatch(JSON.stringify(view),/\d+%|2–3|2-3|minutes/);
-for(const stage of ['operations_paused','needs_operator','queued']) {
- const value=progressView({...base,stage,active:true},'qa-computer');
- assert.equal(value.active,false);
- if(stage!=='queued')assert.equal(value.steps.length,0,'underlying recordedStage never drives the paused display');
+assert.equal(view.transfer,null);
+assert.doesNotMatch(JSON.stringify(view),/\d+%|2–3|2-3|\d+ minutes/);
+const moving={...base,bytes:{transferred:312_000_000,total:1_200_000_000},percent:26,etaSeconds:121,typicalSeconds:390};
+const labels=['Saving your files','Getting your AWS computer','Moving your files','Starting your desktop'];
+for(const [stage,transferred,current] of [
+ ['requested',null,0],['fenced',null,0],['exported',0,1],['exported',312_000_000,1],
+ ['provisioning',null,1],['provisioning',0,1],['provisioning',1,2],['restored',312_000_000,2],
+ ['committed',312_000_000,3],['mounting',312_000_000,3],['starting',312_000_000,3],['running',312_000_000,3],
+]) {
+ const value=progressView({...moving,stage,bytes:{...moving.bytes,transferred}},'qa-computer');
+ assert.equal(value.title,labels[current],stage);
+ assert.deepEqual(value.steps,labels.map((label,i)=>({label,state:i<current?'complete':i===current?'current':'pending'})),stage);
+ assert.equal(value.transfer!==null,current===2,stage);
+ assert.match(value.guidance,/This usually takes about 7 minutes/);
 }
-assert.equal(progressView({...base,operationsPaused:true,needsOperator:true},'qa-computer').stage,'operations_paused');
+for(const [transferred,total,text] of [
+ [312_000_000,1_200_000_000,'312 MB of 1.2 GB'],[12_400_000,999_000_000,'12 MB of 999 MB'],
+ [1_000_000_000,1_250_000_000,'1.0 GB of 1.3 GB'],[0,0,'0 MB of 0 MB'],
+]) {
+ assert.equal(progressView({...moving,stage:'restored',bytes:{transferred,total}},'qa-computer').transfer.bytes,text);
+}
+assert.equal(progressView(moving,'qa-computer').transfer.percent,26);
+for(const [etaSeconds,text] of [[0,'Less than a minute left'],[59,'Less than a minute left'],[60,'About 1 min left'],[61,'About 2 min left'],[121,'About 3 min left'],[null,'']]) {
+ assert.equal(progressView({...moving,etaSeconds},'qa-computer').transfer.eta,text);
+}
+for(const bytes of [{transferred:312_000_000,total:null},{transferred:null,total:1_200_000_000},{transferred:null,total:null}]) {
+ assert.deepEqual(progressView({...moving,stage:'restored',bytes},'qa-computer').transfer,{bytes:'Not measured',percent:null,eta:''});
+}
+assert.equal(progressView({...moving,percent:null},'qa-computer').transfer.percent,null);
+for(const [typicalSeconds,text] of [[90,'This usually takes about 2 minutes'],[120,'This usually takes about 2 minutes'],[121,'This usually takes about 3 minutes'],[null,'This can take a few minutes']]) {
+ assert.equal(progressView({...base,stage:'requested',typicalSeconds},'qa-computer').guidance,`Moving your files to AWS. ${text}. You can close this window — your files keep moving, and your computer will be ready when you come back.`);
+}
+for(const [stage,title] of [['operations_paused','Computer startup is temporarily paused'],['needs_operator','Computer needs attention'],['queued','Waiting to start'],['failed_reopened','Migration did not finish'],['failed_needs_operator','Computer needs attention']]) {
+ const value=progressView({...moving,stage,active:true},'qa-computer');
+ assert.equal(value.title,title);
+ assert.equal(value.active,false);
+ assert.equal(value.steps.length,0,'underlying recordedStage never drives the paused display');
+ assert.equal(value.transfer,null);
+ if(stage!=='queued')assert.equal(value.guidance,'');
+ else assert.match(value.guidance,/You can close this window/);
+}
+for(const override of [{operationsPaused:true,needsOperator:true},{paused:true,needsOperator:true},{stage:'operations_paused',needsOperator:true}]) {
+ const value=progressView({...moving,...override},'qa-computer');
+ assert.equal(value.stage,'operations_paused');assert.equal(value.active,false);
+ assert.equal(value.steps.length,0);assert.equal(value.transfer,null);assert.equal(value.guidance,'');
+}
 assert.equal(progressView({...base,needsOperator:true},'qa-computer').stage,'needs_operator');
 assert.equal(progressView(base,'someone-else'),null);
-assert.equal(progressView({...base,version:2},'qa-computer'),null);
+assert.equal(progressView({...base,version:1},'qa-computer').title,'Getting your AWS computer');
+assert.equal(progressView({...base,version:3},'qa-computer'),null);
 assert.equal(progressView({...base,stage:'<script>'},'qa-computer'),null);
-view=progressView({...base,operation:'opening',stage:'mounting',durable:false},'qa-computer');
-assert.match(view.body,/reattaching/i);assert.equal(view.guidance,'');assert.equal(view.steps.length,0);
+view=progressView({...moving,operation:'opening',stage:'mounting',durable:false},'qa-computer');
+assert.match(view.body,/reattaching/i);assert.equal(view.guidance,'');assert.equal(view.steps.length,0);assert.equal(view.transfer,null);
+view=progressView({...moving,stage:'recovering'},'qa-computer');
+assert.equal(view.title,'Recovering computer');assert.equal(view.steps.length,0);assert.equal(view.transfer,null);
 assert.equal(progressView({...base,operation:'none',durable:true,stage:'failed_reopened'},'qa-computer').guidance,'');
 
 const originalSet=globalThis.setTimeout,originalClear=globalThis.clearTimeout;
