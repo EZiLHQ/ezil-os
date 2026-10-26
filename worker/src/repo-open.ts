@@ -16,6 +16,6 @@ export function repoOpenResult(value: unknown, repo: string) {
     if (v?.ok === true && v.canonicalUrl === repo && validRepoFolder(v.folder) && ['cloned', 'reused'].includes(String(v.status))) {
         return { ok: true as const, folder: v.folder, canonicalUrl: repo, status: v.status as 'cloned' | 'reused' };
     }
-    const errors = ['repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination', 'repo_clone_failed'];
+    const errors = ['repo_timeout', 'repo_recovery_required', 'repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination', 'repo_clone_failed'];
     return { ok: false as const, error: errors.includes(String(v?.error)) ? String(v?.error) : 'repo_open_failed' };
 }

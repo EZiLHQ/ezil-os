@@ -15,7 +15,9 @@ export function withRepositoryFolder(url: string, folder: string): string {
 }
 export async function requestRepositoryOpen(workerUrl: string, secret: string, target: ControlTarget, computer: ComputerRef, repo: string) {
     const failure = (error = 'repo_open_failed') => ({ ok: false as const, error, errorCode: error,
-        message: error === 'repo_auth_required' ? 'Sign in to EZiL Works with ezil auth login in this computer, then retry.' : 'Repository could not be opened.' });
+        message: error === 'repo_recovery_required' ? 'Repository operation was forcibly stopped. Verified recovery is required before retrying.'
+            : error === 'repo_timeout' ? 'Repository operation timed out and stopped. Retry the request.'
+            : error === 'repo_auth_required' ? 'Sign in to EZiL Works with ezil auth login in this computer, then retry.' : 'Repository could not be opened.' });
     if (!canonicalRepository.test(repo) || !secret) return failure('repo_invalid_request');
     try {
         const endpoint = new URL(`/sandbox/${target.sandboxName}/repo-open`, workerUrl);
@@ -29,7 +31,7 @@ export async function requestRepositoryOpen(workerUrl: string, secret: string, t
         const value = await response.json();
         const expectedSuffix = '/' + createHash('sha256').update(computer.userId).digest('hex') + '/' + createHash('sha256').update(repo).digest('hex');
         if (response.ok && value.ok === true && value.canonicalUrl === repo && repositoryFolder(value.folder) && value.folder.endsWith(expectedSuffix)) return { ok: true as const, folder: value.folder };
-        const codes = ['repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination', 'repo_clone_failed'];
+        const codes = ['repo_timeout', 'repo_recovery_required', 'repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination', 'repo_clone_failed'];
         return failure(codes.includes(value.error) ? value.error : undefined);
     } catch { return failure(); }
 }

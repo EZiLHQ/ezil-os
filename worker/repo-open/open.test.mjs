@@ -37,3 +37,8 @@ test('auth and grant refusal expose bounded errors without credential output', (
         await assert.rejects(openRepository(intent, { root, verifyPin: false, run: async () => { throw Object.assign(new Error('SECRET'), { stdout: JSON.stringify({ error: { code, message: 'SECRET' } }) }); } }), new RegExp(expected));
     }
 }));
+test('timeout and forced termination are distinct bounded errors', () => fixture(async root => {
+    for (const [code, expected] of [[124, 'repo_timeout'], [126, 'repo_recovery_required']]) {
+        await assert.rejects(openRepository(intent, { root, verifyPin: false, run: async () => { throw Object.assign(new Error('private process output'), { code }); } }), new RegExp(expected));
+    }
+}));
