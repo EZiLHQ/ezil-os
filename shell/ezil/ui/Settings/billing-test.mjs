@@ -265,7 +265,7 @@ try {
     pass('shared formatting, 12 distinct error mappings, safe URLs and sheet exports');
 
     await open();
-    assert.deepEqual(qa('.ezil-settings-tab').map(tab => tab.dataset.tab), ['account', 'billing', 'computers', 'system', 'appearance', 'about', 'troubleshoot']);
+    assert.deepEqual(qa('.ezil-settings-tab').map(tab => tab.dataset.tab), ['account', 'usage', 'billing', 'computers', 'system', 'appearance', 'about', 'troubleshoot']);
     assert.equal(active(), 'billing');
     assert.equal(count(), 1);
     contains('.ezil-billing-header', 'Plan & usage');
@@ -945,9 +945,9 @@ try {
         { ...context, desktopState: { provider: 'native-macos' }, initialTab: 'billing' },
     ] ) {
         const before = billingRequests(); await open(ctx);
-        has('[data-tab="billing"]', false); assert.equal(active(), 'computers'); assert.equal(billingRequests(), before);
+        has('[data-tab="billing"]', false); assert.equal(active(), ctx.desktopState?.provider !== 'native-macos' && ctx.payload?.user?.id ? 'account' : 'computers'); assert.equal(billingRequests(), before);
     }
-    await open({ ...context, initialTab: 'missing' }); assert.equal(active(), 'computers'); has('[data-tab="billing"]');
+    await open({ ...context, initialTab: 'missing' }); assert.equal(active(), 'account'); has('[data-tab="billing"]');
     const before = count(); click(q('[data-tab="billing"]')); await settle(); assert.equal(count(), before + 1);
     click(q('[data-tab="billing"]')); await settle(); assert.equal(count(), before + 1);
     await open();
