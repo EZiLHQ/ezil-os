@@ -7,7 +7,7 @@ import { validateRedemption, type RetainedIdentity, type PrivateGrant } from './
 export const IDENTITY_COOKIE = '__Host-ezil-project-identity';
 export const LAUNCH_COOKIE = '__Host-ezil-project-launch';
 export const COOKIE_OPTIONS = { httpOnly: true, secure: true, sameSite: 'lax', path: '/' } as const;
-interface Launch { code?: string; deadline: number; userId?: string; sessionId?: string; computerId?: string; grant?: PrivateGrant; busy?: boolean }
+interface Launch { intentId: string; code?: string; deadline: number; userId?: string; sessionId?: string; computerId?: string; grant?: PrivateGrant; busy?: boolean }
 const state = globalThis as typeof globalThis & { ezilProjectVault?: { identities: Vault<RetainedIdentity>; launches: Vault<Launch> } };
 export const vaults = state.ezilProjectVault ??= { identities: new Vault(), launches: new Vault() };
 async function currentSession(userId?: string) {
@@ -33,17 +33,38 @@ export async function retainedIdentity(userId?: string) {
     if (checked.subject !== record.subject || checked.issuer !== record.issuer) throw new Error('project_repo_invalid_identity');
     return record;
 }
+export function launchProofCookie(intentId: string) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(intentId)) throw new Error('project_repo_not_authorized');
+    return `${LAUNCH_COOKIE}-${intentId}`;
+}
+export async function resolveLaunchIntent(intentId: string) {
+    const handle = (await cookies()).get(launchProofCookie(intentId))?.value;
+    const entry = vaults.launches.get(handle);
+    if (!handle || !entry || entry.intentId !== intentId || entry.busy) throw new Error('project_repo_not_authorized');
+    return { handle, entry };
+}
+export async function bindLaunchIdentity(intentId: string, identity: RetainedIdentity, computerId?: string) {
+    const resolved = await resolveLaunchIntent(intentId);
+    const entry = resolved.entry;
+    if ((entry.userId !== undefined && entry.userId !== identity.userId)
+        || (entry.sessionId !== undefined && entry.sessionId !== identity.sessionId)
+        || (computerId !== undefined && entry.computerId !== undefined && entry.computerId !== computerId)) throw new Error('project_repo_not_authorized');
+    entry.userId = identity.userId; entry.sessionId = identity.sessionId;
+    if (computerId !== undefined) entry.computerId = computerId;
+    return resolved;
+}
 export async function clearProjectIdentity() {
     const jar = await cookies();
-    vaults.identities.delete(jar.get(IDENTITY_COOKIE)?.value); vaults.launches.delete(jar.get(LAUNCH_COOKIE)?.value);
-    jar.set(IDENTITY_COOKIE, '', { ...COOKIE_OPTIONS, maxAge: 0 }); jar.set(LAUNCH_COOKIE, '', { ...COOKIE_OPTIONS, maxAge: 0 });
+    vaults.identities.delete(jar.get(IDENTITY_COOKIE)?.value);
+    jar.set(IDENTITY_COOKIE, '', { ...COOKIE_OPTIONS, maxAge: 0 });
+    for (const cookie of jar.getAll()) if (cookie.name === LAUNCH_COOKIE || cookie.name.startsWith(LAUNCH_COOKIE + '-')) {
+        vaults.launches.delete(cookie.value);
+        jar.set(cookie.name, '', { ...COOKIE_OPTIONS, maxAge: 0 });
+    }
 }
-export async function launchGrant(userId: string, computerId: string): Promise<PrivateGrant | undefined> {
-    const handle = (await cookies()).get(LAUNCH_COOKIE)?.value;
-    if (!handle) return;
-    const entry = vaults.launches.get(handle);
-    if (!entry || entry.busy) throw new Error('project_repo_not_authorized');
+export async function launchGrant(userId: string, computerId: string, intentId: string): Promise<PrivateGrant> {
     const identity = await retainedIdentity(userId);
+    const { handle, entry } = await bindLaunchIdentity(intentId, identity, computerId);
     if (entry.grant) {
         if (entry.userId !== userId || entry.sessionId !== identity.sessionId || entry.computerId !== computerId) throw new Error('project_repo_not_authorized');
         validateRedemption({ binding: entry.grant.binding, identity: entry.grant.identity, git: entry.grant.git }, identity);

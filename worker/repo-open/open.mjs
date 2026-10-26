@@ -61,7 +61,7 @@ export async function openRepository(input, { root = process.env.EZIL_WORKSPACE_
         if (error.code === 124) throw new Error('repo_timeout');
         let code;
         try { code = JSON.parse(error.stdout).error?.code; } catch { /* No raw output escapes. */ }
-        throw new Error(code === 'auth-required' ? 'repo_auth_required' : code === 'repository-not-authorized' ? 'repo_not_authorized' : 'repo_clone_failed');
+        throw new Error(code === 'repository-ref-mismatch' ? 'repo_ref_mismatch' : code === 'auth-required' ? 'repo_auth_required' : code === 'repository-not-authorized' ? 'repo_not_authorized' : 'repo_clone_failed');
     }
     if (result?.canonicalUrl !== repo || result.folder !== folder || (grant ? result.identity?.issuer !== grant.identity.issuer || result.identity?.subject !== grant.identity.subject : typeof result.accountId !== 'string' || !result.accountId)
         || !['cloned', 'reused'].includes(result.status)) throw new Error('repo_invalid_result');
