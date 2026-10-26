@@ -51,6 +51,30 @@ export interface SystemInfo {
     usage: null;
 }
 
+/** Read-only recorded transition progress; never a command or physical readiness probe. */
+export interface ComputerProgress {
+    version: 1;
+    computerId: string;
+    observedAt: string;
+    operation: 'migration' | 'opening' | 'stopping' | 'none';
+    stage: string;
+    recordedStage: string;
+    lifecycleState: string | null;
+    paused: boolean;
+    operationsPaused: boolean;
+    needsOperator: boolean;
+    active: boolean;
+    startedAt: string | null;
+    updatedAt: string | null;
+    durable: boolean;
+    resumePolicy: 'saved_workspace_only' | 'unavailable';
+    bytes: { transferred: null; total: null };
+    percent: null;
+    etaSeconds: null;
+    hardware: { instanceType: string | null; source: 'placement' | 'unavailable' };
+    selectedNextOpenHardware: { size: string; vcpu: number; memoryGiB: number; effective: 'next_open' } | null;
+}
+
 /** Result of `desktop.status` — a cheap poll that never boots anything. */
 export interface DesktopStatus {
     ok: boolean;
