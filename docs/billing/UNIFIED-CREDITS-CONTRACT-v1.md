@@ -120,6 +120,21 @@ Production is out of scope for v1 (later port: Gateway prod migrations `0028+`).
     - Replays of the same eventId stay idempotent.
   - **Overlapping disputes (W0.4).** A restore `E:restore:<D1>` is refused with 409 `restore_review_required` (no grant, fail closed) while the head carries any unresolved dispute marker other than `D1`, or whenever the restorable revocation is otherwise ambiguous. Resolution is an operator review; no amount is ever guessed. A restore for `D2` likewise requires `D1` to be resolved.
   - **Invariant** (tested): for every chain, Σ debits over all generations + Σ remaining over unrevoked generations ≤ the root grant's credits, and at most one generation is unrevoked.
+  - **Safety completion (W0.5, frozen by root after independent financial review; it governs wherever W0.3/W0.4 wording differs. HTTP hook field shape is unchanged):**
+    - **Edges, not timestamps.** `ezil_ai.funding_events` gains `parent_grant_id uuid null references ezil_ai.grants(id)`.
+      - A restore event records `parent_grant_id` = the revoked source grant, `grant_id` = the minted child grant, and `entitlement_id` = always the root `E`.
+      - Chain traversal follows parent→child edges only, never timestamps. Later revokes always name the root `E`; the Gateway resolves the head by following the edges.
+    - **No double mint.** Partial unique index on `(parent_grant_id)`, and on the minted `grant_id`, where `action = 'restore' and outcome = 'restored'`. Distinct restore events can never mint twice from one parent. An arbitrary new restore id cannot mint.
+    - **Tombstones.** Every revoke event records the resolved head `grant_id`, even when that head is already revoked. So a refund or legacy revoke that arrives after a dispute revoke stays a terminal tombstone. This supersedes the "`already_revoked` no-op" reading.
+    - **Terminal wins.** Before any restore: if any terminal (refund/legacy) revoke exists anywhere in root `E`'s chain → `restore_refused_terminal`, no funding row, no mint.
+    - **One dispute only.** The current head's dispute revocations must be exactly one distinct `D`, matching the restore's `D`. Several distinct `D` → 409 `restore_review_required`: no funding row, no mint, manual review. The second dispute is never ignored.
+    - **Lock order.** Root advisory lock → event advisory lock → wallet → head grant. Re-read the head and its open holds after taking the locks.
+    - **Rollback** drops only the new column and indexes, and refuses while any restore-chain rows exist.
+    - **Required tests:**
+      - D1 revoke → refund → D1 won ⇒ no restore;
+      - overlapping D1/D2 ⇒ no restore (409 review);
+      - D1 restore → D2 revoke → D2 restore preserves fractional micro amounts, the root expiry and conservation;
+      - an arbitrary new restore id cannot mint.
   - **W0.4 tests:**
     - dispute `D` revokes → refund `R` on the revoked head → `terminalized` → restore `D` → `restore_refused_terminal`, no grant;
     - `D1` revokes → `D2` recorded → restore `D1` → 409 `restore_review_required`;
