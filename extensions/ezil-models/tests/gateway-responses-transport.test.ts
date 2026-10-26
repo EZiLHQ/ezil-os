@@ -44,6 +44,21 @@ beforeEach(() => forgetGatewayModels());
 afterEach(() => forgetGatewayModels());
 
 describe('Responses transport contract', () => {
+    for (const stream of [true, false]) test(`clamped Responses ${stream ? 'SSE' : 'JSON'} logs only the reply limit notice`, async () => {
+        const s = server(() => {
+            const response = stream ? success() : Response.json(completed());
+            response.headers.set('x-ezil-output-limit-clamped', '512');
+            response.headers.set('x-ezil-output-limit-requested', '4096');
+            return response;
+        });
+        const logs: string[] = [];
+        const events = await run(s.fetch, { log: line => logs.push(line) }, { ...responsesModel(), stream });
+        expect(logs).toHaveLength(2);
+        expect(logs[0]).toBe('Reply limited to 512 tokens to fit your credit balance');
+        expect(JSON.parse(logs[1]!).error_code).toBeNull();
+        expect(events.filter(event => event.type === 'text')).toEqual([{ type: 'text', value: 'Visible answer' }]);
+        expect(s.posts).toHaveLength(1);
+    });
     for (const catalogValue of [{}, { data: [] }, { data: [{ ...catalog().data[0], protocols: undefined }] },
         { data: [{ ...catalog().data[0], protocols: ['anthropic-messages'] }] },
         { data: [{ ...catalog().data[0], enabled: false }] }, { ...catalog(), killswitch: true },

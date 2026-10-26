@@ -114,8 +114,17 @@ export function isUtilityRequest(options: Record<string, unknown>): boolean {
     return ['role', 'requestInitiator'].some(key => typeof options[key] === 'string' && /(?:^|[./_-])(utility(?:Small)?|title|summary|summariz(?:e|ation)|progress)(?:$|[./_-])/i.test(options[key] as string));
 }
 
+function aiCreditsLink(): vscode.Uri | undefined {
+    try {
+        const url = new URL(process.env.EZIL_AI_BASE_URL ?? '');
+        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&section=ai-credits`);
+    } catch { /* no usable OS origin */ }
+    return undefined;
+}
+
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private readonly changed = new vscode.EventEmitter<void>();
+    private lastCreditWarningAt = -Infinity;
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
 
     constructor(private readonly host: ProviderHost) {}
@@ -220,6 +229,13 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // to be free of key material (a gateway may echo headers or carry the key in its path).
             const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
             if (resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
+            if (error instanceof GatewayError && ['insufficient_credits', 'no_live_grant'].includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
+                this.lastCreditWarningAt = Date.now();
+                const link = aiCreditsLink();
+                void Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
+                    if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
+                }).catch(() => {});
+            }
             if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout'].includes(error.code ?? '')) {
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
