@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { and, count, eq, isNull, lt } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as schema from '@/server/db/schema';
 import {
@@ -19,6 +19,19 @@ import { createBillingStore } from './store';
 
 type Database = typeof import('@/server/db').db;
 const instant = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000);
+
+describe('billing inbox receipt comparison without a database connection', () => {
+    const receipt = { eventId: 'event', type: 'invoice.paid', livemode: false, payloadSha256: 'a'.repeat(64) };
+    it.each([{ payloadSha256: 'b'.repeat(64) }, { type: 'invoice.updated' }, { livemode: true }])('conflicts on changed receipt fields %j even before processing', async change => {
+        for (const processedAt of [null, instant(1)]) {
+            const returning = vi.fn().mockResolvedValue([]);
+            const limit = vi.fn().mockResolvedValue([{ ...receipt, processedAt, outcome: 'applied' }]);
+            const db = { insert: () => ({ values: () => ({ onConflictDoNothing: () => ({ returning }) }) }),
+                select: () => ({ from: () => ({ where: () => ({ limit }) }) }) } as unknown as Database;
+            expect(await createBillingStore(db).recordEvent({ ...receipt, ...change })).toBe('conflict');
+        }
+    });
+});
 
 /**
  * Run against a disposable migrated database. A single connection keeps each
@@ -112,7 +125,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
             expect(await store.recordEvent(event)).toBe('processed');
         }
         await store.markEventProcessed(event.eventId, 'ignored_not_failed');
-        expect(await store.recordEvent({ ...event, type: 'changed', payloadSha256: 'b'.repeat(64) })).toBe('processed');
+        expect(await store.recordEvent({ ...event, type: 'changed', payloadSha256: 'b'.repeat(64) })).toBe('conflict');
         const [unchanged] = await db.select().from(billingEvents).where(eq(billingEvents.eventId, event.eventId));
         expect(unchanged).toMatchObject(event);
 

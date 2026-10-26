@@ -9,7 +9,7 @@ import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, Us
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
 import { CATALOG_V3 } from './v3/contract';
-import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem } from './ai-credits';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, hasAiTopupReceipts } from './ai-credits';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
 
@@ -254,21 +254,18 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             const userId = await store.userForStripeCustomer(session.customer);
             if (userId === null) return 'unattributed:customer';
             if (session.paymentIntentId === null) return 'review:missing_payment_intent';
+            if (!hasAiTopupReceipts(store)) return 'failed:ai_topup_receipts_unavailable';
+            // The original policy and expiry win even if the catalog changes before a replay.
+            if (await store.aiTopupReceipt(userId, session.paymentIntentId)) return 'applied';
             const amount = BigInt(pack.creditCents) * BigInt(10_000);
             const period = purchasedPeriod(event.created);
-            await store.insertGrant({
+            const receipt = aiTopupOutboxItem(userId, pack, session.paymentIntentId, period.end);
+            if (!receipt) return 'review:pack_credits_unset';
+            return store.recordAiTopup({
                 userId, meter: 'ai_usd_micro', kind: 'topup', amount,
                 periodStart: period.start, periodEnd: period.end,
                 sourceType: 'payment_intent', sourceId: session.paymentIntentId,
-            });
-            await store.enqueueOutbox({
-                eventKey: `payment_intent:${session.paymentIntentId}:ai_topup`, userId, kind: 'ai_grant',
-                payload: {
-                    amountUsdMicro: amount.toString(), bucket: 'purchased', expiresAt: period.end.toISOString(),
-                    provider: 'stripe', providerObjectId: session.paymentIntentId,
-                },
-            });
-            return 'applied';
+            }, receipt);
         }
         case 'revoke':
         case 'suspend':
@@ -297,6 +294,11 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 return action.type === 'revoke' ? 'failed:no_grant_for_refund' : 'failed:no_grant_for_dispute';
             }
             if (originals.some(grant => grant.userId !== userId)) return 'review:customer_mismatch';
+            const topupReceipt = charge.invoiceId === null && charge.paymentIntentId !== null && hasAiTopupReceipts(store)
+                ? await store.aiTopupReceipt(userId, charge.paymentIntentId) : null;
+            // v1 grants cannot reinstate a revoked entitlement. Leave its receipt intact.
+            if (topupReceipt && action.type === 'restore') return 'review:ai_restore_unresolved';
+            if (topupReceipt) await store.enqueueOutbox(aiCreditRevokeItem(topupReceipt));
             // Invoice lines retain the sold SKU even after an upgrade/downgrade.
             // Reconstructing also repairs a reversal arriving between ledger and outbox writes.
             if (action.type !== 'restore' && charge.invoiceId !== null && originals.some(grant => grant.kind === 'plan_period')) {
@@ -335,7 +337,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             // grant is also the receipt for reversing the included credit.
             const aiOriginal = originals.find(grant => grant.meter === 'ai_usd_micro')
                 ?? originals.find(grant => grant.kind === 'pro_period');
-            if (aiOriginal !== undefined) {
+            if (aiOriginal !== undefined && !topupReceipt) {
                 const amount = aiOriginal.meter === 'ai_usd_micro' ? aiOriginal.amount : PRO_PLAN.aiIncludedMicro;
                 await store.enqueueOutbox({
                     eventKey: `${sourceType}:${sourceId}:ai_${action.type}`,
@@ -349,6 +351,11 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                         provider: 'stripe', providerObjectId: sourceId,
                     },
                 });
+            }
+            if (action.type === 'restore' && charge.invoiceId !== null
+                && (await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? []).length > 0) {
+                // UNRESOLVED: V3 compute restoration above does not restore Gateway AI credits.
+                return 'review:ai_restore_unresolved';
             }
             return 'applied';
         }

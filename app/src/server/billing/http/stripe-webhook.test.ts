@@ -195,7 +195,7 @@ describe('Stripe webhook HTTP handler', () => {
         const response = await handleStripeWebhook(request(), f.deps, f.process);
         expect(response.status).toBe(500);
         expect(await response.json()).toEqual({ error: 'processing_failed' });
-        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, 'failed: temporary failure retry');
+        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, 'failed:processing_unavailable');
         f.store.recordEvent.mockResolvedValue('unprocessed');
         expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);
         expect(f.process).toHaveBeenCalledTimes(2);
@@ -208,7 +208,35 @@ describe('Stripe webhook HTTP handler', () => {
         f.process.mockRejectedValue(new Error('temporary failure'));
         f.store.markEventProcessed.mockRejectedValue(new Error('store unavailable'));
         expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(500);
-        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, 'failed: temporary failure');
+        expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, 'failed:processing_unavailable');
+    });
+
+    it.each([`${rawBody}\n`, JSON.stringify({ ...event, type: 'invoice.updated' }),
+        JSON.stringify({ ...event, data: { object: { id: 'different_invoice' } } })])('refuses a changed signed event without replacing its receipt: %s', async changedBody => {
+        const f = fixture();
+        let original: Parameters<BillingStore['recordEvent']>[0] | undefined;
+        f.store.recordEvent.mockImplementation(async receipt => {
+            if (!original) { original = receipt; return 'new'; }
+            return receipt.payloadSha256 === original.payloadSha256 && receipt.type === original.type
+                && receipt.livemode === original.livemode ? 'processed' : 'conflict';
+        });
+        expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);
+        const preserved = { ...original };
+        const conflict = await handleStripeWebhook(request(changedBody), f.deps, f.process);
+        expect(conflict.status).toBe(409);
+        expect(await conflict.json()).toEqual({ error: 'event_conflict' });
+        expect(original).toEqual(preserved);
+        expect(f.process).toHaveBeenCalledTimes(1);
+        expect(f.store.markEventProcessed).toHaveBeenCalledTimes(1);
+        expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);
+        expect(f.process).toHaveBeenCalledTimes(1);
+    });
+    it('never marks a receipt when recording it failed before acceptance', async () => {
+        const f = fixture();
+        f.store.recordEvent.mockRejectedValue(new Error('private database credential'));
+        expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(500);
+        expect(f.store.markEventProcessed).not.toHaveBeenCalled();
+        expect(f.process).not.toHaveBeenCalled();
     });
 });
 
@@ -230,7 +258,7 @@ describe('retryable processor outcomes', () => {
         expect(f.process).toHaveBeenCalledTimes(2);
     });
 
-    it.each(['applied', 'ignored', 'review:no_base_line', 'unattributed:customer'])('acknowledges ordinary outcome %s', async outcome => {
+    it.each(['applied', 'ignored', 'review:no_base_line', 'review:pack_credits_unset', 'review:ai_restore_unresolved', 'unattributed:customer'])('acknowledges ordinary outcome %s', async outcome => {
         const f = fixture();
         f.process.mockResolvedValue(outcome);
         expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);

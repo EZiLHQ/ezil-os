@@ -6,6 +6,8 @@ export const AI_CREDIT_MAX_ATTEMPTS = 10;
 export const AI_CREDIT_LEASE_MS = 30_000;
 export interface AiCreditOutboxRow {
     id: string; eventKey: string; userId: string; kind: string; payload: Record<string, unknown>; attempts: number; exhausted?: boolean;
+    /** Completed account waits do not consume the delivery failure budget. */
+    dependencyWaits?: number;
 }
 export interface AiCreditDelivery {
     status: 'done' | 'failed' | 'retry'; reason: string | null; nextAttemptAt?: number;
@@ -17,8 +19,9 @@ export interface AiCreditOutboxStore {
     finish(row: AiCreditOutboxRow, result: AiCreditDelivery, now: number): Promise<void>;
 }
 export const aiCreditBackoffMs = (attempt: number) => Math.min(3_600_000, 60_000 * 2 ** Math.max(0, attempt - 1));
+export const isAiAccountDependency = (reason: string | null) => reason === 'no_ai_account' || reason === 'account_not_found';
 
-function plannedEvent(row: AiCreditOutboxRow): Omit<AiGatewayEvent, 'accountPublicId'> | null {
+export function plannedAiCreditEvent(row: AiCreditOutboxRow): Omit<AiGatewayEvent, 'accountPublicId'> | null {
     const p = row.payload;
     if (p.protocol !== AI_CREDIT_PROTOCOL || typeof p.entitlementId !== 'string'
         || !/^ezil-os:v1:[A-Za-z0-9._:-]+$/.test(p.entitlementId) || p.entitlementId.length > 193
@@ -51,7 +54,7 @@ export async function drainAiCreditOutbox(deps: {
         if (!row) break;
         counts.claimed++;
         let result: AiCreditDelivery;
-        const event = plannedEvent(row);
+        const event = plannedAiCreditEvent(row);
         if (row.exhausted) result = { status: 'failed', reason: 'attempts_exhausted' };
         else if (!event) result = { status: 'failed', reason: 'invalid_payload' };
         else if (event.action === 'grant' && Date.parse(event.expiresAt) <= clock()) result = { status: 'failed', reason: 'expired' };
@@ -59,7 +62,7 @@ export async function drainAiCreditOutbox(deps: {
             try {
                 const account = typeof row.payload.accountPublicId === 'string' ? row.payload.accountPublicId : await store.accountFor(row);
                 if (!account) {
-                    result = { status: 'failed', reason: 'no_ai_account' };
+                    result = { status: 'retry', reason: 'no_ai_account' };
                     counts.skipped++;
                 } else if (!hasTime() || !await store.pinAccount(row, account) || !hasTime()) {
                     result = { status: 'retry', reason: 'deadline_or_lease' };
@@ -75,7 +78,9 @@ export async function drainAiCreditOutbox(deps: {
             }
         }
         if (result.status === 'retry') {
-            if (row.attempts >= AI_CREDIT_MAX_ATTEMPTS) result = { status: 'failed', reason: 'attempts_exhausted' };
+            if (!isAiAccountDependency(result.reason) && row.attempts - (row.dependencyWaits ?? 0) >= AI_CREDIT_MAX_ATTEMPTS) {
+                result = { status: 'failed', reason: 'attempts_exhausted' };
+            }
             else result.nextAttemptAt = clock() + aiCreditBackoffMs(row.attempts);
         }
         await store.finish(row, result, clock());

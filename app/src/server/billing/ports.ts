@@ -232,7 +232,7 @@ export interface BillingStore {
      * nothing); `unprocessed` = seen before but never finished (re-run: every
      * write below is idempotent, so reprocessing is safe).
      */
-    recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed'>;
+    recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed' | 'conflict'>;
     markEventProcessed(eventId: string, outcome: string): Promise<void>;
     upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale' | 'conflict'>;
     insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'>;

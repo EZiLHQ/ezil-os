@@ -4,8 +4,9 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as schema from '@/server/db/schema';
-import { authUsers, billingOutbox } from '@/server/db/schema';
-import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
+import { authUsers, billingOutbox, billingGrants } from '@/server/db/schema';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts } from './ai-credits';
+import { AI_PACKS } from './catalog';
 import { createAiCreditOutboxStore } from './ai-credit-outbox-store';
 import { drainAiCreditOutbox, type AiCreditOutboxStore } from './ai-credit-outbox';
 import { enqueueFreeAiCredits } from './ai-balance';
@@ -57,6 +58,26 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         await store.finish(first, { status: 'retry', reason: 'http_503', nextAttemptAt: NOW + 60_000 }, NOW);
         expect(await store.claim(NOW + 59_999)).toBeNull();
         expect(await store.claim(NOW + 60_000)).toMatchObject({ id: first.id, attempts: 2 });
+    });
+    it.each(['no_ai_account', 'account_not_found'])('persists %s waits beyond ten claims, including a crashed lease', async reason => {
+        await billing.enqueueOutbox(item());
+        for (let attempt = 1; attempt <= 20; attempt++) {
+            const at = NOW + attempt * 3_600_000;
+            const row = (await store.claim(at))!;
+            expect(row).toMatchObject({ attempts: attempt, dependencyWaits: attempt - 1, exhausted: false });
+            await store.finish(row, { status: 'retry', reason, nextAttemptAt: at + 3_600_000 }, at);
+            expect(await store.claim(at + 3_599_999)).toBeNull();
+        }
+        const at = NOW + 21 * 3_600_000;
+        const crashed = (await store.claim(at))!;
+        const recovered = (await store.claim(at + 30_000))!;
+        expect(recovered).toMatchObject({ attempts: 22, dependencyWaits: 20, exhausted: false });
+        expect(await store.pinAccount(crashed, 'stale')).toBe(false);
+        await store.finish(crashed, { status: 'failed', reason: 'stale' }, at + 30_001);
+        expect(await store.pinAccount(recovered, 'ready')).toBe(true);
+        await store.finish(recovered, { status: 'done', reason: null }, at + 30_002);
+        expect((await rows())[0]).toMatchObject({ deliveredAt: new Date(at + 30_002),
+            payload: expect.objectContaining({ accountPublicId: 'ready', delivery: { status: 'done', nextAttemptAt: null, dependencyWaits: 20 } }) });
     });
     it('recovers expired leases and fences writes from the old worker', async () => {
         await billing.enqueueOutbox(item());
@@ -116,6 +137,51 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
             : event('charge.dispute.created', { id: 'dispute', charge: 'charge', status: 'needs_response' });
         await processStripeEvent(reversal, deps); await processStripeEvent(reversal, deps);
         expect((await rows()).map(r => r.kind).sort()).toEqual(['ai_grant', 'ai_revoke']);
+    });
+});
+
+describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('atomic topup receipts with Postgres', () => {
+    it('freezes one receipt, rolls back a failed insert, and never converts a legacy purchase', async () => {
+        const client = postgres(process.env.BILLING_TEST_DATABASE_URL!, { max: 1, prepare: false });
+        const db = drizzle(client, { schema });
+        const rollback = new Error('fixture rollback');
+        try {
+            await expect(db.transaction(async tx => {
+                const store = createBillingStore(tx as unknown as Database);
+                if (!hasAiTopupReceipts(store)) throw new Error('missing topup store');
+                const userId = randomUUID();
+                await tx.insert(authUsers).values({ id: userId });
+                const pack = { ...AI_PACKS[0]!, aiCredits: 1234 };
+                const make = (id: string) => {
+                    const receipt = aiTopupOutboxItem(userId, pack, id, end)!;
+                    const grant = { userId, meter: 'ai_usd_micro' as const, kind: 'topup' as const, amount: BigInt(10_000_000),
+                        sourceType: 'payment_intent' as const, sourceId: id, periodStart: start, periodEnd: end };
+                    return { grant, receipt };
+                };
+                const first = make(`pi_${userId.replaceAll('-', '')}`);
+                expect(await store.recordAiTopup(first.grant, first.receipt)).toBe('applied');
+                await store.enqueueOutbox(aiCreditRevokeItem(first.receipt));
+                const changed = { ...first.receipt, payload: { ...first.receipt.payload, credits: 9999 } };
+                expect(await store.recordAiTopup(first.grant, changed)).toBe('applied');
+                expect((await store.aiTopupReceipt(userId, first.grant.sourceId))?.payload.credits).toBe(1234);
+                expect(await tx.select().from(billingGrants).where(eq(billingGrants.userId, userId))).toHaveLength(1);
+                expect(await tx.select().from(billingOutbox).where(eq(billingOutbox.userId, userId))).toHaveLength(2);
+
+                const collision = make(`pi_collision${userId.replaceAll('-', '')}`);
+                collision.receipt.eventKey = first.receipt.eventKey;
+                await expect(store.recordAiTopup(collision.grant, collision.receipt)).rejects.toThrow('ai_topup_receipt_conflict');
+                expect(await tx.select().from(billingGrants).where(eq(billingGrants.sourceId, collision.grant.sourceId))).toHaveLength(0);
+
+                const legacy = make(`pi_legacy${userId.replaceAll('-', '')}`);
+                await store.insertGrant(legacy.grant);
+                const old = { userId, eventKey: `payment_intent:${legacy.grant.sourceId}:ai_topup`, kind: 'ai_grant' as const,
+                    payload: { amountUsdMicro: '10000000', bucket: 'purchased' } };
+                await store.enqueueOutbox(old);
+                expect(await store.recordAiTopup(legacy.grant, legacy.receipt)).toBe('review:legacy_topup_unfunded');
+                expect(await store.aiTopupReceipt(userId, legacy.grant.sourceId)).toBeNull();
+                throw rollback;
+            })).rejects.toBe(rollback);
+        } finally { await client.end(); }
     });
 });
 

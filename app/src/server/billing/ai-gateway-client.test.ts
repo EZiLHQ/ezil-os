@@ -37,6 +37,14 @@ describe('signed AI Gateway client', () => {
         expect(await sendAiCreditEvent({ ...options, fetch: fetcher, log })).toEqual({ status: 'permanent', reason: 'event_conflict' });
         expect(log).toHaveBeenCalledExactlyOnceWith('[billing.ai] event_conflict', { entitlementId: 'ent' });
     });
+    it.each([{ error: { code: 'account_not_found' } }, { code: 'account_not_found' }])('retries a documented missing Gateway account %j', async body => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(body, { status: 404 }));
+        expect(await sendAiCreditEvent({ ...options, fetch: fetcher })).toEqual({ status: 'retryable', reason: 'account_not_found' });
+    });
+    it('does not turn an unknown 404 into an account wait', async () => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ error: { code: 'route_not_found' } }, { status: 404 }));
+        expect(await sendAiCreditEvent({ ...options, fetch: fetcher })).toEqual({ status: 'permanent', reason: 'http_404' });
+    });
     it.each(['fetch', 'body'] as const)('times out a stalled %s at ten seconds and aborts', async stall => {
         vi.useFakeTimers();
         const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => stall === 'fetch' ? new Promise(() => {})

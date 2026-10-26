@@ -60,7 +60,7 @@ export function serviceFeeCents(creditCents: number): number {
 
 function pack(sku: string, creditCents: number): CatalogPack {
     const fee = serviceFeeCents(creditCents);
-    return { sku, creditCents, serviceFeeCents: fee, totalCents: creditCents + fee };
+    return { sku, aiCredits: null, creditCents, serviceFeeCents: fee, totalCents: creditCents + fee };
 }
 
 export const AI_PACKS: readonly CatalogPack[] = Object.freeze([
@@ -79,6 +79,12 @@ export function catalogPro(): CatalogPro {
 
 export function findPack(sku: string): CatalogPack | undefined {
     return AI_PACKS.find(p => p.sku === sku);
+}
+
+/** Additional purchase gate: callers must also check their existing checkout flags. */
+export function aiPackCheckoutEligible(pack: CatalogPack | null | undefined): pack is CatalogPack & { aiCredits: number } {
+    return pack != null && typeof pack.aiCredits === 'number' && Number.isSafeInteger(pack.aiCredits)
+        && pack.aiCredits >= 1 && pack.aiCredits <= 1_000_000;
 }
 
 /** Pro's storage cap is only raised past Free's once G-STOR is declared met. */

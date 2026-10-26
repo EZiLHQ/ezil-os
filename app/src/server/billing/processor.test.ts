@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PRO_PLAN } from './catalog';
+import * as catalog from './catalog';
+import type { AiTopupReceiptStore } from './ai-credits';
+import { drainAiCreditOutbox, type AiCreditOutboxRow } from './ai-credit-outbox';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
     StorageSample, StripeApi, StripeCharge, StripeCheckoutSession, StripeInvoice, StripeInvoicePaymentState,
@@ -22,7 +25,7 @@ type Interval = {
 };
 
 /** Match the database's unique keys so replay tests exercise persisted effects. */
-class MemoryStore implements BillingStore {
+class MemoryStore implements BillingStore, AiTopupReceiptStore {
     epochs: StoredComputeEpoch[] = [];
     grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
     openEpoch: BillingStore['openEpoch'] = async input => {
@@ -205,6 +208,25 @@ class MemoryStore implements BillingStore {
         return [...this.outbox.values()].filter(item => item.userId === userId && item.kind === 'ai_grant'
             && item.payload.protocol === 'ezil-ai-credits-v1' && item.payload.invoiceId === invoiceId);
     }
+    async aiTopupReceipt(userId: string, paymentIntentId: string) {
+        return [...this.outbox.values()].find(item => item.userId === userId && item.kind === 'ai_grant'
+            && item.payload.protocol === 'ezil-ai-credits-v1' && item.payload.paymentIntentId === paymentIntentId) ?? null;
+    }
+    recordAiTopup: AiTopupReceiptStore['recordAiTopup'] = async (grant, receipt) => {
+        const original = [...this.grants.values()].find(row => row.kind === 'topup' && row.sourceId === grant.sourceId);
+        if (original && original.userId !== grant.userId) return 'review:customer_mismatch';
+        if (await this.aiTopupReceipt(grant.userId, grant.sourceId)) return 'applied';
+        if (original || this.outbox.has(`payment_intent:${grant.sourceId}:ai_topup`)) return 'review:legacy_topup_unfunded';
+        const before = { grants: new Map(this.grants), outbox: new Map(this.outbox), writes: [...this.writes] };
+        try {
+            await this.insertGrant(grant);
+            await this.enqueueOutbox(receipt);
+        } catch (error) {
+            this.grants = before.grants; this.outbox = before.outbox; this.writes = before.writes;
+            throw error;
+        }
+        return 'applied';
+    };
     async latestIntervalFor(computerId: string) {
         return this.intervals.filter(row => row.computerId === computerId)
             .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())[0] ?? null;
@@ -312,6 +334,14 @@ async function seedTopup(store: MemoryStore) {
 }
 
 afterEach(() => vi.restoreAllMocks());
+// Explicit test-only policy values, unrelated to any USD conversion. Shipped packs stay null.
+beforeEach(() => {
+    vi.spyOn(catalog, 'findPack').mockImplementation(sku => {
+        const pack = catalog.AI_PACKS.find(value => value.sku === sku);
+        return pack ? { ...pack, aiCredits: sku === 'ai_pack_10_v1' ? 1234 : 5678 } : undefined;
+    });
+});
+vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
 
 describe('processStripeEvent', () => {
     it('links only a re-read server checkout and applies the subsequent top-up in order', async () => {
@@ -423,7 +453,7 @@ describe('processStripeEvent', () => {
     it.each([invoice, sync, () => checkout(false), refund, dispute, () => dispute(true)])(
         'never attributes a foreign customer through payload metadata %#', async makeEvent => {
             const good = fixture();
-            await seedTopup(good.store);
+            if (makeEvent().type.startsWith('charge.')) await seedTopup(good.store);
             expect(await processStripeEvent(makeEvent(), good.deps)).toBe('applied');
             expect(good.store.owners).toEqual(['cus_local']);
             const bad = fixture();
@@ -476,8 +506,9 @@ describe('processStripeEvent', () => {
         stripe.session.sku = sku;
         expect(await processStripeEvent(checkout(false), deps)).toBe('applied');
         expect([...store.grants.values()][0]).toMatchObject({ meter: 'ai_usd_micro', kind: 'topup', amount: BigInt(amount), sourceId: 'pi_local' });
-        expect(store.outbox.get('payment_intent:pi_local:ai_topup')).toMatchObject({
-            kind: 'ai_grant', payload: { amountUsdMicro: amount, bucket: 'purchased', expiresAt: '2027-10-11T12:00:00.000Z', providerObjectId: 'pi_local' },
+        expect(store.outbox.get(`ezil-os:v1:topup:${sku}:pi_local:grant`)).toMatchObject({
+            kind: 'ai_grant', payload: { protocol: 'ezil-ai-credits-v1', credits: sku === 'ai_pack_10_v1' ? 1234 : 5678,
+                amountUsdMicro: amount, bucket: 'purchased', expiresAt: '2027-10-11T12:00:00.000Z', providerObjectId: 'pi_local' },
         });
     });
 
@@ -485,7 +516,76 @@ describe('processStripeEvent', () => {
         const { store, deps } = fixture();
         const input = { ...checkout(false), created: Date.parse('2024-02-29T12:00:00Z') / 1000 };
         expect(await processStripeEvent(input, deps)).toBe('applied');
-        expect(store.outbox.get('payment_intent:pi_local:ai_topup')?.payload.expiresAt).toBe('2025-02-28T12:00:00.000Z');
+        expect(store.outbox.get('ezil-os:v1:topup:ai_pack_10_v1:pi_local:grant')?.payload.expiresAt).toBe('2025-02-28T12:00:00.000Z');
+    });
+
+    it('records a review outcome and no funding when shipped pack policies are unset', async () => {
+        vi.mocked(catalog.findPack).mockImplementation(sku => catalog.AI_PACKS.find(value => value.sku === sku));
+        const f = fixture();
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:pack_credits_unset');
+        expect(f.store.outbox.size).toBe(0);
+        expect(f.store.grants.size).toBe(0);
+    });
+    it('preserves first topup amount, expiry and account through later catalog changes, refund and replay', async () => {
+        const f = fixture();
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        const receipt = [...f.store.outbox.values()][0]!;
+        receipt.payload.accountPublicId = 'original-account';
+        const snapshot = structuredClone(receipt);
+        vi.mocked(catalog.findPack).mockImplementation(sku => ({ ...catalog.AI_PACKS[0]!, sku, aiCredits: 9999 }));
+        expect(await processStripeEvent({ ...checkout(false), id: 'different-event', created: checkout(false).created + 86400 }, f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()]).toEqual([snapshot]);
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(await processStripeEvent({ ...refund(), id: 'another-refund-event' }, f.deps)).toBe('applied');
+        const reversal = [...f.store.outbox.values()][1]!;
+        expect(reversal).toMatchObject({ eventKey: `${receipt.payload.entitlementId}:revoke`,
+            payload: { entitlementId: receipt.payload.entitlementId, credits: 1234,
+                expiresAt: snapshot.payload.expiresAt, accountPublicId: 'original-account' } });
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(f.store.outbox.size).toBe(2);
+        const beforeRestore = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:ai_restore_unresolved');
+        expect(f.store.writes).toEqual(beforeRestore);
+    });
+    it('retries refund-before-purchase and delivers grant/revoke with one shared v1 entitlement in either order', async () => {
+        const f = fixture();
+        expect(await processStripeEvent(refund(), f.deps)).toBe('failed:no_grant_for_refund');
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        const items = [...f.store.outbox.values()];
+        for (const order of [items, [...items].reverse()]) {
+            const pending: AiCreditOutboxRow[] = order.map((item, index) => ({ ...item, id: String(index), attempts: 1 }));
+            const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+            await drainAiCreditOutbox({ config: { fundingUrl: 'https://gateway.test', fundingHmacSecret: 'fixture' },
+                clock: () => now.getTime(), fetch: fetcher, aiCredits: {
+                    claim: async () => pending.shift() ?? null, accountFor: async () => 'account',
+                    pinAccount: async () => true, finish: async () => {},
+                } }, { limit: 2, deadlineMs: now.getTime() + 40_000 });
+            const bodies = fetcher.mock.calls.map(call => JSON.parse(call[1]!.body as string));
+            expect(bodies.map(body => body.action)).toEqual(order.map(item => item.payload.action));
+            expect(new Set(bodies.map(body => body.entitlementId))).toEqual(new Set(['ezil-os:v1:topup:ai_pack_10_v1:pi_local']));
+            expect(bodies.every(body => body.eventId === `${body.entitlementId}:${body.action}` && body.credits === 1234)).toBe(true);
+        }
+    });
+    it('does not migrate an existing dollar-only topup on paid replay', async () => {
+        const f = fixture();
+        await seedTopup(f.store);
+        await f.store.enqueueOutbox({ userId: 'user_local', eventKey: 'payment_intent:pi_local:ai_topup', kind: 'ai_grant',
+            payload: { amountUsdMicro: '10000000', bucket: 'purchased' } });
+        const before = structuredClone([...f.store.outbox.values()]);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:legacy_topup_unfunded');
+        expect([...f.store.outbox.values()]).toEqual(before);
+        expect(f.store.grants.size).toBe(1);
+    });
+    it('can retry an interrupted atomic topup without leaving a ledger-only purchase', async () => {
+        const f = fixture();
+        vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('interrupted'));
+        await expect(processStripeEvent(checkout(false), f.deps)).rejects.toThrow('interrupted');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(f.store.grants.size).toBe(1);
+        expect(f.store.outbox.size).toBe(1);
     });
 
     it.each([
@@ -1157,6 +1257,13 @@ describe('v2 webhook grants', () => {
                 expect(store.writes).toEqual([]);
                 expect(await processStripeEvent(scenario === 'top-up' ? checkout(false) : paidV2(), deps)).toBe('applied');
                 const original = [...store.grants.values()][0];
+                if (scenario === 'top-up' && kind === 'dispute restore') {
+                    const before = [...store.writes];
+                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:ai_restore_unresolved');
+                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:ai_restore_unresolved');
+                    expect(store.writes).toEqual(before);
+                    return;
+                }
                 expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
                 const writes = [...store.writes];
                 expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
@@ -1544,7 +1651,7 @@ describe('v3 paid invoice grants', () => {
         f.stripe.charge.invoiceId = f.stripe.invoice.id;
         await processStripeEvent(dispute(), f.deps); await processStripeEvent(dispute(), f.deps);
         expect([...f.store.outbox.values()].map(item => item.payload.action)).toEqual(['grant', 'revoke']);
-        await processStripeEvent(dispute(true), f.deps);
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:ai_restore_unresolved');
         expect(f.store.outbox.size).toBe(2);
     });
     it('revokes the stored policy and account, even when the subscription and invoice adapter now report Premium', async () => {

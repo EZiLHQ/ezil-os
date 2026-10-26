@@ -36,9 +36,13 @@ export async function sendAiCreditEvent(input: {
                     'X-EZiL-Timestamp': timestamp, 'X-EZiL-Signature': signAiGatewayBody(input.secret, timestamp, rawBody) }, body: rawBody,
             });
             if (response.ok) return { status: 'ok' };
-            if (response.status === 409) {
+            if (response.status === 409 || response.status === 404) {
                 const body = await response.json().catch(() => null);
-                if (body?.error?.code === 'event_conflict' || body?.code === 'event_conflict') {
+                const code = body?.error?.code ?? body?.code;
+                if (response.status === 404 && code === 'account_not_found') {
+                    return { status: 'retryable', reason: 'account_not_found' };
+                }
+                if (response.status === 409 && code === 'event_conflict') {
                     (input.log ?? console.warn)('[billing.ai] event_conflict', { entitlementId: event.entitlementId });
                     return { status: 'permanent', reason: 'event_conflict' };
                 }
