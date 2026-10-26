@@ -623,6 +623,7 @@ export async function launch (id, ctx = {}) {
     if (opening.has(id)) {
         const el = await opening.get(id);
         if (id === 'settings') el?.ezilActivateSettings?.(ctx.initialTab);
+        if (id === 'code') el?.ezilOpenRepository?.(ctx.repo);
         return el;
     }
     const pending = launchOnce(id, ctx);
@@ -662,6 +663,7 @@ async function launchOnce (id, ctx = {}) {
             $existing.showWindow();
             const el_existing = $existing.get(0);
             if (id === 'settings') el_existing?.ezilActivateSettings?.(ctx.initialTab);
+            if (id === 'code') el_existing?.ezilOpenRepository?.(ctx.repo);
             // Belt and braces: the first open already did this, but a window
             // that somehow lost its button (a re-attached drawer, a rebuild)
             // must not stay without one. Idempotent — see drawer-action.js.

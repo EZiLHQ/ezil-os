@@ -3964,3 +3964,32 @@ describe('Worker JSON error response boundary', () => {
     } finally { logs.mockRestore(); }
   });
 });
+
+describe('repository open authenticates before private runtime access', () => {
+  const userId = '11111111-1111-4111-8111-111111111111';
+  const computerId = '22222222-2222-4222-8222-222222222222';
+  const repo = 'https://github.ezil.work/team/fixture.git';
+  async function request(patch: Record<string, unknown> = {}, unsigned = false) {
+    const sandboxId = 'guac-1111111111114111-2222222222224222';
+    const path = `/sandbox/${sandboxId}/repo-open`;
+    const body = JSON.stringify({ userId, repo, ...patch });
+    const token = await mintPreviewTokenV2(SECRET, { ts: Date.now(), sandboxId, userId, computerId, provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0 }, { method: 'POST', path, body });
+    return new Request(`https://api-desktop.ezil.org${path}`, { method: 'POST', body, headers: unsigned ? {} : { 'x-ezil-auth': token } });
+  }
+  it('refuses unsigned, mismatched user and caller-selected paths without any runtime call', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET };
+    for (const req of [await request({}, true), await request({ userId: '33333333-3333-4333-8333-333333333333' }), await request({ folder: '/tmp' })]) {
+      expect((await worker.fetch(req, env)).status).toBeGreaterThanOrEqual(400);
+    }
+    expect(calls.containerFetch).toEqual([]); expect(calls.exec).toBe(0);
+  });
+  it('forwards only the narrow URL intent and returns the exact validated folder', async () => {
+    const folder = '/workspace/.ezil-repositories/' + 'a'.repeat(64) + '/' + 'b'.repeat(64);
+    const { binding, calls } = fakeSandboxNamespace({ containerResponse: () => new Response(JSON.stringify({ ok: true, canonicalUrl: repo, folder, status: 'reused' })) });
+    const response = await worker.fetch(await request(), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(response.status).toBe(200); expect((await response.json() as any).folder).toBe(folder);
+    expect(calls.containerFetch).toHaveLength(1); expect(calls.containerFetch[0].port).toBe(9224);
+    expect(JSON.parse(calls.containerFetch[0].body)).toEqual({ repo, userId }); expect(calls.exec).toBe(0);
+  });
+});

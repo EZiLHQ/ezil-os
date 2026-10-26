@@ -1,3 +1,5 @@
+import { validRepoIntent, repoOpenResult, REPO_OPEN_PORT } from './repo-open';
+import { sendAwsRepositoryOpen } from './aws-origin';
 import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
@@ -725,6 +727,8 @@ const corsHeaders = {
 // Only these public protocol codes may leave the shared error-response boundary.
 // A code-shaped exception message is still private unless it is in this list.
 const PUBLIC_ERROR_CODES = [
+  'repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination',
+  'repo_clone_failed', 'repo_open_failed', 'repo_invalid_request', 'repo_unauthorized',
   'acceptance_auth_not_configured', 'acceptance_fault_bad_request', 'acceptance_fault_failed',
   'acceptance_faults_disabled', 'acceptance_reset_failed', 'acceptance_reset_unsupported',
   'acceptance_stop_failed', 'access_token_expired', 'access_token_malformed',
@@ -7537,6 +7541,30 @@ export default {
     const statusMatch = path.match(/^\/sandbox\/([^/]+)\/status$/);
     if (method === 'GET' && statusMatch) {
       return handleStatus(env, url, decodeURIComponent(statusMatch[1]), url.searchParams.get('desktopMode') ?? undefined);
+    }
+
+    const repoMatch = path.match(/^\/sandbox\/([^/]+)\/repo-open$/);
+    if (method === 'POST' && repoMatch) {
+      // Require body-bound v2 claims even while older controls accept v1.
+      const claims = verifiedV2Claims.get(request);
+      if (!claims || claims.sandboxId !== repoMatch[1]) return json({ ok: false, error: 'repo_unauthorized' }, 401);
+      let intent: unknown;
+      try { intent = await request.json(); } catch { return json({ ok: false, error: 'repo_invalid_request' }, 400); }
+      if (!validRepoIntent(intent) || intent.userId !== claims.userId
+          || deriveSandboxId(claims.userId, claims.computerId) !== claims.sandboxId) return json({ ok: false, error: 'repo_invalid_request' }, 400);
+      const target = await awsControlTarget(env, request, claims.sandboxId, 'repo');
+      if (target instanceof Response) return target;
+      const body = JSON.stringify(intent);
+      try {
+        const response = target
+          ? await sendAwsRepositoryOpen(target.record, target.zone, body, (url, init) => fetch(url, init), Math.floor(Date.now() / 1000))
+          : await withDeadline(openSandbox(env, claims.sandboxId).containerFetch(
+              'http://127.0.0.1:9224/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body }, REPO_OPEN_PORT), 195000, 'repo-open');
+        const raw = await response.text();
+        if (raw.length > 4096) return json({ ok: false, error: 'repo_open_failed' }, 502);
+        const result = repoOpenResult(JSON.parse(raw), intent.repo);
+        return json(result, result.ok ? 200 : 409);
+      } catch { return json({ ok: false, error: 'repo_open_failed' }, 502); }
     }
 
     const systemMatch = path.match(/^\/sandbox\/([^/]+)\/system$/);
