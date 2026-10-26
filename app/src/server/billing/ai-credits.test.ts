@@ -1,10 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem } from './ai-credits';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem } from './ai-credits';
+import { AI_PACKS } from './catalog';
 
 const input = { userId: 'user', sku: 'standard_monthly_v3' as const, subscriptionId: 'sub',
     periodStart: new Date('2026-10-01T00:00:00Z'), periodEnd: new Date('2026-11-01T00:00:00Z'), invoiceId: 'invoice' };
 
 describe('AI credit planning', () => {
+    it('requires explicit pack credits and preserves the v1 topup receipt when reversing', () => {
+        const pack = { ...AI_PACKS[0]!, aiCredits: 1234 };
+        expect(aiTopupOutboxItem('user', AI_PACKS[0]!, 'pi_fixture', input.periodEnd)).toBeNull();
+        const grant = aiTopupOutboxItem('user', pack, 'pi_fixture', input.periodEnd)!;
+        expect(grant).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_pack_10_v1:pi_fixture:grant',
+            payload: { protocol: 'ezil-ai-credits-v1', credits: 1234, amountUsdMicro: '10000000',
+                expiresAt: input.periodEnd.toISOString(), paymentIntentId: 'pi_fixture' } });
+        grant.payload.accountPublicId = 'pinned-account';
+        pack.aiCredits = 9999;
+        expect(aiCreditRevokeItem(grant)).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_pack_10_v1:pi_fixture:revoke',
+            payload: { credits: 1234, expiresAt: input.periodEnd.toISOString(), accountPublicId: 'pinned-account', paymentIntentId: 'pi_fixture' } });
+    });
     it('reverses the immutable receipt and strips grant delivery metadata', () => {
         const grant = aiCreditOutboxItem('user', aiCreditEntitlement(input), 'grant', 'invoice');
         Object.assign(grant.payload, { credits: 1234, accountPublicId: 'original-account', delivery: { status: 'done' } });

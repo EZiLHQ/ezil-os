@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
     AI_PACKS, CATALOG_VERSION, FREE_PLAN, PRO_PLAN, catalogPro,
-    findPack, serviceFeeCents, storageCapBytes, workspaceAllowanceSeconds,
+    findPack, aiPackCheckoutEligible, serviceFeeCents, storageCapBytes, workspaceAllowanceSeconds,
 } from '../catalog';
 import { checkoutAvailable, readBillingConfig } from '../config';
 
@@ -29,12 +29,22 @@ describe('billing catalog contract', () => {
 
     it('lists both packs with face value, flat service fee and total', () => {
         expect(AI_PACKS).toEqual([
-            { sku: 'ai_pack_10_v1', creditCents: 1000, serviceFeeCents: 84, totalCents: 1084 },
-            { sku: 'ai_pack_25_v1', creditCents: 2500, serviceFeeCents: 161, totalCents: 2661 },
+            { sku: 'ai_pack_10_v1', aiCredits: null, creditCents: 1000, serviceFeeCents: 84, totalCents: 1084 },
+            { sku: 'ai_pack_25_v1', aiCredits: null, creditCents: 2500, serviceFeeCents: 161, totalCents: 2661 },
         ]);
         expect(findPack('ai_pack_10_v1')).toEqual(AI_PACKS[0]);
         expect(findPack('ai_pack_25_v1')).toEqual(AI_PACKS[1]);
         expect(findPack('unrecognised_sku')).toBeUndefined();
+        expect(AI_PACKS.every(pack => !aiPackCheckoutEligible(pack))).toBe(true);
+    });
+
+    it.each([null, undefined, 0, -1, 1.5, 1_000_001, NaN, Infinity])('refuses an unset or invalid pack credit policy %s', aiCredits => {
+        expect(aiPackCheckoutEligible({ ...AI_PACKS[0]!, aiCredits: aiCredits as number | null })).toBe(false);
+    });
+    it('allows an explicit whole-credit fixture policy without changing prices or live packs', () => {
+        expect(aiPackCheckoutEligible({ ...AI_PACKS[0]!, aiCredits: 1234 })).toBe(true);
+        expect(aiPackCheckoutEligible(undefined)).toBe(false);
+        expect(AI_PACKS[0]!.aiCredits).toBeNull();
     });
 
     it('raises only Pro storage and only after the large-storage gate', () => {

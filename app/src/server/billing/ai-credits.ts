@@ -1,4 +1,6 @@
-import type { OutboxInsert } from './ports';
+import type { BillingStore, GrantInsert, OutboxInsert } from './ports';
+import type { CatalogPack } from './types';
+import { aiPackCheckoutEligible } from './catalog';
 import { AI_CREDIT_POLICY_VERSION, CATALOG_V3, type PlanSkuV3 } from './v3/contract';
 
 const DAY = 86_400_000;
@@ -37,6 +39,31 @@ export function aiCreditOutboxItem(userId: string, entitlement: AiCreditEntitlem
     } };
 }
 
+/** Only explicit whole-credit pack policy can create a deliverable top-up receipt. */
+export function aiTopupOutboxItem(userId: string, pack: CatalogPack, paymentIntentId: string, expiresAt: Date): OutboxInsert | null {
+    if (!aiPackCheckoutEligible(pack)) return null;
+    const entitlementId = `ezil-os:v1:topup:${pack.sku}:${paymentIntentId}`;
+    if (!userId || !/^ai_pack_[A-Za-z0-9_]+$/.test(pack.sku) || !/^pi_[A-Za-z0-9_]+$/.test(paymentIntentId)
+        || entitlementId.length > 193 || !Number.isFinite(expiresAt.getTime())
+        || !Number.isSafeInteger(pack.creditCents) || pack.creditCents < 1) throw new TypeError('Invalid AI topup');
+    const item = aiCreditOutboxItem(userId, { entitlementId, credits: pack.aiCredits, expiresAt: expiresAt.toISOString() }, 'grant', null);
+    return { ...item, payload: { ...item.payload, packSku: pack.sku, paymentIntentId,
+        amountUsdMicro: (BigInt(pack.creditCents) * BigInt(10_000)).toString(),
+        bucket: 'purchased', provider: 'stripe', providerObjectId: paymentIntentId } };
+}
+
+/** Local extension keeps the frozen shared billing ports unchanged. */
+export interface AiTopupReceiptStore {
+    aiTopupReceipt(userId: string, paymentIntentId: string): Promise<OutboxInsert | null>;
+    /** Commit the first receipt and monetary ledger entry together; replays retain both. */
+    recordAiTopup(grant: GrantInsert, receipt: OutboxInsert): Promise<'applied' | 'review:customer_mismatch' | 'review:legacy_topup_unfunded'>;
+}
+
+export function hasAiTopupReceipts(store: BillingStore): store is BillingStore & AiTopupReceiptStore {
+    return 'aiTopupReceipt' in store && typeof store.aiTopupReceipt === 'function'
+        && 'recordAiTopup' in store && typeof store.recordAiTopup === 'function';
+}
+
 /** Reverse the stored receipt, retaining its policy/amount if the catalog changes later. */
 export function aiCreditRevokeItem(grant: OutboxInsert): OutboxInsert {
     const p = grant.payload;
@@ -46,6 +73,7 @@ export function aiCreditRevokeItem(grant: OutboxInsert): OutboxInsert {
     return { userId: grant.userId, eventKey: eventId, kind: 'ai_revoke', payload: {
         protocol: p.protocol, policyVersion: p.policyVersion, invoiceId: p.invoiceId,
         entitlementId: p.entitlementId, credits: p.credits, expiresAt: p.expiresAt, eventId, action: 'revoke',
+        ...(typeof p.paymentIntentId === 'string' ? { paymentIntentId: p.paymentIntentId, packSku: p.packSku } : {}),
         ...(typeof p.accountPublicId === 'string' ? { accountPublicId: p.accountPublicId } : {}),
     } };
 }
