@@ -481,8 +481,8 @@ recovery versions in **source evidence only**. The target schema stays strict.
 Promotion and rollback append/retain complete immutable release records under
 `app-secret.lock`, preserve string/object encoding and other regions, and journal
 both full deployment entries before writing. All records are retained, including
-records referenced by placements or unfinished jobs. At thirteen records the tool
-refuses a fourteenth; it never guesses whether a record can be collected. Registry
+records referenced by placements or unfinished jobs. At fourteen records the tool
+refuses a fifteenth; it never guesses whether a record can be collected. Registry
 identity is `(lowerImageDigest, amiId)`: duplicate pairs and changes to
 an existing pair refuse, including attempts to fill historical null fields.
 Different AMIs may share a lower. The app resolver still refuses ambiguous
@@ -884,3 +884,11 @@ fence and investigate that evidence; do not delete, reset, or hand-edit history.
 Reconciliation also covers a successful secret write followed by failed ledger
 completion. It does not verify the canary or open admission. The app secret and
 app reader gain no new fields.
+
+### 1.0.20 registry compatibility
+The next matched app/host release permits fourteen retained records, refusing a
+fifteenth. All immutable records, GC proofs, 24,000-byte map/readback limits and
+65,536-byte secret limits remain enforced. Verify actual sizes before promotion.
+Rollback must retain the invoking fourteen-compatible app while restoring the
+prior deployment tuple; the 1.0.19 app only supports thirteen records. No resource
+cleanup or history removal is implied by this count change.

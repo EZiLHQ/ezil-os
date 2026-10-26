@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readLifecycleDeployments } from './aws-intent';
 import { parseRebaseRelease, parseRebaseSourceRelease, RebaseReleaseSchema, RebaseSourceReleaseSchema,
     resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
-import { fixtureReleaseRegistry106, fixtureReleaseRegistry13, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
+import { fixtureReleaseRegistry106, fixtureReleaseRegistry14, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
 
 describe('B2/B4/B5 retained 1.0.6 release registry', () => {
     it('resolves 8dbc to 1.0.6 while preserving the entire legacy 1.0.2 source deployment', () => {
@@ -163,14 +163,16 @@ describe('B2 shared lower resolved by observed AMI', () => {
     });
 });
 
-describe('thirteen-record registry capacity and rollback compatibility', () => {
-    it('accepts promotion through 1.0.19 and rollback with all thirteen immutable records', () => {
-        const f = fixtureReleaseRegistry13();
+describe('fourteen-record registry capacity and rollback compatibility', () => {
+    it('accepts promotion through 1.0.20 and rollback with all fourteen immutable records', () => {
+        const f = fixtureReleaseRegistry14();
         for (const [deployment, releases, target] of [
             [f.deployment116, f.retained.slice(0, 10), f.release116],
             [f.deployment117, f.retained.slice(0, 11), f.release117],
             [f.deployment116, f.retained.slice(0, 11), f.release116],
             [f.deployment118, f.retained.slice(0, 12), f.release118],
+            [f.deployment119, f.retained.slice(0, 13), f.release119],
+            [f.deployment120, f.retained, f.release120],
             [f.deployment119, f.retained, f.release119],
             [f.deployment118, f.retained, f.release118],
             [f.deployment117, f.retained, f.release117],
@@ -185,34 +187,34 @@ describe('thirteen-record registry capacity and rollback compatibility', () => {
             expect(parseRebaseRelease(target, deployment, f.repository)).toEqual(target);
             expect(JSON.stringify(entry)).toBe(original);
         }
-        expect(f.retained).toHaveLength(13);
+        expect(f.retained).toHaveLength(14);
         expect(f.retained.slice(0, 3)).toEqual(f.releases);
     });
 
-    it('refuses fourteen records in both validators even when all identities are valid', () => {
-        const f = fixtureReleaseRegistry13(), entry = { ...f.deployment118,
-            releases: [...f.retained, { ...f.release118, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.20' }] };
-        expect(entry.releases).toHaveLength(14);
+    it('refuses fifteen records in both validators even when all identities are valid', () => {
+        const f = fixtureReleaseRegistry14(), entry = { ...f.deployment118,
+            releases: [...f.retained, { ...f.release118, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.21' }] };
+        expect(entry.releases).toHaveLength(15);
         entry.releases.forEach(r => expect(RebaseSourceReleaseSchema.safeParse(r).success).toBe(true));
         expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]).ok).toBe(false);
         expect(() => resolveRebaseReleases(entry, LOWER_102)).toThrow();
     });
 
     it.each(['duplicate source', 'duplicate target', 'foreign source', 'malformed record', 'mutable workflow', 'out of order'])
-    ('still rejects %s within the thirteen-record limit', kind => {
-        const f = fixtureReleaseRegistry13(), releases = structuredClone(f.retained);
+    ('still rejects %s within the fourteen-record limit', kind => {
+        const f = fixtureReleaseRegistry14(), releases = structuredClone(f.retained);
         if (kind === 'duplicate source') releases[1] = { ...f.release102 };
         if (kind === 'duplicate target') releases[10] = { ...f.release118 };
         if (kind === 'foreign source') releases[0] = { ...f.release102, lowerImageRef: f.release102.lowerImageRef.replace('/desktop@', '/foreign@') };
         if (kind === 'malformed record') releases[4] = { ...releases[4]!, amiId: 'malformed' };
         if (kind === 'mutable workflow') releases[4] = { ...releases[4]!, stateMachineVersionArn: releases[4]!.stateMachineVersionArn.replace(/:[0-9]+$/, ':latest') };
         if (kind === 'out of order') [releases[3], releases[4]] = [releases[4]!, releases[3]!];
-        expect(releases).toHaveLength(13);
+        expect(releases).toHaveLength(14);
         expect(() => resolveRebaseReleases({ ...f.deployment118, releases }, LOWER_102)).toThrow();
     });
 
-    it('keeps the 65,536-byte deployment-map ceiling at thirteen records', () => {
-        const f = fixtureReleaseRegistry13(), entry = { ...f.deployment118, releases: f.retained };
+    it('keeps the 65,536-byte deployment-map ceiling at fourteen records', () => {
+        const f = fixtureReleaseRegistry14(), entry = { ...f.deployment118, releases: f.retained };
         const raw = JSON.stringify({ [entry.region]: entry });
         const atLimit = raw + ' '.repeat(65536 - Buffer.byteLength(raw));
         expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: atLimit }, [entry.region]).ok).toBe(true);
