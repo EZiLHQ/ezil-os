@@ -1043,6 +1043,11 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-billing-meter{min-width:0;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}
 .ezil-billing-meter p{margin:8px 0 0}
 .ezil-billing-usage{font-size:28px;font-weight:600;line-height:34px}
+.ezil-billing-ai-credits{margin-bottom:16px}
+.ezil-billing-credit-balance{margin:12px 0 0}
+.ezil-billing-credit-balance strong{font-size:32px;line-height:40px;font-variant-numeric:tabular-nums}
+.ezil-billing-credit-balance span{color:var(--muted)}
+.ezil-billing-ai-credits h4:focus{outline:2px solid var(--accent);outline-offset:4px}
 .ezil-billing-meter.is-unavailable .ezil-billing-usage{font-size:18px;line-height:34px;color:var(--muted,#9aa3ad)}
 .ezil-billing-allowance,.ezil-billing-note,.ezil-billing-timing{color:var(--muted);font-size:12px;line-height:16px}
 .ezil-billing-progress{height:7px;margin:12px 0;overflow:hidden;border-radius:999px;background:var(--bg)}
@@ -1248,6 +1253,7 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-computer-progress li[data-state=complete]{opacity:.85}
 .ezil-computer-progress li[aria-current=step]{font-weight:600;opacity:1}
 .ezil-computer-progress p{margin:8px 0}
+.ezil-computer-progress progress{display:block;width:100%;margin:8px 0}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#04060c;background-image:radial-gradient(24% 6% at 50% 91.2%,rgba(255,200,150,.6) 0,rgba(255,150,100,.18) 55%,rgba(255,150,100,0) 100%),radial-gradient(150% 72% at 50% 138%,#04060c 0,#04060c 62%,rgba(0,200,208,.72) 63.1%,rgba(96,110,255,.38) 65.4%,rgba(112,86,255,.1) 70%,rgba(112,86,255,0) 78%),radial-gradient(55% 45% at 82% 6%,rgba(0,190,200,.4) 0,rgba(0,190,200,0) 62%),radial-gradient(50% 55% at 8% 22%,rgba(112,86,255,.34) 0,rgba(112,86,255,0) 64%),linear-gradient(180deg,#0a0e1d 0,#070a14 50%,#04060c 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
