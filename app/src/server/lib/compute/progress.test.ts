@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ placement: vi.fn(), migration: vi.fn() }));
 vi.mock('./placement', async original => ({ ...await original<typeof import('./placement')>(), readPlacement: h.placement }));
-vi.mock('./provider-migrate-store', () => ({ createProviderMigrationStore: () => ({ readByComputer: h.migration }) }));
+vi.mock('./provider-migrate-store', async original => ({ ...await original<typeof import('./provider-migrate-store')>(), createProviderMigrationStore: () => ({ readByComputer: h.migration }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ billingV2EntitlementReader: () => ({ read: async () => null }) }));
 import { describeProgress, readComputerProgress } from './progress';
 import { PlacementOwnerError, type Placement } from './placement';
@@ -10,8 +10,63 @@ const computer = { computerId: 'c', userId: 'u' };
 const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_COMPUTE_PLACEMENT_READS: '1', EZIL_AWS_KILL_SWITCH: '0' };
 const placement = { provider: 'aws-ec2', state: 'STOPPED', instanceType: 'm6i.large', updatedAt: new Date('2026-10-26T10:00:00Z') } as Placement;
 const migration = { computerId: 'c', userId: 'u', state: 'provisioning', createdAt: '2026-10-26T10:00:00Z', updatedAt: '2026-10-26T10:01:00Z', lastError: null, restoreTokenSha256: 'secret', workspaceHead: { secret: 'private' } } as unknown as ComputeMigration;
+const measured: ComputeMigration = { ...migration,
+    workspaceHead: { generation: 'g', chunks: Array.from({ length: 8 }, () => ({ size: 1_000_000 })) },
+    systemHead: { generation: 's', chunks: [{ size: 500_000 }, { size: 500_000 }] },
+    restoreProgress: { workspace: '07'.padEnd(128, '0'), system: '01'.padEnd(128, '0'), bytes: 3_500_000,
+        first: '2026-10-26T10:00:00Z', last: '2026-10-26T10:00:10Z' },
+};
 beforeEach(() => { h.placement.mockReset().mockResolvedValue({ record: placement }); h.migration.mockReset().mockResolvedValue(null); });
 describe('read-only progress', () => {
+    it('projects measured workspace and system bytes from the stored migration into v2', async () => {
+        h.migration.mockResolvedValue(measured);
+        const result = await readComputerProgress({} as never, computer, env);
+        expect(result).toMatchObject({ version: 2, bytes: { transferred: 3_500_000, total: 9_000_000 }, percent: 38,
+            etaSeconds: 16, typicalSeconds: 92, transferStartedAt: '2026-10-26T10:00:00.000Z', transferUpdatedAt: '2026-10-26T10:00:10.000Z' });
+        expect(JSON.stringify(result)).not.toMatch(/workspaceHead|restoreProgress|secret/);
+    });
+    it.each(['requested', 'fenced', 'committed', 'failed_reopened', 'failed_needs_operator'] as const)('has no transfer metrics for pre-export or non-migration operation %s', state => {
+        expect(describeProgress('c', placement, { ...measured, state }, env)).toMatchObject({
+            bytes: { transferred: null, total: null }, percent: null, etaSeconds: null, typicalSeconds: null,
+            transferStartedAt: null, transferUpdatedAt: null,
+        });
+    });
+    it('keeps unknown heads unmeasured and starts exported heads at zero before any served chunks', () => {
+        for (const workspaceHead of [null, { generation: 'g' }, { generation: 'g', chunks: [{ size: '100' }] }])
+            expect(describeProgress('c', placement, { ...measured, workspaceHead }, env).bytes).toEqual({ transferred: null, total: null });
+        expect(describeProgress('c', placement, { ...measured, systemHead: null, restoreProgress: null }, env)).toMatchObject({
+            bytes: { transferred: 0, total: 8_000_000 }, percent: 0, etaSeconds: null, typicalSeconds: 92,
+            transferStartedAt: null, transferUpdatedAt: null,
+        });
+        expect(describeProgress('c', placement, null, env).typicalSeconds).toBeNull();
+    });
+    it.each([['03', 2_000_000], ['07', 3_000_000]] as const)('does not estimate ETA below four distinct chunks (%s)', (bits, bytes) => {
+        expect(describeProgress('c', null, { ...measured, systemHead: null,
+            restoreProgress: { ...measured.restoreProgress!, workspace: bits.padEnd(128, '0'), system: '0'.repeat(128), bytes } }, env).etaSeconds).toBeNull();
+    });
+    it.each([{ bytes: 0 }, { last: '2026-10-26T10:00:00Z' }, { last: '2026-10-26T09:59:59Z' }, { first: 'invalid' }])('has no ETA without a positive measured rate %j', patch => {
+        expect(describeProgress('c', null, { ...measured, restoreProgress: { ...measured.restoreProgress!, ...patch } }, env).etaSeconds).toBeNull();
+    });
+    it('clamps percent and remaining time and recomputes ETA from observed elapsed time', () => {
+        expect(describeProgress('c', null, { ...measured, restoreProgress: { ...measured.restoreProgress!, bytes: 10_000_000 } }, env))
+            .toMatchObject({ percent: 100, etaSeconds: 0 });
+        expect(describeProgress('c', null, { ...measured, restoreProgress: { ...measured.restoreProgress!, bytes: -1 } }, env).percent).toBe(0);
+        expect(describeProgress('c', null, { ...measured, restoreProgress: { ...measured.restoreProgress!, last: '2026-10-26T10:00:20Z' } }, env).etaSeconds).toBe(32);
+    });
+    it.each([[1, 90], [6_000_000, 92], [4_000_000_000, 600]])('estimates typical duration for %i bytes as %i seconds', (size, typicalSeconds) => {
+        expect(describeProgress('c', null, { ...measured, workspaceHead: { generation: 'g', chunks: [{ size }] }, systemHead: null }, env).typicalSeconds).toBe(typicalSeconds);
+    });
+    it('preserves stage precedence and suppresses ETA while paused, operator-blocked, recovering or restored', () => {
+        expect(describeProgress('c', placement, measured, { ...env, EZIL_AWS_KILL_SWITCH: '1' }))
+            .toMatchObject({ stage: 'operations_paused', percent: 38, etaSeconds: null });
+        expect(describeProgress('c', { ...placement, state: 'UNCONFIRMED' }, measured, env))
+            .toMatchObject({ stage: 'needs_operator', percent: 38, etaSeconds: null });
+        expect(describeProgress('c', null, { ...measured, lastError: 'recovery:abort:provision' }, env))
+            .toMatchObject({ stage: 'recovering', etaSeconds: null });
+        expect(describeProgress('c', null, { ...measured, state: 'restored' }, env))
+            .toMatchObject({ stage: 'restored', percent: 38, etaSeconds: null });
+        expect(describeProgress('c', null, { ...measured, state: 'exported' }, env).etaSeconds).toBe(16);
+    });
     it('cutoff overrides active migration without fabricating transfer metrics', () => {
         const result = describeProgress('c', placement, migration, { ...env, EZIL_AWS_KILL_SWITCH: '1' });
         expect(result).toMatchObject({ stage: 'operations_paused', recordedStage: 'provisioning', paused: true, durable: true, bytes: { transferred: null, total: null }, percent: null, etaSeconds: null });
