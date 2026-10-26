@@ -429,7 +429,7 @@ async function act ($win, state, action, value) {
                 const machine = summary.computer.machineChoice.find(machine => machine.size === result.data.size);
                 if ( ! machine || result.data.effective !== 'next_open' ) throw new Error('unavailable');
                 Object.assign(summary.computer, { size: machine.size, vcpu: machine.vcpu, memoryGiB: machine.memoryGiB });
-                $pane.find('[data-role="machine-status"]').text(`Your next session opens with ${machine.vcpu} vCPU`);
+                $pane.find('[data-role="machine-status"]').text(`Your next session opens with ${machine.vcpu} vCPU and ${machine.memoryGiB} GiB memory. Applies after you stop this session and start again.`);
             } else if ( action === 'size' ) {
                 summary.compute.selectedSize = result.data.selectedSize;
                 $pane.find('[data-role="size-status"]').text('Size saved.');

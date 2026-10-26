@@ -301,7 +301,7 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
-    const progress = AppSpinner({ label: 'Opening Code…', isMigrating: () => session.isComputeMigrating(computer.id),
+    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
         onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
@@ -649,6 +649,7 @@ export async function openCodeWindow (ctx = {}) {
     const on_restarted = (e) => { if ( ! disposed && e?.detail?.computerId === computer.id ) void start_boot(); };
 
     const dispose = () => {
+        progress.dispose();
         if (disposed) return;
         disposed = true;
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
