@@ -10,6 +10,7 @@ import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3 } from '@/server/billing/v3/summary';
+import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3Result, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
     CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
@@ -86,6 +87,28 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 export function createBillingRouter(getDeps: () => BillingDeps) {
     return createTRPCRouter({
+        usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
+            const deps = getDeps();
+            if (!deps.config.tabEnabled) return { enabled: false as const };
+            if (input?.computerId && await deps.store.computerOwner(input.computerId) !== ctx.user.id)
+                throw new TRPCError({ code: 'NOT_FOUND' });
+            const now = deps.now();
+            const [subs, userCreatedAt] = await Promise.all([
+                deps.store.subscriptionsFor(ctx.user.id), deps.store.userCreatedAt(ctx.user.id),
+            ]);
+            const plan = planFromSubscriptions({ subs, userCreatedAt, now });
+            const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
+            const [epochs, grants, storage, consent, overageInvoices] = await Promise.all([
+                deps.store.epochsFor(ctx.user.id, window.start),
+                deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
+                deps.store.latestStorageFor(ctx.user.id),
+                plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
+                deps.store.overageInvoicesFor(ctx.user.id),
+            ]);
+            return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
+                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference: null,
+                hasCustomer: false, computerId: input?.computerId });
+        }),
         summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV3Result> => {
             const deps = getDeps();
             if (!deps.config.tabEnabled) return { enabled: false };

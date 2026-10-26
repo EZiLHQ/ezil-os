@@ -940,3 +940,27 @@ describe('v3 Premium machine selection', () => {
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
     });
 });
+
+describe('billing.usage read-only boundary', () => {
+    it('authenticates, scopes all reads and has no external or write effects', async () => {
+        const f = fixture();
+        const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('No external calls allowed'));
+        const result = await f.caller.usage();
+        expect(result).toMatchObject({ enabled: true, version: 1, egress: { state: 'unavailable', usedBytes: null } });
+        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor'] as const)
+            expect(f.store[name].mock.calls[0][0]).toBe(userId);
+        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor']);
+        for (const [name, method] of Object.entries(f.store)) if (!reads.has(name)) expect(method).not.toHaveBeenCalled();
+        for (const method of Object.values(f.stripe)) expect(method).not.toHaveBeenCalled();
+        expect(fetch).not.toHaveBeenCalled();
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).usage()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+    it('does not reveal a foreign computer and makes no reads when disabled', async () => {
+        const f = fixture(); f.store.computerOwner.mockResolvedValue('another-user');
+        await expect(f.caller.usage({ computerId: '22222222-2222-4222-8222-222222222222' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(f.store.epochsFor).not.toHaveBeenCalled();
+        f.deps.config.tabEnabled = false;
+        await expect(f.caller.usage()).resolves.toEqual({ enabled: false });
+        expect(f.store.subscriptionsFor).not.toHaveBeenCalled();
+    });
+});
