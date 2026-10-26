@@ -353,7 +353,7 @@ describe('billing router', () => {
         const f = fixture();
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, clientReferenceId: owner });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(1, session.id);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(2, session.id);
@@ -361,9 +361,25 @@ describe('billing router', () => {
 
     it.each(['open', 'complete', 'expired'] as const)('maps %s from a fresh Stripe read', async status => {
         const f = fixture();
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status, paymentStatus: 'paid' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: status === 'open' ? 'pending' : status });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledWith(session.id);
+    });
+
+    it('keeps a completed delayed payment pending until the actual payment succeeds, without granting', async () => {
+        const f = fixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'unpaid' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
+        expect(f.store.insertGrant).not.toHaveBeenCalled();
+        expect(f.store.upsertSubscription).not.toHaveBeenCalled();
+    });
+
+    it('allows a complete receipt that requires no payment', async () => {
+        const f = fixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'no_payment_required' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
     });
 
     it.each(['', 'cs_', 'pi_fixture', 'cs_bad/path', 'cs_bad?query'])('rejects malformed session id %s before reading Stripe', async sessionId => {

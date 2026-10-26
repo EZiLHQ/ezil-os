@@ -414,7 +414,10 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 if (!/^cs_[A-Za-z0-9_]+$/.test(input.sessionId)) throw billingError('not_subscribed', 'BAD_REQUEST');
                 const session = await stripeCall(() => stripe.retrieveCheckoutSession(input.sessionId));
                 if (session.clientReferenceId !== ctx.user.id) throw billingError('not_subscribed', 'NOT_FOUND');
-                return { status: session.status === 'open' ? 'pending' : session.status };
+                // Checkout can complete before a delayed payment succeeds. The return page
+                // must not call an unpaid receipt complete; webhooks still own fulfillment.
+                if (session.status === 'open' || (session.status === 'complete' && session.paymentStatus === 'unpaid')) return { status: 'pending' };
+                return { status: session.status };
             }),
     });
 }
