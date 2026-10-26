@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Linux-only CLI deadline. Own one process group, reap it, never remove files."""
 import ctypes
+import json
 import os
 import selectors
 import signal
@@ -22,6 +23,7 @@ def main():
     kill_at = None
     forced = False
     output = bytearray()
+    output_valid = True
 
     def stop(_signum=None, _frame=None):
         nonlocal stopping, kill_at
@@ -67,7 +69,8 @@ def main():
             elif len(output) + len(chunk) > 65536:
                 stop()  # bounded output; never forward partial/oversized JSON
                 output.clear()
-            elif not stopping:
+                output_valid = False
+            elif output_valid:
                 output.extend(chunk)
         parent_code = child.poll()
         if parent_code is not None:
@@ -86,6 +89,14 @@ def main():
             elif not selector.get_map():
                 break
     selector.close()
+    try:
+        error = json.loads(output).get("error", {}) if output_valid else {}
+        recovery = error.get("code") == "clone-failed" and error.get("message") == (
+            "Repository open interrupted; recovery required after forced Git termination.")
+    except (ValueError, AttributeError):
+        recovery = False
+    if recovery:
+        return 126  # CLI escalated its own Git child; ordinary exit does not prove cleanup.
     if stopping:
         # No stdout from an interrupted operation can masquerade as success.
         return 126 if forced or parent_code is None or parent_code < 0 else 124
