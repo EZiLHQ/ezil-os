@@ -62,6 +62,24 @@ try{
     assert.doesNotMatch(ordinary.el.textContent,/Moving your computer/);
     ordinary.render({kind:'ready'});assert.equal(timers.size,0);ordinary.dispose();
  }
+ // A SELECT-only observation cannot restart a terminal physical mint. Retain its original Retry callback.
+ for (const [stage, recordedStage, retryVisible] of [
+    ['needs_operator', 'unconfirmed', true],
+    ['needs_operator', 'failed_needs_operator', false],
+    ['operations_paused', 'unconfirmed', false],
+ ]) {
+    globalThis.fetch=async()=>({ok:true,status:200,json:async()=>({result:{data:{json:{...base,stage,recordedStage,active:false}}}})});
+    let retried=0;
+    const failed=AppSpinner({computerId:'qa-computer',onRetry:()=>{retried++;}});
+    document.body.appendChild(failed.el);failed.render({kind:'progress'});await tick();
+    assert.equal(failed.el.querySelector('.ezil-boot-actions').hidden,true);
+    // Same observation, changed physical state: fingerprint must include that state.
+    failed.render({kind:'failed',reason:'mint_failed'});
+    assert.equal(failed.el.querySelector('.ezil-boot-actions').hidden,!retryVisible);
+    if(retryVisible)failed.el.querySelector('.ezil-boot-retry').click();
+    assert.equal(retried,retryVisible?1:0,'original onRetry invoked exactly once only for the offered retry');
+    failed.dispose();assert.equal(timers.size,0);
+ }
  assert.equal(progressView({...base,stage:'unavailable'},'qa-computer'),null);
 
 }finally{globalThis.setTimeout=originalSet;globalThis.clearTimeout=originalClear;delete globalThis.fetch;dom.window.close();}

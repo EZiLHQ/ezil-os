@@ -14,6 +14,7 @@ async function until(fn) {
 }
 
 const copies = {
+    attention: ['Computer needs attention', 'Check the computer’s current status before trying again.'],
     unavailable: ['Opening', 'Detailed computer progress is unavailable.'],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
     moving: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
@@ -42,13 +43,13 @@ async function open(t, app, initialMode = 'moving') {
         const path = String(raw);
         let body = { ok: true };
         if (path.includes('/api/trpc/computer.progress')) {
-            const stage = mode === 'unavailable' ? 'unavailable' : mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : 'starting';
-            body = {result:{data:{json:{version:1,computerId:'computer-1',stage,recordedStage:'provisioning',operationsPaused:mode==='paused',active:mode!=='paused',operation:['moving','both','paused'].includes(mode)?'migration':'opening',durable:['moving','both','paused'].includes(mode),resumePolicy:'saved_workspace_only',bytes:{transferred:null,total:null},percent:null,etaSeconds:null}}}};
+            const stage = mode === 'attention' ? 'needs_operator' : mode === 'unavailable' ? 'unavailable' : mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : 'starting';
+            body = {result:{data:{json:{version:1,computerId:'computer-1',stage,recordedStage:mode==='attention'?'unconfirmed':'provisioning',operationsPaused:mode==='paused',active:mode!=='paused',operation:['moving','both','paused'].includes(mode)?'migration':'opening',durable:['moving','both','paused'].includes(mode),resumePolicy:'saved_workspace_only',bytes:{transferred:null,total:null},percent:null,etaSeconds:null}}}};
         } else if (['/api/shell/desktop', '/api/shell/code-preview-url', '/api/shell/preview-url'].includes(path) && init.method === 'POST') {
             asks[path.includes('code') ? 'code' : path.includes('preview') ? 'preview' : 'desktop']++;
             body = mode === 'ready'
                 ? { ok: true, guacamoleUrl: 'https://viewer.example/?embed=1', codePreviewUrl: 'https://code.example/', appPreviewUrl: 'https://preview.example/', frame: { confirmed: true } }
-                : { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2',
+                : { ok: false, errorCode: mode === 'attention' ? 'computer_recovering' : 'sandbox_starting', computeProvider: 'aws-ec2',
                     ...(['moving', 'both'].includes(mode) ? { computeMigrating: true } : {}),
                     ...(['launching', 'both'].includes(mode) ? { computeLaunching: true } : {}) };
         } else if (path.includes('confirm=frame')) body = { ok: true, confirmed: true, status: 200 };
@@ -74,6 +75,18 @@ async function open(t, app, initialMode = 'moving') {
 }
 
 for (const app of ['code', 'desktop', 'preview']) {
+    test(`${app}: terminal mint with generic UNCONFIRMED retains the normal retry`, async t => {
+        const h = await open(t, app, 'attention');
+        await until(() => h.spinner.dataset.kind === 'failed');
+        assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, false);
+        const before = h.asks[app];
+        await wait(30);
+        assert.equal(h.asks[app], before, 'read-only progress does not resume the stopped mint loop');
+        h.setMode('ready');
+        h.spinner.querySelector('.ezil-boot-retry').click();
+        await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://'));
+        assert.equal(h.asks[app], before + 1, 'normal retry opens exactly one new mint attempt');
+    });
     test(`${app}: ordinary CF with no AWS record keeps physical pending app copy`, async t => {
         const h = await open(t, app, 'unavailable');
         assert.match(h.spinner.querySelector('.ezil-app-spinner-label').textContent, /^Opening /);

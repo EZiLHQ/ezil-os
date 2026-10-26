@@ -86,7 +86,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             observer?.stop(); observation = null; progressChecked = false;
         }
         const showObservation = pending && observation && (state.kind === 'progress' || ['operations_paused', 'needs_operator', 'queued'].includes(observation.stage));
-        const fingerprint = showObservation ? JSON.stringify(observation) : null;
+        const fingerprint = showObservation ? JSON.stringify([state.kind, observation]) : null;
         if (fingerprint !== null && fingerprint === paintedObservation) return;
         paintedObservation = fingerprint;
         el_detail.hidden = true;
@@ -94,7 +94,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             el_ring.hidden = !observation.active;
             el_label.textContent = observation.title;
             el_sub.hidden = false; el_sub.textContent = observation.body;
-            el_actions.hidden = !['failed_reopened'].includes(observation.stage);
+            el_actions.hidden = !(observation.stage === 'failed_reopened'
+                || (state.kind === 'failed' && observation.stage === 'needs_operator' && !observation.manualAttention));
             el_detail.replaceChildren(); el_detail.hidden = false;
             if (observation.steps.length) {
                 const list = document.createElement('ol'); list.setAttribute('aria-label', 'Saved migration stages');

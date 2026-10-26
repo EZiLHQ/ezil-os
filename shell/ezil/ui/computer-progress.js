@@ -39,6 +39,7 @@ export function progressView(data, computerId) {
         ? `Next session: ${hardware.vcpu} vCPU · ${hardware.memoryGiB} GiB memory. Applies after you stop this session and start again.` : '';
     return {
         stage, title: stages[stage][0], body: stages[stage][1],
+        manualAttention: data.recordedStage === 'failed_needs_operator',
         active: data.active === true && !['operations_paused', 'needs_operator', 'queued', 'unavailable', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
         steps: data.operation === 'migration' && current >= 0 ? migrationSteps.map((key, i) => ({ label: stages[key][0], state: i < current ? 'complete' : i === current ? 'current' : 'pending' })) : [],
         guidance: data.operation === 'migration' && data.durable === true && data.resumePolicy === 'saved_workspace_only'
