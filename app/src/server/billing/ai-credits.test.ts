@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, aiCreditRestoreItem, parseAiCreditEventId } from './ai-credits';
-import { AI_PACKS, findPack, customTopupPack } from './catalog';
+import { findPack, customTopupPack } from './catalog';
 
 const input = { userId: 'user', sku: 'standard_monthly_v3' as const, subscriptionId: 'sub',
     periodStart: new Date('2026-10-01T00:00:00Z'), periodEnd: new Date('2026-11-01T00:00:00Z'), invoiceId: 'invoice' };
@@ -34,7 +34,7 @@ describe('AI credit planning', () => {
         expect(revoke.payload).not.toHaveProperty('delivery');
         expect(grant.payload.action).toBe('grant');
     });
-    it.each([['standard_monthly_v3', 4000], ['premium_monthly_v3', 20000]] as const)('plans %s with deterministic period ids and grace', (sku, credits) => {
+    it.each([['standard_monthly_v3', 200], ['premium_monthly_v3', 1000]] as const)('plans %s with deterministic period ids and grace', (sku, credits) => {
         const grant = aiCreditEntitlement({ ...input, sku });
         expect(grant).toEqual({ entitlementId: `ezil-os:v1:${sku}:sub:2026-10-01T00:00:00.000Z`, credits,
             expiresAt: '2026-11-04T00:00:00.000Z' });
@@ -62,7 +62,7 @@ describe('AI credit planning', () => {
 
 
 describe('W0.3 canonical root event grammar', () => {
-    const grant = aiTopupOutboxItem('user', { ...AI_PACKS[0]!, aiCredits: 1234 }, 'pi_test', new Date('2027-01-01Z'))!;
+    const grant = aiTopupOutboxItem('user', { ...findPack('ai_pack_10_v1')!, aiCredits: 1234 }, 'pi_test', new Date('2027-01-01Z'))!;
     it('retains root terms and payer across dispute, refund, and restore events', () => {
         grant.payload.accountPublicId = 'frozen-account';
         for (const item of [aiCreditRevokeItem(grant, { type: 'dispute', id: 'dp_D' }),

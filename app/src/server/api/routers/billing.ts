@@ -2,13 +2,14 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
-import { AI_PACKS, aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
 import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
 import type { BillingDeps, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
+import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
@@ -124,7 +125,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices] = await Promise.all([
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -133,6 +134,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 deps.store.sizePreference(ctx.user.id),
                 deps.store.stripeCustomerFor(ctx.user.id),
                 deps.store.overageInvoicesFor(ctx.user.id),
+                readStripePacks(deps.stripe),
             ]);
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
@@ -147,7 +149,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             }
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
-                storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal,
+                storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
             });
             await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
             const ai = await aiRead;
@@ -221,7 +223,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             const stripe = configuredStripe(deps);
             const publishableKey = deps.config.stripePublishableKey;
             if (!publishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
-            const pack = 'sku' in input ? AI_PACKS.find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
+            const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
             if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);

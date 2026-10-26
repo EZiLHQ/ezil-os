@@ -33,9 +33,9 @@ describe('billing.summary AI wiring', () => {
         expect(fetcher.mock.calls[0]![1]!.headers).toEqual({ Authorization: 'Bearer current-token' });
     });
     it('uses the paid plan threshold and never queues a Free trial for it', async () => {
-        vi.stubGlobal('fetch', gateway({ available_micro: '400000000' }));
+        vi.stubGlobal('fetch', gateway({ available_micro: '20000000' }));
         const f = fixture('standard_monthly_v3');
-        expect(await f.caller.summary()).toMatchObject({ ai: { grant: { amount: 4000 }, balance: 400, state: 'low' } });
+        expect(await f.caller.summary()).toMatchObject({ ai: { grant: { amount: 200 }, balance: 20, state: 'low' } });
         expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
     });
     it('performs billing reads while balance is stalled and returns unavailable by the timeout', async () => {

@@ -22,10 +22,10 @@ import type { ComputeProvider, SizeCode } from '../v2/contract';
 export const CATALOG_V3_VERSION = 3 as const;
 
 /**
- * AI credit policy (founder 2026-10-20): the platform decides how many EZiL AI
- * credits each plan grants; users only ever see credit numbers. Consumption per
- * model is the AI Gateway's own pricing (credits per token), not this file.
- * Bump the version whenever an amount changes; grants already made keep theirs.
+ * AI credit policy (founder 2026-10-26): the platform decides how many EZiL AI
+ * credits each plan grants; paid credits equal the plan price at $0.10 each.
+ * Consumption per model is the AI Gateway's own pricing (credits per token).
+ * Keep entitlement identities stable; grants already made retain their stored terms.
  */
 export const AI_CREDIT_POLICY_VERSION = 1 as const;
 
@@ -106,7 +106,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
         sessionMaxSeconds: null, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
-        highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 4_000, per: 'period' },
+        highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 200, per: 'period' },
         bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', 'No session time limit'],
     },
     premium_monthly_v3: {
@@ -115,7 +115,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
         sessionMaxSeconds: null, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
-        highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 20_000, per: 'period' },
+        highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 1_000, per: 'period' },
         bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', 'No session time limit', 'Bigger computers use your monthly time faster'],
     },
 });

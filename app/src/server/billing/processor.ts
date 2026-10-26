@@ -6,6 +6,7 @@
 import { schedulePaidMigration } from '../lib/compute/provider-migrate-orchestrator';
 import { CUSTOM_TOPUP_SKU, customTopupPack, findPack, PRO_PLAN } from './catalog';
 import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, UsageEvent } from './ports';
+import { stripePackCredits, stripePackSku } from './stripe/packs';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
 import { CATALOG_V3 } from './v3/contract';
@@ -249,11 +250,10 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             const session = await stripe.retrieveCheckoutSession(action.sessionId);
             if (session.mode !== 'payment' || session.paymentStatus !== 'paid') return 'ignored';
             const custom = session.sku === CUSTOM_TOPUP_SKU;
-            const pack = custom ? customTopupPack(session.amountTotal ?? NaN)
+            let pack = custom ? customTopupPack(session.amountTotal ?? NaN)
                 : session.sku === null ? undefined : findPack(session.sku);
             if (custom && (!pack || session.currency !== 'usd')) return 'review:invalid_custom_amount';
             if (custom && session.metadataCredits !== String(pack!.aiCredits)) return 'review:custom_credits_mismatch';
-            if (pack === undefined) return 'review:unknown_sku';
             if (session.customer === null) return 'unattributed:customer';
             const userId = await store.userForStripeCustomer(session.customer);
             if (userId === null) return 'unattributed:customer';
@@ -261,6 +261,23 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             if (!hasAiTopupReceipts(store)) return 'failed:ai_topup_receipts_unavailable';
             // The original policy and expiry win even if the catalog changes before a replay.
             if (await store.aiTopupReceipt(userId, session.paymentIntentId)) return 'applied';
+            if (!custom && !pack && session.sku?.startsWith('ai_pack_')) {
+                const lines = await stripe.retrieveCheckoutLineItems(session.id);
+                const line = lines[0];
+                if (lines.length !== 1 || line?.quantity !== 1 || !line.price?.productId) return 'review:invalid_pack_line';
+                const product = await stripe.retrieveProduct(line.price.productId);
+                const credits = stripePackCredits(product);
+                if (credits === null || session.metadataCredits !== String(credits)) return 'review:pack_credits_mismatch';
+                if (stripePackSku(product.id) !== session.sku) return 'review:unknown_sku';
+                const face = credits * 10;
+                if (line.price.type !== 'one_time' || line.price.currency !== 'usd' || line.price.unitAmount !== face)
+                    return 'review:invalid_pack_price';
+                if (session.currency !== 'usd' || !Number.isSafeInteger(session.amountTotal)
+                    || session.amountTotal! < 0 || session.amountTotal! > face) return 'review:invalid_pack_amount';
+                pack = { sku: session.sku, aiCredits: credits, creditCents: face, discountPercent: 0,
+                    serviceFeeCents: 0, totalCents: session.amountTotal! };
+            }
+            if (!pack) return 'review:unknown_sku';
             const amount = BigInt(pack.creditCents) * BigInt(10_000);
             const period = purchasedPeriod(event.created);
             const receipt = aiTopupOutboxItem(userId, pack, session.paymentIntentId, period.end);

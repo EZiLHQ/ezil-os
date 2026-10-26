@@ -101,6 +101,8 @@ export function fakeStripe() {
     }
     const unused = (name: string) => async (): Promise<never> => { calls.push(name); throw new Error(`Unexpected Stripe call ${name}`); };
     const api: StripeApi = {
+        listProducts: unused('listProducts'), retrieveProduct: unused('retrieveProduct'), retrievePackPrice: unused('retrievePackPrice'),
+        retrieveCoupon: unused('retrieveCoupon'), retrieveCheckoutLineItems: unused('retrieveCheckoutLineItems'),
         resolvePrice: unused('resolvePrice'), previewUpgrade: unused('previewUpgrade'), confirmUpgrade: unused('confirmUpgrade'),
         scheduleDowngrade: unused('scheduleDowngrade'), cancelScheduledChange: unused('cancelScheduledChange'),
         setCancelAtPeriodEnd: unused('setCancelAtPeriodEnd'), createCustomer: unused('createCustomer'),

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { productResponse, priceResponse, couponResponse } from './packs.test-support';
 import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
 import * as catalog from '../catalog';
 import type { CheckoutRequest } from '../ports';
@@ -7,6 +8,36 @@ import { BillingProviderError, createStripeClient, resetStripeCachesForTests, St
 
 beforeEach(resetStripeCachesForTests);
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+describe('Stripe pack reads', () => {
+    it('paginates products and checkout line items and maps server product facts', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ data: [productResponse], has_more: true }))
+            .mockResolvedValueOnce(Response.json({ data: [{ ...productResponse, id: 'prod_second' }], has_more: false }))
+            .mockResolvedValueOnce(Response.json(productResponse))
+            .mockResolvedValueOnce(Response.json({ data: [{ id: 'li_one', quantity: 1, price: priceResponse }], has_more: true }))
+            .mockResolvedValueOnce(Response.json({ data: [{ id: 'li_two', quantity: 2, price: null }], has_more: false }));
+        expect((await client.listProducts()).map(product => product.id)).toEqual(['prod_fixture', 'prod_second']);
+        expect(String(fetcher.mock.calls[1]![0])).toContain('starting_after=prod_fixture');
+        expect(await client.retrieveProduct('prod_fixture')).toMatchObject({ defaultPrice: 'price_pack', metadata: { ezil_credits: '1000' } });
+        expect(await client.retrieveCheckoutLineItems('cs_fixture')).toEqual([
+            { quantity: 1, price: { id: 'price_pack', active: true, productId: 'prod_fixture', type: 'one_time', currency: 'usd', unitAmount: 10000 } },
+            { quantity: 2, price: null },
+        ]);
+        expect(String(fetcher.mock.calls[4]![0])).toContain('starting_after=li_one');
+    });
+    it('maps missing coupons to null and propagates transient provider errors', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 404 }))
+            .mockResolvedValueOnce(Response.json({ error: {} }, { status: 503 }));
+        expect(await client.retrieveCoupon('missing')).toBeNull();
+        await expect(client.retrieveCoupon('unavailable')).rejects.toMatchObject({ status: 503 });
+    });
+    it('reads pack ezil_credits without trusting the older custom metadata field', async () => {
+        const { client } = fixture({ ...session, metadata: { sku: 'ai_pack_fixture', ezil_credits: '1000', credits: '9999' } });
+        expect(await client.retrieveCheckoutSession('cs_fixture')).toMatchObject({ sku: 'ai_pack_fixture', metadataCredits: '1000' });
+    });
+});
 
 const secretKey = 'sk_test_client_fixture';
 const start = 1_799_000_000;
@@ -245,17 +276,21 @@ describe('createStripeClient requests', () => {
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
     });
 
-    it.each([
-        ['ai_pack_100_v2', 8000], ['ai_pack_500_v2', 35000],
-        ['ai_pack_1000_v2', 70000], ['ai_pack_2000_v2', 120000],
-    ] as const)('charges the discounted total for %s in a single payment item', async (sku, totalCents) => {
-        const { client, fetcher } = fixture(checkoutResult);
-        await client.createCheckoutSession({ ...checkoutRequest, sku, uiMode: 'embedded' });
-        expect(inspect(fetcher).body).toMatchObject({ mode: 'payment', ui_mode: 'embedded_page',
-            'metadata[sku]': sku, 'payment_intent_data[metadata][sku]': sku,
-            'line_items[0][price_data][unit_amount]': String(totalCents),
-            'line_items[0][price_data][currency]': 'usd', 'line_items[0][price_data][tax_behavior]': 'inclusive' });
-        expect(inspect(fetcher).body).not.toHaveProperty('line_items[1][quantity]');
+    it.each([true, false])('uses the dashboard default price and optional coupon (%s)', async discounted => {
+        const { client, fetcher } = fixture({ id: 'cs_pack', client_secret: 'secret_fixture' });
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ ...productResponse,
+            metadata: { ezil_kind: 'ai_pack', ezil_credits: '1000', ...(discounted ? { ezil_coupon: 'coupon_pack' } : {}) } }], has_more: false }))
+            .mockResolvedValueOnce(Response.json(priceResponse));
+        if (discounted) fetcher.mockResolvedValueOnce(Response.json(couponResponse));
+        await client.createCheckoutSession({ ...checkoutRequest, sku: 'ai_pack_fixture', uiMode: 'embedded' });
+        const sent = inspect(fetcher, fetcher.mock.calls.length - 1).body;
+        expect(sent).toMatchObject({ mode: 'payment', ui_mode: 'embedded_page', 'line_items[0][price]': 'price_pack',
+            'line_items[0][quantity]': '1', 'metadata[sku]': 'ai_pack_fixture', 'metadata[ezil_credits]': '1000',
+            'payment_intent_data[metadata][ezil_credits]': '1000' });
+        expect(sent).not.toHaveProperty('line_items[0][price_data][unit_amount]');
+        expect(sent).not.toHaveProperty('allow_promotion_codes');
+        if (discounted) expect(sent['discounts[0][coupon]']).toBe('coupon_pack');
+        else expect(sent).not.toHaveProperty('discounts[0][coupon]');
     });
 
     it('stores custom credits on the session and payment intent and reads verified payment facts', async () => {

@@ -10,6 +10,7 @@ import type {
     StripeSubscription, SubscriptionUpsert, UsageEvent, OverageConsentRow, OverageInvoiceRow, PlanChangeRow, PaymentIssueRow, StoredComputeEpoch,
 } from './ports';
 import { ingestUsageEvents, processStripeEvent } from './processor';
+import { packProduct, packPrice } from './stripe/packs.test-support';
 import { createStripeClient } from './stripe/client';
 import type { StripeEventLike } from './stripe/events';
 import { CATALOG_V2, OVERAGE_PRICE_LOOKUP_KEY, OVERAGE_TERMS_VERSION } from './v2/contract';
@@ -281,6 +282,13 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore 
 }
 
 class MemoryStripe implements StripeApi {
+    product = structuredClone(packProduct);
+    lines = [{ quantity: 1, price: { ...packPrice } }];
+    async listProducts() { return [this.product]; }
+    async retrieveProduct() { return this.product; }
+    async retrievePackPrice() { return packPrice; }
+    async retrieveCoupon() { return null; }
+    async retrieveCheckoutLineItems() { return this.lines; }
     async resolvePrice(): Promise<never> { throw new Error('Unexpected resolvePrice'); }
     async previewUpgrade(): Promise<never> { throw new Error('Unexpected previewUpgrade'); }
     async confirmUpgrade(): Promise<never> { throw new Error('Unexpected confirmUpgrade'); }
@@ -552,18 +560,65 @@ describe('processStripeEvent', () => {
         expect(f.store.grants.size).toBe(0);
     });
 
-    it.each([
-        ['ai_pack_100_v2', 1000, 10000], ['ai_pack_500_v2', 5000, 50000],
-        ['ai_pack_1000_v2', 10000, 100000], ['ai_pack_2000_v2', 20000, 200000],
-    ] as const)('funds the shipped founder pack %s exactly once', async (sku, credits, creditCents) => {
+    function stripePackFixture() {
         const f = fixture();
-        f.stripe.session.sku = sku;
-        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        Object.assign(f.stripe.session, { sku: 'ai_pack_fixture', metadataCredits: '1000', currency: 'usd', amountTotal: 8000 });
+        return f;
+    }
+    it.each([1000, 5000, 10000])('verifies the Stripe product and grants %i credits exactly once', async credits => {
+        const f = stripePackFixture();
+        f.stripe.product.metadata.ezil_credits = String(credits);
+        f.stripe.session.metadataCredits = String(credits);
+        f.stripe.lines[0]!.price.unitAmount = credits * 10;
+        const input = checkout(false);
+        input.data.object.metadata = { ezil_credits: '999999', sku: 'ai_pack_untrusted' };
+        expect(await processStripeEvent(input, f.deps)).toBe('applied');
         expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
         expect([...f.store.grants.values()]).toHaveLength(1);
-        expect([...f.store.grants.values()][0]).toMatchObject({ kind: 'topup', amount: BigInt(creditCents) * BigInt(10000) });
+        expect([...f.store.grants.values()][0]).toMatchObject({ kind: 'topup', amount: BigInt(credits * 10) * BigInt(10000) });
         expect([...f.store.outbox.values()]).toHaveLength(1);
-        expect([...f.store.outbox.values()][0]).toMatchObject({ kind: 'ai_grant', payload: { credits, packSku: sku } });
+        expect([...f.store.outbox.values()][0]).toMatchObject({ eventKey: 'ezil-os:v1:topup:ai_pack_fixture:pi_local:grant',
+            kind: 'ai_grant', payload: { credits, packSku: 'ai_pack_fixture' } });
+    });
+    it.each([undefined, null, '', '999', '1000.0', '10000'])('reviews mismatched pack session credits %s', async metadataCredits => {
+        const f = stripePackFixture(); f.stripe.session.metadataCredits = metadataCredits;
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:pack_credits_mismatch');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+    });
+    it.each([{ ezil_kind: 'other' }, { ezil_credits: '0' }, { ezil_credits: '10001' }])('requires pack product metadata %j', async change => {
+        const f = stripePackFixture(); Object.assign(f.stripe.product.metadata, change);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:pack_credits_mismatch');
+        expect(f.store.grants.size).toBe(0);
+    });
+    it.each([{ currency: 'eur' }, { currency: null }, { amountTotal: 10001 }, { amountTotal: null },
+        { amountTotal: -1 }, { amountTotal: 8000.5 }])('reviews invalid pack payment %j', async change => {
+        const f = stripePackFixture(); Object.assign(f.stripe.session, change);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:invalid_pack_amount');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+    });
+    it.each([{ currency: 'eur' }, { unitAmount: 8000 }, { type: 'recurring' }])('reviews invalid purchased price %j', async change => {
+        const f = stripePackFixture(); Object.assign(f.stripe.lines[0]!.price, change);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:invalid_pack_price');
+        expect(f.store.grants.size).toBe(0);
+    });
+    it('requires one purchased unit and a SKU matching its product', async () => {
+        const f = stripePackFixture(); f.stripe.lines[0]!.quantity = 2;
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:invalid_pack_line');
+        f.stripe.lines[0]!.quantity = 1;
+        f.stripe.session.sku = 'ai_pack_other';
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:unknown_sku');
+        expect(f.store.grants.size).toBe(0);
+    });
+    it('replays and refunds stored pack terms after the product changes or becomes unavailable', async () => {
+        const f = stripePackFixture();
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        f.stripe.product.metadata.ezil_credits = '5000';
+        vi.spyOn(f.stripe, 'retrieveProduct').mockRejectedValue(new Error('unavailable'));
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()].find(item => item.kind === 'ai_revoke')?.payload.credits).toBe(1000);
     });
 
     it.each([1000, 12300, 1000000])('derives custom credits from verified amount %i and refunds the stored receipt', async amountTotal => {
@@ -611,7 +666,7 @@ describe('processStripeEvent', () => {
         const receipt = [...f.store.outbox.values()][0]!;
         receipt.payload.accountPublicId = 'original-account';
         const snapshot = structuredClone(receipt);
-        vi.mocked(catalog.findPack).mockImplementation(sku => ({ ...catalog.AI_PACKS[0]!, sku, aiCredits: 9999 }));
+        vi.mocked(catalog.findPack).mockImplementation(sku => ({ ...findPack('ai_pack_10_v1')!, sku, aiCredits: 9999 }));
         expect(await processStripeEvent({ ...checkout(false), id: 'different-event', created: checkout(false).created + 86400 }, f.deps)).toBe('applied');
         expect([...f.store.outbox.values()]).toEqual([snapshot]);
         expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
@@ -1705,7 +1760,7 @@ describe('v3 paid invoice grants', () => {
             subscriptionId: 'sub_local', meter: 'compute_std_seconds', kind: 'plan_period' })]);
         const entitlementId = `ezil-os:v1:${sku}:sub_local:${periodStart.toISOString()}`;
         expect([...store.outbox.values()]).toEqual([expect.objectContaining({ eventKey: `${entitlementId}:grant`, kind: 'ai_grant',
-            payload: expect.objectContaining({ entitlementId, credits: sku === 'standard_monthly_v3' ? 4000 : 20000,
+            payload: expect.objectContaining({ entitlementId, credits: sku === 'standard_monthly_v3' ? 200 : 1000,
                 action: 'grant', expiresAt: '2026-11-04T00:00:00.000Z' }) })]);
         stripe.charge.invoiceId = stripe.invoice.id;
         stripe.charge.refunded = true;
@@ -1714,7 +1769,7 @@ describe('v3 paid invoice grants', () => {
         expect([...store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
         expect(store.outbox.size).toBe(2);
         expect(store.outbox.get(`${entitlementId}:revoke:refund:re_v3`)).toMatchObject({ kind: 'ai_revoke',
-            payload: { eventId: `${entitlementId}:revoke:refund:re_v3`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 4000 : 20000 } });
+            payload: { eventId: `${entitlementId}:revoke:refund:re_v3`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 200 : 1000 } });
         await processStripeEvent({ ...delivery, id: 'evt_refund_replayed' }, deps);
         expect(store.outbox.size).toBe(2);
     });
@@ -1723,7 +1778,7 @@ describe('v3 paid invoice grants', () => {
         stripe.invoice.lines[0]!.lookupKey = 'ezil_standard_monthly_v3';
         expect(await processStripeEvent(paidV2(), deps)).toBe('applied');
         expect([...store.grants.values()][0]!.amount).toBe(BigInt(144000));
-        expect([...store.outbox.values()][0]!.payload.credits).toBe(4000);
+        expect([...store.outbox.values()][0]!.payload.credits).toBe(200);
     });
     it.each(['open', 'manual', 'foreign', 'ambiguous'] as const)('does not grant %s invoices', async scenario => {
         const { store, stripe, deps } = v3Fixture();
@@ -1978,7 +2033,7 @@ describe('W0.3 dispute restore receipts', () => {
         expect(await Promise.all([processStripeEvent(dispute(true), f.deps), processStripeEvent(dispute(true), f.deps)])).toEqual(['applied', 'applied']);
         const restored = f.store.outbox.get(`${f.root.payload.entitlementId}:restore:dp_local`)!;
         expect(restored).toMatchObject({ kind: 'ai_restore', payload: { action: 'restore',
-            entitlementId: f.root.payload.entitlementId, credits: v3 ? 4000 : 1234, accountPublicId: 'original-payer',
+            entitlementId: f.root.payload.entitlementId, credits: v3 ? 200 : 1234, accountPublicId: 'original-payer',
             expiresAt: f.root.payload.expiresAt } });
         expect(f.store.writes.length - before.length).toBe(2);
         expect([...f.store.grants.values()].map(g => g.kind)).toEqual([v3 ? 'plan_period' : 'topup', 'suspend', 'restore']);

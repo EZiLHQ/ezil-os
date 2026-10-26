@@ -27,15 +27,9 @@ describe('billing catalog contract', () => {
         expect((total - 1) * 0.951 - 30).toBeLessThan(credit);
     });
 
-    it('offers the founder v2 credit packs at the exact discounted USD prices', () => {
-        expect(AI_PACKS).toEqual([
-            { sku: 'ai_pack_100_v2', aiCredits: 1000, creditCents: 10000, discountPercent: 20, serviceFeeCents: 0, totalCents: 8000 },
-            { sku: 'ai_pack_500_v2', aiCredits: 5000, creditCents: 50000, discountPercent: 30, serviceFeeCents: 0, totalCents: 35000 },
-            { sku: 'ai_pack_1000_v2', aiCredits: 10000, creditCents: 100000, discountPercent: 30, serviceFeeCents: 0, totalCents: 70000 },
-            { sku: 'ai_pack_2000_v2', aiCredits: 20000, creditCents: 200000, discountPercent: 40, serviceFeeCents: 0, totalCents: 120000 },
-        ]);
-        expect(AI_PACKS.every(aiPackCheckoutEligible)).toBe(true);
-        for (const pack of AI_PACKS) expect(findPack(pack.sku)).toEqual(pack);
+    it('offers no hard-coded packs and no longer resolves v2 prices', () => {
+        expect(AI_PACKS).toEqual([]);
+        expect(findPack('ai_pack_100_v2')).toBeUndefined();
     });
 
     it('resolves historical v1 prices for fulfilment and refunds without offering them', () => {
@@ -58,12 +52,12 @@ describe('billing catalog contract', () => {
     });
 
     it.each([null, undefined, 0, -1, 1.5, 1_000_001, NaN, Infinity])('refuses an unset or invalid pack credit policy %s', aiCredits => {
-        expect(aiPackCheckoutEligible({ ...AI_PACKS[0]!, aiCredits: aiCredits as number | null })).toBe(false);
+        expect(aiPackCheckoutEligible({ ...findPack('ai_pack_10_v1')!, aiCredits: aiCredits as number | null })).toBe(false);
     });
     it('allows explicit whole-credit policy and refuses a missing pack', () => {
-        expect(aiPackCheckoutEligible({ ...AI_PACKS[0]!, aiCredits: 1234 })).toBe(true);
+        expect(aiPackCheckoutEligible({ ...findPack('ai_pack_10_v1')!, aiCredits: 1234 })).toBe(true);
         expect(aiPackCheckoutEligible(undefined)).toBe(false);
-        expect(AI_PACKS[0]!.aiCredits).toBe(1000);
+        expect(findPack('ai_pack_10_v1')!.aiCredits).toBeNull();
     });
 
     it('raises only Pro storage and only after the large-storage gate', () => {

@@ -8,7 +8,7 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('AI balance', () => {
     it.each([[null, 500, 'unavailable'], [0, 500, 'exhausted'], [1, 500, 'low'], [50, 500, 'low'], [51, 500, 'ok'],
-        [400, 4000, 'low'], [401, 4000, 'ok'], [2000, 20000, 'low'], [2001, 20000, 'ok'], [1, 0, 'ok']] as const)
+        [20, 200, 'low'], [21, 200, 'ok'], [100, 1000, 'low'], [101, 1000, 'ok'], [1, 0, 'ok']] as const)
     ('balance %s against grant %s is %s', (balance, grant, state) => expect(aiBalanceState(balance, grant)).toBe(state));
     it.each([[{ available_micro: '123456789' }, 123.456789], [{ available_micro: 1_000_000 }, 1], [{ available_micro: '999999' }, 0.999999],
         [{ available_micro: '0' }, 0], [{ credits: 4000 }, 4000], [{ credits: 0 }, 0], [null, null], [{}, null],

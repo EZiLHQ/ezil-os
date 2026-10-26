@@ -18,7 +18,7 @@ import type { BillingStore, GrantInsert, SubscriptionUpsert } from './ports';
 import { createBillingStore } from './store';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { aiTopupOutboxItem, hasAiReversals, planAiReversal } from './ai-credits';
-import { AI_PACKS } from './catalog';
+import { findPack } from './catalog';
 import { billingGrants } from '@/server/db/schema/billing';
 import type { GrantRow } from './ports';
 
@@ -356,7 +356,7 @@ describe('atomic canonical restore store without a database connection', () => {
         const original: GrantRow = { id: 'original', userId: 'user', subscriptionId: null, meter: 'ai_usd_micro', kind: 'topup',
             amount: BigInt(10_000_000), sourceType: 'payment_intent', sourceId: 'pi_test',
             periodStart: instant(0), periodEnd: instant(100), createdAt: instant(0) };
-        const root = aiTopupOutboxItem('user', { ...AI_PACKS[0]!, aiCredits: 1234 }, 'pi_test', original.periodEnd!)!;
+        const root = aiTopupOutboxItem('user', { ...findPack('ai_pack_10_v1')!, aiCredits: 1234 }, 'pi_test', original.periodEnd!)!;
         root.payload.accountPublicId = 'payer';
         const input = { action: 'restore' as const, userId: 'user', customerId: 'cus_test', chargeId: 'ch_test',
             causeId: 'dp_test', originals: [original], receipts: [root] };

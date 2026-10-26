@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as schema from '@/server/db/schema';
 import { authUsers, billingOutbox, billingGrants } from '@/server/db/schema';
 import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts, hasAiReversals, aiCreditRestoreItem } from './ai-credits';
-import { AI_PACKS } from './catalog';
+import { findPack } from './catalog';
 import { createAiCreditOutboxStore } from './ai-credit-outbox-store';
 import { drainAiCreditOutbox, type AiCreditOutboxStore } from './ai-credit-outbox';
 import { enqueueFreeAiCredits } from './ai-balance';
@@ -228,7 +228,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('atomic topup receipts w
                 if (!hasAiTopupReceipts(store)) throw new Error('missing topup store');
                 const userId = randomUUID();
                 await tx.insert(authUsers).values({ id: userId });
-                const pack = { ...AI_PACKS[0]!, aiCredits: 1234 };
+                const pack = { ...findPack('ai_pack_10_v1')!, aiCredits: 1234 };
                 const make = (id: string) => {
                     const receipt = aiTopupOutboxItem(userId, pack, id, end)!;
                     const grant = { userId, meter: 'ai_usd_micro' as const, kind: 'topup' as const, amount: BigInt(10_000_000),
