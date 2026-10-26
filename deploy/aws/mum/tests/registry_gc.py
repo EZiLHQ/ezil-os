@@ -230,8 +230,8 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        # 8 + 8 = 16 records: one beyond the fifteen-record bound.
-        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa0']]
+        # 8 + 9 = 17 records: one beyond the sixteen-record bound.
+        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa01']]
         self.refuse('invalid registry')
 
     def test_twelve_record_gc_removes_exactly_one_preserving_eleven(self):
@@ -247,23 +247,23 @@ class RegistryGcTests(unittest.TestCase):
         self.drops.append(gc.identity(self.records[2]))
         self.refuse('exactly one')
 
-    def test_fifteen_record_gc_removes_exactly_one_preserving_fourteen(self):
+    def test_sixteen_record_gc_removes_exactly_one_preserving_fifteen(self):
         self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17,recipeVersion='1.0.1'+str(n))
-                             for n,c in ((3,'b'),(4,'c'),(5,'d'),(6,'e'),(7,'f'),(8,'0'))]])
-        self.assertEqual(len(self.records),15)
+                             for n,c in ((3,'b'),(4,'c'),(5,'d'),(6,'e'),(7,'f'),(8,'0'),(9,'1'))]])
+        self.assertEqual(len(self.records),16)
         self.evidence['registrySha256']=gc.sha(self.records)
         before=copy.deepcopy(self.snapshot)
         after=self.prepare()
-        self.assertEqual(len(after['releases']),14)
+        self.assertEqual(len(after['releases']),15)
         self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
         self.assertEqual(self.snapshot,before)
         self.drops.append(gc.identity(self.records[2]))
         self.refuse('exactly one')
 
-    def test_fifteen_record_gc_still_refuses_keep_set(self):
+    def test_sixteen_record_gc_still_refuses_keep_set(self):
         self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17,recipeVersion='1.0.1'+str(n))
-                             for n,c in ((3,'b'),(4,'c'),(5,'d'),(6,'e'),(7,'f'),(8,'0'))]])
-        self.assertEqual(len(self.records),15)
+                             for n,c in ((3,'b'),(4,'c'),(5,'d'),(6,'e'),(7,'f'),(8,'0'),(9,'1'))]])
+        self.assertEqual(len(self.records),16)
         self.evidence['registrySha256']=gc.sha(self.records)
         for record in (self.records[0],self.records[7],self.target):
             self.drops=[gc.identity(record)]
