@@ -78,14 +78,17 @@ try {
     if (dir) { mkdirSync(dir, { recursive: true }); await page.screenshot({ path: path.join(dir, 'ui-windows.png') }); }
     await ordinary.locator('.taskbar-item[data-app="settings"]').click();
     await ordinary.locator('.ezil-settings-tab[data-tab="usage"]').click();
-    await ordinary.getByText('Last observation is stale', { exact: false }).waitFor();
-    assert.ok((await ordinary.locator('[data-role="usage-body"]').textContent()).includes('Current total: unavailable'));
+    await ordinary.getByText('Update delayed', { exact: true }).waitFor();
+    assert.ok((await ordinary.locator('[data-role="usage-body"]').textContent()).includes('Current total unavailable'));
+    assert.ok((await ordinary.locator('[data-usage="session"]').textContent()).includes('Showing the last recorded runtime.'));
     assert.ok(!requests.includes('/api/trpc/billing.summary'), 'Usage does not invoke the billing summary side effects');
     if (dir) await ordinary.screenshot({ path: path.join(dir, 'ui-usage.png') });
     usageFails = true; await ordinary.getByRole('button', { name: 'Refresh', exact: true }).click();
-    await ordinary.getByRole('alert').filter({ hasText: 'Could not load usage' }).waitFor();
+    await ordinary.getByRole('alert').filter({ hasText: 'Could not refresh. Showing the last observation below' }).waitFor();
+    assert.ok((await ordinary.locator('[data-usage="session"]').textContent()).includes('Last recorded · update failed'));
+    assert.ok((await ordinary.locator('[data-usage="session"]').textContent()).includes('20 min'), 'failed refresh retains recorded runtime');
     usageFails = false; await ordinary.getByRole('button', { name: 'Refresh', exact: true }).click();
-    await ordinary.getByText('Last observation is stale', { exact: false }).waitFor();
+    await ordinary.getByText('Update delayed', { exact: true }).waitFor();
     assert.deepEqual(errors, []);
     console.log('PASS local Chromium: fresh Code/Browser, refresh, Settings close/reopen/default/deep section, repeated target, two OS tabs, ordinary entry, invalid target, truthful Usage and failed-refresh recovery');
 } finally { await context.close(); await browser.close(); await new Promise(resolve => server.close(resolve)); }
