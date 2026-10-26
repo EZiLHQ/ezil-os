@@ -944,6 +944,43 @@ describe('Codex 4275911832: the lease deadline and hour caps bind during a sessi
         expect(placements[0]).toMatchObject({ last_error: 'user_hours_cap' });
     });
 
+    it('activity meters accepted fresh presence at its observed instant on every beat', async () => {
+        const meter = { ready: vi.fn(), stopped: vi.fn(), heartbeat: vi.fn(async () => {}) };
+        const { provider } = setup({ placements: [running()] }, { meter });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 60_000 })).toEqual({ ok: true });
+        expect(meter.heartbeat).toHaveBeenLastCalledWith({ ...me, at: new Date(NOW.getTime() - 60_000) });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 0 })).toEqual({ ok: true });
+        expect(meter.heartbeat).toHaveBeenCalledTimes(2);
+        expect(meter.heartbeat).toHaveBeenLastCalledWith({ ...me, at: NOW });
+    });
+
+    it('activity does not meter stale release, stopped, over-cap, or foreign-owner requests', async () => {
+        const meter = { ready: vi.fn(), stopped: vi.fn(), heartbeat: vi.fn(async () => {}) };
+        const fresh = setup({ placements: [running()] }, { meter });
+        expect(await fresh.provider.activity(ctx, me, { lastInputAgoMs: 30 * 60_000 })).toEqual({ ok: true });
+        await expect(fresh.provider.activity(ctx, { ...me, userId: U2 }, { lastInputAgoMs: 0 })).rejects.toBeInstanceOf(PlacementOwnerError);
+        const halted = setup({ placements: [stopped()] }, { meter });
+        expect(await halted.provider.activity(ctx, me, { lastInputAgoMs: 0 })).toMatchObject({ ok: false });
+        const capped = setup({ placements: [running()], usage: [hours(100)] }, { meter });
+        expect(await capped.provider.activity(ctx, me, { lastInputAgoMs: 0 })).toMatchObject({ ok: false, error: 'user_hours_cap' });
+        expect(meter.heartbeat).not.toHaveBeenCalled();
+    });
+
+    it.each(['stopping', 'stopped'])('activity refuses a %s observation on its second reconcile without heartbeating', async state => {
+        const meter = { ready: vi.fn(), stopped: vi.fn(async () => { throw new Error('meter unavailable'); }), heartbeat: vi.fn(async () => {}) };
+        let reads = 0;
+        const describer: NonNullable<AwsProviderDeps['describer']> = {
+            async describeForEnrollment(_region, instanceId) {
+                return { instanceId, state: ++reads === 1 ? 'running' : state } as never;
+            },
+        };
+        const { provider, placements } = setup({ placements: [running()] }, { meter, describer });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'placement_stopping' });
+        expect(reads).toBe(2);
+        expect(placements[0]?.state).toBe('STOPPING');
+        expect(meter.heartbeat).not.toHaveBeenCalled();
+    });
+
     it('activity never shortens a lease', async () => {
         const far = new Date(NOW.getTime() + 5 * HOUR);
         const { provider, placements, statements } = setup({ placements: [running({ lease_until: far })] });

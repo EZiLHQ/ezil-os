@@ -895,14 +895,14 @@ def edit_release_secret(envelope, before, after, records):
     """CAS the complete tuple and append immutable records; capacity fails closed.
 
     Retaining ALL records satisfies placement/job retention without racing the DB.
-    A separately reviewed garbage collector is required when fourteen slots are full.
+    A separately reviewed garbage collector is required when fifteen slots are full.
     """
     updated = edit_secret(envelope, before, after)
     raw = updated[KEY]
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 14, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= 15, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
@@ -914,7 +914,7 @@ def edit_release_secret(envelope, before, after, records):
         need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 14, "release registry full; retained placement/job evidence must never be dropped")
+    need(1 <= len(retained) <= 15, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.
