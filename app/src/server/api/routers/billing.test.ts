@@ -1,15 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '@/server/billing/config';
+import * as catalog from '@/server/billing/catalog';
+import type { AiTopupReceiptStore } from '@/server/billing/ai-credits';
+import { processStripeEvent } from '@/server/billing/processor';
 import type { SubscriptionRow } from '@/server/billing/meters';
 import type { BillingDeps, BillingStore, GrantRow, PlanChangeRow, OverageConsentRow, StripeApi, StripeCheckoutSession, StripeInvoiceSummary } from '@/server/billing/ports';
 import { CATALOG_V2, type BillingErrorCode, OVERAGE_TERMS_VERSION } from '@/server/billing/v2/contract';
-import { BillingProviderError, StripeRequestError } from '@/server/billing/stripe/client';
+import { BillingProviderError, createStripeClient, StripeRequestError } from '@/server/billing/stripe/client';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 import { upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
+vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
 vi.mock('@/server/billing/deps', () => ({
     getBillingDeps: () => { throw new Error('Tests must inject billing ports'); },
@@ -534,6 +538,138 @@ describe('billing publishable-key configuration', () => {
         expect(readBillingConfig({ STRIPE_PUBLISHABLE_KEY: 'pk_live_explicit', STRIPE_KEY: 'pk_test_legacy' }).stripePublishableKey).toBe('pk_live_explicit');
         expect(readBillingConfig({ STRIPE_PUBLISHABLE_KEY: 'sk_test_invalid', STRIPE_KEY: 'pk_test_legacy' }).stripePublishableKey).toBeUndefined();
         expect(readBillingConfig({ STRIPE_SECRET: 'sk_test_fixture' }).stripePublishableKey).toBeUndefined();
+    });
+});
+
+describe('billing top-up checkout', () => {
+    function topupFixture() {
+        const f = fixture();
+        f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        return f;
+    }
+
+    it('creates and reuses the authenticated customer for embedded payment on any plan', async () => {
+        const f = topupFixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        const input = { sku: 'ai_pack_100_v2' };
+        await expect(f.caller.createTopupCheckout(input)).resolves.toEqual({
+            sessionId: session.id, clientSecret: 'cs_fixture_secret_fixture', publishableKey: 'pk_test_fixture' });
+        await f.caller.createTopupCheckout(input);
+        expect(f.stripe.createCustomer).toHaveBeenCalledTimes(1);
+        expect(f.stripe.createCustomer).toHaveBeenCalledWith({ userId, email: 'fixture@example.org', idempotencyKey: `customer:${userId}` });
+        expect(f.store.linkCustomer).toHaveBeenCalledWith(userId, 'cus_fixture');
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({
+            customerId: 'cus_fixture', userId, sku: input.sku, uiMode: 'embedded', adaptivePricing: false,
+            returnUrl: 'https://os.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}' }));
+        const calls = f.stripe.createCheckoutSession.mock.calls;
+        expect(calls[0]![0].idempotencyKey).not.toBe(calls[1]![0].idempotencyKey);
+    });
+
+    it.each(['unknown', 'ai_pack_10_v1', 'ai_pack_25_v1', 'ai_custom_v2', sku])('refuses unknown or unsellable pack %s', async sku => {
+        const f = topupFixture();
+        await expect(f.caller.createTopupCheckout({ sku })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('refuses a pack with an ineligible credit policy', async () => {
+        const f = topupFixture();
+        vi.spyOn(catalog, 'aiPackCheckoutEligible').mockReturnValue(false);
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_100_v2' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it.each(['flag', 'secret', 'client', 'publishableKey'] as const)('uses the existing disabled error without %s', async missing => {
+        const f = topupFixture();
+        if (missing === 'flag') f.deps.config.checkoutEnabled = false;
+        if (missing === 'secret') f.deps.config.stripeSecret = undefined;
+        if (missing === 'client') f.deps.stripe = null;
+        if (missing === 'publishableKey') f.deps.config.stripePublishableKey = undefined;
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_100_v2' })).rejects.toMatchObject({
+            code: 'PRECONDITION_FAILED', message: 'billing_not_configured' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('requires authentication before creating a top-up', async () => {
+        const f = topupFixture();
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).createTopupCheckout({ sku: 'ai_pack_100_v2' }))
+            .rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+    });
+
+    it('refuses a conflicting customer and a missing embedded secret', async () => {
+        const f = topupFixture();
+        f.store.linkCustomer.mockResolvedValueOnce('conflict');
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_100_v2' })).rejects.toMatchObject({ code: 'CONFLICT', message: 'customer_conflict' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        f.stripe.createCheckoutSession.mockResolvedValueOnce({ id: session.id, url: null, clientSecret: null });
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_100_v2' })).rejects.toMatchObject({ message: 'stripe_unavailable' });
+    });
+
+    it.each([1000, 1200, 1000000])('accepts custom whole-dollar amount %i', async customAmountCents => {
+        const f = topupFixture();
+        await f.caller.createTopupCheckout({ customAmountCents });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku: 'ai_custom_v2', customAmountCents }));
+    });
+
+    it.each([0, -100, 900, 999, 1001, 1050, 1000.5, 1000001, 1000100])('refuses invalid custom amount %i', async customAmountCents => {
+        const f = topupFixture();
+        await expect(f.caller.createTopupCheckout({ customAmountCents })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('requires exactly one of sku or custom amount', async () => {
+        const f = topupFixture();
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_100_v2', customAmountCents: 1000 })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it.each([{ sku: 'ai_pack_100_v2' }, { customAmountCents: 2500 }])('fulfils the created checkout through Stripe events exactly once: %j', async input => {
+        const f = topupFixture();
+        const pack = input.sku ? catalog.findPack(input.sku)! : catalog.customTopupPack(input.customAmountCents!)!;
+        let paidSession: Record<string, unknown> = {};
+        let form = new URLSearchParams();
+        const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+            if (String(url).endsWith('/customers')) return Response.json({ id: 'cus_fixture' });
+            if (init?.method === 'POST') {
+                form = new URLSearchParams(String(init.body));
+                paidSession = { id: session.id, customer: form.get('customer'), client_reference_id: form.get('client_reference_id'),
+                    mode: form.get('mode'), status: 'complete', payment_status: 'paid', payment_intent: 'pi_fixture',
+                    amount_total: Number(form.get('line_items[0][price_data][unit_amount]')), currency: 'usd',
+                    metadata: { sku: form.get('metadata[sku]'), credits: form.get('metadata[credits]') } };
+                return Response.json({ id: session.id, client_secret: 'cs_fixture_secret_fixture' });
+            }
+            return Response.json(paidSession);
+        });
+        const stripe = createStripeClient({ secretKey: 'sk_test_fixture', fetch: fetcher });
+        f.deps.stripe = stripe;
+        const receipts: Parameters<AiTopupReceiptStore['recordAiTopup']>[1][] = [];
+        const grants: Parameters<AiTopupReceiptStore['recordAiTopup']>[0][] = [];
+        const recordAiTopup = vi.fn<AiTopupReceiptStore['recordAiTopup']>(async (grant, receipt) => {
+            grants.push(grant); receipts.push(receipt); return 'applied';
+        });
+        const store = Object.assign(f.store, {
+            aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>(async () => receipts[0] ?? null), recordAiTopup,
+        });
+        await expect(f.caller.createTopupCheckout(input)).resolves.toEqual({
+            sessionId: session.id, clientSecret: 'cs_fixture_secret_fixture', publishableKey: 'pk_test_fixture' });
+        expect(form.get('mode')).toBe('payment');
+        expect(form.get('ui_mode')).toBe('embedded_page');
+        expect(form.get('return_url')).toBe('https://os.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}');
+        expect(form.get('line_items[0][price_data][unit_amount]')).toBe(String(pack.totalCents));
+        expect(form.get('metadata[sku]')).toBe(pack.sku);
+        expect(form.get('payment_intent_data[metadata][sku]')).toBe(pack.sku);
+        const event = { id: 'evt_topup', type: 'checkout.session.completed', created: now.getTime() / 1000,
+            livemode: false, data: { object: paidSession } };
+        const deps = { store, stripe, now: () => now };
+        expect(await processStripeEvent(event, deps)).toBe('applied');
+        expect(await processStripeEvent({ ...event, id: 'evt_async', type: 'checkout.session.async_payment_succeeded' }, deps)).toBe('applied');
+        expect(recordAiTopup).toHaveBeenCalledTimes(1);
+        expect(grants).toEqual([expect.objectContaining({ userId, kind: 'topup', meter: 'ai_usd_micro',
+            amount: BigInt(pack.creditCents) * BigInt(10000), sourceType: 'payment_intent', sourceId: 'pi_fixture' })]);
+        expect(receipts).toEqual([expect.objectContaining({ kind: 'ai_grant',
+            eventKey: `ezil-os:v1:topup:${pack.sku}:pi_fixture:grant`, payload: expect.objectContaining({ credits: pack.aiCredits }) })]);
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
     });
 });
 

@@ -4,7 +4,7 @@
  * effect; stable ledger/outbox keys let a retry finish an interrupted delivery.
  */
 import { schedulePaidMigration } from '../lib/compute/provider-migrate-orchestrator';
-import { findPack, PRO_PLAN } from './catalog';
+import { CUSTOM_TOPUP_SKU, customTopupPack, findPack, PRO_PLAN } from './catalog';
 import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, UsageEvent } from './ports';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
@@ -248,7 +248,11 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
         case 'topup_paid': {
             const session = await stripe.retrieveCheckoutSession(action.sessionId);
             if (session.mode !== 'payment' || session.paymentStatus !== 'paid') return 'ignored';
-            const pack = session.sku === null ? undefined : findPack(session.sku);
+            const custom = session.sku === CUSTOM_TOPUP_SKU;
+            const pack = custom ? customTopupPack(session.amountTotal ?? NaN)
+                : session.sku === null ? undefined : findPack(session.sku);
+            if (custom && (!pack || session.currency !== 'usd')) return 'review:invalid_custom_amount';
+            if (custom && session.metadataCredits !== String(pack!.aiCredits)) return 'review:custom_credits_mismatch';
             if (pack === undefined) return 'review:unknown_sku';
             if (session.customer === null) return 'unattributed:customer';
             const userId = await store.userForStripeCustomer(session.customer);

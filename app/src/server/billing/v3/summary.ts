@@ -1,4 +1,4 @@
-import { storageCapBytes } from '../catalog';
+import { AI_PACKS, aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
 import { storageState } from '../meters';
 import type { GrantRow } from '../ports';
@@ -97,11 +97,14 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable' },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
         storage: { usedBytes: usedBytes.toString(), capBytes: capBytes.toString(), state: storage === 'over_cap' ? 'exhausted' : storage },
-        actions: { checkout: enabled && plan.family === 'free',
+        actions: { checkout: enabled && plan.family === 'free', topup: enabled && AI_PACKS.some(aiPackCheckoutEligible),
             upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: enabled && input.hasCustomer },
-        catalog: { version: CATALOG_V3_VERSION, offers: publicOffers() },
+        catalog: { version: CATALOG_V3_VERSION, offers: publicOffers(),
+            packs: AI_PACKS.filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
+                sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),
+            customTopup: { ...CUSTOM_TOPUP } },
     };
 }

@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import * as catalog from '../catalog';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
 import { buildSummaryV3, usedSecondsInWindow } from './summary';
@@ -25,6 +26,31 @@ function sessions(hours: number, size: 'std-2' | 'cmp-8'): Input['epochs'] {
 }
 
 describe('v3 summary', () => {
+    it.each([undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const)('offers top-ups independently of subscription checkout for %s', sku => {
+        const summary = buildSummaryV3(input(sku));
+        expect(summary.actions.topup).toBe(true);
+        expect(summary.catalog.packs).toEqual([
+            { sku: 'ai_pack_100_v2', aiCredits: 1000, creditCents: 10000, discountPercent: 20, totalCents: 8000, currency: 'usd' },
+            { sku: 'ai_pack_500_v2', aiCredits: 5000, creditCents: 50000, discountPercent: 30, totalCents: 35000, currency: 'usd' },
+            { sku: 'ai_pack_1000_v2', aiCredits: 10000, creditCents: 100000, discountPercent: 30, totalCents: 70000, currency: 'usd' },
+            { sku: 'ai_pack_2000_v2', aiCredits: 20000, creditCents: 200000, discountPercent: 40, totalCents: 120000, currency: 'usd' },
+        ]);
+        expect(summary.catalog.customTopup).toEqual({ minCents: 1000, maxCents: 1000000, centsPerCredit: 10 });
+    });
+    it.each(['flag', 'secret'] as const)('disables top-ups without the checkout %s', missing => {
+        const args = input();
+        if (missing === 'flag') args.config.checkoutEnabled = false;
+        else args.config.stripeSecret = undefined;
+        expect(buildSummaryV3(args).actions).toMatchObject({ checkout: false, topup: false });
+    });
+    it('requires at least one eligible pack to offer top-ups', () => {
+        const eligible = vi.spyOn(catalog, 'aiPackCheckoutEligible').mockReturnValue(false);
+        try {
+            const summary = buildSummaryV3(input());
+            expect(summary.actions).toMatchObject({ checkout: true, topup: false });
+            expect(summary.catalog.packs).toEqual([]);
+        } finally { eligible.mockRestore(); }
+    });
     it.each([[100, 400, 'near'], [125, 500, 'paused']] as const)(
         '%s hours at cmp-8 uses %s standard-hours and is %s', (hours, standardHours, status) => {
             const args = input('premium_monthly_v3');

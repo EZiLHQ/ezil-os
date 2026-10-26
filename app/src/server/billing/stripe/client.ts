@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 
-import { aiPackCheckoutEligible, findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP_SKU, customTopupPack, findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
 import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult } from '../ports';
 import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offerBySku } from '../v3/catalog';
 import { CATALOG_V3 } from '../v3/contract';
@@ -45,7 +45,7 @@ export class BillingProviderError extends Error {
 type FormValue = string | number | boolean | undefined | FormValue[] | { [key: string]: FormValue };
 type FormFields = { [key: string]: FormValue };
 type StripeReference = string | { id: string } | null;
-type Metadata = { sku?: string; kind?: string };
+type Metadata = { sku?: string; kind?: string; credits?: string };
 type Price = { id: string; lookup_key?: string | null; active?: boolean; unit_amount?: number | null; currency?: string; recurring?: object | null };
 
 interface SubscriptionItem {
@@ -121,6 +121,8 @@ interface CheckoutResponse {
     payment_status: StripeCheckoutSession['paymentStatus'];
     payment_intent?: StripeReference;
     metadata?: Metadata | null;
+    amount_total?: number | null;
+    currency?: string | null;
 }
 
 interface ChargeResponse {
@@ -441,7 +443,7 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         },
 
         async createCheckoutSession(input) {
-            const pack = findPack(input.sku);
+            const pack = input.sku === CUSTOM_TOPUP_SKU ? customTopupPack(input.customAmountCents ?? NaN) : findPack(input.sku);
             // Refuse purchases we cannot fund, before price lookup or any Stripe request.
             if (pack !== undefined && !aiPackCheckoutEligible(pack)) {
                 throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'pack_credits_unset' });
@@ -450,10 +452,12 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             const lookupKey = offer?.sellable ? offer.stripeLookupKey : null;
             if (input.sku !== PRO_PLAN.sku && !lookupKey && pack === undefined) throw new Error('Unknown billing SKU');
 
+            const metadata = { sku: input.sku,
+                ...(input.sku === CUSTOM_TOPUP_SKU ? { credits: String(pack!.aiCredits) } : {}) };
             const fields: FormFields = {
                 customer: input.customerId,
                 client_reference_id: input.userId,
-                metadata: { sku: input.sku },
+                metadata,
                 // As merchant of record, Stripe controls tax, currency and
                 // payment methods and rejects the corresponding seller fields.
                 ...(input.managedPayments ? {
@@ -506,22 +510,22 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 fields.subscription_data = { metadata: { sku: PRO_PLAN.sku } };
             } else if (pack !== undefined) {
                 fields.mode = 'payment';
-                fields.line_items = [
+                fields.line_items = (pack.serviceFeeCents ? [
                     { name: 'AI credits', amount: pack.creditCents },
                     { name: 'Service fee', amount: pack.serviceFeeCents },
-                ].map(item => ({
+                ] : [{ name: 'AI credits', amount: pack.totalCents }]).map(item => ({
                     quantity: 1,
                     price_data: {
                         currency: 'usd',
                         unit_amount: item.amount,
-                        tax_behavior: 'exclusive',
+                        tax_behavior: pack.serviceFeeCents ? 'exclusive' : 'inclusive',
                         product_data: {
                             name: item.name,
                             ...(input.managedPayments ? { tax_code: MANAGED_PAYMENTS_TAX_CODE } : {}),
                         },
                     },
                 }));
-                fields.payment_intent_data = { metadata: { sku: pack.sku } };
+                fields.payment_intent_data = { metadata };
             }
             const session = await request<{ id: string; url?: string | null; client_secret?: string | null }>(
                 '/checkout/sessions', fields, input.idempotencyKey,
@@ -650,6 +654,9 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 paymentStatus: session.payment_status,
                 paymentIntentId: referenceId(session.payment_intent),
                 sku: session.metadata?.sku ?? null,
+                amountTotal: session.amount_total ?? null,
+                currency: session.currency ?? null,
+                metadataCredits: session.metadata?.credits ?? null,
             };
         },
 

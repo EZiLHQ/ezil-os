@@ -180,7 +180,8 @@ describe('billing summary wire contract', () => {
         // Contract §5.1: the portal is for a Pro or past-due plan only — a Free
         // user with checkout available has nothing to manage yet.
         expect(enabled.actions.portal).toBe(false);
-        expect(enabled.actions.topup).toBe(false);
+        // Founder 2026-10-26: AI top-up packs are sold wherever checkout is available.
+        expect(enabled.actions.topup).toBe(true);
         const pro = summary({ config: readBillingConfig({ ...keys, BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1' }), subs: [subscription()] });
         expect(pro.actions.portal).toBe(true);
     });

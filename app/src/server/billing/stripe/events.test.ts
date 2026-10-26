@@ -38,6 +38,15 @@ const link: BillingAction = {
 const paid: BillingAction = {
     type: 'topup_paid', paymentIntentId: 'pi_fixture', customerId: 'cus_fixture', sessionId: 'cs_fixture', eventId,
 };
+
+it.each(['checkout.session.completed', 'checkout.session.async_payment_succeeded'])(
+    'routes custom %s through the verified-session top-up action', type => {
+        const actions = planStripeEvent(event(type, { ...checkout, amount_total: 2500,
+            metadata: { sku: 'ai_custom_v2', credits: '250', user_id: 'untrusted' } }));
+        expect(actions).toEqual(type === 'checkout.session.completed' ? [link, paid] : [paid]);
+        expect(actions.find(action => action.type === 'topup_paid')).not.toHaveProperty('credits');
+    },
+);
 const grant: BillingAction = {
     type: 'grant_period', invoiceId: 'in_fixture', subscriptionId: 'sub_fixture',
     customerId: 'cus_fixture', periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000), eventId,

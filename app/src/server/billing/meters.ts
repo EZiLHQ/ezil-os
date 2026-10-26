@@ -1,5 +1,6 @@
 import {
     AI_PACKS,
+    aiPackCheckoutEligible,
     CATALOG_VERSION,
     catalogPro,
     storageCapBytes,
@@ -197,7 +198,7 @@ export function buildSummary(input: {
         actions: {
             checkout,
             portal: checkout && (resolved.plan === 'pro' || resolved.status === 'past_due'),
-            topup: false,
+            topup: checkout && AI_PACKS.some(aiPackCheckoutEligible),
         },
         catalog: {
             pro: catalogPro(),

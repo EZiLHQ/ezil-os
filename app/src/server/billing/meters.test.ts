@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AI_PACKS, catalogPro, PRO_PLAN } from './catalog';
+import * as catalog from './catalog';
 import { readBillingConfig } from './config';
 import {
     buildSummary,
@@ -300,7 +301,7 @@ describe('buildSummary', () => {
             catalog: { pro: catalogPro(), packs: AI_PACKS },
         });
         expect(summary({ config: readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' }), subs: [subscription()] }).actions)
-            .toEqual({ checkout: true, portal: true, topup: false });
+            .toEqual({ checkout: true, portal: true, topup: true });
     });
 
     it.each([
@@ -371,16 +372,16 @@ describe('buildSummary', () => {
         ]) {
             const result = summary({ config, subs: [subscription({ status })] });
             const enabled = config.checkoutEnabled && config.stripeSecret !== undefined;
-            expect(result.actions).toEqual({ checkout: enabled, portal: enabled && status !== 'canceled', topup: false });
+            expect(result.actions).toEqual({ checkout: enabled, portal: enabled && status !== 'canceled', topup: enabled });
             expect(result.catalog.packs).toEqual(AI_PACKS);
         }
     });
 
     it('offers checkout to Free and the portal to a canceling Pro subscription', () => {
         const config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' });
-        expect(summary({ config }).actions).toEqual({ checkout: true, portal: false, topup: false });
+        expect(summary({ config }).actions).toEqual({ checkout: true, portal: false, topup: true });
         const result = summary({ config, subs: [subscription({ cancelAtPeriodEnd: true })] });
-        expect(result.actions).toEqual({ checkout: true, portal: true, topup: false });
+        expect(result.actions).toEqual({ checkout: true, portal: true, topup: true });
         expect(result.plan.cancelsAt).toBe(PERIOD_END.toISOString());
         expect(result.plan.renewsAt).toBeNull();
         expect(summary({ subs: [subscription()] }).plan.renewsAt).toBe(PERIOD_END.toISOString());
@@ -402,9 +403,18 @@ describe('buildSummary', () => {
             state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null,
         });
         expect(result.actions.checkout).toBe(true);
-        expect(result.actions.topup).toBe(false);
+        expect(result.actions.topup).toBe(true);
         expect(result.catalog).toEqual({ pro: catalogPro(), packs: AI_PACKS });
     });
+});
+
+it('requires an eligible pack as well as checkout availability for legacy top-ups', () => {
+    const config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' });
+    expect(summary({ config }).actions.topup).toBe(true);
+    const eligible = vi.spyOn(catalog, 'aiPackCheckoutEligible').mockReturnValue(false);
+    try {
+        expect(summary({ config }).actions).toMatchObject({ checkout: true, topup: false });
+    } finally { eligible.mockRestore(); }
 });
 
 describe('open intervals that stopped heartbeating', () => {

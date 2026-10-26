@@ -199,8 +199,13 @@ export interface BillingSummaryV3 {
     };
     fairUse: { status: FairUseStatus; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
-    actions: { checkout: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean };
-    catalog: { version: typeof CATALOG_V3_VERSION; offers: PublicOfferV3[] };
+    actions: { checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean };
+    catalog: {
+        version: typeof CATALOG_V3_VERSION;
+        offers: PublicOfferV3[];
+        packs: { sku: string; aiCredits: number; creditCents: number; discountPercent: number; totalCents: number; currency: 'usd' }[];
+        customTopup: { minCents: 1000; maxCents: 1000000; centsPerCredit: 10 };
+    };
 }
 
 export type BillingSummaryV3Result = BillingSummaryV3 | { enabled: false };
@@ -229,7 +234,7 @@ export interface PublicOfferV3 {
  *  scheduleDowngrade({toSku:'standard_monthly_v3'}), cancelAtPeriodEnd, history, portal, checkoutStatus.
  *  Input/output shapes otherwise as v2 (PreviewUpgradeOutput etc. with toSku widened). No overage, no selectSize. */
 export const ROUTER_V3_PROCEDURES = [
-    'summary', 'createCheckout', 'previewUpgrade', 'confirmUpgrade', 'scheduleDowngrade', 'cancelAtPeriodEnd',
+    'summary', 'createCheckout', 'createTopupCheckout', 'previewUpgrade', 'confirmUpgrade', 'scheduleDowngrade', 'cancelAtPeriodEnd',
     'history', 'portal', 'checkoutStatus',
 ] as const;
 

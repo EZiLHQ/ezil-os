@@ -2,6 +2,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
+import { AI_PACKS, aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
 import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
@@ -210,6 +211,40 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             }
             if (!session.url) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
             return { mode: 'redirect', sessionId: session.id, url: session.url };
+        }),
+
+        createTopupCheckout: protectedProcedure.input(z.union([
+            z.object({ sku: z.string() }).strict(),
+            z.object({ customAmountCents: z.number().int().min(CUSTOM_TOPUP.minCents).max(CUSTOM_TOPUP.maxCents).multipleOf(100) }).strict(),
+        ])).mutation(async ({ ctx, input }): Promise<{ sessionId: string; clientSecret: string; publishableKey: string }> => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            const publishableKey = deps.config.stripePublishableKey;
+            if (!publishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+            const pack = 'sku' in input ? AI_PACKS.find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
+            if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+
+            let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
+            if (!customerId) {
+                const customer = await stripeCall(() => stripe.createCustomer({
+                    userId: ctx.user.id, email: ctx.user.email ?? null, idempotencyKey: `customer:${ctx.user.id}`,
+                }));
+                const linked = await deps.store.linkCustomer(ctx.user.id, customer.id);
+                if (linked === 'conflict') throw billingError('customer_conflict', 'CONFLICT');
+                customerId = customer.id;
+            }
+            const origin = billingReturnOrigin(ctx.headers);
+            const returnUrl = `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`;
+            const session = await stripeCall(() => stripe.createCheckoutSession({
+                customerId, userId: ctx.user.id, sku: pack.sku,
+                ...('customAmountCents' in input ? { customAmountCents: input.customAmountCents } : {}),
+                uiMode: 'embedded', automaticTax: deps.config.automaticTaxEnabled, adaptivePricing: false,
+                managedPayments: deps.config.managedPaymentsEnabled,
+                returnUrl, successUrl: returnUrl, cancelUrl: `${origin}/os`,
+                idempotencyKey: `checkout:${ctx.user.id}:${pack.sku}:${crypto.randomUUID()}`,
+            }));
+            if (!session.clientSecret) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
+            return { sessionId: session.id, clientSecret: session.clientSecret, publishableKey };
         }),
 
         previewUpgrade: protectedProcedure.input(z.object({ toSku: z.string() }))

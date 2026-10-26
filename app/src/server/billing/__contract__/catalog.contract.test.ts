@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
     AI_PACKS, CATALOG_VERSION, FREE_PLAN, PRO_PLAN, catalogPro,
-    findPack, aiPackCheckoutEligible, serviceFeeCents, storageCapBytes, workspaceAllowanceSeconds,
+    findPack, aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack, serviceFeeCents, storageCapBytes, workspaceAllowanceSeconds,
 } from '../catalog';
 import { checkoutAvailable, readBillingConfig } from '../config';
 
@@ -27,24 +27,43 @@ describe('billing catalog contract', () => {
         expect((total - 1) * 0.951 - 30).toBeLessThan(credit);
     });
 
-    it('lists both packs with face value, flat service fee and total', () => {
+    it('offers the founder v2 credit packs at the exact discounted USD prices', () => {
         expect(AI_PACKS).toEqual([
-            { sku: 'ai_pack_10_v1', aiCredits: null, creditCents: 1000, serviceFeeCents: 84, totalCents: 1084 },
-            { sku: 'ai_pack_25_v1', aiCredits: null, creditCents: 2500, serviceFeeCents: 161, totalCents: 2661 },
+            { sku: 'ai_pack_100_v2', aiCredits: 1000, creditCents: 10000, discountPercent: 20, serviceFeeCents: 0, totalCents: 8000 },
+            { sku: 'ai_pack_500_v2', aiCredits: 5000, creditCents: 50000, discountPercent: 30, serviceFeeCents: 0, totalCents: 35000 },
+            { sku: 'ai_pack_1000_v2', aiCredits: 10000, creditCents: 100000, discountPercent: 30, serviceFeeCents: 0, totalCents: 70000 },
+            { sku: 'ai_pack_2000_v2', aiCredits: 20000, creditCents: 200000, discountPercent: 40, serviceFeeCents: 0, totalCents: 120000 },
         ]);
-        expect(findPack('ai_pack_10_v1')).toEqual(AI_PACKS[0]);
-        expect(findPack('ai_pack_25_v1')).toEqual(AI_PACKS[1]);
+        expect(AI_PACKS.every(aiPackCheckoutEligible)).toBe(true);
+        for (const pack of AI_PACKS) expect(findPack(pack.sku)).toEqual(pack);
+    });
+
+    it('resolves historical v1 prices for fulfilment and refunds without offering them', () => {
+        expect(findPack('ai_pack_10_v1')).toEqual({ sku: 'ai_pack_10_v1', aiCredits: null,
+            creditCents: 1000, discountPercent: 0, serviceFeeCents: 84, totalCents: 1084 });
+        expect(findPack('ai_pack_25_v1')).toEqual({ sku: 'ai_pack_25_v1', aiCredits: null,
+            creditCents: 2500, discountPercent: 0, serviceFeeCents: 161, totalCents: 2661 });
+        expect(AI_PACKS.some(pack => pack.sku.endsWith('_v1'))).toBe(false);
+        expect(aiPackCheckoutEligible(findPack('ai_pack_10_v1'))).toBe(false);
         expect(findPack('unrecognised_sku')).toBeUndefined();
-        expect(AI_PACKS.every(pack => !aiPackCheckoutEligible(pack))).toBe(true);
+    });
+
+    it.each([1000, 1200, 1000000])('prices custom %i cents at ten cents per credit without a fee or discount', amount => {
+        expect(CUSTOM_TOPUP).toEqual({ minCents: 1000, maxCents: 1000000, centsPerCredit: 10 });
+        expect(customTopupPack(amount)).toEqual({ sku: 'ai_custom_v2', aiCredits: amount / 10,
+            creditCents: amount, discountPercent: 0, serviceFeeCents: 0, totalCents: amount });
+    });
+    it.each([0, -100, 900, 999, 1001, 1050, 1000.5, 1000001, 1000100, NaN, Infinity])('refuses invalid custom amount %s', amount => {
+        expect(customTopupPack(amount)).toBeUndefined();
     });
 
     it.each([null, undefined, 0, -1, 1.5, 1_000_001, NaN, Infinity])('refuses an unset or invalid pack credit policy %s', aiCredits => {
         expect(aiPackCheckoutEligible({ ...AI_PACKS[0]!, aiCredits: aiCredits as number | null })).toBe(false);
     });
-    it('allows an explicit whole-credit fixture policy without changing prices or live packs', () => {
+    it('allows explicit whole-credit policy and refuses a missing pack', () => {
         expect(aiPackCheckoutEligible({ ...AI_PACKS[0]!, aiCredits: 1234 })).toBe(true);
         expect(aiPackCheckoutEligible(undefined)).toBe(false);
-        expect(AI_PACKS[0]!.aiCredits).toBeNull();
+        expect(AI_PACKS[0]!.aiCredits).toBe(1000);
     });
 
     it('raises only Pro storage and only after the large-storage gate', () => {

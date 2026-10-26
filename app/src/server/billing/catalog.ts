@@ -1,9 +1,8 @@
 import type { CatalogPack, CatalogPro } from './types';
 
 /**
- * Billing catalog, version 1 — the pilot offer recorded in
- * `docs/billing/CONTRACT.md` §2. Prices and allowances come ONLY from here;
- * a client-supplied amount is never read.
+ * Legacy plan catalog and versioned AI packs. Prices and allowances come from
+ * here; custom top-ups accept only bounded whole-dollar amounts.
  *
  * These are pilot terms. Changing one is a new catalog version, never an
  * in-place edit of a SKU that customers already bought.
@@ -60,13 +59,30 @@ export function serviceFeeCents(creditCents: number): number {
 
 function pack(sku: string, creditCents: number): CatalogPack {
     const fee = serviceFeeCents(creditCents);
-    return { sku, aiCredits: null, creditCents, serviceFeeCents: fee, totalCents: creditCents + fee };
+    return { sku, aiCredits: null, creditCents, discountPercent: 0, serviceFeeCents: fee, totalCents: creditCents + fee };
 }
 
-export const AI_PACKS: readonly CatalogPack[] = Object.freeze([
+const LEGACY_AI_PACKS: readonly CatalogPack[] = Object.freeze([
     pack('ai_pack_10_v1', 1000),
     pack('ai_pack_25_v1', 2500),
 ]);
+
+export const AI_PACKS: readonly CatalogPack[] = Object.freeze([
+    { sku: 'ai_pack_100_v2', aiCredits: 1000, creditCents: 10_000, discountPercent: 20, serviceFeeCents: 0, totalCents: 8000 },
+    { sku: 'ai_pack_500_v2', aiCredits: 5000, creditCents: 50_000, discountPercent: 30, serviceFeeCents: 0, totalCents: 35_000 },
+    { sku: 'ai_pack_1000_v2', aiCredits: 10_000, creditCents: 100_000, discountPercent: 30, serviceFeeCents: 0, totalCents: 70_000 },
+    { sku: 'ai_pack_2000_v2', aiCredits: 20_000, creditCents: 200_000, discountPercent: 40, serviceFeeCents: 0, totalCents: 120_000 },
+]);
+
+export const CUSTOM_TOPUP = Object.freeze({ minCents: 1000, maxCents: 1_000_000, centsPerCredit: 10 } as const);
+export const CUSTOM_TOPUP_SKU = 'ai_custom_v2';
+
+export function customTopupPack(amountCents: number): CatalogPack | undefined {
+    if (!Number.isSafeInteger(amountCents) || amountCents % 100 !== 0
+        || amountCents < CUSTOM_TOPUP.minCents || amountCents > CUSTOM_TOPUP.maxCents) return undefined;
+    return { sku: CUSTOM_TOPUP_SKU, aiCredits: amountCents / CUSTOM_TOPUP.centsPerCredit,
+        creditCents: amountCents, discountPercent: 0, serviceFeeCents: 0, totalCents: amountCents };
+}
 
 export function catalogPro(): CatalogPro {
     return {
@@ -78,7 +94,7 @@ export function catalogPro(): CatalogPro {
 }
 
 export function findPack(sku: string): CatalogPack | undefined {
-    return AI_PACKS.find(p => p.sku === sku);
+    return AI_PACKS.find(p => p.sku === sku) ?? LEGACY_AI_PACKS.find(p => p.sku === sku);
 }
 
 /** Additional purchase gate: callers must also check their existing checkout flags. */

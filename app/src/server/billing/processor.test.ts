@@ -357,11 +357,12 @@ async function seedTopup(store: MemoryStore) {
 }
 
 afterEach(() => vi.restoreAllMocks());
-// Explicit test-only policy values, unrelated to any USD conversion. Shipped packs stay null.
+// Historical test-only policies preserve coverage of immutable v1 receipts.
+const findPack = catalog.findPack;
 beforeEach(() => {
     vi.spyOn(catalog, 'findPack').mockImplementation(sku => {
-        const pack = catalog.AI_PACKS.find(value => value.sku === sku);
-        return pack ? { ...pack, aiCredits: sku === 'ai_pack_10_v1' ? 1234 : 5678 } : undefined;
+        const pack = findPack(sku);
+        return pack?.sku.endsWith('_v1') ? { ...pack, aiCredits: sku === 'ai_pack_10_v1' ? 1234 : 5678 } : pack;
     });
 });
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
@@ -543,12 +544,66 @@ describe('processStripeEvent', () => {
         expect(store.outbox.get('ezil-os:v1:topup:ai_pack_10_v1:pi_local:grant')?.payload.expiresAt).toBe('2025-02-28T12:00:00.000Z');
     });
 
-    it('records a review outcome and no funding when shipped pack policies are unset', async () => {
-        vi.mocked(catalog.findPack).mockImplementation(sku => catalog.AI_PACKS.find(value => value.sku === sku));
+    it('keeps historical v1 packs unfunded when their credit policy is unset', async () => {
+        vi.mocked(catalog.findPack).mockImplementation(findPack);
         const f = fixture();
         expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:pack_credits_unset');
         expect(f.store.outbox.size).toBe(0);
         expect(f.store.grants.size).toBe(0);
+    });
+
+    it.each([
+        ['ai_pack_100_v2', 1000, 10000], ['ai_pack_500_v2', 5000, 50000],
+        ['ai_pack_1000_v2', 10000, 100000], ['ai_pack_2000_v2', 20000, 200000],
+    ] as const)('funds the shipped founder pack %s exactly once', async (sku, credits, creditCents) => {
+        const f = fixture();
+        f.stripe.session.sku = sku;
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()]).toHaveLength(1);
+        expect([...f.store.grants.values()][0]).toMatchObject({ kind: 'topup', amount: BigInt(creditCents) * BigInt(10000) });
+        expect([...f.store.outbox.values()]).toHaveLength(1);
+        expect([...f.store.outbox.values()][0]).toMatchObject({ kind: 'ai_grant', payload: { credits, packSku: sku } });
+    });
+
+    it.each([1000, 12300, 1000000])('derives custom credits from verified amount %i and refunds the stored receipt', async amountTotal => {
+        const f = fixture();
+        Object.assign(f.stripe.session, { sku: 'ai_custom_v2', amountTotal, currency: 'usd', metadataCredits: String(amountTotal / 10) });
+        const paid = checkout(false);
+        Object.assign(paid.data.object, { amount_total: 99999999, metadata: { sku: 'ai_custom_v2', credits: '9999999' } });
+        expect(await processStripeEvent(paid, f.deps)).toBe('applied');
+        expect(await processStripeEvent(paid, f.deps)).toBe('applied');
+        expect([...f.store.grants.values()]).toHaveLength(1);
+        expect([...f.store.grants.values()][0]).toMatchObject({ kind: 'topup', amount: BigInt(amountTotal) * BigInt(10000) });
+        expect([...f.store.outbox.values()][0]).toMatchObject({
+            eventKey: 'ezil-os:v1:topup:ai_custom_v2:pi_local:grant', payload: { credits: amountTotal / 10 },
+        });
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()].find(item => item.kind === 'ai_revoke')?.payload.credits).toBe(amountTotal / 10);
+    });
+
+    it.each([undefined, null, '101', '100.0', '1000', ''])('refuses custom metadata credits %s that disagree with Stripe', async metadataCredits => {
+        const f = fixture();
+        Object.assign(f.stripe.session, { sku: 'ai_custom_v2', amountTotal: 1000, currency: 'usd', metadataCredits });
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:custom_credits_mismatch');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+    });
+
+    it.each([undefined, null, 0, 900, 1001, 1000.5, 1000100, NaN, Infinity])('refuses invalid verified custom amount %s', async amountTotal => {
+        const f = fixture();
+        Object.assign(f.stripe.session, { sku: 'ai_custom_v2', amountTotal, currency: 'usd', metadataCredits: '100' });
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:invalid_custom_amount');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+    });
+
+    it.each([undefined, null, 'eur'])('refuses custom fulfilment without verified USD (%s)', async currency => {
+        const f = fixture();
+        Object.assign(f.stripe.session, { sku: 'ai_custom_v2', amountTotal: 1000, currency, metadataCredits: '100' });
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:invalid_custom_amount');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
     });
     it('preserves first topup amount, expiry and account through later catalog changes, refund and replay', async () => {
         const f = fixture();

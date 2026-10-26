@@ -297,6 +297,10 @@ export interface StripeCheckoutSession {
     paymentIntentId: string | null;
     /** `metadata.sku` set by our own checkout. */
     sku: string | null;
+    /** Verified Stripe amount/currency and raw metadata for custom top-up reconciliation. */
+    amountTotal?: number | null;
+    currency?: string | null;
+    metadataCredits?: string | null;
 }
 
 export interface StripeCharge {
@@ -313,6 +317,7 @@ export interface CheckoutRequest {
     customerId: string;
     userId: string;
     sku: string;
+    customAmountCents?: number;
     /**
      * `embedded` (default for the OS): Stripe Embedded Checkout mounted in an
      * OS window — `ui_mode=embedded_page`, `return_url` = `returnUrl`,
