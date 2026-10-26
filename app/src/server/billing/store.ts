@@ -18,10 +18,10 @@ import {
     billingUsageIntervals,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
-import type { BillingStore, GrantKind, GrantMeter, GrantSource, StoredComputeEpoch } from './ports';
+import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, OutboxInsert, StoredComputeEpoch } from './ports';
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
-import { AI_CREDIT_PROTOCOL } from './ai-credits';
+import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
 
 type Database = typeof import('@/server/db').db;
 
@@ -49,7 +49,7 @@ function computeEpoch(row: BillingComputeEpochRow): StoredComputeEpoch {
  * SQL so concurrent deliveries obey the same rules as sequential retries.
  */
 export function createBillingStore(db: Database): BillingStore {
-    return {
+    const store: BillingStore & AiTopupReceiptStore & AiReversalStore = {
         async grantsForPeriod(userId, window, meters) {
             if (meters.length === 0) return [];
             const rows = await db.select().from(billingGrants).where(and(
@@ -433,6 +433,8 @@ export function createBillingStore(db: Database): BillingStore {
             if (inserted.length > 0) return 'new';
             const [row] = await db.select().from(billingEvents)
                 .where(eq(billingEvents.eventId, event.eventId)).limit(1);
+            if (!row) throw new Error('billing_receipt_unavailable');
+            if (row.payloadSha256 !== event.payloadSha256 || row.type !== event.type || row.livemode !== event.livemode) return 'conflict';
             // Failed attempts retain their receipt but must remain retryable.
             return row?.processedAt && !row.outcome?.startsWith('failed') ? 'processed' : 'unprocessed';
         },
@@ -486,6 +488,101 @@ export function createBillingStore(db: Database): BillingStore {
                 payload: row.payload as Record<string, unknown> }));
         },
 
+        async aiTopupReceipt(userId, paymentIntentId) {
+            const rows = await db.select().from(billingOutbox).where(and(
+                eq(billingOutbox.userId, userId), eq(billingOutbox.kind, 'ai_grant'),
+                sql`${billingOutbox.payload}->>'protocol' = ${AI_CREDIT_PROTOCOL}`,
+                sql`${billingOutbox.payload}->>'paymentIntentId' = ${paymentIntentId}`,
+            )).limit(2);
+            if (rows.length > 1) throw new Error('ai_topup_receipt_conflict');
+            const row = rows[0];
+            return row ? { eventKey: row.eventKey, userId: row.userId, kind: 'ai_grant',
+                payload: row.payload as Record<string, unknown> } : null;
+        },
+
+        async recordAiTopup(grant, receipt) {
+            if (grant.sourceType !== 'payment_intent' || grant.kind !== 'topup' || grant.meter !== 'ai_usd_micro'
+                || receipt.userId !== grant.userId || receipt.kind !== 'ai_grant'
+                || receipt.payload.protocol !== AI_CREDIT_PROTOCOL || receipt.payload.paymentIntentId !== grant.sourceId
+                || receipt.payload.amountUsdMicro !== grant.amount.toString()
+                || receipt.payload.expiresAt !== grant.periodEnd?.toISOString()) throw new Error('invalid_ai_topup_receipt');
+            return db.transaction(async tx => {
+                // Serialize by payment intent, including conflicting SKU/owner deliveries.
+                await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_topup:${grant.sourceId}`}, 0))`);
+                const [original] = await tx.select().from(billingGrants).where(and(
+                    eq(billingGrants.sourceType, 'payment_intent'), eq(billingGrants.sourceId, grant.sourceId),
+                    eq(billingGrants.kind, 'topup'), eq(billingGrants.meter, 'ai_usd_micro'),
+                )).limit(1);
+                const receipts = await tx.select().from(billingOutbox).where(and(
+                    eq(billingOutbox.kind, 'ai_grant'),
+                    sql`${billingOutbox.payload}->>'protocol' = ${AI_CREDIT_PROTOCOL}`,
+                    sql`${billingOutbox.payload}->>'paymentIntentId' = ${grant.sourceId}`,
+                )).limit(2);
+                if ((original && original.userId !== grant.userId) || receipts.some(row => row.userId !== grant.userId)) return 'review:customer_mismatch';
+                if (receipts.length > 1 || (receipts.length === 1 && !original)) throw new Error('ai_topup_receipt_conflict');
+                if (receipts.length === 1) return 'applied';
+                const [legacy] = await tx.select({ id: billingOutbox.id }).from(billingOutbox)
+                    .where(eq(billingOutbox.eventKey, `payment_intent:${grant.sourceId}:ai_topup`)).limit(1);
+                // This phase never converts or repairs historical dollar-only funding.
+                if (original || legacy) return 'review:legacy_topup_unfunded';
+                const inserted = await tx.insert(billingGrants).values(grant).onConflictDoNothing().returning({ id: billingGrants.id });
+                const queued = await tx.insert(billingOutbox).values(receipt).onConflictDoNothing().returning({ id: billingOutbox.id });
+                if (inserted.length !== 1 || queued.length !== 1) throw new Error('ai_topup_receipt_conflict');
+                return 'applied';
+            });
+        },
+
+        async recordAiReversal(input) {
+            return db.transaction(async tx => {
+                const causeType = input.action === 'revoke' ? 'refund' : 'dispute';
+                await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_cause:${causeType}:${input.causeId}`}, 0))`);
+                const roots = [...new Set(input.receipts.map(r => String(r.payload.entitlementId)))].sort();
+                for (const root of roots) {
+                    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_root:${root}`}, 0))`);
+                }
+                const [owner] = await tx.select().from(billingCustomers).where(eq(billingCustomers.stripeCustomerId, input.customerId));
+                if (owner?.userId !== input.userId) return 'review:customer_mismatch';
+                const original = input.originals[0];
+                if (!original || roots.length === 0) return 'review:restore_receipt_missing';
+                const originals = await tx.select().from(billingGrants).where(and(
+                    eq(billingGrants.sourceType, original.sourceType), eq(billingGrants.sourceId, original.sourceId),
+                ));
+                // No user predicate: a conflicting owner/root/D must be seen and refused.
+                const receipts = await tx.select().from(billingOutbox).where(and(
+                    sql`${billingOutbox.payload}->>'protocol' = ${AI_CREDIT_PROTOCOL}`,
+                    or(sql`${billingOutbox.payload}->>'entitlementId' in (${sql.join(roots.map(root => sql`${root}`), sql`, `)})`,
+                        and(sql`${billingOutbox.payload}->'reversal'->>'causeType' = ${causeType}`,
+                            sql`${billingOutbox.payload}->'reversal'->>'causeId' = ${input.causeId}`)),
+                ));
+                // Include every local cause bound to these roots, not just the incoming D/R.
+                // Root locks serialize different disputes/refunds against the same paid allowance.
+                const causes = new Map<string, { type: 'refund' | 'dispute'; id: string }>([
+                    [`${causeType}:${input.causeId}`, { type: causeType, id: input.causeId }],
+                ]);
+                for (const receipt of receipts) {
+                    const proof = (receipt.payload as Record<string, unknown>).reversal as { causeType?: unknown; causeId?: unknown } | undefined;
+                    if ((proof?.causeType === 'dispute' || proof?.causeType === 'refund') && typeof proof.causeId === 'string') {
+                        causes.set(`${proof.causeType}:${proof.causeId}`, { type: proof.causeType, id: proof.causeId });
+                    }
+                }
+                const corrections = await tx.select().from(billingGrants).where(or(...[...causes.values()].map(cause => and(
+                    eq(billingGrants.sourceType, cause.type), eq(billingGrants.sourceId, cause.id),
+                ))));
+                const plan = planAiReversal(input, { originals: originals as GrantRow[], corrections: corrections as GrantRow[],
+                    receipts: receipts.map(r => ({ ...r, kind: r.kind as OutboxInsert['kind'], payload: r.payload as Record<string, unknown> })) });
+                if (plan.outcome !== 'applied') return plan.outcome;
+                for (const grant of plan.grants) {
+                    const inserted = await tx.insert(billingGrants).values(grant).onConflictDoNothing().returning({ id: billingGrants.id });
+                    if (inserted.length !== 1) throw new Error('ai_reversal_receipt_conflict');
+                }
+                for (const item of plan.outbox) {
+                    const inserted = await tx.insert(billingOutbox).values(item).onConflictDoNothing().returning({ id: billingOutbox.id });
+                    if (inserted.length !== 1) throw new Error('ai_reversal_receipt_conflict');
+                }
+                return 'applied';
+            });
+        },
+
         async latestIntervalFor(computerId) {
             const [row] = await db.select({ endedAt: billingUsageIntervals.endedAt })
                 .from(billingUsageIntervals).where(eq(billingUsageIntervals.computerId, computerId))
@@ -527,4 +624,5 @@ export function createBillingStore(db: Database): BillingStore {
             return closed.length;
         },
     };
+    return store;
 }

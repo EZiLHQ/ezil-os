@@ -2,8 +2,10 @@ import { createHmac } from 'node:crypto';
 import type { AiCreditEntitlement } from './ai-credits';
 
 export const AI_GATEWAY_TIMEOUT_MS = 10_000;
-export type AiGatewayEvent = AiCreditEntitlement & { eventId: string; accountPublicId: string; action: 'grant' | 'revoke' };
-export type AiGatewayResult = { status: 'ok' } | { status: 'permanent' | 'retryable'; reason: string };
+export type AiGatewayEvent = AiCreditEntitlement & { eventId: string; accountPublicId: string; action: 'grant' | 'revoke' | 'restore' };
+export const AI_RESTORE_OUTCOMES = ['restored', 'already_restored', 'restore_refused_terminal', 'restore_expired', 'restore_nothing_forfeited'] as const;
+export type AiRestoreOutcome = typeof AI_RESTORE_OUTCOMES[number];
+export type AiGatewayResult = { status: 'ok'; outcome?: AiRestoreOutcome } | { status: 'permanent' | 'retryable' | 'review'; reason: string };
 export type AiLogger = (message: string, fields?: { entitlementId: string }) => void;
 
 export function signAiGatewayBody(secret: string, timestamp: string, rawBody: string): string {
@@ -35,10 +37,27 @@ export async function sendAiCreditEvent(input: {
                 method: 'POST', redirect: 'error', signal, headers: { 'Content-Type': 'application/json',
                     'X-EZiL-Timestamp': timestamp, 'X-EZiL-Signature': signAiGatewayBody(input.secret, timestamp, rawBody) }, body: rawBody,
             });
-            if (response.ok) return { status: 'ok' };
-            if (response.status === 409) {
+            if (response.ok) {
+                if (event.action !== 'restore') return { status: 'ok' };
                 const body = await response.json().catch(() => null);
-                if (body?.error?.code === 'event_conflict' || body?.code === 'event_conflict') {
+                if (body && body.ok !== false && AI_RESTORE_OUTCOMES.includes(body.outcome) && body.event_id === event.eventId) {
+                    return { status: 'ok', outcome: body.outcome as AiRestoreOutcome };
+                }
+                return { status: 'review', reason: 'restore_response_invalid' };
+            }
+            if (response.status === 409 || response.status === 404) {
+                const body = await response.json().catch(() => null);
+                const code = body?.error?.code ?? body?.code;
+                if (response.status === 404 && code === 'account_not_found') {
+                    return { status: 'retryable', reason: 'account_not_found' };
+                }
+                if (response.status === 409 && event.action === 'restore') {
+                    if (code === 'restore_hold_pending') return { status: 'retryable', reason: code };
+                    if (['restore_not_revoked', 'restore_mismatch', 'restore_review_required'].includes(code)) {
+                        return { status: 'review', reason: code };
+                    }
+                }
+                if (response.status === 409 && code === 'event_conflict') {
                     (input.log ?? console.warn)('[billing.ai] event_conflict', { entitlementId: event.entitlementId });
                     return { status: 'permanent', reason: 'event_conflict' };
                 }

@@ -262,7 +262,7 @@ describe('billing router', () => {
         f.deps.stripe = f.stripe;
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku });
         await expect(f.caller.history()).resolves.toEqual(history);
         expect(f.stripe.listInvoices).toHaveBeenCalledWith('cus_fixture', 12);
         expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
@@ -353,40 +353,61 @@ describe('billing router', () => {
         const f = fixture();
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, clientReferenceId: owner });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'unpaid', sku });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(1, session.id);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(2, session.id);
     });
 
     it.each(['open', 'complete', 'expired'] as const)('maps %s from a fresh Stripe read', async status => {
         const f = fixture();
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status, paymentStatus: 'paid' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: status === 'open' ? 'pending' : status });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: status === 'open' ? 'pending' : status, paymentStatus: 'unpaid', sku });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledWith(session.id);
     });
 
-    it('keeps a completed delayed payment pending until the actual payment succeeds, without granting', async () => {
+    it.each(['unpaid', 'paid', 'no_payment_required'] as const)('reports complete Checkout and %s independently without granting a plan', async paymentStatus => {
         const f = fixture();
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'unpaid' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
-        expect(f.store.insertGrant).not.toHaveBeenCalled();
-        expect(f.store.upsertSubscription).not.toHaveBeenCalled();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus, sku });
+        expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledExactlyOnceWith(session.id);
+        for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
     });
 
-    it('allows a complete receipt that requires no payment', async () => {
+    it.each([undefined, null, 'unexpected'])('does not infer payment when Stripe payment status is %s', async paymentStatus => {
         const f = fixture();
-        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'no_payment_required' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete' });
+        // Simulate an incomplete/unknown provider response at the runtime boundary.
+        const response = { ...session, status: 'complete', paymentStatus } as unknown as StripeCheckoutSession;
+        if (paymentStatus === undefined) delete (response as Partial<StripeCheckoutSession>).paymentStatus;
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(response);
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: null, sku });
+        for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
+    });
+
+    it.each(['standard_monthly_v3', 'premium_monthly_v3', 'compute_monthly_v2'])('returns the verified session SKU %s without looking up or granting a plan', async checkoutSku => {
+        const f = fixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid', sku: checkoutSku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: checkoutSku });
+        expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledExactlyOnceWith(session.id);
+        for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, null, '', '   ', 42, false, {}])('does not invent a target SKU for invalid session metadata %j', async checkoutSku => {
+        const f = fixture();
+        const response = { ...session, status: 'complete', paymentStatus: 'paid', sku: checkoutSku } as unknown as StripeCheckoutSession;
+        if (checkoutSku === undefined) delete (response as Partial<StripeCheckoutSession>).sku;
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(response);
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: null });
+        for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
     });
 
     it.each(['', 'cs_', 'pi_fixture', 'cs_bad/path', 'cs_bad?query'])('rejects malformed session id %s before reading Stripe', async sessionId => {
         const f = fixture();
         await expect(f.caller.checkoutStatus({ sessionId })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(0);
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(1);
     });
 
@@ -401,7 +422,7 @@ describe('billing router', () => {
         await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true });
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toMatchObject({ url: 'https://billing.example/portal' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku });
         await expect(f.caller.history()).resolves.toEqual(history);
     });
 

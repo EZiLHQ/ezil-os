@@ -16,6 +16,9 @@ import { DEFAULT_TOOL_RESERVE } from './gateway-messages';
 export const PROVIDER_TYPES = ['ezil-gateway', 'anthropic', 'anthropic-foundry', 'openai', 'azure-openai', 'openai-compatible'] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
 
+export type GatewayProtocol = 'anthropic-messages' | 'openai-responses';
+const GATEWAY_PROTOCOLS: readonly GatewayProtocol[] = ['anthropic-messages', 'openai-responses'];
+
 export const MODEL_ROLES = ['default', 'plan', 'utility', 'utilitySmall'] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
 
@@ -51,6 +54,8 @@ export type ModelConfig = {
     name?: string;
     provider: string;
     model: string;
+    /** Gateway wire protocol. Omitted legacy entries use Anthropic Messages. */
+    gatewayProtocol?: GatewayProtocol;
     family?: string;
     version?: string;
     tooltip?: string;
@@ -73,7 +78,7 @@ export type ModelConfig = {
 export type ModelsConfig = {
     providers: Record<string, ProviderConfig>;
     models: ModelConfig[];
-    defaults?: Partial<Omit<ModelConfig, 'id' | 'provider' | 'model' | 'default' | 'roles'>>;
+    defaults?: Partial<Omit<ModelConfig, 'id' | 'provider' | 'model' | 'gatewayProtocol' | 'default' | 'roles'>>;
 };
 
 export type ResolvedProvider = Required<Pick<ProviderConfig, 'type' | 'headers' | 'betas' | 'includeUsage'>> &
@@ -85,6 +90,7 @@ export type ResolvedModel = {
     providerName: string;
     provider: ResolvedProvider;
     model: string;
+    gatewayProtocol?: GatewayProtocol;
     family: string;
     version: string;
     tooltip?: string;
@@ -257,8 +263,12 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
         }
     }
 
-    const defaults = isRecord(raw.defaults) ? raw.defaults : {};
+    const defaults = isRecord(raw.defaults) ? { ...raw.defaults } : {};
     if (raw.defaults !== undefined && !isRecord(raw.defaults)) errors.push('"defaults" must be an object (ignored)');
+    if (defaults.gatewayProtocol !== undefined) {
+        errors.push('defaults.gatewayProtocol is not supported; set gatewayProtocol on each Gateway model (ignored)');
+        delete defaults.gatewayProtocol;
+    }
 
     const models: ResolvedModel[] = [];
     const seen = new Set<string>();
@@ -279,13 +289,19 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
             if (!outcome) { errors.push(`${where}.provider "${String(merged.provider)}" is not defined in "providers"`); return; }
             const provider = outcome.provider;
             if (typeof merged.model !== 'string' || !merged.model) { errors.push(`${where}.model (provider model id or deployment name) is required`); return; }
+            let gatewayProtocol: GatewayProtocol | undefined;
+            if (merged.gatewayProtocol !== undefined) {
+                if (!GATEWAY_PROTOCOLS.includes(merged.gatewayProtocol as GatewayProtocol)) problems.push(`${where}.gatewayProtocol must be one of ${GATEWAY_PROTOCOLS.join(', ')}`);
+                else if (provider.type !== 'ezil-gateway') problems.push(`${where}.gatewayProtocol is only supported for ezil-gateway providers`);
+                else gatewayProtocol = merged.gatewayProtocol as GatewayProtocol;
+            }
             const positiveInt = (value: unknown, field: string, fallback: number): number => {
                 if (value === undefined) return fallback;
                 if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) { problems.push(`${where}.${field} must be a positive integer`); return fallback; }
                 return value;
             };
             const gatewayOutput = () => {
-                const fallback = merged.model === 'us.moonshotai.kimi-k3' ? 4096 : 8192;
+                const fallback = gatewayProtocol !== 'openai-responses' && merged.model === 'us.moonshotai.kimi-k3' ? 4096 : 8192;
                 if (merged.maxOutputTokens === undefined) return fallback;
                 if (typeof merged.maxOutputTokens !== 'number' || !Number.isFinite(merged.maxOutputTokens)) {
                     problems.push(`${where}.maxOutputTokens must be finite`);
@@ -361,6 +377,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 providerName: provider.name,
                 provider,
                 model: merged.model,
+                gatewayProtocol,
                 family: typeof merged.family === 'string' ? merged.family : isAnthropic(provider.type) ? 'claude' : 'gpt',
                 version: typeof merged.version === 'string' ? merged.version : '1',
                 tooltip: typeof merged.tooltip === 'string' ? merged.tooltip : undefined,
@@ -373,7 +390,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 default: isDefault,
                 roles,
                 forcedToolChoice: provider.type === 'ezil-gateway' ? false : typeof merged.forcedToolChoice === 'boolean' ? merged.forcedToolChoice : supportsForcedToolChoice(merged.model),
-                stream: merged.model === 'us.moonshotai.kimi-k3' ? false : merged.stream !== false,
+                stream: gatewayProtocol !== 'openai-responses' && merged.model === 'us.moonshotai.kimi-k3' ? false : merged.stream !== false,
                 toolReserve: typeof merged.toolReserve === 'number' ? merged.toolReserve : DEFAULT_TOOL_RESERVE,
                 topP: typeof merged.topP === 'number' ? merged.topP : undefined,
                 temperature: typeof merged.temperature === 'number' ? merged.temperature : undefined,

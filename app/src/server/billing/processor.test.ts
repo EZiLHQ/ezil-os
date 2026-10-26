@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PRO_PLAN } from './catalog';
+import * as catalog from './catalog';
+import { planAiReversal, type AiReversalStore, type AiReversalReceipt, type AiTopupReceiptStore } from './ai-credits';
+import { drainAiCreditOutbox, type AiCreditOutboxRow } from './ai-credit-outbox';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
     StorageSample, StripeApi, StripeCharge, StripeCheckoutSession, StripeInvoice, StripeInvoicePaymentState,
@@ -22,7 +25,7 @@ type Interval = {
 };
 
 /** Match the database's unique keys so replay tests exercise persisted effects. */
-class MemoryStore implements BillingStore {
+class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore {
     epochs: StoredComputeEpoch[] = [];
     grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
     openEpoch: BillingStore['openEpoch'] = async input => {
@@ -130,7 +133,7 @@ class MemoryStore implements BillingStore {
     computers = new Map<string, string>([['computer_local', 'user_local']]);
     subscriptions = new Map<string, SubscriptionUpsert>();
     grants = new Map<string, GrantRow>();
-    outbox = new Map<string, OutboxInsert>();
+    outbox = new Map<string, AiReversalReceipt>();
     intervals: Interval[] = [];
     samples: (StorageSample & { userId: string; source: string })[] = [];
     writes: string[] = [];
@@ -205,6 +208,48 @@ class MemoryStore implements BillingStore {
         return [...this.outbox.values()].filter(item => item.userId === userId && item.kind === 'ai_grant'
             && item.payload.protocol === 'ezil-ai-credits-v1' && item.payload.invoiceId === invoiceId);
     }
+    async aiTopupReceipt(userId: string, paymentIntentId: string) {
+        return [...this.outbox.values()].find(item => item.userId === userId && item.kind === 'ai_grant'
+            && item.payload.protocol === 'ezil-ai-credits-v1' && item.payload.paymentIntentId === paymentIntentId) ?? null;
+    }
+    recordAiTopup: AiTopupReceiptStore['recordAiTopup'] = async (grant, receipt) => {
+        const original = [...this.grants.values()].find(row => row.kind === 'topup' && row.sourceId === grant.sourceId);
+        if (original && original.userId !== grant.userId) return 'review:customer_mismatch';
+        if (await this.aiTopupReceipt(grant.userId, grant.sourceId)) return 'applied';
+        if (original || this.outbox.has(`payment_intent:${grant.sourceId}:ai_topup`)) return 'review:legacy_topup_unfunded';
+        const before = { grants: new Map(this.grants), outbox: new Map(this.outbox), writes: [...this.writes] };
+        try {
+            await this.insertGrant(grant);
+            await this.enqueueOutbox(receipt);
+        } catch (error) {
+            this.grants = before.grants; this.outbox = before.outbox; this.writes = before.writes;
+            throw error;
+        }
+        return 'applied';
+    };
+    private reversalQueue: Promise<unknown> = Promise.resolve();
+    recordAiReversal: AiReversalStore['recordAiReversal'] = input => {
+        const run = this.reversalQueue.then(async () => {
+            const first = input.originals[0]!;
+            const plan = planAiReversal(input, {
+                originals: [...this.grants.values()].filter(g => g.sourceType === first.sourceType && g.sourceId === first.sourceId),
+                corrections: [...this.grants.values()].filter(g => g.sourceType === 'refund' || g.sourceType === 'dispute'),
+                receipts: [...this.outbox.values()],
+            });
+            if (plan.outcome !== 'applied') return plan.outcome;
+            const before = { grants: new Map(this.grants), outbox: new Map(this.outbox), writes: [...this.writes] };
+            try {
+                for (const grant of plan.grants) if (await this.insertGrant(grant) !== 'inserted') throw new Error('conflict');
+                for (const item of plan.outbox) if (await this.enqueueOutbox(item) !== 'queued') throw new Error('conflict');
+            } catch (error) {
+                this.grants = before.grants; this.outbox = before.outbox; this.writes = before.writes;
+                throw error;
+            }
+            return 'applied';
+        });
+        this.reversalQueue = run.catch(() => {});
+        return run;
+    };
     async latestIntervalFor(computerId: string) {
         return this.intervals.filter(row => row.computerId === computerId)
             .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())[0] ?? null;
@@ -312,6 +357,14 @@ async function seedTopup(store: MemoryStore) {
 }
 
 afterEach(() => vi.restoreAllMocks());
+// Explicit test-only policy values, unrelated to any USD conversion. Shipped packs stay null.
+beforeEach(() => {
+    vi.spyOn(catalog, 'findPack').mockImplementation(sku => {
+        const pack = catalog.AI_PACKS.find(value => value.sku === sku);
+        return pack ? { ...pack, aiCredits: sku === 'ai_pack_10_v1' ? 1234 : 5678 } : undefined;
+    });
+});
+vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
 
 describe('processStripeEvent', () => {
     it('links only a re-read server checkout and applies the subsequent top-up in order', async () => {
@@ -423,8 +476,9 @@ describe('processStripeEvent', () => {
     it.each([invoice, sync, () => checkout(false), refund, dispute, () => dispute(true)])(
         'never attributes a foreign customer through payload metadata %#', async makeEvent => {
             const good = fixture();
-            await seedTopup(good.store);
-            expect(await processStripeEvent(makeEvent(), good.deps)).toBe('applied');
+            if (makeEvent().type.startsWith('charge.')) await seedTopup(good.store);
+            expect(await processStripeEvent(makeEvent(), good.deps)).toBe(makeEvent().type === 'charge.dispute.closed'
+                ? 'review:restore_refused_terminal' : 'applied');
             expect(good.store.owners).toEqual(['cus_local']);
             const bad = fixture();
             await seedTopup(bad.store);
@@ -476,8 +530,9 @@ describe('processStripeEvent', () => {
         stripe.session.sku = sku;
         expect(await processStripeEvent(checkout(false), deps)).toBe('applied');
         expect([...store.grants.values()][0]).toMatchObject({ meter: 'ai_usd_micro', kind: 'topup', amount: BigInt(amount), sourceId: 'pi_local' });
-        expect(store.outbox.get('payment_intent:pi_local:ai_topup')).toMatchObject({
-            kind: 'ai_grant', payload: { amountUsdMicro: amount, bucket: 'purchased', expiresAt: '2027-10-11T12:00:00.000Z', providerObjectId: 'pi_local' },
+        expect(store.outbox.get(`ezil-os:v1:topup:${sku}:pi_local:grant`)).toMatchObject({
+            kind: 'ai_grant', payload: { protocol: 'ezil-ai-credits-v1', credits: sku === 'ai_pack_10_v1' ? 1234 : 5678,
+                amountUsdMicro: amount, bucket: 'purchased', expiresAt: '2027-10-11T12:00:00.000Z', providerObjectId: 'pi_local' },
         });
     });
 
@@ -485,7 +540,76 @@ describe('processStripeEvent', () => {
         const { store, deps } = fixture();
         const input = { ...checkout(false), created: Date.parse('2024-02-29T12:00:00Z') / 1000 };
         expect(await processStripeEvent(input, deps)).toBe('applied');
-        expect(store.outbox.get('payment_intent:pi_local:ai_topup')?.payload.expiresAt).toBe('2025-02-28T12:00:00.000Z');
+        expect(store.outbox.get('ezil-os:v1:topup:ai_pack_10_v1:pi_local:grant')?.payload.expiresAt).toBe('2025-02-28T12:00:00.000Z');
+    });
+
+    it('records a review outcome and no funding when shipped pack policies are unset', async () => {
+        vi.mocked(catalog.findPack).mockImplementation(sku => catalog.AI_PACKS.find(value => value.sku === sku));
+        const f = fixture();
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:pack_credits_unset');
+        expect(f.store.outbox.size).toBe(0);
+        expect(f.store.grants.size).toBe(0);
+    });
+    it('preserves first topup amount, expiry and account through later catalog changes, refund and replay', async () => {
+        const f = fixture();
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        const receipt = [...f.store.outbox.values()][0]!;
+        receipt.payload.accountPublicId = 'original-account';
+        const snapshot = structuredClone(receipt);
+        vi.mocked(catalog.findPack).mockImplementation(sku => ({ ...catalog.AI_PACKS[0]!, sku, aiCredits: 9999 }));
+        expect(await processStripeEvent({ ...checkout(false), id: 'different-event', created: checkout(false).created + 86400 }, f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()]).toEqual([snapshot]);
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(await processStripeEvent({ ...refund(), id: 'another-refund-event' }, f.deps)).toBe('applied');
+        const reversal = [...f.store.outbox.values()][1]!;
+        expect(reversal).toMatchObject({ eventKey: `${receipt.payload.entitlementId}:revoke:refund:re_local`,
+            payload: { entitlementId: receipt.payload.entitlementId, credits: 1234,
+                expiresAt: snapshot.payload.expiresAt, accountPublicId: 'original-account' } });
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(f.store.outbox.size).toBe(2);
+        const beforeRestore = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect(f.store.writes).toEqual(beforeRestore);
+    });
+    it('retries refund-before-purchase and delivers grant/revoke with one shared v1 entitlement in either order', async () => {
+        const f = fixture();
+        expect(await processStripeEvent(refund(), f.deps)).toBe('failed:no_grant_for_refund');
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        const items = [...f.store.outbox.values()];
+        for (const order of [items, [...items].reverse()]) {
+            const pending: AiCreditOutboxRow[] = order.map((item, index) => ({ ...item, id: String(index), attempts: 1 }));
+            const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+            await drainAiCreditOutbox({ config: { fundingUrl: 'https://gateway.test', fundingHmacSecret: 'fixture' },
+                clock: () => now.getTime(), fetch: fetcher, aiCredits: {
+                    claim: async () => pending.shift() ?? null, accountFor: async () => 'account',
+                    pinAccount: async () => true, finish: async () => {},
+                } }, { limit: 2, deadlineMs: now.getTime() + 40_000 });
+            const bodies = fetcher.mock.calls.map(call => JSON.parse(call[1]!.body as string));
+            expect(bodies.map(body => body.action)).toEqual(order.map(item => item.payload.action));
+            expect(new Set(bodies.map(body => body.entitlementId))).toEqual(new Set(['ezil-os:v1:topup:ai_pack_10_v1:pi_local']));
+            expect(bodies.every(body => body.eventId === `${body.entitlementId}:${body.action}${body.action === 'revoke' ? ':refund:re_local' : ''}` && body.credits === 1234)).toBe(true);
+        }
+    });
+    it('does not migrate an existing dollar-only topup on paid replay', async () => {
+        const f = fixture();
+        await seedTopup(f.store);
+        await f.store.enqueueOutbox({ userId: 'user_local', eventKey: 'payment_intent:pi_local:ai_topup', kind: 'ai_grant',
+            payload: { amountUsdMicro: '10000000', bucket: 'purchased' } });
+        const before = structuredClone([...f.store.outbox.values()]);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('review:legacy_topup_unfunded');
+        expect([...f.store.outbox.values()]).toEqual(before);
+        expect(f.store.grants.size).toBe(1);
+    });
+    it('can retry an interrupted atomic topup without leaving a ledger-only purchase', async () => {
+        const f = fixture();
+        vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('interrupted'));
+        await expect(processStripeEvent(checkout(false), f.deps)).rejects.toThrow('interrupted');
+        expect(f.store.grants.size).toBe(0);
+        expect(f.store.outbox.size).toBe(0);
+        expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+        expect(f.store.grants.size).toBe(1);
+        expect(f.store.outbox.size).toBe(1);
     });
 
     it.each([
@@ -504,7 +628,7 @@ describe('processStripeEvent', () => {
         expect(bad.store.writes).toEqual([]);
     });
 
-    it.each([['revoke', refund], ['suspend', dispute], ['restore', () => dispute(true)]] as const)(
+    it.each([['revoke', refund], ['suspend', dispute]] as const)(
         'appends %s with the original meter and period and queues its AI correction', async (kind, makeEvent) => {
             const { store, stripe, deps } = fixture();
             await seedTopup(store);
@@ -512,13 +636,13 @@ describe('processStripeEvent', () => {
             expect(stripe.reads).toEqual(['charge:ch_local']);
             expect(store.sourceReads).toEqual(['payment_intent:pi_local']);
             expect([...store.grants.values()][1]).toMatchObject({
-                kind, meter: 'ai_usd_micro', amount: BigInt(kind === 'restore' ? 10_000_000 : -10_000_000),
+                kind, meter: 'ai_usd_micro', amount: BigInt(-10_000_000),
                 periodStart, periodEnd, sourceType: kind === 'revoke' ? 'refund' : 'dispute',
                 sourceId: kind === 'revoke' ? 're_local' : 'dp_local',
             });
             expect([...store.outbox.values()][0]).toMatchObject({
                 eventKey: kind === 'revoke' ? 'refund:re_local:ai_revoke' : `dispute:dp_local:ai_${kind}`,
-                kind: kind === 'restore' ? 'ai_grant' : 'ai_revoke', payload: { amountUsdMicro: '10000000' },
+                kind: 'ai_revoke', payload: { amountUsdMicro: '10000000' },
             });
         },
     );
@@ -558,6 +682,11 @@ describe('processStripeEvent', () => {
         expect(await processStripeEvent(makeEvent(), deps)).toBe('review:customer_mismatch');
         expect(store.writes).toEqual(before);
         original.userId = 'user_local';
+        if (makeEvent().type === 'charge.dispute.closed') {
+            expect(await processStripeEvent(makeEvent(), deps)).toBe('review:restore_refused_terminal');
+            expect(store.grants.size).toBe(1);
+            return;
+        }
         expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
         expect(store.grants.size).toBe(2);
     });
@@ -567,6 +696,13 @@ describe('processStripeEvent', () => {
             const { store, deps } = fixture();
             const input = makeEvent();
             if (input.type.startsWith('charge.')) await seedTopup(store);
+            if (input.type === 'charge.dispute.closed') {
+                const before = [...store.writes];
+                expect(await processStripeEvent(input, deps)).toBe('review:restore_refused_terminal');
+                expect(await processStripeEvent(input, deps)).toBe('review:restore_refused_terminal');
+                expect(store.writes).toEqual(before);
+                return;
+            }
             expect(await processStripeEvent(input, deps)).toBe('applied');
             expect(store.writes.length).toBeGreaterThan(0);
             const writes = [...store.writes];
@@ -575,9 +711,11 @@ describe('processStripeEvent', () => {
         },
     );
 
-    it('records both suspend and restore for the same dispute id', async () => {
-        const { store, deps } = fixture();
-        await seedTopup(store);
+    it('records both suspend and restore for the same canonical dispute receipt', async () => {
+        const { store, stripe, deps } = fixture();
+        stripe.charge.refunded = false;
+        await processStripeEvent(checkout(false), deps);
+        [...store.outbox.values()][0]!.payload.accountPublicId = 'original-account';
         expect(await processStripeEvent(dispute(), deps)).toBe('applied');
         expect(await processStripeEvent(dispute(true), deps)).toBe('applied');
         expect([...store.grants.values()].map(row => row.kind)).toEqual(['topup', 'suspend', 'restore']);
@@ -1157,6 +1295,13 @@ describe('v2 webhook grants', () => {
                 expect(store.writes).toEqual([]);
                 expect(await processStripeEvent(scenario === 'top-up' ? checkout(false) : paidV2(), deps)).toBe('applied');
                 const original = [...store.grants.values()][0];
+                if (kind === 'dispute restore') {
+                    const before = [...store.writes];
+                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:restore_refused_terminal');
+                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:restore_refused_terminal');
+                    expect(store.writes).toEqual(before);
+                    return;
+                }
                 expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
                 const writes = [...store.writes];
                 expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
@@ -1164,7 +1309,7 @@ describe('v2 webhook grants', () => {
                 expect([...store.grants.values()]).toEqual([original, expect.objectContaining({
                     kind: kind === 'refund' ? 'revoke' : kind === 'dispute' ? 'suspend' : 'restore',
                     meter: original.meter, subscriptionId: original.subscriptionId,
-                    amount: kind === 'dispute restore' ? original.amount : -original.amount,
+                    amount: -original.amount,
                     periodStart: original.periodStart, periodEnd: original.periodEnd,
                 })]);
             },
@@ -1201,6 +1346,12 @@ describe('v2 webhook grants', () => {
         f.stripe.charge.invoiceId = 'in_local';
         expect(await processStripeEvent(dispute(restore), f.deps)).toBe('failed:no_grant_for_dispute');
         await processStripeEvent(paidV2(), f.deps);
+        if (restore) {
+            f.stripe.charge.refunded = false;
+            expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_receipt_missing');
+            expect(f.store.grants.size).toBe(1);
+            return;
+        }
         expect(await processStripeEvent(dispute(restore), f.deps)).toBe('applied');
         expect([...f.store.grants.values()][1]).toMatchObject({ kind: restore ? 'restore' : 'suspend',
             meter: 'compute_std_seconds', subscriptionId: 'sub_local', amount: BigInt(restore ? 216000 : -216000) });
@@ -1507,8 +1658,8 @@ describe('v3 paid invoice grants', () => {
         expect(await processStripeEvent(delivery, deps)).toBe('applied');
         expect([...store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
         expect(store.outbox.size).toBe(2);
-        expect(store.outbox.get(`${entitlementId}:revoke`)).toMatchObject({ kind: 'ai_revoke',
-            payload: { eventId: `${entitlementId}:revoke`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 4000 : 20000 } });
+        expect(store.outbox.get(`${entitlementId}:revoke:refund:re_v3`)).toMatchObject({ kind: 'ai_revoke',
+            payload: { eventId: `${entitlementId}:revoke:refund:re_v3`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 4000 : 20000 } });
         await processStripeEvent({ ...delivery, id: 'evt_refund_replayed' }, deps);
         expect(store.outbox.size).toBe(2);
     });
@@ -1539,12 +1690,12 @@ describe('v3 paid invoice grants', () => {
         await processStripeEvent({ ...paidV2(), id: 'evt_another' }, f.deps);
         expect(f.store.grants.size).toBe(1); expect(f.store.outbox.size).toBe(1);
     });
-    it('revokes a disputed period once and a won dispute cannot grant an irrevocably revoked entitlement again', async () => {
+    it('keeps a refunded disputed period terminal without local restoration', async () => {
         const f = v3Fixture(); await processStripeEvent(paidV2(), f.deps);
         f.stripe.charge.invoiceId = f.stripe.invoice.id;
         await processStripeEvent(dispute(), f.deps); await processStripeEvent(dispute(), f.deps);
         expect([...f.store.outbox.values()].map(item => item.payload.action)).toEqual(['grant', 'revoke']);
-        await processStripeEvent(dispute(true), f.deps);
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
         expect(f.store.outbox.size).toBe(2);
     });
     it('revokes the stored policy and account, even when the subscription and invoice adapter now report Premium', async () => {
@@ -1605,5 +1756,302 @@ describe('v3 paid invoice grants', () => {
         vi.spyOn(f.stripe, 'retrieveSubscription').mockImplementation(client.retrieveSubscription);
         expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
         expect(f.store.subscriptions.get('sub_local')?.sku).toBe('premium_monthly_v3');
+    });
+});
+
+describe('W0.3 dispute restore receipts', () => {
+    async function funded(v3 = false) {
+        const f = fixture();
+        f.stripe.charge.refunded = false;
+        if (v3) {
+            f.stripe.subscription.sku = 'standard_monthly_v3';
+            f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3' }];
+            f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        }
+        expect(await processStripeEvent(v3 ? paidV2() : checkout(false), f.deps)).toBe('applied');
+        const root = [...f.store.outbox.values()][0]!;
+        root.payload.accountPublicId = 'original-payer';
+        return { ...f, root };
+    }
+    const d = (id: string, won = false) => event(won ? 'charge.dispute.closed' : 'charge.dispute.created',
+        { id, charge: 'ch_local', status: 'won' });
+    it.each([false, true])('a full refund after a dispute debits the original only once (V3=%s)', async v3 => {
+        const f = await funded(v3);
+        const original = [...f.store.grants.values()][0]!;
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([original.amount, -original.amount, BigInt(0)]);
+        const terminal = f.store.outbox.get(`${f.root.payload.entitlementId}:revoke:refund:re_local`)!;
+        expect(terminal.payload).toMatchObject({ action: 'revoke', entitlementId: f.root.payload.entitlementId,
+            credits: f.root.payload.credits, accountPublicId: 'original-payer',
+            localDeltas: [{ originalGrantId: original.id, meter: original.meter, amount: '0' }] });
+        const before = [...f.store.writes];
+        // A refunded purchase stays terminal even if the later charge read omits the refund flag.
+        f.stripe.charge.refunded = false;
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect(f.store.writes).toEqual(before);
+        expect([...f.store.grants.values()].filter(g => g.kind === 'restore')).toHaveLength(0);
+    });
+    it('counts earlier valid receipts without the new optional local-delta audit field', async () => {
+        const f = await funded(true);
+        await processStripeEvent(dispute(), f.deps);
+        const suspended = f.store.outbox.get(`${f.root.payload.entitlementId}:revoke:dispute:dp_local`)!;
+        delete suspended.payload.localDeltas;
+        const frozen = structuredClone(suspended);
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()].at(-1)!.amount).toBe(BigInt(0));
+        expect(suspended).toEqual(frozen);
+    });
+    it('does not repair already-corrupt history by appending an invented positive or another negative', async () => {
+        const f = await funded(true);
+        await processStripeEvent(dispute(), f.deps);
+        const local = [...f.store.grants.values()].find(g => g.kind === 'suspend')!;
+        local.amount *= BigInt(2);
+        const before = [...f.store.writes];
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:local_reversal_mismatch');
+        expect(f.store.writes).toEqual(before);
+    });
+    it('preserves an independently paid upgrade and the actual displayed allowance', async () => {
+        const f = await funded(true);
+        const original = [...f.store.grants.values()][0]!;
+        await f.store.insertGrant({ ...original, sourceId: 'in_paid_upgrade', kind: 'upgrade_prorated', amount: BigInt(100000) });
+        const upgrade = [...f.store.grants.values()][1]!;
+        await processStripeEvent(dispute(), f.deps);
+        f.stripe.charge.refunded = true;
+        await processStripeEvent(refund(), f.deps);
+        const grants = [...f.store.grants.values()];
+        expect(grants.reduce((total, g) => total + g.amount, BigInt(0))).toBe(BigInt(100000));
+        expect(f.store.grants.get(upgrade.id)).toEqual(upgrade);
+        const { fairUseAllowance } = await import('./v3/summary');
+        const { planFromSubscriptions } = await import('./v3/catalog');
+        const plan = planFromSubscriptions({ subs: await f.store.subscriptionsFor('user_local'), now, userCreatedAt: null });
+        expect(fairUseAllowance(plan, grants)).toBe(100000);
+    });
+    it.each([false, true])('a refund after an earned local restore debits that restored amount (delivered=%s)', async delivered => {
+        const f = await funded(true);
+        const original = [...f.store.grants.values()][0]!;
+        await processStripeEvent(dispute(), f.deps);
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
+        const restored = f.store.outbox.get(`${f.root.payload.entitlementId}:restore:dp_local`)!;
+        if (delivered) { restored.deliveredAt = now; restored.payload.delivery = { status: 'done', outcome: 'restored' }; }
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([original.amount, -original.amount, original.amount, -original.amount]);
+        const before = [...f.store.writes];
+        f.stripe.charge.refunded = false;
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied'); // Immutable replay, never another local restore.
+        expect(f.store.writes).toEqual(before);
+    });
+    it('retains each committed delta on interleaved D and refund replays, including different refund IDs', async () => {
+        const f = await funded(true);
+        const original = [...f.store.grants.values()][0]!;
+        await processStripeEvent(dispute(), f.deps);
+        await processStripeEvent(dispute(true), f.deps);
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(f.store.writes).toEqual(before);
+        f.stripe.charge.refunded = true;
+        await processStripeEvent(refund(), f.deps);
+        const second = refund(); second.data.object.refunds = { data: [{ id: 're_second' }] };
+        expect(await processStripeEvent(second, f.deps)).toBe('applied');
+        const after = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(second, f.deps)).toBe('applied');
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(f.store.writes).toEqual(after);
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([original.amount, -original.amount, original.amount, -original.amount, BigInt(0)]);
+        expect(f.store.outbox.has(`${f.root.payload.entitlementId}:revoke:refund:re_second`)).toBe(true);
+    });
+    it('does not double-debit overlapping disputes or let either win revive a terminal refund', async () => {
+        const f = await funded(true);
+        const original = [...f.store.grants.values()][0]!;
+        await processStripeEvent(d('dp_A'), f.deps);
+        await processStripeEvent(d('dp_B'), f.deps);
+        f.stripe.charge.refunded = true;
+        await processStripeEvent(refund(), f.deps);
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([original.amount, -original.amount, BigInt(0), BigInt(0)]);
+        f.stripe.charge.refunded = false;
+        for (const id of ['dp_A', 'dp_B']) expect(await processStripeEvent(d(id, true), f.deps)).toBe('review:restore_refused_terminal');
+    });
+    it('a refund arriving first leaves later suspension at zero and a won dispute refused', async () => {
+        const f = await funded(true);
+        const original = [...f.store.grants.values()][0]!;
+        f.stripe.charge.refunded = true;
+        await processStripeEvent(refund(), f.deps);
+        f.stripe.charge.refunded = false;
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([original.amount, -original.amount, BigInt(0)]);
+    });
+    it('keeps renewal grants isolated from old-period reversals and their replays', async () => {
+        const f = await funded(true);
+        await processStripeEvent(dispute(), f.deps);
+        f.stripe.charge.refunded = true;
+        await processStripeEvent(refund(), f.deps);
+        const nextEnd = new Date('2026-12-01T00:00:00Z');
+        f.stripe.subscription.currentPeriodStart = periodEnd;
+        f.stripe.subscription.currentPeriodEnd = nextEnd;
+        f.stripe.invoice = { ...f.stripe.invoice, id: 'in_renewal', periodStart: periodEnd, periodEnd: nextEnd,
+            lines: f.stripe.invoice.lines.map(line => ({ ...line, periodStart: periodEnd, periodEnd: nextEnd })) };
+        const renewal = { ...paidV2(), created: periodEnd.getTime() / 1000 };
+        renewal.data.object.id = 'in_renewal';
+        expect(await processStripeEvent(renewal, f.deps)).toBe('applied');
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied'); // charge still references the old invoice.
+        expect([...f.store.grants.values()].reduce((total, g) => total + g.amount, BigInt(0))).toBe(BigInt(144000));
+        const { fairUseAllowance } = await import('./v3/summary');
+        const { planFromSubscriptions } = await import('./v3/catalog');
+        const plan = planFromSubscriptions({ subs: await f.store.subscriptionsFor('user_local'), now: periodEnd, userCreatedAt: null });
+        expect(fairUseAllowance(plan, [...f.store.grants.values()])).toBe(144000);
+        f.stripe.charge.invoiceId = 'in_renewal';
+        expect(await processStripeEvent(d('dp_renewal'), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()].at(-1)!.amount).toBe(BigInt(-144000));
+    });
+    it('serializes a concurrent suspend and refund without taking the allowance twice', async () => {
+        const f = await funded(true);
+        f.stripe.charge.refunded = true;
+        expect(await Promise.all([processStripeEvent(dispute(), f.deps), processStripeEvent(refund(), f.deps)])).toEqual(['applied', 'applied']);
+        const corrections = [...f.store.grants.values()].filter(g => g.sourceType === 'refund' || g.sourceType === 'dispute');
+        expect(corrections.map(g => g.amount).sort()).toEqual([BigInt(-144000), BigInt(0)]);
+    });
+    it.each([false, true])('restores a matching topup/V3 suspend exactly once with a constant root (V3=%s)', async v3 => {
+        const f = await funded(v3);
+        await processStripeEvent(dispute(), f.deps);
+        const before = [...f.store.writes];
+        expect(await Promise.all([processStripeEvent(dispute(true), f.deps), processStripeEvent(dispute(true), f.deps)])).toEqual(['applied', 'applied']);
+        const restored = f.store.outbox.get(`${f.root.payload.entitlementId}:restore:dp_local`)!;
+        expect(restored).toMatchObject({ kind: 'ai_restore', payload: { action: 'restore',
+            entitlementId: f.root.payload.entitlementId, credits: v3 ? 4000 : 1234, accountPublicId: 'original-payer',
+            expiresAt: f.root.payload.expiresAt } });
+        expect(f.store.writes.length - before.length).toBe(2);
+        expect([...f.store.grants.values()].map(g => g.kind)).toEqual([v3 ? 'plan_period' : 'topup', 'suspend', 'restore']);
+        expect([...f.store.grants.values()].reduce((total, g) => total + g.amount, BigInt(0))).toBe([...f.store.grants.values()][0]!.amount);
+        const after = [...f.store.writes];
+        expect(await processStripeEvent({ ...dispute(true), id: 'won_replayed' }, f.deps)).toBe('applied');
+        expect(f.store.writes).toEqual(after);
+    });
+    it('won before created waits without a local positive and can complete after its own suspend', async () => {
+        const f = await funded();
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('failed:restore_suspend_pending');
+        expect(f.store.writes).toEqual(before);
+        await processStripeEvent(dispute(), f.deps);
+        expect(await processStripeEvent(d('dp_wrong', true), f.deps)).toBe('failed:restore_suspend_pending');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
+    });
+    it.each(['local amount', 'local period', 'suspend missing', 'refund only', 'payer', 'root terms', 'charge', 'root owner'])(
+        'refuses mismatched %s before any positive effect', async defect => {
+            const f = await funded();
+            await processStripeEvent(dispute(), f.deps);
+            const suspended = [...f.store.grants.values()].find(g => g.kind === 'suspend')!;
+            const receipt = [...f.store.outbox.values()].find(r => r.kind === 'ai_revoke')!;
+            if (defect === 'local amount') suspended.amount += BigInt(1);
+            if (defect === 'local period') suspended.periodEnd = now;
+            if (defect === 'suspend missing') f.store.grants.delete(suspended.id);
+            if (defect === 'refund only') suspended.sourceType = 'refund';
+            if (defect === 'payer') receipt.payload.accountPublicId = 'different-payer';
+            if (defect === 'root terms') f.root.payload.credits = 777;
+            if (defect === 'charge') f.stripe.charge.id = 'ch_different';
+            if (defect === 'root owner') receipt.userId = 'other-user';
+            const before = [...f.store.writes];
+            expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_mismatch');
+            expect(f.store.writes).toEqual(before);
+        },
+    );
+    it('waits for the suspended payer to be pinned and never substitutes another account', async () => {
+        const f = await funded();
+        delete f.root.payload.accountPublicId;
+        await processStripeEvent(dispute(), f.deps);
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('failed:restore_account_pending');
+        expect(f.store.writes).toEqual(before);
+        [...f.store.outbox.values()].find(r => r.kind === 'ai_revoke')!.payload.accountPublicId = 'late-payer';
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()].at(-1)!.payload.accountPublicId).toBe('late-payer');
+    });
+    it('rolls back a local positive when the atomic outbox insert fails, then retries cleanly', async () => {
+        const f = await funded();
+        await processStripeEvent(dispute(), f.deps);
+        const before = [...f.store.writes];
+        vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('transaction interrupted'));
+        await expect(processStripeEvent(dispute(true), f.deps)).rejects.toThrow('transaction interrupted');
+        expect(f.store.writes).toEqual(before);
+        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
+    });
+    it('emits a distinct terminal refund after a dispute, on the root and frozen payer', async () => {
+        const f = await funded();
+        await processStripeEvent(dispute(), f.deps);
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(f.store.outbox.get(`${f.root.payload.entitlementId}:revoke:refund:re_local`)).toMatchObject({
+            kind: 'ai_revoke', payload: { entitlementId: f.root.payload.entitlementId, accountPublicId: 'original-payer' } });
+        // Even a later provider read that omits the refund cannot erase the terminal receipt.
+        f.stripe.charge.refunded = false;
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect(f.store.writes).toEqual(before);
+    });
+    it('keeps a legacy root revoke terminal', async () => {
+        const f = await funded();
+        await processStripeEvent(dispute(), f.deps);
+        const { aiCreditRevokeItem } = await import('./ai-credits');
+        await f.store.enqueueOutbox(aiCreditRevokeItem(f.root));
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
+    });
+    it('marks overlapping disputes for review, regardless of which win arrives first', async () => {
+        const f = await funded();
+        await processStripeEvent(d('dp_A'), f.deps);
+        await processStripeEvent(d('dp_B'), f.deps);
+        const before = [...f.store.writes];
+        for (const id of ['dp_A', 'dp_B']) expect(await processStripeEvent(d(id, true), f.deps)).toBe('review:restore_review_required');
+        expect(f.store.writes).toEqual(before);
+    });
+    it('supports successive completed chains without using fractional restored-head values in the body', async () => {
+        const f = await funded();
+        for (const id of ['dp_A', 'dp_B', 'dp_C']) {
+            expect(await processStripeEvent(d(id), f.deps)).toBe('applied');
+            expect(await processStripeEvent(d(id, true), f.deps)).toBe('applied');
+            const r = f.store.outbox.get(`${f.root.payload.entitlementId}:restore:${id}`)!;
+            expect(r.payload).toMatchObject({ credits: 1234, entitlementId: f.root.payload.entitlementId });
+            r.deliveredAt = now;
+            r.payload.delivery = { status: 'done', outcome: 'restored' };
+        }
+        expect(f.store.outbox.size).toBe(7);
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()].at(-1)!.payload.entitlementId).toBe(f.root.payload.entitlementId);
+    });
+    it('cannot reuse a D suspend from another purchase with the same amount and payer', async () => {
+        const f = await funded();
+        await processStripeEvent(dispute(), f.deps);
+        f.stripe.session.paymentIntentId = 'pi_another';
+        f.stripe.charge.paymentIntentId = 'pi_another';
+        await processStripeEvent(checkout(false), f.deps);
+        [...f.store.outbox.values()].at(-1)!.payload.accountPublicId = 'original-payer';
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_mismatch');
+        expect(f.store.writes).toEqual(before);
+    });
+    it('reviews oversize causal IDs before writing even a suspension', async () => {
+        const f = await funded();
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(d('dp_' + 'x'.repeat(200)), f.deps)).toBe('review:invalid_ai_event_id');
+        expect(f.store.writes).toEqual(before);
+    });
+});
+
+describe('legacy restore refusal', () => {
+    it('does not credit legacy dollar-only rows even after a same-D negative entry', async () => {
+        const f = fixture(); f.stripe.charge.refunded = false;
+        await seedTopup(f.store);
+        await processStripeEvent(dispute(), f.deps);
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_receipt_missing');
+        expect(f.store.writes).toEqual(before);
+        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
     });
 });

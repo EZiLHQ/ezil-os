@@ -906,7 +906,7 @@ try {
     }
     pass('Premium machine picker labels, exact mutation, pending guard, rollback and keyboard navigation; other plans read-only');
     summary = summaryV3(); await refresh();
-    for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1 — upgrade to keep working']] ) {
+    for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1.']] ) {
         summary.fairUse.status = status; await refresh(); contains('[data-role="fair-use"]', copy);
     }
     summary.plan.status = 'cancels'; summary.plan.cancelsAt = END; await refresh();
@@ -934,6 +934,46 @@ try {
     for ( const key of Object.keys(summary.actions) ) summary.actions[key] = false;
     await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false);
     pass('v3 DTO-only plans, fair-use states, cancellation/payment, invoices, actions, deep links, escaping and failure recovery');
+    summary = summaryV3(); await refresh();
+    contains('[data-role="ai-usage"]', 'Balance: 1.000001 credits');
+    contains('[data-role="ai-usage"]', 'Commitments include held credits');
+    contains('[data-role="ai-usage"]', 'not a billing-period total');
+    contains('[data-role="ai-limits"]', 'Not reported');
+    contains('[data-role="ai-recent"]', 'charged: Not reported');
+    for ( const [micro, expected] of [['1', '0.000001'], ['999999', '0.999999'], ['1000001', '1.000001'],
+        ['9007199254740991000001', '9,007,199,254,740,991.000001']] ) {
+        summary.ai.balanceMicro = micro; summary.ai.balance = null; await refresh();
+        contains('[data-role="ai-usage"]', `Balance: ${expected} credits`);
+    }
+    for ( const state of ['paused_operations', 'paused_reconciliation', 'paused_policy', 'unavailable'] ) {
+        summary.ai.spendingState = state; summary.ai.balanceMicro = '1000001'; await refresh();
+        const section = q('[data-role="ai-usage"]').textContent;
+        assert.doesNotMatch(section, /spending is available|No AI credits remain|upgrade|top.?up|add credits/i);
+        assert.equal(q('[data-role="ai-spending"]').dataset.state, state);
+    }
+    summary.ai.recentUsage = null; summary.ai.limits = null; summary.ai.balance = null; summary.ai.balanceMicro = null; await refresh();
+    contains('[data-role="ai-usage"]', 'Balance: Not reported');
+    contains('[data-role="ai-usage"]', 'AI limits are unavailable');
+    contains('[data-role="ai-usage"]', 'Recent AI usage is unavailable');
+    summary.ai.balanceMicro = '0'; summary.ai.balanceState = 'exhausted'; summary.ai.spendingState = 'available'; await refresh();
+    contains('[data-role="ai-usage"]', 'Balance: 0 credits'); contains('[data-role="ai-spending"]', 'No AI credits remain');
+    const old = summaryV3(); old.ai.balanceMicro = '123000000';
+    let releaseOld;
+    getSummary = () => new Promise(resolve => { releaseOld = resolve; });
+    click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
+    click(q('[data-tab="account"]'));
+    summary = summaryV3(); summary.ai.balanceMicro = '7000000'; getSummary = () => reply(summary);
+    click(q('[data-tab="billing"]')); await settle();
+    releaseOld(reply(old)); await settle();
+    contains('[data-role="ai-usage"]', 'Balance: 7 credits');
+    assert.doesNotMatch(q('[data-role="ai-usage"]').textContent, /123 credits/);
+    let releaseClosed;
+    getSummary = () => new Promise(resolve => { releaseClosed = resolve; });
+    click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
+    await window.$(q('.window[data-app="settings"]')).close(); await settle();
+    getSummary = () => reply(summary); await open(); releaseClosed(reply(old)); await settle();
+    contains('[data-role="ai-usage"]', 'Balance: 7 credits');
+    pass('AI fractions, exact large balances, partial unknowns, holds, pauses and canceled stale summaries');
     summary = v2(); history = []; await refresh();
 
     const billingRequests = () => calls.filter(call => call.url.includes('/billing.')).length;

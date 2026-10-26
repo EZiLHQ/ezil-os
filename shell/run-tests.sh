@@ -338,8 +338,8 @@ PORTABLE_SUITES=(
     "shell/ezil/apps/app-store-browser-test.mjs"
     "shell/ezil/apps/os-chrome-browser-test.mjs"
     "shell/ezil/apps/mobile-browser-test.mjs"
-    "shell/ezil/ui/Settings/provider-modal-browser-test.mjs"
     "shell/ezil/ui/Settings/stacking-browser-test.mjs"
+    "shell/ezil/ui/Settings/provider-modal-browser-test.mjs"
     "shell/ezil/ui/Settings/late-focus-browser-test.mjs"
 )
 

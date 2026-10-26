@@ -9,7 +9,7 @@ import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, Us
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
 import { CATALOG_V3 } from './v3/contract';
-import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem } from './ai-credits';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, hasAiTopupReceipts, hasAiReversals } from './ai-credits';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
 
@@ -254,21 +254,18 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             const userId = await store.userForStripeCustomer(session.customer);
             if (userId === null) return 'unattributed:customer';
             if (session.paymentIntentId === null) return 'review:missing_payment_intent';
+            if (!hasAiTopupReceipts(store)) return 'failed:ai_topup_receipts_unavailable';
+            // The original policy and expiry win even if the catalog changes before a replay.
+            if (await store.aiTopupReceipt(userId, session.paymentIntentId)) return 'applied';
             const amount = BigInt(pack.creditCents) * BigInt(10_000);
             const period = purchasedPeriod(event.created);
-            await store.insertGrant({
+            const receipt = aiTopupOutboxItem(userId, pack, session.paymentIntentId, period.end);
+            if (!receipt) return 'review:pack_credits_unset';
+            return store.recordAiTopup({
                 userId, meter: 'ai_usd_micro', kind: 'topup', amount,
                 periodStart: period.start, periodEnd: period.end,
                 sourceType: 'payment_intent', sourceId: session.paymentIntentId,
-            });
-            await store.enqueueOutbox({
-                eventKey: `payment_intent:${session.paymentIntentId}:ai_topup`, userId, kind: 'ai_grant',
-                payload: {
-                    amountUsdMicro: amount.toString(), bucket: 'purchased', expiresAt: period.end.toISOString(),
-                    provider: 'stripe', providerObjectId: session.paymentIntentId,
-                },
-            });
-            return 'applied';
+            }, receipt);
         }
         case 'revoke':
         case 'suspend':
@@ -297,36 +294,47 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 return action.type === 'revoke' ? 'failed:no_grant_for_refund' : 'failed:no_grant_for_dispute';
             }
             if (originals.some(grant => grant.userId !== userId)) return 'review:customer_mismatch';
-            // Invoice lines retain the sold SKU even after an upgrade/downgrade.
-            // Reconstructing also repairs a reversal arriving between ledger and outbox writes.
-            if (action.type !== 'restore' && charge.invoiceId !== null && originals.some(grant => grant.kind === 'plan_period')) {
-                const receipts = await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? [];
-                for (const receipt of receipts) await store.enqueueOutbox(aiCreditRevokeItem(receipt));
-                if (receipts.length === 0) {
-                    const invoice = await stripe.retrieveInvoice(charge.invoiceId);
-                    if (invoice.customer !== charge.customer) return 'review:customer_mismatch';
-                    for (const original of originals.filter(grant => grant.kind === 'plan_period')) {
-                        for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
-                            const line = invoice.lines.find(line => line.lookupKey === CATALOG_V3[sku].stripeLookupKey
-                                && (line.subscriptionId === original.subscriptionId || line.subscriptionId === null)
-                                && line.periodStart?.getTime() === original.periodStart?.getTime()
-                                && line.periodEnd?.getTime() === original.periodEnd?.getTime());
-                            if (line && original.subscriptionId && original.periodStart && original.periodEnd) {
-                                await store.enqueueOutbox(aiCreditOutboxItem(userId, aiCreditEntitlement({
-                                    userId, sku, subscriptionId: original.subscriptionId, periodStart: original.periodStart,
-                                    periodEnd: original.periodEnd, invoiceId: invoice.id,
-                                }), 'revoke', invoice.id));
-                            }
+            const topupReceipt = charge.invoiceId === null && charge.paymentIntentId !== null && hasAiTopupReceipts(store)
+                ? await store.aiTopupReceipt(userId, charge.paymentIntentId) : null;
+            const receipts = topupReceipt ? [topupReceipt]
+                : charge.invoiceId !== null ? await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? [] : [];
+            // A missing subscription outbox receipt can be reconstructed only for a reversal,
+            // from the sold line and immutable local grant. Never reconstruct restore evidence.
+            if (receipts.length === 0 && action.type !== 'restore' && charge.invoiceId !== null
+                && originals.some(grant => grant.kind === 'plan_period')) {
+                const invoice = await stripe.retrieveInvoice(charge.invoiceId);
+                if (invoice.customer !== charge.customer) return 'review:customer_mismatch';
+                for (const original of originals.filter(grant => grant.kind === 'plan_period')) {
+                    for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
+                        const line = invoice.lines.find(line => line.lookupKey === CATALOG_V3[sku].stripeLookupKey
+                            && (line.subscriptionId === original.subscriptionId || line.subscriptionId === null)
+                            && line.periodStart?.getTime() === original.periodStart?.getTime()
+                            && line.periodEnd?.getTime() === original.periodEnd?.getTime());
+                        if (line && original.subscriptionId && original.periodStart && original.periodEnd) {
+                            receipts.push(aiCreditOutboxItem(userId, aiCreditEntitlement({
+                                userId, sku, subscriptionId: original.subscriptionId, periodStart: original.periodStart,
+                                periodEnd: original.periodEnd, invoiceId: invoice.id,
+                            }), 'grant', invoice.id));
                         }
                     }
                 }
             }
+            if (action.type === 'restore' && charge.refunded) return 'review:restore_refused_terminal';
+            if (receipts.length > 0) {
+                if (!hasAiReversals(store)) return 'failed:ai_reversal_receipts_unavailable';
+                return store.recordAiReversal({ action: action.type,
+                    causeId: action.type === 'revoke' ? action.refundId : action.disputeId,
+                    chargeId: charge.id, customerId: charge.customer, userId, originals, receipts });
+            }
+            // Legacy monetary rows have no canonical dispute/payer receipt. They cannot
+            // justify a positive correction or a replay of a v1 grant as a restore.
+            if (action.type === 'restore') return 'review:restore_receipt_missing';
             const sourceType = action.type === 'revoke' ? 'refund' : 'dispute';
             const sourceId = action.type === 'revoke' ? action.refundId : action.disputeId;
             for (const original of originals) {
                 await store.insertGrant({
                     userId, subscriptionId: original.subscriptionId, meter: original.meter, kind: action.type,
-                    amount: action.type === 'restore' ? original.amount : -original.amount,
+                    amount: -original.amount,
                     periodStart: original.periodStart, periodEnd: original.periodEnd,
                     sourceType, sourceId,
                 });
@@ -335,11 +343,11 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             // grant is also the receipt for reversing the included credit.
             const aiOriginal = originals.find(grant => grant.meter === 'ai_usd_micro')
                 ?? originals.find(grant => grant.kind === 'pro_period');
-            if (aiOriginal !== undefined) {
+            if (aiOriginal !== undefined && !topupReceipt) {
                 const amount = aiOriginal.meter === 'ai_usd_micro' ? aiOriginal.amount : PRO_PLAN.aiIncludedMicro;
                 await store.enqueueOutbox({
                     eventKey: `${sourceType}:${sourceId}:ai_${action.type}`,
-                    userId, kind: action.type === 'restore' ? 'ai_grant' : 'ai_revoke',
+                    userId, kind: 'ai_revoke',
                     payload: {
                         amountUsdMicro: amount.toString(),
                         bucket: aiOriginal.kind === 'pro_period' ? 'included' : 'purchased',

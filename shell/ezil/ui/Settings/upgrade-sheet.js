@@ -65,11 +65,19 @@ const WATCH_INTERVAL_MS = 4000;
 export const CONFIRM_POLL_MS = 1500;
 export const CONFIRM_DEADLINE_MS = 60000;
 
-// CheckoutStatusDTO is a string; accept the older envelope during rollout too.
+// Retain the legacy string/envelope during rollout. Missing paymentStatus is
+// unconfirmed, never paid; the session's lifecycle and receipt are separate.
 const checkoutStatus = result => {
     const data = unwrap(result);
-    return typeof data === 'string' ? data : data?.status;
+    return {
+        status: typeof data === 'string' ? data : data?.status,
+        paymentStatus: ['paid', 'unpaid', 'no_payment_required'].includes(data?.paymentStatus) ? data.paymentStatus : null,
+    };
 };
+
+// Checkout completion also covers delayed bank payments. Only the webhook-backed
+// summary below establishes the plan; neither this status nor onComplete is paid.
+const PAYMENT_PENDING_COPY = 'Payment confirmation is pending. Bank payments can take a few days. Your plan updates after payment is confirmed.';
 
 // Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
 // modal frames in body portals. Validate their URL only; never inspect their DOM.
@@ -95,7 +103,9 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     let busy = false;
     let polling = false;
     let confirming = false;
-    let paid = false;
+    let sessionCompleted = false;
+    let paymentStatus = null;
+    let confirmationCopy = null;
     let finished = false;
     let deadline = 0;
     const timers = new Set();
@@ -187,7 +197,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     function destroy (instance) {
         try { instance?.destroy(); } catch { /* Teardown must still restore focus. */ }
     }
-    function show (message, label, action) {
+    function show (message, label, action, actionName = 'retry') {
         const hadFocus = state.contains(doc.activeElement);
         state.replaceChildren();
         const text = doc.createElement('p');
@@ -197,26 +207,37 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
             const button = doc.createElement('button');
             button.type = 'button';
             button.textContent = label;
-            button.dataset.action = 'retry';
+            button.dataset.action = actionName;
             button.addEventListener('click', () => { if ( ! closed && ! busy ) action(); });
             state.append(button);
         }
         if ( hadFocus ) focusFirst();
     }
+    function returnToBilling () {
+        try { onDone?.(); } finally { close(); }
+    }
+    function showConfirmation (timeout = false) {
+        const message = paymentStatus === 'paid' ? 'Payment received. Waiting for your plan to update.'
+            : paymentStatus === 'no_payment_required' ? 'No payment is required. Waiting for your plan to update.'
+            : paymentStatus === 'unpaid' ? 'Your payment is processing. Bank payments can take a few days. Your plan updates after payment is confirmed.'
+            : PAYMENT_PENDING_COPY;
+        const copy = timeout ? `${message} Check Settings → Billing for updates.` : message;
+        if ( confirmationCopy === copy ) return;
+        confirmationCopy = copy;
+        show(copy, 'Back to Billing', returnToBilling, 'return-to-billing');
+    }
     function timedOut () {
         if ( closed || finished ) return;
         finished = true;
         clearTimers();
-        show(paid ? 'Payment received — your plan updates in a moment.'
-            : 'We could not confirm your payment yet. Check Settings → Billing in a moment.');
+        if ( sessionCompleted ) showConfirmation(true);
+        else show('We could not confirm your payment yet. Check Settings → Billing in a moment.', 'Back to Billing', returnToBilling, 'return-to-billing');
     }
     function success () {
         finished = true;
         clearTimers();
         mount.hidden = true;
-        show(`You're on ${name}`, 'Done', () => {
-            try { onDone?.(); } finally { close(); }
-        });
+        show(`You're on ${name}`, 'Done', returnToBilling);
         state.dataset.role = 'upgrade-success';
         state.querySelector('button').dataset.action = 'done';
         const icon = doc.createElement('span');
@@ -232,19 +253,22 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         if ( closed || finished ) return;
         if ( now() >= deadline ) { timedOut(); return; }
         try {
-            if ( ! paid ) {
-                const status = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
+            if ( ! sessionCompleted || ! ['paid', 'no_payment_required'].includes(paymentStatus) ) {
+                const result = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
                 if ( closed || finished ) return;
-                if ( status === 'expired' ) {
+                if ( result.status === 'expired' ) {
                     finished = true;
                     clearTimers();
                     show('This checkout has expired. Close the sheet and try again.');
                     return;
                 }
-                if ( status !== 'complete' ) { later(() => { void poll(); }, CONFIRM_POLL_MS); return; }
-                paid = true;
-                confirming = true;
-                show('Confirming your payment…');
+                if ( result.status === 'complete' ) {
+                    sessionCompleted = true;
+                    paymentStatus = result.paymentStatus;
+                    confirming = true;
+                    showConfirmation();
+                }
+                if ( ! sessionCompleted ) { later(() => { void poll(); }, CONFIRM_POLL_MS); return; }
             }
             const summary = unwrap(await trpc.query('billing.summary'));
             if ( closed || finished ) return;
@@ -256,15 +280,15 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
     /**
      * Stripe's form can lose its own confirmation (seen in a real run: "Your
      * internet connection is unstable. Your payment may have been successful…")
-     * and then never calls onComplete — leaving someone who has PAID looking at
-     * a form. So while the form is open the sheet also asks the server about the
-     * session itself; a completed session is handled exactly like onComplete.
-     * Read-only: it never grants anything (the webhook does).
+     * and then never calls onComplete. While the form is open the sheet also
+     * asks the server about the session itself. Completion starts verification;
+     * it does not establish receipt of an asynchronous bank payment. Only the
+     * webhook-backed plan can make this sheet show success.
      */
     async function watchSession () {
         if ( closed || polling || finished ) return;
         try {
-            const status = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
+            const { status } = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
             if ( closed || polling || finished ) return;
             if ( status === 'complete' ) { startPolling(true); return; }
         } catch { /* A failed check is retried on the next tick. */ }
@@ -274,7 +298,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         if ( closed || polling ) return;
         polling = true;
         stopWatching();
-        // onComplete starts verification; checkoutStatus still confirms receipt.
+        // onComplete starts verification; it does not confirm receipt of funds.
         if ( completed ) { confirming = true; mount.hidden = true; show('Confirming your payment…'); }
         deadline = now() + CONFIRM_DEADLINE_MS;
         later(timedOut, CONFIRM_DEADLINE_MS);
@@ -285,6 +309,7 @@ export function openUpgradeSheet ({ container, sku, offer, sizes, trpc, onDone, 
         busy = true;
         show('Loading the secure payment form…');
         try {
+            // Stripe() can preload its hidden Link modal during the loader.
             releaseProviderPortals = frame.registerProviderPortals({ matchesFrame: isStripeModalFrame });
             const stripe = await loadStripe(session.publishableKey, { signal: controller.signal });
             if ( closed ) return;

@@ -35,6 +35,18 @@ const deferred = () => {
     const promise = new Promise(done => { resolve = done; });
     return { promise, resolve };
 };
+const stripeModalURL = (kind = 'linked-accounts') => kind === 'embedded-checkout-modal'
+    ? `https://js.stripe.com/v3/embedded-checkout-modal-${'a'.repeat(40)}.html?locale=en#test`
+    : `https://js.stripe.com/v3/${kind}-inner-${'a'.repeat(32)}.html?locale=en#test`;
+const providerPortal = (h, src = stripeModalURL()) => {
+    const root = h.document.createElement('div');
+    const iframe = h.document.createElement('iframe');
+    iframe.src = src;
+    iframe.title = 'Simulated Stripe provider modal';
+    root.append(iframe);
+    h.document.body.append(root);
+    return { root, iframe };
+};
 
 function harness () {
     const dom = new JSDOM('<!doctype html><body><button id="opener">Subscribe to Standard</button><main id="container"></main></body>', {
@@ -183,7 +195,7 @@ test('backdrop dismisses idle checkout but preserves confirmation until it finis
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), confirming, 'onComplete protects even the pending status read');
     await settle();
-    assert.match(h.text(), /Confirming your payment…/);
+    assert.match(h.text(), /Payment confirmation is pending/);
     assert.ok(h.timers.size > 0);
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), confirming, 'receipt verification also keeps the dialog open');
@@ -197,7 +209,7 @@ test('backdrop dismisses idle checkout but preserves confirmation until it finis
     assert.equal(h.timers.size, 0, 'verification timers existed above');
 });
 
-test('redirect polling allows dismissal before payment and protects a received payment until timeout', async h => {
+test('redirect polling allows dismissal before completion and protects confirmation until timeout', async h => {
     h.create = async () => ({ mode: 'redirect', sessionId: 'cs_redirect', url: 'https://checkout.stripe.com/test' });
     h.status = async () => ({ status: 'pending' });
     h.open();
@@ -209,12 +221,13 @@ test('redirect polling allows dismissal before payment and protects a received p
     h.summary = async () => free;
     h.open();
     await settle();
-    assert.match(h.text(), /Confirming your payment…/);
+    assert.match(h.text(), /Payment confirmation is pending/);
     const sheet = h.q('[data-role="upgrade-sheet"]');
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), sheet);
     await h.tick(60000);
-    assert.match(h.text(), /Payment received — your plan updates in a moment/);
+    assert.match(h.text(), /Payment confirmation is pending\. Bank payments can take a few days/);
+    assert.doesNotMatch(h.text(), /Payment received|You're on/);
     h.click('.ezil-upgrade-backdrop');
     assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'timeout releases the protected dialog above');
 });
@@ -351,6 +364,252 @@ test('Stripe load failure retries the loader without creating another checkout',
     assert.equal(h.count('billing.createCheckout'), 1);
 });
 
+for ( const kind of ['linked-accounts', 'universal-link-modal', 'embedded-checkout-modal'] ) {
+    test(`simulated ${kind} portal closes back into the same embedded checkout before payment`, async h => {
+        h.status = async () => ({ status: 'pending', paymentStatus: 'unpaid' });
+        h.summary = async () => free;
+        h.open();
+        await settle();
+        const sheet = h.q('[data-role="upgrade-sheet"]');
+        const embeddedFrame = h.q('#ezil-embedded-checkout iframe');
+        embeddedFrame.focus();
+        const portal = providerPortal(h, stripeModalURL(kind));
+        await settle();
+        assert.equal(h.document.activeElement, portal.iframe, 'the simulated provider receives focus');
+        assert.equal(sheet.getAttribute('aria-modal'), 'false');
+        assert.ok(sheet.hasAttribute('inert'));
+        assert.equal(portal.root.hasAttribute('inert'), false);
+        const escape = new h.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+        portal.iframe.dispatchEvent(escape);
+        assert.equal(escape.defaultPrevented, false, 'provider Escape is not intercepted by the parent sheet');
+        assert.equal(h.q('[data-role="upgrade-sheet"]'), sheet);
+        assert.equal(h.closed, 0);
+        // Simulated provider teardown after Bank → Success → Agree and continue.
+        // No Stripe cross-origin content is read or driven by this fixture.
+        portal.root.remove();
+        await settle();
+        assert.equal(sheet.getAttribute('aria-modal'), 'true');
+        assert.equal(sheet.hasAttribute('inert'), false);
+        assert.equal(h.document.activeElement, embeddedFrame);
+        await h.tick(4000);
+        assert.equal(h.q('#ezil-embedded-checkout iframe'), embeddedFrame);
+        assert.equal(h.q('#ezil-embedded-checkout').hidden, false);
+        assert.equal(h.q('[data-role="upgrade-success"]'), null, 'bank-link success is not checkout payment');
+        assert.equal(h.count('billing.summary'), 0);
+        assert.equal(h.count('billing.createCheckout'), 1);
+        assert.equal(h.mounted, 1);
+        assert.equal(h.destroyed, 0);
+        h.status = async () => ({ status: 'complete', paymentStatus: 'paid' });
+        h.complete();
+        await settle();
+        assert.equal(h.q('[data-role="upgrade-success"]'), null);
+        h.summary = async () => standard;
+        await h.tick(1500);
+        assert.ok(h.q('[data-role="upgrade-success"]'));
+        assert.equal(h.count('billing.createCheckout'), 1);
+    });
+}
+
+test('Stripe loader can preload a hidden Link portal and show it later without losing ownership', async h => {
+    let portal;
+    h.open({ loadStripe: async () => {
+        portal = providerPortal(h, stripeModalURL('universal-link-modal'));
+        portal.root.hidden = true;
+        return h.stripe;
+    } });
+    await settle();
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    const embeddedFrame = h.q('#ezil-embedded-checkout iframe');
+    embeddedFrame.focus();
+    assert.equal(sheet.getAttribute('aria-modal'), 'true', 'a hidden preload does not suspend the sheet');
+    portal.root.hidden = false;
+    await settle();
+    assert.equal(portal.root.hasAttribute('inert'), false);
+    assert.equal(sheet.getAttribute('aria-modal'), 'false');
+    assert.equal(h.document.activeElement, portal.iframe);
+    portal.root.hidden = true;
+    await settle();
+    assert.equal(sheet.getAttribute('aria-modal'), 'true');
+    assert.equal(h.document.activeElement, embeddedFrame);
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.destroyed, 0);
+});
+
+test('Stripe mount can preload its embedded modal with hidden visibility and later continue the same checkout', async h => {
+    let portal;
+    const mount = h.instance.mount;
+    h.instance.mount = selector => {
+        portal = providerPortal(h, stripeModalURL('embedded-checkout-modal'));
+        portal.iframe.name = 'embedded-checkout-modals';
+        portal.root.style.cssText = 'visibility: hidden; opacity: 0;';
+        mount(selector);
+    };
+    h.open();
+    await settle();
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    const embeddedFrame = h.q('#ezil-embedded-checkout iframe');
+    embeddedFrame.focus();
+    assert.equal(sheet.getAttribute('aria-modal'), 'true');
+    portal.root.style.cssText = 'visibility: visible; opacity: 1;';
+    await settle();
+    assert.equal(portal.root.hasAttribute('inert'), false);
+    assert.equal(sheet.getAttribute('aria-modal'), 'false');
+    assert.equal(h.document.activeElement, portal.iframe);
+    portal.root.style.cssText = 'visibility: hidden; opacity: 0;';
+    await settle();
+    assert.equal(sheet.getAttribute('aria-modal'), 'true');
+    assert.equal(h.document.activeElement, embeddedFrame);
+    assert.equal(h.q('#ezil-embedded-checkout iframe'), embeddedFrame);
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.destroyed, 0);
+});
+
+test('Stripe portal matcher requires the exact trusted origin and known modal path, without srcdoc', async h => {
+    h.open();
+    await settle();
+    const valid = stripeModalURL();
+    const rejected = [
+        valid.replace('https:', 'http:'),
+        valid.replace('js.stripe.com', 'js.stripe.com.evil.test'),
+        valid.replace('js.stripe.com', 'evil.test'),
+        valid.replace('js.stripe.com', 'js.stripe.com:444'),
+        valid.replace('js.stripe.com', 'user:password@js.stripe.com'),
+        valid.replace('/v3/', '/v2/'),
+        valid.replace('linked-accounts', 'some-other-frame'),
+        valid.replace('a'.repeat(32), 'a'.repeat(31)),
+        valid.replace('a'.repeat(32), 'z'.repeat(32)),
+        stripeModalURL('embedded-checkout-modal').replace('a'.repeat(40), 'a'.repeat(39)),
+        stripeModalURL('embedded-checkout-modal').replace('a'.repeat(40), 'a'.repeat(41)),
+        stripeModalURL('embedded-checkout-modal').replace('a'.repeat(40), 'a'.repeat(42)),
+        stripeModalURL('embedded-checkout-modal').replace('embedded-checkout-modal-', 'embedded-checkout-modal-extra-'),
+        'https://js.stripe.com/v3',
+        'https://hooks.stripe.com/three-d-secure',
+        'about:blank',
+        'data:text/html,Stripe',
+    ];
+    for ( const src of rejected ) {
+        const portal = providerPortal(h, src);
+        portal.root.className = '__PrivateStripeElement stripe-modal';
+        await settle();
+        assert.ok(portal.root.hasAttribute('inert'), src);
+        assert.equal(h.q('[data-role="upgrade-sheet"]').getAttribute('aria-modal'), 'true', src);
+        portal.root.remove();
+        await settle();
+    }
+    const forged = providerPortal(h, valid);
+    forged.iframe.setAttribute('srcdoc', '<p>Unrelated content</p>');
+    await settle();
+    assert.ok(forged.root.hasAttribute('inert'));
+    forged.root.remove();
+    const accepted = providerPortal(h, valid);
+    await settle();
+    assert.equal(accepted.root.hasAttribute('inert'), false, 'exact URL is the positive control');
+    assert.equal(h.document.activeElement, accepted.iframe);
+    accepted.iframe.src = 'https://unrelated.example.test';
+    await settle();
+    assert.ok(accepted.root.hasAttribute('inert'), 'changing ownership revokes the exception');
+    assert.equal(h.q('[data-role="upgrade-sheet"]').getAttribute('aria-modal'), 'true');
+    accepted.iframe.src = valid;
+    await settle();
+    assert.equal(h.document.activeElement, accepted.iframe);
+    accepted.iframe.setAttribute('srcdoc', '<p>Changed ownership</p>');
+    await settle();
+    assert.ok(accepted.root.hasAttribute('inert'), 'srcdoc appearing on an active frame revokes the exception');
+    assert.equal(h.q('[data-role="upgrade-sheet"]').getAttribute('aria-modal'), 'true');
+});
+
+for ( const phase of ['initialization', 'mount'] ) {
+    test(`failed Stripe ${phase} releases provider ownership; Retry reuses the checkout session`, async h => {
+        let portal;
+        const initialize = h.stripe.initEmbeddedCheckout;
+        const mount = h.instance.mount;
+        if ( phase === 'initialization' ) h.stripe.initEmbeddedCheckout = async () => {
+            portal = providerPortal(h);
+            throw new Error('Simulated initialization failure');
+        };
+        else h.instance.mount = () => {
+            portal = providerPortal(h);
+            throw new Error('Simulated mount failure');
+        };
+        h.open();
+        await settle();
+        assert.match(h.text(), /Couldn't load the secure payment form/);
+        assert.ok(portal.root.hasAttribute('inert'), 'failed provider no longer bypasses the billing trap');
+        assert.equal(h.q('[data-role="upgrade-sheet"]').getAttribute('aria-modal'), 'true');
+        h.stripe.initEmbeddedCheckout = initialize;
+        h.instance.mount = mount;
+        h.click('[data-action="retry"]');
+        await settle();
+        assert.equal(h.mounted, 1);
+        assert.equal(h.count('billing.createCheckout'), 1);
+        assert.ok(portal.root.hasAttribute('inert'), 'old provider root is not adopted on Retry');
+        const next = providerPortal(h);
+        await settle();
+        assert.equal(next.root.hasAttribute('inert'), false);
+        assert.equal(h.document.activeElement, next.iframe);
+        h.handle.close();
+        assert.equal(h.closed, 0, 'provider hide must run before checkout destruction');
+        assert.ok(h.q('[data-role="upgrade-sheet"]'));
+        next.root.remove();
+        await h.tick(0);
+        assert.equal(h.closed, 1);
+        assert.equal(h.document.activeElement, h.q('#opener'));
+    });
+}
+
+test('closing during a simulated provider modal waits for provider tabindex and scroll restoration', async h => {
+    const opener = h.q('#opener');
+    opener.setAttribute('tabindex', '3');
+    h.document.body.style.overflow = 'auto';
+    h.status = async () => ({ status: 'pending', paymentStatus: 'unpaid' });
+    h.open();
+    await settle();
+    const handle = h.handle;
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    const embeddedFrame = h.q('#ezil-embedded-checkout iframe');
+    embeddedFrame.focus();
+    const portal = providerPortal(h, stripeModalURL('embedded-checkout-modal'));
+    // Simulate only the SDK's documented parent-page modal side effects. No
+    // Stripe cross-origin DOM is accessed or driven by this test.
+    opener.setAttribute('tabindex', '-1');
+    h.document.body.style.overflow = 'clip';
+    await settle();
+    const destroy = h.instance.destroy;
+    h.instance.destroy = () => {
+        assert.equal(portal.root.hidden, true, 'provider hide finishes before destroy');
+        assert.equal(opener.getAttribute('tabindex'), '3', 'provider restores its own tab stops');
+        assert.equal(h.document.body.style.overflow, 'hidden', 'provider restores the sheet scroll lock before sheet disposal');
+        destroy();
+    };
+    handle.close();
+    handle.close();
+    assert.equal(h.closed, 0);
+    assert.equal(h.destroyed, 0);
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), sheet);
+    assert.equal(h.open(), handle, 'pending close keeps the document checkout reservation');
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    portal.root.hidden = true;
+    // The provider hide routine restores scroll synchronously and schedules its
+    // tabindex restoration before the sheet's queued destruction task.
+    h.document.body.style.overflow = 'hidden';
+    h.window.setTimeout(() => opener.setAttribute('tabindex', '3'), 0);
+    await h.tick(0);
+    assert.equal(h.closed, 1);
+    assert.equal(h.destroyed, 1);
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null);
+    assert.equal(h.document.body.style.overflow, 'auto');
+    assert.equal(opener.getAttribute('tabindex'), '3');
+    assert.equal(opener.hasAttribute('inert'), false);
+    assert.equal(h.document.activeElement, opener);
+    assert.equal(h.timers.size, 0);
+    handle.close();
+    assert.equal(h.closed, 1);
+    assert.equal(h.destroyed, 1);
+});
+
 test('redirect checkout opens a safe new tab and polls pending → complete every 1.5 seconds', async h => {
     h.create = async () => ({ mode: 'redirect', sessionId: 'cs_redirect', url: 'https://checkout.stripe.com/test' });
     let polls = 0;
@@ -377,9 +636,11 @@ test('summary that never grants Standard gets the honest timeout, not a success 
     await settle();
     assert.ok(h.timers.size > 0);
     await h.tick(59999);
-    assert.match(h.text(), /Confirming your payment…/);
+    assert.match(h.text(), /Payment confirmation is pending/);
     await h.tick(1);
-    assert.match(h.text(), /Payment received — your plan updates in a moment\./);
+    assert.match(h.text(), /Payment confirmation is pending\. Bank payments can take a few days/);
+    assert.match(h.text(), /Check Settings → Billing for updates/);
+    assert.doesNotMatch(h.text(), /Payment received|You're on/);
     assert.equal(h.q('[data-role="upgrade-success"]'), null, 'a timely Standard response supplies the success control below');
     assert.equal(h.timers.size, 0, 'deadline was active above');
     const reads = h.count('billing.summary');
@@ -419,7 +680,8 @@ test('hung status and late summary cannot outrun the total deadline', async h =>
     await h.tick(60000);
     summary.resolve(standard);
     await settle();
-    assert.match(h.text(), /Payment received — your plan updates in a moment/);
+    assert.match(h.text(), /Payment confirmation is pending/);
+    assert.doesNotMatch(h.text(), /Payment received|You're on/);
     assert.equal(h.q('[data-role="upgrade-success"]'), null, 'timely Standard response succeeds in the control below');
     h.handle.close();
     h.summary = async () => standard;
@@ -519,7 +781,7 @@ test('default loader is single-flight, times out in 15 seconds and retries witho
     assert.equal(h.timers.size, 1, 'loader timer existed above; only the session watcher remains');
 });
 
-test('a paid session is noticed even when Stripe never calls onComplete', async h => {
+test('a completed session is noticed even when Stripe never calls onComplete', async h => {
     h.open();
     await settle();
     assert.equal(h.mounted, 1);
@@ -528,7 +790,99 @@ test('a paid session is noticed even when Stripe never calls onComplete', async 
     await h.tick(4000);
     await settle();
     assert.ok(h.count('billing.checkoutStatus') >= 1, 'the watcher asked the server about the session');
-    assert.match(h.text(), /Confirming your payment|You're on EZiL Standard|Payment received/);
+    assert.match(h.text(), /You're on EZiL Standard/);
+});
+
+test('completed unpaid bank session stays pending until the webhook-backed plan changes', async h => {
+    h.status = async () => ({ status: 'complete', paymentStatus: 'unpaid' });
+    h.summary = async () => free;
+    h.open();
+    await settle();
+    await h.tick(4000);
+    assert.match(h.text(), /Your payment is processing\. Bank payments can take a few days/);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    assert.equal(h.done, 0);
+    const summaryReads = h.count('billing.summary');
+    await h.tick(3000);
+    assert.ok(h.count('billing.summary') > summaryReads, 'pending bank confirmation keeps checking the authoritative plan');
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.destroyed, 0);
+    assert.ok(h.rendered.every(text => !/Payment received|You're on/.test(text)));
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid' });
+    await h.tick(1500);
+    assert.match(h.text(), /Payment received\. Waiting for your plan to update/);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'receipt alone still waits for the webhook-backed purchased plan');
+    h.summary = async () => standard;
+    await h.tick(1500);
+    assert.match(h.text(), /You're on EZiL Standard/);
+    assert.equal(h.done, 0, 'refresh is reserved for Done, after the server confirms the purchased SKU');
+});
+
+for ( const paymentStatus of ['paid', 'no_payment_required', 'unpaid', null, undefined, 'PAID', 'unexpected'] ) {
+    test(`checkout completion with paymentStatus=${paymentStatus} uses honest copy and waits for the plan`, async h => {
+        h.status = async () => ({ ok: true, data: { status: 'complete', paymentStatus } });
+        h.summary = async () => free;
+        h.open();
+        await settle();
+        h.complete();
+        await settle();
+        if ( paymentStatus === 'paid' ) assert.match(h.text(), /Payment received\. Waiting for your plan to update/);
+        else {
+            assert.doesNotMatch(h.text(), /Payment received/);
+            if ( paymentStatus === 'no_payment_required' ) assert.match(h.text(), /No payment is required\. Waiting for your plan to update/);
+            else if ( paymentStatus === 'unpaid' ) assert.match(h.text(), /Your payment is processing\. Bank payments can take a few days/);
+            else assert.match(h.text(), /Payment confirmation is pending/);
+        }
+        assert.equal(h.q('[data-role="upgrade-success"]'), null);
+        assert.equal(h.q('[data-action="retry"]'), null, 'processing never offers another payment');
+        assert.equal(h.done, 0);
+        const back = h.q('[data-action="return-to-billing"]');
+        assert.equal(back.textContent, 'Back to Billing');
+        await h.tick(1500);
+        assert.equal(h.q('[data-action="return-to-billing"]'), back, 'polling retains the pending action and focus target');
+        await h.tick(58500);
+        assert.match(h.text(), /Check Settings → Billing for updates/);
+        assert.equal(h.q('[data-role="upgrade-success"]'), null);
+        h.click('[data-action="return-to-billing"]');
+        assert.equal(h.done, 1);
+        assert.equal(h.closed, 1);
+        assert.equal(h.destroyed, 1);
+        assert.equal(h.count('billing.createCheckout'), 1);
+        assert.equal(h.timers.size, 0);
+    });
+}
+
+test('Back to Billing while bank processing is pending refreshes and closes without another payment', async h => {
+    h.status = async () => ({ status: 'complete', paymentStatus: 'unpaid' });
+    h.summary = async () => free;
+    h.open();
+    await settle();
+    h.complete();
+    await settle();
+    h.click('[data-action="return-to-billing"]');
+    assert.equal(h.done, 1);
+    assert.equal(h.closed, 1);
+    assert.equal(h.destroyed, 1);
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+});
+
+test('onComplete alone never grants the plan or claims payment received', async h => {
+    h.status = async () => ({ status: 'pending' });
+    h.open();
+    await settle();
+    h.complete();
+    h.complete();
+    await h.tick(60000);
+    assert.match(h.text(), /We could not confirm your payment yet/);
+    assert.equal(h.count('billing.summary'), 0, 'an incomplete checkout cannot advance to plan confirmation');
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    assert.equal(h.done, 0);
+    assert.ok(h.rendered.every(text => !/Payment received|You're on/.test(text)));
 });
 
 test('closing while the default script loads cancels its timeout', async h => {
