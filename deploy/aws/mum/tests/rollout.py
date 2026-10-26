@@ -2557,6 +2557,160 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][0]['appGitSha'],'7'*40)
         self.cli('ledger-init','--manifest',str(self.manifest),'--apply',expected=1)
 
+    def prepare_app_adoption(self):
+        ledger=RELEASE.load_ledger(self.ledger)
+        _,d=RELEASE.secret_deployment(self.envelope)
+        ledger['entries'][-1].update(state='completed',registrySha256=RELEASE.release_state(d,self.running_sha)['registrySha256'])
+        TOOL.write(self.ledger,ledger)
+        self.running_sha='a'*40
+        patch.dict(os.environ,PATH=self.env['PATH']).start()
+        return ledger
+
+    def assert_app_adoption_refused(self,message,git_sha=None):
+        before=self.ledger.read_bytes();secret=copy.deepcopy(self.envelope);running=self.running_sha
+        for apply in (False,True):
+            with self.subTest(apply=apply),self.assertRaisesRegex(ValueError,message):
+                RELEASE.ledger_adopt_app(git_sha or self.running_sha,self.root/'checkout',apply,self.ledger)
+            self.assertEqual(self.ledger.read_bytes(),before);self.assertEqual(self.envelope,secret)
+            self.assertEqual(self.running_sha,running);self.assertEqual(self.generation,0)
+
+    def test_ledger_adopt_app_dry_run_then_apply(self):
+        ledger=self.prepare_app_adoption();before=self.ledger.read_bytes();secret=copy.deepcopy(self.envelope)
+        _,d=RELEASE.secret_deployment(self.envelope)
+        with patch('sys.stdout',new_callable=io.StringIO) as output:
+            RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout')
+        self.assertEqual(output.getvalue().count('\n'),1);self.assertIn('DRY RUN: would append app-adopt completed generation 2',output.getvalue())
+        self.assertEqual(self.ledger.read_bytes(),before)
+        with patch('sys.stdout',new_callable=io.StringIO) as output:
+            RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout',True)
+        self.assertEqual(output.getvalue().count('\n'),1);self.assertIn('Ledger appended: app-adopt',output.getvalue())
+        updated=RELEASE.load_ledger(self.ledger);entry=updated['entries'][-1]
+        expected=RELEASE.observed_state(secret,d,self.running_sha)
+        self.assertEqual(entry,{'generation':2,'operation':'app-adopt','state':'completed','planSha256':'app-adopt:'+self.running_sha,
+                                'before':dict(expected,appGitSha='e'*40),'expected':expected,**expected})
+        self.assertEqual(updated['entries'][:-1],ledger['entries'])
+        self.assertIn(before[before.index(b'[')+1:before.rindex(b']')],self.ledger.read_bytes())
+        self.assertEqual(self.envelope,secret);self.assertEqual(self.generation,0);self.assertEqual(self.running_sha,'a'*40)
+        self.assertEqual(len(self.commands),2)
+        for payload in self.payloads.values():self.assertIn('INSTALL = False',payload)
+        calls=[json.loads(line) for line in (self.root/'calls.jsonl').read_text().splitlines()]
+        self.assertEqual([c for c in calls if c[0]=='git'],
+                         [['git','-C',str(self.root/'checkout'),'merge-base','--is-ancestor','e'*40,'a'*40]]*2)
+
+    def test_ledger_adopt_app_requires_existing_ledger(self):
+        self.prepare_app_adoption();self.ledger.unlink()
+        for apply in (False,True):
+            with self.assertRaisesRegex(ValueError,'requires an existing ledger'):
+                RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout',apply,self.ledger)
+            self.assertFalse(self.ledger.exists())
+
+    def test_ledger_adopt_app_pending_or_aborted_refused(self):
+        ledger=self.prepare_app_adoption();_,d=RELEASE.secret_deployment(self.envelope)
+        pending={'generation':2,'operation':'apply-app','planSha256':RELEASE.digest(self.path),'state':'pending',
+                 'before':RELEASE.observed_state(self.envelope,d,'e'*40),'expected':RELEASE.release_state(d,'e'*40)}
+        ledger['entries'].append(pending);TOOL.write(self.ledger,ledger)
+        self.assert_app_adoption_refused('requires a completed latest entry')
+        ledger['entries'].append({'generation':3,'operation':'apply-app','planSha256':pending['planSha256'],'state':'aborted',**pending['before']})
+        TOOL.write(self.ledger,ledger)
+        self.assert_app_adoption_refused('requires a completed latest entry')
+
+    def test_ledger_adopt_app_tuple_drift_refused(self):
+        ledger=self.prepare_app_adoption();ledger['entries'][-1]['tuple']['amiId']='ami-'+'9'*17
+        TOOL.write(self.ledger,ledger)
+        self.assert_app_adoption_refused('tuple drift')
+
+    def test_ledger_adopt_app_registry_drift_or_missing_pin_refused(self):
+        ledger=self.prepare_app_adoption();ledger['entries'][-1]['registrySha256']='9'*64
+        TOOL.write(self.ledger,ledger)
+        self.assert_app_adoption_refused('registry drift')
+        del ledger['entries'][-1]['registrySha256'];TOOL.write(self.ledger,ledger)
+        self.assert_app_adoption_refused('registry drift')
+
+    def test_ledger_adopt_app_live_sha_mismatch_refused(self):
+        self.prepare_app_adoption()
+        self.assert_app_adoption_refused('live git SHA mismatch','b'*40)
+
+    def test_ledger_adopt_app_same_sha_refused(self):
+        self.prepare_app_adoption();self.running_sha='e'*40
+        self.assert_app_adoption_refused('already recorded')
+
+    def test_ledger_adopt_app_non_ancestor_and_git_error_refused(self):
+        self.prepare_app_adoption()
+        for status in (1,128):
+            TOOL.write(self.root/'scenario.json',{'git_ancestor_status':status})
+            self.assert_app_adoption_refused('requires a forward descendant')
+
+    def test_ledger_adopt_app_envelope_change_refused(self):
+        self.prepare_app_adoption();before=self.ledger.read_bytes();real=RELEASE.app_operation
+        def changed(*args,**kwargs):
+            result=real(*args,**kwargs);self.envelope['VersionId']+='-changed';return result
+        for apply in (False,True):
+            with patch.object(RELEASE,'app_operation',side_effect=changed),self.assertRaisesRegex(ValueError,'inputs changed during readback'):
+                RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout',apply,self.ledger)
+            self.assertEqual(self.ledger.read_bytes(),before);self.assertEqual(self.generation,0)
+
+    def test_ledger_adopt_app_ledger_change_refused(self):
+        self.prepare_app_adoption();real=RELEASE.app_operation
+        def changed(*args,**kwargs):
+            result=real(*args,**kwargs);ledger=RELEASE.load_ledger(self.ledger)
+            ledger['entries'][-1]['secretVersionId']='concurrent-edit';TOOL.write(self.ledger,ledger)
+            return result
+        with patch.object(RELEASE,'app_operation',side_effect=changed),self.assertRaisesRegex(ValueError,'ledger changed during operation'):
+            RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout',True,self.ledger)
+        ledger=RELEASE.load_ledger(self.ledger)
+        self.assertEqual(len(ledger['entries']),1);self.assertEqual(ledger['entries'][-1]['secretVersionId'],'concurrent-edit')
+
+    def test_ledger_adopt_app_next_plan_admitted_and_begins_without_drift(self):
+        ledger=self.prepare_app_adoption();ledger['entries'][-1]['planSha256']=RELEASE.digest(self.path);TOOL.write(self.ledger,ledger)
+        plan=RELEASE.load_plan(self.path);_,d=RELEASE.secret_deployment(self.envelope)
+        with RELEASE.json_tool.app_secret_lock() as fd,self.assertRaisesRegex(ValueError,'ledger drift'):
+            RELEASE.begin_operation(self.ledger,ledger,self.path,plan,'apply-app',self.envelope,d,d,True,fd)
+        RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout',True,self.ledger)
+        with self.assertRaisesRegex(ValueError,'stale plan'):
+            RELEASE.ledger_admit(self.ledger,self.path,plan,self.envelope,d,'apply-app')
+        self.path.unlink();RELEASE.make_plan(self.directory,self.config,self.identity,'1234567890123456789',self.rollout)
+        plan=RELEASE.load_plan(self.path);self.assertEqual(plan['ledgerGeneration'],2)
+        with RELEASE.json_tool.app_secret_lock() as fd:
+            ledger=RELEASE.ledger_admit(self.ledger,self.path,plan,self.envelope,d,'apply-app')
+            ledger,generation=RELEASE.begin_operation(self.ledger,ledger,self.path,plan,'apply-app',self.envelope,d,d,True,fd)
+        self.assertEqual(generation,3);self.assertEqual(RELEASE.load_ledger(self.ledger),ledger)
+        self.assertEqual(ledger['entries'][-1]['state'],'pending');self.assertEqual(ledger['entries'][-1]['before']['appGitSha'],self.running_sha)
+
+    def test_ledger_adopt_app_cli_dry_run_apply_and_required_inputs(self):
+        self.prepare_app_adoption();TOOL.write(self.root/'secret.json',self.envelope)
+        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':self.running_deployment})
+        flags=['--git-sha',self.running_sha,'--source-repo',str(self.root/'checkout')];before=self.ledger.read_bytes()
+        for args in ([],flags[:2],flags[2:],['--git-sha','bad',*flags[2:]],flags+['--plan',str(self.path)]):
+            self.cli('ledger-adopt-app',*args,expected=1)
+            self.assertEqual(self.ledger.read_bytes(),before)
+        result=self.cli('ledger-adopt-app',*flags)
+        self.assertIn('DRY RUN: would append app-adopt',result.stdout);self.assertEqual(self.ledger.read_bytes(),before)
+        result=self.cli('ledger-adopt-app',*flags,'--apply')
+        self.assertIn('Ledger appended: app-adopt',result.stdout)
+        self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['appGitSha'],self.running_sha)
+
+    def test_ledger_adopt_app_sha_validation(self):
+        self.prepare_app_adoption()
+        for sha in ('a'*39,'a'*41,'g'*40,'a'*40+'\n'):
+            self.assert_app_adoption_refused('requires a 40-hex git SHA',sha)
+
+    def test_ledger_adopt_app_schema_binds_snapshots_and_sentinel(self):
+        self.prepare_app_adoption();RELEASE.ledger_adopt_app(self.running_sha,self.root/'checkout',True,self.ledger)
+        valid=RELEASE.load_ledger(self.ledger)
+        cases=[]
+        for field,value in (('planSha256','f'*64),('state','aborted'),('appGitSha','b'*40),('appGitSha',None),('before',{}),('expected',{})):
+            bad=copy.deepcopy(valid);bad['entries'][-1][field]=value;cases.append(bad)
+        for field,value in (('secretVersionId','changed'),('registrySha256','9'*64),('appGitSha','b'*40)):
+            bad=copy.deepcopy(valid);bad['entries'][-1]['before'][field]=value;cases.append(bad)
+        bad=copy.deepcopy(valid);bad['entries'][-1]['before']['tuple']['amiId']='ami-'+'9'*17;cases.append(bad)
+        bad=copy.deepcopy(valid);bad['entries'][-1]['expected']['appGitSha']='b'*40;cases.append(bad)
+        bad=copy.deepcopy(valid);bad['entries'][-1]['before']['appGitSha']=self.running_sha;cases.append(bad)
+        bad=copy.deepcopy(valid);bad['entries']=bad['entries'][1:];bad['entries'][0]['generation']=1;cases.append(bad)
+        bad=copy.deepcopy(valid);del bad['entries'][0]['registrySha256'];cases.append(bad)
+        for bad in cases:
+            TOOL.write(self.ledger,bad)
+            with self.subTest(entry=bad['entries'][-1]),self.assertRaises(ValueError):RELEASE.load_ledger(self.ledger)
+
     def test_maintenance_promotion_and_invalid_target_lineage_still_refuse(self):
         self.through_app()
         with patch.object(RELEASE,'load_plan',return_value=dict(RELEASE.load_plan(self.path),maintenance=True)):

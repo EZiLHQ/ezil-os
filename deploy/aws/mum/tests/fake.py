@@ -61,6 +61,9 @@ if tool == "git":
         out("blob" if args[-1].endswith("/maintenance.py") else "tree")
     elif "archive" in args:
         Path(flag("--output")).write_bytes(b"synthetic archive")
+    elif "merge-base" in args:
+        assert len(args) == 6 and args[0] == '-C' and args[2:4] == ['merge-base', '--is-ancestor']
+        raise SystemExit(scenario.get('git_ancestor_status', 0))
     else:
         raise SystemExit("unexpected git command")
 elif tool == "docker":
