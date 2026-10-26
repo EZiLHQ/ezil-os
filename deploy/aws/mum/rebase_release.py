@@ -75,6 +75,9 @@ def load_ledger(ledger_path):
             fields.add('registrySha256')
         if isinstance(entry, dict) and 'state' in entry:
             fields.add('state')
+        adopt = isinstance(entry, dict) and entry.get('operation') == 'app-adopt'
+        if adopt:
+            fields |= {'state', 'before', 'expected', 'registrySha256'}
         need(isinstance(entry, dict) and set(entry) == fields, 'invalid ledger entry')
         need(state in ('pending', 'completed', 'aborted'), 'invalid ledger state')
         need(type(entry['generation']) is int and entry['generation'] == generation, 'invalid ledger generation')
@@ -82,10 +85,17 @@ def load_ledger(ledger_path):
         if state == 'pending':
             need(isinstance(entry['before'], dict) and set(entry['before']) - {'registrySha256'} == {'secretVersionId', 'tuple', 'appGitSha'} and
                  isinstance(entry['expected'], dict) and set(entry['expected']) - {'registrySha256'} == {'tuple', 'appGitSha'}, 'invalid pending snapshots')
+        if adopt:
+            need(state == 'completed' and all(isinstance(entry[k], dict) and
+                 set(entry[k]) == {'secretVersionId', 'tuple', 'registrySha256', 'appGitSha'} for k in ('before', 'expected')),
+                 'invalid app-adopt snapshots')
+            snapshots = [entry, entry['before'], entry['expected']]
         for snapshot in snapshots:
             need('registrySha256' not in snapshot or manifest.matches(r'[0-9a-f]{64}', snapshot['registrySha256']), 'invalid ledger registry hash')
-            need(manifest.matches(r'[0-9a-f]{64}', entry['planSha256']) and manifest.matches(r'[0-9a-f]{40}', snapshot['appGitSha']), 'invalid ledger source pin')
-            need(entry['operation'] in ('apply-app', 'promote-canary', 'rollback', 'registry-gc') and
+            need(manifest.matches(r'[0-9a-f]{40}', snapshot['appGitSha']) and
+                 (entry['planSha256'] == 'app-adopt:' + entry['appGitSha'] if adopt else manifest.matches(r'[0-9a-f]{64}', entry['planSha256'])),
+                 'invalid ledger source pin')
+            need(entry['operation'] in ('apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt') and
                  isinstance(snapshot.get('secretVersionId', 'expected'), str) and bool(snapshot.get('secretVersionId', 'expected')), 'invalid ledger operation/version')
             need(isinstance(snapshot['tuple'], dict) and set(snapshot['tuple']) == set(manifest.PROMOTION), 'invalid ledger tuple')
         if entry['operation'] == 'registry-gc':
@@ -97,7 +107,14 @@ def load_ledger(ledger_path):
                      entry['before']['registrySha256'] != entry['expected']['registrySha256'],
                      'registry-gc must change only registry identity')
         prior = entries[generation - 2] if generation > 1 else None
-        if prior and prior.get('state') == 'pending':
+        if adopt:
+            need(prior is not None and prior.get('state', 'completed') == 'completed' and 'registrySha256' in prior,
+                 'app-adopt requires completed registry baseline')
+            need(state_matches(entry['before'], prior) and
+                 entry['expected'] == {k: entry[k] for k in entry['expected']} and
+                 entry['before'] == {**entry['expected'], 'appGitSha': prior['appGitSha']} and
+                 entry['appGitSha'] != prior['appGitSha'], 'app-adopt must change only app identity')
+        elif prior and prior.get('state') == 'pending':
             need(state in ('completed', 'aborted') and entry['planSha256'] == prior['planSha256'] and entry['operation'] == prior['operation'], 'unresolved pending ledger entry')
             if entry['operation'] == 'registry-gc':
                 need(state_matches(entry, prior['expected' if state == 'completed' else 'before']),
@@ -164,6 +181,10 @@ def ledger_entry(path, operation, envelope, d, git_sha, generation):
 
 def write_ledger_entry(ledger_path, ledger, path, plan, entry):
     need(load_plan(path) == plan, 'plan changed before ledger append')
+    return write_ledger_append(ledger_path, ledger, entry)
+
+
+def write_ledger_append(ledger_path, ledger, entry):
     need(load_ledger(ledger_path) == ledger, 'ledger changed during operation')
     # json_tool.write uses temp + fsync + rename + directory fsync. Caller holds app-secret.lock.
     updated = {**ledger, 'entries': [*ledger['entries'], entry]}
@@ -721,9 +742,43 @@ def ledger_init(manifest_path, apply, ledger_path=None):
             print('DRY RUN: promoted journal and live tuple verified; add --apply to initialize ledger')
 
 
+def ledger_adopt_app(git_sha, source_repo, apply=False, ledger_path=None):
+    need(manifest.matches(r'[0-9a-f]{40}', git_sha), 'ledger-adopt-app requires a 40-hex git SHA')
+    ledger_path = Path(ledger_path or LEDGER_PATH)
+    with json_tool.app_secret_lock() as fd:
+        need(ledger_path.is_file(), 'ledger-adopt-app requires an existing ledger')
+        ledger = load_ledger(ledger_path)
+        latest = ledger['entries'][-1]
+        need(latest.get('state', 'completed') == 'completed', 'ledger-adopt-app requires a completed latest entry')
+        envelope = json_tool.secret_aws(['get-secret-value', '--secret-id', json_tool.SECRET, '--output', 'json'], lock_fd=fd)
+        _, d = secret_deployment(envelope)
+        before = observed_state(envelope, d, latest['appGitSha'])
+        need(before['tuple'] == latest['tuple'], 'ledger-adopt-app tuple drift')
+        need(before['registrySha256'] == latest.get('registrySha256'), 'ledger-adopt-app registry drift')
+        # Readback requires artifact-shaped inputs, but never uses them to install.
+        plan = {'rollout': {'app': {'tag': 'ledger-adopt-app', 'gitSha': git_sha, 'checksumSha256': '0' * 64}}}
+        generation = latest['generation'] + 1
+        result = app_operation(ledger_path, plan, 'ledger-adopt-app-g' + str(generation) + '-' + git_sha[:12],
+                               True, rebase_app.public_deployment(d), install=False)
+        need(result is not None and result.get('gitSha') == git_sha, 'ledger-adopt-app live git SHA mismatch')
+        need(git_sha != latest['appGitSha'], 'ledger-adopt-app already recorded')
+        ancestor = subprocess.run(['git', '-C', str(source_repo), 'merge-base', '--is-ancestor', latest['appGitSha'], git_sha],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False)
+        need(ancestor.returncode == 0, 'ledger-adopt-app requires a forward descendant')
+        check = json_tool.secret_aws(['get-secret-value', '--secret-id', json_tool.SECRET, '--output', 'json'], lock_fd=fd)
+        need(check == envelope, 'ledger-adopt-app inputs changed during readback')
+        expected = observed_state(envelope, d, git_sha)
+        entry = {'generation': generation, 'planSha256': 'app-adopt:' + git_sha, 'operation': 'app-adopt', 'state': 'completed',
+                 'before': before, 'expected': expected, **expected}
+        if apply:
+            write_ledger_append(ledger_path, ledger, entry)
+        print(('Ledger appended: ' if apply else 'DRY RUN: would append ') +
+              f'app-adopt completed generation {generation}, app {latest["appGitSha"]} -> {git_sha}')
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile'))
+    parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile', 'ledger-adopt-app'))
     parser.add_argument('--release-dir', type=Path)
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--manifest', type=Path)
@@ -732,6 +787,8 @@ def main():
     parser.add_argument('--expect-system-id')
     parser.add_argument('--rollout', type=Path)
     parser.add_argument('--ledger', type=Path, default=LEDGER_PATH)
+    parser.add_argument('--git-sha')
+    parser.add_argument('--source-repo', type=Path)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     if args.operation == 'plan':
@@ -755,6 +812,10 @@ def main():
     elif args.operation=='ledger-reconcile':
         need(args.plan is not None and args.manifest is None,'ledger-reconcile requires --plan')
         ledger_reconcile(args.plan,args.apply,args.ledger)
+    elif args.operation=='ledger-adopt-app':
+        need(args.git_sha is not None and args.source_repo is not None and args.plan is None and args.manifest is None,
+             'ledger-adopt-app requires --git-sha and --source-repo')
+        ledger_adopt_app(args.git_sha,args.source_repo,args.apply,args.ledger)
     else:
         need(args.manifest is not None and args.plan is None,'promotion/rollback requires --manifest')
         promote(args.manifest,args.apply,args.operation=='rollback',args.ledger)
