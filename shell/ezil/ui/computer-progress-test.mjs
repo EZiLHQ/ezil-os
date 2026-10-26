@@ -42,7 +42,7 @@ try{
  resolve({ok:true,data:{...base,computerId:'foreign'}});await tick();assert.equal(received.at(-1),null);observer.stop();
  globalThis.fetch=async()=>({ok:true,status:200,json:async()=>({result:{data:{json:{...base,operationsPaused:true}}}})});
  const spinner=AppSpinner({computerId:'qa-computer',isMigrating:()=>true});document.body.appendChild(spinner.el);spinner.render({kind:'progress'});await tick();
- assert.equal(spinner.el.querySelector('.ezil-app-spinner-label').textContent,'Computer operations are paused');
+ assert.equal(spinner.el.querySelector('.ezil-app-spinner-label').textContent,'Computer startup is temporarily paused');
  assert.equal(spinner.el.querySelector('.ezil-app-spinner-ring').hidden,true);
  assert.equal(spinner.el.querySelector('ol'),null);
  assert.match(spinner.el.textContent,/Applies after you stop this session and start again/);

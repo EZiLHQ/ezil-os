@@ -15,7 +15,7 @@ async function until(fn) {
 
 const copies = {
     unavailable: ['Opening', 'Detailed computer progress is unavailable.'],
-    paused: ['Computer operations are paused', 'Check this view later. No transfer is currently running.'],
+    paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
     moving: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
     launching: ['Starting computer', 'Startup is in progress. A finish time is not available.'],
     both: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],

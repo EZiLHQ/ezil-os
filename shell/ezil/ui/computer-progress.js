@@ -2,9 +2,9 @@
 import trpc from './Settings/trpc.js';
 
 const stages = {
-    operations_paused: ['Computer operations are paused', 'Check this view later. No transfer is currently running.'],
-    needs_operator: ['Computer needs attention', 'An operator must resolve this before the transition can continue.'],
-    queued: ['Waiting to start', 'The request is queued. No transfer is currently running.'],
+    operations_paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
+    needs_operator: ['Computer needs attention', 'Check the computer’s current status before trying again.'],
+    queued: ['Waiting to start', 'Waiting for the saved request to begin.'],
     fenced: ['Workspace secured', 'Preparing the saved workspace for migration.'],
     exported: ['Workspace saved', 'The saved workspace is ready for the new computer.'],
     provisioning: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
