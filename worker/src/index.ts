@@ -727,7 +727,7 @@ const corsHeaders = {
 // Only these public protocol codes may leave the shared error-response boundary.
 // A code-shaped exception message is still private unless it is in this list.
 const PUBLIC_ERROR_CODES = [
-  'repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination',
+  'repo_timeout', 'repo_recovery_required', 'repo_auth_required', 'repo_not_authorized', 'repo_cli_unavailable', 'repo_unsafe_destination',
   'repo_clone_failed', 'repo_open_failed', 'repo_invalid_request', 'repo_unauthorized',
   'acceptance_auth_not_configured', 'acceptance_fault_bad_request', 'acceptance_fault_failed',
   'acceptance_faults_disabled', 'acceptance_reset_failed', 'acceptance_reset_unsupported',

@@ -472,6 +472,8 @@ EXPOSE 9223
 
 # Private repository operation; CLI artifact is supplied by the reviewed staging build.
 COPY repo-open /opt/ezil-repo-open
+RUN python3 -m py_compile /opt/ezil-repo-open/supervise.py \
+    && node --check /opt/ezil-repo-open/open.mjs
 # Default/public builds contain no private CLI. Staging supplies the reviewed bundle
 # using --secret id=ezil_cli_bundle,src=... and --build-arg EZIL_PRIVATE_CLI=1.
 ARG EZIL_PRIVATE_CLI=0

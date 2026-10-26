@@ -71,3 +71,30 @@ current deployed app SHA, Worker/version, desktop/host image digests and rollbac
 isolation/fixture verification; staging deployment through existing preview/wrangler staging path; real browser
 clone/open/reopen/refresh/dirty-state and cross-user/injection negatives. No main/production deployment.
 Do not mark the task Done on this handoff.
+
+## Timeout review correction
+
+Independent OS review of 5211678a found parent-only execFile timeout could orphan Git and strand a lock.
+The OS runner now invokes a small Linux Python subreaper (Python already exists in the desktop image).
+It starts exactly one CLI in a new session/process group, sends TERM at the deadline, allows three seconds
+for cooperative CLI cleanup, then sends KILL to that operation group only if still present. It reaps the
+CLI and adopted descendants before returning; no supervisor filesystem deletion exists.
+An ordinary CLI exit following cancellation returns repo_timeout. Signal death or forced termination
+returns repo_recovery_required, leaving uncertain locks/temp state untouched for verified recovery.
+
+The CLI owner agreed to abort owned API/lock waits/Git on TERM/INT, await Git and run its existing finally
+cleanup before an ordinary nonzero exit. This requires a new independently reviewed cancellation artifact;
+currently pinned v3 is the approved transport-isolation baseline, NOT sufficient release acceptance for this
+cooperative cleanup dependency. No deployment until that follow-up artifact is reviewed and pinned.
+
+V3 approved baseline: source 78eab80c79518132e6a4af0bc66e30fa0ef25fbf,
+version 0.2.1-repo-url-open.20261026.3. Pin metadata supersedes the earlier v2 candidate above.
+Reviewer did not independently reproduce the full bundle because its Bun version differed from the recorded
+1.3.14 author build; artifact/source metadata and bounded source were reviewed. Private bundle remains outside OS.
+
+Targeted tests: eight Node runtime/supervisor cases, including real stalled Git, group death/reaping, retry,
+actual Git checkout dirty-file preservation, unrelated process survival, and preservation of unknown lock state;
+two Worker wire cases and five app handoff cases. Both TypeScript checks pass. No shell appearance changes.
+The real-Git supervisor fixture models cooperative CLI cleanup; exact rebuilt CLI integration remains a separate gate.
+Full Next build compiled and passed TypeScript but page collection failed for missing server environment variables.
+No AWS, lease, deployment, or credential actions were taken for this correction.
