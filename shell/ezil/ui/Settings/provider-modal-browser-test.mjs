@@ -233,6 +233,8 @@ try {
         // Interact with our simulated checkout document, never a real provider.
         await page.frameLocator('#embedded-fixture').getByRole('button', { name: 'Card', exact: true }).click();
         await page.frameLocator('#embedded-fixture').getByRole('textbox').fill('synthetic-card-input');
+        // postMessage is asynchronous across the fixture iframe boundary.
+        await page.waitForFunction(() => window.fixture.cardSelected === true, null, { timeout: 8000 });
         assert.equal(await page.evaluate(() => window.fixture.cardSelected), true);
         await page.frameLocator('#embedded-fixture').getByRole('button', { name: 'Bank', exact: true }).click();
         await page.waitForSelector('#provider-first', { state: 'attached' });
