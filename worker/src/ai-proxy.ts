@@ -39,6 +39,7 @@ const AI_ROUTES: Readonly<Record<string, AiRoute>> = {
   'POST /ai/v1/messages': { method: 'POST', upstreamPath: '/v1/messages', query: [], label: 'POST /v1/messages' },
   'GET /ai/v1/requests/:id': { method: 'GET', upstreamPath: '/v1/requests/:id', query: [], label: 'GET /v1/requests/:id' },
   'GET /ai/v1/me/balance': { method: 'GET', upstreamPath: '/v1/me/balance', query: [], label: 'GET /v1/me/balance' },
+  'GET /ai/v1/me/limits': { method: 'GET', upstreamPath: '/v1/me/limits', query: [], label: 'GET /v1/me/limits' },
   'GET /ai/v1/me/usage': { method: 'GET', upstreamPath: '/v1/me/usage', query: ['limit', 'before'], label: 'GET /v1/me/usage' },
 };
 
