@@ -14,6 +14,7 @@ async function until(fn) {
 }
 
 const copies = {
+    unavailable: ['Opening', 'Detailed computer progress is unavailable.'],
     paused: ['Computer operations are paused', 'Check this view later. No transfer is currently running.'],
     moving: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
     launching: ['Starting computer', 'Startup is in progress. A finish time is not available.'],
@@ -41,7 +42,7 @@ async function open(t, app, initialMode = 'moving') {
         const path = String(raw);
         let body = { ok: true };
         if (path.includes('/api/trpc/computer.progress')) {
-            const stage = mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : 'starting';
+            const stage = mode === 'unavailable' ? 'unavailable' : mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : 'starting';
             body = {result:{data:{json:{version:1,computerId:'computer-1',stage,recordedStage:'provisioning',operationsPaused:mode==='paused',active:mode!=='paused',operation:['moving','both','paused'].includes(mode)?'migration':'opening',durable:['moving','both','paused'].includes(mode),resumePolicy:'saved_workspace_only',bytes:{transferred:null,total:null},percent:null,etaSeconds:null}}}};
         } else if (['/api/shell/desktop', '/api/shell/code-preview-url', '/api/shell/preview-url'].includes(path) && init.method === 'POST') {
             asks[path.includes('code') ? 'code' : path.includes('preview') ? 'preview' : 'desktop']++;
@@ -68,11 +69,18 @@ async function open(t, app, initialMode = 'moving') {
     await registry.launch(app, { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState });
     const win = await until(() => w.document.querySelector(`.window[data-app="${app}"]`));
     const spinner = win.querySelector('.ezil-app-spinner');
-    await until(() => spinner.querySelector('.ezil-app-spinner-label').textContent === copies[initialMode][0]);
+    await until(() => initialMode === 'unavailable' ? spinner.querySelector('.ezil-app-spinner-label').textContent.startsWith('Opening ') && spinner.querySelector('.ezil-app-spinner-sub').textContent === copies.unavailable[1] : spinner.querySelector('.ezil-app-spinner-label').textContent === copies[initialMode][0]);
     return { w, win, spinner, asks, setMode: m => { mode = m; }, setNow: ms => { now = ms; } };
 }
 
 for (const app of ['code', 'desktop', 'preview']) {
+    test(`${app}: ordinary CF with no AWS record keeps physical pending app copy`, async t => {
+        const h = await open(t, app, 'unavailable');
+        assert.match(h.spinner.querySelector('.ezil-app-spinner-label').textContent, /^Opening /);
+        assert.equal(h.spinner.querySelector('.ezil-app-spinner-ring').hidden, false);
+        assert.match(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, /progress is unavailable/);
+        assert.doesNotMatch(h.spinner.textContent, /Moving your computer/);
+    });
     test(`${app}: authoritative pause wins over recorded migration and hides active transfer`, async t => {
         const h = await open(t, app, 'paused');
         assert.equal(h.spinner.querySelector('.ezil-app-spinner-ring').hidden, true);
