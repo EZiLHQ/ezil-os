@@ -93,17 +93,36 @@ Production is out of scope for v1 (later port: Gateway prod migrations `0028+`).
   - With a value: `entitlementId = ezil-os:v1:topup:<packSku>:<paymentIntentId>`, `eventId = <entitlementId>:grant`, `expiresAt` = existing `purchasedPeriod(event.created).end`.
   - Full refund → `revoke` from the stored receipt (frozen `accountPublicId`).
   - Legacy `amountUsdMicro` rows are untouched.
-- **Dispute restoration (event-correct):**
-  - Refund revokes are terminal: never restored.
-  - On `restore` (dispute won), for each AI receipt revoked by **that dispute**, enqueue kind `ai_restore`, action `restore`, `eventId = <entitlementId>:restore:<disputeId>`, with the original entitlementId, credits and expiresAt.
-  - Delivery claims an `ai_restore` row only after that entitlement's `ai_revoke` row is delivered. Delivery timestamps are never used for ordering.
-  - OS delivery's event check today requires `eventId === entitlementId + ':' + action`; for `restore` the rule is `eventId === entitlementId + ':restore:' + disputeId` (O-credits follow-up).
-- **Gateway `restore` action** (ledger lane G5; `32_entitlement_restore.sql` widens the event action check and replaces `ezil_ai.entitlement_event`, recording the previous md5 for rollback):
-  - for an entitlement whose grant was revoked by a prior event, and only once **no reservation on that grant is open** (else 409 `restore_hold_pending`; the OS retries), create **one new grant**. Its `credits_micro` = the micro forfeited by the revoke row(s) **plus** any positive remainder later stranded on the revoked grant when holds that were open at revoke time settled. Equivalently, the original credits minus everything actually debited. It keeps the original `expires_at`;
-  - the new grant is addressable as entitlement `<entitlementId>:restore:<disputeId>`, so a later revoke can target it;
-  - idempotent per eventId: a replay returns `already_restored` and **never mints**; the ledger stays append-only (no un-revoke);
-  - outcomes `restored` | `already_restored` | 409 `restore_not_revoked` (OS retries) | `restore_expired` (OS done; no grant) | `restore_nothing_forfeited` (OS done; no grant).
-  - Hook body fields are unchanged; `action` accepts `restore`; `credits` must equal the original grant's credits (consistency check), else 409 `event_conflict`.
+- **Dispute restoration — restore chains (W0.3; supersedes the W0.2 restore text).**
+  - **Chain.** An original entitlement `E` (generation 0, entitlement id `E`) and its restore grants (generation k ≥ 1, entitlement id = the restore eventId). At most **one** generation of a chain is unrevoked at any time; it is the chain **head**.
+  - **Event id grammar** (the Gateway parses it for `revoke`/`restore`; `grant` is unchanged):
+    - `E:revoke:dispute:<disputeId>`: a restorable revocation;
+    - `E:revoke:refund:<refundId>`: a terminal revocation (never restored);
+    - legacy `E:revoke` (rows queued before this change): terminal;
+    - `E:restore:<disputeId>`.
+  - **Revoke** with `entitlementId = E` always targets the chain head: generation 0 if it is unrevoked, else the latest restore grant. If the head is already revoked → outcome `already_revoked` (no-op). Each eventId is idempotent.
+  - **Restore** `E:restore:<D>` is valid only when all of these hold:
+    - the head is revoked by exactly `E:revoke:dispute:<D>`;
+    - that revocation has not been restored;
+    - no reservation on the head is open;
+    - the root grant has not expired.
+  - **Restore refusals:**
+    - head unrevoked → 409 `restore_not_revoked`;
+    - head revoked by a different event → 409 `restore_mismatch`;
+    - head revoked by refund or legacy → `restore_refused_terminal` (OS done, no grant);
+    - open hold → 409 `restore_hold_pending` (OS retries);
+    - expired → `restore_expired`;
+    - nothing unspent → `restore_nothing_forfeited`.
+  - **Restore amount** = the revoked head's unspent value: its `credits_micro` minus every debit ever posted to it (the revoke forfeiture plus any remainder stranded on it when open holds settled). It mints **one** new head with the root grant's `expires_at`, `source 'entitlement'`, entitlement id = the restore eventId. A replay → `already_restored`, never mints.
+  - **Invariant** (tested): for every chain, Σ debits over all generations + Σ remaining over unrevoked generations ≤ the root grant's credits, and at most one generation is unrevoked.
+  - Revoke and restore on the same chain serialize: lock on the root entitlement id.
+  - The hook body is unchanged; `credits` must equal the root grant's whole credits, else 409 `event_conflict`.
+  - **Gateway work (G5):** `src/entitlements.ts` accepts `restore`, `32_entitlement_restore.sql` implements the above, and new tests. The previous `entitlement_event` md5 is recorded; the rollback refuses if any chain generation ≥ 1 exists.
+  - **OS follow-up (O-credits, after G5 lands):**
+    - refund revokes emit `E:revoke:refund:<refundId>`; dispute revokes emit `E:revoke:dispute:<disputeId>`; a won dispute emits `restore` with `E:restore:<disputeId>`, always for the **root** `E` (the Gateway resolves the head);
+    - the delivery check accepts exactly these grammars;
+    - `ai_restore` is claimed only after the matching dispute revoke is delivered;
+    - refund receipts never produce a restore.
 - **Stripe inbox:** the same Stripe event id with a different payload sha256 → reject (HTTP 409 `event_conflict`, no processing, review log). An identical replay stays idempotent.
 
 ## 6. Canonical AI balance (parity) and service balance read
@@ -111,13 +130,12 @@ Production is out of scope for v1 (later port: Gateway prod migrations `0028+`).
 - Gateway: `POST /v1/integrations/balance`.
   - Same HMAC scheme as entitlements (`X-EZiL-Timestamp`, `X-EZiL-Signature: v1=…`, `ENTITLEMENT_HMAC_SECRET`, skew check).
   - Body exactly `{accountPublicId}` → 200 `{account_public_id, state, available_micro, held_micro}`, where `state` is the `/v1/me/balance` vocabulary (`ok|exhausted|paused_reconciliation|paused_operations`); 404 `account_not_found`. Read-only.
-- OS module `app/src/server/billing/ai-balance-state.ts` (O-API), `canonicalAiBalance(gateway: {state, available_micro, held_micro} | null, planGrantCredits: number)` → `{balance: number|null, state: 'ok'|'warning'|'exhausted'|'paused'|'unknown'}`:
-  - `balance = floor(available_micro / 1e6)`;
-  - `paused_*` → `paused`;
-  - `available_micro == 0` → `exhausted`. Decide on micro, never on the floored number;
-  - `available_micro ≤ 10% of planGrantCredits × 1e6` → `warning`;
-  - else `ok`; unreadable → `unknown` with balance null.
-- The OS summary (`BillingSummaryV3.ai.state`) adopts this vocabulary.
+- **OS views keep exact fractions (W0.3, aligned with the O-API phase-1 implementation).**
+  - `ai.balanceMicro` is the exact decimal string; `ai.balance` is credits exact to 6 decimals and is **never floored** in OS views.
+  - `exhausted` iff `available_micro == 0`; `warning` iff `available_micro ≤ 10% of the plan grant × 1e6`; else `ok`; unreadable → `unknown` with null balance.
+  - Pauses (`paused_*` or the models killswitch) are reported as a separate spending state and are never shown as healthy.
+  - The legacy `ai.state`/`ai.balance` fields stay compatible as the O-API patch defines them.
+  - A whole-credit floor applies only at the Universe REST boundary (v1.1), because that client validates integers.
 - The REST entitlement `ai` field is `{balance, state}` only for `ok|warning|exhausted`, and `null` for `paused|unknown` (the Universe client treats null as unknown).
 
 ## 7. OS REST adapter for Universe — DEFERRED to v1.1 (not dispatched)
