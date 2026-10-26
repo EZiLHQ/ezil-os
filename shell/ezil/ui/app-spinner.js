@@ -113,10 +113,11 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         }
 
         if (state.kind === 'progress' && observer) {
-            el_ring.hidden = true;
-            el_label.textContent = progressChecked ? 'Progress unavailable' : 'Checking computer progress…';
-            el_sub.hidden = false;
-            el_sub.textContent = 'Waiting for a current server observation. A finish time is not available.';
+            // Optional AWS/migration metadata must not replace physical app startup.
+            el_ring.hidden = false;
+            el_label.textContent = label;
+            el_sub.hidden = !progressChecked;
+            el_sub.textContent = progressChecked ? 'Detailed computer progress is unavailable.' : '';
             el_actions.hidden = true;
             return;
         }

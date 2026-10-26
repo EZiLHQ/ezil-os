@@ -31,7 +31,7 @@ export function progressView(data, computerId) {
     if (!data || data.version !== 1 || data.computerId !== computerId) return null;
     const stage = data.operationsPaused === true || data.paused === true || data.stage === 'operations_paused' ? 'operations_paused'
         : data.needsOperator === true || data.stage === 'needs_operator' ? 'needs_operator' : data.stage;
-    if (!Object.hasOwn(stages, stage)) return null;
+    if (!Object.hasOwn(stages, stage) || stage === 'unavailable') return null;
     const current = migrationSteps.indexOf(stage);
     const hardware = data.selectedNextOpenHardware;
     const next = hardware?.effective === 'next_open' && Number.isSafeInteger(hardware.vcpu) && hardware.vcpu > 0
@@ -75,7 +75,7 @@ export function observeComputerProgress({ computerId, element, onChange, query =
     };
     return {
         start() {
-            if (watching || !computerId) return;
+            if (watching || !computerId || !element.isConnected) return;
             watching = true; document.addEventListener('visibilitychange', visibility); void poll();
         },
         stop() {

@@ -29,10 +29,11 @@ const originalSet=globalThis.setTimeout,originalClear=globalThis.clearTimeout;
 const timers=new Map();let id=0;globalThis.setTimeout=(fn,ms)=>{timers.set(++id,{fn,ms});return id;};globalThis.clearTimeout=id=>timers.delete(id);
 const tick=async()=>{for(let i=0;i<15;i++)await Promise.resolve();};
 try{
- const element=document.createElement('div');document.body.appendChild(element);
+ const element=document.createElement('div');
  let resolve;const calls=[],received=[];
  const observer=observeComputerProgress({computerId:'qa-computer',element,onChange:x=>received.push(x),query:(...args)=>{calls.push(args);return new Promise(r=>resolve=r);}});
- observer.start();observer.start();assert.equal(calls.length,1,'no concurrent duplicate poll');
+ observer.start();assert.equal(calls.length,0,'disconnected start does not latch watching or query');
+ document.body.appendChild(element);observer.start();observer.start();assert.equal(calls.length,1,'connected retry starts once without duplicate polling');
  assert.deepEqual(calls[0],['computer.progress',{computerId:'qa-computer'}]);
  observer.stop();resolve({ok:true,data:base});await tick();assert.equal(received.length,0,'closed observer ignores pending response');
  observer.start();resolve({ok:true,data:{...base,operationsPaused:true}});await tick();assert.equal(received.at(-1).active,false);
@@ -47,5 +48,21 @@ try{
  assert.match(spinner.el.textContent,/Applies after you stop this session and start again/);
  assert.doesNotMatch(spinner.el.textContent,/Moving your computer|files come with you/);
  spinner.dispose();assert.equal(timers.size,0);
+ for(const result of [
+    {ok:true,status:200,json:async()=>({result:{data:{json:{...base,stage:'unavailable',active:false,durable:false,operation:'none'}}}})},
+    {ok:false,status:503,json:async()=>({})},
+ ]) {
+    globalThis.fetch=async()=>result;
+    const ordinary=AppSpinner({computerId:'qa-computer',label:'Opening Code…',isMigrating:()=>true});
+    document.body.appendChild(ordinary.el);ordinary.render({kind:'progress'});await tick();
+    assert.equal(ordinary.el.querySelector('.ezil-app-spinner-label').textContent,'Opening Code…');
+    assert.equal(ordinary.el.querySelector('.ezil-app-spinner-ring').hidden,false);
+    assert.equal(ordinary.hasComputerProgress(),false);
+    assert.match(ordinary.el.querySelector('.ezil-app-spinner-sub').textContent,/progress is unavailable/);
+    assert.doesNotMatch(ordinary.el.textContent,/Moving your computer/);
+    ordinary.render({kind:'ready'});assert.equal(timers.size,0);ordinary.dispose();
+ }
+ assert.equal(progressView({...base,stage:'unavailable'},'qa-computer'),null);
+
 }finally{globalThis.setTimeout=originalSet;globalThis.clearTimeout=originalClear;delete globalThis.fetch;dom.window.close();}
 console.log('PASS authoritative progress precedence, no invented metrics, scope, read-only polling, hidden/disposed lifecycle and paused spinner');
