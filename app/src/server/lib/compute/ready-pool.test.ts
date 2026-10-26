@@ -23,24 +23,37 @@ function capture(result: unknown = [raw]) {
 describe('P1/P2 pool planning', () => {
     it.each([
         ['minimum', {}, 1, 1], ['recent rounds up', { opens15m: 1 }, 1, 1],
-        ['unknown boot defaults to four minutes', { opens15m: 4 }, 2, 2],
+        ['unknown boot defaults to four minutes', { opens15m: 4, activeStandard: 2 }, 2, 2],
         ['measured p90', { opens15m: 4, bootMinutes: 1 }, 1, 1],
         ['measured fractional p90', { opens15m: 10, bootMinutes: 1.5 }, 1, 1],
         ['standard base', { activeStandard: 26 }, 2, 2], ['premium base', { activePremium: 11 }, 2, 2],
         ['weighted base combined before ceiling', { activeStandard: 1, activePremium: 1 }, 1, 1],
         ['max recent/base, not sum', { opens15m: 4, activePremium: 11 }, 2, 2],
-        ['max spares and two boots', { opens15m: 1000 }, 4, 2],
+        ['activity ceiling and two boots', { opens15m: 1000, activeStandard: 30 }, 16, 2],
         ['booting already covers target', { spares: 1, vcpuInUse: 2, booting: [{ poolHostId: 'b', createdAt: ago(1) }] }, 1, 0],
         ['mixed ready/booting covers target', { opens15m: 1, spares: 2, vcpuInUse: 4,
             idleReady: [{ poolHostId: 'r', readyAt: ago(1) }], booting: [{ poolHostId: 'b', createdAt: ago(1) }] }, 1, 0],
-        ['vcpu includes existing spares', { opens15m: 100, spares: 1, vcpuInUse: 8, regionVcpuCap: 10 }, 2, 1],
+        ['vcpu includes existing spares', { opens15m: 100, activeStandard: 5, spares: 1, vcpuInUse: 8, regionVcpuCap: 10 }, 2, 1],
         ['vcpu floor', { opens15m: 100, vcpuInUse: 7, regionVcpuCap: 10 }, 1, 1],
-        ['vcpu full', { opens15m: 100, spares: 2, vcpuInUse: 10, regionVcpuCap: 10 }, 2, 0],
+        ['vcpu full', { opens15m: 100, activeStandard: 5, spares: 2, vcpuInUse: 10, regionVcpuCap: 10 }, 2, 0],
         ['over cap lowers target', { spares: 2, vcpuInUse: 12, regionVcpuCap: 10 }, 1, 0],
         ['target never negative', { spares: 1, vcpuInUse: 30, regionVcpuCap: 0 }, 0, 0],
         ['kill switch', { opens15m: 100, activePremium: 100, killSwitch: true }, 0, 0],
     ] as [string, Partial<PoolDemand>, number, number][])('%s', (_, patch, target, provision) => {
         expect(planPool(c, demand(patch), NOW)).toEqual({ target, provision, retire: [], fail: [] });
+    });
+    it.each([
+        ['one paid user keeps exactly one spare despite heavy history', { opens15m: 1000, activeStandard: 1 }, 1],
+        ['one Premium on its selected class keeps one spare', { activeStandard: 0, activePremium: 1 }, 1],
+        ['spares rise with paid users and opens', { opens15m: 15, activeStandard: 3, activePremium: 2 }, 4],
+        ['spares never exceed paid users of the class', { opens15m: 60, activeStandard: 2, activePremium: 1 }, 3],
+    ] as [string, Partial<PoolDemand>, number][])('demand-driven: %s', (_, patch, target) => {
+        expect(planPool(c, demand(patch), NOW).target).toBe(target);
+    });
+    it('scale-down retires aged excess spares once paid users leave the class, back to the minimum', () => {
+        const idleReady = [40, 50, 60].map(n => ({ poolHostId: String(n), readyAt: ago(n) }));
+        expect(planPool(c, demand({ activeStandard: 1, spares: 3, idleReady }), NOW)).toMatchObject({ target: 1, retire: ['40', '50'] });
+        expect(planPool(c, demand({ activeStandard: 0, spares: 3, idleReady }), NOW)).toMatchObject({ target: 0, retire: ['40', '50'] });
     });
     it('booting reservations do not permit retiring the sole usable ready host',()=>{
         const d=demand({spares:2,ready:1,vcpuInUse:4,idleReady:[{poolHostId:'ready',readyAt:ago(31)}],booting:[{poolHostId:'boot',createdAt:ago(1)}]});
@@ -53,7 +66,7 @@ describe('P1/P2 pool planning', () => {
     it.each([2, 4, 5, 10])('pending %i uses shared bounded spares and existing reservations', pending => {
         for (const instanceType of ['m6i.large','m6i.xlarge','m6i.2xlarge'] as const) {
             const key = {...c, instanceType};
-            const target = Math.min(4, pending + 1);
+            const target = Math.min({ 'm6i.large': 16, 'm6i.xlarge': 8, 'm6i.2xlarge': 4 }[instanceType], pending);
             expect(planPool(key, demand({pending}), NOW)).toMatchObject({target, provision:2});
             expect(planPool(key, demand({pending, spares:target}), NOW).provision).toBe(0);
         }

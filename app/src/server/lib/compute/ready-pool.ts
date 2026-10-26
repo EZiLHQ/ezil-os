@@ -27,9 +27,12 @@ export type PoolData = Pick<typeof import('./ready-pool'), 'recordPoolEnrollment
 export interface PoolReadinessDiagnostic {
     poolHostId: string; instanceId: string | null; createdAt: string; enrolledAt: string | null; health: string;
 }
+/** Demand-driven pool (founder, 2026-10-26): one ready spare per class while any paid user has
+ * selected it, rising with activity. Idle spares never exceed that class's paid users. maxSpares is
+ * only a runaway ceiling; the region vCPU cap still bounds every class. */
 export const POOL_POLICY: Record<string, { minSpares: number; maxSpares: number }> = {
-    'ap-south-1:m6i.large': { minSpares: 1, maxSpares: 4 },
-    'ap-south-1:m6i.xlarge': { minSpares: 1, maxSpares: 4 },
+    'ap-south-1:m6i.large': { minSpares: 1, maxSpares: 16 },
+    'ap-south-1:m6i.xlarge': { minSpares: 1, maxSpares: 8 },
     'ap-south-1:m6i.2xlarge': { minSpares: 1, maxSpares: 4 },
 };
 const MINUTE = 60_000;
@@ -186,8 +189,11 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     const recent = Math.ceil(d.opens15m * boot / 15);
     const base = Math.ceil(0.04 * d.activeStandard + 0.10 * d.activePremium);
     const pending = count(d.pending ?? 0);
-    const eligible = d.activeStandard + d.activePremium > 0;
-    const desired = eligible ? Math.min(policy.maxSpares, Math.max(policy.minSpares, base, recent, pending + policy.minSpares)) : 0;
+    const paid = d.activeStandard + d.activePremium;
+    const eligible = paid > 0;
+    const want = Math.max(policy.minSpares, base, recent, pending + policy.minSpares);
+    // One computer per user: idle spares beyond the class's paid users (or waiting opens) can never be claimed.
+    const desired = eligible ? Math.min(policy.maxSpares, want, Math.max(paid, pending)) : 0;
     const capacity = Math.floor((d.regionVcpuCap - d.vcpuInUse - count(d.demandVcpu ?? 0)) / instanceVcpu(c.instanceType)) + d.spares;
     const target = d.killSwitch ? 0 : Math.max(0, Math.min(desired, capacity));
     const excess = Math.max(0, d.spares - target);
