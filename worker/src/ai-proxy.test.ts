@@ -82,10 +82,11 @@ async function proxyAuth(sandboxId = SANDBOX): Promise<string> {
 }
 
 describe('route allow-list', () => {
-  it('forwards exactly the six member routes', () => {
+  it('forwards exactly the seven member routes', () => {
     expect(matchAiRoute('GET', '/ai/v1/requests/1b4e28ba-2fa1-11d2-883f-0016d3cca427')?.upstreamPath).toBe('/v1/requests/:id');
     expect(matchAiRoute('GET', '/ai/v1/models')?.upstreamPath).toBe('/v1/models');
     expect(matchAiRoute('POST', '/ai/v1/messages')?.upstreamPath).toBe('/v1/messages');
+    expect(matchAiRoute('POST', '/ai/v1/responses')).toEqual({ method: 'POST', upstreamPath: '/v1/responses', query: [], label: 'POST /v1/responses' });
     expect(matchAiRoute('GET', '/ai/v1/me/balance')?.upstreamPath).toBe('/v1/me/balance');
     expect(matchAiRoute('GET', '/ai/v1/me/limits')).toEqual({ method: 'GET', upstreamPath: '/v1/me/limits', query: [], label: 'GET /v1/me/limits' });
     expect(matchAiRoute('GET', '/ai/v1/me/usage')?.upstreamPath).toBe('/v1/me/usage');
@@ -100,7 +101,7 @@ describe('route allow-list', () => {
       ['GET', '/ai/v1/requests/not-a-uuid'],
       ['GET', '/ai/v1/requests/:id'],
       ['GET', '/ai/v1/requests/1b4e28ba-2fa1-11d2-883f-0016d3cca427/extra'],
-      ['POST', '/ai/v1/responses'],
+      ['GET', '/ai/v1/responses'],
       ['GET', '/ai/v1/messages'],
       ['POST', '/ai/v1/models'],
       ['GET', '/ai/v1/models/'],
@@ -119,6 +120,25 @@ describe('route allow-list', () => {
     expect(isAiProxyPath('/ai/v1/admin/pending')).toBe(true);
     expect(isAiProxyPath('/aiv1')).toBe(false);
     expect(isAiProxyPath('/preview/ai/v1/models')).toBe(false);
+  });
+
+  it('refuses Responses methods and lookalikes before credentials or upstream', async () => {
+    const gw = mockGateway(() => Response.json({}));
+    let credentialReads = 0;
+    const d = await deps({ fetch: gw.fetch, credential: async () => { credentialReads++; return USER_JWT; } });
+    const denied = [
+      ...['GET', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map(method => [method, '/ai/v1/responses']),
+      ...['/ai/v1/responses/', '/ai/v1/responses/extra', '/ai/v1/responses-other', '/ai/v1//responses',
+        '/ai/v1/%72esponses', '/ai/v1/responses%2f', '/ai/v1/Responses', '/ai/responses'].map(path => ['POST', path]),
+    ];
+    for (const [method, path] of denied) {
+      expect(matchAiRoute(method!, path!)).toBeNull();
+      const response = await handleAiProxyRequest(new Request(`${HOST}${path}`, { method }), d);
+      expect(response.status).toBe(404);
+      await response.text();
+    }
+    expect(credentialReads).toBe(0);
+    expect(gw.calls).toHaveLength(0);
   });
 
   it('allows only exact GET limits, refusing mutations and lookalikes before credentials or upstream', async () => {
@@ -204,6 +224,63 @@ describe('proxy authentication', () => {
 });
 
 describe('forwarding', () => {
+  it('forwards Responses once with exact body bytes, the original stored bearer and existing header allow-list', async () => {
+    const raw = '{ "model":"azure-ready", "input":"private prompt", "stream":false, "store":false }';
+    const gw = mockGateway(() => Response.json({ id: 'resp-1', status: 'completed', output: [], usage: { input_tokens: 8, output_tokens: 3 } }));
+    const d = await deps({ fetch: gw.fetch });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/responses?api-version=evil&model=other&path=/v1/admin`, {
+      method: 'POST', body: raw, headers: {
+        authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-responses',
+        'anthropic-version': '2023-06-01', 'api-key': 'private', 'x-api-key': 'private', cookie: 'private',
+        'openai-organization': 'private', 'x-ezil-user-id': 'other', 'anthropic-beta': 'private',
+      },
+    }), d);
+    await response.text();
+    expect(gw.calls).toHaveLength(1);
+    expect(gw.calls[0]).toEqual({ url: 'https://ai.ezil.work/v1/responses', method: 'POST',
+      headers: { authorization: `Bearer ${USER_JWT}`, 'content-type': 'application/json', 'idempotency-key': 'turn-responses', 'anthropic-version': '2023-06-01' },
+      body: new TextEncoder().encode(raw) });
+    expect(d.logs.at(-1)).toMatchObject({ route: 'POST /v1/responses', terminal: 'response.completed', usage: { input_tokens: 8, output_tokens: 3 } });
+    expect(JSON.stringify(d.logs)).not.toContain('private');
+    expect(JSON.stringify(d.logs)).not.toContain(USER_JWT);
+    expect(d.dropped).toEqual([]);
+  });
+
+  it('retains the original credential across all four status reads after configuration refusal', async () => {
+    const gw = mockGateway(() => Response.json({ error: { code: 'unauthorized', reason: 'wrong_issuer' } }, { status: 401 }));
+    const d = await deps({ fetch: gw.fetch });
+    for (const path of ['/me/balance', '/me/usage?limit=5', '/me/limits', '/models']) {
+      const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1${path}`, { headers: { authorization: await proxyAuth() } }), d);
+      expect(await response.json()).toEqual({ error: { code: 'unauthorized', reason: 'wrong_issuer' } });
+    }
+    expect(gw.calls).toHaveLength(4);
+    expect(gw.calls.map(call => call.headers.authorization)).toEqual(Array(4).fill(`Bearer ${USER_JWT}`));
+    expect(d.dropped).toEqual([]);
+  });
+
+  it('preserves sanitized Responses HTTP refusal codes without interpreting them as response objects', async () => {
+    for (const [status, code, reason] of [[400, 'unsupported_parameter', undefined], [401, 'unauthorized', 'wrong_issuer'], [402, 'insufficient_credits', undefined]] as const) {
+      const error = { code, ...(reason ? { reason } : {}) };
+      const gw = mockGateway(() => Response.json({ error: { ...error, message: USER_JWT, token: 'private' } }, {
+        status, headers: { 'x-ezil-request-id': 'refusal-1', 'retry-after': '17' },
+      }));
+      const d = await deps({ fetch: gw.fetch });
+      const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/responses`, {
+        method: 'POST', body: '{"input":"private"}', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-refusal' },
+      }), d);
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({ error });
+      expect(response.headers.get('x-ezil-request-id')).toBe('refusal-1');
+      expect(response.headers.get('retry-after')).toBe('17');
+      expect(d.logs.at(-1)).toMatchObject({ status, code, reason: reason ?? null, request_id: 'refusal-1', route: 'POST /v1/responses' });
+      expect(d.logs.at(-1)).not.toHaveProperty('terminal');
+      expect(JSON.stringify(d.logs)).not.toContain(USER_JWT);
+      expect(JSON.stringify(d.logs)).not.toContain('private');
+      expect(d.dropped).toEqual([]);
+      expect(gw.calls).toHaveLength(1);
+    }
+  });
+
   it('forwards member limits once with the stored bearer, dropping all caller queries and private headers', async () => {
     const body = '{"policy":{"policy":{"rpm":3},"sources":{"rpm":"user"}},"ceilings":{"rpm":60,"concurrency":2}}';
     const gw = mockGateway(() => new Response(body, { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
@@ -500,6 +577,148 @@ describe('streaming', () => {
     expect(cancelled).toBe(true);
     expect(upstreamSignal?.aborted).toBe(true);
     expect(d.logs.at(-1)).toMatchObject({ outcome: 'client_cancelled' });
+  });
+});
+
+describe('Responses terminal telemetry', () => {
+  const enc = new TextEncoder();
+  const terminal = (status: string, usage: unknown = { input_tokens: 11, output_tokens: 7, total_tokens: 18 }) => ({
+    type: `response.${status}`, response: { id: 'resp-1', status, output: [{ type: 'message', content: [{ type: 'output_text', text: 'private output' }] }], usage },
+  });
+  const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+  async function request(body: BodyInit, sse = true) {
+    const gw = mockGateway(() => new Response(body, { headers: { 'content-type': sse ? 'text/event-stream' : 'application/json' } }));
+    const d = await deps({ fetch: gw.fetch });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/responses`, {
+      method: 'POST', headers: { authorization: await proxyAuth() }, body: '{"stream":true,"store":false}',
+    }), d);
+    return { response, d, gw };
+  }
+
+  for (const status of ['completed', 'incomplete', 'failed']) {
+    it(`observes ${status} JSON and complete SSE terminals without computing cost`, async () => {
+      for (const sse of [true, false]) {
+        const value = terminal(status);
+        const raw = sse ? event(value) : JSON.stringify(value.response);
+        const { response, d, gw } = await request(raw, sse);
+        expect(await response.text()).toBe(raw);
+        expect(d.logs.at(-1)).toMatchObject({ outcome: 'eof', terminal: `response.${status}`, usage: { input_tokens: 11, output_tokens: 7 } });
+        expect(d.logs.at(-1)).not.toHaveProperty('cost');
+        expect(JSON.stringify(d.logs)).not.toContain('private output');
+        expect(gw.calls).toHaveLength(1);
+      }
+    });
+  }
+
+  it('streams deltas immediately and assembles a terminal split across arbitrary byte boundaries', async () => {
+    let push!: (text: string) => void;
+    let close!: () => void;
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      push = text => controller.enqueue(enc.encode(text)); close = () => controller.close();
+    } });
+    const { response, d, gw } = await request(body);
+    const reader = response.body!.getReader();
+    const delta = event({ type: 'response.output_text.delta', delta: 'hi' });
+    push(delta);
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(delta);
+    expect(d.logs).toHaveLength(0);
+    const raw = `event: response.completed\r\ndata: ${JSON.stringify(terminal('completed'))}\r\n\r\n`;
+    for (let i = 0; i < raw.length; i += 3) push(raw.slice(i, i + 3));
+    close();
+    let tail = '';
+    for (let next = await reader.read(); !next.done; next = await reader.read()) tail += new TextDecoder().decode(next.value);
+    expect(tail).toBe(raw);
+    expect(d.logs.at(-1)).toMatchObject({ terminal: 'response.completed', usage: { input_tokens: 11, output_tokens: 7 } });
+    expect(gw.calls).toHaveLength(1);
+  });
+
+  it('never promotes delta EOF, malformed or truncated terminals to completion', async () => {
+    for (const raw of [event({ type: 'response.output_text.delta', delta: 'partial' }),
+      'event: response.completed\ndata: {broken}\n\n',
+      'data: {broken}\n\n' + event(terminal('completed')),
+      `event: response.completed\ndata: ${JSON.stringify(terminal('completed'))}`,
+      event({ ...terminal('completed'), response: { ...terminal('completed').response, status: 'in_progress' } }),
+      event({ ...terminal('completed'), response: { ...terminal('completed').response, id: null } }),
+      event(terminal('completed')) + 'data: {truncated',
+      event(terminal('completed')) + event(terminal('completed')),
+      event({ type: 'response.created', response: { id: 'different' } }) + event(terminal('completed')),
+      'data: [DONE]\n\n' + event(terminal('completed')),
+      event({ ...terminal('completed'), response: { ...terminal('completed').response, output: 'x'.repeat(70 * 1024) } }),
+    ]) {
+      const { response, d, gw } = await request(raw);
+      expect(await response.text()).toBe(raw);
+      expect(d.logs.at(-1)).toMatchObject({ outcome: 'eof', terminal: null, usage: null });
+      expect(gw.calls).toHaveLength(1);
+    }
+  });
+
+  it('accepts CR-only SSE framing and keeps an error terminal after a later completion', async () => {
+    const valid = event(terminal('completed')).replace(/\n/g, '\r');
+    const completed = await request(valid);
+    expect(await completed.response.text()).toBe(valid);
+    expect(completed.d.logs.at(-1)).toMatchObject({ terminal: 'response.completed', usage: { input_tokens: 11, output_tokens: 7 } });
+    const raw = event({ type: 'error', error: { code: 'stream_interrupted' } }) + event(terminal('completed'));
+    const failed = await request(raw);
+    expect(await failed.response.text()).toBe(raw);
+    expect(failed.d.logs.at(-1)).toMatchObject({ terminal: 'error', usage: null });
+  });
+
+  it('keeps absent or invalid terminal usage unknown', async () => {
+    for (const usage of [null, {}, { input_tokens: 11 }, { input_tokens: -1, output_tokens: 7 },
+      { input_tokens: 11, output_tokens: 0.5 }, { input_tokens: 11, output_tokens: 7, total_tokens: 19 }]) {
+      const { response, d } = await request(event(terminal('completed', usage)));
+      await response.text();
+      expect(d.logs.at(-1)).toMatchObject({ terminal: 'response.completed', usage: null });
+    }
+  });
+
+  it('leaves malformed, truncated and oversized JSON telemetry unknown while forwarding it unchanged', async () => {
+    const complete = JSON.stringify(terminal('completed').response);
+    for (const raw of ['{broken}', complete.slice(0, -1), JSON.stringify({ ...terminal('completed').response, output: 'x'.repeat(70 * 1024) })]) {
+      const { response, d, gw } = await request(raw, false);
+      expect(await response.text()).toBe(raw);
+      expect(d.logs.at(-1)).toMatchObject({ terminal: null, usage: null });
+      expect(gw.calls).toHaveLength(1);
+    }
+  });
+
+  it('forwards invalid UTF-8 JSON and SSE bytes unchanged while keeping terminal telemetry unknown', async () => {
+    for (const sse of [true, false]) {
+      const value = terminal('completed');
+      const raw = sse ? event(value) : JSON.stringify(value.response);
+      const invalidText = enc.encode(raw);
+      invalidText[raw.indexOf('private output')] = 0xff;
+      const incompleteTail = new Uint8Array(enc.encode(raw).length + 1);
+      incompleteTail.set(enc.encode(raw));
+      incompleteTail[incompleteTail.length - 1] = 0xc3;
+      for (const bytes of [invalidText, incompleteTail]) {
+        const { response, d, gw } = await request(bytes, sse);
+        expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+        expect(d.logs.at(-1)).toMatchObject({ outcome: 'eof', terminal: null, usage: null });
+        expect(gw.calls).toHaveLength(1);
+      }
+    }
+  });
+
+  it('passes a Responses error unchanged and replaces prior completion telemetry', async () => {
+    const raw = event(terminal('completed')) + event({ type: 'error', error: { code: 'stream_interrupted' } });
+    const { response, d, gw } = await request(raw);
+    expect(await response.text()).toBe(raw);
+    expect(d.logs.at(-1)).toMatchObject({ terminal: 'error', code: 'stream_interrupted', usage: null });
+    expect(gw.calls).toHaveLength(1);
+  });
+
+  it('cancels Responses upstream without an inference retry or completion telemetry', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(enc.encode(event({ type: 'response.output_text.delta', delta: 'partial' })));
+    }, cancel() { cancelled = true; } });
+    const { response, d, gw } = await request(body);
+    const reader = response.body!.getReader();
+    await reader.read(); await reader.cancel();
+    expect(cancelled).toBe(true);
+    expect(d.logs.at(-1)).toMatchObject({ outcome: 'client_cancelled', terminal: null, usage: null });
+    expect(gw.calls).toHaveLength(1);
   });
 });
 

@@ -3,6 +3,7 @@
 
 import { gatewayChat, type GatewayOptions } from './gateway';
 import { buildGatewayBody } from './gateway-messages';
+import { buildGatewayResponsesBody } from './gateway-responses';
 import { anthropicStream, buildAnthropicBody } from './anthropic';
 import type { ResolvedModel } from './config';
 import { hostOf, resolveEndpoint, type Endpoint } from './endpoints';
@@ -59,7 +60,8 @@ export function describeHttpError(model: ResolvedModel, endpoint: Endpoint, stat
 }
 
 export function buildBody(model: ResolvedModel, request: ChatRequest): { endpoint: Endpoint; body: Record<string, unknown> } {
-    if (model.provider.type === 'ezil-gateway') return { endpoint: resolveEndpoint(model.provider), body: buildGatewayBody(model, request).body };
+    if (model.provider.type === 'ezil-gateway') return { endpoint: resolveEndpoint(model.provider, [], model.gatewayProtocol),
+        body: model.gatewayProtocol === 'openai-responses' ? buildGatewayResponsesBody(model, request).body : buildGatewayBody(model, request).body };
     // `thinking.display: "updates"` (progress notes between tool calls) is behind a beta header.
     const endpoint = resolveEndpoint(model.provider, model.thinking?.display === 'updates' ? ['thinking-display-updates-2026-08-18'] : []);
     const body = endpoint.api === 'anthropic' ? buildAnthropicBody(model, request) : buildOpenAIBody(model, request);
