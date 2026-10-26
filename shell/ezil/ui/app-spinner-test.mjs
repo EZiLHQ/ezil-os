@@ -43,7 +43,7 @@ push('🔴 app-spinner.js contains no setTimeout', ! source.includes('setTimeout
 push('🔴 app-spinner.js contains no setInterval', ! source.includes('setInterval'));
 
 // ── 2. Behavioural checks ────────────────────────────────────────────────
-const dom = new JSDOM('<!doctype html><html><body></body></html>');
+const dom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true });
 globalThis.document = dom.window.document;
 globalThis.HTMLElement = dom.window.HTMLElement;
 
@@ -167,6 +167,111 @@ for (const flag of [undefined, null, false, 'true', 'false', 1, 0, {}, [], true]
         spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Opening Code…'
         && spinner.el.querySelector('.ezil-app-spinner-sub').hidden === true
         && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === '');
+}
+
+const originalFetch = globalThis.fetch, originalSet = globalThis.setTimeout, originalClear = globalThis.clearTimeout;
+const timers = new Map(); let timerId = 0;
+globalThis.setTimeout = (fn, ms) => { timers.set(++timerId, { fn, ms }); return timerId; };
+globalThis.clearTimeout = id => timers.delete(id);
+const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+const migration = { version: 2, computerId: 'qa-computer', operation: 'migration', stage: 'provisioning', recordedStage: 'provisioning',
+    active: true, durable: true, resumePolicy: 'saved_workspace_only', bytes: { transferred: 312_000_000, total: 1_200_000_000 },
+    percent: 26, etaSeconds: 121, typicalSeconds: 390, transferStartedAt: '2026-10-26T10:00:00Z', transferUpdatedAt: '2026-10-26T10:01:00Z' };
+let payload = migration;
+globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+async function observe(data, check) {
+    payload = data;
+    const spinner = AppSpinner({ computerId: 'qa-computer' });
+    document.body.appendChild(spinner.el);
+    try { spinner.render({ kind: 'progress' }); await tick(); await check(spinner); }
+    finally { spinner.dispose(); spinner.el.remove(); }
+}
+try {
+    const labels = ['Saving your files', 'Getting your AWS computer', 'Moving your files', 'Starting your desktop'];
+    for (const [stage, transferred, current] of [
+        ['requested', null, 0], ['fenced', null, 0], ['exported', 0, 1], ['provisioning', 0, 1],
+        ['provisioning', 312_000_000, 2], ['restored', 312_000_000, 2], ['committed', 312_000_000, 3],
+        ['mounting', 312_000_000, 3], ['starting', 312_000_000, 3], ['running', 312_000_000, 3],
+    ]) {
+        await observe({ ...migration, stage, bytes: { ...migration.bytes, transferred } }, spinner => {
+            const items = [...spinner.el.querySelectorAll('ol li')];
+            push(`${stage} (${transferred} bytes): four steps with one highlighted current step`,
+                items.length === 4 && spinner.el.querySelectorAll('[aria-current="step"]').length === 1
+                && items[current].getAttribute('aria-current') === 'step' && items[current].textContent === labels[current]);
+            push(`${stage} (${transferred} bytes): only completed steps have ticks`,
+                items.every((item, i) => item.dataset.state === (i < current ? 'complete' : i === current ? 'current' : 'pending')
+                    && item.textContent === `${i < current ? '✓ ' : ''}${labels[i]}`)
+                && spinner.el.querySelectorAll('li span[aria-hidden="true"]').length === current);
+            push(`${stage} (${transferred} bytes): transfer bar appears only during Moving your files`,
+                !!spinner.el.querySelector('progress') === (current === 2));
+        });
+    }
+    await observe(migration, async spinner => {
+        const bar = spinner.el.querySelector('progress');
+        push('measured transfer uses decimal MB and GB', spinner.el.textContent.includes('312 MB of 1.2 GB'));
+        push('determinate bar exposes the measured percentage and accessible range',
+            bar?.value === 26 && bar.max === 100 && bar.getAttribute('aria-valuenow') === '26'
+            && bar.getAttribute('aria-valuemin') === '0' && bar.getAttribute('aria-valuemax') === '100'
+            && bar.getAttribute('aria-label') === 'Moving your files');
+        push('measured ETA rounds up to whole minutes', spinner.el.textContent.includes('About 3 min left'));
+        push('typical duration and closing guidance are shown upfront', spinner.el.textContent.includes(
+            'Moving your files to AWS. This usually takes about 7 minutes. You can close this window — your files keep moving, and your computer will be ready when you come back.'));
+        payload = { ...migration, bytes: { transferred: 600_000_000, total: 1_200_000_000 }, percent: 50, etaSeconds: 59 };
+        const [id, timer] = [...timers].find(([, value]) => value.ms === 5000);
+        timers.delete(id); timer.fn(); await tick();
+        push('a later observation updates bytes, bar and ETA without changing stage',
+            spinner.el.textContent.includes('600 MB of 1.2 GB') && spinner.el.textContent.includes('Less than a minute left')
+            && spinner.el.querySelector('progress')?.getAttribute('aria-valuenow') === '50');
+    });
+    for (const [etaSeconds, expected] of [[0, 'Less than a minute left'], [59, 'Less than a minute left'], [60, 'About 1 min left'], [61, 'About 2 min left'], [null, null]]) {
+        await observe({ ...migration, etaSeconds }, spinner => {
+            push(`ETA ${etaSeconds}: measured text only`, expected === null
+                ? !/min left|minute left/.test(spinner.el.textContent) : spinner.el.textContent.includes(expected));
+        });
+    }
+    for (const percent of [0, 100, null]) {
+        await observe({ ...migration, stage: 'restored', bytes: { transferred: percent === 100 ? 1_200_000_000 : 0, total: 1_200_000_000 }, percent }, spinner => {
+            const bar = spinner.el.querySelector('progress');
+            push(`percentage ${percent}: zero and completion remain measured, null stays indeterminate`,
+                percent === null ? !bar.hasAttribute('value') && !bar.hasAttribute('aria-valuenow')
+                    : bar.value === percent && bar.getAttribute('aria-valuenow') === String(percent));
+        });
+    }
+    for (const bytes of [{ transferred: 312_000_000, total: null }, { transferred: null, total: 1_200_000_000 }]) {
+        await observe({ ...migration, stage: 'restored', bytes, typicalSeconds: null }, spinner => {
+            const bar = spinner.el.querySelector('progress');
+            push(`missing bytes ${JSON.stringify(bytes)}: indeterminate bar has no numeric value`,
+                !!bar && !bar.hasAttribute('value') && !bar.hasAttribute('aria-valuenow'));
+            push(`missing bytes ${JSON.stringify(bytes)}: Not measured, without byte counts or ETA`,
+                spinner.el.textContent.includes('Not measured') && !/\d|MB|GB|min left|minute left/.test(spinner.el.textContent));
+        });
+    }
+    await observe({ ...migration, stage: 'requested', typicalSeconds: null }, spinner => {
+        push('first migration stage shows the null duration fallback and closing guidance', spinner.el.textContent.includes(
+            'Moving your files to AWS. This can take a few minutes. You can close this window — your files keep moving, and your computer will be ready when you come back.'));
+        push('old durable-guidance sentence is replaced', !spinner.el.textContent.includes('Progress resumes only when operations allow it'));
+    });
+    for (const [override, title] of [
+        [{ operationsPaused: true, needsOperator: true }, 'Computer startup is temporarily paused'],
+        [{ paused: true }, 'Computer startup is temporarily paused'],
+        [{ stage: 'operations_paused' }, 'Computer startup is temporarily paused'],
+        [{ needsOperator: true }, 'Computer needs attention'], [{ stage: 'queued' }, 'Waiting to start'],
+        [{ stage: 'failed_reopened' }, 'Migration did not finish'], [{ stage: 'failed_needs_operator' }, 'Computer needs attention'],
+    ]) {
+        await observe({ ...migration, ...override }, spinner => {
+            push(`${JSON.stringify(override)}: existing message overrides migration with no animation or transfer`,
+                spinner.el.querySelector('.ezil-app-spinner-label').textContent === title
+                && spinner.el.querySelector('.ezil-app-spinner-ring').hidden
+                && !spinner.el.querySelector('ol') && !spinner.el.querySelector('progress')
+                && !spinner.el.textContent.includes('312 MB') && !spinner.el.textContent.includes('min left'));
+            if (override.stage !== 'queued') push(`${JSON.stringify(override)}: no active migration promise`,
+                !spinner.el.textContent.includes('your files keep moving'));
+        });
+    }
+    push('all observed spinners dispose their polling timers', timers.size === 0);
+} finally {
+    globalThis.fetch = originalFetch; globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear;
+    dom.window.close();
 }
 
 // ───────────────────────────────────────────────────────────────────────────

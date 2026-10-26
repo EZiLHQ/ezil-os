@@ -5,10 +5,12 @@ const stages = {
     operations_paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
     needs_operator: ['Computer needs attention', 'Check the computer’s current status before trying again.'],
     queued: ['Waiting to start', 'Waiting for the saved request to begin.'],
+    requested: ['Saving your files', 'Preparing the saved workspace for migration.'],
     fenced: ['Workspace secured', 'Preparing the saved workspace for migration.'],
     exported: ['Workspace saved', 'The saved workspace is ready for the new computer.'],
     provisioning: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
     restored: ['Workspace restored', 'Waiting for the apps to connect.'],
+    committed: ['Starting your desktop', 'Waiting for the apps to connect.'],
     recovering: ['Recovering computer', 'Checking the saved transition before continuing.'],
     failed_reopened: ['Migration did not finish', 'The original computer was reopened. Check its current status before trying again.'],
     stopped: ['Computer stopped', 'Use the normal computer controls to start a session.'],
@@ -26,24 +28,39 @@ const stages = {
     claimed: ['Computer assigned', 'Waiting for this app to connect.'],
     unavailable: ['Progress unavailable', 'A current progress observation is not available.'],
 };
-const migrationSteps = ['queued', 'fenced', 'exported', 'provisioning', 'restored'];
+const migrationSteps = ['Saving your files', 'Getting your AWS computer', 'Moving your files', 'Starting your desktop'];
+const migrationStages = { requested: 0, fenced: 0, exported: 1, provisioning: 1, restored: 2, committed: 3, mounting: 3, starting: 3, running: 3 };
+const formatBytes = bytes => bytes >= 1_000_000_000 ? `${(bytes / 1_000_000_000).toFixed(1)} GB` : `${Math.round(bytes / 1_000_000)} MB`;
 export function progressView(data, computerId) {
-    if (!data || data.version !== 1 || data.computerId !== computerId) return null;
+    if (!data || ![1, 2].includes(data.version) || data.computerId !== computerId) return null;
     const stage = data.operationsPaused === true || data.paused === true || data.stage === 'operations_paused' ? 'operations_paused'
-        : data.needsOperator === true || data.stage === 'needs_operator' ? 'needs_operator' : data.stage;
+        : data.needsOperator === true || ['needs_operator', 'failed_needs_operator'].includes(data.stage) ? 'needs_operator' : data.stage;
     if (!Object.hasOwn(stages, stage) || stage === 'unavailable') return null;
-    const current = migrationSteps.indexOf(stage);
+    const current = data.operation === 'migration' && Object.hasOwn(migrationStages, stage)
+        ? stage === 'provisioning' && data.bytes?.transferred > 0 ? 2 : migrationStages[stage] : -1;
+    const measured = Number.isFinite(data.bytes?.transferred) && data.bytes.transferred >= 0
+        && Number.isFinite(data.bytes?.total) && data.bytes.total >= 0;
+    const transfer = current === 2 ? {
+        bytes: measured ? `${formatBytes(data.bytes.transferred)} of ${formatBytes(data.bytes.total)}` : 'Not measured',
+        percent: measured && Number.isFinite(data.percent) && data.percent >= 0 && data.percent <= 100 ? data.percent : null,
+        eta: measured && Number.isFinite(data.etaSeconds) && data.etaSeconds >= 0
+            ? data.etaSeconds < 60 ? 'Less than a minute left' : `About ${Math.ceil(data.etaSeconds / 60)} min left` : '',
+    } : null;
+    const duration = Number.isFinite(data.typicalSeconds) && data.typicalSeconds > 0
+        ? `This usually takes about ${Math.ceil(data.typicalSeconds / 60)} minutes` : 'This can take a few minutes';
     const hardware = data.selectedNextOpenHardware;
     const next = hardware?.effective === 'next_open' && Number.isSafeInteger(hardware.vcpu) && hardware.vcpu > 0
         && Number.isFinite(hardware.memoryGiB) && hardware.memoryGiB > 0
         ? `Next session: ${hardware.vcpu} vCPU · ${hardware.memoryGiB} GiB memory. Applies after you stop this session and start again.` : '';
     return {
-        stage, title: stages[stage][0], body: stages[stage][1],
-        manualAttention: data.recordedStage === 'failed_needs_operator',
+        stage, title: current >= 0 ? migrationSteps[current] : stages[stage][0],
+        body: current === 2 && stage === 'provisioning' ? 'Your saved files are being transferred to your AWS computer.' : stages[stage][1],
+        manualAttention: data.recordedStage === 'failed_needs_operator' || data.stage === 'failed_needs_operator',
         active: data.active === true && !['operations_paused', 'needs_operator', 'queued', 'unavailable', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
-        steps: data.operation === 'migration' && current >= 0 ? migrationSteps.map((key, i) => ({ label: stages[key][0], state: i < current ? 'complete' : i === current ? 'current' : 'pending' })) : [],
-        guidance: data.operation === 'migration' && data.durable === true && data.resumePolicy === 'saved_workspace_only'
-            ? 'You can reopen this view to check the saved migration. Unsaved changes inside apps are not guaranteed. Progress resumes only when operations allow it.' : '',
+        steps: current >= 0 ? migrationSteps.map((label, i) => ({ label, state: i < current ? 'complete' : i === current ? 'current' : 'pending' })) : [],
+        transfer,
+        guidance: data.operation === 'migration' && (current >= 0 || stage === 'queued')
+            ? `Moving your files to AWS. ${duration}. You can close this window — your files keep moving, and your computer will be ready when you come back.` : '',
         next,
         updated: typeof data.updatedAt === 'string' && Number.isFinite(Date.parse(data.updatedAt))
             ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(data.updatedAt)) : null,

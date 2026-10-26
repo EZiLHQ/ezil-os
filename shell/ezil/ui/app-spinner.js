@@ -101,10 +101,27 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
                 const list = document.createElement('ol'); list.setAttribute('aria-label', 'Saved migration stages');
                 for (const step of observation.steps) {
                     const item = document.createElement('li'); item.textContent = step.label; item.dataset.state = step.state;
+                    if (step.state === 'complete') {
+                        const tick = document.createElement('span'); tick.textContent = '✓ '; tick.setAttribute('aria-hidden', 'true');
+                        item.prepend(tick);
+                    }
                     if (step.state === 'current') item.setAttribute('aria-current', 'step');
                     list.appendChild(item);
                 }
                 el_detail.appendChild(list);
+            }
+            if (observation.transfer) {
+                const line = document.createElement('p'); line.textContent = observation.transfer.bytes; el_detail.appendChild(line);
+                const bar = document.createElement('progress'); bar.max = 100; bar.setAttribute('aria-label', 'Moving your files');
+                if (observation.transfer.percent !== null) {
+                    bar.value = observation.transfer.percent;
+                    bar.setAttribute('aria-valuenow', String(observation.transfer.percent));
+                    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
+                }
+                el_detail.appendChild(bar);
+                if (observation.transfer.eta) {
+                    const eta = document.createElement('p'); eta.textContent = observation.transfer.eta; el_detail.appendChild(eta);
+                }
             }
             for (const text of [observation.guidance, observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : '']) {
                 if (!text) continue;
