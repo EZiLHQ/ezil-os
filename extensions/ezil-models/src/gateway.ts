@@ -5,10 +5,11 @@
 // code host (`$EZIL_AI_BASE_URL`, `.../ai/v1`), authenticated by `$EZIL_AI_PROXY_TOKEN`.
 
 import { randomUUID } from 'node:crypto';
-import { redact, type ResolvedModel, type ResolvedProvider } from './config';
+import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { buildGatewayBody } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
+import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
 import { localResetTime } from './status-data';
 import type { ChatRequest, StreamEvent } from './types';
@@ -45,12 +46,12 @@ export type GatewayOptions = {
     now?: () => number;
     log?: (line: string) => void;
     /** Called with the built request (no credentials) before it is sent. */
-    onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody>, idempotencyKey: string) => void;
+    onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody> | ReturnType<typeof buildGatewayResponsesBody>, idempotencyKey: string) => void;
 };
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
 
-export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number };
+export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[] };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[] };
 export type GatewayGrant = { remaining_micro: number; live: boolean };
 export type GatewayBalance = { state?: string; available_micro: number; held_micro: number; grants: GatewayGrant[] };
@@ -93,8 +94,20 @@ function asModels(json: unknown): GatewayModels | undefined {
     if (raw.data === undefined || !Array.isArray(raw.data) || raw.data.some(entry => typeof entry !== 'object' || entry === null
         || typeof entry.id !== 'string' || typeof entry.enabled !== 'boolean'
         || !Number.isSafeInteger(entry.max_input_tokens) || entry.max_input_tokens <= 0
-        || !Number.isSafeInteger(entry.max_output_tokens) || entry.max_output_tokens <= 0)) return undefined;
+        || !Number.isSafeInteger(entry.max_output_tokens) || entry.max_output_tokens <= 0
+        || (entry.protocols !== undefined && (!Array.isArray(entry.protocols)
+            || entry.protocols.some((protocol: unknown) => protocol !== 'anthropic-messages' && protocol !== 'openai-responses'))))) return undefined;
     return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data: raw.data as GatewayModel[] };
+}
+
+/** Legacy catalogs imply Messages only. Responses requires an explicit, enabled catalog route. */
+export function gatewayModelAvailable(model: ResolvedModel, catalog: GatewayModels | undefined): boolean {
+    if (model.provider.type !== 'ezil-gateway') return true;
+    const entry = catalog?.data.find(entry => entry.id === model.model);
+    if (entry?.enabled === false) return false;
+    const protocol = model.gatewayProtocol ?? 'anthropic-messages';
+    if (protocol === 'openai-responses') return !catalog?.killswitch && entry?.enabled === true && entry.protocols?.includes(protocol) === true;
+    return entry?.protocols === undefined || entry.protocols.includes(protocol);
 }
 
 /** Apply validated catalog caps without mutating config; callers still apply wire clamps/reserves. */
@@ -330,6 +343,25 @@ async function timedResponse(doFetch: typeof fetch, url: string, init: RequestIn
     return new Response(body, { status: response.status, headers: response.headers });
 }
 
+/** Validate the entire Responses completion before releasing any executable tool call.
+ * The converters validate arguments and terminal usage, and SSE requires clean EOF. Keep the
+ * suffix from the first non-text event so JSON text/tool order is preserved as well. */
+async function* validateResponsesTools(events: Iterable<StreamEvent> | AsyncIterable<StreamEvent>, offered: ReadonlySet<string>,
+    signal: AbortSignal, requestId?: string): AsyncGenerator<StreamEvent> {
+    const pending: StreamEvent[] = [];
+    for await (const event of events) {
+        signal.throwIfAborted();
+        if (event.type === 'text' && pending.length === 0) yield event;
+        else pending.push(event);
+    }
+    signal.throwIfAborted();
+    if (pending.some(event => event.type === 'tool_call' && !offered.has(event.name))) throw new GatewayResponseError(requestId, 'invalid_response');
+    for (const event of pending) {
+        signal.throwIfAborted();
+        yield event;
+    }
+}
+
 /** One UUID and serialization, bounded admission retries. No retries after generation starts. */
 export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, options: GatewayOptions): AsyncGenerator<StreamEvent> {
     const provider = model.provider;
@@ -343,16 +375,26 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let status: number | undefined;
     let stopReason: string | undefined;
     let errorCode: string | undefined;
-    let stream = model.model !== 'us.moonshotai.kimi-k3' && model.stream !== false;
+    const responses = model.gatewayProtocol === 'openai-responses';
+    let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
     let used = emptyUsage();
     let attemptAbort = new AbortController();
     const cancelAttempt = () => attemptAbort.abort(options.signal.reason);
     options.signal.addEventListener('abort', cancelAttempt, { once: true });
     try {
         options.signal.throwIfAborted();
-        const built = buildGatewayBody(model, request, log);
+        // A direct client invocation must enforce the same opt-in as the model picker.
+        if (responses) {
+            const catalog = await gatewayModels(provider, doFetch, now(), options.signal);
+            options.signal.throwIfAborted();
+            if (!gatewayModelAvailable(model, catalog)) throw new GatewayError('EZiL AI: This model does not advertise an available Responses route', undefined, 'model_unavailable', undefined);
+            model = withGatewayModelLimits(model, catalog);
+        }
+        const built = responses ? buildGatewayResponsesBody(model, request, log) : buildGatewayBody(model, request, log);
+        // Snapshot the serialized request's tools before callbacks or network waits can mutate input.
+        const offeredTools = new Set(built.body.tools?.map(tool => tool.name));
         stream = built.body.stream;
-        const url = `${provider.baseUrl}/messages`;
+        const url = `${provider.baseUrl}/${responses ? 'responses' : 'messages'}`;
         // Callback is for tests/integration, never used for gateway prompt logging.
         options.onRequest?.(url, built, idempotencyKey);
         const headers = { ...authHeaders(provider), 'content-type': 'application/json', accept: stream ? 'text/event-stream' : 'application/json', 'idempotency-key': idempotencyKey };
@@ -393,7 +435,11 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                         await response.body.cancel();
                         throw new GatewayResponseError(requestId, 'invalid_response');
                     }
-                    const events = stream ? gatewayStream(sseEvents(response.body), requestId) : gatewayJson(await response.json(), requestId);
+                    const parsed = responses
+                        ? stream ? gatewayResponsesStream(response.body, requestId)
+                            : gatewayResponsesJson(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await response.arrayBuffer())), requestId)
+                        : stream ? gatewayStream(sseEvents(response.body), requestId) : gatewayJson(await response.json(), requestId);
+                    const events = responses ? validateResponsesTools(parsed, offeredTools, options.signal, requestId) : parsed;
                     for await (const event of events) {
                         options.signal.throwIfAborted();
                         if (event.type === 'usage') used = event.usage;
@@ -401,6 +447,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                         yield event;
                     }
                     if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId);
+                    if (stopReason === 'incomplete' || stopReason === 'failed') throw new GatewayError(`EZiL AI: Response ${stopReason} (request ${requestId ?? 'unknown'})`, status, `response_${stopReason}`, requestId);
                     return;
                 }
                 // Body read failures happen after headers: never treat them as pre-header transport failures.

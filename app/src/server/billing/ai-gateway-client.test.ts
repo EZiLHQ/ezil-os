@@ -37,6 +37,14 @@ describe('signed AI Gateway client', () => {
         expect(await sendAiCreditEvent({ ...options, fetch: fetcher, log })).toEqual({ status: 'permanent', reason: 'event_conflict' });
         expect(log).toHaveBeenCalledExactlyOnceWith('[billing.ai] event_conflict', { entitlementId: 'ent' });
     });
+    it.each([{ error: { code: 'account_not_found' } }, { code: 'account_not_found' }])('retries a documented missing Gateway account %j', async body => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(body, { status: 404 }));
+        expect(await sendAiCreditEvent({ ...options, fetch: fetcher })).toEqual({ status: 'retryable', reason: 'account_not_found' });
+    });
+    it('does not turn an unknown 404 into an account wait', async () => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ error: { code: 'route_not_found' } }, { status: 404 }));
+        expect(await sendAiCreditEvent({ ...options, fetch: fetcher })).toEqual({ status: 'permanent', reason: 'http_404' });
+    });
     it.each(['fetch', 'body'] as const)('times out a stalled %s at ten seconds and aborts', async stall => {
         vi.useFakeTimers();
         const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => stall === 'fetch' ? new Promise(() => {})
@@ -56,5 +64,35 @@ describe('signed AI Gateway client', () => {
         const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new Error('fixed-test-key JWT user-token'));
         expect(await sendAiCreditEvent({ ...options, fetch: fetcher })).toMatchObject({ status: 'retryable' });
         expect(log).not.toHaveBeenCalled();
+    });
+});
+
+describe('W0.3 restore responses', () => {
+    const restore = { ...event, action: 'restore' as const, eventId: 'ent:restore:dp_D' };
+    it.each(['restored', 'already_restored', 'restore_refused_terminal', 'restore_expired', 'restore_nothing_forfeited'])(
+        'records %s as an explicit successful delivery', async outcome => {
+            const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ event_id: restore.eventId, outcome }));
+            expect(await sendAiCreditEvent({ ...options, event: restore, fetch: fetcher })).toEqual({ status: 'ok', outcome });
+            expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual(restore);
+        },
+    );
+    it.each(['restore_hold_pending', 'restore_not_revoked', 'restore_mismatch', 'restore_review_required'])(
+        'classifies %s explicitly', async code => {
+            const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ error: { code } }, { status: 409 }));
+            expect(await sendAiCreditEvent({ ...options, event: restore, fetch: fetcher })).toEqual({
+                status: code === 'restore_hold_pending' ? 'retryable' : 'review', reason: code });
+        },
+    );
+    it.each([null, { outcome: 'granted' }, { outcome: 'restored', event_id: 'another-event' }])('reviews an ambiguous success %j', async body => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(body));
+        expect(await sendAiCreditEvent({ ...options, event: restore, fetch: fetcher })).toEqual({ status: 'review', reason: 'restore_response_invalid' });
+    });
+    it('bounds a stalled restore success body within the existing timeout', async () => {
+        vi.useFakeTimers();
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue({ ok: true, json: () => new Promise(() => {}) } as Response);
+        const pending = sendAiCreditEvent({ ...options, event: restore, fetch: fetcher });
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(await pending).toEqual({ status: 'retryable', reason: 'transport_unavailable' });
+        expect(fetcher.mock.calls[0]![1]!.signal!.aborted).toBe(true);
     });
 });

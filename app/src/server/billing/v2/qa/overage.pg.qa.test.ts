@@ -275,7 +275,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
         it('checkoutStatus never reveals another user\'s session', async () => {
             stripe.sessions.set('cs_b', { id: 'cs_b', customer: b.customerId, clientReferenceId: b.userId, mode: 'subscription', status: 'complete', paymentStatus: 'paid', paymentIntentId: null, sku: 'compute_monthly_v2' });
             await expect(caller(a).checkoutStatus({ sessionId: 'cs_b' })).rejects.toThrow();
-            await expect(caller(b).checkoutStatus({ sessionId: 'cs_b' })).resolves.toEqual({ status: 'complete' });
+            await expect(caller(b).checkoutStatus({ sessionId: 'cs_b' })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: 'compute_monthly_v2' });
         });
     });
 });

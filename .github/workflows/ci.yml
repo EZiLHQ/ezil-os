@@ -199,6 +199,10 @@ jobs:
         shell: bash
         working-directory: shell
         run: bun install --frozen-lockfile
+      - name: Install app build tools for source browser fixtures
+        shell: bash
+        working-directory: app
+        run: bun install --frozen-lockfile
       - name: Setup Playwright
         uses: ./.github/actions/setup-playwright
         with:
@@ -221,6 +225,10 @@ jobs:
                    shell/ezil/native-persistence-test.mjs \
                    shell/ezil/app-link-test.mjs \
                    shell/ezil/ui/Settings/usage-test.mjs \
+                   shell/ezil/ui/Settings/billing-sheets-test.mjs \
+                   shell/ezil/ui/Settings/billing-test.mjs \
+                   shell/ezil/ui/Settings/sheet-frame-test.mjs \
+                   shell/ezil/ui/Settings/upgrade-sheet-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
                    shell/ezil/ui/Settings/current-computer-test.mjs \
@@ -245,6 +253,7 @@ jobs:
                    shell/ezil/apps/os-chrome-browser-test.mjs \
                    shell/ezil/apps/mobile-browser-test.mjs \
                    shell/ezil/ui/Settings/stacking-browser-test.mjs \
+                   shell/ezil/ui/Settings/provider-modal-browser-test.mjs \
                    shell/ezil/ui/Settings/late-focus-browser-test.mjs; do
             echo "── $t"
             node "$t"
