@@ -211,11 +211,24 @@ describe('POOL-OPEN warm lifecycle', () => {
             expect(s.starts[0].intent.instanceType).toBe(instanceType);
         }
     });
-    it('a running resize cannot adopt while the old host still owns the disk', async () => {
+    it.each(['cmp-4', 'cmp-8'] as const)('stopped selected %s preserves the disk with matching pool or fresh capacity', async size => {
+        const instanceType = size === 'cmp-4' ? 'm6i.xlarge' : 'm6i.2xlarge';
+        for (const available of [true, false]) {
+            const s = setup({ rows: [stopped()], host: available ? { ...host, instanceType } : null,
+                entitlement: { ...paid, planId: 'premium_monthly_v3', size } });
+            expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
+            expect(s.pool.leasePoolHost).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ instanceType }), C, 2, NOW);
+            expect(s.starts[0].intent).toMatchObject({ operation: available ? 'adopt' : 'replace', instanceType,
+                dataVolumeId: VOLUME, targetGeneration: 4, leaseEpoch: 5 });
+        }
+    });
+    it('a running size change retains the current host and disk until normal stop', async () => {
         const s = setup({ rows: [stopped({ state: 'RUNNING', instance_type: 'm6i.xlarge', last_error: null,
             lease_until: new Date(NOW.getTime() + 3600_000) })] });
-        await s.ensure(); expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
-        expect(s.starts[0].intent.operation).toBe('replace');
+        expect(await s.ensure()).toEqual({ ok: true });
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts).toHaveLength(0);
+        expect(await s.placement()).toMatchObject({ state: 'RUNNING', instanceType: 'm6i.xlarge', volumeId: VOLUME, generation: 3, leaseEpoch: 4 });
     });
     it('missing P8 wiring on reopen refuses without changing the stopped placement', async () => {
         const s = setup({ rows: [stopped()], noPool: true });

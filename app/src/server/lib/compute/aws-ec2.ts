@@ -639,10 +639,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             }
             switch (placement.state) {
                 case 'RUNNING':
-                    if (!resizeTo) return { ok: true };
-                    // The replace workflow gracefully stops the old running instance.
-                    // Admission below credits its slot and reserves the new type atomically.
-                    // falls through
+                    // A size preference applies to the next session, not a refresh or app open.
+                    // Retain this session's hardware and billing epoch until normal Stop.
+                    return { ok: true };
                 case 'UNCONFIRMED':
                 case 'STOPPED': {
                     if (placement.state === 'UNCONFIRMED' && placement.lastError !== ENROLLMENT_FAILED) {

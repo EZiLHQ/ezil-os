@@ -351,8 +351,8 @@ describe('ensure: resize to the current paid plan', () => {
     const meter = () => ({ ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) });
 
     it.each([
-        ['STOPPED', 'std-2', 'cmp-4'], ['RUNNING', 'std-2', 'cmp-4'],
-        ['STOPPED', 'cmp-4', 'std-2'], ['RUNNING', 'cmp-4', 'std-2'],
+        ['STOPPED', 'std-2', 'cmp-4'],
+        ['STOPPED', 'cmp-4', 'std-2'],
     ] as const)('%s %s → %s replaces on the same volume and closes the epoch with resize', async (state, from, to) => {
         const billing = meter();
         const s = setup({ placements: [stopped({
@@ -389,7 +389,7 @@ describe('ensure: resize to the current paid plan', () => {
         expect(billing.stopped).toHaveBeenCalledTimes(1);
     });
 
-    it.each(['STOPPED', 'RUNNING'] as const)('%s upgrade without regional capacity keeps the old type and epoch', async state => {
+    it.each(['STOPPED'] as const)('%s upgrade without regional capacity keeps the old type and epoch', async state => {
         const billing = meter();
         const s = setup({ placements: [stopped({ state, instance_type: 'm6i.large', lease_until: new Date(NOW.getTime() + 3_600_000) })] }, {
             entitlement: paid('cmp-4'), meter: billing, e: resizeEnv({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '1' }),
@@ -398,6 +398,23 @@ describe('ensure: resize to the current paid plan', () => {
         expect(s.placements[0]).toMatchObject({ state, instance_type: 'm6i.large', generation: 1, lease_epoch: 0, fence_token: FENCE });
         expect(s.calls).toEqual([]);
         expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it.each([['std-2', 'cmp-4'], ['cmp-4', 'std-2']] as const)('running %s retains hardware after selecting %s until normal stop', async (from, to) => {
+        const billing = meter();
+        const s = setup({ placements: [stopped({ state: 'RUNNING', instance_type: SIZES[from].machine,
+            generation: 3, lease_epoch: 7, lease_until: new Date(NOW.getTime() + 3_600_000) })] },
+            { entitlement: paid(to), meter: billing, e: resizeEnv() });
+        for (let i = 0; i < 2; i++) expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: true });
+        expect(s.calls).toEqual([]);
+        expect(s.placements[0]).toMatchObject({ state: 'RUNNING', instance_type: SIZES[from].machine, generation: 3, lease_epoch: 7 });
+        expect(billing.stopped).not.toHaveBeenCalled();
+        expect(billing.ready).not.toHaveBeenCalled();
+        // A confirmed normal stop starts a new session with the selected type and same data volume.
+        s.placements[0]!.state = 'STOPPED';
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.calls[0]!.intent).toMatchObject({ operation: 'replace', instanceType: SIZES[to].machine,
+            dataVolumeId: 'vol-11111111111111111', targetGeneration: 4, leaseEpoch: 8 });
     });
 
     it('global capacity checks the new vCPU, even with room in the home region', async () => {
@@ -1292,7 +1309,6 @@ describe('fresh replacement launch status', () => {
             ['enrollment failure', { state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED }, { e: startMode() }],
             ['lost instance', { last_error: 'instance_lost' }, { e: startMode() }],
             ['stopped resize', {}, { e: startMode(), tier: 'plus' as AwsTier }],
-            ['running resize', { state: 'RUNNING' }, { e: startMode(), tier: 'plus' as AwsTier }],
         ])(`%s flags the first and repeated ensure/status (start answer lost: ${failStart})`, async (_name, row, over) => {
             const s = setup({ placements: [stopped(row)] }, { ...over, failStart });
             const first = await s.provider.ensure(ctx, me, opts);
