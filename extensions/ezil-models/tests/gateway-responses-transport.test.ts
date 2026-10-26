@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { gatewayChat, forgetGatewayModels, gatewayModels, type GatewayOptions } from '../src/gateway';
 import type { ResolvedModel } from '../src/config';
 import type { ChatRequest, StreamEvent } from '../src/types';
@@ -39,6 +39,8 @@ async function run(fetch: typeof globalThis.fetch, options: Partial<GatewayOptio
     return events;
 }
 const flush = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
+// Other suites share this synthetic provider identity; always read this test's catalog.
+beforeEach(() => forgetGatewayModels());
 afterEach(() => forgetGatewayModels());
 
 describe('Responses transport contract', () => {
