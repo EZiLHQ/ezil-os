@@ -180,7 +180,8 @@ export function creditState(models: GatewayModels | undefined, balance: GatewayB
 // ── error mapping (by error.code, never by message; contract §8) ─────────────
 
 type ErrorBody = { code?: string; message?: string; request_id?: string; reason?: string; pause?: string; param?: string;
-    no_live_grant?: boolean; available_micro?: number; hold_micro?: number; input_bound_tokens?: number; max_input_tokens?: number; status?: string };
+    no_live_grant?: boolean; available_micro?: number; hold_micro?: number; floor_hold_micro?: number; max_affordable_output_tokens?: number | null;
+    input_bound_tokens?: number; max_input_tokens?: number; status?: string };
 
 export function parseErrorBody(text: string): ErrorBody {
     try {
@@ -213,10 +214,16 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
                 status, code, requestId, seconds);
         }
         case 'insufficient_credits': case 'no_live_grant': {
+            if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
             const available = body.available_micro ?? balance?.available_micro;
-            const state = balance ? creditState(undefined, balance, alias).text : body.no_live_grant || code === 'no_live_grant'
-                ? 'No live AI credit grant.' : 'Not enough AI credits for this request.';
-            return make(`${state}${available !== undefined ? ` Available credits: ${available / MICRO_PER_CREDIT}.` : ''}`);
+            const credits = typeof available === 'number' && Number.isFinite(available) ? (available / MICRO_PER_CREDIT).toFixed(2) : 'Not measured';
+            const state = typeof body.hold_micro === 'number' && Number.isFinite(body.hold_micro)
+                && typeof available === 'number' && Number.isFinite(available) && body.hold_micro > available
+                ? `This request needs up to ${(body.hold_micro / MICRO_PER_CREDIT).toFixed(2)} credits, and you have ${credits}.`
+                : `Not enough AI credits for this request. Available credits: ${credits}.`;
+            const shorter = typeof body.max_affordable_output_tokens === 'number' && Number.isFinite(body.max_affordable_output_tokens) && body.max_affordable_output_tokens > 0
+                ? ' A shorter reply would fit; try again or reduce the conversation.' : '';
+            return make(`${state} Add credits, or start a new chat or pick a smaller model to use less.${shorter}`);
         }
         // The OS app delivers a session only for accounts with an EZiL AI role (ai-credential.ts), so a missing
         // session means either no AI access on this account or no delivered sign-in yet: say both.
@@ -429,6 +436,11 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 requestId = response.headers.get('x-ezil-request-id') ?? undefined;
                 if (response.ok) {
                     options.signal.throwIfAborted();
+                    const clamped = Number(response.headers.get('x-ezil-output-limit-clamped'));
+                    const requested = Number(response.headers.get('x-ezil-output-limit-requested'));
+                    if (Number.isSafeInteger(clamped) && clamped > 0 && Number.isSafeInteger(requested) && clamped < requested) {
+                        log(`Reply limited to ${clamped} tokens to fit your credit balance`);
+                    }
                     if (!response.body) throw new GatewayResponseError(requestId);
                     const contentType = response.headers.get('content-type') ?? '';
                     if (!(stream ? contentType.includes('text/event-stream') : contentType.includes('application/json'))) {

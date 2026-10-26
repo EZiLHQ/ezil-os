@@ -1,7 +1,7 @@
 // Integration: the VS Code-facing provider against in-process mock Anthropic / OpenAI servers, with a
 // fake `vscode` module. Exercises the full Agent-mode tool-call round trip both ways.
 
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { parseModelsConfig, type ResolvedConfig, type ResolvedModel } from '../src/config';
 import { forgetGatewayModels } from '../src/gateway';
 import type { Usage } from '../src/types';
@@ -12,8 +12,12 @@ import { TextPart, ToolCallPart, ToolResultPart, DataPart, ThinkingPart, EventEm
 
 const showRetryError = mock(async (_message: string, ..._actions: string[]): Promise<string | undefined> => undefined);
 const retryCommand = mock(async (_command: string) => undefined);
+const showCreditWarning = mock(async (_message: string, ..._actions: string[]): Promise<string | undefined> => undefined);
+const openExternal = mock(async (_uri: URL) => true);
 (fakeVscode.window as Record<string, unknown>).showErrorMessage = showRetryError;
+(fakeVscode.window as Record<string, unknown>).showWarningMessage = showCreditWarning;
 (fakeVscode.commands as Record<string, unknown>).executeCommand = retryCommand;
+(fakeVscode.env as Record<string, unknown>).openExternal = openExternal;
 
 mock.module('vscode', () => fakeVscode);
 
@@ -274,6 +278,81 @@ describe('EZiL gateway VS Code bridge', () => {
         return { models: () => models, configError: () => undefined, secrets: () => ['synthetic-proxy-token'], logRequests: () => true,
             log: (s: string) => lines.push(s), recordUsage: (_m: ResolvedModel, u: Usage) => usage.push(u), fetch, lines, usage };
     }
+    describe('credit refusal action', () => {
+        const baseUrl = process.env.EZIL_AI_BASE_URL;
+        beforeEach(() => {
+            showCreditWarning.mockReset(); openExternal.mockReset(); showRetryError.mockClear();
+            process.env.EZIL_AI_BASE_URL = 'https://os.invalid:8443/ai/v1?discard=yes#discard';
+        });
+        afterEach(() => {
+            if (baseUrl === undefined) delete process.env.EZIL_AI_BASE_URL;
+            else process.env.EZIL_AI_BASE_URL = baseUrl;
+        });
+        function refusal(code = 'insufficient_credits', extra = {}) {
+            const host = gatewayHost((async () => Response.json({ error: { code, available_micro: 63_092_750,
+                hold_micro: 80_000_000, max_affordable_output_tokens: null, ...extra } }, { status: 402 })) as unknown as typeof fetch);
+            const requestFinished = mock((_model: ResolvedModel) => {});
+            const provider = new EZiLModelsProvider({ ...host, requestFinished });
+            return { host, requestFinished, send: (index = 0) => provider.provideLanguageModelChatResponse(toInformation(host.models()[index]!),
+                [message(1, [new TextPart('q')])] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never) };
+        }
+        for (const [code, extra, text] of [
+            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.09.'],
+            ['insufficient_credits', { no_live_grant: true }, 'You have no AI credits left. Add credits to continue.'],
+            ['no_live_grant', {}, 'You have no AI credits left. Add credits to continue.'],
+        ] as const) test(`${code} ${JSON.stringify(extra)} opens the OS billing card when chosen`, async () => {
+            showCreditWarning.mockResolvedValueOnce('Add credits');
+            const h = refusal(code, extra);
+            await expect(h.send()).rejects.toThrow(text);
+            await Promise.resolve();
+            expect(showCreditWarning).toHaveBeenCalledTimes(1);
+            expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining(text), 'Add credits');
+            expect(openExternal).toHaveBeenCalledTimes(1);
+            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os.invalid:8443/os?settings=billing&section=ai-credits');
+            expect(showRetryError).not.toHaveBeenCalled();
+            expect(h.host.usage).toHaveLength(0); expect(h.requestFinished).toHaveBeenCalledTimes(1);
+        });
+        for (const value of [undefined, '', 'not a URL', '/ai/v1', 'http://os.invalid/ai/v1', 'javascript:alert(1)', 'file:///ai/v1']) {
+            test(`no button without a usable HTTPS environment origin: ${value}`, async () => {
+                if (value === undefined) delete process.env.EZIL_AI_BASE_URL;
+                else process.env.EZIL_AI_BASE_URL = value;
+                const h = refusal();
+                await expect(h.send()).rejects.toThrow('This request needs up to 80.00 credits');
+                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.09.'));
+                expect(openExternal).not.toHaveBeenCalled();
+            });
+        }
+        test('dismissing the warning does not open the billing card', async () => {
+            await expect(refusal().send()).rejects.toThrow('This request needs up to 80.00 credits');
+            expect(showCreditWarning).toHaveBeenCalledTimes(1); expect(openExternal).not.toHaveBeenCalled();
+        });
+        test('warnings across models are deduplicated for 60 seconds, including pending actions', async () => {
+            const now = spyOn(Date, 'now').mockReturnValue(0);
+            let dismiss!: (choice: string | undefined) => void;
+            showCreditWarning.mockImplementation(() => new Promise(resolve => { dismiss = resolve; }));
+            try {
+                const h = refusal();
+                await Promise.all([0, 1].map(index => expect(h.send(index)).rejects.toThrow('This request needs up to')));
+                expect(showCreditWarning).toHaveBeenCalledTimes(1);
+                now.mockReturnValue(59_999);
+                await expect(h.send()).rejects.toThrow('This request needs up to');
+                expect(showCreditWarning).toHaveBeenCalledTimes(1);
+                dismiss(undefined);
+                now.mockReturnValue(60_000);
+                await expect(h.send(1)).rejects.toThrow('This request needs up to');
+                expect(showCreditWarning).toHaveBeenCalledTimes(2);
+                dismiss(undefined);
+                expect(h.requestFinished).toHaveBeenCalledTimes(4);
+            } finally { now.mockRestore(); }
+        });
+        test('failure to open the billing card preserves the original chat error', async () => {
+            showCreditWarning.mockResolvedValueOnce('Add credits');
+            openExternal.mockRejectedValueOnce(new Error('cannot open browser'));
+            await expect(refusal().send()).rejects.toThrow('This request needs up to 80.00 credits');
+            await Promise.resolve();
+            expect(openExternal).toHaveBeenCalledTimes(1);
+        });
+    });
     test('advertises reserved input and per-model output; hides disabled models and caches catalog', async () => {
         let gets = 0;
         const host = gatewayHost((async () => { throw new Error('unexpected POST'); }) as unknown as typeof fetch, () => {
