@@ -8,16 +8,21 @@ const request=(body:unknown)=>new Request('https://os-staging.ezil.work/api/shel
 beforeEach(()=>{mocks.events=[];mocks.contexts=[];mocks.user={id:'os-user'};mocks.owned=true;mocks.grant.mockReset();mocks.preview.mockReset().mockResolvedValue({ok:true,codePreviewUrl:'https://test.invalid/?folder=exact'});});
 it('checks session and ownership before redemption, passes secret only in server context',async()=>{
  const grant={binding:{canonicalURL:'https://github.ezil.work/team/repo.git'},git:{token:'synthetic-private'}};mocks.grant.mockResolvedValue(grant);
- const response=await POST(request({computerId:'computer-a',projectLaunch:true}));expect(response.status).toBe(200);expect(mocks.events).toEqual(['ownership','redeem']);expect(mocks.contexts.at(-1).projectGrant).toBe(grant);expect(mocks.preview).toHaveBeenCalledWith({computerId:'computer-a',repo:grant.binding.canonicalURL});expect(await response.text()).not.toContain('synthetic-private');
+ const response=await POST(request({computerId:'computer-a',projectLaunch:true,projectIntent:"a".repeat(43)}));expect(response.status).toBe(200);expect(mocks.events).toEqual(['ownership','redeem']);expect(mocks.contexts.at(-1).projectGrant).toBe(grant);expect(mocks.preview).toHaveBeenCalledWith({computerId:'computer-a',repo:grant.binding.canonicalURL});expect(await response.text()).not.toContain('synthetic-private');
 });
 it('foreign computer never redeems or opens, missing OS session never parses intent',async()=>{
- mocks.owned=false;await POST(request({computerId:'foreign',projectLaunch:true}));expect(mocks.grant).not.toHaveBeenCalled();expect(mocks.preview).not.toHaveBeenCalled();
- mocks.user=null;expect((await POST(request({computerId:'foreign',projectLaunch:true}))).status).toBe(401);
+ mocks.owned=false;await POST(request({computerId:'foreign',projectLaunch:true,projectIntent:"a".repeat(43)}));expect(mocks.grant).not.toHaveBeenCalled();expect(mocks.preview).not.toHaveBeenCalled();
+ mocks.user=null;expect((await POST(request({computerId:'foreign',projectLaunch:true,projectIntent:"a".repeat(43)}))).status).toBe(401);
 });
 it('expired/missing launch state cannot open workspace root on refresh',async()=>{
- expect((await POST(request({computerId:'computer-a',projectLaunch:true}))).status).toBe(403);expect(mocks.preview).not.toHaveBeenCalled();
+ expect((await POST(request({computerId:'computer-a',projectLaunch:true,projectIntent:"a".repeat(43)}))).status).toBe(403);expect(mocks.preview).not.toHaveBeenCalled();
 });
 it('rejects caller repository substitution and surfaces a configuration refusal without credentials',async()=>{
- mocks.grant.mockResolvedValue({binding:{canonicalURL:'https://github.ezil.work/team/repo.git'}});expect((await POST(request({computerId:'computer-a',repo:'https://github.ezil.work/other/repo.git',projectLaunch:true}))).status).toBe(403);
- mocks.grant.mockRejectedValue(Error('project_repo_configuration_required'));expect((await POST(request({computerId:'computer-a',projectLaunch:true}))).status).toBe(503);expect(mocks.preview).not.toHaveBeenCalled();
+ mocks.grant.mockResolvedValue({binding:{canonicalURL:'https://github.ezil.work/team/repo.git'}});expect((await POST(request({computerId:'computer-a',repo:'https://github.ezil.work/other/repo.git',projectLaunch:true,projectIntent:"a".repeat(43)}))).status).toBe(403);
+ mocks.grant.mockRejectedValue(Error('project_repo_configuration_required'));expect((await POST(request({computerId:'computer-a',projectLaunch:true,projectIntent:"a".repeat(43)}))).status).toBe(503);expect(mocks.preview).not.toHaveBeenCalled();
+});
+
+it('requires an explicit per-document intent even if browser cookies exist',async()=>{
+    expect((await POST(request({computerId:'computer-a',projectLaunch:true}))).status).toBe(403);
+    expect(mocks.grant).not.toHaveBeenCalled();expect(mocks.preview).not.toHaveBeenCalled();
 });

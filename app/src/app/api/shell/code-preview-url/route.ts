@@ -64,12 +64,13 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', repo, projectLaunch } = (body ?? {}) as { computerId?: string; repo?: string; projectLaunch?: boolean };
+        const { computerId = '', repo, projectLaunch, projectIntent } = (body ?? {}) as { computerId?: string; repo?: string; projectLaunch?: boolean; projectIntent?: string };
 
         // Ownership is verified before redemption; never redeem for an arbitrary computer.
         await caller.computer.get({ id: computerId });
         if (projectLaunch !== undefined && projectLaunch !== true) return shellJson({ error: { code: 'BAD_REQUEST', message: 'Invalid repository launch.' } }, 400);
-        const projectGrant = projectLaunch ? await launchGrant(ctx.user.id, computerId) : undefined;
+        if ((projectLaunch && (typeof projectIntent !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(projectIntent))) || (!projectLaunch && projectIntent !== undefined)) return shellJson({error:{code:'project_repo_not_authorized',message:'Repository launch does not match this document.'}},403);
+        const projectGrant = projectLaunch ? await launchGrant(ctx.user.id, computerId, projectIntent!) : undefined;
         if (projectLaunch && !projectGrant) return shellJson({ error: { code: 'project_repo_not_authorized', message: 'Repository launch expired. Open the project again.' } }, 403);
         if (projectGrant && repo !== undefined && projectGrant.binding.canonicalURL !== repo) {
             return shellJson({ error: { code: 'project_repo_not_authorized' } }, 403);

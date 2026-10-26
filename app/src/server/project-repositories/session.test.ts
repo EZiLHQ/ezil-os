@@ -1,12 +1,13 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 vi.mock('server-only', () => ({}));
 const mocks = vi.hoisted(() => ({ jar: new Map<string,string>(), claims: {sub:'os-user',session_id:'session-a'}, verify: vi.fn() }));
-vi.mock('next/headers', () => ({ cookies: async () => ({ get:(k:string) => mocks.jar.has(k) ? {value:mocks.jar.get(k)} : undefined, set:(k:string,v:string) => mocks.jar.set(k,v) }) }));
+vi.mock('next/headers', () => ({ cookies: async () => ({ get:(k:string) => mocks.jar.has(k) ? {value:mocks.jar.get(k)} : undefined, set:(k:string,v:string) => mocks.jar.set(k,v), getAll:()=>[...mocks.jar].map(([name,value])=>({name,value})) }) }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({auth:{getClaims:async()=>({data:{claims:mocks.claims},error:null})}}) }));
 vi.mock('@/server/auth/auth0', () => ({ verifyProjectIdToken: mocks.verify }));
-import { retainProjectIdentity, retainedIdentity, launchGrant, clearProjectIdentity, vaults, LAUNCH_COOKIE } from './session';
+import { retainProjectIdentity, retainedIdentity, launchGrant, clearProjectIdentity, vaults, LAUNCH_COOKIE, launchProofCookie } from './session';
 import { validateRedemption, trustedOrigin } from './contract';
 import { Vault } from './vault';
+const intentId='a'.repeat(43);
 const value = () => ({binding:{projectId:'11111111-1111-4111-8111-111111111111', repositoryId:'22222222-2222-4222-8222-222222222222',canonicalURL:'https://github.ezil.work/acme/repo.git',ref:'refs/heads/main',bindingVersion:'a'.repeat(64)},identity:{issuer:'https://id.ezil.work/',subject:'auth0|a'},git:{username:'ezil',token:'egg_private_synthetic',expiresAt:new Date(Date.now()+60000).toISOString(),scope:'read'}});
 beforeEach(()=> { mocks.jar.clear(); mocks.claims={sub:'os-user',session_id:'session-a'}; mocks.verify.mockResolvedValue({issuer:'https://id.ezil.work/',subject:'auth0|a',expiresAt:Date.now()+120000}); vi.stubEnv('PROJECT_REPO_WORKS_ORIGIN','https://works-staging.example.invalid'); });
 afterEach(()=>{vi.unstubAllEnvs();vi.unstubAllGlobals();});
@@ -18,23 +19,23 @@ describe('private identity and launch session',()=>{
     });
     it('redeems once using v1.1 body only and binds repeat opens to the same computer/session',async()=>{
         await retainProjectIdentity('private-id-token');
-        const handle=vaults.launches.put({code:'c'.repeat(43),deadline:Date.now()+60000},Date.now()+60000);mocks.jar.set(LAUNCH_COOKIE,handle);
+        const handle=vaults.launches.put({intentId,code:'c'.repeat(43),deadline:Date.now()+60000},Date.now()+60000);mocks.jar.set(launchProofCookie(intentId),handle);
         const fetcher=vi.fn(async()=>Response.json(value()));vi.stubGlobal('fetch',fetcher);
-        const grant=await launchGrant('os-user','computer-a');expect(grant?.version).toBe(1);
+        const grant=await launchGrant('os-user','computer-a',intentId);expect(grant?.version).toBe(1);
         const [url,opts]=fetcher.mock.calls[0] as unknown as [URL,RequestInit];
         expect(url.origin).toBe('https://works-staging.example.invalid');expect(url.search).toBe('');
         expect(JSON.parse(opts.body as string)).toEqual({userIdToken:'private-id-token',code:'c'.repeat(43)});
         expect(opts.headers).toEqual({'content-type':'application/json'});
-        expect(await launchGrant('os-user','computer-a')).toBe(grant);expect(fetcher).toHaveBeenCalledTimes(1);
-        await expect(launchGrant('os-user','computer-b')).rejects.toThrow('not_authorized');
-        mocks.claims.sub='foreign';await expect(launchGrant('foreign','computer-a')).rejects.toThrow('invalid_identity');
-        await clearProjectIdentity(); expect(await launchGrant('foreign','computer-a')).toBeUndefined();
+        expect(await launchGrant('os-user','computer-a',intentId)).toBe(grant);expect(fetcher).toHaveBeenCalledTimes(1);
+        await expect(launchGrant('os-user','computer-b',intentId)).rejects.toThrow('not_authorized');
+        mocks.claims.sub='foreign';await expect(launchGrant('foreign','computer-a',intentId)).rejects.toThrow('invalid_identity');
+        await clearProjectIdentity(); await expect(launchGrant('foreign','computer-a',intentId)).rejects.toThrow('invalid_identity');
     });
     it('refusal consumes a pending code and never returns a partial grant',async()=>{
-        await retainProjectIdentity('private');const h=vaults.launches.put({code:'c'.repeat(43),deadline:Date.now()+60000},Date.now()+60000);mocks.jar.set(LAUNCH_COOKIE,h);
+        await retainProjectIdentity('private');const h=vaults.launches.put({intentId,code:'c'.repeat(43),deadline:Date.now()+60000},Date.now()+60000);mocks.jar.set(launchProofCookie(intentId),h);
         const f=vi.fn(async()=>Response.json({error:'project_repo_not_authorized'},{status:403}));vi.stubGlobal('fetch',f);
-        await expect(launchGrant('os-user','a')).rejects.toThrow('not_authorized');
-        await expect(launchGrant('os-user','a')).rejects.toThrow('not_authorized');expect(f).toHaveBeenCalledTimes(1);
+        await expect(launchGrant('os-user','a',intentId)).rejects.toThrow('not_authorized');
+        await expect(launchGrant('os-user','a',intentId)).rejects.toThrow('not_authorized');expect(f).toHaveBeenCalledTimes(1);
     });
     it('validates identity, expiry, read scope, ref and canonical URL',()=>{
         const identity={token:'private',...value().identity,userId:'os-user',sessionId:'a',expiresAt:Date.now()+120000};
@@ -46,4 +47,19 @@ describe('private identity and launch session',()=>{
         for(const origin of [null,'null','https://universe2.ezil.work.evil.invalid','http://universe2.ezil.work']) expect(trustedOrigin(origin,'https://universe2.ezil.work')).toBe(false);
         const v=new Vault<string>(1);const h=v.put('secret',200,100);expect(()=>v.put('second',200,100)).toThrow();expect(v.get(h,200)).toBeUndefined();expect(v.take(v.put('once',400,200),200)).toBe('once');
     });
+});
+
+it('overlapping tabs keep immutable A/B intents, ignore latest cookie, and old A refresh cannot open B',async()=>{
+    await retainProjectIdentity('private-id-token');
+    const a='a'.repeat(43),b='b'.repeat(43);
+    const ha=vaults.launches.put({intentId:a,code:a,deadline:Date.now()+60000},Date.now()+60000);
+    const hb=vaults.launches.put({intentId:b,code:b,deadline:Date.now()+60000},Date.now()+60000);
+    mocks.jar.set(launchProofCookie(a),ha);mocks.jar.set(launchProofCookie(b),hb);
+    mocks.jar.set(LAUNCH_COOKIE,hb); // old browser-wide latest cookie must be irrelevant
+    const f=vi.fn(async(_url:unknown,opts:RequestInit)=>{const code=JSON.parse(opts.body as string).code;return Response.json({...value(),binding:{...value().binding,canonicalURL:`https://github.ezil.work/team/${code===a?'a':'b'}.git`}});});vi.stubGlobal('fetch',f);
+    const [ga,gb]=await Promise.all([launchGrant('os-user','computer-a',a),launchGrant('os-user','computer-a',b)]);
+    expect(ga.binding.canonicalURL).toMatch(/\/a\.git$/);expect(gb.binding.canonicalURL).toMatch(/\/b\.git$/);
+    expect((await launchGrant('os-user','computer-a',a)).binding.canonicalURL).toMatch(/\/a\.git$/);expect(f).toHaveBeenCalledTimes(2);
+    mocks.jar.set(launchProofCookie(a),hb);await expect(launchGrant('os-user','computer-a',a)).rejects.toThrow('not_authorized');
+    mocks.jar.delete(launchProofCookie(a));await expect(launchGrant('os-user','computer-a',a)).rejects.toThrow('not_authorized');
 });
