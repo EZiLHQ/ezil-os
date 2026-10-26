@@ -10,6 +10,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -27,13 +29,16 @@ if ( ! chromium ) {
     process.exit(2);
 }
 
-const { build } = require(require.resolve('esbuild', { paths: [path.resolve(here, '../../../../app')] }));
 const sourceDir = process.env.SOURCE_SETTINGS_DIR || here;
 const baseline = process.env.EXPECT_BASELINE_FAILURE === '1';
-const source = (await build({
-    stdin: { contents: "import { openUpgradeSheet } from './upgrade-sheet.js'; window.openUpgradeSheet = openUpgradeSheet;", resolveDir: sourceDir },
-    bundle: true, write: false, format: 'iife', target: 'es2022',
-})).outputFiles[0].text;
+// The CI shell job already installs pinned Bun; no app-only esbuild dependency.
+const buildDir = await fs.mkdtemp(path.join(os.tmpdir(), 'provider-modal-source-'));
+let source;
+try {
+    const entry = path.join(buildDir, 'entry.js');
+    await fs.writeFile(entry, `import { openUpgradeSheet } from ${JSON.stringify(path.join(sourceDir, 'upgrade-sheet.js'))}; window.openUpgradeSheet = openUpgradeSheet;`);
+    source = execFileSync('bun', ['build', entry, '--target=browser', '--format=iife'], { encoding: 'utf8' });
+} finally { await fs.rm(buildDir, { recursive: true, force: true }); }
 const css = await fs.readFile(path.join(sourceDir, 'upgrade-sheet.css'), 'utf8');
 const output = path.join(path.resolve(process.env.TMPDIR || '.tmp'), 'provider-modal-browser');
 await fs.mkdir(output, { recursive: true });
