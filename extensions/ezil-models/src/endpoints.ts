@@ -1,6 +1,6 @@
-import type { ResolvedProvider } from './config';
+import type { GatewayProtocol, ResolvedProvider } from './config';
 
-export type ApiKind = 'anthropic' | 'openai';
+export type ApiKind = 'anthropic' | 'openai' | 'openai-responses';
 
 export type Endpoint = { api: ApiKind; url: string; headers: Record<string, string> };
 
@@ -19,11 +19,13 @@ export function apiKindOf(provider: ResolvedProvider): ApiKind {
  *                        (or baseUrl https://<resource>.services.ai.azure.com/openai/v1)
  *  - openai-compatible:  <baseUrl>/chat/completions                                              authorization: Bearer (if key)
  */
-export function resolveEndpoint(provider: ResolvedProvider, extraBetas: readonly string[] = []): Endpoint {
+export function resolveEndpoint(provider: ResolvedProvider, extraBetas: readonly string[] = [], gatewayProtocol: GatewayProtocol = 'anthropic-messages'): Endpoint {
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'text/event-stream' };
     let url: string;
     if (provider.type === 'ezil-gateway') {
-        return { api: 'anthropic', url: `${provider.baseUrl}/messages`, headers: { ...headers, authorization: `Bearer ${provider.apiKey ?? ''}` } };
+        return { api: gatewayProtocol === 'openai-responses' ? 'openai-responses' : 'anthropic',
+            url: `${provider.baseUrl}/${gatewayProtocol === 'openai-responses' ? 'responses' : 'messages'}`,
+            headers: { ...headers, authorization: `Bearer ${provider.apiKey ?? ''}` } };
     }
     switch (provider.type) {
         case 'anthropic': {

@@ -37,8 +37,10 @@ export interface AiRoute {
 const AI_ROUTES: Readonly<Record<string, AiRoute>> = {
   'GET /ai/v1/models': { method: 'GET', upstreamPath: '/v1/models', query: [], label: 'GET /v1/models' },
   'POST /ai/v1/messages': { method: 'POST', upstreamPath: '/v1/messages', query: [], label: 'POST /v1/messages' },
+  'POST /ai/v1/responses': { method: 'POST', upstreamPath: '/v1/responses', query: [], label: 'POST /v1/responses' },
   'GET /ai/v1/requests/:id': { method: 'GET', upstreamPath: '/v1/requests/:id', query: [], label: 'GET /v1/requests/:id' },
   'GET /ai/v1/me/balance': { method: 'GET', upstreamPath: '/v1/me/balance', query: [], label: 'GET /v1/me/balance' },
+  'GET /ai/v1/me/limits': { method: 'GET', upstreamPath: '/v1/me/limits', query: [], label: 'GET /v1/me/limits' },
   'GET /ai/v1/me/usage': { method: 'GET', upstreamPath: '/v1/me/usage', query: ['limit', 'before'], label: 'GET /v1/me/usage' },
 };
 
@@ -284,6 +286,106 @@ class IdleTimeout extends Error {
   }
 }
 
+type ResponseUsage = { input_tokens: number; output_tokens: number };
+
+/** Bounded telemetry only: never change the response bytes or calculate a charge. */
+function responseTelemetry(sse: boolean) {
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+  let buffer = '';
+  let event = '';
+  let data = '';
+  let overflow = false;
+  let malformed = false;
+  let trailingCR = false;
+  let responseId: string | null = null;
+  let terminal: string | null = null;
+  let code: string | null = null;
+  let usage: ResponseUsage | null = null;
+  const decode = (bytes?: Uint8Array, stream = false): string => {
+    try { return decoder.decode(bytes, { stream }); }
+    catch { malformed = true; return ''; }
+  };
+  const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+  const count = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  const inspect = (value: unknown, eventName?: string) => {
+    if (!record(value)) { malformed = true; return; }
+    const type = eventName || (typeof value.type === 'string' ? value.type : '');
+    if (sse && eventName && value.type !== undefined && value.type !== eventName) { malformed = true; return; }
+    if (sse && (type === 'error' || value.type === 'error')) {
+      terminal = 'error'; usage = null;
+      code = errorCodeOf(new TextEncoder().encode(JSON.stringify(value)));
+      return;
+    }
+    if (terminal === 'error') return;
+    const response = sse ? value.response : value;
+    if (sse && type === 'response.created') {
+      if (!record(response) || typeof response.id !== 'string' || !response.id || response.id.length > 200
+        || terminal !== null || (responseId !== null && responseId !== response.id)) malformed = true;
+      else responseId = response.id;
+      return;
+    }
+    if (sse && !['response.completed', 'response.incomplete', 'response.failed'].includes(type)) return;
+    if (!record(response) || !['completed', 'incomplete', 'failed'].includes(String(response.status))
+      || typeof response.id !== 'string' || response.id.length === 0 || response.id.length > 200
+      || terminal !== null || (responseId !== null && responseId !== response.id)
+      || (sse && type !== `response.${response.status}`)) {
+      malformed = true; return;
+    }
+    responseId = response.id;
+    terminal = `response.${response.status}`;
+    code = errorCodeOf(new TextEncoder().encode(JSON.stringify({ error: response.error })));
+    const raw = response.usage;
+    usage = record(raw) && count(raw.input_tokens) && count(raw.output_tokens)
+      && (raw.total_tokens === undefined || (count(raw.total_tokens) && raw.total_tokens === raw.input_tokens + raw.output_tokens))
+      ? { input_tokens: raw.input_tokens, output_tokens: raw.output_tokens } : null;
+  };
+  const dispatch = () => {
+    if (overflow) malformed = true;
+    else if (data === '[DONE]') { if (terminal === null) malformed = true; }
+    else if (data) {
+      try { inspect(JSON.parse(data), event); } catch { malformed = true; }
+    }
+    event = ''; data = ''; overflow = false;
+  };
+  return {
+    push(bytes: Uint8Array) {
+      if (!sse) {
+        if (overflow) return;
+        buffer += decode(bytes, true);
+        if (buffer.length > MAX_ERROR_BODY_BYTES) { buffer = ''; overflow = true; }
+        return;
+      }
+      let text = decode(bytes, true);
+      if (!text) return;
+      if (trailingCR && text.startsWith('\n')) text = text.slice(1);
+      trailingCR = text.endsWith('\r');
+      buffer += text.replace(/\r\n|\r/g, '\n');
+      let end: number;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, end).replace(/\r$/, '');
+        buffer = buffer.slice(end + 1);
+        if (line === '') dispatch();
+        else if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:') && !overflow) {
+          data += (data ? '\n' : '') + line.slice(5).replace(/^ /, '');
+          if (data.length > MAX_ERROR_BODY_BYTES) { data = ''; overflow = true; }
+        }
+      }
+      if (buffer.length > MAX_ERROR_BODY_BYTES) { buffer = ''; overflow = true; }
+    },
+    finish() {
+      buffer += decode();
+      if (sse) {
+        // A terminal-looking fragment without the SSE event boundary is not authoritative.
+        if (buffer.trim() || data || event || overflow) malformed = true;
+      } else if (!overflow) {
+        try { inspect(JSON.parse(buffer)); } catch { malformed = true; }
+      }
+      return malformed || overflow ? { terminal: null, code: null, usage: null } : { terminal, code, usage };
+    },
+  };
+}
+
 /**
  * Re-exposes the upstream body chunk by chunk (no buffering), erroring with
  * IdleTimeout when no chunk arrives for `idleMs`, cancelling upstream when the
@@ -293,9 +395,10 @@ function passThrough(
   body: ReadableStream<Uint8Array>,
   idleMs: number,
   watchSse: boolean,
-  onEnd: (outcome: string, terminal: string | null, code: string | null) => void,
+  onEnd: (outcome: string, terminal: string | null, code: string | null, usage?: ResponseUsage | null) => void,
   abort: AbortController,
   watchError: boolean,
+  watchResponses = false,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -306,6 +409,7 @@ function passThrough(
   let finished = false;
   const errorChunks: Uint8Array[] = [];
   let errorBytes = 0;
+  const responses = watchResponses ? responseTelemetry(watchSse) : undefined;
   const finish = (outcome: string) => {
     if (finished) return;
     finished = true;
@@ -316,7 +420,8 @@ function passThrough(
       for (const chunk of errorChunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       code = errorCodeOf(bytes);
     }
-    onEnd(outcome, terminal, code);
+    const observed = responses?.finish();
+    onEnd(outcome, observed ? observed.terminal : terminal, observed ? observed.code : code, observed?.usage);
   };
   return new ReadableStream<Uint8Array>(
     {
@@ -337,7 +442,8 @@ function passThrough(
             if (errorBytes <= MAX_ERROR_BODY_BYTES) errorChunks.push(next.value);
             else errorChunks.length = 0;
           }
-          if (watchSse) {
+          responses?.push(next.value);
+          if (watchSse && !responses) {
             const lines = (tail + decoder.decode(next.value, { stream: true })).split('\n');
             tail = lines.pop()!.slice(-MAX_ERROR_BODY_BYTES);
             for (const raw of lines) {
@@ -555,9 +661,10 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
   }
 
   const isSse = (upstream.headers.get('content-type') ?? '').includes('text/event-stream');
-  const stream = passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS, isSse, (outcome, terminal, code) => {
+  const responses = route.upstreamPath === '/v1/responses';
+  const stream = passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS, isSse, (outcome, terminal, code, usage) => {
     cleanup();
-    log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal });
-  }, abort, !upstream.ok);
+    log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal, ...(responses ? { usage: usage ?? null } : {}) });
+  }, abort, !upstream.ok, responses);
   return new Response(stream, { status: upstream.status, headers: outHeaders });
 }

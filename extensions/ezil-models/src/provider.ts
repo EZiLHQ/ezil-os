@@ -2,7 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
-import { GatewayError, gatewayModels, withGatewayModelLimits } from './gateway';
+import { GatewayError, gatewayModelAvailable, gatewayModels, withGatewayModelLimits } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel } from './config';
@@ -132,7 +132,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const providers = [...new Set(models.filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
             const catalog = new Map(await Promise.all(providers.map(async provider => [provider, await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), controller.signal)] as const)));
             if (token.isCancellationRequested) return [];
-            return models.filter(model => catalog.get(model.provider)?.data.find(entry => entry.id === model.model)?.enabled !== false)
+            return models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider)))
                 .map(model => toInformation(withGatewayModelLimits(model, catalog.get(model.provider))));
         } finally { cancel.dispose(); }
     }
@@ -152,8 +152,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         token: vscode.CancellationToken,
     ): Promise<void> {
         let resolved = this.resolve(model);
-        if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
-            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.model === QWEN) ?? resolved;
+        if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
+            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway'
+                && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
         }
         const request = toNeutralRequest(messages, options);
         const controller = new AbortController();
@@ -167,8 +168,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (resolved.provider.type === 'ezil-gateway') {
                 // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
-                resolved = withGatewayModelLimits(resolved, catalog);
                 controller.signal.throwIfAborted();
+                if (!gatewayModelAvailable(resolved, catalog)) {
+                    throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined);
+                }
+                resolved = withGatewayModelLimits(resolved, catalog);
             }
             const events = chat(resolved, request, {
                 signal: controller.signal,

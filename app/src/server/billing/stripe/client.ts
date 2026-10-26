@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { TRPCError } from '@trpc/server';
 
-import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
+import { aiPackCheckoutEligible, findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
 import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult } from '../ports';
 import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offerBySku } from '../v3/catalog';
 import { CATALOG_V3 } from '../v3/contract';
@@ -441,6 +442,10 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
 
         async createCheckoutSession(input) {
             const pack = findPack(input.sku);
+            // Refuse purchases we cannot fund, before price lookup or any Stripe request.
+            if (pack !== undefined && !aiPackCheckoutEligible(pack)) {
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'pack_credits_unset' });
+            }
             const offer = offerBySku(input.sku);
             const lookupKey = offer?.sellable ? offer.stripeLookupKey : null;
             if (input.sku !== PRO_PLAN.sku && !lookupKey && pack === undefined) throw new Error('Unknown billing SKU');
