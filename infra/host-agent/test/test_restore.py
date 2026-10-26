@@ -1,6 +1,7 @@
 """Offline restore tests. Workspace roundtrip runs the real TS-embedded Python codec
 via node; hostile/system fixtures use the same documented stdlib PAX format.
 """
+from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 import hashlib
 import io
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -300,6 +302,146 @@ class RestoreTests(RestoreFixture, unittest.TestCase):
                     state.unlink()
 
 
+class DownloadTests(RestoreFixture, unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(restore, 'CHUNK', 65536)
+        patch.start()
+        self.addCleanup(patch.stop)
+        super().setUp()
+
+    def test_out_of_order_completion_writes_in_order(self):
+        data = b''.join(bytes([i]) * restore.CHUNK for i in range(10))
+        self.set_archive([file('large', data)])
+        later = threading.Event()
+        lock, completed = threading.Lock(), []
+
+        def fetch(kind, index):
+            if index == 0:
+                self.assertTrue(later.wait(5))
+            chunk = self.fetch(kind, index)
+            with lock:
+                completed.append(index)
+            if index == 7:
+                later.set()
+            return chunk
+
+        self.assertEqual(self.run_restore(fetch), {'files': 1, 'bytes': len(data)})
+        self.assertLess(completed.index(7), completed.index(0))
+        self.assertEqual(sorted(completed), list(range(len(self.spec['workspace']['chunks']))))
+        self.assertEqual((self.data / 'workspace/large').read_bytes(), data)
+        self.assertEqual(self.state()['state'], 'done')
+        self.assertFalse((self.data / restore.STAGE).exists())
+
+    def test_middle_chunk_hash_refuses_before_extraction(self):
+        self.set_archive([file('large', b'x' * (9 * restore.CHUNK))])
+        self.spec['workspace']['chunks'][4]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(Refused, '^restore_chunk_sha256$'):
+            self.run_restore()
+        self.assertFalse((self.data / 'workspace').exists())
+        self.assertFalse((self.data / 'root').exists())
+        self.assertEqual(self.state()['state'], 'started')
+        staged = self.data / restore.STAGE / 'workspace.tar'
+        self.assertEqual(staged.read_bytes(), self.raw['workspace'][:4 * restore.CHUNK])
+
+    def test_concurrency_and_reorder_window_are_bounded(self):
+        self.assertEqual(restore.FETCH_CONCURRENCY, 8)
+        self.set_archive([file('large', b'x' * (23 * restore.CHUNK))])
+        self.assertEqual(len(self.spec['workspace']['chunks']), 24)
+        barrier, lock = threading.Barrier(8), threading.Lock()
+        active, peak, fetched, submitted = 0, 0, [], []
+
+        def fetch(kind, index):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                fetched.append(index)
+            try:
+                barrier.wait(5)
+                return self.fetch(kind, index)
+            finally:
+                with lock:
+                    active -= 1
+
+        class Pool(ThreadPoolExecutor):
+            def submit(pool, fn, kind, index):
+                written = (self.data / restore.STAGE / 'workspace.tar').stat().st_size
+                self.assertLess(index, written // restore.CHUNK + 8)
+                submitted.append(index)
+                return super().submit(fn, kind, index)
+
+        with mock.patch.object(restore, 'ThreadPoolExecutor', Pool):
+            self.run_restore(fetch)
+        self.assertEqual(peak, 8)
+        self.assertEqual(active, 0)
+        self.assertEqual(sorted(fetched), list(range(24)))
+        self.assertEqual(submitted, list(range(24)))
+
+    def test_refusals_cancel_queued_fetches(self):
+        self.set_archive([file('large', b'x' * (9 * restore.CHUNK))])
+        for response, reason in ((b'', 'chunk_size'), (b'x' * restore.CHUNK, 'chunk_sha256'),
+                                 (Refused('restore_fetch_status'), 'fetch_status')):
+            with self.subTest(reason=reason):
+                futures = [Future() for _ in range(8)]
+                if isinstance(response, Exception):
+                    futures[0].set_exception(response)
+                else:
+                    futures[0].set_result(response)
+                with mock.patch.object(restore, 'ThreadPoolExecutor') as executor:
+                    pool = executor.return_value.__enter__.return_value
+                    pool.submit.side_effect = futures
+                    with self.assertRaisesRegex(Refused, '^restore_' + reason + '$'):
+                        self.run_restore()
+                executor.assert_called_once_with(max_workers=8)
+                self.assertEqual(pool.submit.call_count, 8)
+                self.assertTrue(all(f.cancelled() for f in futures[1:]))
+                self.assertFalse((self.data / 'workspace').exists())
+                self.assertEqual(self.state()['state'], 'started')
+
+    def test_sequential_equivalence(self):
+        self.set_archive([directory('dir'), directory('empty'),
+                          file('dir/large', b'abc' * restore.CHUNK, 0o751),
+                          file('é', b'unicode'), link('link', 'dir/large')])
+        self.set_archive([directory('root'), file('root/.bashrc'), file('home/alice/.profile'),
+                          link('root/current', '.bashrc'), file('root/.cache/skip'),
+                          file('usr/bin/skip'), file('.ezil-deleted.json', b'[]')], 'system')
+        self.spec['system']['archiveSha256'] = self.spec['system']['sha256']
+        self.spec['system']['sha256'] = 'f' * 64
+        sequential = Path(self.tmp.name) / 'sequential'
+        sequential.mkdir()
+        for root in (self.data, sequential):
+            (root / 'workspace').mkdir()
+            (root / 'workspace/keep').write_bytes(b'keep')
+
+        def old_download(stage, kind, h, fetch):
+            # The former sequential fetch/check order, using an in-memory archive.
+            data = bytearray()
+            for i, chunk in enumerate(h['chunks']):
+                part = fetch(kind, i)
+                if not isinstance(part, bytes) or len(part) != chunk['size']:
+                    restore.refuse('chunk_size')
+                if hashlib.sha256(part).hexdigest() != chunk['sha256']:
+                    restore.refuse('chunk_sha256')
+                data.extend(part)
+            expected = h.get('archiveSha256', h['sha256']) if kind == 'system' else h['sha256']
+            if hashlib.sha256(data).hexdigest() != expected:
+                restore.refuse('archive_sha256')
+            return io.BytesIO(data)
+
+        def fetch(kind, index):
+            return self.raw[kind][index * restore.CHUNK:(index + 1) * restore.CHUNK]
+
+        def tree(root):
+            return {str(p.relative_to(root)): (stat.S_IMODE(p.lstat().st_mode),
+                    os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None)
+                    for p in root.rglob('*')}
+
+        with mock.patch.object(restore, '_download', old_download):
+            expected = restore.run_restore(self.spec, str(sequential), fetch)
+        self.assertEqual(self.run_restore(), expected)
+        self.assertEqual(tree(self.data), tree(sequential))
+
+
 class FetchTests(unittest.TestCase):
     def setUp(self):
         self.spec = {'kind': 'cf-snapshot', 'workspace': head(archive([file()]), 1), 'system': None,
@@ -321,6 +463,34 @@ class FetchTests(unittest.TestCase):
             self.assertEqual(restore.http_fetch({}, self.client)('workspace', 0), b'ok')
             self.assertEqual(req.call_count, 4)
             self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(2), mock.call(4)])
+
+    def test_concurrent_fetches_have_independent_connections(self):
+        self.spec['workspace']['chunks'] *= 8
+        barrier = threading.Barrier(8)
+        connections, lock = [], threading.Lock()
+
+        def connection(*args, **kwargs):
+            conn = mock.Mock()
+            conn.request.side_effect = lambda *a, **kw: barrier.wait(5)
+            conn.getresponse.return_value.status = 200
+            conn.getresponse.return_value.read.return_value = b'chunk'
+            with lock:
+                connections.append(conn)
+            return conn
+
+        with mock.patch.object(restore.http, 'tls_context', side_effect=lambda _: object()), \
+             mock.patch.object(restore.http.http.client, 'HTTPSConnection', side_effect=connection):
+            fetch = restore.http_fetch({}, self.client)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(fetch, 'workspace', i) for i in range(8)]
+                self.assertEqual([f.result() for f in futures], [b'chunk'] * 8)
+        self.assertEqual(len(connections), 8)
+        for conn in connections:
+            conn.request.assert_called_once()
+            self.assertEqual(conn.request.call_args.kwargs['headers'],
+                             {'Authorization': 'Bearer epoch-test-token'})
+            conn.getresponse.return_value.read.assert_called_once_with(restore.CHUNK + 1)
+            conn.close.assert_called_once()
 
     def test_retry_exhaustion(self):
         with mock.patch.object(self.client, 'get', return_value=(503, b'')) as req, mock.patch.object(restore.time, 'sleep'):
