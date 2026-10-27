@@ -111,3 +111,14 @@ export function fixtureReleaseRegistry16() {
     return { ...f, release122, retained: [...f.retained, release122],
         deployment122: { ...f.deployment121, amiId: release122.amiId } };
 }
+
+/** Synthetic seventeenth and eighteenth records; the cap became 18 for 1.0.23 (readback stays under 24,000 bytes). */
+export function fixtureReleaseRegistry18() {
+    const f = fixtureReleaseRegistry16();
+    const release123 = { ...f.release122, amiId: 'ami-00000000000000017', recipeVersion: '1.0.23',
+        createdAt: '2026-10-26T20:00:00.000Z' };
+    const release124 = { ...release123, amiId: 'ami-00000000000000018', recipeVersion: '1.0.24',
+        createdAt: '2026-10-27T20:00:00.000Z' };
+    return { ...f, release123, release124, retained: [...f.retained, release123, release124],
+        deployment124: { ...f.deployment122, amiId: release124.amiId } };
+}

@@ -230,8 +230,8 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        # 8 + 9 = 17 records: one beyond the sixteen-record bound.
-        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa01']]
+        # 8 + 11 = 19 records: one beyond the eighteen-record bound.
+        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa0123']]
         self.refuse('invalid registry')
 
     def test_twelve_record_gc_removes_exactly_one_preserving_eleven(self):

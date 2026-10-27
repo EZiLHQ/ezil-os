@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readLifecycleDeployments } from './aws-intent';
 import { parseRebaseRelease, parseRebaseSourceRelease, RebaseReleaseSchema, RebaseSourceReleaseSchema,
     resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
-import { fixtureReleaseRegistry106, fixtureReleaseRegistry16, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
+import { fixtureReleaseRegistry106, fixtureReleaseRegistry16, fixtureReleaseRegistry18, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
 
 describe('B2/B4/B5 retained 1.0.6 release registry', () => {
     it('resolves 8dbc to 1.0.6 while preserving the entire legacy 1.0.2 source deployment', () => {
@@ -195,10 +195,13 @@ describe('sixteen-record registry capacity and rollback compatibility', () => {
         expect(f.retained.slice(0, 3)).toEqual(f.releases);
     });
 
-    it('refuses seventeen records in both validators even when all identities are valid', () => {
-        const f = fixtureReleaseRegistry16(), entry = { ...f.deployment118,
-            releases: [...f.retained, { ...f.release118, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.23' }] };
-        expect(entry.releases).toHaveLength(17);
+    it('accepts eighteen records and refuses nineteen in both validators even when all identities are valid', () => {
+        const f = fixtureReleaseRegistry18(), full = { ...f.deployment118, releases: f.retained };
+        expect(full.releases).toHaveLength(18);
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [full.region]: full }) }, [full.region]).ok).toBe(true);
+        expect(() => resolveRebaseReleases(full, LOWER_102)).not.toThrow();
+        const entry = { ...full, releases: [...f.retained, { ...f.release118, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.25' }] };
+        expect(entry.releases).toHaveLength(19);
         entry.releases.forEach(r => expect(RebaseSourceReleaseSchema.safeParse(r).success).toBe(true));
         expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]).ok).toBe(false);
         expect(() => resolveRebaseReleases(entry, LOWER_102)).toThrow();
