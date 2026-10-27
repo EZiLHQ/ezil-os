@@ -87,26 +87,31 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(again,back)
 
     def test_registry_full_refuses_without_dropping_any_record(self):
-        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,37)]]
-        self.assertEqual(len(records),18)
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,38)]]
+        self.assertEqual(len(records),19)
         for record in records: manifest.validate(record, source=True, repository=TOOL.REPOSITORY)
         original=copy.deepcopy(records)
         envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:dict(self.source,releases=records)}})}
         with self.assertRaisesRegex(ValueError,'registry full'): TOOL.edit_release_secret(envelope,self.old,self.new,[self.target])
         self.assertEqual(records,original)
 
-    def test_seventeen_to_eighteen_and_rollback_preserve_all_records(self):
-        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,36)]
+    def test_eighteen_to_nineteen_maintenance_and_rollback_preserve_all_records(self):
+        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,37)]
         records=[self.source,*extra]
+        target=dict(self.target,previousLowerImageDigest=None,previousLowerImageRef=None)
+        after=TOOL.pair({'settings':{'deployment':target}})
+        self.assertEqual(len(records),18)
         for encoded in (True,False):
             d={TOOL.REGION:dict(self.source,releases=records),'other':{'keep':True}}
             envelope={'SecretString':json.dumps({'untouched':'synthetic',TOOL.KEY:json.dumps(d) if encoded else d})}
             frozen=copy.deepcopy(envelope)
-            forward=TOOL.edit_release_secret(envelope,self.old,self.new,[self.source,self.target])
-            back=TOOL.edit_release_secret({'SecretString':json.dumps(forward)},self.new,self.old,[self.source])
+            forward=TOOL.edit_release_secret(envelope,self.old,after,[self.source,target])
+            back=TOOL.edit_release_secret({'SecretString':json.dumps(forward)},after,self.old,[self.source])
             restored=json.loads(back[TOOL.KEY]) if encoded else back[TOOL.KEY]
-            self.assertEqual(len(restored[TOOL.REGION]['releases']),18)
-            self.assertEqual(restored[TOOL.REGION]['releases'],[*records,self.target])
+            self.assertEqual(len(restored[TOOL.REGION]['releases']),19)
+            self.assertEqual(restored[TOOL.REGION]['releases'],[*records,target])
+            self.assertTrue(all(r['previousLowerImageDigest'] is None and r['previousLowerImageRef'] is None
+                                for r in restored[TOOL.REGION]['releases']))
             # Existing operator ceilings, for both secret encodings and both directions.
             # These synthetic sizes do not replace root's actual release proof.
             for outer in (forward,back):
@@ -125,20 +130,53 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(isinstance(back[TOOL.KEY],str),encoded)
             self.assertEqual(envelope,frozen)
             self.assertEqual(TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[self.source]),back)
-            seventeenth=dict(self.target,amiId='ami-'+'f'*17)
+            twentieth=dict(target,amiId='ami-'+'f'*17)
             with self.assertRaisesRegex(ValueError,'registry full'):
-                TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.new,[seventeenth])
-            oversized=dict(restored[TOOL.REGION],releases=[*records,self.target,seventeenth])
+                TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,after,[twentieth])
+            oversized=dict(restored[TOOL.REGION],releases=[*records,target,twentieth])
             with self.assertRaisesRegex(ValueError,'invalid release registry'):
-                TOOL.edit_release_secret({'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:oversized}})},self.old,self.new,[])
+                TOOL.edit_release_secret({'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:oversized}})},self.old,after,[])
+
+    def test_nineteenth_record_readback_limit_in_both_directions(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,37)]]
+        self.assertEqual(len(records),18)
+        for maintenance in (True,False):
+            target=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.25')
+            if maintenance: target.update(previousLowerImageDigest=None,previousLowerImageRef=None)
+            retained=[*records,target]
+            self.assertEqual(len(retained),19)
+            for record in retained: manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
+            after=TOOL.pair({'settings':{'deployment':target}})
+            for encoded in (True,False):
+                for rollback in (True,False):
+                    with self.subTest(maintenance=maintenance,encoded=encoded,rollback=rollback):
+                        current=target if rollback else self.target
+                        desired=self.target if rollback else target
+                        before,next_pair=(after,self.new) if rollback else (self.new,after)
+                        d={TOOL.REGION:dict(current,releases=retained if rollback else records)}
+                        envelope={'SecretString':json.dumps({TOOL.KEY:json.dumps(d) if encoded else d})}
+                        frozen=copy.deepcopy(envelope)
+                        expected=dict(desired,releases=retained)
+                        readback={'gitSha':'9'*40,'killSwitch':'1','deployment':app_ops.public_deployment(expected)}
+                        size=len(json.dumps(readback,separators=(',',':')).encode('utf-8'))
+                        if maintenance:
+                            self.assertLessEqual(size,24000)
+                            result=TOOL.edit_release_secret(envelope,before,next_pair,[desired])
+                            deployments=manifest.loads(result[TOOL.KEY]) if encoded else result[TOOL.KEY]
+                            self.assertEqual(app_ops.public_deployment(deployments[TOOL.REGION]),readback['deployment'])
+                        else:
+                            self.assertGreater(size,24000)
+                            with self.assertRaisesRegex(ValueError,'^release registry readback exceeds SSM 24000-byte limit$'):
+                                TOOL.edit_release_secret(envelope,before,next_pair,[desired])
+                        self.assertEqual(envelope,frozen)
 
     def test_registry_cap_parity_with_app_source_and_manifest_contracts(self):
         # The app cannot import operator tooling; pin all five independent guards.
         root=HERE.parents[3]
         for name in ('aws-intent.ts','aws-rebase-release.ts'):
             source=(root/'app/src/server/lib/compute'/name).read_text()
-            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['18'])
-        for name, expected in (('json-tool.py',[18,18]),('registry_gc.py',[18])):
+            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['19'])
+        for name, expected in (('json-tool.py',[19,19]),('registry_gc.py',[19])):
             tree=ast.parse((HERE.parent/name).read_text())
             caps=[node.comparators[-1].value for node in ast.walk(tree) if isinstance(node,ast.Compare)
                   and isinstance(node.comparators[-1],ast.Constant)

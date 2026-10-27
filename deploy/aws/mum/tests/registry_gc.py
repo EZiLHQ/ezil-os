@@ -230,9 +230,21 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        # 8 + 11 = 19 records: one beyond the eighteen-record bound.
-        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa0123']]
+        # 8 + 12 = 20 records: one beyond the nineteen-record bound.
+        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa01234']]
+        self.assertEqual(len(self.snapshot['deployment']['releases']),20)
         self.refuse('invalid registry')
+
+    def test_nineteen_record_gc_removes_exactly_one_preserving_eighteen(self):
+        self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17)
+                             for c in 'bcdefa0123']])
+        self.assertEqual(len(self.records),19)
+        self.evidence['registrySha256']=gc.sha(self.records)
+        before=copy.deepcopy(self.snapshot)
+        after=self.prepare()
+        self.assertEqual(len(after['releases']),18)
+        self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
+        self.assertEqual(self.snapshot,before)
 
     def test_twelve_record_gc_removes_exactly_one_preserving_eleven(self):
         self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17,recipeVersion='1.0.1'+str(n))

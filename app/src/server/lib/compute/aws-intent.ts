@@ -170,7 +170,7 @@ export function readLifecycleDeployments(
     for (const region of regions) {
         const entry = Object.prototype.hasOwnProperty.call(parsed, region) ? (parsed as Record<string, unknown>)[region] : undefined;
         const { releases, ...deployment } = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
-        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(18).safeParse(releases).success) {
+        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(19).safeParse(releases).success) {
             invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`); continue;
         }
         const d = LifecycleDeploymentSchema.safeParse(deployment);
