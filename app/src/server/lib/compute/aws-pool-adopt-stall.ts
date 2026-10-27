@@ -8,6 +8,7 @@ import { ENROLLMENT_FAILED, failStalledPoolEnrollment, readCanaryComputer, withA
 import { hasFailedPoolLease, isStalledPoolLease, markPoolHost, retirePoolLease } from './ready-pool';
 
 export const ADOPT_STALL_MS = 180_000;
+export const RELEASE_RETRY_AFTER_MS = 60_000;
 type Execution = Awaited<ReturnType<NonNullable<ReceiptDeps['executions']>['describe']>>;
 
 function boundWork(p: Placement, e: Execution): LifecycleWork | null {
@@ -66,6 +67,18 @@ export async function reconcileStalledPoolAdopt(deps: ReceiptDeps, p: Placement,
     const work = boundWork(p, execution);
     if (!work) return true;
     if (work.intent.operation === 'adopt' && execution.status === 'SUCCEEDED') {
+        const release = sessionEndWork(p, d, randomUUID(), deps.pool);
+        const reserved = await writeLivePoolRecovery(deps.db, p, 'UNCONFIRMED', {
+            lifecycleJobId: release.intent.jobId, lifecycleDigest: release.digest,
+        });
+        if (reserved.ok) await startLifecycleJob(deps.starter, p.region, release, deps.sleep);
+        return true;
+    }
+    if (work.intent.operation === 'release' && ['FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status)) {
+        // A release can fail on a rollout race (an old workflow version losing its observer
+        // grant mid-deploy). Retry once it has settled, as a NEW job on the current deployment.
+        const at = (deps.now ?? deps.clock ?? (() => new Date()))();
+        if (!execution.stopDate || at.getTime() - execution.stopDate.getTime() < RELEASE_RETRY_AFTER_MS) return true;
         const release = sessionEndWork(p, d, randomUUID(), deps.pool);
         const reserved = await writeLivePoolRecovery(deps.db, p, 'UNCONFIRMED', {
             lifecycleJobId: release.intent.jobId, lifecycleDigest: release.digest,

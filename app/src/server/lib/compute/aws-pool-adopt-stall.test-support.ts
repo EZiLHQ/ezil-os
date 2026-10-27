@@ -8,7 +8,7 @@ import { createFakePlacementDb, DEFAULT_OWNER, placementRow, type Row } from './
 import { finishEnrollment, POOL_SESSION_PENDING, readPlacement, type PlacementDb, type PlacementExecutor } from './placement';
 import { readPoolSessionReadyAt, recordPoolSessionReady } from './ready-pool';
 
-const CLAIM_AT = new Date('2026-10-27T12:11:00Z');
+export const CLAIM_AT = new Date('2026-10-27T12:11:00Z');
 const HOST = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 
 /** Evaluate the emitted pool predicates, so removing a SQL guard changes the test's outcome. */

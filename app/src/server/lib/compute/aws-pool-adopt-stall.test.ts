@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('inject billing'); }) }));
-import { ADOPT_STALL_MS, failStalledPoolAdopt, replaceStalledPoolAdopt } from './aws-pool-adopt-stall';
-import { stalledAdoptSetup } from './aws-pool-adopt-stall.test-support';
+import { ADOPT_STALL_MS, RELEASE_RETRY_AFTER_MS, failStalledPoolAdopt, replaceStalledPoolAdopt } from './aws-pool-adopt-stall';
+import { CLAIM_AT, stalledAdoptSetup } from './aws-pool-adopt-stall.test-support';
 import { buildLifecycleWork } from './aws-intent';
 import { applyLifecycleReceipt, lifecycleExecutionArn } from './aws-receipts';
 import { ENROLLMENT_FAILED, ENROLLMENT_SUCCEEDED, ImageJobConflictError } from './placement';
@@ -123,6 +123,22 @@ describe('pool adoption stalled before session-ready', () => {
         s.executions.delete(lifecycleExecutionArn(s.d, release.intent.jobId));
         await s.tick();
         expect(s.starts).toEqual([release, release]);
+        s.finish(); await s.fleet();
+        expect(s.starts.at(-1)!.intent.operation).toBe('replace');
+    });
+
+    it('retries a FAILED release once it has settled, as a new job, then replaces normally', async () => {
+        const s = stalledAdoptSetup(); s.at(ADOPT_STALL_MS); await s.tick(); await s.tick();
+        const failed = s.starts[0]!;
+        expect(failed.intent.operation).toBe('release');
+        Object.assign(s.executions.get(lifecycleExecutionArn(s.d, failed.intent.jobId))!, { status: 'FAILED', stopDate: new Date(CLAIM_AT.getTime() + ADOPT_STALL_MS) });
+        s.at(ADOPT_STALL_MS + RELEASE_RETRY_AFTER_MS - 1); await s.tick();
+        expect(s.starts).toHaveLength(1);
+        s.at(ADOPT_STALL_MS + RELEASE_RETRY_AFTER_MS); await s.tick();
+        expect(s.starts).toHaveLength(2);
+        const retry = s.starts[1]!;
+        expect(retry.intent.operation).toBe('release');
+        expect(retry.intent.jobId).not.toBe(failed.intent.jobId);
         s.finish(); await s.fleet();
         expect(s.starts.at(-1)!.intent.operation).toBe('replace');
     });
