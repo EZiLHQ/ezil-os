@@ -231,7 +231,8 @@ def validate_attestation(a, row, evidence, snapshot, candidate):
         need(row.get('state') == a.get('state') == 'retired'
              and row.get('dispatch_status') == a.get('dispatchStatus') == 'settled',
              'GC pool not retired/settled')
-        need(True,
+        need(all(k in row and row[k] is None for k in CLAIMS)
+             and all(v is None for k, v in row.items() if k.startswith(('claim_', 'leased_'))),
              'GC active or missing pool claim fields')
         saved = decoded(row['lifecycle_input'])
         document = decoded(saved['document'])
