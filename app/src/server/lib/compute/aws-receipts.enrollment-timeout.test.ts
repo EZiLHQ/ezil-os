@@ -164,6 +164,77 @@ describe('MOUNTING enrollment timeout after the lifecycle job is cleared', () =>
         expect(s.warn).not.toHaveBeenCalled();
     });
 
+    describe('retire hook', () => {
+        it('runs exactly once, inside the classifying transaction, only after a successful CAS', async () => {
+            const s = setup(), before = await s.current();
+            const seen: string[] = [];
+            const retire = vi.fn(async (tx: PlacementExecutor) => {
+                const { record } = await readPlacement(tx, C);
+                seen.push(`${record!.state}:${record!.lastError}:${record!.instanceId}`);
+            });
+            expect(await failUnenrolledPlacement(s.db, before, NOW, retire)).toMatchObject({ ok: true });
+            expect(retire).toHaveBeenCalledOnce();
+            expect(seen).toEqual([`UNCONFIRMED:${ENROLLMENT_FAILED}:${INSTANCE}`]);
+            const casAt = s.statements.findIndex(q => q.sql.includes('/* placement:cas */'));
+            expect(s.statements.at(-1)!.tx).toBe(s.statements[casAt]!.tx);
+            // Idempotent: the stale observation and the classified row both refuse before any work.
+            expect(await failUnenrolledPlacement(s.db, before, NOW, retire)).toEqual({ ok: false, reason: 'cas_conflict' });
+            expect(await failUnenrolledPlacement(s.db, await s.current(), NOW, retire)).toEqual({ ok: false, reason: 'cas_conflict' });
+            expect(retire).toHaveBeenCalledOnce();
+        });
+
+        it.each([['lock', 'row lock'], ['cas', 'final CAS']] as const)('is not invoked when the row version changes at the %s (%s)', async at => {
+            const s = setup(), before = await s.current();
+            const retire = vi.fn(async () => {});
+            s.race(() => { s.placements[0]!.updated_at = NOW; }, at);
+            expect(await failUnenrolledPlacement(s.db, before, NOW, retire)).toEqual({ ok: false, reason: 'cas_conflict' });
+            expect(retire).not.toHaveBeenCalled();
+            expect(s.placements[0]).toMatchObject({ state: 'MOUNTING' });
+        });
+
+        it('is not invoked when two classifications race; the loser sees a conflict', async () => {
+            const s = setup(), before = await s.current();
+            const retire = vi.fn(async () => {});
+            const results = await Promise.all([failUnenrolledPlacement(s.db, before, NOW, retire), failUnenrolledPlacement(s.db, before, NOW, retire)]);
+            expect(results.filter(r => r.ok)).toHaveLength(1);
+            expect(retire).toHaveBeenCalledOnce();
+        });
+
+        it.each([
+            ['enrollment succeeded', { last_error: ENROLLMENT_SUCCEEDED, enroll_nonce_hash: null }],
+            ['host presence', { presence_at: NOW }],
+            ['grace not elapsed', { enroll_expires_at: new Date(NOW.getTime() - 59_999) }],
+        ] as const)('is never invoked when %s', async (_name, over) => {
+            const s = setup(over), before = await s.current();
+            const retire = vi.fn(async () => {});
+            expect(await failUnenrolledPlacement(s.db, before, NOW, retire)).toEqual({ ok: false, reason: 'cas_conflict' });
+            expect(retire).not.toHaveBeenCalled();
+        });
+
+        it('is not invoked when enrollment succeeds between the observation and the row lock', async () => {
+            const s = setup(), before = await s.current();
+            const retire = vi.fn(async () => {});
+            s.race(() => Object.assign(s.placements[0]!, { last_error: ENROLLMENT_SUCCEEDED, enroll_nonce_hash: null }));
+            expect(await failUnenrolledPlacement(s.db, before, NOW, retire)).toEqual({ ok: false, reason: 'cas_conflict' });
+            expect(retire).not.toHaveBeenCalled();
+            expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', last_error: ENROLLMENT_SUCCEEDED });
+        });
+
+        it('a retire failure rolls the classification back', async () => {
+            const s = setup(), before = await s.current();
+            await expect(failUnenrolledPlacement(s.db, before, NOW, async () => { throw new Error('retire_conflict'); })).rejects.toThrow('retire_conflict');
+            expect(await s.current()).toEqual(before);
+        });
+
+        it('the receipt pass classifies without dispatching any lifecycle job (the refused host is replaced on reopen)', async () => {
+            const s = setup();
+            await s.tick();
+            expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: ENROLLMENT_FAILED, instanceId: INSTANCE, fenceToken: FENCE, lifecycleJobId: null });
+            expect(s.starts).toEqual([]);
+            expect(s.deps.starter.start).not.toHaveBeenCalled();
+        });
+    });
+
     it('the next ensure replaces the refused instance on the same volume', async () => {
         const s = setup();
         await s.tick();

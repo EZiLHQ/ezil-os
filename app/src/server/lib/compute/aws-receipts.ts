@@ -288,6 +288,11 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (enrolled(p)) await step(p, 'RUNNING');
         else if (!options.terminalOnly) {
             const observedAt = (deps.now ?? deps.clock ?? (() => new Date()))();
+            // No `retire` here (L-B 2026-10-27): the refused host stays bound (instance, fence) so the
+            // owner's next open REPLACES it (aws-ec2.ts: previousInstanceId is stopped and terminated).
+            // A placement retire would land RETIRED, which a live computer cannot leave, and the
+            // lifecycle authority refuses any job on a cold UNCONFIRMED placement. Stopping the host
+            // before a reopen needs an instance-only job with its own authority (follow-up).
             const result = await failUnenrolledPlacement(deps.db, p, observedAt);
             if (result.ok) console.warn('[enroll-timeout]', {
                 computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch,

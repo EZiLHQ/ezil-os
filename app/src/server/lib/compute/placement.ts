@@ -1411,11 +1411,33 @@ export async function failStalledPoolEnrollment(db: PlacementDb, p: Placement,
     });
 }
 
-/** A completed attach without enrollment may fail after the nonce's 60-second grace. */
-export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date): Promise<TransitionResult> {
-    const expired = (x: Placement) => x.provider === 'aws-ec2' && x.state === 'MOUNTING' && x.lifecycleJobId === null
+/** Grace after the enrollment nonce's deadline before an unenrolled attach counts as failed. */
+export const ENROLLMENT_GRACE_MS = 60_000;
+
+/**
+ * Pure: an aws-ec2 placement in one of `states` whose attach job is settled (no recorded job),
+ * whose host never reported presence, whose enrollment neither succeeded nor is a pending pool
+ * session, and whose nonce deadline plus `ENROLLMENT_GRACE_MS` has passed at `now`. The
+ * enrollment-timeout CAS uses MOUNTING only; read-only progress may widen it to STARTING.
+ */
+export function isUnenrolledPastGrace(x: Placement, now: Date, states: readonly PlacementState[] = ['MOUNTING']): boolean {
+    return x.provider === 'aws-ec2' && states.includes(x.state) && x.lifecycleJobId === null
         && x.presenceAt === null && x.lastError !== ENROLLMENT_SUCCEEDED && x.lastError !== POOL_SESSION_PENDING
-        && x.enrollExpiresAt !== null && x.enrollExpiresAt.getTime() + 60_000 <= now.getTime();
+        && x.enrollExpiresAt instanceof Date && x.enrollExpiresAt.getTime() + ENROLLMENT_GRACE_MS <= now.getTime();
+}
+
+/**
+ * A completed attach without enrollment may fail after the nonce's 60-second grace.
+ * `retire`, when given, runs inside the same admission transaction ONLY after this CAS
+ * succeeded (same contract as `failStalledPoolEnrollment`): it must be database-only work
+ * (a Step Functions start issued here would be checked against an uncommitted row), and a
+ * throw rolls the classification back. A repeat call or a lost race returns `cas_conflict`
+ * before any transaction work, so `retire` runs at most once per classified placement, and
+ * never for a placement whose enrollment succeeded.
+ */
+export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date,
+    retire?: (tx: PlacementExecutor) => Promise<unknown>): Promise<TransitionResult> {
+    const expired = (x: Placement) => isUnenrolledPastGrace(x, now);
     if (!expired(p)) return { ok: false, reason: 'cas_conflict' };
     return withAdmission(db, async tx => {
         await lockComputer(tx, p.computerId);
@@ -1424,11 +1446,13 @@ export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now
             || current.updatedAt.getTime() !== p.updatedAt.getTime() || current.lastError !== p.lastError
             || current.enrollExpiresAt?.getTime() !== p.enrollExpiresAt?.getTime())
             return { ok: false, reason: 'cas_conflict' };
-        return casInTx(tx, p.computerId, p, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
+        const result = await casInTx(tx, p.computerId, p, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
             { lastError: ENROLLMENT_FAILED, enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null },
             { provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId,
                 volumeId: p.volumeId ?? undefined, fenceToken: p.fenceToken ?? undefined,
                 lastError: p.lastError, updatedAt: p.updatedAt });
+        if (result.ok && retire) await retire(tx);
+        return result;
     });
 }
 
