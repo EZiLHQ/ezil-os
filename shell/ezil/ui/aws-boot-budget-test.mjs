@@ -48,12 +48,27 @@ test('pure: needs_operator / failed_reopened fail immediately', () => {
     assert.equal(awsBootWaitVerdict({ observation: opening({ stage: 'failed_reopened', activeAws: false }), bootElapsedMs: 1 }), 'fail');
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening({ stage: 'operations_paused', activeAws: false }), bootElapsedMs: 215_000 }), 'fail');
 });
+test('pure: a computer that stopped opening ends the wait; one that is ready does not', () => {
+    for (const stage of ['stopped', 'queued', 'operations_paused', 'retired', 'purge_eligible']) {
+        assert.equal(awsBootWaitVerdict({ observation: opening({ stage, activeAws: false, active: false }), bootElapsedMs: 220_000 }), 'fail', stage);
+    }
+    // `activeAws` is also false at the ready step: never abandon a reopen that is about to succeed.
+    assert.equal(awsBootWaitVerdict({ observation: opening({ stage: 'running', activeAws: false }), bootElapsedMs: 220_000 }), 'wait');
+    assert.equal(awsBootWaitVerdict({ observation: opening({ stage: 'ready', activeAws: false }), bootElapsedMs: 220_000 }), 'wait');
+});
+test('pure: without the clock (first request) only the stage can stop the wait', () => {
+    assert.equal(awsBootWaitVerdict({ observation: opening(), bootElapsedMs: 900_000, clock: false }), 'wait');
+    assert.equal(awsBootWaitVerdict({ observation: opening({ elapsed: 900 }), bootElapsedMs: 1, clock: false }), 'wait');
+    assert.equal(awsBootWaitVerdict({ observation: opening({ stage: 'needs_operator', activeAws: false }), bootElapsedMs: 1, clock: false }), 'fail');
+});
 test('pure: no observation or a non-timeout failure is unchanged', () => {
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: null, bootElapsedMs: 215_000 }), 'fail');
     assert.equal(awsBootTimeoutVerdict({ reason: 'desktop_unreachable', observation: opening(), bootElapsedMs: 215_000 }), 'fail');
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening({ activeAws: false, stage: 'running' }), bootElapsedMs: 215_000 }), 'fail');
 });
 test('pure: the reopen cap is a structural backstop', () => {
+    // A literal, so lowering the cap below what a 600 s budget needs fails here.
+    assert.equal(AWS_BOOT_MAX_REOPENS, 6);
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening(), bootElapsedMs: 1, reopens: AWS_BOOT_MAX_REOPENS - 1 }), 'reopen');
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening(), bootElapsedMs: 1, reopens: AWS_BOOT_MAX_REOPENS }), 'budget_spent');
 });
@@ -88,7 +103,17 @@ async function until(fn, what = 'condition') {
 }
 const timeoutError = () => Object.assign(new Error('The operation timed out.'), { name: 'TimeoutError' });
 
-async function open(t, progressMode) {
+const abortError = () => Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+const launchingBody = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2', computeLaunching: true };
+
+/**
+ * @param {string} progressMode 'opening' | 'attention' | 'stopped' | 'unavailable' | 'broken'
+ * @param {{ post?: (n: number) => 'hang' | object, frame?: object, probes?: boolean[], running?: boolean }} [opts]
+ *   `post` answers the nth desktop POST (default: hang until the test settles it);
+ *   `frame` is the ready answer's frame field; `probes` are successive
+ *   `confirm=frame` verdicts (the last repeats); `running` is `guacamoleRunning`.
+ */
+async function open(t, progressMode, opts = {}) {
     const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', {
         url: 'https://app.example/os', runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: new VirtualConsole(),
     });
@@ -107,24 +132,43 @@ async function open(t, progressMode) {
     w.Date.now = () => now;
     Object.defineProperty(w.performance, 'now', { configurable: true, value: () => perf });
     let ready = false;
+    let post = opts.post ?? (() => 'hang');
+    const probes = [...(opts.probes ?? [true])];
+    let running = opts.running ?? false;
     const pending = [];
+    const signals = [];
     const asks = () => posts;
     let posts = 0;
     w.fetch = async (raw, init = {}) => {
         const path = String(raw);
         let body = { ok: true };
         if (path.includes('/api/trpc/computer.progress')) {
+            if (mode === 'broken') return { ok: false, status: 500, json: async () => ({ error: { code: 'INTERNAL_SERVER_ERROR' } }) };
             if (mode === 'unavailable') body = { result: { data: { json: { version: 2, computerId: 'computer-1', stage: 'unavailable', active: false, operation: 'none' } } } };
             else body = { result: { data: { json: {
-                version: 2, computerId: 'computer-1', operation: 'opening', active: mode !== 'attention',
-                stage: mode === 'attention' ? 'needs_operator' : 'starting', recordedStage: mode === 'attention' ? 'unconfirmed' : 'starting',
+                version: 2, computerId: 'computer-1', operation: mode === 'stopped' ? 'none' : 'opening', active: mode === 'opening',
+                stage: mode === 'attention' ? 'needs_operator' : mode === 'stopped' ? 'stopped' : 'starting',
+                recordedStage: mode === 'attention' ? 'unconfirmed' : mode === 'stopped' ? 'stopped' : 'starting',
             } } } };
         } else if (path === '/api/shell/desktop' && init.method === 'POST') {
             posts++;
-            if (ready) return { ok: true, status: 200, json: async () => ({ ok: true, guacamoleUrl: 'https://viewer.example/?embed=1', frame: { confirmed: true } }) };
-            return new Promise((resolve, reject) => pending.push({ resolve, reject }));
-        } else if (path.includes('confirm=frame')) body = { ok: true, confirmed: true, status: 200 };
-        else if (path.startsWith('/api/shell/desktop')) body = { ok: true, guacamoleRunning: false };
+            signals.push(init.signal ?? null);
+            if (ready) return { ok: true, status: 200, json: async () => ({ ok: true, guacamoleUrl: 'https://viewer.example/?embed=1', frame: opts.frame ?? { confirmed: true } }) };
+            const answer = post(posts);
+            if (answer !== 'hang') return { ok: true, status: 200, json: async () => answer };
+            return new Promise((resolve, reject) => {
+                const entry = { resolve, reject };
+                pending.push(entry);
+                init.signal?.addEventListener('abort', () => {
+                    const i = pending.indexOf(entry);
+                    if (i >= 0) pending.splice(i, 1);
+                    reject(abortError());
+                }, { once: true });
+            });
+        } else if (path.includes('confirm=frame')) {
+            const confirmed = probes.length > 1 ? probes.shift() : probes[0];
+            body = confirmed ? { ok: true, confirmed: true, status: 200 } : { ok: true, confirmed: false, reason: 'http_error', status: 502 };
+        } else if (path.startsWith('/api/shell/desktop')) body = { ok: true, guacamoleRunning: running };
         return { ok: true, status: 200, json: async () => body };
     };
     // Each client TIMEOUT costs two POSTs: `withWakeAndOneRetry` re-asks once.
@@ -150,11 +194,12 @@ async function open(t, progressMode) {
     const panel = win.querySelector('.ezil-boot');
     const visible = () => [spinner, panel].filter(el => !el.hidden);
     const tryAgainVisible = () => visible().some(el => el.querySelector('.ezil-boot-actions')?.hidden === false);
-    if (mode !== 'unavailable') await until(() => spinner.querySelector('.ezil-app-spinner-label').textContent === (mode === 'attention' ? 'Computer needs attention' : 'Starting your desktop'), 'observation painted');
-    else await until(() => spinner.querySelector('.ezil-app-spinner-sub').textContent === 'Detailed computer progress is unavailable.', 'no observation');
+    if (mode === 'opening' || mode === 'attention') await until(() => spinner.querySelector('.ezil-app-spinner-label').textContent === (mode === 'attention' ? 'Computer needs attention' : 'Starting your desktop'), 'observation painted');
+    else if (mode === 'unavailable') await until(() => spinner.querySelector('.ezil-app-spinner-sub').textContent === 'Detailed computer progress is unavailable.', 'no observation');
     return {
-        w, win, spinner, panel, visible, tryAgainVisible, logs, asks, timeOutOne, pending,
+        w, win, spinner, panel, visible, tryAgainVisible, logs, asks, timeOutOne, pending, signals,
         setMode: m => { mode = m; }, setNow: ms => { now = ms; }, setPerf: ms => { perf = ms; }, setReady: () => { ready = true; },
+        setPost: fn => { post = fn; }, setRunning: v => { running = v; },
     };
 }
 
@@ -185,8 +230,15 @@ test('desktop: 600 s total ends the re-open with the failure and Try again', asy
     await wait(30);
     assert.equal(h.panel.dataset.kind, 'progress', 'not before ten minutes');
     h.setPerf(600_000); // The window's clock; the observation's own elapsed is still 400 s.
+    const reopenSignal = h.signals.at(-1);
     await until(() => h.panel.dataset.kind === 'failed', 'hard stop with the re-open still in flight');
-    assert.equal(h.pending.length, 1, 'stopped without waiting for the hung request');
+    // The abandoned re-open is CANCELLED, not orphaned: its request is aborted and,
+    // even if the hung request still answers, the wake loop never asks again.
+    assert.ok(reopenSignal?.aborted === true, 'the abandoned re-open request was aborted');
+    const atStop = h.asks();
+    for (const p of h.pending.splice(0)) p.reject(timeoutError());
+    await wait(40);
+    assert.equal(h.asks(), atStop, 'no ask after the hard stop');
     assert.equal(h.panel.querySelector('.ezil-boot-title').textContent, 'This is taking too long');
     await until(() => h.tryAgainVisible(), 'Try again');
     assert.ok(h.logs.some(l => l.includes('budget_spent')), h.logs.join('\n'));
@@ -212,9 +264,12 @@ test('desktop: needs_operator during a re-open stops waiting immediately', async
     h.setNow(215_000); h.setPerf(215_000);
     await h.timeOutOne();
     await until(() => h.asks() === 3 && h.pending.length === 1, 'a re-open POST');
+    const reopenSignal = h.signals.at(-1);
     h.setMode('attention');
     await until(() => h.panel.dataset.kind === 'failed', 'failure on needs_operator');
-    assert.equal(h.pending.length, 1, 'did not wait for the hung request');
+    // Did not wait for the hung request, and cancelled it rather than orphaning it.
+    assert.ok(reopenSignal?.aborted === true, 'the re-open request was aborted');
+    assert.equal(h.pending.length, 0);
     await until(() => h.tryAgainVisible(), 'Try again');
     assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Computer needs attention');
 });
@@ -229,4 +284,103 @@ test('desktop: no observation keeps the unchanged 215 s failure', async t => {
     assert.match(h.spinner.textContent, /This is taking too long/);
     assert.ok(h.tryAgainVisible());
     assert.ok(!h.logs.some(l => l.includes('re-opening')));
+});
+
+test('desktop: real AWS protocol (launching answers, warm offset): no ask after the hard stop', async t => {
+    // The warm's launch answer arrives before the window's first observation:
+    // its 600 s launch deadline lands at window time 555 s, so a re-open is issued.
+    const h = await open(t, 'unavailable', { post: () => launchingBody });
+    await until(() => h.asks() >= 2, 'launching answers');
+    h.setPost(() => 'hang');
+    h.setNow(45_000); h.setMode('opening');
+    await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Starting your desktop', 'observation painted');
+    await until(() => h.pending.length === 1, 'the wake loop asking');
+    h.setPerf(555_000); h.setNow(600_000);
+    h.setPost(() => launchingBody);
+    h.pending.shift().resolve({ ok: true, status: 200, json: async () => launchingBody });
+    await until(() => h.logs.some(l => l.includes('re-opening (#1)')), 're-open #1');
+    await until(() => h.asks() >= 6, 'the re-open wake loop asking');
+    assert.equal(h.panel.dataset.kind, 'progress');
+    assert.equal(h.tryAgainVisible(), false);
+    h.setPerf(600_000);
+    await until(() => h.tryAgainVisible(), 'Try again at the hard stop');
+    const atStop = h.asks();
+    await wait(60);
+    assert.equal(h.asks(), atStop, 'the abandoned re-open never asks again (no orphaned replace launch)');
+});
+
+test('desktop: two consecutive client TIMEOUTs both re-open and stay on progress', async t => {
+    const h = await open(t, 'opening');
+    h.setNow(215_000); h.setPerf(215_000);
+    await h.timeOutOne();
+    await until(() => h.logs.some(l => l.includes('re-opening (#1)')), 're-open #1');
+    h.setNow(430_000); h.setPerf(430_000);
+    await h.timeOutOne();
+    await until(() => h.logs.some(l => l.includes('re-opening (#2)')), 're-open #2');
+    await wait(30);
+    assert.equal(h.panel.dataset.kind, 'progress');
+    assert.equal(h.spinner.dataset.kind, 'progress');
+    assert.equal(h.tryAgainVisible(), false);
+});
+
+test('desktop: closing the window during a re-open cancels it', async t => {
+    const h = await open(t, 'opening');
+    h.setNow(215_000); h.setPerf(215_000);
+    await h.timeOutOne();
+    await until(() => h.asks() === 3 && h.pending.length === 1, 'a re-open POST');
+    const reopenSignal = h.signals.at(-1);
+    void h.w.$(h.win).close();
+    await until(() => reopenSignal?.aborted === true, 'the re-open request aborted on close');
+    const atClose = h.asks();
+    await wait(40);
+    assert.equal(h.asks(), atClose, 'no ask after close');
+});
+
+test('desktop: needs_operator after the first request saw it opening shows Try again at once', async t => {
+    const h = await open(t, 'opening');
+    await until(() => h.pending.length === 1, 'the first desktop POST');
+    const firstSignal = h.signals.at(-1);
+    h.setNow(60_000); h.setPerf(60_000);
+    h.setMode('attention');
+    await until(() => h.tryAgainVisible(), 'Try again before any timeout');
+    assert.ok(firstSignal?.aborted === true, 'the first request (the warm) is cancelled');
+    const atStop = h.asks();
+    await wait(40);
+    assert.equal(h.asks(), atStop, 'no ask after needs_operator');
+    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Computer needs attention');
+});
+
+test('desktop: a computer already needing attention when the window opens is still opened (the open is the recovery)', async t => {
+    const h = await open(t, 'attention');
+    await until(() => h.pending.length === 1, 'the first desktop POST');
+    h.setNow(60_000); h.setPerf(60_000);
+    await wait(40);
+    assert.equal(h.pending.length, 1, 'the first request is not cancelled by a needs_operator it never saw arise');
+    assert.equal(h.tryAgainVisible(), false);
+});
+
+test('desktop: a late success (past t0 + 215 s, no re-open) still gets the origin-probe grace', async t => {
+    const h = await open(t, 'opening', { frame: undefined, probes: [false, true], running: true });
+    await until(() => h.pending.length === 1, 'the first desktop POST');
+    h.setNow(245_000); h.setPerf(245_000);
+    h.setReady();
+    h.pending.shift().resolve({ ok: true, status: 200, json: async () => ({ ok: true, guacamoleUrl: 'https://viewer.example/?embed=1' }) });
+    await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://viewer.example/'), 'desktop frame');
+    await wait(80);
+    assert.ok(!h.logs.some(l => l.includes('not a desktop')), h.logs.join('\n'));
+    assert.notEqual(h.panel.dataset.kind, 'failed');
+    assert.notEqual(h.spinner.dataset.kind, 'failed');
+});
+
+test('desktop: a failed poll at the TIMEOUT keeps the last observation, and the copy drops its stale countdown', async t => {
+    const h = await open(t, 'opening');
+    h.setNow(215_000); h.setPerf(215_000);
+    await wait(30); // at least one poll at 215 s
+    h.setMode('broken');
+    await until(() => h.spinner.querySelector('.ezil-app-spinner-sub')?.textContent !== undefined && !h.panel.hidden, 'the poll failed and the phase panel shows');
+    await h.timeOutOne();
+    await until(() => h.logs.some(l => l.includes('re-opening (#1)')), 're-open on the kept observation');
+    await wait(30);
+    assert.equal(h.panel.dataset.kind, 'progress');
+    assert.equal(h.panel.querySelector('.ezil-boot-sub').textContent, 'Your AWS computer is still starting — still working.');
 });

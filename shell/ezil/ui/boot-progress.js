@@ -37,6 +37,10 @@ export const AWS_BOOT_HARD_STOP_MS = 600_000;
 /** Structural backstop: a server answering `timeout` instantly cannot loop. */
 export const AWS_BOOT_MAX_REOPENS = 6;
 const AWS_STOP_STAGES = ['needs_operator', 'failed_reopened'];
+// While waiting, also every stage at which the computer is no longer opening
+// (computer-progress.js's `activeAws` exclusions). Not `activeAws !== true`:
+// that is false at the ready step too, moments before the open succeeds.
+const AWS_WAIT_STOP_STAGES = [...AWS_STOP_STAGES, 'stopped', 'queued', 'operations_paused', 'retired', 'purge_eligible'];
 const awsBudgetSpent = (observation, bootElapsedMs) => bootElapsedMs >= AWS_BOOT_HARD_STOP_MS
     || (Number.isFinite(observation?.elapsed) && observation.elapsed * 1000 >= AWS_BOOT_HARD_STOP_MS);
 
@@ -60,15 +64,17 @@ export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reo
 }
 
 /**
- * While a reopen is in flight: keep waiting, or stop now. A missing observation
- * (hidden tab, failed poll) is not a reason to stop; the clock still bounds it.
+ * While a desktop request is in flight: keep waiting, or stop now. A missing
+ * observation (hidden tab, failed poll) is not a reason to stop; the clock
+ * still bounds it. `clock: false` (the first request, whose own wake loop owns
+ * the deadline) lets only the observed stage stop it.
  *
- * @param {{observation?: any, bootElapsedMs: number}} input
+ * @param {{observation?: any, bootElapsedMs: number, clock?: boolean}} input
  * @returns {'wait' | 'budget_spent' | 'fail'}
  */
-export function awsBootWaitVerdict ({ observation, bootElapsedMs }) {
-    if ( observation && AWS_STOP_STAGES.includes(observation.stage) ) return 'fail';
-    return awsBudgetSpent(observation, bootElapsedMs) ? 'budget_spent' : 'wait';
+export function awsBootWaitVerdict ({ observation, bootElapsedMs, clock = true }) {
+    if ( observation && AWS_WAIT_STOP_STAGES.includes(observation.stage) ) return 'fail';
+    return clock && awsBudgetSpent(observation, bootElapsedMs) ? 'budget_spent' : 'wait';
 }
 
 /**

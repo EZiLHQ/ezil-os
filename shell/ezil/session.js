@@ -177,7 +177,7 @@ function endpoint (name) {
  *
  * @returns {Promise<{ok: true, data: any} | {ok: false, code: string, status: number, message: string}>}
  */
-async function request (url, { method = 'GET', body, timeoutMs } = {}) {
+async function request (url, { method = 'GET', body, timeoutMs, signal } = {}) {
     let res;
     try {
         res = await fetch(url, {
@@ -185,13 +185,16 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
             credentials: 'same-origin',
             headers: body === undefined ? undefined : { 'content-type': 'application/json' },
             body: body === undefined ? undefined : JSON.stringify(body),
-            signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
+            signal: requestSignal(timeoutMs, signal),
         });
     } catch ( err ) {
         // `AbortSignal.timeout` rejects with a DOMException named
         // 'TimeoutError'; everything else here is a genuine transport
         // failure. The distinction survives into the boot UI's copy.
         const timedOut = err && err.name === 'TimeoutError';
+        if ( ! timedOut && signal?.aborted ) {
+            return { ok: false, code: 'CANCELLED', status: 0, message: 'The request was cancelled.' };
+        }
         return {
             ok: false,
             code: timedOut ? 'TIMEOUT' : 'NETWORK',
@@ -251,6 +254,29 @@ export function isComputeLaunching (computerId) {
 }
 export function isComputeMigrating (computerId) {
     return !!computerId && [...migratingRequests.values()].includes(computerId);
+}
+
+/**
+ * The fetch signal for one request: its timeout and, when given, the caller's
+ * cancel. An engine without `AbortSignal.any` keeps the timeout only; the
+ * caller's loop still stops at its next cancel check, it just cannot cut the
+ * request already on the wire.
+ */
+function requestSignal (timeoutMs, cancel) {
+    const timeout = timeoutMs ? AbortSignal.timeout?.(timeoutMs) : undefined;
+    if ( ! cancel ) return timeout;
+    if ( ! timeout ) return cancel;
+    return typeof AbortSignal.any === 'function' ? AbortSignal.any([timeout, cancel]) : timeout;
+}
+
+/** A sleep that ends early when `signal` aborts. */
+function pause (ms, signal) {
+    return new Promise((resolve) => {
+        if ( signal?.aborted ) return resolve();
+        const done = () => { clearTimeout(timer); signal?.removeEventListener?.('abort', done); resolve(); };
+        const timer = setTimeout(done, ms);
+        signal?.addEventListener?.('abort', done, { once: true });
+    });
 }
 
 /**
@@ -353,7 +379,7 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  * @param {string} what For the log line only.
  * @param {string} [computerId] Scopes migration progress to this computer.
  */
-async function withWakeAndOneRetry (issue, what, computerId) {
+async function withWakeAndOneRetry (issue, what, computerId, signal) {
     const t0 = Date.now();
     let retried = false;
     let asks = 0;
@@ -363,9 +389,20 @@ async function withWakeAndOneRetry (issue, what, computerId) {
     let launchStartedAt = null;
     let wakeResumed = false;
     const progressKey = Symbol();
+    // 🔴 A CANCELLED LOOP NEVER ASKS AGAIN. Every ask runs the server's ensure,
+    // and on an UNCONFIRMED + ENROLLMENT_FAILED placement that ensure launches a
+    // replacement host. A window that has stopped waiting (needs_operator, its
+    // ten-minute stop, a close) must not leave this loop asking behind its back.
+    const cancelled = () => {
+        migratingRequests.delete(progressKey);
+        launchingRequests.delete(progressKey);
+        console.info(`[ezil-os:session] ${what}: cancelled by the caller after ${asks} ask(s); not asking again`);
+        return { ok: false, errorCode: 'cancelled', message: 'Stopped asking: the caller cancelled.' };
+    };
 
     try {
         for (;;) {
+            if ( signal?.aborted ) return cancelled();
             // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
             // bound in this function is a CONDITION — a clock for the wake, a
             // boolean for the retry — and a condition can be edited away. Removing
@@ -389,6 +426,9 @@ async function withWakeAndOneRetry (issue, what, computerId) {
             }
             asks++;
             const res = await issue();
+            // Checked before anything reads `res`: an aborted request surfaces as a
+            // transport failure, which would otherwise buy the one silent re-ask.
+            if ( signal?.aborted ) return cancelled();
             const now = Date.now();
             const migrating = res.ok !== true && res.errorCode === 'sandbox_starting'
                 && res.computeProvider === 'aws-ec2' && res.computeMigrating === true;
@@ -436,7 +476,7 @@ async function withWakeAndOneRetry (issue, what, computerId) {
                     // — try again" — which is exactly what is true.
                     return res;
                 }
-                await new Promise(r => setTimeout(r, WAKE_REASK_MS));
+                await pause(WAKE_REASK_MS, signal);
                 continue;
             }
 
@@ -455,7 +495,7 @@ async function withWakeAndOneRetry (issue, what, computerId) {
                 // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
                 // wait, so its `durationMs` still marks the first failure and the
                 // arithmetic in that comment keeps working.
-                await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                await pause(RETRY_DELAY_MS, signal);
                 continue;
             }
             return res;
@@ -496,11 +536,44 @@ export function openSession () {
  * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId, screen) {
+export async function openDesktop (computerId, screen, { signal } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
-    return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop', computerId);
+    // Every open is cancellable two ways: by the caller's own `signal`, and by
+    // `cancelOpenDesktop(computerId)` — which also reaches an open the caller
+    // did not start itself (the paint-time warm, via `warm.js`).
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    if ( signal?.aborted ) cancel(); else signal?.addEventListener?.('abort', cancel, { once: true });
+    const key = Symbol();
+    openCancels.set(key, { computerId, cancel });
+    try {
+        return await withWakeAndOneRetry(() => openDesktopOnce(computerId, screen, controller.signal),
+            'openDesktop', computerId, controller.signal);
+    } finally {
+        openCancels.delete(key);
+        signal?.removeEventListener?.('abort', cancel);
+    }
+}
+
+/** In-flight `openDesktop` loops, so a caller can stop every one for a computer. */
+const openCancels = new Map();
+
+/**
+ * Stop every in-flight `openDesktop` for `computerId`: each stops asking at once
+ * (its request on the wire is aborted where the engine allows) and resolves
+ * `{ok: false, errorCode: 'cancelled'}`. `warm.js` drops a failed entry, so a
+ * cancelled warm is never replayed. Returns how many were cancelled.
+ *
+ * @param {string} computerId
+ */
+export function cancelOpenDesktop (computerId) {
+    let n = 0;
+    for ( const entry of openCancels.values() ) {
+        if ( entry.computerId === computerId ) { entry.cancel(); n++; }
+    }
+    return n;
 }
 
 // Local preview routes currently only mint URLs for a running container. Code
@@ -516,7 +589,7 @@ export async function ensureLocalDesktop (computerId) {
 }
 
 /** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
-async function openDesktopOnce (computerId, screen) {
+async function openDesktopOnce (computerId, screen, signal) {
     // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
     // for. The server treats absent and malformed identically, but a body that
     // is byte-identical to the pre-change one is the strongest form of "an old
@@ -530,9 +603,11 @@ async function openDesktopOnce (computerId, screen) {
             ? { computerId, screen: { width: screen.width, height: screen.height } }
             : { computerId },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
+        signal,
     });
 
     if ( ! res.ok ) {
+        if ( res.code === 'CANCELLED' ) return { ok: false, errorCode: 'cancelled', message: res.message };
         // Transport/HTTP failure. `TIMEOUT` is the one code `previewUrl`
         // itself can never produce and the boot UI has real copy for.
         if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
@@ -1316,7 +1391,7 @@ export default {
     get, set, del,
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
-    openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
+    openDesktop, cancelOpenDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
     previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
