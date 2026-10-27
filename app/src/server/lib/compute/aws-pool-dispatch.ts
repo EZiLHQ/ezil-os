@@ -49,7 +49,8 @@ export async function poolJobAuthority(db: PlacementExecutor, a: { computerId: s
         && (i.operation !== 'pool-provision' || await provisionEligible(db,w,env));
 }
 /** How long after a FAILED execution stopped an unreadable history keeps its row unsettled for another proof attempt.
- * Reconcile runs every minute, so this is many retries; past it the row settles `failed` and cannot starve the window. */
+ * Reconcile runs on each pool-replenish pass (staging timer: every minute, deploy/aws/os-staging/cron), so this is
+ * many retries; past it the row settles `failed` and cannot starve the window. */
 export const HISTORY_RETRY_MS = 15 * 60_000;
 const LAUNCH_STATES = new Set(['runInstances', 'runBurstableInstances']);
 /** `proven` only when the complete history proves EC2 created nothing for this job. The lifecycle helper never mutates,
