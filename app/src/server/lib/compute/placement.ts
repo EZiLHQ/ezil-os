@@ -1386,6 +1386,31 @@ export const ENROLLMENT_PENDING = 'enroll_tunnel_pending';
 export const ENROLLMENT_SUCCEEDED = 'enroll_succeeded';
 export const ENROLLMENT_FAILED = 'enroll_tunnel_failed';
 
+/** A timed-out pool claim is an enrollment failure, never a new generation.
+ * Lock against session-ready before checking the pool claim and burning its host. */
+export async function failStalledPoolEnrollment(db: PlacementDb, p: Placement,
+    stalled: (tx: PlacementExecutor) => Promise<boolean>, retire: (tx: PlacementExecutor) => Promise<unknown>): Promise<TransitionResult> {
+    if (p.provider !== 'aws-ec2' || !ENROLLABLE_STATES.includes(p.state) || p.lastError === ENROLLMENT_SUCCEEDED
+        || !p.instanceId || !p.volumeId || !p.fenceToken || !p.lifecycleJobId || !p.lifecycleDigest)
+        return { ok: false, reason: 'cas_conflict' };
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, p.computerId);
+        const current = await lockPoolClaimPlacement(tx, p.computerId);
+        if (!current || current.state !== p.state || current.generation !== p.generation || current.leaseEpoch !== p.leaseEpoch
+            || current.updatedAt.getTime() !== p.updatedAt.getTime() || current.lastError !== p.lastError)
+            return { ok: false, reason: 'cas_conflict' };
+        if (!await stalled(tx)) return { ok: false, reason: 'cas_conflict' };
+        await assertUnopenedAdoptUsage(tx, p);
+        const result = await casInTx(tx, p.computerId, p, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
+            { lastError: ENROLLMENT_FAILED, enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null },
+            { provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId, volumeId: p.volumeId!,
+                fenceToken: p.fenceToken!, lifecycleJobId: p.lifecycleJobId!, lifecycleDigest: p.lifecycleDigest!,
+                lastError: p.lastError, updatedAt: p.updatedAt });
+        if (result.ok) await retire(tx);
+        return result;
+    });
+}
+
 /**
  * C-6 step 4: consume the boot's one-time enrollment nonce. ONE compare-and-swap
  * matches the generation, lease epoch, an enrollable state, provider, nonce hash

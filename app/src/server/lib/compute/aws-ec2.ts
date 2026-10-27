@@ -1,5 +1,6 @@
 import { POOL_TYPES, type PoolClass } from './ready-pool';
 import { isPoolReleaseRecovering } from './aws-pool-release-recovery';
+import { isStalledPoolAdoptPending } from './aws-pool-adopt-stall';
 import { settleReplacementGeneration } from './aws-rebase-generation';
 import { adoptRecoveryReplay, matchesAdoptRecovery, failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
 import { writePoolOpen } from './placement';
@@ -130,6 +131,8 @@ export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RET
 
 export interface AwsProviderDeps {
     pool?: PoolDeps;
+    /** Background stall retries may only act on this failed epoch, never renew a ready session. */
+    recoveryExpected?: Pick<Placement, 'generation' | 'leaseEpoch'>;
     db: PlacementDb;
     meter?: ComputeMeter;
     env?: () => Env;
@@ -216,6 +219,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const newId = deps.newId ?? (() => randomUUID());
     const leaseSeconds = deps.leaseSeconds ?? 3600;
     const randomBytes = deps.randomBytes ?? nodeRandomBytes;
+    const recoveryMoved = (p: Placement | null) => deps.recoveryExpected && (!p || p.provider !== 'aws-ec2'
+        || p.state !== 'UNCONFIRMED' || p.lastError !== ENROLLMENT_FAILED || p.lifecycleJobId !== null
+        || p.generation !== deps.recoveryExpected.generation || p.leaseEpoch !== deps.recoveryExpected.leaseEpoch);
 
     /** Flag, admission config and every configured region's deployment, or the refusal code. */
     const configured = ():
@@ -528,12 +534,14 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             // Refuse before any write when a later step could not run.
             if (!deps.starter) return notReady('aws_lifecycle_unconfigured');
             const found = await ownPlacement(c);
+            if (recoveryMoved(found)) return notReady('computer_starting', true);
             // Settle an existing placement first: a receipt may have landed, or its host idle-stopped itself.
             // An explicit open is the owner's presence: it renews the lease BEFORE the session limits
             // are checked, so only an hour cap (never a lapsed lease) can stop what the owner is opening.
             const reconciled = found && found.provider === 'aws-ec2'
                 ? await reconcileOwn(c, found, cfg.deployments, cfg.e, false) : null;
             let placement = reconciled?.placement ?? found;
+            if (recoveryMoved(placement)) return notReady('computer_starting', true);
             if (placement && placement.provider === 'aws-ec2' && placement.state === 'RUNNING') {
                 placement = await renewLease(c, placement, now());
                 const settled = await reconcileOwn(c, placement, cfg.deployments, cfg.e);
@@ -644,6 +652,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     return { ok: true };
                 case 'UNCONFIRMED':
                 case 'STOPPED': {
+                    if (await isStalledPoolAdoptPending(deps, placement)) return notReady('computer_starting', true);
                     if (placement.state === 'UNCONFIRMED' && placement.lastError !== ENROLLMENT_FAILED) {
                         if (placement.lastError?.startsWith('capacity:')) return notReady('capacity_unavailable', false, placement.lastError);
                         if (await isAdoptRecoveryStarting(placement)) return notReady('computer_starting', true);
@@ -784,7 +793,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             // A status poll is not presence: it renews nothing, and a lapsed lease or a reached cap stops here.
             const settled = await reconcileOwn(c, p, cfg.deployments, cfg.e);
             p = settled.placement;
-            const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p) ? 'starting' : AWS_STATE_FOR[p.state];
+            const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p)
+                || await isStalledPoolAdoptPending(deps, p) ? 'starting' : AWS_STATE_FOR[p.state];
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}) };
         },
 
