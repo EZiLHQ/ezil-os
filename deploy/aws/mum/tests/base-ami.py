@@ -142,6 +142,12 @@ class BaseImageTests(unittest.TestCase):
         # The live shape is admitted only without a causing entity.
         self.refuse({"base_live_shape": True, "base_live_cause": "FutureParameter"}, "unexpected versioned Image Builder property change")
 
+    def test_maintenance_emptied_previous(self):
+        # A maintenance bake clears the previous lower: the emptied value arrives Static with no cause.
+        self.run_bake({"maintenance_static_empty": True})
+        self.refuse({"maintenance_static_empty": True, "maintenance_static_value": "sha256:" + "1" * 64}, "unexpected versioned Image Builder property change")
+        self.refuse({"maintenance_static_empty": True, "maintenance_static_cause": "FutureParameter"}, "unexpected versioned Image Builder property change")
+
     def test_unrelated_resource(self):
         self.refuse({"iam_change": True}, "unexpected resource change")
 

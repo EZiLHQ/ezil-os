@@ -432,6 +432,16 @@ elif tool == "aws":
                             {"Target": {"Attribute": "Properties", "Name": "ParentImage", "RequiresRecreation": "Always"},
                              "ChangeSource": "DirectModification", "Evaluation": "Dynamic"},
                         ])
+                    if scenario.get("maintenance_static_empty"):
+                        # Live CloudFormation 2026-10-27: a maintenance bake empties PreviousDesktopImage*; the
+                        # emptied Components value is Static/DirectModification, no cause, no ParameterReference.
+                        detail = {"Target": {"Attribute": "Properties", "Name": "Components", "RequiresRecreation": "Always",
+                                             "BeforeValue": "452630323510.dkr.ecr.ap-south-1.amazonaws.com/x@sha256:" + "a" * 64,
+                                             "AfterValue": scenario.get("maintenance_static_value", "")},
+                                  "ChangeSource": "DirectModification", "Evaluation": "Static"}
+                        if scenario.get("maintenance_static_cause"):
+                            detail["CausingEntity"] = scenario["maintenance_static_cause"]
+                        cs["Changes"][1]["ResourceChange"]["Details"].append(detail)
                     if scenario.get("live_dynamic") or scenario.get("dynamic_unexplained"):
                         # Real CloudFormation also lists value-only Dynamic entries for referenced properties.
                         dyn = lambda name, rec: {"Target": {"Attribute": "Properties", "Name": name, "RequiresRecreation": rec}, "ChangeSource": "DirectModification", "Evaluation": "Dynamic"}

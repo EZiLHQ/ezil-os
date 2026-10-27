@@ -394,6 +394,12 @@ def versioned_ami_changes(cs, resources, template_changes, reviewed_base_change=
             # for a property whose change comes from a reference; accept it only when that
             # same property is already explained by an allowed reference in this change.
             expected |= source == "DirectModification" and detail.get("Evaluation") == "Dynamic" and name in explained
+            # A maintenance bake clears PreviousDesktopImage*: live CloudFormation (2026-10-27) reports the
+            # emptied Components value as Static/DirectModification with no cause and no ParameterReference.
+            # Accept exactly that: an empty after-value on a property already explained by an allowed reference.
+            expected |= (logical == recipe and name == "Components" and source == "DirectModification"
+                         and detail.get("Evaluation") == "Static" and cause == "" and not target.get("AfterValue")
+                         and name in explained)
             need(expected, "unexpected versioned Image Builder property change")
         need(direct <= targets, "change set omits synthesized property changes")
         if logical in (component, recipe):
