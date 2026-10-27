@@ -66,6 +66,11 @@ test('pure: no observation or a non-timeout failure is unchanged', () => {
     assert.equal(awsBootTimeoutVerdict({ reason: 'desktop_unreachable', observation: opening(), bootElapsedMs: 215_000 }), 'fail');
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening({ activeAws: false, stage: 'running' }), bootElapsedMs: 215_000 }), 'fail');
 });
+test('pure: a failure from a spent launch/migration loop is never re-opened', () => {
+    assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening(), bootElapsedMs: 300_000, sessionClockSpent: true }), 'budget_spent');
+    assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening(), bootElapsedMs: 300_000, sessionClockSpent: false }), 'reopen');
+    assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: null, bootElapsedMs: 300_000, sessionClockSpent: true }), 'fail');
+});
 test('pure: the reopen cap is a structural backstop', () => {
     // A literal, so lowering the cap below what a 600 s budget needs fails here.
     assert.equal(AWS_BOOT_MAX_REOPENS, 6);
@@ -286,9 +291,11 @@ test('desktop: no observation keeps the unchanged 215 s failure', async t => {
     assert.ok(!h.logs.some(l => l.includes('re-opening')));
 });
 
-test('desktop: real AWS protocol (launching answers, warm offset): no ask after the hard stop', async t => {
-    // The warm's launch answer arrives before the window's first observation:
-    // its 600 s launch deadline lands at window time 555 s, so a re-open is issued.
+test('desktop: real AWS protocol, warm joined late: a launch that spent its own 10 min is not re-opened', async t => {
+    // The warm's launch answer arrives before the window's first observation, so
+    // its 600 s launch deadline lands at window time 555 s. Re-opening there would
+    // keep asking past the server's ~660 s UNCONFIRMED flip, where an ask replaces
+    // the host. The session's own launch clock ran out: that is the budget.
     const h = await open(t, 'unavailable', { post: () => launchingBody });
     await until(() => h.asks() >= 2, 'launching answers');
     h.setPost(() => 'hang');
@@ -296,11 +303,26 @@ test('desktop: real AWS protocol (launching answers, warm offset): no ask after 
     await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Starting your desktop', 'observation painted');
     await until(() => h.pending.length === 1, 'the wake loop asking');
     h.setPerf(555_000); h.setNow(600_000);
-    h.setPost(() => launchingBody);
     h.pending.shift().resolve({ ok: true, status: 200, json: async () => launchingBody });
+    await until(() => h.tryAgainVisible(), 'Try again when the launch clock is spent');
+    const atStop = h.asks();
+    await wait(60);
+    assert.equal(h.asks(), atStop, 'no ask after the launch budget is spent');
+    assert.ok(!h.logs.some(l => l.includes('re-opening')), h.logs.join('\n'));
+    assert.match(h.spinner.textContent, /taking longer than usual/);
+});
+
+test('desktop: real AWS protocol: a launching re-open is cancelled at the hard stop, never orphaned', async t => {
+    const plainStarting = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2' };
+    const h = await open(t, 'opening', { post: () => plainStarting });
+    await until(() => h.asks() >= 2, 'wake answers');
+    // The first request's ordinary 215 s wake deadline passes.
+    h.setNow(215_000); h.setPerf(215_000);
     await until(() => h.logs.some(l => l.includes('re-opening (#1)')), 're-open #1');
-    await until(() => h.asks() >= 6, 'the re-open wake loop asking');
-    assert.equal(h.panel.dataset.kind, 'progress');
+    // The re-open's answers say a replacement launch is under way (10 min loop).
+    h.setPost(() => launchingBody);
+    const atReopen = h.asks();
+    await until(() => h.asks() >= atReopen + 3, 'the re-open wake loop asking');
     assert.equal(h.tryAgainVisible(), false);
     h.setPerf(600_000);
     await until(() => h.tryAgainVisible(), 'Try again at the hard stop');

@@ -49,18 +49,25 @@ const awsBudgetSpent = (observation, bootElapsedMs) => bootElapsedMs >= AWS_BOOT
  *
  *   'reopen'       — a `timeout` while the observation reports `activeAws`:
  *                    ask again (`session.openDesktop`, never a warm replay).
- *   'budget_spent' — the same, but ten minutes (either clock) or the reopen cap
- *                    has been reached: the existing failure + Try again.
+ *   'budget_spent' — the same, but ten minutes (either clock), the reopen cap,
+ *                    or the session's own launch/migration clock (the failure
+ *                    carried `computeLaunching`/`computeMigrating`: its ten-minute
+ *                    loop already ran out) has been reached: failure + Try again.
  *   'fail'         — anything else, including no observation at all: exactly
  *                    the failure the window rendered before this existed.
  *
- * @param {{reason?: string, observation?: any, bootElapsedMs: number, reopens?: number}} input
+ * 🔴 A spent launch clock is never re-opened. A warm joined late starts the
+ * window's clock after the launch's, and a reopen would keep asking past the
+ * server's enrollment expiry, where an ask replaces the host.
+ *
+ * @param {{reason?: string, observation?: any, bootElapsedMs: number, reopens?: number, sessionClockSpent?: boolean}} input
  * @returns {'reopen' | 'budget_spent' | 'fail'}
  */
-export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reopens = 0 }) {
+export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reopens = 0, sessionClockSpent = false }) {
     if ( reason !== 'timeout' || ! observation || observation.activeAws !== true ) return 'fail';
     if ( AWS_STOP_STAGES.includes(observation.stage) ) return 'fail';
-    return awsBudgetSpent(observation, bootElapsedMs) || reopens >= AWS_BOOT_MAX_REOPENS ? 'budget_spent' : 'reopen';
+    return sessionClockSpent || awsBudgetSpent(observation, bootElapsedMs) || reopens >= AWS_BOOT_MAX_REOPENS
+        ? 'budget_spent' : 'reopen';
 }
 
 /**

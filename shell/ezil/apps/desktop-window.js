@@ -1350,6 +1350,8 @@ export async function openDesktopWindow (ctx = {}) {
             const reason = computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }).reason;
             const verdict = awsBootTimeoutVerdict({
                 reason, observation: aws_observation, bootElapsedMs: performance.now() - t0, reopens: aws_reopens,
+                // The wake loop gave up on its own ten-minute launch/migration clock.
+                sessionClockSpent: res.computeLaunching === true || res.computeMigrating === true,
             });
             if ( verdict === 'budget_spent' ) {
                 aws_budget_spent = true;
