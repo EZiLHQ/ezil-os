@@ -7,8 +7,8 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
-    consumeEnrollmentNonce, createPlacement, findStaleOpenUsage, lockImagePlacement, readPlacement, reconcileReplacementGeneration,
-    setImageReservation, transitionPlacement, withAdmission, writeImagePlacement,
+    consumeEnrollmentNonce, createPlacement, ENROLLMENT_FAILED, findStaleOpenUsage, lockImagePlacement, readPlacement, reconcileReplacementGeneration,
+    setImageReservation, transitionPlacement, withAdmission, writeImagePlacement, writePoolOpen,
     type ImagePlacementFields, type Placement, type PlacementDb, type PlacementExecutor,
 } from './placement';
 
@@ -101,6 +101,27 @@ describe.skipIf(!PG)('placement writes on production Drizzle PostgreSQL', () => 
         expect(new Set(closed.map(r => r.stopped_at)).size).toBe(1);
         expect(closed.every(r => r.observed_by === 'placement-transition' && r.updated_at === r.stopped_at)).toBe(true);
         expect(rows.find(r => r.instance_id === 'i-history')).toEqual(history);
+    });
+
+    it('a warm open after a failed enrollment reserves its release from the real UNCONFIRMED row, once, on the exact last_error', async () => {
+        const releaseJob = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+        const release = { lifecycleJobId: releaseJob, lifecycleDigest: 'd'.repeat(64), lastError: 'pool_open_release',
+            enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null };
+        await production!.execute(sql.raw(`UPDATE ${schema}.ezil_computer_placements SET state = 'UNCONFIRMED', last_error = '${ENROLLMENT_FAILED}',
+            instance_id = '${instanceId}', lifecycle_job_id = NULL, lifecycle_digest = NULL, enroll_nonce_hash = NULL, enroll_expires_at = NULL`));
+        const p = await current();
+        expect(p).toMatchObject({ state: 'UNCONFIRMED', lastError: ENROLLMENT_FAILED, generation: 2, leaseEpoch: 4 });
+        // A snapshot with any other UNCONFIRMED reason is refused before any write; a stale snapshot is refused by the CAS.
+        expect(await writePoolOpen(db, { ...p, lastError: 'failed:LifecycleUnconfirmed' }, 'STOPPING', release)).toEqual({ ok: false, reason: 'cas_conflict' });
+        expect(await writePoolOpen(db, { ...p, updatedAt: new Date(p.updatedAt.getTime() - 1) }, 'STOPPING', release)).toEqual({ ok: false, reason: 'cas_conflict' });
+        expect(await current()).toEqual(p);
+        const reserved = await writePoolOpen(db, p, 'STOPPING', release);
+        expect(reserved).toMatchObject({ ok: true, placement: { state: 'STOPPING', generation: 2, leaseEpoch: 4, instanceId, volumeId,
+            lastError: 'pool_open_release', lifecycleJobId: releaseJob, lifecycleDigest: 'd'.repeat(64), enrollNonceHash: null, enrollExpiresAt: null } });
+        expect(await current()).toEqual((reserved as { placement: Placement }).placement);
+        // The consumed snapshot cannot reserve a second release, and the reserved row answers the lifecycle authority's exact match.
+        expect(await writePoolOpen(db, p, 'STOPPING', release)).toEqual({ ok: false, reason: 'cas_conflict' });
+        expect((await readPlacement(db, computerId)).record).toMatchObject({ state: 'STOPPING', lifecycleJobId: releaseJob });
     });
 
     it('image recovery into STOPPED closes the complete open ledger', async () => {

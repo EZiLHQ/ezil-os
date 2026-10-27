@@ -669,7 +669,13 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // A lost instance (INSTANCE_LOST: EC2 terminated it) can only come back as a REPLACE onto its volume.
                     const replace = resizeTo !== undefined || placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace' || isPoolMode(deployment) || placement.lastError === POOL_RELEASED;
                     const instanceType = resizeTo ? instanceTypeForTier(resizeTo) : placement.instanceType;
-                    let poolTier = placement.state === 'STOPPED' ? openTier : undefined;
+                    // A paid owner's open after a failed enrollment (a guard-refused or never-enrolled
+                    // cold host) may take a warm host too: the refused host is released first, below,
+                    // exactly like a STOPPED computer's retained attachment, and only a volume EC2 shows
+                    // `available` is leased (`admitBoot`). The automatic stall recovery (`recoveryExpected`)
+                    // keeps its cold replace.
+                    const enrollmentFailed = placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED;
+                    let poolTier = placement.state === 'STOPPED' || (enrollmentFailed && !deps.recoveryExpected) ? openTier : undefined;
                     if (placement.lastError === POOL_OPEN_RELEASE_FAILED) poolTier = undefined;
                     if (isPoolMode(deployment) && poolTier && poolTier !== 'free' && POOL_TYPES.includes(instanceType as PoolClass['instanceType'])) {
                         if (!deps.pool) return notReady('aws_intent_invalid');

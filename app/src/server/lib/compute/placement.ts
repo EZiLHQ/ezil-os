@@ -1003,13 +1003,16 @@ export async function reconcileReplacementGeneration(db: PlacementDb, expected: 
 
 /** Pool-open bookkeeping is atomic with burning a refused, unclaimed lease.
  * Only receipt evidence may restore source authority; epochs never move backwards.
+ * The release that precedes a warm open (`STOPPING`) starts from a STOPPED computer or from a
+ * failed enrollment (`UNCONFIRMED` + `ENROLLMENT_FAILED`): that refused host still runs on the
+ * retained volume, and its release is the same job, matched on the exact `last_error`.
  */
 export async function writePoolOpen(db: PlacementDb, expected: Placement, to: 'STOPPING' | 'STOPPED',
     fields: PlacementFields, generation = expected.generation,
     retire?: (tx: PlacementExecutor) => Promise<void>): Promise<TransitionResult> {
     if (expected.provider !== 'aws-ec2' || !expected.instanceId || !expected.volumeId || !expected.fenceToken
         || !Number.isSafeInteger(generation) || generation < 1 || generation > expected.generation
-        || !(to === 'STOPPING' ? expected.state === 'STOPPED'
+        || !(to === 'STOPPING' ? expected.state === 'STOPPED' || (expected.state === 'UNCONFIRMED' && expected.lastError === ENROLLMENT_FAILED)
             : ['LEASED', 'STARTING', 'MOUNTING', 'STOPPING', 'UNCONFIRMED'].includes(expected.state)))
         return { ok: false, reason: 'cas_conflict' };
     return withAdmission(db, async tx => {

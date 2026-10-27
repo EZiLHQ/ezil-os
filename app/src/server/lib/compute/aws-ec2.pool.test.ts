@@ -12,7 +12,7 @@ import { applyLifecycleReceipt, enforceSessionLimits, isPoolMode, POOL_RELEASED,
 import { fixtureDeployment } from './aws-intent.test-support';
 import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent, type LifecycleWork } from './aws-intent';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { consumeEnrollmentNonce, finishEnrollment, ImageJobConflictError, publishAttachedPoolClaim, readPlacement,
+import { consumeEnrollmentNonce, ENROLLMENT_FAILED, finishEnrollment, ImageJobConflictError, publishAttachedPoolClaim, readPlacement,
     reservePoolHostForBoot, type PlacementDb, type PlacementExecutor, type Placement } from './placement';
 import { poolPriorityForEntitlement } from './select';
 import { stopComputerForPolicy } from './stop-policy';
@@ -514,6 +514,120 @@ describe('POOLFIX retained attachments and refused adoption', () => {
         if (kind === 'stale-placement') s.placements[0].lifecycle_digest = 'a'.repeat(64);
         await applyLifecycleReceipt(s.deps, p, D);
         expect((await s.placement()).state).toBe('UNCONFIRMED'); expect(s.leasedHost.state).toBe('leased');
+    });
+});
+
+// L-C: a paid owner's open after a failed enrollment (UNCONFIRMED + enroll_tunnel_failed, the guard-refused
+// cold host still running on the retained volume) follows the STOPPED warm path: release the refused host
+// first, lease a warm spare only once EC2 shows the volume `available`, else the cold replace as before.
+describe('L-C warm adopt after an enrollment failure', () => {
+    const refusedHost = (over: Record<string, unknown> = {}) => stopped({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED, ...over });
+    const attachedRunning = (s: ReturnType<typeof setup>) => {
+        s.volume.state = 'in-use'; s.volume.attachments = [{ instanceId: s.source.instanceId, state: 'attached' }]; s.source.state = 'running';
+    };
+    const freed = (s: ReturnType<typeof setup>) => { s.volume.state = 'available'; s.volume.attachments = []; s.source.state = 'terminated'; };
+
+    it('releases the refused host first, closes its usage at the release, then adopts a warm spare', async () => {
+        const s = setup({ rows: [refusedHost()] }); attachedRunning(s);
+        s.usage.push({ computer_id: C, user_id: U, instance_id: s.source.instanceId, instance_type: 'm6i.large',
+            started_at: new Date(NOW.getTime() - 7200_000), stopped_at: null, observed_by: 'receipt', updated_at: NOW });
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['release']);
+        expect(s.starts[0].intent).toMatchObject({ providerInstanceId: s.source.instanceId, dataVolumeId: VOLUME, targetGeneration: 3, leaseEpoch: 4, userData: null });
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(await s.placement()).toMatchObject({ state: 'STOPPING', lastError: 'pool_open_release', generation: 3, leaseEpoch: 4,
+            instanceId: s.source.instanceId, volumeId: VOLUME, lifecycleJobId: s.starts[0].intent.jobId, enrollNonceHash: null });
+        expect(await s.status()).toMatchObject({ state: 'starting' });
+        // Another open while the release runs starts nothing and leases nothing.
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts).toHaveLength(1); expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        const stopDate = new Date(NOW.getTime() - 60_000);
+        s.execution('SUCCEEDED'); s.executionFields({ startDate: new Date(stopDate.getTime() - 60_000), stopDate }); freed(s);
+        expect(await s.status()).toMatchObject({ state: 'stopped' });
+        expect(await s.placement()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED, instanceId: s.source.instanceId, volumeId: VOLUME, lifecycleJobId: null });
+        // The dead generation's open usage row closes at the release's own stop time (same as a normal release).
+        expect(s.usage[0].stopped_at).toEqual(stopDate);
+        expect(s.meter.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U, computerId: C, endedAt: stopDate, reason: 'user_stop' });
+        s.executionFields({});
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['release', 'adopt']);
+        expect(s.pool.leasePoolHost).toHaveBeenCalledOnce();
+        expect(s.starts[1].intent).toMatchObject({ poolHostId: HOST, providerInstanceId: INSTANCE, dataVolumeId: VOLUME,
+            targetGeneration: 4, leaseEpoch: 5, previousInstanceId: null, userData: null });
+        s.execution('SUCCEEDED'); await s.status(); await s.ready();
+        expect(await s.status()).toMatchObject({ state: 'running' });
+        expect((await s.placement()).instanceId).toBe(INSTANCE);
+        expect(s.starts).toHaveLength(2);
+    });
+    it('no spare after the release: the cold replace onto the freed volume, never a second release', async () => {
+        const s = setup({ rows: [refusedHost()], host: null }); attachedRunning(s);
+        await s.ensure(); expect(s.starts.map(w => w.intent.operation)).toEqual(['release']);
+        s.execution('SUCCEEDED'); freed(s); await s.status();
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['release', 'replace']);
+        expect(s.pool.leasePoolHost).toHaveBeenCalledOnce();
+        expect(s.starts[1].intent).toMatchObject({ previousInstanceId: s.source.instanceId, previousGeneration: 3, dataVolumeId: VOLUME, targetGeneration: 4, leaseEpoch: 5 });
+    });
+    it.each(['terminated', 'not-found'])('a refused host already gone (%s, e.g. retired at enroll-timeout) adopts at once, with no release', async how => {
+        const s = setup({ rows: [refusedHost()] });
+        if (how === 'terminated') s.source.state = 'terminated';
+        else vi.mocked(s.deps.describer!.describeForEnrollment).mockRejectedValue(Object.assign(new Error('gone'), { name: 'InvalidInstanceID.NotFound' }));
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['adopt']);
+        expect(s.pool.leasePoolHost).toHaveBeenCalledOnce();
+        expect(s.starts[0].intent).toMatchObject({ poolHostId: HOST, providerInstanceId: INSTANCE, dataVolumeId: VOLUME, targetGeneration: 4, leaseEpoch: 5, previousInstanceId: null });
+        s.execution('SUCCEEDED'); await s.status(); await s.ready();
+        expect(await s.status()).toMatchObject({ state: 'running' });
+    });
+    it.each(['stale attachment to a terminated host', 'attached elsewhere', 'volume describe unavailable'])('never leases on %s: the cold replace, never a release of a gone host', async kind => {
+        const s = setup({ rows: [refusedHost()] });
+        if (kind === 'stale attachment to a terminated host') { attachedRunning(s); s.source.state = 'terminated'; }
+        if (kind === 'attached elsewhere') { attachedRunning(s); s.volume.attachments = [{ instanceId: 'i-33333333333333333', state: 'attached' }]; }
+        if (kind === 'volume describe unavailable') vi.mocked(s.deps.describer!.describeVolume!).mockRejectedValue(new Error('unavailable'));
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['replace']);
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts[0].intent.previousInstanceId).toBe(s.source.instanceId);
+    });
+    it.each(['FAILED', 'TIMED_OUT', 'ABORTED', 'start-refused'])('release %s falls back to the cold replace without leasing', async failure => {
+        const s = setup({ rows: [refusedHost()] }); attachedRunning(s);
+        if (failure === 'start-refused') vi.mocked(s.deps.starter!.start).mockRejectedValueOnce(Object.assign(new Error('denied'), {
+            name: 'AccessDeniedException', $metadata: { httpStatusCode: 400 },
+        }));
+        await s.ensure();
+        if (failure !== 'start-refused') { s.execution(failure); await s.status(); }
+        expect(await s.placement()).toMatchObject({ state: 'STOPPED', lastError: POOL_OPEN_RELEASE_FAILED, instanceId: s.source.instanceId, generation: 3, leaseEpoch: 4 });
+        await s.ensure(); expect(s.starts.at(-1)!.intent).toMatchObject({ operation: 'replace', previousInstanceId: s.source.instanceId, targetGeneration: 4 });
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+    });
+    it('a lost release acknowledgement stays starting and cannot lease before its receipt', async () => {
+        const s = setup({ rows: [refusedHost()], lostStart: true }); attachedRunning(s);
+        await s.ensure(); await s.ensure();
+        expect(await s.status()).toMatchObject({ state: 'starting' });
+        expect(s.starts.every(w => w.intent.operation === 'release')).toBe(true);
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        s.execution('SUCCEEDED'); freed(s);
+        await s.ensure(); expect(s.starts.at(-1)!.intent.operation).toBe('adopt');
+    });
+    it('a free owner never releases or leases: the cold replace as before', async () => {
+        const s = setup({ rows: [refusedHost()], entitlement: null }); attachedRunning(s);
+        await s.ensure();
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['replace']);
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts[0].intent.previousInstanceId).toBe(s.source.instanceId);
+    });
+    it('the automatic stall recovery (recoveryExpected) keeps its cold replace', async () => {
+        const s = setup({ rows: [refusedHost()] }); attachedRunning(s);
+        const recovery = createAwsEc2Provider({ ...s.deps, recoveryExpected: { generation: 3, leaseEpoch: 4 } });
+        expect(await recovery.ensure(ctx, computer, options)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['replace']);
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+    });
+    it('every other UNCONFIRMED reason is unchanged: no release, no lease', async () => {
+        const s = setup({ rows: [refusedHost({ last_error: 'capacity:region_capacity' })] }); attachedRunning(s);
+        expect(await s.ensure()).toMatchObject({ errorCode: 'capacity_unavailable' });
+        expect(s.starts).toHaveLength(0); expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect((await s.placement()).state).toBe('UNCONFIRMED');
     });
 });
 
