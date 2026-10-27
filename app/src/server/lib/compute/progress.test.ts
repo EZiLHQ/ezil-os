@@ -3,7 +3,7 @@ const h = vi.hoisted(() => ({ placement: vi.fn(), migration: vi.fn() }));
 vi.mock('./placement', async original => ({ ...await original<typeof import('./placement')>(), readPlacement: h.placement }));
 vi.mock('./provider-migrate-store', async original => ({ ...await original<typeof import('./provider-migrate-store')>(), createProviderMigrationStore: () => ({ readByComputer: h.migration }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ billingV2EntitlementReader: () => ({ read: async () => null }) }));
-import { describeProgress, readComputerProgress } from './progress';
+import { describeProgress, openingTypicalSeconds, readComputerProgress } from './progress';
 import { PlacementOwnerError, type Placement } from './placement';
 import type { ComputeMigration } from './provider-migrate-store';
 const computer = { computerId: 'c', userId: 'u' };
@@ -98,6 +98,66 @@ describe('read-only progress', () => {
         expect(describeProgress('c', placement, migration, { ...env, EZIL_AWS_KILL_SWITCH: '1' }).active).toBe(false);
         expect(describeProgress('c', null, null, { ...env, EZIL_AWS_KILL_SWITCH: '1' }, new Date(), entitlement)).toMatchObject({ stage: 'operations_paused', active: false });
         expect(describeProgress('c', placement, null, env, new Date(), { ...entitlement, status: 'past_due' }).selectedNextOpenHardware).toBeNull();
+    });
+
+    describe('opening progress', () => {
+        const NOW = new Date('2026-10-27T12:00:00Z');
+        // Explicit nulls: the enrollment predicate never treats a missing field as "no job" or "no presence".
+        const mounting = { ...placement, state: 'MOUNTING', lifecycleJobId: null, presenceAt: null, lastError: null,
+            enrollExpiresAt: new Date(NOW.getTime() - 60_000), updatedAt: new Date('2026-10-27T11:50:00Z') } as Placement;
+
+        it.each(['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'WARMING', 'CLAIMED'] as const)('%s reports the bounded 240 s default', state => {
+            expect(describeProgress('c', { ...placement, state }, null, env)).toMatchObject({
+                operation: 'opening', typicalSeconds: 240, bytes: { transferred: null, total: null }, etaSeconds: null });
+        });
+        it.each([[3, 180], [4.5, 270], [1, 90], [0.1, 90], [20, 600], [0, 240], [-2, 240], [Number.NaN, 240], [Number.POSITIVE_INFINITY, 240], [null, 240]] as const)(
+            'derives opening seconds from a pool boot p90 of %s min as %i s (clamped 90-600)', (minutes, seconds) => {
+                expect(openingTypicalSeconds(minutes)).toBe(seconds);
+                expect(describeProgress('c', { ...placement, state: 'STARTING' }, null, env, new Date(), null, { poolBootP90Minutes: minutes }).typicalSeconds).toBe(seconds);
+            });
+        it('keeps typicalSeconds null outside an open and while paused', () => {
+            expect(describeProgress('c', placement, null, env, NOW, null, { poolBootP90Minutes: 3 }).typicalSeconds).toBeNull();
+            expect(describeProgress('c', { ...placement, state: 'RUNNING' }, null, env).typicalSeconds).toBeNull();
+            expect(describeProgress('c', { ...placement, state: 'MOUNTING' }, null, { ...env, EZIL_AWS_KILL_SWITCH: '1' }))
+                .toMatchObject({ stage: 'operations_paused', active: false, typicalSeconds: null });
+        });
+        it.each([
+            ['no presence', null],
+            ['stale presence from an earlier session', new Date(NOW.getTime() - 3_600_000)],
+            ['presence 1 ms before this nonce was issued', new Date(NOW.getTime() - 660_001)],
+        ] as const)('MOUNTING with an expired enrollment nonce (+60 s grace) and %s reports needs_operator', (_name, presenceAt) => {
+            for (const lastError of [null, 'enroll_tunnel_pending']) {
+                expect(describeProgress('c', { ...mounting, presenceAt, lastError }, null, env, NOW)).toMatchObject({
+                    operation: 'opening', stage: 'needs_operator', recordedStage: 'mounting', lifecycleState: 'MOUNTING',
+                    needsOperator: true, active: false, typicalSeconds: null, etaSeconds: null });
+            }
+        });
+        it('a live or failed migration owns the stage; an expired-looking placement never overrides it', () => {
+            const live = describeProgress('c', mounting, { ...migration, state: 'provisioning', updatedAt: '2026-10-27T11:59:00Z' }, env, NOW);
+            expect(live).toMatchObject({ operation: 'migration', stage: 'provisioning', needsOperator: false, active: true });
+            const failed = describeProgress('c', mounting, { ...migration, state: 'failed_reopened', updatedAt: '2026-10-27T11:59:00Z' }, env, NOW);
+            expect(failed).toMatchObject({ stage: 'failed_reopened', recordedStage: 'failed_reopened', needsOperator: false });
+        });
+        it.each([
+            ['not yet past the grace', { enrollExpiresAt: new Date(NOW.getTime() - 59_999) }],
+            ['still before the nonce deadline', { enrollExpiresAt: new Date(NOW.getTime() + 600_000) }],
+            ['no deadline', { enrollExpiresAt: null }],
+            ['a recorded lifecycle job', { lifecycleJobId: 'job' }],
+            ['host presence', { presenceAt: new Date(NOW.getTime() - 1_000) }],
+            ['rebase presence stamped at the nonce issue time', { presenceAt: new Date(NOW.getTime() - 660_000) }],
+            ['STARTING (the timeout CAS is MOUNTING-only)', { state: 'STARTING' }],
+            ['enrollment success', { lastError: 'enroll_succeeded' }],
+            ['a pending pool session', { lastError: 'pool_session_pending' }],
+            ['another state', { state: 'PROVISIONING' }],
+        ] as const)('stays an active open with %s', (_name, patch) => {
+            const result = describeProgress('c', { ...mounting, ...patch } as Placement, null, env, NOW);
+            expect(result).toMatchObject({ operation: 'opening', needsOperator: false, active: true, typicalSeconds: 240 });
+            expect(result.stage).toBe(result.recordedStage);
+        });
+        it('never reports an expired enrollment for a non-AWS placement', () => {
+            expect(describeProgress('c', { ...mounting, provider: 'cloudflare' } as Placement, null, env, NOW)).toMatchObject({
+                needsOperator: false, lifecycleState: null });
+        });
     });
 
     it('reads only stored placement and latest migration', async () => {

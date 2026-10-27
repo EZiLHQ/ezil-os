@@ -46,6 +46,7 @@ import { sql, type SQL } from 'drizzle-orm';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
+import { ENROLL_NONCE_TTL_SECONDS } from './aws-rebase-lease';
 
 // ── Enums ────────────────────────────────────────────────────────────────
 
@@ -1411,11 +1412,43 @@ export async function failStalledPoolEnrollment(db: PlacementDb, p: Placement,
     });
 }
 
-/** A completed attach without enrollment may fail after the nonce's 60-second grace. */
-export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date): Promise<TransitionResult> {
-    const expired = (x: Placement) => x.provider === 'aws-ec2' && x.state === 'MOUNTING' && x.lifecycleJobId === null
-        && x.presenceAt === null && x.lastError !== ENROLLMENT_SUCCEEDED && x.lastError !== POOL_SESSION_PENDING
-        && x.enrollExpiresAt !== null && x.enrollExpiresAt.getTime() + 60_000 <= now.getTime();
+/** Grace after the enrollment nonce's deadline before an unenrolled attach counts as failed. */
+export const ENROLLMENT_GRACE_MS = 60_000;
+
+/**
+ * Pure: a MOUNTING aws-ec2 placement whose attach job is settled (no recorded job), with no
+ * owner presence in the CURRENT enrollment epoch, whose enrollment neither succeeded nor is a
+ * pending pool session, and whose nonce deadline plus `ENROLLMENT_GRACE_MS` has passed at `now`.
+ *
+ * Presence is epoch-scoped: `presence_at` is monotonic and no lease, wake or replace clears it,
+ * so a stamp older than this nonce's issue time (`enrollExpiresAt - ENROLL_NONCE_TTL_SECONDS`;
+ * every nonce writer uses that TTL) belongs to an earlier RUNNING session and says nothing
+ * about this host. An image rebase stamps presence AT the issue time, so `>=` keeps it excluded.
+ */
+export function isUnenrolledPastGrace(x: Placement, now: Date): boolean {
+    if (x.provider !== 'aws-ec2' || x.state !== 'MOUNTING' || x.lifecycleJobId !== null
+        || x.lastError === ENROLLMENT_SUCCEEDED || x.lastError === POOL_SESSION_PENDING
+        || !(x.enrollExpiresAt instanceof Date)) return false;
+    const deadline = x.enrollExpiresAt.getTime();
+    const presentThisEpoch = x.presenceAt !== null && x.presenceAt.getTime() >= deadline - ENROLL_NONCE_TTL_SECONDS * 1000;
+    return !presentThisEpoch && deadline + ENROLLMENT_GRACE_MS <= now.getTime();
+}
+
+/**
+ * A completed attach without enrollment may fail after the nonce's 60-second grace.
+ *
+ * KNOWN GAP (L-B 2026-10-27, not delivered): nothing here stops the refused host. The only
+ * production caller (aws-receipts.ts `[enroll-timeout]`) passes no `retire`, so the instance
+ * keeps running until the owner's next open replaces it. `retire` is only the seam for the
+ * instance-only stop follow-up, which needs a lifecycle-authority exception outside this lane.
+ * Contract for that seam: it runs inside the same admission transaction ONLY after this CAS
+ * succeeded (as in `failStalledPoolEnrollment`), it must be database-only work (a Step
+ * Functions start issued here would be checked against an uncommitted row), and a throw rolls
+ * the classification back. A repeat call or a lost race returns `cas_conflict` first.
+ */
+export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date,
+    retire?: (tx: PlacementExecutor) => Promise<unknown>): Promise<TransitionResult> {
+    const expired = (x: Placement) => isUnenrolledPastGrace(x, now);
     if (!expired(p)) return { ok: false, reason: 'cas_conflict' };
     return withAdmission(db, async tx => {
         await lockComputer(tx, p.computerId);
@@ -1424,11 +1457,13 @@ export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now
             || current.updatedAt.getTime() !== p.updatedAt.getTime() || current.lastError !== p.lastError
             || current.enrollExpiresAt?.getTime() !== p.enrollExpiresAt?.getTime())
             return { ok: false, reason: 'cas_conflict' };
-        return casInTx(tx, p.computerId, p, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
+        const result = await casInTx(tx, p.computerId, p, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
             { lastError: ENROLLMENT_FAILED, enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null },
             { provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId,
                 volumeId: p.volumeId ?? undefined, fenceToken: p.fenceToken ?? undefined,
                 lastError: p.lastError, updatedAt: p.updatedAt });
+        if (result.ok && retire) await retire(tx);
+        return result;
     });
 }
 

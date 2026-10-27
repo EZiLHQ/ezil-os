@@ -2,7 +2,7 @@
 import { SIZES } from '@/server/billing/v2/contract';
 import type { EntitlementRecord } from './tier';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
-import { PlacementOwnerError, readPlacement, type Placement, type PlacementState, type PlacementExecutor } from './placement';
+import { isUnenrolledPastGrace, PlacementOwnerError, readPlacement, type Placement, type PlacementState, type PlacementExecutor } from './placement';
 import { MIGRATION_STATES, pendingRecovery, TERMINAL_MIGRATION_STATES, type MigrationState } from './provider-migrate';
 import { createProviderMigrationStore, snapshotChunkSizes, type ComputeMigration } from './provider-migrate-store';
 
@@ -28,7 +28,30 @@ function transferProgress(migration: ComputeMigration | null, stage: string, sto
     };
 }
 
-export function describeProgress(computerId: string, placement: Placement | null, migration: ComputeMigration | null, env: Env, now = new Date(), entitlement: EntitlementRecord | null = null) {
+/**
+ * Typical seconds for an AWS open (provision or wake through desktop-ready), shown as the
+ * shell's meter/countdown denominator. 240 s is the measured cold open (founder runs
+ * 2026-10: 215-300 s), which is also the shell's own fallback. When the caller already holds
+ * the pool class's boot p90 (ready-pool `boot_minutes`, in MINUTES) it is used instead.
+ * Either figure is clamped to the same 90-600 s band as migration estimates, so a corrupt or
+ * outlier observation can neither promise an instant open nor a ten-minute-plus one.
+ */
+export const OPENING_TYPICAL_SECONDS = 240;
+export const TYPICAL_SECONDS_MIN = 90;
+export const TYPICAL_SECONDS_MAX = 600;
+
+export function openingTypicalSeconds(poolBootP90Minutes?: number | null): number {
+    const measured = typeof poolBootP90Minutes === 'number' && Number.isFinite(poolBootP90Minutes) && poolBootP90Minutes > 0
+        ? Math.round(poolBootP90Minutes * 60) : OPENING_TYPICAL_SECONDS;
+    return Math.max(TYPICAL_SECONDS_MIN, Math.min(TYPICAL_SECONDS_MAX, measured));
+}
+
+export interface ProgressOptions {
+    /** Pool class boot p90 in minutes, only when the caller already has it; never read here. */
+    poolBootP90Minutes?: number | null;
+}
+
+export function describeProgress(computerId: string, placement: Placement | null, migration: ComputeMigration | null, env: Env, now = new Date(), entitlement: EntitlementRecord | null = null, options: ProgressOptions = {}) {
     const active = migration && !TERMINAL_MIGRATION_STATES.includes(migration.state) ? migration : null;
     const aws = placement?.provider === 'aws-ec2' || !!active
         || (entitlement?.provider === 'aws' && entitlement.status === 'active' && !entitlement.paymentIssue);
@@ -49,7 +72,12 @@ export function describeProgress(computerId: string, placement: Placement | null
     }
     const selectedSize = entitlement?.source === 'billing_v2' && entitlement.status === 'active' && !entitlement.paymentIssue && entitlement.provider === 'aws' && entitlement.size && entitlement.planId ? SIZES[entitlement.size] : null;
     const selected = selectedSize?.provider === 'aws' ? selectedSize : null;
-    const needsOperator = stage === 'failed_needs_operator' || lifecycle === 'UNCONFIRMED';
+    // The enrollment nonce (TTL + grace, placement.ts `isUnenrolledPastGrace`) has expired with no
+    // host presence this epoch: the open has failed even before the receipt pass records
+    // UNCONFIRMED. Same MOUNTING-only predicate as that CAS, so progress never shows a failure
+    // that no transition resolves.
+    const enrollmentExpired = !active && !relevantFailure && !!placement && isUnenrolledPastGrace(placement, now);
+    const needsOperator = stage === 'failed_needs_operator' || lifecycle === 'UNCONFIRMED' || enrollmentExpired;
     // A cutoff must never be presented as active transfer. Keep recordedStage for diagnostics.
     return {
         version: 2 as const, computerId, observedAt: now.toISOString(), operation,
@@ -60,6 +88,8 @@ export function describeProgress(computerId: string, placement: Placement | null
         updatedAt: active || relevantFailure ? new Date(migration!.updatedAt).toISOString() : placement?.updatedAt.toISOString() ?? null,
         durable: !!active, resumePolicy: active ? 'saved_workspace_only' as const : 'unavailable' as const,
         ...transferProgress(operation === 'migration' ? migration : null, stage, paused || needsOperator),
+        // An open has no byte count; it still has a bounded typical duration while it is underway.
+        ...(operation === 'opening' ? { typicalSeconds: paused || needsOperator ? null : openingTypicalSeconds(options.poolBootP90Minutes) } : {}),
         selectedNextOpenHardware: selected ? { size: entitlement!.size!, vcpu: selected.vcpu, memoryGiB: selected.memoryGiB, effective: 'next_open' as const } : null,
         hardware: { instanceType: placement?.instanceType ?? null, source: placement ? 'placement' as const : 'unavailable' as const },
     };
