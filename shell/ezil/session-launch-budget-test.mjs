@@ -26,15 +26,15 @@ async function run(t, { answer = () => launching, open = openDesktop, requestMs 
 }
 
 for (const [name, open] of surfaces) {
-    test(`${name}: fresh launch waits eight minutes and preserves the timeout code`, async t => {
+    test(`${name}: fresh launch waits ten minutes and preserves the timeout code`, async t => {
         const out = await run(t, { open, onWait: () => {
             assert.equal(isComputeLaunching('launch-computer'), true);
             assert.equal(isComputeLaunching('another-computer'), false);
             assert.equal(isComputeMigrating('launch-computer'), false);
         } });
-        assert.equal(LAUNCH_DEADLINE_MS, 480_000);
-        assert.equal(out.elapsed, 480_000);
-        assert.equal(out.asks, 321);
+        assert.equal(LAUNCH_DEADLINE_MS, 600_000);
+        assert.equal(out.elapsed, 600_000);
+        assert.equal(out.asks, 401);
         assert.equal(out.result.errorCode, 'sandbox_starting');
         assert.equal(out.result.computeLaunching, true);
         assert.equal(isComputeLaunching('launch-computer'), false);
@@ -59,25 +59,25 @@ test('replacement succeeds at 235.5s, beyond the incident cutoff, even after enr
 
 test('launch budget begins when first observed; later flags cannot restart it', async t => {
     const out = await run(t, { answer: ({ now }) => now < 90_000 || now === 300_000 ? pending : launching });
-    assert.equal(out.elapsed, 570_000);
+    assert.equal(out.elapsed, 690_000);
     assert.equal(out.result.errorCode, 'sandbox_starting');
 });
 
 test('dropping the launch flag retains the original bounded launch deadline', async t => {
     const out = await run(t, { answer: ({ now }) => now < 54_000 ? launching : pending });
-    assert.equal(out.elapsed, 480_000);
-    assert.equal(out.asks, 321);
+    assert.equal(out.elapsed, 600_000);
+    assert.equal(out.asks, 401);
 });
 
 test('slow launch responses remain bounded by elapsed time', async t => {
     const out = await run(t, { requestMs: 60_000 });
-    assert.equal(out.elapsed, 552_000);
-    assert.equal(out.asks, 9);
+    assert.equal(out.elapsed, 675_000);
+    assert.equal(out.asks, 11);
 });
 
 for (const [name, answer, cap] of [
-    ['launch', () => launching, 322],
-    ['launch flag dropped', ({ asks }) => asks === 1 ? launching : pending, 322],
+    ['launch', () => launching, 402],
+    ['launch flag dropped', ({ asks }) => asks === 1 ? launching : pending, 402],
     ['ordinary AWS', () => pending, 146],
     ['Cloudflare', () => ({ ...launching, computeProvider: 'cloudflare' }), 40],
     ['unlabelled', () => ({ ...launching, computeProvider: undefined }), 40],
@@ -151,8 +151,8 @@ test('migration keeps its own copy and deadline when both flags are present', as
         assert.equal(isComputeMigrating('launch-computer'), true);
         assert.equal(isComputeLaunching('launch-computer'), false);
     } });
-    assert.equal(out.elapsed, 480_000);
-    assert.equal(out.asks, 321);
+    assert.equal(out.elapsed, 600_000);
+    assert.equal(out.asks, 401);
 });
 
 test('launch preserves one automatic retry for a subsequent genuine failure', async t => {
