@@ -233,9 +233,10 @@ const MAX_ISSUES = 40;
 const AWS_MAX_ISSUES = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
 // A paid upgrade includes host provisioning and workspace/system restore.
 // Count from the first migration answer, then allow a full ordinary AWS wake.
-export const MIGRATION_DEADLINE_MS = 8 * 60_000;
-// A replacement AMI boot gets one bounded budget, retained after enrollment.
-export const LAUNCH_DEADLINE_MS = 8 * 60_000;
+export const MIGRATION_DEADLINE_MS = 10 * 60_000;
+// A replacement AMI boot gets one bounded budget, retained after enrollment. Both match the
+// loader's 10-minute calm ceiling; a stalled pool adoption self-recovers well inside it.
+export const LAUNCH_DEADLINE_MS = 10 * 60_000;
 export { LAUNCH_COPY } from './launch-copy.js';
 
 const LAUNCH_MAX_ISSUES = Math.ceil(LAUNCH_DEADLINE_MS / WAKE_REASK_MS) + 2;
