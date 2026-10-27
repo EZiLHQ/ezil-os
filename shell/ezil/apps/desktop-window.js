@@ -97,7 +97,7 @@ import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
-import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
+import BootProgress, { DisplayNotice, awsBootTimeoutVerdict, awsBootWaitVerdict } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import {
@@ -153,6 +153,8 @@ const PHASE_LIST_AFTER_MS = 4_000;
 const FRAME_CONFIRM_FALLBACK_MS = 4_000;
 const FRAME_CONFIRM_ATTEMPTS = 3;
 const FRAME_CONFIRM_RETRY_MS = 1_500;
+/** The least origin-probe grace a desktop URL gets, measured from its handover. */
+const FRAME_ORIGIN_GRACE_MS = 60_000;
 
 /**
  * The display gate (`start_display_gate`) — the answer to "did any pixel
@@ -857,6 +859,26 @@ export async function openDesktopWindow (ctx = {}) {
     let boot_work = null;
     let stale_recoveries = 0;
     let running_signal;       // undefined until a poll lands; never coerced to false
+    /**
+     * The last `computer.progress` observation the spinner's observer produced
+     * (the same poller; no second one). Kept across a null caused by a hidden tab
+     * or a failed poll, because neither is evidence the AWS computer stopped
+     * opening. Never set for Cloudflare/native: their observation is always null.
+     */
+    let aws_observation = null;
+    /**
+     * While a desktop request is in flight: ends the wait early. `clock` is set
+     * only during a reopen (the ten-minute stop applies); on the first request
+     * only the observed stage can end it. See `check_aws_wait`.
+     */
+    let aws_stop_wait = null;
+    /** Whether THIS attempt has watched the AWS computer actively opening. */
+    let aws_seen_active = false;
+    /**
+     * Cancels this window's own in-flight `session.openDesktop` (a reopen or a
+     * Try again). One controller per request; aborting a finished one is a no-op.
+     */
+    let own_open = null;
     let disposed = false;
     /**
      * Set once the desktop has actually been shown. It is the DESIRE, not the
@@ -1062,7 +1084,13 @@ export async function openDesktopWindow (ctx = {}) {
     // sequence in which one shows a claim the other has not also made.
     const spinner = AppSpinner({
         computerId: computer.id,
-        onProgressChange: () => { if (last_kind === 'progress') show_panel(); },
+        onProgressChange: () => {
+            const seen = spinner.computerProgress();
+            if ( seen ) aws_observation = seen;
+            if ( seen?.activeAws === true ) aws_seen_active = true;
+            check_aws_wait();
+            if (last_kind === 'progress') show_panel();
+        },
         label: `Opening ${ctx.appName || title}…`,
         isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
@@ -1079,10 +1107,44 @@ export async function openDesktopWindow (ctx = {}) {
      *  separately-maintained flag that could drift from what was rendered. */
     let last_kind = null;
 
+    /**
+     * While a desktop request is in flight, stop waiting the moment the
+     * observation says the computer stopped opening (needs_operator, stopped,
+     * paused, ...) or, during a reopen, ten minutes (either clock) have passed.
+     * A no-op when no observation exists, i.e. on every non-AWS boot.
+     *
+     * 🔴 STOPPING THE WAIT STOPS THE ASKING. The abandoned `openDesktop` loop is
+     * cancelled, never orphaned: each of its asks runs the server's ensure, which
+     * on an UNCONFIRMED + ENROLLMENT_FAILED placement launches a replacement host
+     * while this window says it stopped.
+     */
+    function check_aws_wait () {
+        if ( ! aws_stop_wait ) return;
+        const { t0, resolve, clock } = aws_stop_wait;
+        const verdict = awsBootWaitVerdict({ observation: aws_observation, bootElapsedMs: performance.now() - t0, clock });
+        if ( verdict === 'wait' ) return;
+        // On the first request only a change this attempt WATCHED happen counts:
+        // a computer that already needed attention when the window opened is being
+        // recovered by this very open, and cancelling it would strand the user.
+        if ( ! clock && ! aws_seen_active ) return;
+        aws_stop_wait = null;
+        own_open?.abort();
+        // The server says stop for this computer: also stop an open this window did
+        // not start itself (the paint-time warm the first attempt joined).
+        if ( verdict === 'fail' ) session.cancelOpenDesktop(computer.id);
+        console.info(`[${PHASE}] stopped waiting for the AWS computer: ${verdict}`
+            + ` (stage ${aws_observation?.stage ?? 'unobserved'}, +${Math.round(performance.now() - t0)}ms)`);
+        resolve({ ok: false, errorCode: 'timeout', message: `Stopped waiting for the AWS computer (${verdict}).` });
+    }
+
     /** The one place either boot surface is told what to render. */
     function render_both (state) {
         last_kind = state.kind;
-        progress.render(state);
+        // The LIVE observation's countdown only: this panel is on screen exactly when
+        // the spinner has none (failed poll, hidden tab), and a kept countdown would
+        // be frozen at the last good poll. No live estimate reads "still working".
+        progress.render(state, state.kind === 'progress' && aws_stop_wait?.clock
+            ? { countdown: spinner.computerProgress()?.countdown } : null);
         spinner.render(state);
         if (state.kind === 'progress') show_panel();
     }
@@ -1174,6 +1236,8 @@ export async function openDesktopWindow (ctx = {}) {
         // could not check" must not linger over it.
         notice.hide();
         running_signal = undefined;
+        aws_observation = spinner.computerProgress();
+        aws_seen_active = aws_observation?.activeAws === true;
 
         // 🔴 PHASE_LIST_AFTER_MS, measured from THIS attempt's own start, not
         // from anything upstream. Guarded on `last_kind` rather than a second
@@ -1207,6 +1271,7 @@ export async function openDesktopWindow (ctx = {}) {
         const t0 = performance.now();
         paint = () => {
             if ( disposed || my_attempt !== attempt ) return;
+            check_aws_wait();
             render_both(computeBootUiState({
                 requestStatus: 'pending',
                 elapsedMs: performance.now() - t0,
@@ -1260,9 +1325,50 @@ export async function openDesktopWindow (ctx = {}) {
         // open), the first settle corrects it — which is exactly what the live
         // path is for.
         const boot_screen_ask = measure_screen();
-        const res = my_attempt === 1
-            ? await claimWarm(computer.id)
-            : await session.openDesktop(computer.id, boot_screen_ask);
+        const ask_fresh = () => {
+            own_open = new AbortController();
+            return session.openDesktop(computer.id, boot_screen_ask, { signal: own_open.signal });
+        };
+        // The first request ends early only on an observed stage change (see
+        // `check_aws_wait`); its own wake loop still owns the clock.
+        const first_stop = new Promise(resolve => { aws_stop_wait = { t0, resolve, clock: false }; });
+        let res = await Promise.race([my_attempt === 1 ? claimWarm(computer.id) : ask_fresh(), first_stop]);
+        aws_stop_wait = null;
+
+        // 🔴 A TIMEOUT IS NOT A FAILURE WHILE AWS SAYS IT IS STILL OPENING. A cold
+        // AWS replace measures 210-250 s against a 215 s budget. While the
+        // spinner's `computer.progress` observation reports `activeAws`, ask
+        // again — `openDesktop` with the same screen ask, never a warm replay —
+        // and keep the panel on progress (the clock and the status poll keep
+        // running). Ten minutes (either clock), `needs_operator`, or the reopen
+        // cap end it with the existing failure + Try again. With no observation
+        // (Cloudflare, native) the verdict is always 'fail': unchanged.
+        let aws_reopens = 0;
+        let reopen_started_at = null;
+        let aws_budget_spent = false;
+        while ( ! disposed && my_attempt === attempt && ! res.ok ) {
+            const reason = computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }).reason;
+            const verdict = awsBootTimeoutVerdict({
+                reason, observation: aws_observation, bootElapsedMs: performance.now() - t0, reopens: aws_reopens,
+                // The wake loop gave up on its own ten-minute launch/migration clock.
+                sessionClockSpent: res.computeLaunching === true || res.computeMigrating === true,
+            });
+            if ( verdict === 'budget_spent' ) {
+                aws_budget_spent = true;
+                console.info(`[${PHASE}] AWS boot budget spent at +${Math.round(performance.now() - t0)}ms`
+                    + ` after ${aws_reopens} reopen(s) (stage ${aws_observation?.stage}); showing Try again`);
+            }
+            if ( verdict !== 'reopen' ) break;
+            aws_reopens++;
+            reopen_started_at = performance.now();
+            console.info(`[${PHASE}] ${res.errorCode} at +${Math.round(reopen_started_at - t0)}ms while the AWS computer`
+                + ` is still opening (stage ${aws_observation.stage}, ${aws_observation.countdown || 'no estimate'}); re-opening (#${aws_reopens})`);
+            const stopped = new Promise(resolve => { aws_stop_wait = { t0, resolve, clock: true }; });
+            paint();
+            res = await Promise.race([ask_fresh(), stopped]);
+            aws_stop_wait = null;
+            own_open?.abort(); // a no-op when the reopen itself answered
+        }
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -1306,11 +1412,14 @@ export async function openDesktopWindow (ctx = {}) {
                 // redacted and capped at 200 chars by `telemetry.js`.
                 detail: res.message,
             });
-            render_both(computeBootUiState({
+            const failed = computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
-            }));
+            });
+            // The spinner keeps an active AWS timeout on progress; tell it the
+            // window's budget is spent so it shows Try again.
+            render_both(aws_budget_spent ? { ...failed, observedBudgetSpent: true } : failed);
             // Terminal: the mint itself failed, so there is no URL to
             // navigate to and nothing further will run on this attempt.
             trace.step('mint_error');
@@ -1436,7 +1545,12 @@ export async function openDesktopWindow (ctx = {}) {
             if ( disposed || my_attempt !== attempt ) return;
             if (viewer_origin && viewer_origin !== 'null') el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
         }, { once: true });
-        settle_frame(my_attempt, res.url, gate, t0 + DESKTOP_BOOT_TIMEOUT_MS);
+        // The origin-probe grace never ends before the URL is handed over. A cold
+        // AWS host routinely answers past t0 + 215 s, with or without a reopen
+        // (the wake loop absorbs a launch for up to ten minutes); a fast mint
+        // keeps the original t0 + 215 s.
+        settle_frame(my_attempt, res.url, gate, Math.max(
+            (reopen_started_at ?? t0) + DESKTOP_BOOT_TIMEOUT_MS, performance.now() + FRAME_ORIGIN_GRACE_MS));
     }
 
     // ── the handoff ────────────────────────────────────────────────────────
@@ -2214,6 +2328,8 @@ export async function openDesktopWindow (ctx = {}) {
     const dispose = () => {
         spinner.dispose();
         disposed = true;
+        // A closed window stops its own in-flight open (a reopen or a Try again).
+        own_open?.abort();
         relay_renewal?.stop();
         document.removeEventListener('visibilitychange',on_relay_return);
         window.removeEventListener('online',on_relay_online);
