@@ -22,6 +22,8 @@ import { lockImagePlacement, lockPoolClaimPlacement, pinCloudflarePlacement, rea
 import { cancelComputerDemand, reservePoolDemand, resetCapacityAttempt, type PoolDemandDeps } from './aws-pool-demand';
 import { closeExpiredDemands, closeOrphanedDemands, demandDeploymentDigest, hasDemandHoldForRouting, lockComputerDemandLive } from './capacity-demand';
 import { PgDialect } from 'drizzle-orm/pg-core';
+import type { HistoryEvent } from '@aws-sdk/client-sfn';
+import { failedReplaceHistory } from './aws-historical-source.test-support';
 import { createPoolDeps } from './aws-pool-runtime';
 import * as poolData from './ready-pool';
 import { leasePoolHost, markPoolHost, publishPoolClaim, readPendingPoolAdopt, readPoolClaim, readPoolDemand, recordPoolEnrollment, recordPoolReady,
@@ -35,6 +37,10 @@ const c: PoolClass = { region: 'ap-south-1', zoneId: 'aps1-az1', instanceType: '
 const schema = `ready_pool_v2_${randomUUID().replaceAll('-', '')}`;
 const directory = path.resolve(__dirname, '../../../../../docs/aws-computers/sql');
 const claim = { computerId: uuid(101), generation: 3, leaseEpoch: 4, fence: uuid(201), volumeSerial: 'vol0123456789abcdef0' };
+/** Observe-initial, one RunInstances that EC2 refused, Observe-instance, then the graph's terminal with `error`. */
+const refusedLaunchHistory = (error: string) => [{ type: 'ExecutionStarted' },
+    ...['Observe-initial', 'runInstances', 'Observe-instance'].map(name => ({ type: 'TaskStateEntered', stateEnteredEventDetails: { name } })),
+    { type: 'ExecutionFailed', executionFailedEventDetails: { error, cause: 'VcpuLimitExceeded' } }] as HistoryEvent[];
 
 describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
     const client = PG ? postgres(PG, { max: 16, idle_timeout: 20, prepare: false, onnotice: () => {} }) : null;
@@ -408,6 +414,30 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             expect(await current()).toEqual(retired);
         });
 
+        it.each([
+            ['never left Observe-initial', 'retired', 0, (w: LifecycleWork) => failedReplaceHistory(w.input, NOW)],
+            ['had its only launch refused for capacity', 'retired', 0, () => refusedLaunchHistory('LifecycleRefused')],
+            ['entered a launch and ended unconfirmed', 'failed', 2, () => refusedLaunchHistory('LifecycleUnconfirmed')],
+        ] as const)('settles a FAILED provision that %s as %s in one reconcile and releases its vCPU only when proven', async (_case, state, vcpu, history) => {
+            await boot();
+            const w = poolWork(c, deployment, 'pool-provision', poolData.poolHostFromRow(await current()));
+            await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET lifecycle_job_id = ${w.intent.jobId}::uuid,
+                lifecycle_digest = ${w.digest}, lifecycle_input = ${w.input}, dispatch_status = 'started' WHERE id = ${uuid(1)}::uuid`);
+            expect(await readPoolDemand(db, c, NOW)).toMatchObject({ vcpuInUse: 2 });
+            const executions = {
+                describe: vi.fn<LifecycleExecutionReader['describe']>(async () => ({ status: 'FAILED', input: w.input, output: null, stopDate: new Date(),
+                    executionArn: lifecycleExecutionArn(deployment, w.intent.jobId), stateMachineVersionArn: w.stateMachineArn })),
+                history: vi.fn(async () => history(w)),
+            };
+            const store = createPoolDispatchStore(db, { EZIL_AWS_KILL_SWITCH: '1' }, { starter: { start: vi.fn(async () => {}) }, executions });
+            await store.reconcile!();
+            expect(await current()).toMatchObject({ state, dispatch_status: 'settled', instance_id: null, lifecycle_job_id: w.intent.jobId });
+            expect(await readPoolDemand(db, c, NOW)).toMatchObject({ vcpuInUse: vcpu });
+            // Settled rows leave the reconcile window: a second pass reads nothing.
+            await store.reconcile!();
+            expect(executions.describe).toHaveBeenCalledTimes(1);
+        });
+
         it.each(['no job', 'settled provision'])('dispatches an existing retiring row with %s once, then settles only its receipt', async prior => {
             await stranded();
             if (prior === 'settled provision') {
@@ -643,7 +673,8 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         for (let i=1;i<=n;i++) { await subscriber(i); await placement(i,i,'m6i.large','PROVISIONING'); }
         const d = await readPoolDemand(db,c,NOW);
         expect(d.pending).toBe(n);
-        expect(poolData.planPool(c,{...d,regionVcpuCap:100},NOW)).toMatchObject({target:Math.min(4,n+1),provision:2});
+        // Demand-driven (66d9ad63): never more spares than paid users of the class, so n paid + n pending targets n.
+        expect(poolData.planPool(c,{...d,regionVcpuCap:100},NOW)).toMatchObject({target:n,provision:2});
         await db.execute(sql`UPDATE public.ezil_computer_placements SET lifecycle_job_id = ${uuid(900)}::uuid`);
         expect((await readPoolDemand(db,c,NOW)).pending).toBe(0);
         await boot(101);
