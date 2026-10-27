@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -159,16 +160,43 @@ class RegistryTests(unittest.TestCase):
                         expected=dict(desired,releases=retained)
                         readback={'gitSha':'9'*40,'killSwitch':'1','deployment':app_ops.public_deployment(expected)}
                         size=len(json.dumps(readback,separators=(',',':')).encode('utf-8'))
-                        if maintenance:
-                            self.assertLessEqual(size,24000)
-                            result=TOOL.edit_release_secret(envelope,before,next_pair,[desired])
-                            deployments=manifest.loads(result[TOOL.KEY]) if encoded else result[TOOL.KEY]
-                            self.assertEqual(app_ops.public_deployment(deployments[TOOL.REGION]),readback['deployment'])
-                        else:
-                            self.assertGreater(size,24000)
-                            with self.assertRaisesRegex(ValueError,'^release registry readback exceeds SSM 24000-byte limit$'):
-                                TOOL.edit_release_secret(envelope,before,next_pair,[desired])
+                        self.assertLessEqual(size,24000)
+                        result=TOOL.edit_release_secret(envelope,before,next_pair,[desired])
+                        deployments=manifest.loads(result[TOOL.KEY]) if encoded else result[TOOL.KEY]
+                        self.assertEqual(app_ops.public_deployment(deployments[TOOL.REGION]),readback['deployment'])
+                        self.assertEqual(deployments[TOOL.REGION]['releases'],retained)
                         self.assertEqual(envelope,frozen)
+
+    def test_nineteen_and_twenty_normal_records_fit_readback_but_count_stays_nineteen(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,39)]]
+        for record in records:
+            manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
+            self.assertIsNotNone(record['previousLowerImageDigest'])
+            self.assertIsNotNone(record['previousLowerImageRef'])
+        for count in (19,20):
+            with self.subTest(count=count):
+                d=dict(self.target,releases=records[:count])
+                public=app_ops.public_deployment(d)
+                readback={'gitSha':'9'*40,'killSwitch':'1','deployment':public}
+                self.assertNotIn('releases',public)
+                self.assertRegex(public['releasesSha256'],r'^[0-9a-f]{64}$')
+                self.assertLessEqual(len(json.dumps(readback,separators=(',',':')).encode('utf-8')),24000)
+                before=dict(self.target,releases=records[:count-1])
+                envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:before}})}
+                if count==19:
+                    result=TOOL.edit_release_secret(envelope,self.new,self.new,[records[count-1]])
+                    self.assertEqual(result[TOOL.KEY][TOOL.REGION]['releases'],records[:count])
+                else:
+                    with self.assertRaisesRegex(ValueError,'registry full'):
+                        TOOL.edit_release_secret(envelope,self.new,self.new,[records[count-1]])
+
+    def test_readback_byte_guard_still_refuses_oversized_public_fields(self):
+        d=dict(self.target,releases=[self.target],storage={'padding':'x'*24000})
+        envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:d}})}
+        frozen=copy.deepcopy(envelope)
+        with self.assertRaisesRegex(ValueError,'^release registry readback exceeds SSM 24000-byte limit$'):
+            TOOL.edit_release_secret(envelope,self.new,self.new,[])
+        self.assertEqual(envelope,frozen)
 
     def test_registry_cap_parity_with_app_source_and_manifest_contracts(self):
         # The app cannot import operator tooling; pin all five independent guards.
@@ -1240,7 +1268,7 @@ class IntegrationTests(unittest.TestCase):
         self.envelope={'VersionId':'initial','SecretString':json.dumps({'keep':'synthetic','EZIL_AWS_KILL_SWITCH':'1',TOOL.KEY:{TOOL.REGION:dict(self.source,releases=[self.source]),'other':{'keep':True}}})}
         stage1.seed_ledger(self.ledger,self.envelope)
         self.outer_original=manifest.loads(self.envelope['SecretString'])
-        self.running_deployment=app_ops.public_deployment(self.outer_original[TOOL.KEY][TOOL.REGION])
+        self.running_deployment=copy.deepcopy(self.outer_original[TOOL.KEY][TOOL.REGION])
         for phase in cfn.STACKS:
             if phase=='identity':before,after,review=CloudFormationTests().templates()
             elif phase=='foundation':
@@ -1342,7 +1370,7 @@ class IntegrationTests(unittest.TestCase):
                             ds=manifest.loads(self.envelope['SecretString'])[TOOL.KEY]
                             if isinstance(ds,str):ds=manifest.loads(ds)
                             self.running_sha='9'*40 if self.bad_install else app['gitSha']
-                            if not self.stale_install:self.running_deployment=app_ops.public_deployment(ds[TOOL.REGION])
+                            if not self.stale_install:self.running_deployment=copy.deepcopy(ds[TOOL.REGION])
                         result=execute_app_payload(payload,install,lambda:{'EZIL_GIT_SHA':self.running_sha,'EZIL_AWS_KILL_SWITCH':'1',
                                                    'EZIL_AWS_LIFECYCLE_DEPLOYMENTS':json.dumps({TOOL.REGION:self.running_deployment})})
                     self.command_results[cid]=copy.deepcopy(result)
@@ -1439,7 +1467,7 @@ class IntegrationTests(unittest.TestCase):
             d['releases'].append(dict(self.source, amiId='ami-' + format(n, '017x'), recipeVersion='1.0.' + str(n), launchTemplateVersion=str(n)))
         self.envelope['SecretString'] = json.dumps(outer)
         stage1.seed_ledger(self.ledger, self.envelope)
-        self.running_deployment = app_ops.public_deployment(d)
+        self.running_deployment = copy.deepcopy(d)
         self.through_app()
         snapshot = {'VersionId': self.envelope['VersionId'], 'deployment': copy.deepcopy(d)}
         after = copy.deepcopy(d); after['releases'].pop(4)
@@ -1461,7 +1489,7 @@ class IntegrationTests(unittest.TestCase):
         d['releases'].extend(extra)
         self.envelope['SecretString']=json.dumps(outer)
         stage1.seed_ledger(self.ledger,self.envelope)
-        self.running_deployment=app_ops.public_deployment(d)
+        self.running_deployment=copy.deepcopy(d)
         self.value['agentCommit']='9'*40  # new registry-compatible app, different from source
         self.restage(self.source)
         self.through_app();RELEASE.promote(self.manifest,True)
@@ -1483,7 +1511,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(entries[:-2], old)
         self.assertEqual([e['operation'] for e in entries[-2:]], ['registry-gc'] * 2)
         self.assertEqual(entries[-1]['registrySha256'], RELEASE.release_state(after, self.running_sha)['registrySha256'])
-        self.assertEqual(self.running_deployment, app_ops.public_deployment(after))
+        self.assertEqual(app_ops.public_deployment(self.running_deployment), app_ops.public_deployment(after))
         self.assertEqual(self.path.read_bytes(), plan_bytes)
         self.assertTrue(any('registry-gc-app-g' in c for c in self.commands.values()))
         RELEASE.promote(self.manifest, True)
@@ -1657,7 +1685,7 @@ class IntegrationTests(unittest.TestCase):
     def test_unchanged_identity_real_cli_live_readback(self):
         self.unchanged_identity_plan();RELEASE.apply_schema(self.path,True)
         TOOL.write(self.root/'secret.json',self.envelope)
-        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':self.running_deployment})
+        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment)})
         TOOL.write(self.root/'identity-live-template.json',{'TemplateBody':json.dumps(self.templates['identity'][1],sort_keys=True)})
         TOOL.write(self.root/'identity-live-stack.json',{'Stacks':[{'StackStatus':'CREATE_COMPLETE','Parameters':None}]})
         self.cli('apply-identity','--plan',str(self.path))
@@ -1827,7 +1855,7 @@ class IntegrationTests(unittest.TestCase):
             deployment={k:v for k,v in self.source.items() if k not in manifest.TUPLE}
             deployment['releases']=[self.source]
             outer[TOOL.KEY]=json.dumps({TOOL.REGION:deployment,'other':{'keep':True}})
-            self.running_deployment=app_ops.public_deployment(deployment)
+            self.running_deployment=copy.deepcopy(deployment)
         self.envelope['SecretString']=json.dumps(outer);stage1.seed_ledger(self.ledger,self.envelope)
         self.restage(self.source)
         self.through_app();RELEASE.promote(self.manifest,True)
@@ -2171,9 +2199,9 @@ class IntegrationTests(unittest.TestCase):
         deployment=manifest.loads(outer[TOOL.KEY])[TOOL.REGION]
         self.assertFalse(set(manifest.TUPLE)&deployment.keys())
         self.assertEqual({k:deployment[k] for k in journal['before']},journal['before'])
-        self.assertEqual(self.running_deployment,app_ops.public_deployment(deployment))
-        self.assertEqual({k:v for k,v in self.running_deployment.items() if k!='releases'},
-                         {k:v for k,v in journal['beforeDeployment'].items() if k!='releases'})
+        self.assertEqual(app_ops.public_deployment(self.running_deployment),app_ops.public_deployment(deployment))
+        self.assertEqual({k:v for k,v in app_ops.public_deployment(self.running_deployment).items() if k!='releasesSha256'},
+                         {k:v for k,v in journal['beforeDeployment'].items() if k!='releasesSha256'})
         self.assertEqual(deployment['releases'],[journal['source'],journal['target']])
         self.assertEqual(self.running_sha,journal['target']['agentCommit'])
         envelope=copy.deepcopy(self.envelope)
@@ -2345,14 +2373,14 @@ class IntegrationTests(unittest.TestCase):
             _,d=RELEASE.secret_deployment(self.envelope)
             self.assertEqual(RELEASE.ledger_tuple(d),pending['entries'][-1]['expected']['tuple'])
             self.assertEqual(self.running_sha,pending['entries'][-1]['expected']['appGitSha'])
-            self.assertNotEqual(self.running_deployment,app_ops.public_deployment(d))
+            self.assertNotEqual(app_ops.public_deployment(self.running_deployment),app_ops.public_deployment(d))
             with self.assertRaisesRegex(ValueError,'secret written; app not yet adopted — resume the same operation'):
                 RELEASE.ledger_reconcile(self.path,True)
             self.assertEqual(RELEASE.load_ledger(self.ledger),pending);self.assertEqual(self.running_deployment,stale)
             RELEASE.promote(self.manifest,True,rollback=rollback)
             entries=RELEASE.load_ledger(self.ledger)['entries']
             self.assertEqual(entries[:-1],pending['entries']);self.assertEqual(entries[-1]['state'],'completed')
-            self.assertEqual(self.generation,puts);self.assertEqual(self.running_deployment,app_ops.public_deployment(d))
+            self.assertEqual(self.generation,puts);self.assertEqual(app_ops.public_deployment(self.running_deployment),app_ops.public_deployment(d))
 
     def test_normal_promotion_and_rollback_require_running_deployment(self):
         self.prepared_106();RELEASE.apply_app(self.manifest,True)
@@ -2369,11 +2397,11 @@ class IntegrationTests(unittest.TestCase):
     def test_local_running_deployment_receipt_guard(self):
         plan=RELEASE.load_plan(self.path)
         receipt={'gitSha':plan['rollout']['app']['gitSha'],'killSwitch':'1',
-                 'deployment':dict(self.running_deployment,amiId='ami-'+'9'*17)}
+                 'deployment':dict(app_ops.public_deployment(self.running_deployment),amiId='ami-'+'9'*17)}
         with patch.object(ssm,'run',return_value=receipt):
             for install in (False,True):
                 with self.assertRaisesRegex(ValueError,'running app deployment mismatch'):
-                    RELEASE.app_operation(self.path,plan,'promote-app',True,self.running_deployment,install=install)
+                    RELEASE.app_operation(self.path,plan,'promote-app',True,app_ops.public_deployment(self.running_deployment),install=install)
 
     def test_exact_p1_delayed_106_reconcile_then_105_rollback_refuses(self):
         _,cid=self.delayed_106_install()
@@ -2470,7 +2498,7 @@ class IntegrationTests(unittest.TestCase):
     def test_reconcile_cli_dry_run_and_apply(self):
         self.prepared_106();self.crash_before_install()
         TOOL.write(self.root/'secret.json',self.envelope)
-        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':self.running_deployment})
+        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment)})
         before=self.ledger.read_bytes()
         result=self.cli('ledger-reconcile','--plan',str(self.path))
         self.assertIn('would append aborted',result.stdout);self.assertEqual(self.ledger.read_bytes(),before)
@@ -2481,7 +2509,7 @@ class IntegrationTests(unittest.TestCase):
     def test_reconcile_cli_reports_remote_and_adoption_refusals(self):
         _,cid=self.delayed_106_install()
         TOOL.write(self.root/'secret.json',self.envelope)
-        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':self.running_deployment})
+        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment)})
         TOOL.write(self.root/'scenario.json',{'rebase_ssm_status':'InProgress'})
         before=self.ledger.read_bytes()
         result=self.cli('ledger-reconcile','--plan',str(self.path),'--apply',expected=1)
@@ -2493,7 +2521,7 @@ class IntegrationTests(unittest.TestCase):
         self.lost_put=True
         with self.assertRaises(TimeoutError):RELEASE.promote(self.manifest,True)
         TOOL.write(self.root/'secret.json',self.envelope)
-        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':self.running_deployment})
+        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment)})
         before=self.ledger.read_bytes()
         result=self.cli('ledger-reconcile','--plan',str(self.path),'--apply',expected=1)
         self.assertIn('secret written; app not yet adopted — resume the same operation',result.stderr)
@@ -2554,7 +2582,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['state'],'pending')
         self.assertFalse((self.directory/'apply-app-receipt.json').exists())
         # Also exercise the independent local receipt guard against forged remote output.
-        with patch.object(ssm,'run',return_value={'gitSha':'9'*40,'killSwitch':'1','deployment':self.running_deployment}):
+        with patch.object(ssm,'run',return_value={'gitSha':'9'*40,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment)}):
             with self.assertRaisesRegex(ValueError,'installed app commit mismatch'):
                 RELEASE.app_operation(self.path,RELEASE.load_plan(self.path),'apply-app',True)
 
@@ -2716,7 +2744,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_ledger_adopt_app_cli_dry_run_apply_and_required_inputs(self):
         self.prepare_app_adoption();TOOL.write(self.root/'secret.json',self.envelope)
-        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':self.running_deployment})
+        TOOL.write(self.root/'schema-readback.json',{'gitSha':self.running_sha,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment)})
         flags=['--git-sha',self.running_sha,'--source-repo',str(self.root/'checkout')];before=self.ledger.read_bytes()
         for args in ([],flags[:2],flags[2:],['--git-sha','bad',*flags[2:]],flags+['--plan',str(self.path)]):
             self.cli('ledger-adopt-app',*args,expected=1)
@@ -2796,6 +2824,58 @@ class MaintenanceBakeTests(unittest.TestCase):
 
 
 class AppPayloadTests(unittest.TestCase):
+    def test_public_deployment_hash_matches_node_compact_json(self):
+        if shutil.which('node') is None:
+            self.skipTest('node is absent; Python/Node release registry hash equivalence requires node -e')
+        target=release_record()
+        source=dict(target,previousLowerImageDigest=None,previousLowerImageRef=None,
+                    preparationStateMachineVersionArn=None,recoveryStateMachineVersionArn=None)
+        installer=(HERE.parents[3]/'deploy/aws/os-staging/install-host.sh').read_text()
+        app={'tag':'reviewed-v1','gitSha':'e'*40,'checksumSha256':'f'*64}
+        payload=app_ops.body(installer,app,install=False)
+        script=payload.split("<<'EZIL_APP_PY'\n",1)[1].rsplit('\nEZIL_APP_PY',1)[0]
+        constants={n.targets[0].id:ast.literal_eval(n.value) for n in ast.parse(script).body if isinstance(n,ast.Assign)}
+        for records in ([],[source,target],[target,source],[dict(reversed(list(source.items()))),target]):
+            with self.subTest(records=records):
+                d=dict(target,releases=records,zoneId='aps1-az1',subnetId='subnet-synthetic',securityGroupId='sg-synthetic',
+                       instanceTypes=['m6i.large'],storage={'sizeGiB':32},dataKeyArn='arn:aws:kms:ap-south-1:452630323510:key/synthetic',
+                       privateValue='excluded')
+                frozen=copy.deepcopy(d)
+                expected=app_ops.public_deployment(d)
+                self.assertEqual(expected['releasesSha256'],hashlib.sha256(json.dumps(records,separators=(',',':'),ensure_ascii=False).encode('utf-8')).hexdigest())
+                self.assertEqual(set(expected),{'accountId','region','namespace','zoneId','subnetId','securityGroupId','instanceTypes','storage','dataKeyArn',
+                                               'amiId','launchTemplateId','launchTemplateVersion','stateMachineVersionArn',*manifest.TUPLE,'releasesSha256'})
+                self.assertEqual({k:v for k,v in expected.items() if k!='releasesSha256'},
+                                 {k:d[k] for k in expected if k!='releasesSha256'})
+                result=subprocess.run(['node','-e',constants['NODE']],capture_output=True,text=True,timeout=10,
+                                      env={'PATH':os.environ['PATH'],'EZIL_GIT_SHA':app['gitSha'],'EZIL_AWS_KILL_SWITCH':'1',
+                                           'EZIL_AWS_LIFECYCLE_DEPLOYMENTS':json.dumps({TOOL.REGION:d})})
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(json.loads(result.stdout),{'gitSha':app['gitSha'],'killSwitch':'1','deployment':expected})
+                self.assertEqual(d,frozen)
+        self.assertNotIn('releasesSha256',app_ops.public_deployment(target))
+
+    def test_remote_registry_hash_guard_executes_for_install_and_gate(self):
+        installer=(HERE.parents[3]/'deploy/aws/os-staging/install-host.sh').read_text()
+        app={'tag':'reviewed-v1','gitSha':'e'*40,'checksumSha256':'f'*64}
+        target=release_record()
+        d=dict(target,releases=[target,dict(target,amiId='ami-'+'1'*17)])
+        expected=app_ops.public_deployment(d)
+        for install in (False,True):
+            payload=app_ops.body(installer,app,expected,install)
+            for change in ('none','record','order','missing'):
+                with self.subTest(install=install,change=change):
+                    live=copy.deepcopy(d)
+                    if change=='record':live['releases'][0]['agentCommit']='9'*40
+                    if change=='order':live['releases'].reverse()
+                    if change=='missing':del live['releases']
+                    environment={'EZIL_GIT_SHA':app['gitSha'],'EZIL_AWS_KILL_SWITCH':'1',
+                                 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS':json.dumps({TOOL.REGION:live})}
+                    result=execute_app_payload(payload,lambda _:None,lambda:environment)
+                    self.assertEqual(result['Status'],'Success' if change=='none' else 'Failed')
+                    if change=='none':self.assertEqual(json.loads(result['StandardOutputContent'])['deployment'],expected)
+                    else:self.assertEqual(result['StandardOutputContent'],'')
+
     def test_remote_deployment_guard_executes_for_install_and_gate(self):
         installer=(HERE.parents[3]/'deploy/aws/os-staging/install-host.sh').read_text()
         app={'tag':'reviewed-v1','gitSha':'e'*40,'checksumSha256':'f'*64}
