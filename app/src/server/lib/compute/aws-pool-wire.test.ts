@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { createPoolDispatchStore, poolJobAuthority, storedPoolWork } from './aws-pool-dispatch';
@@ -12,6 +14,7 @@ import { handlePoolSessionReady } from './aws-pool-session';
 import * as placement from './placement';
 import { handlePoolClaim } from './aws-pool-claim';
 import { buildLifecycleWork } from './aws-intent';
+import { failedReplaceHistory } from './aws-historical-source.test-support';
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 function harness() {
     vi.stubEnv('AWS_REGIONS', 'ap-south-1'); vi.stubEnv('EZIL_AWS_MAX_RUNNING_AP_SOUTH_1', '5'); vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
@@ -65,7 +68,7 @@ function harness() {
         }
         if (/SET state = \$1, dispatch_status = 'settled'/.test(q.sql)) {
             expect(q.sql).toContain('AND leased_computer_id IS NULL');
-            if (row.lifecycle_job_id === p[2] && row.lifecycle_digest === p[3] && row.leased_computer_id === null) {
+            if (row.id === p[1] && row.lifecycle_job_id === p[2] && row.lifecycle_digest === p[3] && row.leased_computer_id === null) {
                 row.state = p[0]; row.dispatch_status = 'settled';
             }
             return [];
@@ -88,28 +91,82 @@ function harness() {
         output: JSON.stringify(receipt(w)), executionArn: lifecycleExecutionArn(f.deployment, w.intent.jobId), stateMachineVersionArn: w.stateMachineArn });
     return { f, c, db, row, state, trace, sdk, store, env, prepare, receipt, execution };
 }
-const entered = (...names: string[]) => [{ type: 'ExecutionStarted' }, ...names.map(name => ({ type: 'TaskStateEntered', stateEnteredEventDetails: { name } })),
-    { type: 'ExecutionFailed' }];
-it('settles a FAILED provision as retired only when the complete history proves the graph never left Observe-initial', async () => {
+const failedWith = (error: string, ...names: string[]) => [{ type: 'ExecutionStarted' },
+    ...names.map(name => ({ type: 'TaskStateEntered', stateEnteredEventDetails: { name } })),
+    { type: 'ExecutionFailed', executionFailedEventDetails: { error, cause: 'VcpuLimitExceeded' } }];
+const entered = (...names: string[]) => failedWith('LifecycleUnconfirmed', ...names);
+const refused = (...names: string[]) => failedWith('LifecycleRefused', ...names);
+async function failedProvision(stopDate: Date | null = new Date()) {
     const h = harness(); const w = await h.prepare(); await h.store.outcome(w, 'started');
-    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status: 'FAILED', output: undefined });
-    h.sdk.executions.history!.mockResolvedValue(entered('Observe-initial'));
+    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status: 'FAILED', output: undefined, stopDate });
+    return { ...h, w };
+}
+it('settles a FAILED provision as retired when its recorded history never left Observe-initial (the 1.0.16/1.0.26 shape)', async () => {
+    const h = await failedProvision();
+    h.sdk.executions.history!.mockResolvedValue(failedReplaceHistory(h.w.input, NOW));
     await h.store.reconcile!();
-    expect(h.sdk.executions.history).toHaveBeenCalledWith(h.f.deployment.region, lifecycleExecutionArn(h.f.deployment, w.intent.jobId));
+    expect(h.sdk.executions.history).toHaveBeenCalledWith(h.f.deployment.region, lifecycleExecutionArn(h.f.deployment, h.w.intent.jobId));
+    expect(h.row).toMatchObject({ state: 'retired', dispatch_status: 'settled', instance_id: null });
+});
+it.each(['runInstances', 'runBurstableInstances'])('settles a FAILED provision as retired when its only launch (%s) was refused for capacity or quota', async launch => {
+    const h = await failedProvision();
+    h.sdk.executions.history!.mockResolvedValue(refused('Observe-initial', launch, 'Observe-instance'));
+    await h.store.reconcile!();
     expect(h.row).toMatchObject({ state: 'retired', dispatch_status: 'settled', instance_id: null });
 });
 it.each([
-    ['a later task state was entered', () => entered('Observe-initial', 'Observe-instance')],
+    ['a launch was entered and the graph ended unconfirmed', () => entered('Observe-initial', 'runInstances', 'Observe-instance')],
+    ['the refusal followed a second launch attempt', () => refused('Observe-initial', 'runInstances', 'Observe-instance', 'runInstances', 'Observe-instance')],
+    ['a refusal followed a successful launch and a tag', () => refused('Observe-initial', 'runInstances', 'Observe-instance', 'createTags', 'Observe-tagged')],
+    ['the refused task was not a launch', () => refused('Observe-initial', 'createVolume', 'Observe-volume')],
     ['the history has no task state at all', () => entered()],
     ['the history read returns an empty events array', () => []],
     ['the history never recorded the failure', () => entered('Observe-initial').filter(e => e.type !== 'ExecutionFailed')],
-    ['the history read fails', () => { throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound'); }],
 ])('keeps a FAILED provision failed (capacity reserved) when %s', async (_case, history) => {
-    const h = harness(); const w = await h.prepare(); await h.store.outcome(w, 'started');
-    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status: 'FAILED', output: undefined });
+    const h = await failedProvision();
     h.sdk.executions.history!.mockImplementation(async () => history());
     await h.store.reconcile!();
     expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled' });
+});
+it('leaves a recently stopped FAILED provision unsettled when its history read fails, so the next reconcile retries the proof', async () => {
+    const h = await failedProvision(new Date(Date.now() - 60_000));
+    h.sdk.executions.history!.mockRejectedValueOnce(new AwsClientError('aws_error', true, 'ExecutionHistoryBound'));
+    await h.store.reconcile!();
+    expect(h.row).toMatchObject({ state: 'booting', dispatch_status: 'started' });
+    h.sdk.executions.history!.mockResolvedValue(failedReplaceHistory(h.w.input, NOW));
+    await h.store.reconcile!();
+    expect(h.row).toMatchObject({ state: 'retired', dispatch_status: 'settled', instance_id: null });
+});
+it.each([['stopped more than the retry window ago', new Date(Date.now() - 16 * 60_000)], ['with no stop date', null]] as const)(
+    'settles a FAILED provision %s as failed when its history read fails, so stuck rows cannot starve the reconcile window', async (_case, stopDate) => {
+        const h = await failedProvision(stopDate);
+        h.sdk.executions.history!.mockRejectedValue(new AwsClientError('aws_error', true, 'ExecutionHistoryBound'));
+        await h.store.reconcile!();
+        expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled' });
+    });
+it('pins the deployed graph premises the never-launched proof relies on (infra lifecycle definition, contract, helper)', () => {
+    const infra = (file: string) => readFileSync(path.resolve(__dirname, '../../../../../infra/app-computers/lib/lifecycle', file), 'utf8');
+    const definition = infra('definition.ts'), contract = infra('contract.ts'), helper = infra('helper.ts');
+    // The first task state is the read-only observation; Init is a Pass state.
+    expect(definition).toContain("Init:{Type:'Pass',Result:{lastError:NO_ERROR,observeError:NO_ERROR,throttles:0},ResultPath:'$.ctl',Next:'Observe-initial'}");
+    // Observations run the helper; every other task is exactly one EC2 action state named after its action.
+    expect(definition).toContain("States['Observe-'+phase]={Type:'Task',Resource:helperArn,");
+    expect(definition).toContain("States[name]={Type:'Task',Resource:`arn:aws:states:::aws-sdk:ec2:${ec2Api(name as Action)}`,");
+    expect(definition).not.toMatch(/Type:'(Map|Parallel)'/);
+    expect(definition).toContain("Refused:{Type:'Fail',Error:'LifecycleRefused',CausePath:'$.step.code'}");
+    expect(contract).toContain("runInstances:'instance',runBurstableInstances:'instance'");
+    // The helper never mutates, and refuses only on a capacity or quota error from the previous EC2 task.
+    expect(helper.match(/decision:'refused'/g)).toEqual(["decision:'refused'"]);
+    expect(helper).toContain("if(previous.kind==='capacity')return {decision:'refused',code:previous.code};");
+});
+it('never retires a FAILED pool-retire, even one that failed at Observe-initial: its instance is still running', async () => {
+    const h = retiringHarness(); await h.pass(); const w = h.work();
+    expect(h.row).toMatchObject({ state: 'retiring', dispatch_status: 'started' });
+    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status: 'FAILED', output: undefined, stopDate: new Date() });
+    h.sdk.executions.history!.mockResolvedValue(failedReplaceHistory(w.input, NOW));
+    await h.store.reconcile!();
+    expect(h.sdk.executions.history).not.toHaveBeenCalled();
+    expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled', instance_id: h.f.row.instanceId });
 });
 it.each(['TIMED_OUT', 'ABORTED'])('never consults the history for a %s provision: it may have launched', async status => {
     const h = harness(); const w = await h.prepare(); await h.store.outcome(w, 'started');

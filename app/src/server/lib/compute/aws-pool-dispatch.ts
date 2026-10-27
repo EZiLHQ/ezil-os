@@ -48,17 +48,27 @@ export async function poolJobAuthority(db: PlacementExecutor, a: { computerId: s
         && row.leased_computer_id === null
         && (i.operation !== 'pool-provision' || await provisionEligible(db,w,env));
 }
-/** True only when the complete history shows the graph entered no task state other than `Observe-initial`:
- * the lifecycle helper never mutates, and every provider call is a later task state. Any read failure or an
- * unexpected history keeps the conservative answer (false), so the row stays `failed` and keeps its capacity. */
-export async function neverLaunched(executions: LifecycleExecutionReader, region: string, executionArn: string): Promise<boolean> {
-    if (!executions.history) return false;
-    try {
-        const events = await executions.history(region, executionArn);
-        const entered = events.filter(e => e.type === 'TaskStateEntered').map(e => e.stateEnteredEventDetails?.name);
-        return entered.length >= 1 && entered.every(name => name === 'Observe-initial')
-            && events.some(e => e.type === 'ExecutionFailed');
-    } catch { return false; }
+/** How long after a FAILED execution stopped an unreadable history keeps its row unsettled for another proof attempt.
+ * Reconcile runs every minute, so this is many retries; past it the row settles `failed` and cannot starve the window. */
+export const HISTORY_RETRY_MS = 15 * 60_000;
+const LAUNCH_STATES = new Set(['runInstances', 'runBurstableInstances']);
+/** `proven` only when the complete history proves EC2 created nothing for this job. The lifecycle helper never mutates,
+ * and every provider call is its own later task state, so either:
+ * - the graph entered no task state other than `Observe-initial` (the 1.0.16/1.0.26 lifecycle_invalid failures), or
+ * - it entered exactly Observe-initial, one launch, Observe-instance and ended in `Refused`: the helper refuses only
+ *   on a capacity or quota error from the previous EC2 task, a definite refusal that created nothing (infra errors.ts C-3).
+ * An unexpected history is `unproven` (the row stays `failed`); a read failure is `unread` so the caller may retry. */
+export async function neverLaunched(executions: LifecycleExecutionReader, region: string, executionArn: string): Promise<'proven' | 'unproven' | 'unread'> {
+    if (!executions.history) return 'unproven';
+    let events;
+    try { events = await executions.history(region, executionArn); } catch { return 'unread'; }
+    const entered = events.filter(e => e.type === 'TaskStateEntered').map(e => e.stateEnteredEventDetails?.name);
+    const failed = events.filter(e => e.type === 'ExecutionFailed').at(-1);
+    if (!failed || entered.length === 0) return 'unproven';
+    if (entered.every(name => name === 'Observe-initial')) return 'proven';
+    return failed.executionFailedEventDetails?.error === 'LifecycleRefused' && entered.length === 3
+        && entered[0] === 'Observe-initial' && LAUNCH_STATES.has(entered[1] ?? '') && entered[2] === 'Observe-instance'
+        ? 'proven' : 'unproven';
 }
 
 export function createPoolDispatchStore(db: PlacementDb, env: Env,
@@ -139,11 +149,16 @@ export function createPoolDispatchStore(db: PlacementDb, env: Env,
                         AND lifecycle_job_id = ${i.jobId}::uuid AND lifecycle_digest = ${work.digest}`);
                 } else if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status)) {
                     // A failed execution may have launched. Keep consuming capacity until its bound instance is retired,
-                    // unless its history proves the graph never left the first observation: then no provider call ran,
-                    // nothing exists in AWS, and a failed row would hold phantom vCPU against the region cap forever
-                    // (every 1.0.26 pool-provision failed this way at Observe-initial with lifecycle_invalid).
-                    const settled = i.operation === 'pool-provision' && execution.status === 'FAILED'
-                        && await neverLaunched(sdk.executions, i.deployment.region, arn) ? 'retired' : 'failed';
+                    // unless its history proves EC2 created nothing (see neverLaunched): then a failed row would hold
+                    // phantom vCPU against the region cap forever (every 1.0.26 pool-provision failed at Observe-initial).
+                    // A pool-retire never qualifies: its instance exists until the retire succeeds.
+                    let settled: 'retired' | 'failed' = 'failed';
+                    if (i.operation === 'pool-provision' && execution.status === 'FAILED') {
+                        const proof = await neverLaunched(sdk.executions, i.deployment.region, arn);
+                        // An unreadable history is retried on later passes, bounded by the stop time.
+                        if (proof === 'unread' && execution.stopDate && Date.now() - execution.stopDate.getTime() < HISTORY_RETRY_MS) continue;
+                        if (proof === 'proven') settled = 'retired';
+                    }
                     await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = ${settled}, dispatch_status = 'settled', updated_at = now()
                         WHERE id = ${i.poolHostId}::uuid AND lifecycle_job_id = ${i.jobId}::uuid AND lifecycle_digest = ${work.digest}
                         AND leased_computer_id IS NULL`);
