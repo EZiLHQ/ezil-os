@@ -85,7 +85,9 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             observer?.stop(); observation = null; progressChecked = false;
         }
         const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
-        const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws && observation.elapsed >= 600;
+        // `observedBudgetSpent`: the desktop window's own ten-minute clock ran out first.
+        const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws
+            && (observation.elapsed >= 600 || state.observedBudgetSpent === true);
         root.setAttribute('data-kind', activeTimeout ? 'progress' : state.kind);
         root.classList.toggle('ezil-app-spinner-running-long', !!runningLong);
         const showObservation = pending && observation && (state.kind === 'progress' || activeTimeout
@@ -188,7 +190,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         // "did pixels arrive" question).
     }
 
-    return { el: root, render, hasComputerProgress: () => observation !== null, dispose: () => observer?.stop() };
+    return { el: root, render, hasComputerProgress: () => observation !== null, computerProgress: () => observation, dispose: () => observer?.stop() };
 }
 
 export default AppSpinner;

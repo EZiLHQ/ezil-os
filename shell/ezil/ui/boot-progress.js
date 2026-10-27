@@ -27,6 +27,63 @@ import {
     phaseVisualState,
 } from '../boot-phases.js';
 
+// ── the AWS boot budget ─────────────────────────────────────────────────────
+// A cold AWS replace measures 210-250 s, so a TIMEOUT at `DESKTOP_BOOT_TIMEOUT_MS`
+// (215 s) is not evidence of failure while `computer.progress` still reports the
+// computer actively opening. These two verdicts are pure: the desktop window owns
+// the clock and the observation and asks; this file is still never told the time
+// except as an argument. Ten minutes matches `app-spinner.js`'s calm Retry.
+export const AWS_BOOT_HARD_STOP_MS = 600_000;
+/** Structural backstop: a server answering `timeout` instantly cannot loop. */
+export const AWS_BOOT_MAX_REOPENS = 6;
+const AWS_STOP_STAGES = ['needs_operator', 'failed_reopened'];
+const awsBudgetSpent = (observation, bootElapsedMs) => bootElapsedMs >= AWS_BOOT_HARD_STOP_MS
+    || (Number.isFinite(observation?.elapsed) && observation.elapsed * 1000 >= AWS_BOOT_HARD_STOP_MS);
+
+/**
+ * What a boot attempt that just FAILED should do next.
+ *
+ *   'reopen'       — a `timeout` while the observation reports `activeAws`:
+ *                    ask again (`session.openDesktop`, never a warm replay).
+ *   'budget_spent' — the same, but ten minutes (either clock) or the reopen cap
+ *                    has been reached: the existing failure + Try again.
+ *   'fail'         — anything else, including no observation at all: exactly
+ *                    the failure the window rendered before this existed.
+ *
+ * @param {{reason?: string, observation?: any, bootElapsedMs: number, reopens?: number}} input
+ * @returns {'reopen' | 'budget_spent' | 'fail'}
+ */
+export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reopens = 0 }) {
+    if ( reason !== 'timeout' || ! observation || observation.activeAws !== true ) return 'fail';
+    if ( AWS_STOP_STAGES.includes(observation.stage) ) return 'fail';
+    return awsBudgetSpent(observation, bootElapsedMs) || reopens >= AWS_BOOT_MAX_REOPENS ? 'budget_spent' : 'reopen';
+}
+
+/**
+ * While a reopen is in flight: keep waiting, or stop now. A missing observation
+ * (hidden tab, failed poll) is not a reason to stop; the clock still bounds it.
+ *
+ * @param {{observation?: any, bootElapsedMs: number}} input
+ * @returns {'wait' | 'budget_spent' | 'fail'}
+ */
+export function awsBootWaitVerdict ({ observation, bootElapsedMs }) {
+    if ( observation && AWS_STOP_STAGES.includes(observation.stage) ) return 'fail';
+    return awsBudgetSpent(observation, bootElapsedMs) ? 'budget_spent' : 'wait';
+}
+
+/**
+ * The phase panel's subtext while a reopen is in flight, from the observation's
+ * own countdown ("About 2 min left", "Less than a minute left"); anything else,
+ * including "Almost there" past the typical time, is only "still working".
+ *
+ * @param {string} [countdown]
+ */
+export function awsStillStartingCopy (countdown) {
+    const left = typeof countdown === 'string' && /^(About \d+ min|Less than a minute) left$/.test(countdown)
+        ? countdown[0].toLowerCase() + countdown.slice(1) : 'still working';
+    return `Your AWS computer is still starting — ${left}.`;
+}
+
 const CHECK = '<svg class="ezil-boot-check" viewBox="0 0 16 16" aria-hidden="true">'
     + '<path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="2"'
     + ' stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -90,13 +147,17 @@ export function BootProgress ({ onRetry } = {}) {
 
     /**
      * @param {import('../boot-phases.js').BootUiState} state
+     * @param {{countdown?: string} | null} [aws] Set only while the window is
+     *   re-asking because the AWS observation says the computer is still opening.
+     *   Changes the subtext only; the phase rows are drawn exactly as before.
      */
-    function render (state) {
+    function render (state, aws = null) {
         root.setAttribute('data-kind', state.kind);
 
         if ( state.kind === 'progress' ) {
             el_title.textContent = BOOT_PROGRESS_HEADLINE;
-            el_sub.textContent = state.isRunningLong
+            el_sub.textContent = aws ? awsStillStartingCopy(aws.countdown)
+                : state.isRunningLong
                 ? BOOT_PROGRESS_LONG_SUBTEXT
                 : BOOT_PROGRESS_SUBTEXT;
             el_phases.hidden = false;
