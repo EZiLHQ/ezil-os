@@ -643,7 +643,8 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         for (let i=1;i<=n;i++) { await subscriber(i); await placement(i,i,'m6i.large','PROVISIONING'); }
         const d = await readPoolDemand(db,c,NOW);
         expect(d.pending).toBe(n);
-        expect(poolData.planPool(c,{...d,regionVcpuCap:100},NOW)).toMatchObject({target:Math.min(4,n+1),provision:2});
+        // Demand-driven (66d9ad63): never more spares than paid users of the class, so n paid + n pending targets n.
+        expect(poolData.planPool(c,{...d,regionVcpuCap:100},NOW)).toMatchObject({target:n,provision:2});
         await db.execute(sql`UPDATE public.ezil_computer_placements SET lifecycle_job_id = ${uuid(900)}::uuid`);
         expect((await readPoolDemand(db,c,NOW)).pending).toBe(0);
         await boot(101);

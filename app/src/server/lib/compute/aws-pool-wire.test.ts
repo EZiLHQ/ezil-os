@@ -63,6 +63,13 @@ function harness() {
             }
             return [];
         }
+        if (/SET state = \$1, dispatch_status = 'settled'/.test(q.sql)) {
+            expect(q.sql).toContain('AND leased_computer_id IS NULL');
+            if (row.lifecycle_job_id === p[2] && row.lifecycle_digest === p[3] && row.leased_computer_id === null) {
+                row.state = p[0]; row.dispatch_status = 'settled';
+            }
+            return [];
+        }
         if (q.sql.includes('SELECT * FROM public.ezil_compute_pool_hosts')) {
             return !q.sql.includes('WHERE dispatch_status IN') || ['pending', 'unknown', 'started'].includes(String(row.dispatch_status)) ? [row] : [];
         }
@@ -70,7 +77,7 @@ function harness() {
         if (q.sql.includes('placement:lock-admission')) return [{ pg_advisory_xact_lock: '', isolation: 'read committed' }];
         return [];
     }), transaction: async fn => { trace.push('BEGIN'); const value = await fn(db); trace.push('COMMIT'); return value; } };
-    const sdk = { starter: { start: vi.fn(async () => { trace.push('START'); }) }, executions: { describe: vi.fn() } };
+    const sdk = { starter: { start: vi.fn(async () => { trace.push('START'); }) }, executions: { describe: vi.fn(), history: vi.fn() } };
     const env: Record<string,string|undefined> = { ...f.deps.env, EZIL_AWS_KILL_SWITCH: '0' };
     const store = createPoolDispatchStore(db, env, sdk);
     const prepare = () => db.transaction(tx => store.prepare(tx, c, 'pool-provision', h => poolWork(c, f.deployment, 'pool-provision', h)));
@@ -81,6 +88,36 @@ function harness() {
         output: JSON.stringify(receipt(w)), executionArn: lifecycleExecutionArn(f.deployment, w.intent.jobId), stateMachineVersionArn: w.stateMachineArn });
     return { f, c, db, row, state, trace, sdk, store, env, prepare, receipt, execution };
 }
+const entered = (...names: string[]) => [{ type: 'ExecutionStarted' }, ...names.map(name => ({ type: 'TaskStateEntered', stateEnteredEventDetails: { name } })),
+    { type: 'ExecutionFailed' }];
+it('settles a FAILED provision as retired only when the complete history proves the graph never left Observe-initial', async () => {
+    const h = harness(); const w = await h.prepare(); await h.store.outcome(w, 'started');
+    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status: 'FAILED', output: undefined });
+    h.sdk.executions.history!.mockResolvedValue(entered('Observe-initial'));
+    await h.store.reconcile!();
+    expect(h.sdk.executions.history).toHaveBeenCalledWith(h.f.deployment.region, lifecycleExecutionArn(h.f.deployment, w.intent.jobId));
+    expect(h.row).toMatchObject({ state: 'retired', dispatch_status: 'settled', instance_id: null });
+});
+it.each([
+    ['a later task state was entered', () => entered('Observe-initial', 'Observe-instance')],
+    ['the history has no task state at all', () => entered()],
+    ['the history read returns an empty events array', () => []],
+    ['the history never recorded the failure', () => entered('Observe-initial').filter(e => e.type !== 'ExecutionFailed')],
+    ['the history read fails', () => { throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound'); }],
+])('keeps a FAILED provision failed (capacity reserved) when %s', async (_case, history) => {
+    const h = harness(); const w = await h.prepare(); await h.store.outcome(w, 'started');
+    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status: 'FAILED', output: undefined });
+    h.sdk.executions.history!.mockImplementation(async () => history());
+    await h.store.reconcile!();
+    expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled' });
+});
+it.each(['TIMED_OUT', 'ABORTED'])('never consults the history for a %s provision: it may have launched', async status => {
+    const h = harness(); const w = await h.prepare(); await h.store.outcome(w, 'started');
+    h.sdk.executions.describe.mockResolvedValue({ ...h.execution(w), status, output: undefined });
+    await h.store.reconcile!();
+    expect(h.sdk.executions.history).not.toHaveBeenCalled();
+    expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled' });
+});
 it('reserves booting generation and immutable job before dispatch, then retries the same job after a lost dispatch', async () => {
     const h = harness(); const w = await h.prepare();
     expect(h.row).toMatchObject({ state: 'booting', generation: 1, lifecycle_job_id: w.intent.jobId, lifecycle_digest: w.digest, lifecycle_input: w.input });

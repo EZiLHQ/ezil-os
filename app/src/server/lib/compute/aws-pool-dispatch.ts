@@ -48,6 +48,19 @@ export async function poolJobAuthority(db: PlacementExecutor, a: { computerId: s
         && row.leased_computer_id === null
         && (i.operation !== 'pool-provision' || await provisionEligible(db,w,env));
 }
+/** True only when the complete history shows the graph entered no task state other than `Observe-initial`:
+ * the lifecycle helper never mutates, and every provider call is a later task state. Any read failure or an
+ * unexpected history keeps the conservative answer (false), so the row stays `failed` and keeps its capacity. */
+export async function neverLaunched(executions: LifecycleExecutionReader, region: string, executionArn: string): Promise<boolean> {
+    if (!executions.history) return false;
+    try {
+        const events = await executions.history(region, executionArn);
+        const entered = events.filter(e => e.type === 'TaskStateEntered').map(e => e.stateEnteredEventDetails?.name);
+        return entered.length >= 1 && entered.every(name => name === 'Observe-initial')
+            && events.some(e => e.type === 'ExecutionFailed');
+    } catch { return false; }
+}
+
 export function createPoolDispatchStore(db: PlacementDb, env: Env,
     sdk: { starter?: LifecycleStarter; executions?: LifecycleExecutionReader }): PoolDispatchStore {
     const store: PoolDispatchStore = {
@@ -125,8 +138,13 @@ export function createPoolDispatchStore(db: PlacementDb, env: Env,
                         dispatch_status = 'settled', updated_at = now() WHERE id = ${i.poolHostId}::uuid
                         AND lifecycle_job_id = ${i.jobId}::uuid AND lifecycle_digest = ${work.digest}`);
                 } else if (['FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status)) {
-                    // A failed execution may have launched. Keep consuming capacity until its bound instance is retired.
-                    await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = 'failed', dispatch_status = 'settled', updated_at = now()
+                    // A failed execution may have launched. Keep consuming capacity until its bound instance is retired,
+                    // unless its history proves the graph never left the first observation: then no provider call ran,
+                    // nothing exists in AWS, and a failed row would hold phantom vCPU against the region cap forever
+                    // (every 1.0.26 pool-provision failed this way at Observe-initial with lifecycle_invalid).
+                    const settled = i.operation === 'pool-provision' && execution.status === 'FAILED'
+                        && await neverLaunched(sdk.executions, i.deployment.region, arn) ? 'retired' : 'failed';
+                    await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = ${settled}, dispatch_status = 'settled', updated_at = now()
                         WHERE id = ${i.poolHostId}::uuid AND lifecycle_job_id = ${i.jobId}::uuid AND lifecycle_digest = ${work.digest}
                         AND leased_computer_id IS NULL`);
                 }
