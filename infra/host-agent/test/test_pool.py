@@ -185,10 +185,117 @@ class Requests(PoolTest):
         client.claim.side_effect = [None] * 301 + [CLAIM]
         ready = self.patch(pool, "wait_ready", return_value=HEALTH)
         self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
-        client.enroll.assert_called_once_with()
-        client.ready.assert_called_once_with(HEALTH)
-        ready.assert_called_once_with(self.cfg)
+        client.enroll.assert_called_once_with(retry_seconds=20)
+        client.ready.assert_called_once_with(HEALTH, retry_seconds=20)
+        ready.assert_called_once_with(self.cfg, timeout=20)
         self.assertEqual(self.clock.sleeps, [1] * 301)
+
+    def test_claim_precedes_due_refresh(self):
+        client = mock.Mock()
+        client.claim.side_effect = [None] * 300 + [CLAIM]
+        ready = self.patch(pool, "wait_ready", return_value=HEALTH)
+        self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+        client.enroll.assert_not_called()
+        client.ready.assert_not_called()
+        ready.assert_not_called()
+
+    def test_claim_arriving_during_refused_refresh_is_returned(self):
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        for operation in ("enroll", "ready"):
+            for code in ("pool_unavailable", "pool_retry_exhausted", "pool_request_refused"):
+                with self.subTest(operation=operation, code=code):
+                    self.clock.now, self.clock.sleeps = 0, []
+                    client = mock.Mock()
+                    client.claim.side_effect = [None] * 301 + [CLAIM]
+                    getattr(client, operation).side_effect = Refused(code)
+                    self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+                    self.assertEqual(client.mock_calls[-1], mock.call.claim())
+                    self.assertEqual(self.clock.sleeps, [1] * 300)
+
+    def test_retryable_refresh_refusal_without_claim_keeps_polling(self):
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        for operation in ("enroll", "ready"):
+            for code in ("pool_unavailable", "pool_retry_exhausted"):
+                with self.subTest(operation=operation, code=code):
+                    self.clock.now, self.clock.sleeps = 0, []
+                    client = mock.Mock()
+                    client.claim.side_effect = [None] * 302 + [CLAIM]
+                    getattr(client, operation).side_effect = Refused(code)
+                    self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+                    self.assertEqual(client.enroll.call_count, 1)
+                    self.assertEqual(self.clock.sleeps, [1] * 301)
+
+    def test_retryable_refresh_is_retried_on_next_cycle(self):
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        for operation in ("enroll", "ready"):
+            with self.subTest(operation=operation):
+                self.clock.now, self.clock.sleeps = 0, []
+                client = mock.Mock()
+                client.claim.side_effect = [None] * 303 + [CLAIM]
+                getattr(client, operation).side_effect = [Refused("pool_retry_exhausted"), None]
+                self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+                self.assertEqual(client.enroll.call_count, 2)
+                self.assertEqual(client.ready.call_count, 1 if operation == "enroll" else 2)
+                self.assertEqual(self.clock.sleeps, [1] * 302)
+
+    def test_nonretryable_refresh_refusal_without_claim_raises(self):
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        for operation in ("enroll", "ready"):
+            with self.subTest(operation=operation):
+                self.clock.now, self.clock.sleeps = 0, []
+                client = mock.Mock()
+                client.claim.return_value = None
+                refusal = Refused("pool_request_refused")
+                getattr(client, operation).side_effect = refusal
+                with self.assertRaises(Refused) as caught:
+                    pool.wait_claim(client, self.cfg)
+                self.assertIs(caught.exception, refusal)
+                self.assertEqual(client.claim.call_count, 302)
+                self.assertEqual(client.mock_calls[-1], mock.call.claim())
+
+    def test_refresh_retry_budget_is_bounded_for_enroll_and_ready(self):
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        request = self.patch(pool.http, "request")
+        for operation in ("enroll", "ready"):
+            for budget in (5, 100, 540):
+                with self.subTest(operation=operation, budget=budget):
+                    self.clock.now, self.clock.sleeps = 0, []
+                    self.cfg["enrollRetrySeconds"] = budget
+                    attempts = []
+
+                    def respond(method, url, **kwargs):
+                        if url.endswith("/claim"):
+                            if self.clock.now == 0:
+                                self.clock.now = 300
+                                return 204, b""
+                            return 200, json.dumps(CLAIM).encode()
+                        if url.endswith("/" + operation):
+                            attempts.append((self.clock.now, kwargs["timeout"]))
+                            return 503, b'{"error":"pool_unavailable","retryable":true}'
+                        return 200, b"{}"
+
+                    request.side_effect = respond
+                    self.assertEqual(pool.wait_claim(pool.Client(self.cfg, POOL), self.cfg), CLAIM)
+                    self.assertTrue(attempts)
+                    self.assertLessEqual(self.clock.now - 300, min(20, budget))
+                    for at, timeout in attempts:
+                        self.assertLessEqual(at + timeout, 300 + min(20, budget))
+                    self.assertEqual(self.cfg["enrollRetrySeconds"], budget)
+
+    def test_initial_pool_enrollment_keeps_its_retry_budget(self):
+        request = self.patch(pool.http, "request", side_effect=[
+            (503, b'{"error":"pool_unavailable","retryable":true}')] * 5 + [(200, b"{}")])
+        pool.Client(self.cfg, POOL).enroll()
+        self.assertEqual(self.clock.sleeps, [1, 2, 4, 8, 16])
+        self.assertEqual(request.call_count, 6)
+
+    def test_refresh_health_wait_is_bounded_and_checks_claim_on_failure(self):
+        client = mock.Mock()
+        client.claim.side_effect = [None] * 301 + [CLAIM]
+        self.patch(pool, "health", return_value={"ok": False})
+        self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+        self.assertEqual(self.clock.now, 320)
+        client.ready.assert_not_called()
 
 
 class Timing(PoolTest):
@@ -375,6 +482,7 @@ class Lifecycle(PoolTest):
     def lifecycle_stubs(self):
         self.save_lease(POOL)
         client = mock.Mock(origin=POOL["appOrigin"])
+        client.claim.return_value = None
         self.patch(pool, "Client", return_value=client)
         self.patch(pool, "start_warm")
         self.patch(pool, "wait_ready", return_value=HEALTH)
@@ -458,12 +566,13 @@ class Lifecycle(PoolTest):
         enroll_call.assert_not_called()
         stopped.assert_called_once()
 
-    def test_unready_host_never_reports_ready_or_claims(self):
+    def test_unready_host_without_claim_never_reports_ready_or_adopts(self):
         client, guarded, stopped = self.lifecycle_stubs()
         self.patch(pool, "wait_ready", side_effect=Refused("pool_desktop_not_ready"))
         with self.assertRaisesRegex(Refused, "pool_desktop_not_ready"):
             pool.run(self.cfg, POOL)
         client.ready.assert_not_called()
+        client.claim.assert_called_once_with()
         guarded.assert_not_called()
         stopped.assert_called_once()
 
@@ -508,6 +617,19 @@ class Resume(PoolTest):
         self.client.enroll.assert_not_called()
         self.client.ready.assert_not_called()
         self.assertFalse(self.guarded.call_args.kwargs["allow_reboot"])
+        self.assertEqual(pool.read_record(self.cfg)["phase"], "switched")
+
+    def test_restart_with_leased_host_picks_up_claim_before_pool_enrollment(self):
+        warm = self.patch(pool, "start_warm")
+        self.patch(desktop, "state", return_value="running")
+        self.client.claim.return_value = CLAIM
+        self.client.enroll.side_effect = Refused("pool_unavailable")
+        self.assertIsNone(pool.read_record(self.cfg))
+        self.assertIn("pool claimed", cli.step(self.cfg, "guard"))
+        self.assertEqual(self.client.mock_calls, [mock.call.claim()])
+        warm.assert_not_called()
+        self.guarded.assert_called_once()
+        self.request.assert_called_once()
         self.assertEqual(pool.read_record(self.cfg)["phase"], "switched")
 
     def test_crash_after_marker_commit_resumes_same_instance_epoch(self):
@@ -827,10 +949,9 @@ class Protocol(PoolTest):
         self.patch(guard, "run_guard")
         self.patch(pool, "stop_warm")
         cli.step(self.cfg, "guard")
-        self.assertEqual(self.clock.sleeps, [1, 1])
-        self.assertEqual(app.calls, [("POST", "pool/enroll"), ("POST", "pool/ready"),
-                                     ("GET", "pool/claim"), ("GET", "pool/claim"),
-                                     ("GET", "pool/claim"), ("POST", "enroll")])
+        self.assertEqual(self.clock.sleeps, [1])
+        self.assertEqual(app.calls, [("GET", "pool/claim"), ("POST", "pool/enroll"), ("POST", "pool/ready"),
+                                     ("GET", "pool/claim"), ("GET", "pool/claim"), ("POST", "enroll")])
         self.assertTrue(app.enrolled)
 
 
