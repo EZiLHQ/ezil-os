@@ -219,6 +219,10 @@ test('desktop: 215 s TIMEOUT while activeAws re-opens and the panel stays on pro
     assert.equal(h.tryAgainVisible(), false);
     assert.ok(h.visible().every(el => !el.textContent.includes('This is taking too long')));
     assert.match(h.panel.querySelector('.ezil-boot-sub').textContent, /^Your AWS computer is still starting — /);
+    // What the user actually sees during the re-open is the spinner's live observation.
+    assert.equal(h.spinner.hidden, false);
+    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Starting your desktop');
+    assert.ok(!/taking (too long|longer than usual)|needs attention/i.test(h.spinner.textContent), h.spinner.textContent);
     assert.ok(h.logs.some(l => l.includes('re-opening (#1)')), h.logs.join('\n'));
     // The re-open is a real ask, and its success opens the desktop.
     h.setReady();
