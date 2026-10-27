@@ -183,7 +183,7 @@ describe('MOUNTING enrollment timeout after the lifecycle job is cleared', () =>
             expect(retire).toHaveBeenCalledOnce();
         });
 
-        it.each([['lock', 'row lock'], ['cas', 'final CAS']] as const)('is not invoked when the row version changes at the %s (%s)', async at => {
+        it.each(['lock', 'cas'] as const)('is not invoked when the row version changes at the %s step', async at => {
             const s = setup(), before = await s.current();
             const retire = vi.fn(async () => {});
             s.race(() => { s.placements[0]!.updated_at = NOW; }, at);
