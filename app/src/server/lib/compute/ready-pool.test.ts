@@ -53,15 +53,18 @@ describe('P1/P2 pool planning', () => {
     it('scale-down retires aged excess spares once paid users leave the class, back to the minimum', () => {
         const idleReady = [40, 50, 60].map(n => ({ poolHostId: String(n), readyAt: ago(n) }));
         expect(planPool(c, demand({ activeStandard: 1, spares: 3, idleReady }), NOW)).toMatchObject({ target: 1, retire: ['40', '50'] });
-        expect(planPool(c, demand({ activeStandard: 0, spares: 3, idleReady }), NOW)).toMatchObject({ target: 0, retire: ['40', '50'] });
+        expect(planPool(c, demand({ activeStandard: 0, spares: 3, idleReady }), NOW)).toMatchObject({ target: 1, retire: ['40', '50'] });
     });
     it('booting reservations do not permit retiring the sole usable ready host',()=>{
         const d=demand({spares:2,ready:1,vcpuInUse:4,idleReady:[{poolHostId:'ready',readyAt:ago(31)}],booting:[{poolHostId:'boot',createdAt:ago(1)}]});
         expect(planPool(c,d,NOW)).toMatchObject({target:1,provision:0,retire:[]});
     });
-    it('zero subscribers overrides history and pending demand without touching leased capacity', () => {
-        expect(planPool(c, demand({activeStandard:0, activePremium:0, opens15m:100, pending:10, vcpuInUse:20}), NOW))
-            .toEqual({target:0, provision:0, retire:[], fail:[]});
+    it('zero subscribers keep exactly the one base-class floor spare; larger classes none', () => {
+        expect(planPool(c, demand({activeStandard:0, activePremium:0, opens15m:100, vcpuInUse:20}), NOW))
+            .toEqual({target:1, provision:1, retire:[], fail:[]});
+        expect(planPool({ ...c, instanceType: 'm6i.xlarge' }, demand({activeStandard:0, activePremium:0, opens15m:100}), NOW).target).toBe(0);
+        expect(planPool(c, demand({activeStandard:0, activePremium:0, spares:1, vcpuInUse:2, idleReady:[{poolHostId:'f', readyAt: ago(90)}]}), NOW))
+            .toEqual({target:1, provision:0, retire:[], fail:[]});
     });
     it.each([2, 4, 5, 10])('pending %i uses shared bounded spares and existing reservations', pending => {
         for (const instanceType of ['m6i.large','m6i.xlarge','m6i.2xlarge'] as const) {

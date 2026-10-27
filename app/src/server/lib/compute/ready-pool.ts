@@ -190,10 +190,12 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     const base = Math.ceil(0.04 * d.activeStandard + 0.10 * d.activePremium);
     const pending = count(d.pending ?? 0);
     const paid = d.activeStandard + d.activePremium;
-    const eligible = paid > 0;
     const want = Math.max(policy.minSpares, base, recent, pending + policy.minSpares);
+    // Founder 2026-10-26: the minimum is one. The base class keeps one warm spare even with no
+    // paid user yet, so the first upgrade adopts instantly; larger classes warm only once selected.
+    const floor = c.instanceType === 'm6i.large' ? policy.minSpares : 0;
     // One computer per user: idle spares beyond the class's paid users (or waiting opens) can never be claimed.
-    const desired = eligible ? Math.min(policy.maxSpares, want, Math.max(paid, pending)) : 0;
+    const desired = paid + pending > 0 ? Math.min(policy.maxSpares, want, Math.max(paid, pending)) : floor;
     const capacity = Math.floor((d.regionVcpuCap - d.vcpuInUse - count(d.demandVcpu ?? 0)) / instanceVcpu(c.instanceType)) + d.spares;
     const target = d.killSwitch ? 0 : Math.max(0, Math.min(desired, capacity));
     const excess = Math.max(0, d.spares - target);
