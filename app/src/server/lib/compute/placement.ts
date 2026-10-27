@@ -1411,6 +1411,27 @@ export async function failStalledPoolEnrollment(db: PlacementDb, p: Placement,
     });
 }
 
+/** A completed attach without enrollment may fail after the nonce's 60-second grace. */
+export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date): Promise<TransitionResult> {
+    const expired = (x: Placement) => x.provider === 'aws-ec2' && x.state === 'MOUNTING' && x.lifecycleJobId === null
+        && x.presenceAt === null && x.lastError !== ENROLLMENT_SUCCEEDED && x.lastError !== POOL_SESSION_PENDING
+        && x.enrollExpiresAt !== null && x.enrollExpiresAt.getTime() + 60_000 <= now.getTime();
+    if (!expired(p)) return { ok: false, reason: 'cas_conflict' };
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, p.computerId);
+        const current = await lockPoolClaimPlacement(tx, p.computerId);
+        if (!current || !expired(current) || current.generation !== p.generation || current.leaseEpoch !== p.leaseEpoch
+            || current.updatedAt.getTime() !== p.updatedAt.getTime() || current.lastError !== p.lastError
+            || current.enrollExpiresAt?.getTime() !== p.enrollExpiresAt?.getTime())
+            return { ok: false, reason: 'cas_conflict' };
+        return casInTx(tx, p.computerId, p, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
+            { lastError: ENROLLMENT_FAILED, enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null },
+            { provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId,
+                volumeId: p.volumeId ?? undefined, fenceToken: p.fenceToken ?? undefined,
+                lastError: p.lastError, updatedAt: p.updatedAt });
+    });
+}
+
 /**
  * C-6 step 4: consume the boot's one-time enrollment nonce. ONE compare-and-swap
  * matches the generation, lease epoch, an enrollable state, provider, nonce hash

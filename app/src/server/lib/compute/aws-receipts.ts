@@ -30,6 +30,7 @@ import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    failUnenrolledPlacement,
     INSTANCE_LOST,
     INSTANCE_LOST_VOLUME_MISSING,
     LIFECYCLE_START_FAILED,
@@ -282,9 +283,17 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     const close: UsageEffect = { kind: 'close', observedBy: USAGE_OBSERVER };
     let p: Placement | null = p0;
     const enrolled = (x: Placement) => (x.lastError === ENROLLMENT_SUCCEEDED || (migrationCommitted && x.lastError === p0.lastError)) && x.enrollNonceHash === null && x.instanceId !== null;
-    // A receipt already applied (job cleared): MOUNTING waits only for the host's enrollment.
+    // A receipt already applied (job cleared): bound the wait for the host's enrollment.
     if (p.state === 'MOUNTING' && p.lifecycleJobId === null) {
         if (enrolled(p)) await step(p, 'RUNNING');
+        else if (!options.terminalOnly) {
+            const observedAt = (deps.now ?? deps.clock ?? (() => new Date()))();
+            const result = await failUnenrolledPlacement(deps.db, p, observedAt);
+            if (result.ok) console.warn('[enroll-timeout]', {
+                computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch,
+                enrollExpiresAt: p.enrollExpiresAt, observedAt,
+            });
+        }
         return;
     }
     const waiting: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
