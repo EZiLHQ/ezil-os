@@ -46,6 +46,7 @@ import { sql, type SQL } from 'drizzle-orm';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
+import { ENROLL_NONCE_TTL_SECONDS } from './aws-rebase-lease';
 
 // ── Enums ────────────────────────────────────────────────────────────────
 
@@ -1415,25 +1416,35 @@ export async function failStalledPoolEnrollment(db: PlacementDb, p: Placement,
 export const ENROLLMENT_GRACE_MS = 60_000;
 
 /**
- * Pure: an aws-ec2 placement in one of `states` whose attach job is settled (no recorded job),
- * whose host never reported presence, whose enrollment neither succeeded nor is a pending pool
- * session, and whose nonce deadline plus `ENROLLMENT_GRACE_MS` has passed at `now`. The
- * enrollment-timeout CAS uses MOUNTING only; read-only progress may widen it to STARTING.
+ * Pure: a MOUNTING aws-ec2 placement whose attach job is settled (no recorded job), with no
+ * owner presence in the CURRENT enrollment epoch, whose enrollment neither succeeded nor is a
+ * pending pool session, and whose nonce deadline plus `ENROLLMENT_GRACE_MS` has passed at `now`.
+ *
+ * Presence is epoch-scoped: `presence_at` is monotonic and no lease, wake or replace clears it,
+ * so a stamp older than this nonce's issue time (`enrollExpiresAt - ENROLL_NONCE_TTL_SECONDS`;
+ * every nonce writer uses that TTL) belongs to an earlier RUNNING session and says nothing
+ * about this host. An image rebase stamps presence AT the issue time, so `>=` keeps it excluded.
  */
-export function isUnenrolledPastGrace(x: Placement, now: Date, states: readonly PlacementState[] = ['MOUNTING']): boolean {
-    return x.provider === 'aws-ec2' && states.includes(x.state) && x.lifecycleJobId === null
-        && x.presenceAt === null && x.lastError !== ENROLLMENT_SUCCEEDED && x.lastError !== POOL_SESSION_PENDING
-        && x.enrollExpiresAt instanceof Date && x.enrollExpiresAt.getTime() + ENROLLMENT_GRACE_MS <= now.getTime();
+export function isUnenrolledPastGrace(x: Placement, now: Date): boolean {
+    if (x.provider !== 'aws-ec2' || x.state !== 'MOUNTING' || x.lifecycleJobId !== null
+        || x.lastError === ENROLLMENT_SUCCEEDED || x.lastError === POOL_SESSION_PENDING
+        || !(x.enrollExpiresAt instanceof Date)) return false;
+    const deadline = x.enrollExpiresAt.getTime();
+    const presentThisEpoch = x.presenceAt !== null && x.presenceAt.getTime() >= deadline - ENROLL_NONCE_TTL_SECONDS * 1000;
+    return !presentThisEpoch && deadline + ENROLLMENT_GRACE_MS <= now.getTime();
 }
 
 /**
  * A completed attach without enrollment may fail after the nonce's 60-second grace.
- * `retire`, when given, runs inside the same admission transaction ONLY after this CAS
- * succeeded (same contract as `failStalledPoolEnrollment`): it must be database-only work
- * (a Step Functions start issued here would be checked against an uncommitted row), and a
- * throw rolls the classification back. A repeat call or a lost race returns `cas_conflict`
- * before any transaction work, so `retire` runs at most once per classified placement, and
- * never for a placement whose enrollment succeeded.
+ *
+ * KNOWN GAP (L-B 2026-10-27, not delivered): nothing here stops the refused host. The only
+ * production caller (aws-receipts.ts `[enroll-timeout]`) passes no `retire`, so the instance
+ * keeps running until the owner's next open replaces it. `retire` is only the seam for the
+ * instance-only stop follow-up, which needs a lifecycle-authority exception outside this lane.
+ * Contract for that seam: it runs inside the same admission transaction ONLY after this CAS
+ * succeeded (as in `failStalledPoolEnrollment`), it must be database-only work (a Step
+ * Functions start issued here would be checked against an uncommitted row), and a throw rolls
+ * the classification back. A repeat call or a lost race returns `cas_conflict` first.
  */
 export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date,
     retire?: (tx: PlacementExecutor) => Promise<unknown>): Promise<TransitionResult> {

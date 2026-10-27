@@ -73,8 +73,10 @@ export function describeProgress(computerId: string, placement: Placement | null
     const selectedSize = entitlement?.source === 'billing_v2' && entitlement.status === 'active' && !entitlement.paymentIssue && entitlement.provider === 'aws' && entitlement.size && entitlement.planId ? SIZES[entitlement.size] : null;
     const selected = selectedSize?.provider === 'aws' ? selectedSize : null;
     // The enrollment nonce (TTL + grace, placement.ts `isUnenrolledPastGrace`) has expired with no
-    // host presence: the open has failed even before the receipt pass records UNCONFIRMED.
-    const enrollmentExpired = !active && !relevantFailure && !!placement && isUnenrolledPastGrace(placement, now, ['MOUNTING', 'STARTING']);
+    // host presence this epoch: the open has failed even before the receipt pass records
+    // UNCONFIRMED. Same MOUNTING-only predicate as that CAS, so progress never shows a failure
+    // that no transition resolves.
+    const enrollmentExpired = !active && !relevantFailure && !!placement && isUnenrolledPastGrace(placement, now);
     const needsOperator = stage === 'failed_needs_operator' || lifecycle === 'UNCONFIRMED' || enrollmentExpired;
     // A cutoff must never be presented as active transfer. Keep recordedStage for diagnostics.
     return {

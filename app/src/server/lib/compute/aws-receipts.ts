@@ -288,7 +288,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (enrolled(p)) await step(p, 'RUNNING');
         else if (!options.terminalOnly) {
             const observedAt = (deps.now ?? deps.clock ?? (() => new Date()))();
-            // No `retire` here (L-B 2026-10-27): the refused host stays bound (instance, fence) so the
+            // KNOWN GAP, host leak NOT stopped. No `retire` here (L-B 2026-10-27): the refused host stays bound (instance, fence) so the
             // owner's next open REPLACES it (aws-ec2.ts: previousInstanceId is stopped and terminated).
             // A placement retire would land RETIRED, which a live computer cannot leave, and the
             // lifecycle authority refuses any job on a cold UNCONFIRMED placement. Stopping the host

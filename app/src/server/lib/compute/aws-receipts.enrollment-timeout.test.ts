@@ -20,6 +20,8 @@ const VOLUME = 'vol-11111111111111111';
 const FENCE = 'fdfdfdfd-fdfd-4dfd-8dfd-fdfdfdfdfdfd';
 const NOW = new Date('2026-10-27T12:00:00Z');
 const EXPIRES = new Date(NOW.getTime() - 60_000);
+/** This nonce's issue time: every nonce writer uses ENROLL_NONCE_TTL_SECONDS (600 s). */
+const ISSUED = new Date(EXPIRES.getTime() - 600_000);
 const D = fixtureDeployment('ap-south-1', ['t3a.medium', 't3.medium']);
 const dialect = new PgDialect();
 
@@ -97,7 +99,8 @@ describe('MOUNTING enrollment timeout after the lifecycle job is cleared', () =>
     });
 
     it.each([
-        ['presence', { presence_at: new Date(NOW.getTime() - 3_600_000) }],
+        ['presence in this epoch', { presence_at: new Date(EXPIRES.getTime() - 300_000) }],
+        ['rebase presence stamped at the nonce issue time', { presence_at: ISSUED }],
         ['success marker', { last_error: ENROLLMENT_SUCCEEDED }],
         ['pool session pending', { last_error: POOL_SESSION_PENDING }],
         ['no deadline', { enroll_expires_at: null }],
@@ -110,6 +113,18 @@ describe('MOUNTING enrollment timeout after the lifecycle job is cleared', () =>
         await s.tick();
         expect(await s.current()).toEqual(before);
         expect(s.warn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['an hour before this nonce', new Date(NOW.getTime() - 3_600_000)],
+        ['1 ms before this nonce was issued', new Date(ISSUED.getTime() - 1)],
+    ] as const)('classifies despite stale presence from an earlier session (%s)', async (_name, presenceAt) => {
+        // presence_at is monotonic and never cleared by a lease, wake or replace: a returning
+        // owner's earlier RUNNING session must not hide this epoch's enrollment failure.
+        const s = setup({ presence_at: presenceAt }), before = await s.current();
+        await s.tick(before);
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: ENROLLMENT_FAILED, instanceId: INSTANCE });
+        expect(s.warn).toHaveBeenCalledOnce();
     });
 
     it('promotes an enrolled placement to RUNNING even after the deadline', async () => {
@@ -164,7 +179,8 @@ describe('MOUNTING enrollment timeout after the lifecycle job is cleared', () =>
         expect(s.warn).not.toHaveBeenCalled();
     });
 
-    describe('retire hook', () => {
+    // Seam only: no production caller passes `retire` (KNOWN GAP, see failUnenrolledPlacement).
+    describe('retire seam (unused in production)', () => {
         it('runs exactly once, inside the classifying transaction, only after a successful CAS', async () => {
             const s = setup(), before = await s.current();
             const seen: string[] = [];
@@ -226,7 +242,9 @@ describe('MOUNTING enrollment timeout after the lifecycle job is cleared', () =>
             expect(await s.current()).toEqual(before);
         });
 
-        it('the receipt pass classifies without dispatching any lifecycle job (the refused host is replaced on reopen)', async () => {
+        // KNOWN GAP (host leak, brief item 3 NOT delivered): pins today's behaviour so the
+        // follow-up that adds an instance-only stop must change this test deliberately.
+        it('KNOWN GAP: the receipt pass classifies but stops nothing; the refused host runs until a reopen replaces it', async () => {
             const s = setup();
             await s.tick();
             expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: ENROLLMENT_FAILED, instanceId: INSTANCE, fenceToken: FENCE, lifecycleJobId: null });
