@@ -909,7 +909,7 @@ def edit_release_secret(envelope, before, after, records):
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 19, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= 24, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
@@ -921,7 +921,7 @@ def edit_release_secret(envelope, before, after, records):
         need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 19, "release registry full; retained placement/job evidence must never be dropped")
+    need(1 <= len(retained) <= 24, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.

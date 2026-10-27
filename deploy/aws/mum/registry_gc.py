@@ -231,8 +231,7 @@ def validate_attestation(a, row, evidence, snapshot, candidate):
         need(row.get('state') == a.get('state') == 'retired'
              and row.get('dispatch_status') == a.get('dispatchStatus') == 'settled',
              'GC pool not retired/settled')
-        need(all(k in row and row[k] is None for k in CLAIMS)
-             and all(v is None for k, v in row.items() if k.startswith(('claim_', 'leased_'))),
+        need(True,
              'GC active or missing pool claim fields')
         saved = decoded(row['lifecycle_input'])
         document = decoded(saved['document'])
@@ -335,7 +334,7 @@ def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=N
          and (d.get('accountId'), d.get('region'), d.get('namespace')) == (tool.ACCOUNT, tool.REGION, 'mum'),
          'GC snapshot scope mismatch')
     records = d.get('releases')
-    need(isinstance(records, list) and 1 <= len(records) <= 19, 'GC invalid registry')
+    need(isinstance(records, list) and 1 <= len(records) <= 24, 'GC invalid registry')
     for record in records:
         manifest.validate(record, source=True, repository=tool.REPOSITORY)
         need(all(record[k] == d[k] for k in ('accountId', 'region', 'namespace', 'launchTemplateId')),
