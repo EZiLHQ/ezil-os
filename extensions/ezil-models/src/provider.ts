@@ -2,7 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
-import { GatewayError, gatewayModels, withGatewayModelLimits } from './gateway';
+import { GatewayError, gatewayModelAvailable, gatewayModels, withGatewayModelLimits } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel } from './config';
@@ -114,8 +114,17 @@ export function isUtilityRequest(options: Record<string, unknown>): boolean {
     return ['role', 'requestInitiator'].some(key => typeof options[key] === 'string' && /(?:^|[./_-])(utility(?:Small)?|title|summary|summariz(?:e|ation)|progress)(?:$|[./_-])/i.test(options[key] as string));
 }
 
+function aiCreditsLink(): vscode.Uri | undefined {
+    try {
+        const url = new URL(process.env.EZIL_AI_BASE_URL ?? '');
+        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&section=ai-credits`);
+    } catch { /* no usable OS origin */ }
+    return undefined;
+}
+
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private readonly changed = new vscode.EventEmitter<void>();
+    private lastCreditWarningAt = -Infinity;
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
 
     constructor(private readonly host: ProviderHost) {}
@@ -132,7 +141,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const providers = [...new Set(models.filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
             const catalog = new Map(await Promise.all(providers.map(async provider => [provider, await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), controller.signal)] as const)));
             if (token.isCancellationRequested) return [];
-            return models.filter(model => catalog.get(model.provider)?.data.find(entry => entry.id === model.model)?.enabled !== false)
+            return models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider)))
                 .map(model => toInformation(withGatewayModelLimits(model, catalog.get(model.provider))));
         } finally { cancel.dispose(); }
     }
@@ -152,8 +161,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         token: vscode.CancellationToken,
     ): Promise<void> {
         let resolved = this.resolve(model);
-        if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
-            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.model === QWEN) ?? resolved;
+        if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
+            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway'
+                && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
         }
         const request = toNeutralRequest(messages, options);
         const controller = new AbortController();
@@ -167,8 +177,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (resolved.provider.type === 'ezil-gateway') {
                 // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
-                resolved = withGatewayModelLimits(resolved, catalog);
                 controller.signal.throwIfAborted();
+                if (!gatewayModelAvailable(resolved, catalog)) {
+                    throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined);
+                }
+                resolved = withGatewayModelLimits(resolved, catalog);
             }
             const events = chat(resolved, request, {
                 signal: controller.signal,
@@ -216,6 +229,13 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // to be free of key material (a gateway may echo headers or carry the key in its path).
             const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
             if (resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
+            if (error instanceof GatewayError && ['insufficient_credits', 'no_live_grant'].includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
+                this.lastCreditWarningAt = Date.now();
+                const link = aiCreditsLink();
+                void Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
+                    if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
+                }).catch(() => {});
+            }
             if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout'].includes(error.code ?? '')) {
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {

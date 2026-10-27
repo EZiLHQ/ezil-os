@@ -1,6 +1,6 @@
 /** Single-use warm hosts. Callers own admission, lifecycle execution and transactions. */
 import { sql } from 'drizzle-orm';
-import { RUNNING_CLASS_STATES, type PlacementExecutor } from './placement';
+import { RUNNING_CLASS_STATES, type Placement, type PlacementExecutor } from './placement';
 import { AWS_REGION_PATTERN, INSTANCE_VCPU, instanceVcpu, readAwsRegions } from './aws-config';
 
 export const POOL_TYPES = ['m6i.large', 'm6i.xlarge', 'm6i.2xlarge'] as const;
@@ -27,9 +27,12 @@ export type PoolData = Pick<typeof import('./ready-pool'), 'recordPoolEnrollment
 export interface PoolReadinessDiagnostic {
     poolHostId: string; instanceId: string | null; createdAt: string; enrolledAt: string | null; health: string;
 }
+/** Demand-driven pool (founder, 2026-10-26): one ready spare per class while any paid user has
+ * selected it, rising with activity. Idle spares never exceed that class's paid users. maxSpares is
+ * only a runaway ceiling; the region vCPU cap still bounds every class. */
 export const POOL_POLICY: Record<string, { minSpares: number; maxSpares: number }> = {
-    'ap-south-1:m6i.large': { minSpares: 1, maxSpares: 4 },
-    'ap-south-1:m6i.xlarge': { minSpares: 1, maxSpares: 4 },
+    'ap-south-1:m6i.large': { minSpares: 1, maxSpares: 16 },
+    'ap-south-1:m6i.xlarge': { minSpares: 1, maxSpares: 8 },
     'ap-south-1:m6i.2xlarge': { minSpares: 1, maxSpares: 4 },
 };
 const MINUTE = 60_000;
@@ -186,8 +189,13 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     const recent = Math.ceil(d.opens15m * boot / 15);
     const base = Math.ceil(0.04 * d.activeStandard + 0.10 * d.activePremium);
     const pending = count(d.pending ?? 0);
-    const eligible = d.activeStandard + d.activePremium > 0;
-    const desired = eligible ? Math.min(policy.maxSpares, Math.max(policy.minSpares, base, recent, pending + policy.minSpares)) : 0;
+    const paid = d.activeStandard + d.activePremium;
+    const want = Math.max(policy.minSpares, base, recent, pending + policy.minSpares);
+    // Founder 2026-10-26: the minimum is one. The base class keeps one warm spare even with no
+    // paid user yet, so the first upgrade adopts instantly; larger classes warm only once selected.
+    const floor = c.instanceType === 'm6i.large' ? policy.minSpares : 0;
+    // One computer per user: idle spares beyond the class's paid users (or waiting opens) can never be claimed.
+    const desired = paid + pending > 0 ? Math.min(policy.maxSpares, want, Math.max(paid, pending)) : floor;
     const capacity = Math.floor((d.regionVcpuCap - d.vcpuInUse - count(d.demandVcpu ?? 0)) / instanceVcpu(c.instanceType)) + d.spares;
     const target = d.killSwitch ? 0 : Math.max(0, Math.min(desired, capacity));
     const excess = Math.max(0, d.spares - target);
@@ -349,8 +357,30 @@ export async function retireRefusedPoolLease(db: PlacementExecutor, poolHostId: 
 /** A confirmed release burns the single-use host; cold fallback has no matching pool row. */
 export async function retirePoolLease(db: PlacementExecutor, p: { computerId: string; instanceId: string | null; generation: number; leaseEpoch: number }): Promise<void> {
     await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = 'retired', updated_at = now()
-        WHERE state = 'leased' AND instance_id = ${p.instanceId} AND leased_computer_id = ${p.computerId}::uuid
+        WHERE state IN ('leased', 'retiring') AND instance_id = ${p.instanceId} AND leased_computer_id = ${p.computerId}::uuid
             AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}`);
+}
+
+/** leased_at is the immutable claim time; enrollment and repeated receipt polls cannot extend it. */
+export async function isStalledPoolLease(db: PlacementExecutor, poolHostId: string, p: Placement,
+    now: Date, stallMs: number, lock = false): Promise<boolean> {
+    return rowsOf(await db.execute(sql`SELECT id FROM public.ezil_compute_pool_hosts
+        WHERE id = ${poolHostId}::uuid AND state = 'leased' AND instance_id = ${p.instanceId}
+            AND leased_computer_id = ${p.computerId}::uuid AND region = ${p.region} AND zone_id = ${p.zoneId}
+            AND instance_type = ${p.instanceType} AND generation = leased_generation AND lease_token IS NOT NULL
+            AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}
+            AND claim_fence = ${p.fenceToken} AND claim_volume_serial = ${p.volumeId!.replace('-', '')}
+            AND session_ready_at IS NULL AND leased_at <= ${new Date(now.getTime() - stallMs).toISOString()}::timestamptz
+        ${lock ? sql`FOR UPDATE` : sql``}`)).length === 1;
+}
+
+/** Keep the tenant binding while release runs: spare pool-retire must never take this attached host. */
+export async function hasFailedPoolLease(db: PlacementExecutor, p: Placement, state: 'retiring' | 'retired'): Promise<boolean> {
+    return rowsOf(await db.execute(sql`SELECT id FROM public.ezil_compute_pool_hosts
+        WHERE state = ${state} AND instance_id = ${p.instanceId} AND leased_computer_id = ${p.computerId}::uuid
+            AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}
+            AND claim_fence = ${p.fenceToken} AND claim_volume_serial = ${p.volumeId?.replace('-', '') ?? null}
+            AND session_ready_at IS NULL`)).length === 1;
 }
 
 /** Durable tenant readiness belongs to the claimed epoch, independently of placement updated_at. */

@@ -1,10 +1,32 @@
-/** Read-only progress. Recorded stages are not measured transfer progress or readiness probes. */
+/** Read-only progress from recorded stages and successful restore chunk responses. */
 import { SIZES } from '@/server/billing/v2/contract';
 import type { EntitlementRecord } from './tier';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
 import { PlacementOwnerError, readPlacement, type Placement, type PlacementState, type PlacementExecutor } from './placement';
 import { MIGRATION_STATES, pendingRecovery, TERMINAL_MIGRATION_STATES, type MigrationState } from './provider-migrate';
-import { createProviderMigrationStore, type ComputeMigration } from './provider-migrate-store';
+import { createProviderMigrationStore, snapshotChunkSizes, type ComputeMigration } from './provider-migrate-store';
+
+function transferProgress(migration: ComputeMigration | null, stage: string, stopped: boolean) {
+    const workspace = migration && !['requested', 'fenced'].includes(migration.state) ? snapshotChunkSizes(migration.workspaceHead) : null;
+    const system = migration?.systemHead ? snapshotChunkSizes(migration.systemHead) : [];
+    const total = workspace && system ? [...workspace, ...system].reduce((sum, size) => sum + size, 0) : null;
+    const progress = total === null ? null : migration?.restoreProgress;
+    const transferred = total === null ? null : progress?.bytes ?? 0;
+    const iso = (value: string | undefined) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
+    const transferStartedAt = iso(progress?.first), transferUpdatedAt = iso(progress?.last);
+    const seconds = transferStartedAt && transferUpdatedAt ? (Date.parse(transferUpdatedAt) - Date.parse(transferStartedAt)) / 1000 : 0;
+    const chunks = [progress?.workspace, progress?.system].reduce((count, bits) => count + (bits && /^[a-f0-9]{128}$/i.test(bits)
+        ? [...bits].reduce((sum, hex) => sum + parseInt(hex, 16).toString(2).replaceAll('0', '').length, 0) : 0), 0);
+    const rate = transferred !== null && seconds > 0 ? transferred / seconds : 0;
+    return {
+        bytes: { transferred, total },
+        percent: transferred === null || total === null || total === 0 ? null : Math.max(0, Math.min(100, Math.floor(100 * transferred / total))),
+        etaSeconds: !stopped && ['exported', 'provisioning'].includes(stage) && chunks >= 4 && rate > 0 && total !== null
+            ? Math.ceil(Math.max(0, total - transferred!) / rate) : null,
+        transferStartedAt, transferUpdatedAt,
+        typicalSeconds: total === null ? null : Math.max(90, Math.min(600, Math.round(90 + total / 4_000_000))),
+    };
+}
 
 export function describeProgress(computerId: string, placement: Placement | null, migration: ComputeMigration | null, env: Env, now = new Date(), entitlement: EntitlementRecord | null = null) {
     const active = migration && !TERMINAL_MIGRATION_STATES.includes(migration.state) ? migration : null;
@@ -30,14 +52,14 @@ export function describeProgress(computerId: string, placement: Placement | null
     const needsOperator = stage === 'failed_needs_operator' || lifecycle === 'UNCONFIRMED';
     // A cutoff must never be presented as active transfer. Keep recordedStage for diagnostics.
     return {
-        version: 1 as const, computerId, observedAt: now.toISOString(), operation,
+        version: 2 as const, computerId, observedAt: now.toISOString(), operation,
         stage: paused ? 'operations_paused' : needsOperator ? 'needs_operator' : stage === 'requested' ? 'queued' : stage, recordedStage: stage,
         lifecycleState: lifecycle, paused, operationsPaused: paused, needsOperator,
         active: !paused && !needsOperator && operation !== 'none' && stage !== 'requested',
         startedAt: active ? new Date(active.createdAt).toISOString() : null,
         updatedAt: active || relevantFailure ? new Date(migration!.updatedAt).toISOString() : placement?.updatedAt.toISOString() ?? null,
         durable: !!active, resumePolicy: active ? 'saved_workspace_only' as const : 'unavailable' as const,
-        bytes: { transferred: null, total: null }, percent: null, etaSeconds: null,
+        ...transferProgress(operation === 'migration' ? migration : null, stage, paused || needsOperator),
         selectedNextOpenHardware: selected ? { size: entitlement!.size!, vcpu: selected.vcpu, memoryGiB: selected.memoryGiB, effective: 'next_open' as const } : null,
         hardware: { instanceType: placement?.instanceType ?? null, source: placement ? 'placement' as const : 'unavailable' as const },
     };

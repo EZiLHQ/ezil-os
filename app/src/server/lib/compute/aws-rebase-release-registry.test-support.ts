@@ -111,3 +111,34 @@ export function fixtureReleaseRegistry16() {
     return { ...f, release122, retained: [...f.retained, release122],
         deployment122: { ...f.deployment121, amiId: release122.amiId } };
 }
+
+/** Synthetic seventeenth and eighteenth records; not actual release proof. */
+export function fixtureReleaseRegistry18() {
+    const f = fixtureReleaseRegistry16();
+    const release123 = { ...f.release122, amiId: 'ami-00000000000000017', recipeVersion: '1.0.23',
+        createdAt: '2026-10-26T20:00:00.000Z' };
+    const release124 = { ...release123, amiId: 'ami-00000000000000018', recipeVersion: '1.0.24',
+        createdAt: '2026-10-27T20:00:00.000Z' };
+    return { ...f, release123, release124, retained: [...f.retained, release123, release124],
+        deployment124: { ...f.deployment122, amiId: release124.amiId } };
+}
+
+/** Synthetic nineteenth maintenance record; not actual 1.0.25 release proof. */
+export function fixtureReleaseRegistry19() {
+    const f = fixtureReleaseRegistry18();
+    const release125 = { ...f.release124, amiId: 'ami-00000000000000019', recipeVersion: '1.0.25',
+        previousLowerImageDigest: null, previousLowerImageRef: null, createdAt: '2026-10-28T20:00:00.000Z' };
+    return { ...f, release125, retained: [...f.retained, release125],
+        deployment125: { ...f.deployment124, amiId: release125.amiId, previousLowerImageDigest: null } };
+}
+
+/** Synthetic twentieth to twenty-fourth normal records; not actual 1.0.26+ release proof.
+ * The count cap is 24: the hashed readback no longer bounds the registry, only the 65,536-byte secret does. */
+export function fixtureReleaseRegistry24() {
+    const f = fixtureReleaseRegistry19();
+    const later = [26, 27, 28, 29, 30].map((n, i) => ({ ...f.release124, amiId: `ami-${String(20 + i).padStart(17, '0')}`,
+        recipeVersion: `1.0.${n}`, createdAt: `2026-11-0${1 + i}T20:00:00.000Z` }));
+    const release130 = later[4]!;
+    return { ...f, later, release130, retained: [...f.retained, ...later],
+        deployment130: { ...f.deployment124, amiId: release130.amiId } };
+}

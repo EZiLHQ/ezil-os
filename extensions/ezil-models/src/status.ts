@@ -31,10 +31,14 @@ export class EZiLAIStatus implements vscode.Disposable {
         if (this.disposed) return;
         this.request?.abort();
         const request = this.request = new AbortController();
+        const configured = this.provider();
+        const provider = configured ? { ...configured } : undefined;
         this.state = undefined;
         this.render();
-        const state = await readAIStatus(this.provider(), this.doFetch, request.signal);
+        const state = await readAIStatus(provider, this.doFetch, request.signal);
         if (this.disposed || this.request !== request) return;
+        const current = this.provider();
+        if (current?.type !== provider?.type || current?.baseUrl !== provider?.baseUrl || current?.apiKey !== provider?.apiKey) return;
         this.state = state;
         this.render();
     }
@@ -44,7 +48,7 @@ export class EZiLAIStatus implements vscode.Disposable {
         await this.refresh();
         if (this.disposed) return;
         const view = statusView(this.state);
-        await this.ui.window.showQuickPick(view.lines.slice(1).map(label => ({ label })), { title: 'EZiL AI', placeHolder: 'Credits and recent Gateway usage' });
+        await this.ui.window.showQuickPick(view.lines.slice(1).map(label => ({ label })), { title: 'EZiL AI', placeHolder: 'Credits, effective limits and recent Gateway usage' });
     }
 
     dispose(): void {

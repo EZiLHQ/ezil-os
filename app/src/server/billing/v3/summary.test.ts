@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
 import { buildSummaryV3, usedSecondsInWindow } from './summary';
@@ -12,6 +13,7 @@ function input(sku?: SellableSkuV3): Input {
         epochs: [], grants: sku ? [{ id: 'grant', userId: 'u', subscriptionId: 'sub', kind: 'plan_period', meter: 'compute_std_seconds',
             amount: BigInt(CATALOG_V3[sku].fairUseSeconds), periodStart: start, periodEnd: end, sourceType: 'invoice', sourceId: 'in', createdAt: start }] : [],
         consent: null, planChanges: [], paymentIssues: [], storage: [], sizePreference: null, hasCustomer: !!sku,
+        packs: [offeredPack],
         renewal: sku ? { at: '2026-11-10T00:00:00Z', amountCents: 1700 } : null };
 }
 const epoch = (overrides: Partial<Input['epochs'][number]> = {}): Input['epochs'][number] => ({ id: 'e', userId: 'u', computerId: 'c',
@@ -25,6 +27,26 @@ function sessions(hours: number, size: 'std-2' | 'cmp-8'): Input['epochs'] {
 }
 
 describe('v3 summary', () => {
+    it.each([undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const)('offers top-ups independently of subscription checkout for %s', sku => {
+        const summary = buildSummaryV3(input(sku));
+        expect(summary.actions.topup).toBe(true);
+        expect(summary.catalog.packs).toEqual([
+            { sku: 'ai_pack_fixture', aiCredits: 1000, creditCents: 10000, discountPercent: 20, totalCents: 8000, currency: 'usd' },
+        ]);
+        expect(summary.catalog.customTopup).toEqual({ minCents: 1000, maxCents: 1000000, centsPerCredit: 10 });
+    });
+    it.each(['flag', 'secret'] as const)('disables top-ups without the checkout %s', missing => {
+        const args = input();
+        if (missing === 'flag') args.config.checkoutEnabled = false;
+        else args.config.stripeSecret = undefined;
+        expect(buildSummaryV3(args).actions).toMatchObject({ checkout: false, topup: false });
+    });
+    it('keeps custom checkout available when Stripe offers no packs', () => {
+        const summary = buildSummaryV3({ ...input(), packs: [] });
+        expect(summary.actions).toMatchObject({ checkout: true, topup: true });
+        expect(summary.catalog.packs).toEqual([]);
+        expect(buildSummaryV3({ ...input(), stripeAvailable: false }).actions.topup).toBe(false);
+    });
     it.each([[100, 400, 'near'], [125, 500, 'paused']] as const)(
         '%s hours at cmp-8 uses %s standard-hours and is %s', (hours, standardHours, status) => {
             const args = input('premium_monthly_v3');

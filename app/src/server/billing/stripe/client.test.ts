@@ -1,11 +1,43 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { productResponse, priceResponse, couponResponse } from './packs.test-support';
 import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
+import * as catalog from '../catalog';
 import type { CheckoutRequest } from '../ports';
 import { BillingProviderError, createStripeClient, resetStripeCachesForTests, StripeRequestError, UPGRADE_PREVIEW_MAX_AGE_SECONDS } from './client';
 
 beforeEach(resetStripeCachesForTests);
-afterEach(() => vi.useRealTimers());
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+describe('Stripe pack reads', () => {
+    it('paginates products and checkout line items and maps server product facts', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ data: [productResponse], has_more: true }))
+            .mockResolvedValueOnce(Response.json({ data: [{ ...productResponse, id: 'prod_second' }], has_more: false }))
+            .mockResolvedValueOnce(Response.json(productResponse))
+            .mockResolvedValueOnce(Response.json({ data: [{ id: 'li_one', quantity: 1, price: priceResponse }], has_more: true }))
+            .mockResolvedValueOnce(Response.json({ data: [{ id: 'li_two', quantity: 2, price: null }], has_more: false }));
+        expect((await client.listProducts()).map(product => product.id)).toEqual(['prod_fixture', 'prod_second']);
+        expect(String(fetcher.mock.calls[1]![0])).toContain('starting_after=prod_fixture');
+        expect(await client.retrieveProduct('prod_fixture')).toMatchObject({ defaultPrice: 'price_pack', metadata: { ezil_credits: '1000' } });
+        expect(await client.retrieveCheckoutLineItems('cs_fixture')).toEqual([
+            { quantity: 1, price: { id: 'price_pack', active: true, productId: 'prod_fixture', type: 'one_time', currency: 'usd', unitAmount: 10000 } },
+            { quantity: 2, price: null },
+        ]);
+        expect(String(fetcher.mock.calls[4]![0])).toContain('starting_after=li_one');
+    });
+    it('maps missing coupons to null and propagates transient provider errors', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 404 }))
+            .mockResolvedValueOnce(Response.json({ error: {} }, { status: 503 }));
+        expect(await client.retrieveCoupon('missing')).toBeNull();
+        await expect(client.retrieveCoupon('unavailable')).rejects.toMatchObject({ status: 503 });
+    });
+    it('reads pack ezil_credits without trusting the older custom metadata field', async () => {
+        const { client } = fixture({ ...session, metadata: { sku: 'ai_pack_fixture', ezil_credits: '1000', credits: '9999' } });
+        expect(await client.retrieveCheckoutSession('cs_fixture')).toMatchObject({ sku: 'ai_pack_fixture', metadataCredits: '1000' });
+    });
+});
 
 const secretKey = 'sk_test_client_fixture';
 const start = 1_799_000_000;
@@ -28,6 +60,15 @@ function fixture(payload: unknown, opts: { priceProMonthly?: string } = {}) {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async url => Response.json(String(url).includes('/invoice_payments?') ? { data: [{ invoice: 'in_fixture' }] } : payload));
     const client = createStripeClient({ secretKey, fetch: fetcher, ...opts });
     return { client, fetcher };
+}
+
+/** Historical synthetic policy; never mutates the catalog. */
+function configurePackForTest(sku: string) {
+    const findPack = catalog.findPack;
+    const pack = findPack(sku);
+    if (!pack) throw new Error('Unknown fixture pack');
+    vi.spyOn(catalog, 'findPack').mockImplementation(value => value === sku
+        ? { ...pack, aiCredits: 1234 } : findPack(value));
 }
 
 function inspect(fetcher: ReturnType<typeof fixture>['fetcher'], index = 0) {
@@ -89,6 +130,7 @@ const session = {
 const expectedSession = {
     id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: 'user_fixture',
     mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_pack_10_v1',
+    amountTotal: null, currency: null, metadataCredits: null,
 };
 const charge = {
     id: 'ch_fixture', customer: 'cus_fixture', invoice: 'in_fixture', payment_intent: 'pi_fixture',
@@ -189,12 +231,27 @@ describe('createStripeClient requests', () => {
         expect(await client.listInvoices('cus_fixture', 12)).toEqual([]);
     });
 
+    it.each(['ai_pack_10_v1', 'ai_pack_25_v1'].map(sku => catalog.findPack(sku)!).flatMap(pack => (['hosted', 'embedded'] as const).flatMap(uiMode =>
+        [false, true].map(managedPayments => ({ sku: pack.sku, uiMode, managedPayments })))))(
+        'refuses null-policy $sku before any Stripe request (mode=$uiMode, managed=$managedPayments)', async input => {
+            const { client, fetcher } = fixture(checkoutResult);
+            expect(catalog.findPack(input.sku)?.aiCredits).toBeNull();
+            await expect(client.createCheckoutSession({ ...checkoutRequest, ...input })).rejects.toMatchObject({
+                name: 'TRPCError', code: 'PRECONDITION_FAILED', message: 'pack_credits_unset',
+            });
+            expect(fetcher).not.toHaveBeenCalled();
+        },
+    );
+
     it.each([
         { sku: 'ai_pack_10_v1', credit: '1000', fee: '84' },
         { sku: 'ai_pack_25_v1', credit: '2500', fee: '161' },
-    ])('encodes separate credits and service fee items for $sku', async ({ sku, credit, fee }) => {
+    ])('encodes separate credits and service fee items for explicitly configured $sku', async ({ sku, credit, fee }) => {
+        configurePackForTest(sku);
         const { client, fetcher } = fixture(checkoutResult, { priceProMonthly: 'price_pro_fixture' });
         expect(await client.createCheckoutSession({ ...checkoutRequest, sku })).toEqual(checkoutResult);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        expect(catalog.AI_PACKS.every(pack => pack.aiCredits !== null)).toBe(true);
         const expected = {
             ...commonCheckout(sku),
             mode: 'payment',
@@ -217,6 +274,41 @@ describe('createStripeClient requests', () => {
         expect(sent.size).toBe(Object.keys(expected).length);
         expect(sent.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+    });
+
+    it.each([true, false])('uses the dashboard default price and optional coupon (%s)', async discounted => {
+        const { client, fetcher } = fixture({ id: 'cs_pack', client_secret: 'secret_fixture' });
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ ...productResponse,
+            metadata: { ezil_kind: 'ai_pack', ezil_credits: '1000', ...(discounted ? { ezil_coupon: 'coupon_pack' } : {}) } }], has_more: false }))
+            .mockResolvedValueOnce(Response.json(priceResponse));
+        if (discounted) fetcher.mockResolvedValueOnce(Response.json(couponResponse));
+        await client.createCheckoutSession({ ...checkoutRequest, sku: 'ai_pack_fixture', uiMode: 'embedded' });
+        const sent = inspect(fetcher, fetcher.mock.calls.length - 1).body;
+        expect(sent).toMatchObject({ mode: 'payment', ui_mode: 'embedded_page', 'line_items[0][price]': 'price_pack',
+            'line_items[0][quantity]': '1', 'metadata[sku]': 'ai_pack_fixture', 'metadata[ezil_credits]': '1000',
+            'payment_intent_data[metadata][ezil_credits]': '1000' });
+        expect(sent).not.toHaveProperty('line_items[0][price_data][unit_amount]');
+        expect(sent).not.toHaveProperty('allow_promotion_codes');
+        if (discounted) expect(sent['discounts[0][coupon]']).toBe('coupon_pack');
+        else expect(sent).not.toHaveProperty('discounts[0][coupon]');
+    });
+
+    it('stores custom credits on the session and payment intent and reads verified payment facts', async () => {
+        const { client, fetcher } = fixture({ ...session, amount_total: 2500, currency: 'usd',
+            metadata: { sku: 'ai_custom_v2', credits: '250' } });
+        await client.createCheckoutSession({ ...checkoutRequest, sku: 'ai_custom_v2', customAmountCents: 2500 });
+        expect(inspect(fetcher).body).toMatchObject({ mode: 'payment',
+            'metadata[sku]': 'ai_custom_v2', 'metadata[credits]': '250',
+            'payment_intent_data[metadata][sku]': 'ai_custom_v2', 'payment_intent_data[metadata][credits]': '250',
+            'line_items[0][price_data][unit_amount]': '2500' });
+        expect(await client.retrieveCheckoutSession('cs_fixture')).toMatchObject({
+            sku: 'ai_custom_v2', amountTotal: 2500, currency: 'usd', metadataCredits: '250' });
+    });
+
+    it.each([undefined, 999, 1001, 1000001])('refuses custom checkout with invalid amount %s before Stripe', async customAmountCents => {
+        const { client, fetcher } = fixture(checkoutResult);
+        await expect(client.createCheckoutSession({ ...checkoutRequest, sku: 'ai_custom_v2', customAmountCents })).rejects.toThrow();
+        expect(fetcher).not.toHaveBeenCalled();
     });
 
     it('uses a configured Pro price in place of inline price data', async () => {
@@ -446,6 +538,7 @@ describe.each(['hosted', 'embedded'] as const)('Managed Payments in %s checkout'
         { sku: 'ai_pack_10_v1', mode: 'payment', amounts: ['1000', '84'], names: ['AI credits', 'Service fee'] },
         { sku: 'ai_pack_25_v1', mode: 'payment', amounts: ['2500', '161'], names: ['AI credits', 'Service fee'] },
     ])('sets eligible tax codes and excludes every incompatible field for $sku', async ({ sku, mode, amounts, names }) => {
+        if (sku.startsWith('ai_pack_')) configurePackForTest(sku);
         const { client, fetcher } = fixture(checkoutResult);
         const input = { ...checkoutRequest, sku, uiMode, automaticTax: true, adaptivePricing: true };
         await client.createCheckoutSession({ ...input, managedPayments: false });
@@ -1021,6 +1114,7 @@ describe('additional endive mappings', () => {
     });
 
     it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1', 'ai_pack_10_v1', 'ai_pack_25_v1'])('never sends payment_method_types for %s with either merchant mode', async sku => {
+        if (sku.startsWith('ai_pack_')) configurePackForTest(sku);
         const isV2 = sku.endsWith('_v2');
         const price = sku === 'standard_monthly_v2' ? standardPrice : computePrice;
         const { client, fetcher } = sequence(...(isV2 ? [{ data: [price] }] : []), checkoutResult, checkoutResult);

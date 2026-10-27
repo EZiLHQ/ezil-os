@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 
+import rebase_app
 import rebase_manifest as release
 
 ACCOUNT = "452630323510"
@@ -393,6 +394,12 @@ def versioned_ami_changes(cs, resources, template_changes, reviewed_base_change=
             # for a property whose change comes from a reference; accept it only when that
             # same property is already explained by an allowed reference in this change.
             expected |= source == "DirectModification" and detail.get("Evaluation") == "Dynamic" and name in explained
+            # A maintenance bake clears PreviousDesktopImage*: live CloudFormation (2026-10-27) reports the
+            # emptied Components value as Static/DirectModification with no cause and no ParameterReference.
+            # Accept exactly that: an empty after-value on a property already explained by an allowed reference.
+            expected |= (logical == recipe and name == "Components" and source == "DirectModification"
+                         and detail.get("Evaluation") == "Static" and cause == "" and not target.get("AfterValue")
+                         and name in explained)
             need(expected, "unexpected versioned Image Builder property change")
         need(direct <= targets, "change set omits synthesized property changes")
         if logical in (component, recipe):
@@ -895,14 +902,14 @@ def edit_release_secret(envelope, before, after, records):
     """CAS the complete tuple and append immutable records; capacity fails closed.
 
     Retaining ALL records satisfies placement/job retention without racing the DB.
-    A separately reviewed garbage collector is required when sixteen slots are full.
+    A separately reviewed garbage collector is required when nineteen slots are full.
     """
     updated = edit_secret(envelope, before, after)
     raw = updated[KEY]
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 16, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= 24, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
@@ -914,7 +921,7 @@ def edit_release_secret(envelope, before, after, records):
         need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 16, "release registry full; retained placement/job evidence must never be dropped")
+    need(1 <= len(retained) <= 24, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.
@@ -922,6 +929,9 @@ def edit_release_secret(envelope, before, after, records):
         need(len(targets) == 1, "target release is not unique")
         release.validate(targets[0], repository=REPOSITORY)
     d["releases"] = retained
+    readback = {"gitSha": "0" * 40, "killSwitch": "1", "deployment": rebase_app.public_deployment(d)}
+    need(len(json.dumps(readback, separators=(",", ":")).encode("utf-8")) <= 24000,
+         'release registry readback exceeds SSM 24000-byte limit')
     updated[KEY] = json.dumps(deployments, separators=(",", ":")) if isinstance(raw, str) else deployments
     return updated
 

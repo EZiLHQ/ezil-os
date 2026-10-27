@@ -7,6 +7,11 @@ const sub = (sku: string, status = 'active'): SubscriptionRow => ({ sku, status,
     currentPeriodStart: new Date('2026-10-10Z'), currentPeriodEnd: new Date('2026-11-10Z'), cancelAtPeriodEnd: false });
 
 describe('v3 catalog', () => {
+    it('grants the paid plan price in credits at ten cents each and keeps Free unchanged', () => {
+        expect(publicOffers().map(offer => offer.aiCredits)).toEqual([
+            { amount: 100, per: 'once' }, { amount: 200, per: 'period' }, { amount: 1000, per: 'period' },
+        ]);
+    });
     it.each([['2026-10-01T00:00:00Z', 1656000], ['2026-10-11T00:00:00Z', 828000],
         ['2026-10-21T00:00:00Z', 0], ['2026-10-22T00:00:00Z', 0], ['2026-09-30T00:00:00Z', 1656000]])(
         'prorates only the 460-hour difference at %s', (effectiveAt, expected) => {

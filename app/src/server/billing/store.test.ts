@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { and, count, eq, isNull, lt } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as schema from '@/server/db/schema';
 import {
@@ -16,9 +16,27 @@ import {
 } from '@/server/db/schema';
 import type { BillingStore, GrantInsert, SubscriptionUpsert } from './ports';
 import { createBillingStore } from './store';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { aiTopupOutboxItem, hasAiReversals, planAiReversal } from './ai-credits';
+import { findPack } from './catalog';
+import { billingGrants } from '@/server/db/schema/billing';
+import type { GrantRow } from './ports';
 
 type Database = typeof import('@/server/db').db;
 const instant = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000);
+
+describe('billing inbox receipt comparison without a database connection', () => {
+    const receipt = { eventId: 'event', type: 'invoice.paid', livemode: false, payloadSha256: 'a'.repeat(64) };
+    it.each([{ payloadSha256: 'b'.repeat(64) }, { type: 'invoice.updated' }, { livemode: true }])('conflicts on changed receipt fields %j even before processing', async change => {
+        for (const processedAt of [null, instant(1)]) {
+            const returning = vi.fn().mockResolvedValue([]);
+            const limit = vi.fn().mockResolvedValue([{ ...receipt, processedAt, outcome: 'applied' }]);
+            const db = { insert: () => ({ values: () => ({ onConflictDoNothing: () => ({ returning }) }) }),
+                select: () => ({ from: () => ({ where: () => ({ limit }) }) }) } as unknown as Database;
+            expect(await createBillingStore(db).recordEvent({ ...receipt, ...change })).toBe('conflict');
+        }
+    });
+});
 
 /**
  * Run against a disposable migrated database. A single connection keeps each
@@ -112,7 +130,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
             expect(await store.recordEvent(event)).toBe('processed');
         }
         await store.markEventProcessed(event.eventId, 'ignored_not_failed');
-        expect(await store.recordEvent({ ...event, type: 'changed', payloadSha256: 'b'.repeat(64) })).toBe('processed');
+        expect(await store.recordEvent({ ...event, type: 'changed', payloadSha256: 'b'.repeat(64) })).toBe('conflict');
         const [unchanged] = await db.select().from(billingEvents).where(eq(billingEvents.eventId, event.eventId));
         expect(unchanged).toMatchObject(event);
 
@@ -329,5 +347,87 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
         const history = await db.select().from(billingStorageSamples).where(eq(billingStorageSamples.userId, userId));
         expect(history).toHaveLength(4);
         expect(history).toEqual(expect.arrayContaining([expect.objectContaining({ ...newest, source: 'storage' })]));
+    });
+});
+
+
+describe('atomic canonical restore store without a database connection', () => {
+    function fixture() {
+        const original: GrantRow = { id: 'original', userId: 'user', subscriptionId: null, meter: 'ai_usd_micro', kind: 'topup',
+            amount: BigInt(10_000_000), sourceType: 'payment_intent', sourceId: 'pi_test',
+            periodStart: instant(0), periodEnd: instant(100), createdAt: instant(0) };
+        const root = aiTopupOutboxItem('user', { ...findPack('ai_pack_10_v1')!, aiCredits: 1234 }, 'pi_test', original.periodEnd!)!;
+        root.payload.accountPublicId = 'payer';
+        const input = { action: 'restore' as const, userId: 'user', customerId: 'cus_test', chargeId: 'ch_test',
+            causeId: 'dp_test', originals: [original], receipts: [root] };
+        const suspend = planAiReversal({ ...input, action: 'suspend' }, { originals: [original], corrections: [], receipts: [root] });
+        const negative: GrantRow = { ...suspend.grants[0]!, subscriptionId: null, id: 'suspend', createdAt: instant(1) };
+        const selects: unknown[][] = [[{ userId: 'user' }], [original], [root, ...suspend.outbox], [negative]];
+        const applied: { table: unknown; value: unknown }[] = [];
+        const execute = vi.fn().mockResolvedValue([]);
+        const insert = vi.fn((table: unknown) => ({ values: (value: unknown) => ({ onConflictDoNothing: () => ({
+            returning: async () => { applied.push({ table, value }); return [{ id: 'inserted' }]; },
+        }) }) }));
+        const readWhere = vi.fn(async (_query: unknown) => selects.shift() ?? []);
+        const tx = { execute, select: () => ({ from: () => ({ where: readWhere }) }), insert };
+        const transaction = vi.fn(async (run: (tx: unknown) => Promise<unknown>) => {
+            const count = applied.length;
+            try { return await run(tx); } catch (error) { applied.splice(count); throw error; }
+        });
+        const db = { transaction, insert: vi.fn(() => { throw new Error('must use transaction'); }) } as unknown as Database;
+        const store = createBillingStore(db);
+        if (!hasAiReversals(store)) throw new Error('missing restore port');
+        return { input, store, selects, applied, transaction, execute, insert, db, readWhere };
+    }
+    it('locks the dispute then root, revalidates in the transaction and inserts both effects there', async () => {
+        const f = fixture();
+        expect(await f.store.recordAiReversal(f.input)).toBe('applied');
+        expect(f.transaction).toHaveBeenCalledTimes(1);
+        expect(f.db.insert).not.toHaveBeenCalled();
+        const locks = f.execute.mock.calls.map(([query]) => new PgDialect().sqlToQuery(query));
+        expect(locks.map(q => q.params[0])).toEqual(['billing:ai_cause:dispute:dp_test', `billing:ai_root:${f.input.receipts[0]!.payload.entitlementId}`]);
+        expect(locks.every(q => q.sql.includes('pg_advisory_xact_lock'))).toBe(true);
+        expect(f.applied.map(a => a.table)).toEqual([billingGrants, billingOutbox]);
+        expect(f.applied[0]!.value).toMatchObject({ kind: 'restore', sourceId: 'dp_test', amount: BigInt(10_000_000) });
+        expect(f.applied[1]!.value).toMatchObject({ kind: 'ai_restore' });
+    });
+    it('loads earlier dispute corrections for a different refund cause and commits a zero local delta plus terminal event', async () => {
+        const f = fixture();
+        expect(await f.store.recordAiReversal({ ...f.input, action: 'revoke', causeId: 're_terminal' })).toBe('applied');
+        const query = new PgDialect().sqlToQuery(f.readWhere.mock.calls[3]![0] as Parameters<PgDialect['sqlToQuery']>[0]);
+        expect(query.params).toEqual(['refund', 're_terminal', 'dispute', 'dp_test']);
+        expect(f.applied[0]!.value).toMatchObject({ kind: 'revoke', sourceType: 'refund', sourceId: 're_terminal', amount: BigInt(0) });
+        expect(f.applied[1]!.value).toMatchObject({ kind: 'ai_revoke',
+            eventKey: `${f.input.receipts[0]!.payload.entitlementId}:revoke:refund:re_terminal`,
+            payload: { accountPublicId: 'payer', localDeltas: [{ originalGrantId: 'original', meter: 'ai_usd_micro', amount: '0' }] } });
+    });
+    it('rolls back the zero local audit when its distinct terminal refund insert conflicts', async () => {
+        const f = fixture();
+        f.insert.mockImplementationOnce(table => ({ values: value => ({ onConflictDoNothing: () => ({
+            returning: async () => { f.applied.push({ table, value }); return [{ id: 'local' }]; },
+        }) }) })).mockImplementationOnce(() => ({ values: () => ({ onConflictDoNothing: () => ({ returning: async () => [] }) }) }));
+        await expect(f.store.recordAiReversal({ ...f.input, action: 'revoke', causeId: 're_terminal' })).rejects.toThrow('ai_reversal_receipt_conflict');
+        expect(f.applied).toEqual([]);
+    });
+    it('reviews an unproven local history without creating another negative or compensating positive', async () => {
+        const f = fixture();
+        // A receipt without its local correction must not be treated as an available allowance.
+        f.selects[3] = [];
+        expect(await f.store.recordAiReversal({ ...f.input, action: 'revoke', causeId: 're_terminal' })).toBe('review:local_reversal_mismatch');
+        expect(f.insert).not.toHaveBeenCalled();
+    });
+    it('rolls back when the outbox key conflicts after the local insert', async () => {
+        const f = fixture();
+        f.insert.mockImplementationOnce(table => ({ values: value => ({ onConflictDoNothing: () => ({
+            returning: async () => { f.applied.push({ table, value }); return [{ id: 'local' }]; },
+        }) }) })).mockImplementationOnce(() => ({ values: () => ({ onConflictDoNothing: () => ({ returning: async () => [] }) }) }));
+        await expect(f.store.recordAiReversal(f.input)).rejects.toThrow('ai_reversal_receipt_conflict');
+        expect(f.applied).toEqual([]);
+    });
+    it.each(['owner', 'suspend'])('performs no insert when the fresh %s check fails', async defect => {
+        const f = fixture();
+        f.selects[defect === 'owner' ? 0 : 3] = [];
+        expect(await f.store.recordAiReversal(f.input)).toBe(defect === 'owner' ? 'review:customer_mismatch' : 'review:restore_mismatch');
+        expect(f.insert).not.toHaveBeenCalled();
     });
 });

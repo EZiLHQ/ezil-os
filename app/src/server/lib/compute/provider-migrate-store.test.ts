@@ -83,6 +83,32 @@ describe('restore tokens', () => {
 });
 
 describe('migration persistence', () => {
+    it('reads restore progress and treats rows without accounting as unmeasured', async () => {
+        expect((await migration()).restoreProgress).toBeNull();
+        const progress = { workspace: '01'.padEnd(128, '0'), system: '0'.repeat(128), bytes: 123, first: now.toISOString(), last: now.toISOString() };
+        expect((await setup([[{ ...row, restore_progress: progress }]]).store.readById(G))?.restoreProgress).toEqual(progress);
+    });
+    it.each(['workspace', 'system'] as const)('records %s using one atomic update and the saved head size without touching lifecycle CAS', async kind => {
+        const m = { ...await migration(), workspaceHead: { generation: G, chunks: [{ size: 123 }] }, systemHead: { generation: C, chunks: [{ size: 456 }] } };
+        const f = setup();
+        await f.store.recordRestoreChunk(m, kind, 0);
+        expect(f.queries).toHaveLength(1);
+        const q = f.queries[0]!;
+        expect(q.sql).toMatch(/^UPDATE public.ezil_compute_migrations SET restore_progress =/);
+        expect(q.sql).toMatch(/CASE WHEN get_bit\([\s\S]* = 0 THEN /);
+        expect(q.sql).toContain('encode(set_bit(');
+        expect(q.sql).not.toMatch(/SELECT|updated_at/);
+        expect(q.sql).toMatch(/WHERE id = [\s\S]* AND generation = /);
+        expect(q.params).toContain(kind === 'workspace' ? 123 : 456);
+        expect(q.params).toContain(kind);
+        expect(q.params).toContain(now.toISOString());
+    });
+    it.each([-1, 512, 0.5, NaN, 1])('rejects invalid or missing stored chunk %s before writing', async index => {
+        const f = setup();
+        await expect(f.store.recordRestoreChunk({ ...await migration(), workspaceHead: { generation: G, chunks: [{ size: 123 }] } }, 'workspace', index))
+            .rejects.toThrow('invalid_restore_chunk');
+        expect(f.queries).toHaveLength(0);
+    });
     it('CAS guards reservation release and binds JSON text with an explicit jsonb cast', async () => {
         const m = { ...await migration(), state: 'failed_reopened' as const }, f = setup();
         const provision = { placement: { instanceId: null }, released: true };

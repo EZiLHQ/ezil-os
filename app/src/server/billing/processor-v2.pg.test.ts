@@ -91,6 +91,7 @@ function fakeStripe() {
     }
     const unused = async (): Promise<never> => { throw new Error('Unexpected Stripe API operation'); };
     const api: StripeApi = {
+        listProducts: unused, retrieveProduct: unused, retrievePackPrice: unused, retrieveCoupon: unused, retrieveCheckoutLineItems: unused,
         resolvePrice: unused, previewUpgrade: unused, confirmUpgrade: unused, scheduleDowngrade: unused, cancelScheduledChange: unused, setCancelAtPeriodEnd: unused,
         retrieveSubscription: async id => read(subscriptions, id), retrieveInvoice: async id => read(invoices, id),
         retrieveInvoicePaymentState: async id => paymentStates.get(id) ?? 'failed',

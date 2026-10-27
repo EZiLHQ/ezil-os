@@ -1,4 +1,5 @@
 import { reconcilePoolReleaseRecovery } from './aws-pool-release-recovery';
+import { failStalledPoolAdopt, reconcileStalledPoolAdopt, replaceStalledPoolAdopt } from './aws-pool-adopt-stall';
 import { replacementNeverLaunched, replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
 import { failPoolOpenRelease, isPoolOpenRelease, POOL_OPEN_RELEASE_FAILED, recoverRefusedAdopt } from './aws-pool-recovery';
 import { createProviderMigrationStore } from './provider-migrate-store';
@@ -29,6 +30,7 @@ import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    failUnenrolledPlacement,
     INSTANCE_LOST,
     INSTANCE_LOST_VOLUME_MISSING,
     LIFECYCLE_START_FAILED,
@@ -240,6 +242,7 @@ export async function startLifecycleJob(
  * recovery for the frequent stop-settlement pass.
  */
 export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment, options: { terminalOnly?: boolean } = {}): Promise<void> {
+    if (!options.terminalOnly && await reconcileStalledPoolAdopt(deps, p0, deployment)) return;
     if (!options.terminalOnly && await reconcilePoolReleaseRecovery(deps, p0, deployment)) return;
     // Migration provision receipts restore a host, but cannot open a normal epoch before commit.
     let migrationCommitted = false;
@@ -280,9 +283,17 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     const close: UsageEffect = { kind: 'close', observedBy: USAGE_OBSERVER };
     let p: Placement | null = p0;
     const enrolled = (x: Placement) => (x.lastError === ENROLLMENT_SUCCEEDED || (migrationCommitted && x.lastError === p0.lastError)) && x.enrollNonceHash === null && x.instanceId !== null;
-    // A receipt already applied (job cleared): MOUNTING waits only for the host's enrollment.
+    // A receipt already applied (job cleared): bound the wait for the host's enrollment.
     if (p.state === 'MOUNTING' && p.lifecycleJobId === null) {
         if (enrolled(p)) await step(p, 'RUNNING');
+        else if (!options.terminalOnly) {
+            const observedAt = (deps.now ?? deps.clock ?? (() => new Date()))();
+            const result = await failUnenrolledPlacement(deps.db, p, observedAt);
+            if (result.ok) console.warn('[enroll-timeout]', {
+                computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch,
+                enrollExpiresAt: p.enrollExpiresAt, observedAt,
+            });
+        }
         return;
     }
     const waiting: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING', 'UNCONFIRMED'];
@@ -397,6 +408,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
             if (p.state === 'STARTING') p = await step(p, 'MOUNTING');
             if (p) await step(p, 'RUNNING', done, usage);
         } else {
+            if (!options.terminalOnly && await failStalledPoolAdopt(deps, p, e)) return;
             await publishAttachedPoolClaim(deps.db, p, r.volumeId, tx => deps.pool!.publishPoolClaim(tx,
                 poolWork.poolHostId!, { computerId: p!.computerId, generation: p!.generation,
                     leaseEpoch: p!.leaseEpoch, fence: p!.fenceToken!, volumeSerial: r.volumeId.replace('-', '') },
@@ -480,6 +492,8 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
 // ── Guest-initiated idle stop (R9) ───────────────────────────────────────
 
 export interface GuestStopDeps extends ReceiptDeps {
+    /** Supplied only by background reconciliation, for an admitted retry of a stalled open. */
+    recoveryEnv?: Env;
     /**
      * Read-only EC2 describe in the placement's region (the app caller's enrollment describer).
      * `describeVolume` lets a lost instance be recovered onto its retained volume; without it a
@@ -745,6 +759,7 @@ export async function reconcileAwsFleet(
             await applyLifecycleReceipt(deps, record, deployment);
             const { record: now } = await readPlacement(deps.db, computerId);
             if (!now) continue;
+            if (deps.recoveryEnv) await replaceStalledPoolAdopt(deps, now, deps.recoveryEnv);
             if (await reconcileGuestStop(deps, now, deployment)) {
                 stopsStarted += 1;
                 continue;
@@ -989,7 +1004,7 @@ export async function runAwsBackgroundReconcile(
     // Reached hour caps are stopped here too, for computers nobody touches (a lapsed lease alone is not: reconcileAwsFleet).
     const fleet = deps.signal?.aborted
         ? { checked: 0, stopsStarted: 0, limitStops: 0 }
-        : await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
+        : await reconcileAwsFleet({ ...deps, recoveryEnv: env }, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
     return { ok: true, deleted, fleet };
 }
 

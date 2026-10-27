@@ -40,7 +40,7 @@
  * per window-open, instead.
  */
 
-import { readBillingConfig, type BillingConfig } from '@/server/billing/config';
+import { readBillingConfig, stripeMode, type BillingConfig } from '@/server/billing/config';
 import type { NativeRuntime } from '../../../../native/src/contract';
 
 /** Structural input keeps this shared transport independent of database packages. */
@@ -294,7 +294,7 @@ export interface ShellBootPayload {
     desktopState: ShellDesktopState;
     /**
      * Opt-in shell features. ABSENT unless one is on, so a deploy with every
-     * billing flag unset serves exactly the payload it did before billing
+     * feature off serves exactly the payload it did before billing
      * existed (docs/billing/CONTRACT.md §6).
      */
     features?: ShellBootFeatures;
@@ -302,12 +302,17 @@ export interface ShellBootPayload {
 
 export interface ShellBootFeatures {
     /** Settings → Billing tab (`BILLING_TAB_ENABLED=1`). */
-    billing: true;
+    billing?: true;
+    /** Progress diagnostics, only in Stripe test mode. */
+    devDetails?: true;
 }
 
 /** `features` for the current environment, or undefined when none is on. */
 export function shellBootFeatures(config: BillingConfig = readBillingConfig()): ShellBootFeatures | undefined {
-    return config.tabEnabled ? { billing: true } : undefined;
+    const features: ShellBootFeatures = {};
+    if (config.tabEnabled) features.billing = true;
+    if (stripeMode(config).mode === 'test') features.devDetails = true;
+    return Object.keys(features).length ? features : undefined;
 }
 
 /** The same payload with no computer — the read-only `GET /api/shell/session` answer. */

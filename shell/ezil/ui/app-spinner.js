@@ -1,7 +1,7 @@
 // EZiL app loading surface. Physical app readiness remains owned by the caller.
 // Hosted computers also show protected, read-only computer.progress observations.
 // Paused/operator/queued states override recorded migration intent; none animate.
-// The separate observer owns polling and disposal, never allocation or fake progress.
+// The separate observer owns polling, estimated timing and disposal, never allocation.
 // Without an authoritative observation, do not infer a transfer from launch flags.
 // Native/local callers retain the original BootUiState and retry behavior.
 
@@ -80,12 +80,16 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
      */
     function render (state) {
         latestState = state;
-        root.setAttribute('data-kind', state.kind);
         const pending = state.kind === 'progress' || state.kind === 'failed';
         if (pending) observer?.start(); else {
             observer?.stop(); observation = null; progressChecked = false;
         }
-        const showObservation = pending && observation && (state.kind === 'progress' || ['operations_paused', 'needs_operator', 'queued'].includes(observation.stage));
+        const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
+        const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws && observation.elapsed >= 600;
+        root.setAttribute('data-kind', activeTimeout ? 'progress' : state.kind);
+        root.classList.toggle('ezil-app-spinner-running-long', !!runningLong);
+        const showObservation = pending && observation && (state.kind === 'progress' || activeTimeout
+            || ['operations_paused', 'needs_operator', 'queued', 'failed_reopened'].includes(observation.stage));
         const fingerprint = showObservation ? JSON.stringify([state.kind, observation]) : null;
         if (fingerprint !== null && fingerprint === paintedObservation) return;
         paintedObservation = fingerprint;
@@ -93,20 +97,43 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         if (showObservation) {
             el_ring.hidden = !observation.active;
             el_label.textContent = observation.title;
-            el_sub.hidden = false; el_sub.textContent = observation.body;
-            el_actions.hidden = !(observation.stage === 'failed_reopened'
+            el_sub.hidden = false; el_sub.textContent = runningLong
+                ? "This is taking longer than usual. We're still working on it — you can keep this open or come back later." : observation.body;
+            el_actions.hidden = !(runningLong || observation.stage === 'failed_reopened'
                 || (state.kind === 'failed' && observation.stage === 'needs_operator' && !observation.manualAttention));
             el_detail.replaceChildren(); el_detail.hidden = false;
             if (observation.steps.length) {
-                const list = document.createElement('ol'); list.setAttribute('aria-label', 'Saved migration stages');
+                const list = document.createElement('ol'); list.setAttribute('aria-label', observation.stepsLabel);
                 for (const step of observation.steps) {
                     const item = document.createElement('li'); item.textContent = step.label; item.dataset.state = step.state;
+                    if (step.state === 'complete') {
+                        const tick = document.createElement('span'); tick.textContent = '✓ '; tick.setAttribute('aria-hidden', 'true');
+                        item.prepend(tick);
+                    }
                     if (step.state === 'current') item.setAttribute('aria-current', 'step');
                     list.appendChild(item);
                 }
                 el_detail.appendChild(list);
             }
-            for (const text of [observation.guidance, observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : '']) {
+            if (observation.reassurance) {
+                const line = document.createElement('p'); line.textContent = observation.reassurance; el_detail.appendChild(line);
+            }
+            if (observation.transfer) {
+                const line = document.createElement('p'); line.textContent = observation.transfer.bytes; el_detail.appendChild(line);
+            }
+            if (observation.meter) {
+                const { percent, estimated } = observation.meter;
+                const bar = document.createElement('progress'); bar.max = 100;
+                bar.setAttribute('aria-label', estimated ? 'Estimated progress' : observation.transfer ? 'Moving your files' : 'Computer ready');
+                if (percent !== null) {
+                    const line = document.createElement('p'); line.textContent = `${estimated ? 'Estimated: ' : ''}${percent}%`; el_detail.appendChild(line);
+                    bar.value = percent;
+                    bar.setAttribute('aria-valuenow', String(percent));
+                    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
+                }
+                el_detail.appendChild(bar);
+            }
+            for (const text of [observation.countdown, observation.guidance, observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : '']) {
                 if (!text) continue;
                 const line = document.createElement('p'); line.textContent = text; el_detail.appendChild(line);
             }

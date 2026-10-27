@@ -57,6 +57,7 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         // Minimal fixtures for existing billing tables; production migrations require auth.users.
         // The real provider-migration table: capacity-demand reauthorization reads it through the production store.
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0006_compute_migrations.sql'), 'utf8')));
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0010_migration_restore_progress.sql'), 'utf8')));
         await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz, created_at timestamptz NOT NULL DEFAULT now());
             CREATE TABLE ${schema}.test_users (id uuid PRIMARY KEY, deleted_at timestamptz, banned_until timestamptz);
             CREATE TABLE ${schema}.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);

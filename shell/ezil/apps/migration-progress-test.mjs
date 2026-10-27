@@ -17,9 +17,9 @@ const copies = {
     attention: ['Computer needs attention', 'Check the computer’s current status before trying again.'],
     unavailable: ['Opening', 'Detailed computer progress is unavailable.'],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
-    moving: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
-    launching: ['Starting computer', 'Startup is in progress. A finish time is not available.'],
-    both: ['Preparing computer', 'Waiting for the new computer before restoring the saved workspace.'],
+    moving: ['Getting your AWS computer', 'Waiting for the new computer before restoring the saved workspace.'],
+    launching: ['Starting your desktop', 'Your AWS computer is on its way. Your desktop will open as soon as it is ready.'],
+    both: ['Getting your AWS computer', 'Waiting for the new computer before restoring the saved workspace.'],
 };
 
 async function open(t, app, initialMode = 'moving') {
@@ -93,6 +93,10 @@ for (const app of ['code', 'desktop', 'preview']) {
         assert.equal(h.spinner.querySelector('.ezil-app-spinner-ring').hidden, false);
         assert.match(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, /progress is unavailable/);
         assert.doesNotMatch(h.spinner.textContent, /Moving your computer/);
+        h.setNow(480_000);
+        await until(() => h.spinner.dataset.kind === 'failed');
+        assert.match(h.spinner.textContent, /This is taking too long/);
+        assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, false);
     });
     test(`${app}: authoritative pause wins over recorded migration and hides active transfer`, async t => {
         const h = await open(t, app, 'paused');
@@ -113,8 +117,9 @@ for (const app of ['code', 'desktop', 'preview']) {
             await wait(20);
             assert.equal(h.spinner.dataset.kind, 'progress');
             h.setMode('waking');
-            await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Attaching saved workspace');
-            assert.match(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, /retained workspace volume/);
+            await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Attaching your files');
+            assert.match(h.spinner.textContent, /Your files stay on your own disk/);
+            assert.equal(h.spinner.querySelectorAll('ol li').length, 3);
             if (app === 'desktop') {
                 assert.equal(h.spinner.hidden, false);
                 assert.equal(h.win.querySelector('.ezil-boot').hidden, true);
@@ -125,15 +130,27 @@ for (const app of ['code', 'desktop', 'preview']) {
             assert.ok(h.asks[app] > 1);
         });
 
-        test(`${app}: ${mode} timeout retains the existing taking-too-long and Retry path`, async t => {
+        test(`${app}: ${mode} timeout keeps active progress until the calm ten-minute retry`, async t => {
             const h = await open(t, app, mode);
             h.setNow(480_000);
-            await until(() => h.spinner.dataset.kind === 'failed');
+            await until(() => h.spinner.textContent.includes('Almost there — finishing up'));
+            assert.equal(h.spinner.dataset.kind, 'progress');
+            assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
+            assert.doesNotMatch(h.spinner.textContent, /This is taking too long/);
+            assert.equal(h.spinner.querySelector('progress').value, 95);
+            h.setNow(599_000);
+            await wait(30);
+            assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
+            h.setNow(600_000);
+            await until(() => h.spinner.querySelector('.ezil-boot-actions').hidden === false);
             const visible = [...h.win.querySelectorAll('.ezil-app-spinner, .ezil-boot')].filter(el => !el.hidden);
             assert.ok(visible.length > 0);
-            assert.ok(visible.some(el => el.textContent.includes('This is taking too long')));
-            assert.ok(visible.some(el => el.textContent.includes('background')));
+            assert.ok(visible.every(el => !el.textContent.includes('This is taking too long')));
+            assert.ok(visible.some(el => el.textContent.includes("This is taking longer than usual. We're still working on it — you can keep this open or come back later.")));
             assert.ok(visible.some(el => el.querySelector('.ezil-boot-actions')?.hidden === false));
+            h.setMode('ready');
+            h.spinner.querySelector('.ezil-boot-retry').click();
+            await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://'));
         });
     }
 

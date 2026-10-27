@@ -407,6 +407,12 @@ describe('buildSummary', () => {
     });
 });
 
+it('keeps legacy top-ups disabled without an offered catalog', () => {
+    const config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture' });
+    expect(summary({ config }).actions).toMatchObject({ checkout: true, topup: false });
+    expect(summary({ config }).catalog.packs).toEqual([]);
+});
+
 describe('open intervals that stopped heartbeating', () => {
     const window = { start: new Date('2026-10-01T00:00:00.000Z'), end: new Date('2026-11-01T00:00:00.000Z') };
     const startedAt = new Date('2026-10-10T10:00:00.000Z');

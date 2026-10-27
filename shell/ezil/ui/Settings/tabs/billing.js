@@ -5,7 +5,7 @@ import { isNative } from '../../../native-runtime.js';
 import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl } from '../billing-format.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, creditsLabel } from '../billing-format.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -196,11 +196,61 @@ function machineV3Html ({ plan, computer }) {
         </label>`).join('')}</div><p data-role="machine-status" role="status" aria-live="polite"></p></fieldset>`;
 }
 
+function aiCreditsV3Html ({ ai, actions, catalog }) {
+    const state = STATES.has(ai.state) ? ai.state : 'unavailable';
+    const packs = actions.topup === true ? catalog.packs ?? [] : [];
+    return `<section id="ai-credits" class="ezil-billing-card ezil-billing-ai-credits is-${state}" aria-labelledby="ai-credits-heading">
+        <h4 id="ai-credits-heading" tabindex="-1">AI credits</h4>
+        <p class="ezil-billing-credit-balance">${ai.balance == null ? 'Not available' : `<strong>${encode(creditsLabel(null, ai.balance))}</strong> <span>credits left</span>`}</p>
+        ${packs.length ? `<div class="ezil-billing-actions">${packs.map(pack => actionHtml('topup', `Add ${creditsLabel(null, pack.aiCredits)} credits — ${dollars(pack.totalCents, { compact: true })}`, false, pack.sku)).join('')}</div>` : ''}
+    </section>`;
+}
+
+function aiV3Html (ai) {
+    const spending = ai?.spendingState ?? 'unavailable';
+    const copy = {
+        available: ai?.balanceState === 'exhausted' ? 'No AI credits remain.'
+            : ai?.balanceState === 'low' ? 'AI credits are running low.' : 'AI spending is not paused.',
+        paused_operations: 'AI spending is paused by operations.',
+        paused_reconciliation: 'AI spending is paused while pending requests are reconciled.',
+        paused_policy: 'AI spending is paused by an account policy.',
+        unavailable: 'AI spending status is unavailable.',
+    }[spending] ?? 'AI spending status is unavailable.';
+    const limits = ai?.limits, policy = limits?.policy, counters = limits?.counters;
+    const number = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : 'Not reported';
+    const credits = value => value == null ? 'Not reported' : `${creditsLabel(value)} credits`;
+    const detail = (label, value) => `<div><dt>${encode(label)}</dt><dd>${encode(value)}</dd></div>`;
+    const recent = ai?.recentUsage;
+    return `<section class="ezil-billing-card" data-role="ai-usage" aria-label="AI credits and usage">
+        <h4>AI usage</h4>
+        ${paragraph(`Balance: ${ai?.balanceMicro != null || ai?.balance != null ? `${creditsLabel(ai.balanceMicro, ai.balance)} credits` : 'Not reported'}`, 'ezil-billing-usage')}
+        <p role="status" data-role="ai-spending" data-state="${encode(spending)}">${encode(copy)}</p>
+        ${paragraph(`Held for requests: ${credits(ai?.heldMicro)}`)}
+        ${limits?.pauses?.some(p => ['model', 'client'].includes(p.scope)) ? paragraph('Some models or clients are paused.') : ''}
+        <h4>AI limits</h4>
+        ${!limits ? paragraph('AI limits are unavailable.') : `<dl data-role="ai-limits">
+            ${detail('Requests per minute', `${number(policy?.rpm)} · service ceiling: ${number(limits.ceilings?.rpm)}`)}
+            ${detail('Concurrent requests', `${number(policy?.concurrency)} · service ceiling: ${number(limits.ceilings?.concurrency)}`)}
+            ${detail('Tokens per minute', number(policy?.tpm))}
+            ${detail('Output tokens per request', number(policy?.maxOutputTokens))}
+            ${detail('Daily commitment / budget', `${credits(counters?.dayMicro)} / ${credits(policy?.dailyBudgetMicro)}`)}
+            ${detail('Monthly commitment / budget', `${credits(counters?.monthMicro)} / ${credits(policy?.monthlyBudgetMicro)}`)}
+            ${detail('Open / pending requests', `${number(counters?.inflight)} / ${number(counters?.pending)}`)}
+        </dl>`}
+        ${paragraph('Commitments include held credits. Unreported limits are unknown.')}
+        <h4>Recent AI requests</h4>
+        ${!recent ? paragraph('Recent AI usage is unavailable.') : !recent.rows.length ? paragraph('No requests in this result.')
+            : `<ul data-role="ai-recent">${recent.rows.map(row => `<li>${encode(dateLabel(row.at, true))} · ${encode({ reserved: 'Reserved', pending: 'Pending', settled: 'Settled' }[row.status] ?? 'Unknown')}
+                · charged: ${encode(credits(row.chargedMicro))} · held: ${encode(credits(row.heldMicro))}</li>`).join('')}</ul>`}
+        ${paragraph(`Recent requests${recent ? ` (up to ${recent.limit})` : ''} are not a billing-period total.`)}
+    </section>`;
+}
+
 export function summaryV3Html (summary) {
     const { plan, computer, fairUse, actions } = summary;
     const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
     const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
-    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)} — upgrade to keep working` }[fairUse.status];
+    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status];
     const changeAction = actions.downgrade ? actionHtml('downgrade', 'Change plan')
         : actions.upgrade ? actionHtml('upgrade', 'Change plan') : actions.checkout ? actionHtml('choose', 'Change plan', true) : '';
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div>
@@ -221,6 +271,7 @@ export function summaryV3Html (summary) {
             ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
         </section>
         <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
+        ${aiCreditsV3Html(summary)}${aiV3Html(summary.ai)}
         <p class="ezil-billing-note">Prices before tax.</p>
         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3>Invoices</h3>
@@ -301,7 +352,7 @@ async function load ($win, state) {
     const history = trpc.query('billing.history').catch(() => ({ ok: false }));
     try {
         const result = await trpc.query('billing.summary');
-        if ( state.closed || ! $win.get(0).isConnected ) return;
+        if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected ) return;
         if ( ! result.ok ) throw new Error('summary failed');
         if ( result.data?.enabled === false || ! [2, 3].includes(result.data?.version) ) {
             $body.html('<p>Billing isn\'t available yet.</p>');
@@ -311,15 +362,22 @@ async function load ($win, state) {
             startCountdown($win, state);
         }
     } catch {
+        if ( request !== state.request || ! state.active || state.closed ) return;
         $body.html('<div class="ezil-billing-card ezil-settings-error" role="alert">Couldn\'t load billing. Try again. <button type="button" class="ezil-settings-btn" data-action="retry">Retry</button></div>');
     } finally {
-        state.loading = false;
-        $body.attr('aria-busy', 'false');
+        if ( request === state.request ) {
+            state.loading = false;
+            $body.attr('aria-busy', 'false');
+        }
     }
     if ( state.summary && ! state.autoOpened ) {
         state.autoOpened = true;
         const sku = state.openUpgrade;
-        if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
+        if ( state.openSection === 'ai-credits' ) {
+            const card = $body.find('#ai-credits').get(0);
+            card?.scrollIntoView?.({ block: 'nearest' });
+            card?.querySelector('h4')?.focus({ preventScroll: true });
+        } else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
             if ( state.summary.version === 3 ) openSheet($win, state, 'choose');
@@ -349,7 +407,9 @@ function openSheet ($win, state, action, sku) {
     if ( state.pending || state.sheet || state.closed || state.summary?.actions[action === 'choose' ? 'checkout' : action] !== true ) return;
     const summary = state.summary;
     const offer = action === 'checkout' ? offerFor(summary, sku) : null;
+    const pack = action === 'topup' ? summary.catalog.packs?.find(pack => pack.sku === sku) : null;
     if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return;
+    if ( action === 'topup' && (summary.version !== 3 || ! pack) ) return;
     const container = $win.find('.window-body').get(0);
     const token = {};
     state.sheet = token;
@@ -362,7 +422,8 @@ function openSheet ($win, state, action, sku) {
     actionError($win, '');
     try {
         const options = { container, trpc, onDone, onClose, checkout: params => openSheet($win, state, 'checkout', params.sku) };
-        token.handle = action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes })
+        token.handle = action === 'topup' ? upgradeSheetOpener({ ...options, sku, pack })
+            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
         const checkoutRoot = action === 'checkout' && container.ownerDocument.querySelector('[data-role="upgrade-sheet"]');
@@ -429,7 +490,7 @@ async function act ($win, state, action, value) {
                 const machine = summary.computer.machineChoice.find(machine => machine.size === result.data.size);
                 if ( ! machine || result.data.effective !== 'next_open' ) throw new Error('unavailable');
                 Object.assign(summary.computer, { size: machine.size, vcpu: machine.vcpu, memoryGiB: machine.memoryGiB });
-                $pane.find('[data-role="machine-status"]').text(`Your next session opens with ${machine.vcpu} vCPU and ${machine.memoryGiB} GiB memory. Applies after you stop this session and start again.`);
+                $pane.find('[data-role="machine-status"]').text(`Your files stay on your disk. Your next session starts on ${machine.vcpu} vCPU · ${machine.memoryGiB} GB — about 30 seconds after you stop and reopen your computer.`);
             } else if ( action === 'size' ) {
                 summary.compute.selectedSize = result.data.selectedSize;
                 $pane.find('[data-role="size-status"]').text('Size saved.');
@@ -468,14 +529,14 @@ export default {
                 <a href="/refunds" target="_blank" rel="noopener">Refund policy</a><a href="/pricing" target="_blank" rel="noopener">Plans</a></footer></div>`;
     },
     init ($win) {
-        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, timer: null, active: false, closed: false };
+        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openSection: null, timer: null, active: false, closed: false };
         windows.set($win.get(0), state);
         const $pane = $win.find('[data-pane="billing"]');
         $pane.on('click', 'button[data-action]', function () {
             if ( this.disabled ) return;
             const action = this.dataset.action;
             if ( action === 'retry' ) void load($win, state);
-            else if ( ['checkout', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
+            else if ( ['checkout', 'topup', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
             else void act($win, state, action, this.dataset.kind);
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {
@@ -497,6 +558,7 @@ export default {
         });
         $win.on('remove.billing', () => {
             state.closed = true;
+            state.request++;
             stopCountdown(state);
             state.sheet?.handle?.close();
             state.sheet?.cleanup?.();
@@ -507,11 +569,13 @@ export default {
         if ( state ) {
             state.active = true;
             state.openUpgrade ||= ctx.openUpgrade;
+            const params = new URLSearchParams(window.location.search);
+            if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) state.openSection = 'ai-credits';
             void load($win, state);
         }
     },
     onDeactivate ($win) {
         const state = $win && windows.get($win.get(0));
-        if ( state ) { state.active = false; stopCountdown(state); }
+        if ( state ) { state.active = false; state.request++; state.loading = false; stopCountdown(state); }
     },
 };

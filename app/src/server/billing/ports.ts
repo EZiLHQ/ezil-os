@@ -58,7 +58,7 @@ export interface OutboxInsert {
     /** Unique; the Gateway's idempotency key. */
     eventKey: string;
     userId: string;
-    kind: 'ai_grant' | 'ai_revoke';
+    kind: 'ai_grant' | 'ai_revoke' | 'ai_restore';
     payload: Record<string, unknown>;
 }
 
@@ -232,7 +232,7 @@ export interface BillingStore {
      * nothing); `unprocessed` = seen before but never finished (re-run: every
      * write below is idempotent, so reprocessing is safe).
      */
-    recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed'>;
+    recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed' | 'conflict'>;
     markEventProcessed(eventId: string, outcome: string): Promise<void>;
     upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale' | 'conflict'>;
     insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'>;
@@ -297,6 +297,10 @@ export interface StripeCheckoutSession {
     paymentIntentId: string | null;
     /** `metadata.sku` set by our own checkout. */
     sku: string | null;
+    /** Verified Stripe amount/currency and raw metadata for top-up reconciliation. */
+    amountTotal?: number | null;
+    currency?: string | null;
+    metadataCredits?: string | null;
 }
 
 export interface StripeCharge {
@@ -313,6 +317,7 @@ export interface CheckoutRequest {
     customerId: string;
     userId: string;
     sku: string;
+    customAmountCents?: number;
     /**
      * `embedded` (default for the OS): Stripe Embedded Checkout mounted in an
      * OS window — `ui_mode=embedded_page`, `return_url` = `returnUrl`,
@@ -357,7 +362,45 @@ export interface StripeInvoiceSummary {
 
 export type StripeInvoicePaymentState = 'paid' | 'requires_action' | 'processing' | 'failed' | 'none';
 
-export interface StripeApi {
+export interface StripePackPrice {
+    id: string;
+    productId: string | null;
+    active: boolean;
+    type: string;
+    currency: string;
+    unitAmount: number | null;
+}
+
+export interface StripeProduct {
+    id: string;
+    active: boolean;
+    defaultPrice: string | null;
+    metadata: Record<string, string>;
+}
+
+export interface StripeCoupon {
+    id: string;
+    valid: boolean;
+    percentOff: number | null;
+    amountOff: number | null;
+}
+
+export interface StripeCheckoutLineItem {
+    quantity: number | null;
+    price: StripePackPrice | null;
+}
+
+export interface StripePackApi {
+    /** Account fingerprint: reuse process caches across per-request adapters. */
+    readonly packCacheKey?: string;
+    listProducts(): Promise<StripeProduct[]>;
+    retrieveProduct(id: string): Promise<StripeProduct>;
+    retrievePackPrice(id: string): Promise<StripePackPrice>;
+    retrieveCoupon(id: string): Promise<StripeCoupon | null>;
+    retrieveCheckoutLineItems(sessionId: string): Promise<StripeCheckoutLineItem[]>;
+}
+
+export interface StripeApi extends StripePackApi {
     previewRenewal?(subscriptionId: string): Promise<{ at: Date; amountCents: number } | null>;
     resolvePrice(lookupKey: string): Promise<StripePrice>;
     previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2' | 'premium_monthly_v3'; prorationDate: number }): Promise<StripeUpgradePreview>;

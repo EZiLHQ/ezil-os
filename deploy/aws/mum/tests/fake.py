@@ -61,6 +61,9 @@ if tool == "git":
         out("blob" if args[-1].endswith("/maintenance.py") else "tree")
     elif "archive" in args:
         Path(flag("--output")).write_bytes(b"synthetic archive")
+    elif "merge-base" in args:
+        assert len(args) == 6 and args[0] == '-C' and args[2:4] == ['merge-base', '--is-ancestor']
+        raise SystemExit(scenario.get('git_ancestor_status', 0))
     else:
         raise SystemExit("unexpected git command")
 elif tool == "docker":
@@ -429,6 +432,16 @@ elif tool == "aws":
                             {"Target": {"Attribute": "Properties", "Name": "ParentImage", "RequiresRecreation": "Always"},
                              "ChangeSource": "DirectModification", "Evaluation": "Dynamic"},
                         ])
+                    if scenario.get("maintenance_static_empty"):
+                        # Live CloudFormation 2026-10-27: a maintenance bake empties PreviousDesktopImage*; the
+                        # emptied Components value is Static/DirectModification, no cause, no ParameterReference.
+                        detail = {"Target": {"Attribute": "Properties", "Name": "Components", "RequiresRecreation": "Always",
+                                             "BeforeValue": "452630323510.dkr.ecr.ap-south-1.amazonaws.com/x@sha256:" + "a" * 64,
+                                             "AfterValue": scenario.get("maintenance_static_value", "")},
+                                  "ChangeSource": "DirectModification", "Evaluation": "Static"}
+                        if scenario.get("maintenance_static_cause"):
+                            detail["CausingEntity"] = scenario["maintenance_static_cause"]
+                        cs["Changes"][1]["ResourceChange"]["Details"].append(detail)
                     if scenario.get("live_dynamic") or scenario.get("dynamic_unexplained"):
                         # Real CloudFormation also lists value-only Dynamic entries for referenced properties.
                         dyn = lambda name, rec: {"Target": {"Attribute": "Properties", "Name": name, "RequiresRecreation": rec}, "ChangeSource": "DirectModification", "Evaluation": "Dynamic"}

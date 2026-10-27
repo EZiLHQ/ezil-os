@@ -50,6 +50,41 @@ describe('gateway transport', () => {
         expect(new Headers(s.posts()[0]!.init.headers).get('accept')).toBe('application/json');
         expect(events.map(e => e.type)).toEqual(['text', 'thinking', 'tool_call', 'text', 'usage', 'stop']);
     });
+    for (const stream of [true, false]) test(`clamped ${stream ? 'SSE' : 'JSON'} output logs one balance notice without changing events`, async () => {
+        const s = server(() => {
+            const response = stream ? ok() : json(messageJson());
+            response.headers.set('x-ezil-output-limit-clamped', '512');
+            response.headers.set('x-ezil-output-limit-requested', '8192');
+            return response;
+        });
+        const logs: string[] = [];
+        const events = await run(s.fetch, { logs, model: { ...gw(), stream } });
+        expect(logs).toHaveLength(2);
+        expect(logs[0]).toBe('Reply limited to 512 tokens to fit your credit balance');
+        expect(JSON.parse(logs[1]!).error_code).toBeNull();
+        expect(events).toEqual(await run(server(() => stream ? ok() : json(messageJson())).fetch, { model: { ...gw(), stream } }));
+    });
+    for (const [clamped, requested] of [[null, null], ['512', null], [null, '8192'], ['8192', '8192'], ['8193', '8192'],
+        ['invalid', '8192'], ['512', 'invalid'], ['0', '8192'], ['-1', '8192'], ['1.5', '8192'], ['512', '8192.5'],
+        ['512', 'Infinity'], ['9007199254740992', '9007199254740994']] as const) {
+        test(`no clamp notice for headers ${clamped}/${requested}`, async () => {
+            const s = server(() => {
+                const response = ok();
+                if (clamped !== null) response.headers.set('x-ezil-output-limit-clamped', clamped);
+                if (requested !== null) response.headers.set('x-ezil-output-limit-requested', requested);
+                return response;
+            });
+            const logs: string[] = [];
+            await run(s.fetch, { logs });
+            expect(logs).toHaveLength(1); expect(JSON.parse(logs[0]!).error_code).toBeNull();
+        });
+    }
+    test('refusal headers do not report a clamped reply', async () => {
+        const logs: string[] = [];
+        const s = server(() => error(402, 'insufficient_credits', {}, { 'x-ezil-output-limit-clamped': '512', 'x-ezil-output-limit-requested': '8192' }));
+        await expect(run(s.fetch, { logs })).rejects.toThrow('Not enough AI credits');
+        expect(logs).toHaveLength(1); expect(JSON.parse(logs[0]!).error_code).toBe('insufficient_credits');
+    });
     test('one fresh UUID per provider call', async () => {
         const s = server(() => ok());
         for (let i = 0; i < 2; i++) for await (const _ of gatewayChat(gw(), ask(), { signal: new AbortController().signal, fetch: s.fetch })) { /* drain */ }
@@ -156,7 +191,7 @@ describe('gateway errors and credits', () => {
         expect(error.retryAfterSeconds).toBe(0);
     });
     for (const [status, code, text] of [
-        [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'grant'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
+        [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'no AI credits left'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
         [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS refused this computer'],
         [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'Conversation too large — start a new chat'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
@@ -179,8 +214,37 @@ describe('gateway errors and credits', () => {
     });
     test('available credits and nested auth reason; raw messages never shown', () => {
         const e = describeGatewayError('qwen', 402, null, parseErrorBody('{"type":"error","error":{"code":"insufficient_credits","available_micro":1500000,"message":"secret"}}'), 'req');
-        expect(e.message).toContain('Available credits: 1.5'); expect(e.message).not.toContain('secret');
+        expect(e.message).toContain('Available credits: 1.50.'); expect(e.message).not.toContain('secret');
         expect(describeGatewayError('', 401, null, { code: 'unauthorized', reason: 'no_ezil_role' }, 'req').message).toContain('no AI access yet');
+    });
+    for (const tokens of [undefined, null, 0, 512]) test(`credit refusal explains the full hold with affordable output ${tokens}`, () => {
+        const body = parseErrorBody(JSON.stringify({ error: { code: 'insufficient_credits', available_micro: 63_092_750,
+            hold_micro: 80_126_789, floor_hold_micro: 64_000_000, max_affordable_output_tokens: tokens, no_live_grant: false } }));
+        const e = describeGatewayError('qwen', 402, null, body, 'req');
+        expect(e.message).toBe('EZiL AI: This request needs up to 80.13 credits, and you have 63.09. Add credits, or start a new chat or pick a smaller model to use less.'
+            + (tokens ? ' A shorter reply would fit; try again or reduce the conversation.' : '') + ' (request req)');
+        expect(e.message).not.toContain('63.09275');
+    });
+    for (const body of [{ code: 'no_live_grant' }, { code: 'insufficient_credits', no_live_grant: true }]) {
+        test(`no live grant gives the add-credits message for ${body.code}`, () => {
+            const e = describeGatewayError('qwen', 402, null, { ...body, available_micro: 0, hold_micro: 80_000_000 }, null,
+                { available_micro: 0, held_micro: 0, grants: [] });
+            expect(e.message).toBe('EZiL AI: You have no AI credits left. Add credits to continue.');
+        });
+    }
+    test('legacy refusal uses the measured balance and displays exactly two decimals', () => {
+        const e = describeGatewayError('qwen', 402, null, { code: 'insufficient_credits' }, null,
+            { available_micro: 63_092_750, held_micro: 0, grants: [] });
+        expect(e.message).toBe('EZiL AI: Not enough AI credits for this request. Available credits: 63.09. Add credits, or start a new chat or pick a smaller model to use less.');
+        expect(describeGatewayError('qwen', 402, null, { code: 'insufficient_credits', available_micro: 0, hold_micro: 1_000_000 }, null).message)
+            .toContain('up to 1.00 credits, and you have 0.00.');
+    });
+    test('missing or null credit measurements are not invented', () => {
+        for (const available_micro of [undefined, null]) {
+            const body = parseErrorBody(JSON.stringify({ error: { code: 'insufficient_credits', available_micro, hold_micro: null } }));
+            expect(describeGatewayError('qwen', 402, null, body, null).message)
+                .toBe('EZiL AI: Not enough AI credits for this request. Available credits: Not measured. Add credits, or start a new chat or pick a smaller model to use less.');
+        }
     });
     test('model catalog cached for five minutes and scoped by provider identity', async () => {
         const s = server(() => json(catalog)); const provider = gw().provider;

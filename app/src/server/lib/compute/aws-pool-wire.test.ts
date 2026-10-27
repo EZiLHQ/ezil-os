@@ -313,7 +313,7 @@ it('replays a missing retirement execution with the exact saved job and input', 
 it('release and nonce SQL preserve instance, epoch and single-use guards', async () => {
     const h = harness();
     await data.retirePoolLease(h.db, h.f.p);
-    expect(h.trace.at(-1)).toMatch(/state = 'leased'.*instance_id[\s\S]*leased_computer_id[\s\S]*claim_generation[\s\S]*claim_lease_epoch/);
+    expect(h.trace.at(-1)).toMatch(/state IN \('leased', 'retiring'\).*instance_id[\s\S]*leased_computer_id[\s\S]*claim_generation[\s\S]*claim_lease_epoch/);
     await placement.savePoolEnrollmentNonce(h.db, h.f.p, { nonceHash: 'a'.repeat(64), expiresAt: NOW });
     expect(h.trace.at(-1)).toMatch(/generation =[\s\S]*lease_epoch =[\s\S]*instance_id =[\s\S]*enroll_consumed_hash IS NULL AND enroll_nonce_hash IS NULL/);
 });

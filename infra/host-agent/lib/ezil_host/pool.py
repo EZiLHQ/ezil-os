@@ -21,6 +21,7 @@ from .fsops import DIR_FLAGS, Refused, read_regular_at
 EPOCH_FILE = "pool-epoch.json"       # host root disk; survives reboots, never guest-visible
 POLL_SECONDS = 1.0
 READY_POLL_SECONDS = 0.25
+REFRESH_RETRY_SECONDS = 20
 TIMING_FILE = "pool-session-timing.json"
 TIMING_PHASES = ("claimObservedMs", "guardDoneMs", "enrollDoneMs", "warmStoppedMs",
                  "relayAvailableMs", "desktopStartedMs", "desktopHealthyMs")
@@ -106,7 +107,7 @@ class Client:
         with open(os.path.join(cfg.runDir, "identity.json"), encoding="utf-8") as f:
             self.identity = json.load(f)
 
-    def request(self, method, endpoint, payload=None):
+    def request(self, method, endpoint, payload=None, *, retry_seconds=None):
         headers = {
             "Accept": "application/json", "Cache-Control": "no-store",
             "X-Ezil-Pool-Host-Id": self.lease["poolHostId"],
@@ -118,7 +119,10 @@ class Client:
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode()
-        deadline = time.monotonic() + float(self.cfg.get("enrollRetrySeconds", 540))
+        budget = float(self.cfg.get("enrollRetrySeconds", 540))
+        if retry_seconds is not None:
+            budget = min(budget, retry_seconds)
+        deadline = time.monotonic() + budget
         delay = 1.0
         while True:
             remaining = deadline - time.monotonic()
@@ -141,17 +145,17 @@ class Client:
             time.sleep(delay)
             delay = min(delay * 2, 30.0)
 
-    def enroll(self):
+    def enroll(self, *, retry_seconds=None):
         status, _ = self.request("POST", "enroll", {
             "poolHostId": self.lease["poolHostId"], "poolGeneration": self.lease["poolGeneration"],
             "identityDocument": self.identity["document"], "signature": self.identity["signature"],
-        })
+        }, retry_seconds=retry_seconds)
         if status != 200:
             raise Refused("pool_enroll_invalid_status")
 
-    def ready(self, health):
+    def ready(self, health, *, retry_seconds=None):
         self.request("POST", "ready", {"poolHostId": self.lease["poolHostId"],
-                                       "health": {"editorOk": health["ok"]}})
+                                       "health": {"editorOk": health["ok"]}}, retry_seconds=retry_seconds)
 
     def claim(self):
         status, body = self.request("GET", "claim")
@@ -292,14 +296,23 @@ def wait_ready(cfg, timeout=180):
 def wait_claim(client, warm):
     refresh_at = time.monotonic() + 300
     while True:
-        if time.monotonic() >= refresh_at:
-            # Ready hosts require enrollment age < 10 min even when idle for hours.
-            client.enroll()
-            client.ready(wait_ready(warm))
-            refresh_at = time.monotonic() + 300
         claim = client.claim()
         if claim is not None:
             return claim
+        if time.monotonic() >= refresh_at:
+            # Ready hosts require enrollment age < 10 min even when idle for hours.
+            try:
+                client.enroll(retry_seconds=REFRESH_RETRY_SECONDS)
+                client.ready(wait_ready(warm, timeout=REFRESH_RETRY_SECONDS), retry_seconds=REFRESH_RETRY_SECONDS)
+            except Refused as e:
+                # Leasing can refuse a refresh before the claim response is published.
+                claim = client.claim()
+                if claim is not None:
+                    return claim
+                if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+                    raise
+            else:
+                refresh_at = time.monotonic() + 300
         time.sleep(POLL_SECONDS)
 
 
@@ -339,12 +352,15 @@ def _adopt(cfg, pool_lease):
     stop_attempted = stopped
     try:
         if record is None:
-            client.enroll()
-            # A guard process may have died while waiting for a claim.
-            if desktop.state(warm) != "running":
-                start_warm(warm, pool_lease)
-            client.ready(wait_ready(warm))
-            claim = wait_claim(client, warm)
+            # A restart may find the row leased before the claim was saved locally.
+            claim = client.claim()
+            if claim is None:
+                client.enroll()
+                # A guard process may have died while waiting for a claim.
+                if desktop.state(warm) != "running":
+                    start_warm(warm, pool_lease)
+                client.ready(wait_ready(warm))
+                claim = wait_claim(client, warm)
             timing(cfg, "claimObservedMs", claim)
             record = reserve_claim(cfg, pool_lease, claim)
         else:

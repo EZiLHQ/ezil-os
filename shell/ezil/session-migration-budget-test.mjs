@@ -29,11 +29,11 @@ async function run(t, { answer = () => moving, open = openDesktop, requestMs = 0
 
 for (const [name, open] of [['Desktop', openDesktop], ['Preview', previewUrl],
     ['Code mapper', id => withWakeAndOneRetry(async () => pendingOrRefused(await (await fetch('/code')).json()), 'codePreviewUrl', id)]]) {
-    test(`${name}: migration waits the full eight minutes and preserves the timeout code`, async t => {
+    test(`${name}: migration waits the full ten minutes and preserves the timeout code`, async t => {
         const out = await run(t, { open });
-        assert.equal(MIGRATION_DEADLINE_MS, 480_000);
-        assert.equal(out.elapsed, 480_000);
-        assert.equal(out.asks, 321);
+        assert.equal(MIGRATION_DEADLINE_MS, 600_000);
+        assert.equal(out.elapsed, 600_000);
+        assert.equal(out.asks, 401);
         assert.equal(out.result.errorCode, 'sandbox_starting');
         assert.equal(out.result.computeMigrating, true);
         assert.equal(isComputeMigrating('migration-computer'), false);
@@ -42,15 +42,15 @@ for (const [name, open] of [['Desktop', openDesktop], ['Preview', previewUrl],
 
 test('migration clock starts at the first flagged answer, not at window open', async t => {
     const out = await run(t, { answer: ({ now }) => now < 90_000 ? pending : moving });
-    assert.equal(out.elapsed, 570_000);
-    assert.equal(out.asks, 381);
+    assert.equal(out.elapsed, 690_000);
+    assert.equal(out.asks, 461);
     assert.equal(out.result.errorCode, 'sandbox_starting');
 });
 
-test('flag dropped: a full AWS wake budget resumes after even a nearly eight-minute move', async t => {
-    const out = await run(t, { answer: ({ now }) => now < 480_000 ? moving : pending });
-    assert.equal(out.elapsed, 696_000);
-    assert.equal(out.asks, 465);
+test('flag dropped: a full AWS wake budget resumes after even a nearly ten-minute move', async t => {
+    const out = await run(t, { answer: ({ now }) => now < 600_000 ? moving : pending });
+    assert.equal(out.elapsed, 816_000);
+    assert.equal(out.asks, 545);
     assert.equal(out.result.errorCode, 'sandbox_starting');
     assert.equal(isComputeMigrating('migration-computer'), false);
 });
@@ -69,8 +69,8 @@ test('repeated flags cannot restart the migration or resumed wake deadlines', as
 
 test('slow first migration response does not spend the migration budget before it is observed', async t => {
     const out = await run(t, { requestMs: 60_000 });
-    assert.equal(out.elapsed, 552_000);
-    assert.equal(out.asks, 9);
+    assert.equal(out.elapsed, 675_000);
+    assert.equal(out.asks, 11);
     assert.equal(out.result.errorCode, 'sandbox_starting');
 });
 
@@ -78,7 +78,7 @@ for (const [name, answer, cap] of [
     ['Cloudflare', () => ({ ...pending, computeProvider: 'cloudflare' }), 40],
     ['unlabelled', () => ({ ...pending, computeProvider: undefined }), 40],
     ['ordinary AWS', () => pending, 146],
-    ['migration', () => moving, 322],
+    ['migration', () => moving, 402],
     ['resumed AWS', ({ asks }) => asks <= 300 ? moving : pending, 446],
 ]) {
     test(`${name}: frozen clock still stops at the deadline-derived issue cap (${cap})`, async t => {

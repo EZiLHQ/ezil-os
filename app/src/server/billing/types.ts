@@ -65,7 +65,10 @@ export interface CatalogPro {
 
 export interface CatalogPack {
     sku: string;
+    /** Whole Gateway credits; null until this pack has an approved credit policy. */
+    aiCredits: number | null;
     creditCents: number;
+    discountPercent: number;
     serviceFeeCents: number;
     totalCents: number;
 }

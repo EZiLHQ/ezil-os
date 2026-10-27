@@ -20,6 +20,8 @@ export const fakeVscode: Record<string, unknown> = {
     // Owned here and mutated in place by tests: bun's mock.module snapshots top-level
     // properties, so a test that REPLACED `window` would not reach a module imported
     // under another file's earlier mock.
-    window: { showErrorMessage: async () => undefined },
+    window: { showErrorMessage: async () => undefined, showWarningMessage: async () => undefined },
+    env: { openExternal: async () => true },
+    Uri: { parse: (value: string) => new URL(value) },
     commands: { executeCommand: async () => undefined },
 };

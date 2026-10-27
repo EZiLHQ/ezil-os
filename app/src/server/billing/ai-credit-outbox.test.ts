@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
 import { aiCreditBackoffMs, drainAiCreditOutbox, type AiCreditOutboxRow, type AiCreditOutboxStore } from './ai-credit-outbox';
-import { lookupAiAccount, missingAiAccountView } from './ai-credit-outbox-store';
+import { lookupAiAccount, missingAiAccountView, previewAiCreditRecovery } from './ai-credit-outbox-store';
 
 const NOW = Date.parse('2026-10-21T00:00:00Z');
 function row(overrides: Partial<AiCreditOutboxRow> = {}): AiCreditOutboxRow {
@@ -36,7 +36,7 @@ describe('AI credit outbox delivery', () => {
         expect(await f.run()).toEqual({ claimed: 1, done: 1, failed: 0, retry: 0, skipped: 0 });
         const body = JSON.parse(f.fetcher.mock.calls[0]![1]!.body as string);
         expect(body).toEqual({ eventId: row().eventKey, entitlementId: row().payload.entitlementId, action: 'grant',
-            credits: 4000, expiresAt: '2026-11-04T00:00:00.000Z', accountPublicId: 'works-public-id' });
+            credits: 200, expiresAt: '2026-11-04T00:00:00.000Z', accountPublicId: 'works-public-id' });
         expect(f.store.finish).toHaveBeenCalledWith(expect.anything(), { status: 'done', reason: null }, NOW);
     });
     it('preserves a frozen account id on retry without looking up a changed mapping', async () => {
@@ -69,11 +69,27 @@ describe('AI credit outbox delivery', () => {
         expect(await f.run()).toMatchObject({ failed: 1, retry: 0 });
         expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'failed', reason: `http_${status}` });
     });
-    it('records no_ai_account and makes no call or fabricated mapping', async () => {
+    it('waits for no_ai_account without a call or fabricated mapping', async () => {
         const f = fixture(); f.store.accountFor.mockResolvedValue(null);
-        expect(await f.run()).toMatchObject({ skipped: 1, failed: 1 });
-        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'failed', reason: 'no_ai_account' });
+        expect(await f.run()).toMatchObject({ skipped: 1, retry: 1, failed: 0 });
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + 60_000 });
         expect(f.fetcher).not.toHaveBeenCalled(); expect(f.store.pinAccount).not.toHaveBeenCalled();
+    });
+    it.each(['lookup', 'gateway'] as const)('retains %s account waits beyond ten attempts and delivers when ready', async missing => {
+        const f = fixture([row({ attempts: 25, dependencyWaits: 24 })]);
+        if (missing === 'lookup') f.store.accountFor.mockResolvedValue(null);
+        else f.fetcher.mockResolvedValue(Response.json({ error: { code: 'account_not_found' } }, { status: 404 }));
+        expect(await f.run()).toMatchObject({ retry: 1, failed: 0 });
+        expect(f.store.finish.mock.calls[0]![1]).toMatchObject({ status: 'retry', nextAttemptAt: NOW + 3_600_000 });
+        f.rows.push(row({ attempts: 26, dependencyWaits: 25 }));
+        f.store.accountFor.mockResolvedValue('pinned-account');
+        f.fetcher.mockResolvedValue(new Response(null, { status: 204 }));
+        expect(await f.run()).toMatchObject({ done: 1, failed: 0 });
+    });
+    it('retains the normal delivery failure budget after prolonged enrollment waiting', async () => {
+        const f = fixture([row({ attempts: 26, dependencyWaits: 25 })]);
+        f.fetcher.mockResolvedValue(new Response(null, { status: 503 }));
+        expect(await f.run()).toMatchObject({ retry: 1, failed: 0 });
     });
     it.each(['fundingUrl', 'fundingHmacSecret'] as const)('does nothing when %s is missing and logs once', async key => {
         const f = fixture();
@@ -163,5 +179,90 @@ describe('Works account lookup', () => {
         const execute = vi.fn().mockRejectedValue(error);
         await expect(lookupAiAccount({ execute } as unknown as Parameters<typeof lookupAiAccount>[0], 'user')).rejects.toBe(error);
         expect(missingAiAccountView(error)).toBe(false);
+    });
+});
+
+describe('explicit dry-run AI recovery', () => {
+    it('selects only requested, valid, unexpired account failures without writes or legacy conversion', async () => {
+        const make = (key: string, lastError: string | null, overrides: Partial<ReturnType<typeof row>> = {}) => {
+            const value = row();
+            const entitlementId = `ezil-os:v1:free-once:${key}`;
+            return { ...value, ...overrides, eventKey: `${entitlementId}:grant`, deliveredAt: null, lastError,
+                payload: { ...value.payload, entitlementId, eventId: `${entitlementId}:grant`, delivery: { status: 'failed' }, ...overrides.payload } };
+        };
+        const eligible = make('eligible', 'no_ai_account');
+        const gateway = make('gateway', 'account_not_found');
+        const exhausted = make('exhausted', 'attempts_exhausted');
+        const ambiguous404 = make('unknown404', 'http_404');
+        const expired = make('expired', 'no_ai_account', { payload: { expiresAt: new Date(NOW).toISOString() } });
+        const done = { ...make('done', 'no_ai_account'), deliveredAt: new Date(NOW).toISOString() };
+        const legacy = make('legacy', 'no_ai_account', { payload: { protocol: undefined, amountUsdMicro: '10000000' } });
+        const rows = [eligible, gateway, exhausted, ambiguous404, expired, done, legacy];
+        const execute = vi.fn().mockResolvedValue(rows);
+        const eventKeys = [...rows.map(value => value.eventKey), 'missing'];
+        const result = await previewAiCreditRecovery({ execute } as unknown as Parameters<typeof previewAiCreditRecovery>[0], { eventKeys, now: NOW });
+        expect(result).toMatchObject({ dryRun: true, selected: 8, eligible: 2, legacyCount: 1 });
+        expect(result.decisions.map(value => value.reason)).toEqual(['eligible_dependency_wait', 'eligible_dependency_wait',
+            'unproven_dependency_failure', 'unproven_dependency_failure', 'expired', 'already_delivered', 'unsupported_protocol', 'not_found']);
+        const query = new PgDialect().sqlToQuery(execute.mock.calls[0]![0]);
+        expect(query.sql).toMatch(/^select /);
+        expect(query.sql).not.toMatch(/\b(update|insert|delete)\b/i);
+        expect(query.params).toEqual(eventKeys);
+    });
+    it('does not query for an empty selection and rejects unbounded selections', async () => {
+        const execute = vi.fn();
+        const db = { execute } as unknown as Parameters<typeof previewAiCreditRecovery>[0];
+        expect(await previewAiCreditRecovery(db, { eventKeys: [], now: NOW })).toMatchObject({ dryRun: true, selected: 0 });
+        await expect(previewAiCreditRecovery(db, { eventKeys: Array(201).fill('key'), now: NOW })).rejects.toThrow(TypeError);
+        expect(execute).not.toHaveBeenCalled();
+    });
+});
+
+describe('W0.3 restore delivery', () => {
+    function restore(overrides: Partial<AiCreditOutboxRow> = {}) {
+        const r = row(overrides);
+        r.kind = 'ai_restore';
+        r.eventKey = `${r.payload.entitlementId}:restore:dp_D`;
+        r.payload = { ...r.payload, eventId: r.eventKey, action: 'restore' };
+        return r;
+    }
+    it('keeps hold waits durable beyond ten attempts, then records the explicit result', async () => {
+        const r = restore({ attempts: 26, dependencyWaits: 25 });
+        const f = fixture([r]);
+        f.fetcher.mockResolvedValue(Response.json({ error: { code: 'restore_hold_pending' } }, { status: 409 }));
+        expect(await f.run()).toMatchObject({ retry: 1, failed: 0 });
+        expect(f.store.finish.mock.calls[0]![1]).toMatchObject({ status: 'retry', reason: 'restore_hold_pending', nextAttemptAt: NOW + 3_600_000 });
+        f.rows.push(restore({ attempts: 27, dependencyWaits: 26 }));
+        f.fetcher.mockResolvedValue(Response.json({ event_id: r.eventKey, outcome: 'restored' }));
+        expect(await f.run()).toMatchObject({ done: 1 });
+        expect(f.store.finish.mock.calls[1]![1]).toEqual({ status: 'done', reason: null, outcome: 'restored' });
+    });
+    it.each(['restore_expired', 'restore_nothing_forfeited', 'restore_refused_terminal'])('delivers expired restore requests to obtain %s', async outcome => {
+        const r = restore(); r.payload.expiresAt = new Date(NOW - 1).toISOString();
+        const f = fixture([r]);
+        f.fetcher.mockResolvedValue(Response.json({ event_id: r.eventKey, outcome }));
+        expect(await f.run()).toMatchObject({ done: 1, failed: 0 });
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'done', reason: null, outcome });
+    });
+    it.each(['restore_mismatch', 'restore_not_revoked', 'restore_review_required'])('persists manual review for %s without retrying', async code => {
+        const f = fixture([restore()]);
+        f.fetcher.mockResolvedValue(Response.json({ error: { code, message: 'private upstream text' } }, { status: 409 }));
+        expect(await f.run()).toMatchObject({ failed: 1, retry: 0 });
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'failed', reason: code, reviewRequired: true });
+        expect(JSON.stringify(f.log.mock.calls)).not.toContain('private upstream text');
+    });
+});
+
+describe('restore receipt conflicts after enqueue', () => {
+    it.each(['terminal', 'review', 'mismatch'] as const)('refuses %s without a funding request', async disposition => {
+        const r = row(); r.kind = 'ai_restore'; r.eventKey = `${r.payload.entitlementId}:restore:dp_D`;
+        r.payload = { ...r.payload, action: 'restore', eventId: r.eventKey };
+        if (disposition === 'mismatch') r.restoreConflict = true;
+        else r.restoreDisposition = disposition;
+        const f = fixture([r]); await f.run();
+        expect(f.fetcher).not.toHaveBeenCalled();
+        expect(f.store.finish.mock.calls[0]![1]).toEqual(disposition === 'terminal'
+            ? { status: 'done', reason: null, outcome: 'restore_refused_terminal' }
+            : { status: 'failed', reason: disposition === 'review' ? 'restore_review_required' : 'restore_mismatch', reviewRequired: true });
     });
 });

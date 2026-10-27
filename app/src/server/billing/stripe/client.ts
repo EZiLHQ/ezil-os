@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
+import { TRPCError } from '@trpc/server';
 
-import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
-import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult } from '../ports';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP_SKU, customTopupPack, findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
+import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult, StripePackPrice, StripeProduct } from '../ports';
 import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offerBySku } from '../v3/catalog';
+import { readStripePacks, resetStripePackCachesForTests } from './packs';
 import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
 
@@ -18,6 +20,7 @@ const lookupKeysByPriceId = new Map<string, CacheEntry<string | null>>();
 const portalConfigurations = new Map<string, CacheEntry<string>>();
 
 export function resetStripeCachesForTests(): void {
+    resetStripePackCachesForTests();
     pricesByLookupKey.clear();
     lookupKeysByPriceId.clear();
     portalConfigurations.clear();
@@ -44,8 +47,19 @@ export class BillingProviderError extends Error {
 type FormValue = string | number | boolean | undefined | FormValue[] | { [key: string]: FormValue };
 type FormFields = { [key: string]: FormValue };
 type StripeReference = string | { id: string } | null;
-type Metadata = { sku?: string; kind?: string };
-type Price = { id: string; lookup_key?: string | null; active?: boolean; unit_amount?: number | null; currency?: string; recurring?: object | null };
+type Metadata = { sku?: string; kind?: string; credits?: string; ezil_credits?: string };
+type Price = { id: string; product?: StripeReference; type?: string; lookup_key?: string | null; active?: boolean; unit_amount?: number | null; currency?: string; recurring?: object | null };
+
+type ProductResponse = { id: string; active: boolean; default_price: StripeReference; metadata?: Record<string, string> };
+
+function packPrice(price: Price): StripePackPrice {
+    return { id: price.id, productId: referenceId(price.product), active: price.active === true,
+        type: price.type ?? '', currency: price.currency ?? '', unitAmount: price.unit_amount ?? null };
+}
+
+function packProduct(product: ProductResponse): StripeProduct {
+    return { id: product.id, active: product.active, defaultPrice: referenceId(product.default_price), metadata: product.metadata ?? {} };
+}
 
 interface SubscriptionItem {
     id?: string | null;
@@ -120,6 +134,8 @@ interface CheckoutResponse {
     payment_status: StripeCheckoutSession['paymentStatus'];
     payment_intent?: StripeReference;
     metadata?: Metadata | null;
+    amount_total?: number | null;
+    currency?: string | null;
 }
 
 interface ChargeResponse {
@@ -243,6 +259,20 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
     // A fingerprint scopes shared caches without retaining the secret in cache keys.
     const scope = createHash('sha256').update(opts.secretKey).digest('hex').slice(0, 32);
 
+    async function listAll<T extends { id: string }>(path: string, params: Record<string, string> = {}): Promise<T[]> {
+        const data: T[] = [];
+        let cursor: string | undefined;
+        do {
+            const query = new URLSearchParams({ ...params, limit: '100', ...(cursor ? { starting_after: cursor } : {}) });
+            const page = await request<{ data: T[]; has_more: boolean }>(`${path}?${query}`);
+            data.push(...page.data);
+            const next = page.data.at(-1)?.id;
+            if (page.has_more && (!next || next === cursor)) throw new Error('Invalid Stripe pagination');
+            cursor = page.has_more ? next : undefined;
+        } while (cursor);
+        return data;
+    }
+
     async function resolvePrice(lookupKey: string): Promise<StripePrice> {
         const key = `${scope}:${lookupKey}`;
         const hit = cached(pricesByLookupKey, key);
@@ -328,7 +358,24 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         };
     }
 
-    return {
+    const client: StripeApi = {
+        packCacheKey: scope,
+        async listProducts() { return (await listAll<ProductResponse>('/products', { active: 'true' })).map(packProduct); },
+        async retrieveProduct(id) { return packProduct(await request<ProductResponse>(`/products/${encodeURIComponent(id)}`)); },
+        async retrievePackPrice(id) { return packPrice(await request<Price>(`/prices/${encodeURIComponent(id)}`)); },
+        async retrieveCoupon(id) {
+            try {
+                const coupon = await request<{ id: string; valid: boolean; percent_off: number | null; amount_off: number | null }>(`/coupons/${encodeURIComponent(id)}`);
+                return { id: coupon.id, valid: coupon.valid, percentOff: coupon.percent_off ?? null, amountOff: coupon.amount_off ?? null };
+            } catch (error) {
+                if (error instanceof StripeRequestError && error.status === 404) return null;
+                throw error;
+            }
+        },
+        async retrieveCheckoutLineItems(id) {
+            return (await listAll<{ id: string; quantity: number | null; price: Price | null }>(`/checkout/sessions/${encodeURIComponent(id)}/line_items`))
+                .map(line => ({ quantity: line.quantity, price: line.price ? packPrice(line.price) : null }));
+        },
         resolvePrice,
         retrieveInvoicePaymentState,
 
@@ -440,15 +487,25 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         },
 
         async createCheckoutSession(input) {
-            const pack = findPack(input.sku);
+            const stripePack = input.sku.startsWith('ai_pack_') && !findPack(input.sku)
+                ? (await readStripePacks(client)).find(pack => pack.sku === input.sku) : undefined;
+            const pack = input.sku === CUSTOM_TOPUP_SKU ? customTopupPack(input.customAmountCents ?? NaN)
+                : stripePack ?? findPack(input.sku);
+            // Refuse purchases we cannot fund, before price lookup or any Stripe request.
+            if (pack !== undefined && !aiPackCheckoutEligible(pack)) {
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'pack_credits_unset' });
+            }
             const offer = offerBySku(input.sku);
             const lookupKey = offer?.sellable ? offer.stripeLookupKey : null;
             if (input.sku !== PRO_PLAN.sku && !lookupKey && pack === undefined) throw new Error('Unknown billing SKU');
 
+            const metadata = { sku: input.sku,
+                ...(input.sku === CUSTOM_TOPUP_SKU ? { credits: String(pack!.aiCredits) }
+                    : stripePack ? { ezil_credits: String(stripePack.aiCredits) } : {}) };
             const fields: FormFields = {
                 customer: input.customerId,
                 client_reference_id: input.userId,
-                metadata: { sku: input.sku },
+                metadata,
                 // As merchant of record, Stripe controls tax, currency and
                 // payment methods and rejects the corresponding seller fields.
                 ...(input.managedPayments ? {
@@ -501,22 +558,23 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 fields.subscription_data = { metadata: { sku: PRO_PLAN.sku } };
             } else if (pack !== undefined) {
                 fields.mode = 'payment';
-                fields.line_items = [
+                if (stripePack?.couponId) fields.discounts = [{ coupon: stripePack.couponId }];
+                fields.line_items = stripePack ? [{ price: stripePack.priceId, quantity: 1 }] : (pack.serviceFeeCents ? [
                     { name: 'AI credits', amount: pack.creditCents },
                     { name: 'Service fee', amount: pack.serviceFeeCents },
-                ].map(item => ({
+                ] : [{ name: 'AI credits', amount: pack.totalCents }]).map(item => ({
                     quantity: 1,
                     price_data: {
                         currency: 'usd',
                         unit_amount: item.amount,
-                        tax_behavior: 'exclusive',
+                        tax_behavior: pack.serviceFeeCents ? 'exclusive' : 'inclusive',
                         product_data: {
                             name: item.name,
                             ...(input.managedPayments ? { tax_code: MANAGED_PAYMENTS_TAX_CODE } : {}),
                         },
                     },
                 }));
-                fields.payment_intent_data = { metadata: { sku: pack.sku } };
+                fields.payment_intent_data = { metadata };
             }
             const session = await request<{ id: string; url?: string | null; client_secret?: string | null }>(
                 '/checkout/sessions', fields, input.idempotencyKey,
@@ -645,6 +703,9 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 paymentStatus: session.payment_status,
                 paymentIntentId: referenceId(session.payment_intent),
                 sku: session.metadata?.sku ?? null,
+                amountTotal: session.amount_total ?? null,
+                currency: session.currency ?? null,
+                metadataCredits: session.metadata?.sku === CUSTOM_TOPUP_SKU ? session.metadata?.credits ?? null : session.metadata?.ezil_credits ?? null,
             };
         },
 
@@ -672,4 +733,5 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             };
         },
     };
+    return client;
 }

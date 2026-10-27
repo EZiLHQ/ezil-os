@@ -4,6 +4,7 @@ System heads use archiveSha256 for bytes (sha256 is a logical fingerprint),
 with one extra .ezil-deleted.json member not counted in entries. Deletions and
 image-relative system state are deliberately not replayed across images.
 """
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -21,6 +22,7 @@ from .fsops import DIR_FLAGS, Refused, empty_dir_fd, read_regular_at, write_file
 STATE = ".ezil-restore-state.json"
 STAGE = ".ezil-restore-stage"
 CHUNK = 1024 * 1024
+FETCH_CONCURRENCY = 8
 MAX_CHUNKS = 512
 MAX_ENTRIES = 100000
 HASH = re.compile(r"[a-f0-9]{64}")
@@ -166,14 +168,27 @@ def _download(stage, kind, head, fetch):
     out = os.fdopen(fd, "w+b")
     try:
         digest = hashlib.sha256()
-        for i, chunk in enumerate(head["chunks"]):
-            data = fetch(kind, i)
-            if not isinstance(data, bytes) or len(data) != chunk["size"]:
-                refuse("chunk_size")
-            if hashlib.sha256(data).hexdigest() != chunk["sha256"]:
-                refuse("chunk_sha256")
-            out.write(data)
-            digest.update(data)
+        with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as pool:
+            pending = {}
+            try:
+                for i in range(min(FETCH_CONCURRENCY, len(head["chunks"]))):
+                    pending[i] = pool.submit(fetch, kind, i)
+                for i, chunk in enumerate(head["chunks"]):
+                    data = pending[i].result()
+                    if not isinstance(data, bytes) or len(data) != chunk["size"]:
+                        refuse("chunk_size")
+                    if hashlib.sha256(data).hexdigest() != chunk["sha256"]:
+                        refuse("chunk_sha256")
+                    out.write(data)
+                    digest.update(data)
+                    # Futures hold the reorder buffer; refill only after writing.
+                    del data, pending[i]
+                    next_index = i + FETCH_CONCURRENCY
+                    if next_index < len(head["chunks"]):
+                        pending[next_index] = pool.submit(fetch, kind, next_index)
+            finally:
+                for future in pending.values():
+                    future.cancel()
         expected = head.get("archiveSha256", head["sha256"]) if kind == "system" else head["sha256"]
         if digest.hexdigest() != expected:
             refuse("archive_sha256")
@@ -325,6 +340,7 @@ class SnapshotClient:
         self.token = lease["restore"].get("identityToken")
 
     def get(self, path, token, response_limit=CHUNK + 1):
+        # http.request creates and closes its own connection for every call.
         return http.request("GET", path, headers={"Authorization": "Bearer " + token},
                             timeout=20, ca_file=self.cfg.get("caFile"),
                             server_name=self.cfg.get("tlsServerName"), response_limit=response_limit)

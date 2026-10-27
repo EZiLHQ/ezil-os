@@ -2,16 +2,20 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
-import { aiBalanceState, enqueueFreeAiCredits, readAiBalance } from '@/server/billing/ai-balance';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
+import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { readAiUsage } from '@/server/billing/ai-usage';
+import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
-import type { BillingDeps, StripeApi } from '@/server/billing/ports';
+import type { BillingDeps, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
+import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3 } from '@/server/billing/v3/summary';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
-import type { BillingSummaryV3Result, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
+import type { SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
     CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
     type SizeCode,
@@ -109,10 +113,10 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference: null,
                 hasCustomer: false, computerId: input?.computerId });
         }),
-        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV3Result> => {
+        summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
             if (!deps.config.tabEnabled) return { enabled: false };
-            const aiBalance = readAiBalance({ config: deps.config, userId: ctx.user.id, headers: ctx.headers });
+            const aiRead = readAiAccount({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
             const now = deps.now();
             const [subs, userCreatedAt, planChanges] = await Promise.all([
                 deps.store.subscriptionsFor(ctx.user.id),
@@ -121,7 +125,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices] = await Promise.all([
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -130,6 +134,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 deps.store.sizePreference(ctx.user.id),
                 deps.store.stripeCustomerFor(ctx.user.id),
                 deps.store.overageInvoicesFor(ctx.user.id),
+                readStripePacks(deps.stripe),
             ]);
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
@@ -144,12 +149,29 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             }
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
-                storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal,
+                storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
             });
             await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
-            summary.ai.balance = await aiBalance;
-            summary.ai.state = aiBalanceState(summary.ai.balance, summary.ai.grant.amount);
-            return summary;
+            const ai = await aiRead;
+            ai.balanceState = aiMicroBalanceState(ai.balanceMicro, summary.ai.grant.amount);
+            return { ...summary, ai: { ...summary.ai, ...ai,
+                // Older consumers cannot describe a pause. They must not call it healthy or exhausted.
+                state: ai.spendingState === 'available' ? ai.balanceState : 'unavailable' } };
+        }),
+
+        aiUsage: protectedProcedure.input(z.object({
+            limit: z.number().int().min(1).max(50).default(20),
+            before: z.string().datetime({ offset: true }).optional(),
+        }).strict().default({ limit: 20 })).query(async ({ ctx, input, signal }) => {
+            const deps = getDeps();
+            if (!deps.config.tabEnabled) return { state: 'unavailable' as const, recentUsage: null };
+            return readAiUsage({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal }, input);
+        }),
+
+        aiLimits: protectedProcedure.query(async ({ ctx, signal }) => {
+            const deps = getDeps();
+            if (!deps.config.tabEnabled) return { state: 'unavailable' as const, limits: null };
+            return readAiLimits({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
         }),
 
         createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
@@ -191,6 +213,40 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             }
             if (!session.url) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
             return { mode: 'redirect', sessionId: session.id, url: session.url };
+        }),
+
+        createTopupCheckout: protectedProcedure.input(z.union([
+            z.object({ sku: z.string() }).strict(),
+            z.object({ customAmountCents: z.number().int().min(CUSTOM_TOPUP.minCents).max(CUSTOM_TOPUP.maxCents).multipleOf(100) }).strict(),
+        ])).mutation(async ({ ctx, input }): Promise<{ sessionId: string; clientSecret: string; publishableKey: string }> => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            const publishableKey = deps.config.stripePublishableKey;
+            if (!publishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+            const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
+            if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+
+            let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
+            if (!customerId) {
+                const customer = await stripeCall(() => stripe.createCustomer({
+                    userId: ctx.user.id, email: ctx.user.email ?? null, idempotencyKey: `customer:${ctx.user.id}`,
+                }));
+                const linked = await deps.store.linkCustomer(ctx.user.id, customer.id);
+                if (linked === 'conflict') throw billingError('customer_conflict', 'CONFLICT');
+                customerId = customer.id;
+            }
+            const origin = billingReturnOrigin(ctx.headers);
+            const returnUrl = `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`;
+            const session = await stripeCall(() => stripe.createCheckoutSession({
+                customerId, userId: ctx.user.id, sku: pack.sku,
+                ...('customAmountCents' in input ? { customAmountCents: input.customAmountCents } : {}),
+                uiMode: 'embedded', automaticTax: deps.config.automaticTaxEnabled, adaptivePricing: false,
+                managedPayments: deps.config.managedPaymentsEnabled,
+                returnUrl, successUrl: returnUrl, cancelUrl: `${origin}/os`,
+                idempotencyKey: `checkout:${ctx.user.id}:${pack.sku}:${crypto.randomUUID()}`,
+            }));
+            if (!session.clientSecret) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
+            return { sessionId: session.id, clientSecret: session.clientSecret, publishableKey };
         }),
 
         previewUpgrade: protectedProcedure.input(z.object({ toSku: z.string() }))
@@ -408,16 +464,18 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
         }),
 
         checkoutStatus: protectedProcedure.input(z.object({ sessionId: z.string() }))
-            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO }> => {
+            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null; sku: string | null }> => {
                 const deps = getDeps();
                 const stripe = configuredStripe(deps);
                 if (!/^cs_[A-Za-z0-9_]+$/.test(input.sessionId)) throw billingError('not_subscribed', 'BAD_REQUEST');
                 const session = await stripeCall(() => stripe.retrieveCheckoutSession(input.sessionId));
                 if (session.clientReferenceId !== ctx.user.id) throw billingError('not_subscribed', 'NOT_FOUND');
-                // Checkout can complete before a delayed payment succeeds. The return page
-                // must not call an unpaid receipt complete; webhooks still own fulfillment.
-                if (session.status === 'open' || (session.status === 'complete' && session.paymentStatus === 'unpaid')) return { status: 'pending' };
-                return { status: session.status };
+                // Completing Checkout can precede settlement for bank payments.
+                // Missing or unrecognized payment state must not imply receipt.
+                const paymentStatus = session.paymentStatus === 'paid' || session.paymentStatus === 'unpaid'
+                    || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
+                const sku = typeof session.sku === 'string' && session.sku.trim() ? session.sku : null;
+                return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku };
             }),
     });
 }

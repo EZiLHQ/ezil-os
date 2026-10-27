@@ -236,3 +236,56 @@ test('gateway config clamps output limits at both boundaries', () => {
         expect(config.errors).toEqual([]); expect(config.models[0]!.maxOutputTokens).toBe(expected);
     }
 });
+
+describe('explicit Gateway protocol configuration', () => {
+    const providers = {
+        gateway: { type: 'ezil-gateway', baseUrl: 'https://proxy.invalid/ai/v1', apiKey: '{env:TOKEN}' },
+        direct: { type: 'azure-openai', resource: 'synthetic-resource', apiKey: '{env:TOKEN}' },
+    };
+    const parse = (models: unknown[], defaults?: Record<string, unknown>) => parseModelsConfig(JSON.stringify({ providers, models, defaults }), { env: { TOKEN: 'synthetic-key' } });
+
+    test('selects Responses only from the model field while preserving legacy defaults', () => {
+        const config = parse([
+            { id: 'legacy', provider: 'gateway', model: 'gpt-5.5' },
+            { id: 'messages', provider: 'gateway', model: 'custom-alias', gatewayProtocol: 'anthropic-messages' },
+            { id: 'responses', provider: 'gateway', model: 'custom-alias', gatewayProtocol: 'openai-responses' },
+        ]);
+        expect(config.errors).toEqual([]);
+        expect(config.models.map(model => model.gatewayProtocol)).toEqual([undefined, 'anthropic-messages', 'openai-responses']);
+        expect(config.models[2]).toMatchObject({ maxOutputTokens: 8192, stream: true, cache: { enabled: false }, capabilities: { imageInput: false } });
+        expect(config.models[2]!.provider).toMatchObject({ type: 'ezil-gateway', baseUrl: 'https://proxy.invalid/ai/v1', apiKey: 'synthetic-key' });
+    });
+
+    test('invalid protocols and protocols on direct providers drop only those models', () => {
+        const config = parse([
+            { id: 'good', provider: 'gateway', model: 'custom-alias', gatewayProtocol: 'openai-responses' },
+            ...['responses', 'OPENAI-RESPONSES', null, 1].map((gatewayProtocol, i) => ({ id: `bad-${i}`, provider: 'gateway', model: 'x', gatewayProtocol })),
+            { id: 'direct', provider: 'direct', model: 'x', gatewayProtocol: 'openai-responses' },
+        ]);
+        expect(config.models.map(model => model.id)).toEqual(['good']);
+        expect(config.errors).toHaveLength(5);
+        expect(config.errors.slice(0, 4).every(error => error.includes('.gatewayProtocol must be one of'))).toBe(true);
+        expect(config.errors[4]).toBe('models[5].gatewayProtocol is only supported for ezil-gateway providers');
+    });
+
+    test('defaults cannot opt models into Responses; an explicit model selection still works', () => {
+        const config = parse([
+            { id: 'legacy', provider: 'gateway', model: 'gpt-5.5' },
+            { id: 'explicit', provider: 'gateway', model: 'x', gatewayProtocol: 'openai-responses' },
+            { id: 'direct', provider: 'direct', model: 'x' },
+        ], { gatewayProtocol: 'openai-responses', maxOutputTokens: 2048 });
+        expect(config.models.map(model => model.gatewayProtocol)).toEqual([undefined, 'openai-responses', undefined]);
+        expect(config.models.every(model => model.maxOutputTokens === 2048)).toBe(true);
+        expect(config.errors).toEqual(['defaults.gatewayProtocol is not supported; set gatewayProtocol on each Gateway model (ignored)']);
+    });
+
+    test('Kimi compatibility settings apply only to the legacy protocol', () => {
+        const config = parse([
+            { id: 'legacy', provider: 'gateway', model: 'us.moonshotai.kimi-k3', stream: true },
+            { id: 'responses', provider: 'gateway', model: 'us.moonshotai.kimi-k3', gatewayProtocol: 'openai-responses', stream: true },
+            { id: 'json', provider: 'gateway', model: 'x', gatewayProtocol: 'openai-responses', stream: false },
+        ]);
+        expect(config.errors).toEqual([]);
+        expect(config.models.map(model => [model.stream, model.maxOutputTokens])).toEqual([[false, 4096], [true, 8192], [false, 8192]]);
+    });
+});

@@ -22,6 +22,7 @@ export const EXPLICIT_FILES = Object.freeze([
     'docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt',
     'app/drizzle/0008_pool_dispatch.sql',
     'app/drizzle/0009_capacity_demands.sql',
+    'app/drizzle/0010_migration_restore_progress.sql',
 ]);
 const TABLE = 'public.ezil_staging_schema_log';
 const HASH = /^[a-f0-9]{64}$/;
@@ -167,8 +168,8 @@ export function run(args = process.argv.slice(2), {
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
         // P9: pool v2 is staging-only, even though this runner also supports production.
         if (target === 'aws-production' &&
-            (mode === 'apply' || requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql'].includes(basename(name))))) {
-            refuse('Pool hosts v2 and capacity demand are staging-only; production apply/baseline is forbidden.');
+            (mode === 'apply' || requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql'].includes(basename(name))))) {
+            refuse('Pool hosts v2, capacity demand and migration restore progress are staging-only; production apply/baseline is forbidden.');
         }
         const files = ordered.map((file) => ({ file, sha256: sha256(readFileSync(resolve(ROOT, file))) }));
         const selected = new Set(requested.map((name) => {

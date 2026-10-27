@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, readAiBalance } from './ai-balance';
+import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
 import type { OutboxInsert } from './ports';
 
 const input = { config: { fundingUrl: 'https://gateway.test/' }, userId: 'current-user', headers: new Headers(),
@@ -8,11 +8,11 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('AI balance', () => {
     it.each([[null, 500, 'unavailable'], [0, 500, 'exhausted'], [1, 500, 'low'], [50, 500, 'low'], [51, 500, 'ok'],
-        [400, 4000, 'low'], [401, 4000, 'ok'], [2000, 20000, 'low'], [2001, 20000, 'ok'], [1, 0, 'ok']] as const)
+        [20, 200, 'low'], [21, 200, 'ok'], [100, 1000, 'low'], [101, 1000, 'ok'], [1, 0, 'ok']] as const)
     ('balance %s against grant %s is %s', (balance, grant, state) => expect(aiBalanceState(balance, grant)).toBe(state));
-    it.each([[{ available_micro: '123456789' }, 123], [{ available_micro: 1_000_000 }, 1], [{ available_micro: '999999' }, 0],
+    it.each([[{ available_micro: '123456789' }, 123.456789], [{ available_micro: 1_000_000 }, 1], [{ available_micro: '999999' }, 0.999999],
         [{ available_micro: '0' }, 0], [{ credits: 4000 }, 4000], [{ credits: 0 }, 0], [null, null], [{}, null],
-        [{ credits: -1 }, null], [{ credits: 1.5 }, null], [{ credits: '1' }, null], [{ credits: Infinity }, null],
+        [{ credits: -1 }, null], [{ credits: 1.5 }, 1.5], [{ credits: '1' }, null], [{ credits: Infinity }, null],
         [{ available_micro: '-1' }, null], [{ available_micro: 1.5 }, null], [{ available_micro: '1e6' }, null],
         [{ available_micro: '9007199254740992000000' }, null], [{ available_micro: null }, null]] as const)
     ('parses the isolated Gateway shape %j', (body, expected) => expect(parseAiBalance(body)).toBe(expected));
@@ -91,7 +91,7 @@ describe('Free summary grant', () => {
         await enqueueFreeAiCredits(store, 'user', 'free_v3', new Date('2026-11-21Z'));
         expect(rows.size).toBe(1);
         expect([...rows.values()][0]).toMatchObject({ eventKey: 'ezil-os:v1:free-once:user:grant',
-            payload: { credits: 500, expiresAt: '2027-10-21T00:00:00.000Z' } });
+            payload: { credits: 100, expiresAt: '2027-10-21T00:00:00.000Z' } });
     });
     it.each(['legacy', 'standard_monthly_v3', 'premium_monthly_v3'])('does not give %s a Free grant', async sku => {
         const store = { enqueueOutbox: vi.fn() };
@@ -102,5 +102,80 @@ describe('Free summary grant', () => {
         await expect(enqueueFreeAiCredits({ enqueueOutbox: vi.fn().mockRejectedValue(new Error('postgres://secret-token')) },
             'user', 'free_v3', new Date())).resolves.toBeUndefined();
         expect(warn).toHaveBeenCalledExactlyOnceWith('[billing.ai] free grant enqueue unavailable');
+    });
+});
+
+
+describe('exact AI account projection', () => {
+    it.each([['1', 0.000001], ['999999', 0.999999], ['1000001', 1.000001], ['0', 0],
+        ['9007199254740991', null], ['9007199254740991000000', Number.MAX_SAFE_INTEGER],
+        ['9007199254740992000000', null]] as const)('retains %s microcredits without silently rounding', (micro, number) => {
+        expect(parseAiBalanceMicro({ available_micro: micro })).toBe(micro);
+        expect(parseAiBalance({ available_micro: micro })).toBe(number);
+        expect(aiMicroBalanceState(micro, 500)).toBe(micro === '0' ? 'exhausted' : BigInt(micro) <= BigInt(50000000) ? 'low' : 'ok');
+    });
+    it('rejects unsafe JSON numbers and excess fractional precision but accepts exact decimal strings', () => {
+        expect(parseAiBalanceMicro({ available_micro: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
+        expect(parseAiBalanceMicro({ available_micro: String(Number.MAX_SAFE_INTEGER + 1) })).not.toBeNull();
+        expect(parseAiBalance({ credits: 0.0000001 })).toBeNull();
+    });
+    function fetcher(overrides: Record<string, unknown> = {}) {
+        const bodies: Record<string, unknown> = {
+            '/v1/me/balance': { available_micro: '1000001', held_micro: '20', state: 'ok' },
+            '/v1/models': { killswitch: false, pause: null },
+            '/v1/me/limits': { policy: { policy: {} }, pauses: [], entitlement: { required: false, basis: 'not_required' } },
+            '/v1/me/usage': { object: 'list', data: [] }, ...overrides,
+        };
+        return vi.fn<typeof fetch>(async url => Response.json(bodies[new URL(String(url)).pathname]));
+    }
+    it('captures one current-user credential for all four independently validated reads', async () => {
+        const session = vi.fn(input.session), fetch = fetcher();
+        expect(await readAiAccount({ ...input, session, fetch })).toMatchObject({ balanceMicro: '1000001', balance: 1.000001,
+            heldMicro: '20', spendingState: 'available', recentUsage: { rows: [] }, limitsState: 'available' });
+        expect(session).toHaveBeenCalledOnce(); expect(fetch).toHaveBeenCalledTimes(4);
+        for (const [, options] of fetch.mock.calls) expect(options).toMatchObject({ method: 'GET', redirect: 'error', cache: 'no-store',
+            headers: { Authorization: 'Bearer supabase-session-token' } });
+    });
+    it.each(['operations', 'reconciliation'] as const)('preserves global %s pause with a positive balance', async pause => {
+        const result = await readAiAccount({ ...input, fetch: fetcher({ '/v1/models': { killswitch: true, pause } }) });
+        expect(result).toMatchObject({ balance: 1.000001, balanceState: 'ok', spendingState: `paused_${pause}` });
+    });
+    it('finds the global pause even when an exhausted wallet hides it', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/balance': { available_micro: '0', state: 'exhausted' },
+            '/v1/models': { killswitch: true, pause: 'operations' } }) })).toMatchObject({ balanceState: 'exhausted', spendingState: 'paused_operations' });
+    });
+    it('keeps successful balance and usage reads when limits are unavailable', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': null }) })).toMatchObject({ balance: 1.000001,
+            spendingState: 'unavailable', usageState: 'available', limitsState: 'unavailable', limits: null });
+    });
+    it('does not claim spending is available when the wallet is unknown', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/balance': null }) })).toMatchObject({ balance: null,
+            spendingState: 'unavailable', usageState: 'available', limitsState: 'available' });
+    });
+    it('keeps limits and their policy pause when balance and usage fail', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/balance': null, '/v1/me/usage': {},
+            '/v1/me/limits': { pauses: [{ scope: 'account', reason: 'private' }] } }) })).toMatchObject({ balance: null,
+            balanceState: 'unavailable', spendingState: 'paused_policy', usageState: 'unavailable', limits: { pauses: [{ scope: 'account' }] } });
+    });
+    it('does not treat a model/client pause as an account-wide pause', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': { policy: { policy: {} }, pauses: [{ scope: 'model' }, { scope: 'client' }],
+            entitlement: { required: false, basis: 'not_required' } } }) })).toMatchObject({ spendingState: 'available' });
+    });
+    it('reports a required but missing entitlement as a policy pause with a positive balance', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': { policy: { policy: {} }, pauses: [],
+            entitlement: { required: true, basis: null } } }) })).toMatchObject({ balance: 1.000001, spendingState: 'paused_policy' });
+    });
+    it('keeps an unreadable effective policy unknown rather than implying no limits', async () => {
+        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': { policy: {}, pauses: [],
+            entitlement: { required: false, basis: 'not_required' } } }) })).toMatchObject({ balance: 1.000001, spendingState: 'unavailable' });
+    });
+    it('cancels delayed requests immediately and clears deadline timers', async () => {
+        vi.useFakeTimers(); const controller = new AbortController();
+        const fetch = vi.fn<typeof globalThis.fetch>(() => new Promise(() => {}));
+        const pending = readAiAccount({ ...input, signal: controller.signal, fetch });
+        await vi.advanceTimersByTimeAsync(1); controller.abort();
+        expect(await pending).toMatchObject({ balance: null, spendingState: 'unavailable', recentUsage: null, limits: null });
+        expect(vi.getTimerCount()).toBe(0);
+        for (const [, options] of fetch.mock.calls) expect(options?.signal?.aborted).toBe(true);
     });
 });

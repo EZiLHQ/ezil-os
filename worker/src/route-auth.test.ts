@@ -3478,9 +3478,23 @@ describe('AI credential and code-host routes', () => {
     const unauthorized = await worker.fetch(new Request(url), { ...env, SANDBOX_AI_PROXY: 'on' });
     expect(unauthorized.status).toBe(401);
     expect(await unauthorized.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized' } });
-    for (const path of ['/ai/v1/responses', '/ai/v1/admin/pending']) {
-      expect((await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org${path}`, { method: 'POST' }), env)).status).toBe(404);
-    }
+    const upstream = spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({}));
+    try {
+      for (const cookie of [null, 'ezil_preview=not-an-ai-token']) {
+        const responses = await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/responses`, {
+          method: 'POST', headers: cookie === null ? {} : { cookie },
+        }), env);
+        expect(responses.status).toBe(401);
+        expect(await responses.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized', source: 'ezil-os-proxy' } });
+        expect(responses.headers.get('set-cookie')).toBeNull();
+        expect(responses.headers.get('location')).toBeNull();
+      }
+      const admin = await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/admin/pending`, { method: 'POST' }), env);
+      expect(admin.status).toBe(404);
+      expect(await admin.json()).toMatchObject({ error: { code: 'not_found', source: 'ezil-os-proxy' } });
+      expect(admin.headers.get('set-cookie')).toBeNull();
+      expect(upstream).not.toHaveBeenCalled();
+    } finally { upstream.mockRestore(); }
     for (const flag of ['on', 'off']) {
       const res = await worker.fetch(new Request(`https://aws-8443-${SANDBOX_NAME}-aws.ezil.org/ai/v1/models`), { ...env, AWS_ROUTING_ENABLED: flag });
       expect(res.status).toBe(404);

@@ -1,4 +1,5 @@
-import { storageCapBytes } from '../catalog';
+import type { StripeAiPack } from '../stripe/packs';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
 import { storageState } from '../meters';
 import type { GrantRow } from '../ports';
@@ -36,6 +37,8 @@ export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
+    packs?: readonly StripeAiPack[];
+    stripeAvailable?: boolean;
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
@@ -81,7 +84,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const usedBytes = [...newest.values()].reduce((sum, sample) => sum + sample.bytes, BigInt(0));
     const capBytes = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', input.config.largeStorageEnabled);
     const storage = storageState(usedBytes, capBytes);
-    const enabled = checkoutAvailable(input.config);
+    const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     return {
         enabled: true, version: 3,
         plan: { sku: plan.sku, name: plan.sku === 'legacy' ? plan.offer.family === 'pro_legacy' ? 'Pro (legacy)'
@@ -97,11 +100,14 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable' },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
         storage: { usedBytes: usedBytes.toString(), capBytes: capBytes.toString(), state: storage === 'over_cap' ? 'exhausted' : storage },
-        actions: { checkout: enabled && plan.family === 'free',
+        actions: { checkout: enabled && plan.family === 'free', topup: enabled,
             upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: enabled && input.hasCustomer },
-        catalog: { version: CATALOG_V3_VERSION, offers: publicOffers() },
+        catalog: { version: CATALOG_V3_VERSION, offers: publicOffers(),
+            packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
+                sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),
+            customTopup: { ...CUSTOM_TOPUP } },
     };
 }

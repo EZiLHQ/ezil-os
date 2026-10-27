@@ -27,6 +27,9 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     const inert = new Set();
     let closed = false;
     let provider = null;
+    // Roots a released registration had adopted (e.g. a failed Stripe init). A
+    // later registration (Retry) never re-adopts them; foreign preloads stay eligible.
+    const retired = new WeakSet();
     let portals = [];
     let returnFocus = null;
     let lastSheetFocus = null;
@@ -54,7 +57,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
         if ( inert.delete(element) ) element.removeAttribute('inert');
     }
     function providerFrame (root) {
-        if ( ! provider ) return null;
+        if ( ! provider || retired.has(root) ) return null;
         // Stripe's body lightbox is a dedicated div containing its iframe.
         // Never exempt an application subtree just because it contains one.
         let node = root;
@@ -75,6 +78,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
                 if ( sibling === backdrop ) continue;
                 const iframe = providerFrame(sibling);
                 if ( iframe ) {
+                    provider.adopted.add(sibling);
                     releaseInert(sibling);
                     if ( ! hidden(iframe) ) next.push({ root: sibling, iframe });
                 } else if ( ! sibling.hasAttribute('inert') ) {
@@ -118,11 +122,14 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     function registerProviderPortals ({ matchesFrame }) {
         // A dedicated provider preload may predate this sheet. Only release
         // inert owned by this frame; pre-existing inert remains authoritative.
-        const registration = { matchesFrame };
+        const registration = { matchesFrame, adopted: new Set() };
         provider = registration;
         sync();
         return () => {
             if ( provider !== registration ) return;
+            // A frame added just before a synchronous failure may not have been observed yet.
+            for ( const sibling of doc.body.children ) if ( providerFrame(sibling) ) registration.adopted.add(sibling);
+            for ( const root of registration.adopted ) retired.add(root);
             provider = null;
             sync();
         };

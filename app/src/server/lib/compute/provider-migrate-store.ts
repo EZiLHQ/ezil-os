@@ -7,6 +7,15 @@ import { pendingRecovery, reduceMigration, type MigrationEvent, type MigrationPr
 export type MigrationFailureReason = MigrateConflictReason | 'system_head_mismatch';
 export type MigrationStoreEvent = MigrationEvent & { reason?: MigrationFailureReason };
 
+export interface MigrationRestoreProgress {
+    /** Hex-encoded 512-bit sets, indexed with PostgreSQL bytea get_bit/set_bit. */
+    workspace: string;
+    system: string;
+    bytes: number;
+    first: string;
+    last: string;
+}
+
 export interface ComputeMigration extends MigrationProgress {
     id: string;
     userId: string;
@@ -16,6 +25,7 @@ export interface ComputeMigration extends MigrationProgress {
     toSize: 'standard' | 'premium';
     restoreTokenSha256: string | null;
     restoreTokenExpiresAt: Date | null;
+    restoreProgress?: MigrationRestoreProgress | null;
     createdAt: string;
     /** Opaque PostgreSQL timestamp text, preserving microseconds for CAS. */
     updatedAt: string;
@@ -39,11 +49,22 @@ function parse(r: Record<string, unknown>): ComputeMigration {
         migratedEtag: r.migrated_etag as string | null, attempts: Number(r.attempts), lastError: r.last_error as string | null,
         restoreTokenSha256: r.restore_token_sha256 as string | null,
         restoreTokenExpiresAt: r.restore_token_expires_at == null ? null : new Date(r.restore_token_expires_at as string),
+        restoreProgress: r.restore_progress as MigrationRestoreProgress | null ?? null,
         createdAt: String(r.created_at), updatedAt: String(r.updated_at),
     };
 }
 const one = (result: unknown): ComputeMigration | null => { const r = rows(result)[0]; return r ? parse(r) : null; };
 const digest = (token: string) => createHash('sha256').update(token, 'utf8').digest();
+
+export function snapshotChunkSizes(head: SnapshotHead | null): number[] | null {
+    if (!head || !Array.isArray(head.chunks)) return null;
+    const sizes: number[] = [];
+    for (const chunk of head.chunks) {
+        if (!chunk || typeof chunk.size !== 'number' || !Number.isSafeInteger(chunk.size) || chunk.size < 0) return null;
+        sizes.push(chunk.size);
+    }
+    return sizes;
+}
 
 /** Always compares two fixed-length digests, including unknown computers and malformed hashes. */
 export function restoreTokenMatches(m: ComputeMigration | null, computerId: string, generation: string, token: string, now: Date): boolean {
@@ -65,6 +86,24 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
         WHERE computer_id = ${computerId}::uuid AND ${ACTIVE}`));
     return {
         readById, readByComputer, readActiveByComputer,
+        async recordRestoreChunk(m: ComputeMigration, kind: 'workspace' | 'system', index: number): Promise<void> {
+            const size = snapshotChunkSizes(kind === 'workspace' ? m.workspaceHead : m.systemHead)?.[index];
+            if (!m.generation || !Number.isInteger(index) || index < 0 || index > 511 || size === undefined)
+                throw new Error('invalid_restore_chunk');
+            const at = now().toISOString();
+            const bits = sql`decode(COALESCE(restore_progress ->> ${kind}::text, repeat('0', 128)), 'hex')`;
+            // Evaluate against the locked row, not a read/modify/write snapshot. Progress
+            // must not consume the lifecycle CAS timestamp or postpone reconciliation.
+            await db.execute(sql`UPDATE public.ezil_compute_migrations SET restore_progress =
+                COALESCE(restore_progress, jsonb_build_object('workspace', repeat('0', 128), 'system', repeat('0', 128)))
+                || jsonb_build_object(
+                    ${kind}::text, encode(set_bit(${bits}, ${index}::int, 1), 'hex'),
+                    'bytes', COALESCE((restore_progress ->> 'bytes')::bigint, 0)
+                        + CASE WHEN get_bit(${bits}, ${index}::int) = 0 THEN ${size}::bigint ELSE 0 END,
+                    'first', COALESCE(restore_progress ->> 'first', ${at}::text),
+                    'last', GREATEST(restore_progress ->> 'last', ${at}::text))
+                WHERE id = ${m.id}::uuid AND generation = ${m.generation}::uuid`);
+        },
         async claimStale(limit: number): Promise<ComputeMigration[]> {
             const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
             return rows(await db.execute(sql`WITH stale AS (
