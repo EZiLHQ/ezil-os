@@ -112,7 +112,7 @@ export function fixtureReleaseRegistry16() {
         deployment122: { ...f.deployment121, amiId: release122.amiId } };
 }
 
-/** Synthetic seventeenth and eighteenth records; the cap became 18 for 1.0.23 (readback stays under 24,000 bytes). */
+/** Synthetic seventeenth and eighteenth records; not actual release proof. */
 export function fixtureReleaseRegistry18() {
     const f = fixtureReleaseRegistry16();
     const release123 = { ...f.release122, amiId: 'ami-00000000000000017', recipeVersion: '1.0.23',
@@ -121,4 +121,13 @@ export function fixtureReleaseRegistry18() {
         createdAt: '2026-10-27T20:00:00.000Z' };
     return { ...f, release123, release124, retained: [...f.retained, release123, release124],
         deployment124: { ...f.deployment122, amiId: release124.amiId } };
+}
+
+/** Synthetic nineteenth maintenance record; not actual 1.0.25 release proof. */
+export function fixtureReleaseRegistry19() {
+    const f = fixtureReleaseRegistry18();
+    const release125 = { ...f.release124, amiId: 'ami-00000000000000019', recipeVersion: '1.0.25',
+        previousLowerImageDigest: null, previousLowerImageRef: null, createdAt: '2026-10-28T20:00:00.000Z' };
+    return { ...f, release125, retained: [...f.retained, release125],
+        deployment125: { ...f.deployment124, amiId: release125.amiId, previousLowerImageDigest: null } };
 }
