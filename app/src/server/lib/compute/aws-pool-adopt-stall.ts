@@ -4,7 +4,7 @@ import { awsSandboxId } from './aws-enroll';
 import { isExecutionAbsent } from './aws-errors';
 import { buildLifecycleWork, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, sessionEndWork, startLifecycleJob, type ReceiptDeps } from './aws-receipts';
-import { ENROLLMENT_FAILED, failStalledPoolEnrollment, readCanaryComputer, withAdmission, writeLivePoolRecovery, type Placement, type PlacementDb } from './placement';
+import { ENROLLMENT_FAILED, failStalledPoolEnrollment, readCanaryComputer, withAdmission, writeLivePoolRecovery, type Placement, type PlacementDb, type PlacementExecutor } from './placement';
 import { hasFailedPoolLease, isStalledPoolLease, markPoolHost, retirePoolLease } from './ready-pool';
 
 export const ADOPT_STALL_MS = 180_000;
@@ -45,6 +45,19 @@ export async function failStalledPoolAdopt(deps: ReceiptDeps, p: Placement, e: E
 export async function isStalledPoolAdoptPending(deps: Pick<ReceiptDeps, 'db'>, p: Placement): Promise<boolean> {
     return p.state === 'UNCONFIRMED' && p.lastError === ENROLLMENT_FAILED
         && await hasFailedPoolLease(deps.db, p, 'retiring');
+}
+
+/** Lifecycle authority for the stall path's own release job. Only this path leaves a job on an
+ * UNCONFIRMED enrollment failure whose exactly-bound pool lease is retiring; the route has
+ * already matched the job id, digest and lease epoch to the placement. */
+export async function authorizeStalledAdoptRelease(db: PlacementExecutor, p: Placement): Promise<boolean> {
+    try {
+        if (p.provider !== 'aws-ec2' || p.state !== 'UNCONFIRMED' || p.lastError !== ENROLLMENT_FAILED
+            || !p.lifecycleJobId || !p.lifecycleDigest || !p.instanceId || !p.volumeId) return false;
+        if (!await hasFailedPoolLease(db, p, 'retiring')) return false;
+        const computer = await readCanaryComputer(db, p.computerId);
+        return !!computer && !computer.deleted && computer.userId === p.ownerUserId;
+    } catch { return false; }
 }
 
 /** Adopted hosts carry claim tags: ordinary replacement accepts them only AFTER release.

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('inject billing'); }) }));
-import { ADOPT_STALL_MS, RELEASE_RETRY_AFTER_MS, failStalledPoolAdopt, replaceStalledPoolAdopt } from './aws-pool-adopt-stall';
+import { ADOPT_STALL_MS, authorizeStalledAdoptRelease, RELEASE_RETRY_AFTER_MS, failStalledPoolAdopt, replaceStalledPoolAdopt } from './aws-pool-adopt-stall';
 import { CLAIM_AT, stalledAdoptSetup } from './aws-pool-adopt-stall.test-support';
 import { buildLifecycleWork } from './aws-intent';
 import { applyLifecycleReceipt, lifecycleExecutionArn } from './aws-receipts';
@@ -125,6 +125,20 @@ describe('pool adoption stalled before session-ready', () => {
         expect(s.starts).toEqual([release, release]);
         s.finish(); await s.fleet();
         expect(s.starts.at(-1)!.intent.operation).toBe('replace');
+    });
+
+    it('authorizes only the stall path\'s own release while the bound pool lease is retiring', async () => {
+        const s = stalledAdoptSetup();
+        expect(await authorizeStalledAdoptRelease(s.db, await s.current())).toBe(false);
+        s.at(ADOPT_STALL_MS); await s.tick(); await s.tick();
+        const p = await s.current();
+        expect(p.state).toBe('UNCONFIRMED');
+        expect(await authorizeStalledAdoptRelease(s.db, p)).toBe(true);
+        expect(await authorizeStalledAdoptRelease(s.db, { ...p, lastError: 'other' })).toBe(false);
+        expect(await authorizeStalledAdoptRelease(s.db, { ...p, lifecycleJobId: null })).toBe(false);
+        expect(await authorizeStalledAdoptRelease(s.db, { ...p, leaseEpoch: p.leaseEpoch + 1 })).toBe(false);
+        s.finish(); await s.fleet();
+        expect(await authorizeStalledAdoptRelease(s.db, await s.current())).toBe(false);
     });
 
     it('retries a FAILED release once it has settled, as a new job, then replaces normally', async () => {

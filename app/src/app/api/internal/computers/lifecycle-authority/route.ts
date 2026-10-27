@@ -1,5 +1,6 @@
 import { poolJobAuthority } from '@/server/lib/compute/aws-pool-dispatch';
 import { authorizeAdoptRecovery } from '@/server/lib/compute/aws-pool-recovery';
+import { authorizeStalledAdoptRelease } from '@/server/lib/compute/aws-pool-adopt-stall';
 import { buildLifecycleWork } from '@/server/lib/compute/aws-intent';
 import { isPoolReleaseRecovering, poolReleaseReplay, matchesPoolReleaseRecovery } from '@/server/lib/compute/aws-pool-release-recovery';
 import { isPoolMode } from '@/server/lib/compute/aws-receipts';
@@ -73,6 +74,9 @@ export async function POST(req: Request): Promise<Response> {
             || record.leaseEpoch !== authority.leaseEpoch) return refuse();
         if (!IN_FLIGHT_STATES.has(record.state)) {
             if (await authorizeAdoptRecovery(db, record))
+                return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
+            // A stalled pool adoption's release: the automatic recovery's only job.
+            if (await authorizeStalledAdoptRelease(db, record))
                 return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
             // Only the durable live-release replay can authorize RECOVERING.
             // Deleted-computer and image recovery have separate authority.
