@@ -1270,6 +1270,7 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-computer-progress li[aria-current=step]{font-weight:600;opacity:1}
 .ezil-computer-progress p{margin:8px 0}
 .ezil-computer-progress progress{display:block;width:100%;margin:8px 0}
+.ezil-app-spinner-running-long .ezil-boot-retry{padding:6px 12px;background:0 0;color:inherit;border:1px solid #555;font-size:12px}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#04060c;background-image:radial-gradient(24% 6% at 50% 91.2%,rgba(255,200,150,.6) 0,rgba(255,150,100,.18) 55%,rgba(255,150,100,0) 100%),radial-gradient(150% 72% at 50% 138%,#04060c 0,#04060c 62%,rgba(0,200,208,.72) 63.1%,rgba(96,110,255,.38) 65.4%,rgba(112,86,255,.1) 70%,rgba(112,86,255,0) 78%),radial-gradient(55% 45% at 82% 6%,rgba(0,190,200,.4) 0,rgba(0,190,200,0) 62%),radial-gradient(50% 55% at 8% 22%,rgba(112,86,255,.34) 0,rgba(112,86,255,0) 64%),linear-gradient(180deg,#0a0e1d 0,#070a14 50%,#04060c 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
@@ -1347,9 +1348,9 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 .ezil-boot-retry{appearance:none;border:none;border-radius:6px;padding:9px 16px;font:inherit;font-size:13px;font-weight:500;color:#101111;background-color:#00adb5;cursor:pointer}
 .ezil-boot-retry:hover{opacity:.9}
 .ezil-boot-retry:focus-visible{outline:#f5f5f4 solid 2px;outline-offset:2px}
-.ezil-app-spinner{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:24px;background-color:#101111;color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none;overflow:hidden;text-align:center}
+.ezil-app-spinner{position:absolute;inset:0;z-index:2;display:flex;align-items:safe center;justify-content:center;padding:24px;background-color:#101111;color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none;overflow:auto;text-align:center}
 .ezil-app-spinner[hidden]{display:none}
-.ezil-app-spinner-panel{display:flex;flex-direction:column;align-items:center;max-width:280px}
+.ezil-app-spinner-panel{display:flex;flex-direction:column;align-items:center;max-width:440px}
 .ezil-app-spinner-ring{width:32px;height:32px;margin-bottom:18px;border-radius:50%;border:3px solid #2a2e2e;border-top-color:#00adb5;animation:.9s linear infinite ezil-app-spinner-spin}
 .ezil-app-spinner-sub[hidden]{display:none}
 @keyframes ezil-app-spinner-spin{
