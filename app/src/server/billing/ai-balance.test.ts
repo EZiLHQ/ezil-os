@@ -91,7 +91,7 @@ describe('Free summary grant', () => {
         await enqueueFreeAiCredits(store, 'user', 'free_v3', new Date('2026-11-21Z'));
         expect(rows.size).toBe(1);
         expect([...rows.values()][0]).toMatchObject({ eventKey: 'ezil-os:v1:free-once:user:grant',
-            payload: { credits: 500, expiresAt: '2027-10-21T00:00:00.000Z' } });
+            payload: { credits: 100, expiresAt: '2027-10-21T00:00:00.000Z' } });
     });
     it.each(['legacy', 'standard_monthly_v3', 'premium_monthly_v3'])('does not give %s a Free grant', async sku => {
         const store = { enqueueOutbox: vi.fn() };

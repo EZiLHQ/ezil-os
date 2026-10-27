@@ -42,10 +42,10 @@ describe('AI credit planning', () => {
         expect(aiCreditOutboxItem('user', grant, 'grant', 'invoice').eventKey).toBe(`${grant.entitlementId}:grant`);
         expect(aiCreditOutboxItem('user', grant, 'revoke', 'invoice').eventKey).toBe(`${grant.entitlementId}:revoke`);
     });
-    it('gives Free 500 credits once with exactly 365 days, including leap years', () => {
+    it('gives Free 100 credits once with exactly 365 days, including leap years', () => {
         const free = { ...input, sku: 'free_v3' as const, subscriptionId: null, invoiceId: null, periodEnd: null,
             periodStart: new Date('2024-02-29T12:00:00Z') };
-        expect(aiCreditEntitlement(free)).toEqual({ entitlementId: 'ezil-os:v1:free-once:user', credits: 500,
+        expect(aiCreditEntitlement(free)).toEqual({ entitlementId: 'ezil-os:v1:free-once:user', credits: 100,
             expiresAt: '2025-02-28T12:00:00.000Z' });
         expect(aiCreditEntitlement({ ...free, periodStart: input.periodStart }).entitlementId).toBe('ezil-os:v1:free-once:user');
         expect(aiCreditEntitlement({ ...free, userId: 'other' }).entitlementId).not.toBe(aiCreditEntitlement(free).entitlementId);

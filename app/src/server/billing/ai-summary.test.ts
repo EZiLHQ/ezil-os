@@ -25,10 +25,10 @@ function fixture(sku: 'free_v3' | 'standard_monthly_v3' = 'free_v3') {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('billing.summary AI wiring', () => {
-    it.each([0, 50, 51])('fills a Free live balance %s and queues the current user trial', async credits => {
+    it.each([0, 10, 11])('fills a Free live balance %s and queues the current user trial', async credits => {
         const fetcher = gateway({ credits }); vi.stubGlobal('fetch', fetcher);
         const f = fixture();
-        expect(await f.caller.summary()).toMatchObject({ ai: { balance: credits, state: credits === 0 ? 'exhausted' : credits <= 50 ? 'low' : 'ok' } });
+        expect(await f.caller.summary()).toMatchObject({ ai: { balance: credits, state: credits === 0 ? 'exhausted' : credits <= 10 ? 'low' : 'ok' } });
         expect(f.store.enqueueOutbox).toHaveBeenCalledWith(expect.objectContaining({ userId: 'current-user', eventKey: 'ezil-os:v1:free-once:current-user:grant' }));
         expect(fetcher.mock.calls[0]![1]!.headers).toEqual({ Authorization: 'Bearer current-token' });
     });
