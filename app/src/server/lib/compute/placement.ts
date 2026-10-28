@@ -1386,6 +1386,20 @@ export const ENROLLABLE_STATES: readonly PlacementState[] = ['PROVISIONING', 'ST
 export const ENROLLMENT_PENDING = 'enroll_tunnel_pending';
 export const ENROLLMENT_SUCCEEDED = 'enroll_succeeded';
 export const ENROLLMENT_FAILED = 'enroll_tunnel_failed';
+/**
+ * `last_error` of the RECOVERING and RETIRING steps of the lifecycle retire that ends a
+ * guard-refused host (aws-receipts.ts `retireUnenrolledHost`): the instance is stopped and
+ * terminated, the data volume kept, and the receipt lands STOPPED with `INSTANCE_LOST`
+ * (the next open replaces onto the volume) instead of RETIRED, which a live computer
+ * could never leave.
+ */
+export const ENROLLMENT_HOST_RETIRE = 'enroll_host_retire';
+
+/** True while that host retire is recorded on `p`, including through an unknown StartExecution. */
+export function isEnrollmentHostRetire(p: Pick<Placement, 'state' | 'lastError'>): boolean {
+    return (p.state === 'RECOVERING' || p.state === 'RETIRING')
+        && (p.lastError === ENROLLMENT_HOST_RETIRE || p.lastError === `${LIFECYCLE_START_UNKNOWN}:UNCONFIRMED:${ENROLLMENT_HOST_RETIRE}`);
+}
 
 /** A timed-out pool claim is an enrollment failure, never a new generation.
  * Lock against session-ready before checking the pool claim and burning its host. */
@@ -1437,14 +1451,13 @@ export function isUnenrolledPastGrace(x: Placement, now: Date): boolean {
 /**
  * A completed attach without enrollment may fail after the nonce's 60-second grace.
  *
- * KNOWN GAP (L-B 2026-10-27, not delivered): nothing here stops the refused host. The only
- * production caller (aws-receipts.ts `[enroll-timeout]`) passes no `retire`, so the instance
- * keeps running until the owner's next open replaces it. `retire` is only the seam for the
- * instance-only stop follow-up, which needs a lifecycle-authority exception outside this lane.
- * Contract for that seam: it runs inside the same admission transaction ONLY after this CAS
- * succeeded (as in `failStalledPoolEnrollment`), it must be database-only work (a Step
- * Functions start issued here would be checked against an uncommitted row), and a throw rolls
- * the classification back. A repeat call or a lost race returns `cas_conflict` first.
+ * The refused host is NOT stopped here: the production caller (aws-receipts.ts
+ * `[enroll-timeout]`) records and starts its lifecycle retire right after this commits
+ * (`retireUnenrolledHost`), because a Step Functions start issued inside this transaction
+ * would be authorized against an uncommitted row. `retire` is an in-transaction seam for
+ * database-only work: it runs ONLY after this CAS succeeded (as in `failStalledPoolEnrollment`)
+ * and a throw rolls the classification back. A repeat call or a lost race returns
+ * `cas_conflict` first.
  */
 export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now: Date,
     retire?: (tx: PlacementExecutor) => Promise<unknown>): Promise<TransitionResult> {

@@ -1213,7 +1213,7 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         const hidden = total; // the most recently changed row: last in updated_at order
         const f = fleet(Array.from({ length: total }, (_, k) => live(k + 1)), new Set([In(hidden)]));
         const first = await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null });
-        expect(first).toEqual({ checked: FLEET_RECONCILE_LIMIT, stopsStarted: 0, limitStops: 0 });
+        expect(first).toEqual({ checked: FLEET_RECONCILE_LIMIT, stopsStarted: 0, limitStops: 0, hostRetires: 0 });
         expect(f.starts).toEqual([]);
         const second = await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null });
         // The second pass claims the 5 never-reconciled rows first (then 15 more): the hidden one is among them.

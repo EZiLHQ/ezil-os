@@ -49,7 +49,7 @@ it('claims at most the existing per-pass limits, once each, and nothing more', a
     const res = await run();
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, deleted: { checked: 0, retiresStarted: 0, retired: 0, stuck: 0 },
-        fleet: { checked: 0, stopsStarted: 0, limitStops: 0 } });
+        fleet: { checked: 0, stopsStarted: 0, limitStops: 0, hostRetires: 0 } });
     expect(FLEET_RECONCILE_LIMIT).toBe(20); expect(RETIRE_RECONCILE_LIMIT).toBe(20);
     expect(claims.retire.mock.calls.map(([, limit]) => limit)).toEqual([RETIRE_RECONCILE_LIMIT]);
     expect(claims.fleet.mock.calls.map(([, limit]) => limit)).toEqual([FLEET_RECONCILE_LIMIT]);
