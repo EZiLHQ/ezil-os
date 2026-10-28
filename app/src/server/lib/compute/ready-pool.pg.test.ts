@@ -64,7 +64,7 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         // The real provider-migration table: capacity-demand reauthorization reads it through the production store.
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0006_compute_migrations.sql'), 'utf8')));
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0010_migration_restore_progress.sql'), 'utf8')));
-        await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz, created_at timestamptz NOT NULL DEFAULT now());
+        await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), metadata jsonb);
             CREATE TABLE ${schema}.test_users (id uuid PRIMARY KEY, deleted_at timestamptz, banned_until timestamptz);
             CREATE TABLE ${schema}.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);
             CREATE TABLE ${schema}.ezil_billing_grants (user_id uuid, subscription_id text, meter text, amount bigint, period_start timestamptz, period_end timestamptz);
@@ -1336,6 +1336,110 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             // The reserved 2 vCPU plus physical liability leaves no room for a fresh spare while the demand is active.
             const booting = ((await db.execute(sql`SELECT count(*) AS n FROM public.ezil_compute_pool_hosts WHERE state = 'booting'`)) as Record<string, unknown>[])[0]!.n;
             expect(Number(booting)).toBe(0);
+        });
+    });
+
+    describe('ROUND 3 switch preflight, demand signal and opening reads (10 vCPU cap)', () => {
+        const ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '5', AWS_REGIONS: 'ap-south-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '5',
+            EZIL_AWS_USER_MONTHLY_HOURS: '75', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '250', EZIL_AWS_USER_MONTHLY_EGRESS_GB: '100',
+            EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '1000', EZIL_AWS_KILL_SWITCH: '0' };
+        beforeEach(() => { for (const [k, v] of Object.entries(ENV)) vi.stubEnv(k, v); });
+        afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+        const xxl: PoolClass = { ...c, instanceType: 'm6i.2xlarge' };
+        const live = async (n: number, state: string, instanceType = 'm6i.large', instanceId: string | null = `i-${String(n).padStart(17, '0')}`) => {
+            await db.execute(sql`INSERT INTO public.ezil_computers (id, user_id) VALUES (${uuid(n)}::uuid, ${uuid(n)}::uuid) ON CONFLICT DO NOTHING`);
+            await db.execute(sql`INSERT INTO public.ezil_computer_placements
+                (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type, instance_id, updated_at)
+                VALUES (${uuid(n)}::uuid, ${uuid(n)}::uuid, 'aws-ec2', 'ebs', 2, 3, ${state}, ${c.region}, ${c.zoneId}, ${instanceType}, ${instanceId}, ${NOW.toISOString()}::timestamptz)`);
+            return (await readPlacement(db, uuid(n))).record!;
+        };
+        const spare = async (n: number, cls: PoolClass, state: 'booting' | 'ready') => {
+            await db.execute(sql`INSERT INTO public.ezil_compute_pool_hosts (id, region, zone_id, instance_type, created_at, updated_at)
+                VALUES (${uuid(n)}::uuid, ${cls.region}, ${cls.zoneId}, ${cls.instanceType}, ${ago(4).toISOString()}::timestamptz, ${NOW.toISOString()}::timestamptz)`);
+            if (state === 'ready') { await recordPoolEnrollment(db, uuid(n), `i-${String(n).padStart(17, '0')}`, ago(1)); await recordPoolReady(db, uuid(n), { editorOk: true }, NOW); }
+        };
+        const preflight = async (p: Placement, type: string) => (await import('./aws-pool-runtime')).preflightSwitchCapacity(db, p, type, { ...process.env, ...ENV }, NOW);
+
+        it('8 vCPU near the cap: admission alone refuses before any stop', async () => {
+            await live(201, 'RUNNING'); await live(202, 'RUNNING'); await live(203, 'UNCONFIRMED', 'm6i.large', null);
+            const own = await live(501, 'RUNNING');
+            expect(await preflight(own, 'm6i.2xlarge')).toEqual({ ok: false, reason: 'max_running' });
+            // The same computer fits on 4 vCPU: its own 2 vCPU are released, never counted twice.
+            expect(await preflight(own, 'm6i.xlarge')).toEqual({ ok: true, wait: false });
+        });
+        it('spares count the way pool opens count them: an unreclaimable spare refuses 8 vCPU; a READY 8 vCPU spare is adopted at net zero', async () => {
+            const own = await live(501, 'RUNNING');
+            // A host leased to another opening is counted and cannot be reclaimed.
+            await spare(301, xxl, 'ready');
+            await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = 'leased', leased_computer_id = ${uuid(777)}::uuid, leased_at = ${NOW.toISOString()}::timestamptz,
+                leased_generation = generation, lease_token = gen_random_uuid() WHERE id = ${uuid(301)}::uuid`);
+            expect(await preflight(own, 'm6i.2xlarge')).toEqual({ ok: false, reason: 'region_capacity' });
+            await db.execute(sql`DELETE FROM public.ezil_compute_pool_hosts`);
+            await spare(302, xxl, 'ready');
+            expect(await preflight(own, 'm6i.2xlarge')).toEqual({ ok: true, wait: false });
+        });
+        it('over the cap only because of idle reclaimable spares: a capacity wait, not a refusal', async () => {
+            const own = await live(501, 'RUNNING'); await live(201, 'RUNNING');
+            await spare(303, { ...c, instanceType: 'm6i.xlarge' }, 'ready');
+            // 2 + 2 + 4 (spare) − 2 + 8 = 14 > 10, and the idle 4 vCPU spare covers the 4 over.
+            expect(await preflight(own, 'm6i.2xlarge')).toEqual({ ok: true, wait: true });
+            expect(await poolData.readReclaimablePoolVcpu(db, c.region)).toBe(4);
+        });
+        it('poolVcpuExcess is the one count validateCapacity also uses', async () => {
+            const { poolVcpuExcess } = await import('./aws-pool-runtime');
+            expect(poolVcpuExcess({ vcpuInUse: 10, otherDemandVcpu: 0, migrations: 0, regionVcpuCap: 10 })).toBe(0);
+            expect(poolVcpuExcess({ vcpuInUse: 8, otherDemandVcpu: 2, migrations: 1, regionVcpuCap: 10 })).toBe(2);
+            expect(poolVcpuExcess({ vcpuInUse: 10, otherDemandVcpu: 0, migrations: 0, regionVcpuCap: 10, releaseVcpu: 2, addVcpu: 8 })).toBe(6);
+        });
+
+        const premium = async (n: number) => {
+            await subscriber(n, 'premium_monthly_v3');
+            await db.execute(sql`INSERT INTO public.ezil_billing_size_preferences VALUES (${uuid(n)}::uuid, 'cmp-8')`);
+            await placement(n);
+            await db.execute(sql`INSERT INTO public.ezil_computers (id, user_id) VALUES (${uuid(n)}::uuid, ${uuid(n)}::uuid) ON CONFLICT DO NOTHING`);
+        };
+        const switching = (n: number, over: Record<string, unknown> = {}) => db.execute(sql`UPDATE public.ezil_computers SET metadata = jsonb_build_object('transition',
+            ${JSON.stringify({ kind: 'switch', target: 'cmp-8', phase: 'waking', requestedAt: ago(1).toISOString(), ...over })}::jsonb) WHERE id = ${uuid(n)}::uuid`);
+        it('demand signal: an in-flight switch to 8 vCPU is one waiting open of that class, and raises the planned spares', async () => {
+            await premium(1); await premium(2);
+            const before = await readPoolDemand(db, xxl, NOW);
+            expect(before).toMatchObject({ activePremium: 2, pending: 0 });
+            expect(poolData.planPool(xxl, { ...before, regionVcpuCap: 100 }, NOW).target).toBe(1);
+            await switching(1);
+            const after = await readPoolDemand(db, xxl, NOW);
+            expect(after.pending).toBe(1);
+            expect(poolData.planPool(xxl, { ...after, regionVcpuCap: 100 }, NOW).target).toBe(2);
+            // Within the cap: no room, no extra spare.
+            expect(poolData.planPool(xxl, { ...after, regionVcpuCap: 8 }, NOW).target).toBe(1);
+            // Other classes are untouched.
+            expect((await readPoolDemand(db, { ...c, instanceType: 'm6i.xlarge' }, NOW)).pending).toBe(0);
+        });
+        it.each([
+            ['an ended switch', { phase: 'done' }], ['a stale switch', { requestedAt: ago(30).toISOString() }], ['a restart', { kind: 'restart' }],
+            ['another target', { target: 'cmp-4' }],
+        ])('demand signal ignores %s', async (_name, over) => {
+            await premium(1);
+            await switching(1, over);
+            expect((await readPoolDemand(db, xxl, NOW)).pending).toBe(0);
+        });
+        it('demand signal ignores a forged record of a non-subscriber and counts one unit per user', async () => {
+            await premium(1);
+            await db.execute(sql`INSERT INTO public.ezil_computers (id, user_id) VALUES (${uuid(9)}::uuid, ${uuid(9)}::uuid), (${uuid(10)}::uuid, ${uuid(1)}::uuid)`);
+            await switching(9); await switching(1); await switching(10);
+            expect((await readPoolDemand(db, xxl, NOW)).pending).toBe(1);
+        });
+
+        it('opening reads: this epoch\'s pool lease times, the warm median, and an active capacity demand', async () => {
+            await ready(1); await lease(1);
+            await publishPoolClaim(db, uuid(1), { ...claim, computerId: uuid(101), leaseEpoch: 4 }, ago(-0.1));
+            await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET session_ready_at = ${ago(-0.3).toISOString()}::timestamptz WHERE id = ${uuid(1)}::uuid`);
+            expect(await poolData.readPoolOpening(db, { computerId: uuid(101), leaseEpoch: 4 }, NOW))
+                .toEqual({ leasedAt: NOW, claimPublishedAt: ago(-0.1), sessionReadyAt: ago(-0.3) });
+            expect(await poolData.readPoolOpening(db, { computerId: uuid(101), leaseEpoch: 5 }, NOW)).toBeNull();
+            expect(await poolData.readPoolOpening(db, { computerId: uuid(102), leaseEpoch: 4 }, NOW)).toBeNull();
+            expect(await poolData.readWarmOpenSeconds(db, c)).toBe(18);
+            expect(await poolData.readWarmOpenSeconds(db, { ...c, instanceType: 'm6i.xlarge' })).toBeNull();
+            expect(await poolData.hasActiveCapacityDemand(db, uuid(101), NOW)).toBe(false);
         });
     });
 });
