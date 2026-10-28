@@ -61,7 +61,7 @@ import {
     type LifecycleOperation,
     type LifecycleWork,
 } from './aws-intent';
-import { ENROLLMENT_FAILED, INSTANCE_LOST, reservePoolHostForBoot, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { ENROLLMENT_FAILED, INSTANCE_LOST, isEnrollmentHostRetire, reservePoolHostForBoot, markLifecycleStartUnknown, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import type { Ec2ComputerResourceFinder, Ec2ReplacementDescriber, Ec2VolumeDescriber } from './aws-clients';
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
@@ -777,6 +777,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 }
                 default: {
                     if (isPoolOpenRelease(placement) || isPoolReleaseRecovering(placement) || await isAdoptRecoveryStarting(placement)) return notReady('computer_starting', true);
+                    // The refused host is being ended (aws-receipts.ts `retireUnenrolledHost`); it lands STOPPED, then this open replaces.
+                    if (isEnrollmentHostRetire(placement)) return notReady('computer_stopping', true);
                     const state = AWS_STATE_FOR[placement.state];
                     if (state === 'starting') return { ...notReady('computer_starting', true), ...(reconciled?.computeLaunching ? { computeLaunching: true } : {}) };
                     if (state === 'stopping') return notReady('computer_stopping', true);
@@ -794,7 +796,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const settled = await reconcileOwn(c, p, cfg.deployments, cfg.e);
             p = settled.placement;
             const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p)
-                || await isStalledPoolAdoptPending(deps, p) ? 'starting' : AWS_STATE_FOR[p.state];
+                || await isStalledPoolAdoptPending(deps, p) ? 'starting' : isEnrollmentHostRetire(p) ? 'stopping' : AWS_STATE_FOR[p.state];
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}) };
         },
 

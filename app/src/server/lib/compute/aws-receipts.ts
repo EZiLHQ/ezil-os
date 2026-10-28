@@ -29,9 +29,12 @@ import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent, type LifecycleWork } from './aws-intent';
 import {
+    ENROLLMENT_FAILED,
+    ENROLLMENT_HOST_RETIRE,
     ENROLLMENT_SUCCEEDED,
     failUnenrolledPlacement,
     INSTANCE_LOST,
+    isEnrollmentHostRetire,
     INSTANCE_LOST_VOLUME_MISSING,
     LIFECYCLE_START_FAILED,
     lifecycleStartUnknownUndo,
@@ -288,16 +291,18 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (enrolled(p)) await step(p, 'RUNNING');
         else if (!options.terminalOnly) {
             const observedAt = (deps.now ?? deps.clock ?? (() => new Date()))();
-            // KNOWN GAP, host leak NOT stopped. No `retire` here (L-B 2026-10-27): the refused host stays bound (instance, fence) so the
-            // owner's next open REPLACES it (aws-ec2.ts: previousInstanceId is stopped and terminated).
-            // A placement retire would land RETIRED, which a live computer cannot leave, and the
-            // lifecycle authority refuses any job on a cold UNCONFIRMED placement. Stopping the host
-            // before a reopen needs an instance-only job with its own authority (follow-up).
+            // No in-transaction `retire`: a Step Functions start issued inside the classifying
+            // transaction would be authorized against an uncommitted row. The refused host's
+            // retire is recorded and started right after the commit (`retireUnenrolledHost`); the
+            // fleet pass covers a start this caller cannot make (no starter) and the backlog.
             const result = await failUnenrolledPlacement(deps.db, p, observedAt);
-            if (result.ok) console.warn('[enroll-timeout]', {
-                computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch,
-                enrollExpiresAt: p.enrollExpiresAt, observedAt,
-            });
+            if (result.ok) {
+                console.warn('[enroll-timeout]', {
+                    computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch,
+                    enrollExpiresAt: p.enrollExpiresAt, observedAt,
+                });
+                await retireUnenrolledHost(deps, result.placement, deployment);
+            }
         }
         return;
     }
@@ -325,9 +330,18 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
             const work = replacementWorkFromExecution(p, deployment, e);
             const outcome = work ? await settleReplacementGeneration(deps, p, work, false, await replacementNeverLaunched(deps, p, work, e)) : 'unconfirmed';
             if (outcome === 'settled') return;
+            // A failed host retire (`retireUnenrolledHost`) hands the row back as an enrollment
+            // failure: the owner's open still REPLACES it, and the fleet pass retries after its spacing.
+            const hostRetire = isEnrollmentHostRetire(p);
+            if (hostRetire) console.warn('[enroll-host-retire]', {
+                computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch,
+                jobId: p.lifecycleJobId, outcome: 'failed', code: lifecycleFailureCode(e, p.instanceType),
+            });
             if (p.state !== 'UNCONFIRMED') await step(p, 'UNCONFIRMED', {
-                lastError: outcome === 'generation_drift' ? 'generation_drift' : lifecycleFailureCode(e, p.instanceType),
+                lastError: outcome === 'generation_drift' ? 'generation_drift' : hostRetire ? ENROLLMENT_FAILED : lifecycleFailureCode(e, p.instanceType),
                 enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
+                // Nothing to read back from a failed retire: clearing its job lets the fleet pass retry it.
+                ...(hostRetire ? { lifecycleJobId: null, lifecycleDigest: null } : {}),
             });
         }
         return;
@@ -363,8 +377,9 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     }
     startDate = e.startDate ?? null;
     stopDate = e.stopDate ?? null;
-    // Use the same provider evidence as stop-settlement epochs for pool release usage.
-    if (releasing) {
+    // Use the same provider evidence as stop-settlement epochs for pool release usage, and for
+    // the usage row the enrollment-failure host retire closes (its instance ended at stopDate).
+    if (releasing || (retiring && isEnrollmentHostRetire(p))) {
         if (stopDate && startDate && Number.isFinite(stopDate.getTime()) && Number.isFinite(startDate.getTime())
             && stopDate >= startDate && stopDate <= (deps.now ?? deps.clock ?? (() => new Date()))()) close.stoppedAt = stopDate;
         else stopDate = null; // Invalid evidence uses the existing DB-clock close and observation-time meter.
@@ -395,7 +410,11 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     // the usage row here; both are idempotent after a stop already did them.
     if (retiring) {
         if (!(await fence(p))) return;
-        await step(p, 'RETIRED', done, close);
+        // The host retire of a LIVE computer (`retireUnenrolledHost`) ended the instance only: the
+        // computer keeps its volume and lands STOPPED as a lost instance, so its next open REPLACES
+        // (or adopts a warm host) onto that volume. RETIRED is for a deleted computer only.
+        if (isEnrollmentHostRetire(p)) await step(p, 'STOPPED', { ...done, lastError: INSTANCE_LOST }, close);
+        else await step(p, 'RETIRED', done, close);
         return;
     }
     if (adopting) {
@@ -477,7 +496,9 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
             const outcome = await startLifecycleJob(deps.starter, p.region, work, deps.sleep);
             if (outcome === 'started') return; // The next look follows the execution.
             if (outcome === 'unknown') {
-                await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: p, undo });
+                // A host retire keeps its marker through another unknown start (the receipt lands STOPPED by it).
+                await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: p, undo,
+                    ...(isEnrollmentHostRetire(p) ? { context: ENROLLMENT_HOST_RETIRE } : {}) });
                 return;
             }
         }
@@ -489,7 +510,8 @@ async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: L
             // Absence cannot reconstruct its authorized source pair or justify generation-1.
             ...(unresolvedReplacement ? {} : { lifecycleJobId: null, lifecycleDigest: null }),
             enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
-            lastError: isPoolOpenRelease(p) ? POOL_OPEN_RELEASE_FAILED : LIFECYCLE_START_FAILED,
+            // A host retire that never started hands the row back as the enrollment failure it was.
+            lastError: isPoolOpenRelease(p) ? POOL_OPEN_RELEASE_FAILED : isEnrollmentHostRetire(p) ? ENROLLMENT_FAILED : LIFECYCLE_START_FAILED,
         },
     });
 }
@@ -747,10 +769,11 @@ export async function reconcileAwsFleet(
     deployments: Readonly<Record<string, LifecycleDeployment>>,
     limit = FLEET_RECONCILE_LIMIT,
     policy?: SessionLimitPolicy,
-): Promise<{ checked: number; stopsStarted: number; limitStops: number }> {
+): Promise<{ checked: number; stopsStarted: number; limitStops: number; hostRetires: number }> {
     let checked = 0;
     let stopsStarted = 0;
     let limitStops = 0;
+    let hostRetires = 0;
     const claimed = await claimAwsPlacementsToReconcile(deps.db, limit);
     // One usage read per pass, only when caps can bind and a row may be RUNNING.
     const usage = policy?.caps && claimed.length > 0 ? policy.usage ?? (await readMonthUsage(deps.db, policy.now, utcMonthStart(policy.now))) : undefined;
@@ -765,6 +788,12 @@ export async function reconcileAwsFleet(
             const { record: now } = await readPlacement(deps.db, computerId);
             if (!now) continue;
             if (deps.recoveryEnv) await replaceStalledPoolAdopt(deps, now, deps.recoveryEnv);
+            // A refused host still running on an enrollment-failed row (classified before a starter
+            // was available, a refused or failed earlier retire, or the backlog): retire it.
+            if (await retireUnenrolledHost(deps, now, deployment, { minAgeMs: ENROLL_HOST_RETIRE_RETRY_MS })) {
+                hostRetires += 1;
+                continue;
+            }
             if (await reconcileGuestStop(deps, now, deployment)) {
                 stopsStarted += 1;
                 continue;
@@ -775,7 +804,77 @@ export async function reconcileAwsFleet(
             if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
     }
-    return { checked, stopsStarted, limitStops };
+    return { checked, stopsStarted, limitStops, hostRetires };
+}
+
+// ── The enrollment-failure host retire (a guard-refused cold host must stop costing money) ──
+
+/** The fleet pass retries a refused or failed host retire no sooner than this after the row last changed. */
+export const ENROLL_HOST_RETIRE_RETRY_MS = 10 * 60_000;
+
+/**
+ * End the instance of a LIVE computer whose cold boot failed to enroll (`[enroll-timeout]`:
+ * UNCONFIRMED with `ENROLLMENT_FAILED`, no job, an instance and a volume recorded), through the
+ * EXISTING lifecycle `retire` job, exactly as a delete settles an UNCONFIRMED placement
+ * (`settleUnconfirmedAwsPlacement`): UNCONFIRMED → RECOVERING → RETIRING with the job recorded
+ * first (the authority accepts an in-flight RETIRING row), then StartExecution. The helper stops
+ * and terminates the instance only; the data volume (DeleteOnTermination=false) is kept and
+ * must be `available` before the receipt says `retired`.
+ *
+ * `ENROLLMENT_HOST_RETIRE` on the RECOVERING and RETIRING rows tells the receipt path apart
+ * from a delete's retire: its receipt lands STOPPED with `INSTANCE_LOST` (`applyLifecycleReceipt`),
+ * never RETIRED, so the owner's next open replaces (or warm-adopts) onto the volume. A refused
+ * StartExecution, a failed execution or a start settled as never made hands the row back as
+ * UNCONFIRMED/`ENROLLMENT_FAILED` (the owner's open still replaces; the fleet pass retries after
+ * `minAgeMs`). Returns true when a retire job was recorded and its start accepted or unknown.
+ *
+ * A RECOVERING row carrying the marker with no job (the second step lost its race) is resumed.
+ */
+export async function retireUnenrolledHost(
+    deps: ReceiptDeps & { newId?: () => string },
+    p: Placement,
+    deployment: LifecycleDeployment | undefined,
+    options: { minAgeMs?: number } = {},
+): Promise<boolean> {
+    const fresh = p.state === 'UNCONFIRMED' && p.lastError === ENROLLMENT_FAILED;
+    const resumed = p.state === 'RECOVERING' && p.lastError === ENROLLMENT_HOST_RETIRE;
+    if (p.provider !== 'aws-ec2' || !(fresh || resumed) || p.lifecycleJobId !== null || !deps.starter || !deployment) return false;
+    if (!p.region || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return false;
+    const now = (deps.now ?? deps.clock ?? (() => new Date()))();
+    if (options.minAgeMs !== undefined && now.getTime() - p.updatedAt.getTime() < options.minAgeMs) return false;
+    let work: LifecycleWork;
+    try {
+        work = buildLifecycleWork(currentGenerationIntent(p, 'retire', deployment, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
+    } catch (error) {
+        if (error instanceof LifecycleIntentInvalidError) return false;
+        throw error;
+    }
+    let current = p;
+    if (fresh) {
+        const recovering = await transitionPlacementAsReconciler(deps.db, {
+            computerId: p.computerId, expected: p, to: 'RECOVERING', fields: { lastError: ENROLLMENT_HOST_RETIRE },
+        });
+        if (!recovering.ok) return false;
+        current = recovering.placement;
+    }
+    const retiring = await transitionPlacementAsReconciler(deps.db, {
+        computerId: p.computerId, expected: current, to: 'RETIRING',
+        fields: { enrollConsumedHash: null, enrollExpiresAt: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: ENROLLMENT_HOST_RETIRE },
+    });
+    if (!retiring.ok) return false;
+    const log = { computerId: p.computerId, instanceId: p.instanceId, generation: p.generation, leaseEpoch: p.leaseEpoch, jobId: work.intent.jobId };
+    const outcome = await startLifecycleJob(deps.starter, p.region, work, deps.sleep);
+    if (outcome === 'refused') {
+        await transitionPlacementAsReconciler(deps.db, {
+            computerId: p.computerId, expected: retiring.placement, to: 'UNCONFIRMED',
+            fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: ENROLLMENT_FAILED },
+        });
+        console.warn('[enroll-host-retire]', { ...log, outcome: 'refused' });
+        return false;
+    }
+    if (outcome === 'unknown') await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: retiring.placement, undo: 'UNCONFIRMED', context: ENROLLMENT_HOST_RETIRE });
+    console.info('[enroll-host-retire]', { ...log, outcome: outcome === 'unknown' ? 'start_unknown' : 'started' });
+    return true;
 }
 
 // ── Background retirement of deleted computers (§6, R11) ─────────────────
@@ -1008,7 +1107,7 @@ export async function runAwsBackgroundReconcile(
     const deleted = await reconcileDeletedAwsComputers(deps, d.deployments);
     // Reached hour caps are stopped here too, for computers nobody touches (a lapsed lease alone is not: reconcileAwsFleet).
     const fleet = deps.signal?.aborted
-        ? { checked: 0, stopsStarted: 0, limitStops: 0 }
+        ? { checked: 0, stopsStarted: 0, limitStops: 0, hostRetires: 0 }
         : await reconcileAwsFleet({ ...deps, recoveryEnv: env }, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
     return { ok: true, deleted, fleet };
 }

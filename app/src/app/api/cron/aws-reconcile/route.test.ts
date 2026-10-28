@@ -29,7 +29,7 @@ beforeEach(() => {
     vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '1');
     vi.mocked(defaultAwsCollaborators).mockReturnValue({});
     vi.mocked(runAwsBackgroundReconcile).mockResolvedValue({ ok: true,
-        deleted: { checked: 0, retiresStarted: 0, retired: 0, stuck: 0 }, fleet: { checked: 2, stopsStarted: 1, limitStops: 0 } });
+        deleted: { checked: 0, retiresStarted: 0, retired: 0, stuck: 0 }, fleet: { checked: 2, stopsStarted: 1, limitStops: 0, hostRetires: 0 } });
 });
 afterEach(() => { vi.unstubAllEnvs(); });
 
