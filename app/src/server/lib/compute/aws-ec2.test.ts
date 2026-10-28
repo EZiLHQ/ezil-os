@@ -417,6 +417,20 @@ describe('ensure: resize to the current paid plan', () => {
             dataVolumeId: 'vol-11111111111111111', targetGeneration: 4, leaseEpoch: 8 });
     });
 
+    it('round 3 switch: the wake after a confirmed stop is a replace that fences the old host (generation + 1, new fence)', async () => {
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large', generation: 3, lease_epoch: 7 })] },
+            { entitlement: paid('cmp-4'), e: resizeEnv() });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting', computeLaunching: true });
+        const intent = s.calls[0]!.intent;
+        expect(intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.xlarge', targetGeneration: 4, previousGeneration: 3,
+            previousFenceToken: FENCE, dataVolumeId: 'vol-11111111111111111', dataVolumeGiB: null });
+        expect(intent.fenceToken).not.toBe(FENCE);
+        expect(s.placements[0]).toMatchObject({ generation: 4, lease_epoch: 8, instance_type: 'm6i.xlarge', fence_token: intent.fenceToken, instance_id: null });
+        // A second tab racing the same wake: one host, and that caller keeps waiting (never cas_conflict to the user).
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(s.calls).toHaveLength(1);
+    });
+
     it('global capacity checks the new vCPU, even with room in the home region', async () => {
         const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), e: resizeEnv({ AWS_MAX_RUNNING: '1' }) });
         expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable', error: 'max_running' });

@@ -30,6 +30,7 @@ import { planFromSubscriptions } from '@/server/billing/v3/catalog';
 import type { SwitchConfigurationOutputV3, SwitchPhaseV3 } from '@/server/billing/v3/contract';
 import { meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
 import { preflightSwitchCapacity, type SwitchCapacity } from '@/server/lib/compute/aws-pool-runtime';
+import { recordComputeTiming } from '@/server/lib/compute/aws-pool-timing';
 import {
     AWS_SIZE_CODES, readComputerMeta, resolveTransition, TRANSITION_IN_FLIGHT, TRANSITION_REQUEST_ID, TRANSITION_STOP_TIMEOUT_MS,
     TRANSITION_WAKE_TIMEOUT_MS, writeTransition, type AwsSizeCode, type ComputerTransition, type TransitionKind,
@@ -309,6 +310,11 @@ async function finishTransition(db: PlacementExecutor, billing: BillingDeps, com
     if (!ended) return;
     console.info(JSON.stringify({ event: 'compute-transition', kind: t.kind, phase: resolved.phase, reason: resolved.reason,
         current: t.current, target: t.target, ms: now.getTime() - Date.parse(t.requestedAt) }));
+    // The switch phases as one durable row (telemetry ingestion): requested → stopping → waking → end.
+    const at = (v: string | null) => v ? Date.parse(v) - Date.parse(t.requestedAt) : NaN;
+    await recordComputeTiming(db, { site: 'compute.transition', code: `${t.kind}_${resolved.phase}`, outcome: resolved.phase === 'done' ? 'ok' : 'error',
+        ownerUserId: computer.userId, computerId: computer.computerId, durationMs: now.getTime() - Date.parse(t.requestedAt),
+        phases: { stopping: at(t.stoppingAt), waking: at(t.wakingAt), end: now.getTime() - Date.parse(t.requestedAt) } });
     if (resolved.phase === 'failed' && t.kind === 'switch' && t.current !== t.target) {
         // Only the preference this switch wrote: a later explicit choice is never overwritten.
         try { if (await billing.store.sizePreference(computer.userId) === t.target) await billing.store.setSizePreference(computer.userId, t.current); }
