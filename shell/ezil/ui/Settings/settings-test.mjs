@@ -343,6 +343,9 @@ await settle(4);
 }
 
 // ── Appearance tab ─────────────────────────────────────────────────────────
+// A signed-in page: the payload names the account whose keys are used.
+window.localStorage.setItem('ezil-os:settings.accent', '"amber"'); // a pre-round-3 shared key, migrated once
+window.__EZIL_BOOT__ = REAL_PAYLOAD;
 clickTab('appearance');
 await settle(4);
 push('Appearance pane becomes active',
@@ -358,12 +361,27 @@ push('picking a wallpaper applies it to the desktop root',
     (q('.desktop')?.style.background ?? '') !== '', q('.desktop')?.style.background?.slice(0, 40));
 push('picking a wallpaper persists to localStorage (no server call)',
     JSON.stringify(window.localStorage).includes(wallpaperSwatch?.getAttribute('data-wallpaper')));
+push('the old shared accent key was moved to this account once (Amber shows as chosen)',
+    q('.window[data-app="settings"] [data-accent].active')?.getAttribute('data-accent') === 'amber'
+    && window.localStorage.getItem('ezil-os:settings.accent') === null);
 const accentSwatch = qa('.window[data-app="settings"] [data-accent]')[1];
 click(accentSwatch);
 await settle(4);
 push('picking an accent writes the theme tokens',
     doc.documentElement.style.getPropertyValue('--select-hue') !== '',
     doc.documentElement.style.getPropertyValue('--select-hue'));
+// Round 3 (§6.7): the exact token values, not just "non-empty" (A5).
+push('🔴 Violet sets --ezil-accent and a contrast-safe text colour on <html>',
+    accentSwatch?.getAttribute('data-accent') === 'violet'
+    && doc.documentElement.style.getPropertyValue('--ezil-accent') === '#7c3bed'
+    && doc.documentElement.style.getPropertyValue('--ezil-accent-contrast') === '#ffffff',
+    `${doc.documentElement.style.getPropertyValue('--ezil-accent')} / ${doc.documentElement.style.getPropertyValue('--ezil-accent-contrast')}`);
+push('appearance is saved per account on this browser, and the pane says so',
+    window.localStorage.getItem(`ezil-os:settings.${REAL_PAYLOAD.user.id}.accent`) === '"violet"'
+    && window.localStorage.getItem('ezil-os:settings.accent') === null
+    && /Saved on this browser\./.test(q('.window[data-app="settings"] [data-pane="appearance"]')?.textContent ?? ''),
+    JSON.stringify(Object.keys(window.localStorage)));
+delete window.__EZIL_BOOT__;
 
 // ── Account tab — the one place to sign out ───────────────────────────────
 {

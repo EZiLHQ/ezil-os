@@ -6,8 +6,9 @@
     --border: rgba(255, 255, 255, 0.08);
     --text: #f5f5f4;
     --muted: #9aa3ad;
-    --accent: #00adb5;
-    --accent-ink: #04060c;
+    /* Round 3: the user's accent (`--ezil-accent`, ezil-tokens.css + Appearance). */
+    --accent: var(--ezil-accent, #00adb5);
+    --accent-ink: var(--ezil-accent-contrast, #04060c);
     --warn: #f5a524;
     --danger: #f05d5e;
     position: fixed;
