@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { BillingStore, GrantInsert, GrantRow, OutboxInsert } from './ports';
 import type { CatalogPack } from './types';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP_SKU } from './catalog';
-import { AI_CREDIT_POLICY_VERSION, CATALOG_V3, type PlanSkuV3 } from './v3/contract';
+import { AI_CREDIT_POLICY_VERSION, CATALOG_V3, UPGRADE_AI_ENTITLEMENT_SUFFIX, upgradeAiCredits, type PlanSkuV3 } from './v3/contract';
 
 const DAY = 86_400_000;
 export const AI_CREDIT_PROTOCOL = 'ezil-ai-credits-v1';
@@ -30,6 +30,36 @@ export function aiCreditEntitlement(input: {
         credits: policy.amount,
         expiresAt: new Date(policy.per === 'once' ? start + 365 * DAY : input.periodEnd!.getTime() + 3 * DAY).toISOString(),
     };
+}
+
+const UPGRADE_ENTITLEMENT = /^ezil-os:v1:premium_monthly_v3:([A-Za-z0-9_]+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z):upgrade$/;
+
+/**
+ * Round 3 D1: the prorated Standard → Premium credits of one paid upgrade invoice.
+ * `credits` may be 0 (the caller then enqueues nothing); the id never exceeds 193 chars.
+ */
+export function aiUpgradeEntitlement(input: {
+    userId: string; subscriptionId: string; periodStart: Date; periodEnd: Date; effectiveAt: Date;
+}): AiCreditEntitlement {
+    const [start, end, at] = [input.periodStart, input.periodEnd, input.effectiveAt].map(date => date.getTime());
+    if (!input.userId || ![start, end, at].every(Number.isFinite) || end! <= start! || at! < start! || at! >= end!) {
+        throw new TypeError('Invalid AI upgrade period');
+    }
+    const entitlementId = `ezil-os:v${AI_CREDIT_POLICY_VERSION}:premium_monthly_v3:${input.subscriptionId}:`
+        + `${input.effectiveAt.toISOString()}:${UPGRADE_AI_ENTITLEMENT_SUFFIX}`;
+    if (entitlementId.length > 193 || !UPGRADE_ENTITLEMENT.test(entitlementId)) throw new TypeError('Invalid AI upgrade entitlement');
+    return {
+        entitlementId,
+        credits: upgradeAiCredits({ fromSku: 'standard_monthly_v3', toSku: 'premium_monthly_v3',
+            periodStart: input.periodStart.toISOString(), periodEnd: input.periodEnd.toISOString(), effectiveAt: input.effectiveAt.toISOString() }),
+        expiresAt: new Date(end! + 3 * DAY).toISOString(),
+    };
+}
+
+export function parseAiUpgradeEntitlement(entitlementId: string): { subscriptionId: string; effectiveAt: Date } | null {
+    const match = entitlementId.length <= 193 ? UPGRADE_ENTITLEMENT.exec(entitlementId) : null;
+    const effectiveAt = match ? new Date(match[2]!) : null;
+    return match && effectiveAt && effectiveAt.toISOString() === match[2] ? { subscriptionId: match[1]!, effectiveAt } : null;
 }
 
 export function aiCreditOutboxItem(userId: string, entitlement: AiCreditEntitlement, action: 'grant' | 'revoke', invoiceId: string | null): OutboxInsert {
@@ -192,6 +222,14 @@ function localReversalDeltas(input: AiReversalInput, corrections: GrantRow[], re
     return true;
 }
 
+/** The upgrade grant row keeps the subscription period; the root carries the effective instant inside it. */
+function upgradeRootMatches(entitlementId: string, expiresAt: string, g: GrantRow): boolean {
+    const root = parseAiUpgradeEntitlement(entitlementId);
+    return root !== null && g.subscriptionId === root.subscriptionId && g.periodStart !== null && g.periodEnd !== null
+        && root.effectiveAt >= g.periodStart && root.effectiveAt < g.periodEnd
+        && expiresAt === new Date(g.periodEnd.getTime() + 3 * DAY).toISOString();
+}
+
 /** Pure financial guard, run against a fresh snapshot under the store's cause/root locks. */
 export function planAiReversal(input: AiReversalInput, snapshot: {
     originals: GrantRow[]; corrections: GrantRow[]; receipts: AiReversalReceipt[];
@@ -222,7 +260,8 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
                 && p.expiresAt === g.periodEnd?.toISOString()
             : p.invoiceId === g.sourceId && g.kind === 'plan_period' && g.subscriptionId && g.periodStart
                 && ['standard_monthly_v3', 'premium_monthly_v3'].some(sku => p.entitlementId
-                    === `ezil-os:v1:${sku}:${g.subscriptionId}:${g.periodStart!.toISOString()}`));
+                    === `ezil-os:v1:${sku}:${g.subscriptionId}:${g.periodStart!.toISOString()}`)
+            || p.invoiceId === g.sourceId && g.kind === 'upgrade_prorated' && upgradeRootMatches(String(p.entitlementId), String(p.expiresAt), g));
         if (!matchesSource) return refuse('review:restore_mismatch');
         const family = snapshot.receipts.filter(r => r.payload.entitlementId === p.entitlementId);
         if (family.some(r => !receiptTermsMatch(root, r))) return refuse('review:restore_mismatch');

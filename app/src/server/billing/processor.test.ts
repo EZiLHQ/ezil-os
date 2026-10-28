@@ -1856,6 +1856,119 @@ describe('v3 paid invoice grants', () => {
         expect(await processStripeEvent(paidV2(), other.deps)).toBe('ignored');
         expect(other.store.grants.size).toBe(0);
     });
+    describe('round 3 D1: upgrade AI credits', () => {
+        const upgradeRoot = `ezil-os:v1:premium_monthly_v3:sub_local:${now.toISOString()}:upgrade`;
+        const upgradeCredits = Number(BigInt(800) * BigInt((periodEnd.getTime() - now.getTime()) / 1000)
+            / BigInt((periodEnd.getTime() - periodStart.getTime()) / 1000));
+        function upgraded() {
+            const f = v3Fixture('premium_monthly_v3');
+            f.stripe.invoice.id = 'in_upgrade';
+            f.stripe.invoice.billingReason = 'subscription_update';
+            f.stripe.invoice.lines = [
+                { ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3', amount: -1000, proration: true, periodStart: now },
+                { ...baseLine('compute_monthly_v2'), lookupKey: 'ezil_premium_monthly_v3', amount: 2000, proration: true, periodStart: now },
+            ];
+            f.stripe.charge.invoiceId = 'in_upgrade';
+            return f;
+        }
+        const aiRows = (store: MemoryStore) => [...store.outbox.values()].filter(item => item.kind === 'ai_grant');
+        it('enqueues exactly one prorated AI grant with the pinned id and expiry, once across replays', async () => {
+            const f = upgraded();
+            expect(upgradeCredits).toBe(529); // floor(800 × 20.5 / 31)
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(await processStripeEvent({ ...paidV2(), id: 'evt_redelivered' }, f.deps)).toBe('applied');
+            expect(aiRows(f.store)).toEqual([{ eventKey: `${upgradeRoot}:grant`, userId: 'user_local', kind: 'ai_grant',
+                payload: expect.objectContaining({ entitlementId: upgradeRoot, credits: upgradeCredits, action: 'grant',
+                    invoiceId: 'in_upgrade', expiresAt: '2026-11-04T00:00:00.000Z', eventId: `${upgradeRoot}:grant` }) }]);
+            expect(f.store.planChanges.every(change => change.state !== 'pending')).toBe(true);
+        });
+        it('repairs an outbox write interrupted after the compute grant on the next delivery', async () => {
+            const f = upgraded();
+            vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('interrupted'));
+            await expect(processStripeEvent(paidV2(), f.deps)).rejects.toThrow('interrupted');
+            expect(f.store.grants.size).toBe(1); expect(aiRows(f.store)).toHaveLength(0);
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(f.store.grants.size).toBe(1); expect(aiRows(f.store)).toHaveLength(1);
+        });
+        it.each(['unpaid', 'late renewal', 'mismatched end', 'v2 credit line', 'no credit line'] as const)('a %s upgrade invoice enqueues no AI credits', async scenario => {
+            const f = upgraded();
+            if (scenario === 'unpaid') f.stripe.invoice.status = 'open';
+            if (scenario === 'late renewal') f.stripe.subscription.currentPeriodEnd = new Date('2026-12-01T00:00:00.000Z');
+            if (scenario === 'mismatched end') f.stripe.invoice.lines[1]!.periodEnd = new Date('2026-11-02T00:00:00.000Z');
+            if (scenario === 'v2 credit line') f.stripe.invoice.lines[0]!.lookupKey = 'ezil_standard_monthly_v2';
+            if (scenario === 'no credit line') f.stripe.invoice.lines.shift();
+            const outcome = await processStripeEvent(paidV2(), f.deps);
+            expect(outcome).not.toBe('applied');
+            expect(aiRows(f.store)).toHaveLength(0);
+            expect(f.store.grants.size).toBe(0);
+        });
+        it('a v2 Compute upgrade keeps compute-only terms', async () => {
+            const f = fixture();
+            f.stripe.subscription.sku = 'compute_monthly_v2';
+            f.stripe.invoice.billingReason = 'subscription_update';
+            f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+                { ...baseLine('compute_monthly_v2'), amount: 2000, proration: true, periodStart: now }];
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(f.store.grants.size).toBe(1);
+            expect(aiRows(f.store)).toHaveLength(0);
+        });
+        it('skips a zero-credit upgrade in the last instant of the period and logs it', async () => {
+            const f = upgraded();
+            const last = new Date(periodEnd.getTime() - 1000);
+            f.stripe.invoice.lines[1]!.periodStart = last;
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(aiRows(f.store)).toHaveLength(0);
+            expect(info.mock.calls.map(call => JSON.parse(String(call[0])))).toContainEqual(
+                { event: 'ai-upgrade-grant', outcome: 'skipped_zero', invoiceId: 'in_upgrade' });
+            info.mockRestore();
+        });
+        it.each(['refund', 'dispute'] as const)('a %s of the upgrade invoice reverses exactly the upgrade grant', async cause => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            if (cause === 'dispute') f.stripe.charge.refunded = false;
+            expect(await processStripeEvent(cause === 'refund' ? refund() : dispute(), f.deps)).toBe('applied');
+            const key = cause === 'refund' ? `${upgradeRoot}:revoke:refund:re_local` : `${upgradeRoot}:revoke:dispute:dp_local`;
+            expect(f.store.outbox.get(key)).toMatchObject({ kind: 'ai_revoke', payload: { entitlementId: upgradeRoot,
+                credits: upgradeCredits, action: 'revoke', expiresAt: '2026-11-04T00:00:00.000Z' } });
+            expect(f.store.outbox.size).toBe(2);
+            expect([...f.store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
+        });
+        it('reconstructs the missing upgrade receipt byte-for-byte for a refund', async () => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            const original = structuredClone(f.store.outbox.get(`${upgradeRoot}:grant`)!);
+            f.store.outbox.clear();
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(f.store.outbox.get(`${upgradeRoot}:revoke:refund:re_local`)?.payload).toMatchObject({
+                entitlementId: original.payload.entitlementId, credits: original.payload.credits,
+                expiresAt: original.payload.expiresAt, invoiceId: original.payload.invoiceId });
+        });
+        it('the renewal after an upgrade grants the full 1,000 once', async () => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            const nextStart = periodEnd, nextEnd = new Date('2026-12-01T00:00:00.000Z');
+            Object.assign(f.stripe.subscription, { currentPeriodStart: nextStart, currentPeriodEnd: nextEnd });
+            Object.assign(f.stripe.invoice, { id: 'in_renewal', billingReason: 'subscription_cycle', periodStart: nextStart, periodEnd: nextEnd,
+                lines: [{ ...baseLine('compute_monthly_v2'), lookupKey: 'ezil_premium_monthly_v3', periodStart: nextStart, periodEnd: nextEnd }] });
+            expect(await processStripeEvent({ ...paidV2(), id: 'evt_renewal' }, f.deps)).toBe('applied');
+            expect(await processStripeEvent({ ...paidV2(), id: 'evt_renewal_again' }, f.deps)).toBe('applied');
+            const renewal = `ezil-os:v1:premium_monthly_v3:sub_local:${nextStart.toISOString()}`;
+            expect(aiRows(f.store).map(item => [item.payload.entitlementId, item.payload.credits])).toEqual([
+                [upgradeRoot, upgradeCredits], [renewal, 1000]]);
+        });
+        it('logs one structured line per webhook outcome', async () => {
+            const f = upgraded();
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            await processStripeEvent(paidV2(), f.deps);
+            await processStripeEvent(event('invoice.paid', { id: 'in_local' }), f.deps);
+            expect(info.mock.calls.map(call => JSON.parse(String(call[0]))).filter(line => line.event === 'billing-webhook')).toEqual([
+                { event: 'billing-webhook', type: 'invoice.paid', outcome: 'applied', eventId: 'evt_local' },
+                { event: 'billing-webhook', type: 'invoice.paid', outcome: expect.any(String), eventId: 'evt_local' }]);
+            info.mockRestore();
+        });
+    });
     it('resolves Premium from the line lookup key despite stale Standard checkout metadata', async () => {
         const f = v3Fixture('premium_monthly_v3');
         const client = createStripeClient({ secretKey: 'fixture', fetch: vi.fn<typeof fetch>().mockResolvedValue(Response.json({
