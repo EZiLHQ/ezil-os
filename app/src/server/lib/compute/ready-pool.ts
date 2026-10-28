@@ -409,3 +409,33 @@ export async function readPendingPoolAdopt(db: PlacementExecutor, poolHostId: st
             AND claim_fence IS NULL AND claim_volume_serial IS NULL
     `));
 }
+
+/** Round 3 progress: the durable warm-open times of THIS lease epoch's pool host for `computerId`, or null (a cold open). */
+export async function readPoolOpening(db: PlacementExecutor, p: { computerId: string; leaseEpoch: number }, now: Date):
+    Promise<{ leasedAt: Date | null; claimPublishedAt: Date | null; sessionReadyAt: Date | null } | null> {
+    const row = rowsOf(await db.execute(sql`/* pool:opening */ SELECT leased_at,
+            CASE WHEN claim_generation IS NOT NULL THEN updated_at END AS claim_published_at, session_ready_at
+        FROM public.ezil_compute_pool_hosts
+        WHERE leased_computer_id = ${p.computerId}::uuid AND state = 'leased' AND leased_at IS NOT NULL
+            AND (claim_lease_epoch IS NULL OR claim_lease_epoch = ${p.leaseEpoch})
+            AND leased_at > ${now.toISOString()}::timestamptz - interval '1 hour'
+        ORDER BY leased_at DESC, id LIMIT 1`))[0];
+    return row ? { leasedAt: date(row.leased_at), claimPublishedAt: date(row.claim_published_at), sessionReadyAt: date(row.session_ready_at) } : null;
+}
+
+/** Median measured warm open (pool `leased_at` → tenant `session_ready_at`) over the class's last `limit` adoptions, in seconds. */
+export async function readWarmOpenSeconds(db: PlacementExecutor, c: { region: string; instanceType: string }, limit = 20): Promise<number | null> {
+    const row = rowsOf(await db.execute(sql`/* pool:warm-median */ SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY seconds) AS median
+        FROM (SELECT extract(epoch FROM (session_ready_at - leased_at)) AS seconds FROM public.ezil_compute_pool_hosts
+            WHERE region = ${c.region} AND instance_type = ${c.instanceType} AND leased_at IS NOT NULL
+                AND session_ready_at IS NOT NULL AND session_ready_at > leased_at
+            ORDER BY session_ready_at DESC, id LIMIT ${Math.max(1, Math.min(100, Math.floor(limit)))}) recent`))[0];
+    const median = row?.median == null ? null : Number(row.median);
+    return median !== null && Number.isFinite(median) && median > 0 ? median : null;
+}
+
+/** An active capacity demand holds this computer's open: the wake waits for room (never shown as "stopped"). */
+export async function hasActiveCapacityDemand(db: PlacementExecutor, computerId: string, now: Date): Promise<boolean> {
+    return rowsOf(await db.execute(sql`/* pool:demand-active */ SELECT 1 AS active FROM public.ezil_compute_capacity_demands
+        WHERE computer_id = ${computerId}::uuid AND closed_at IS NULL AND expires_at > ${now.toISOString()}::timestamptz LIMIT 1`)).length === 1;
+}
