@@ -1,8 +1,46 @@
-.ezil-computer-progress { max-width: 440px; margin: 16px auto 0; font-size: 13px; line-height: 1.5; text-align: left; overflow-wrap: anywhere; }
-.ezil-computer-progress ol { padding-left: 24px; margin: 0 0 12px; }
-.ezil-computer-progress li { margin: 4px 0; opacity: .65; }
-.ezil-computer-progress li[data-state="complete"] { opacity: .85; }
-.ezil-computer-progress li[aria-current="step"] { font-weight: 600; opacity: 1; }
-.ezil-computer-progress p { margin: 8px 0; }
-.ezil-computer-progress progress { display: block; width: 100%; margin: 8px 0; }
+/* The one opening surface (`computer-progress.js` `OpeningSurface`), shared by
+ * `.ezil-app-spinner` and `.ezil-boot`: icon, app name, one status line, one thin
+ * bar, a muted elapsed time. The selectors carry the parent class so they win over
+ * the older `.ezil-boot-*` rules in `ezil-shell.css`, which loads after this file. */
+.ezil-app-spinner > .ezil-opening, .ezil-boot > .ezil-opening {
+    display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 320px; text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+.ezil-opening .ezil-opening-icon {
+    display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin-bottom: 12px;
+    border-radius: 12px; background: #1d2121; color: #f5f5f4; font-size: 20px; font-weight: 600; overflow: hidden;
+}
+.ezil-opening .ezil-opening-icon img { width: 100%; height: 100%; object-fit: contain; }
+.ezil-opening .ezil-opening-name { margin: 0 0 4px; font-size: 15px; font-weight: 600; line-height: 1.3; color: #f5f5f4; }
+.ezil-app-spinner > .ezil-opening .ezil-opening-status, .ezil-boot > .ezil-opening .ezil-opening-status {
+    margin: 0 0 14px; font-size: 13px; font-weight: 400; line-height: 1.45; color: #c4caca;
+}
+.ezil-app-spinner[data-kind='failed'] .ezil-opening-status, .ezil-boot[data-kind='failed'] .ezil-opening-status,
+.ezil-app-spinner[data-kind='not_configured'] .ezil-opening-status, .ezil-boot[data-kind='not_configured'] .ezil-opening-status {
+    font-size: 15px; font-weight: 600; color: #f5f5f4;
+}
+.ezil-opening .ezil-opening-bar { position: relative; width: 220px; max-width: 100%; height: 4px; border-radius: 2px; background: #2a2e2e; overflow: hidden; }
+.ezil-opening .ezil-opening-bar[hidden], .ezil-opening .ezil-opening-meta[hidden], .ezil-opening .ezil-opening-name[hidden],
+.ezil-opening .ezil-opening-sub[hidden], .ezil-opening .ezil-opening-feedback[hidden], .ezil-opening .ezil-boot-retry[hidden] { display: none; }
+.ezil-opening .ezil-opening-fill { height: 100%; width: 0; border-radius: 2px; background: #00adb5; transition: width 0.9s ease-out; }
+.ezil-opening .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill {
+    width: 30%; animation: ezil-opening-shimmer 1.6s ease-in-out infinite;
+}
+@keyframes ezil-opening-shimmer { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+.ezil-opening .ezil-opening-meta { margin: 8px 0 0; font-size: 12px; line-height: 1.4; color: #7f8686; font-variant-numeric: tabular-nums; }
+.ezil-app-spinner > .ezil-opening .ezil-opening-sub, .ezil-boot > .ezil-opening .ezil-opening-sub { margin: 10px 0 0; font-size: 13px; line-height: 1.5; color: #9ca3a3; }
+.ezil-opening .ezil-boot-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 16px; }
+.ezil-opening .ezil-boot-actions[hidden] { display: none; }
+.ezil-opening .ezil-opening-feedback {
+    appearance: none; padding: 9px 14px; border: 1px solid #3a3f3f; border-radius: 6px; background: transparent;
+    color: #f5f5f4; font: inherit; font-size: 13px; cursor: pointer;
+}
+.ezil-opening .ezil-opening-feedback:focus-visible { outline: 2px solid #f5f5f4; outline-offset: 2px; }
 .ezil-app-spinner-running-long .ezil-boot-retry { padding: 6px 12px; background: transparent; color: inherit; border: 1px solid #555; font-size: 12px; }
+/* Reduced motion: the bar steps (10% at a time, from JS) with no transition and no shimmer. */
+@media (prefers-reduced-motion: reduce) {
+    .ezil-opening .ezil-opening-fill { transition: none; }
+    .ezil-opening .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+}
+.ezil-opening[data-reduced-motion='true'] .ezil-opening-fill { transition: none; }
+.ezil-opening[data-reduced-motion='true'] .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
