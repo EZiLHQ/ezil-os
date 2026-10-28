@@ -307,7 +307,7 @@ export function summaryV3Html (summary, usage = null) {
             <div class="ezil-billing-actions" data-role="plan-actions">${planActionsV3(summary)}</div>
         </section>
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
-            ${paragraph(`${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
+            ${paragraph(choices ? `Next start: ${computer.vcpu} vCPU · ${computer.memoryGiB} GB` : `${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
             ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
             ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
             ${choices ? `<div class="ezil-billing-actions">${actionHtml('computer-tab', 'Change configuration')}</div>` : ''}
