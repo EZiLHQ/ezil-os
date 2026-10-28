@@ -167,6 +167,17 @@ try{
  hidden=false;document.dispatchEvent(new dom.window.Event('visibilitychange'));await tick();
  assert.equal(Math.round(received.at(-1).elapsed),240,'background time counts toward the operation');assert.equal(openingAt(received.at(-1),now).long,false);assert.equal(openingAt(received.at(-1),now+1000).long,true,'past the expected time');
  timed.stop();now=0;
+ // A switch/restart watch settles once, only for the transition asked for (or one it saw in flight).
+ for(const id of ['t-1',null]){
+  const seq=[{transitionId:'old',kind:'switch',phase:'done'},{transitionId:'t-1',kind:'switch',phase:'stopping'},{transitionId:'t-1',kind:'switch',phase:'waking'},{transitionId:'t-1',kind:'switch',phase:'done'}];
+  let i=0;const settled=[];
+  const watch=watchComputerTransition({computerId:'qa-computer',element,transitionId:id,onSettled:t=>settled.push(t),
+   query:async()=>({ok:true,data:{...opening,stage:'switching',transition:seq[Math.min(i++,seq.length-1)]}})});
+  await tick();
+  for(let n=0;n<6;n++){const next=[...timers].find(([,timer])=>timer.ms===5000);if(!next)break;timers.delete(next[0]);next[1].fn();await tick();}
+  assert.equal(settled.length,1,`settled once (${id})`);assert.equal(settled[0].transitionId,'t-1');assert.equal(settled[0].phase,'done');
+  assert.equal(watch.active(),false);assert.equal([...timers].some(([,timer])=>timer.ms===5000),false,'the watch stops polling');
+ }
  globalThis.fetch=async()=>({ok:true,status:200,json:async()=>({result:{data:{json:{...base,operationsPaused:true}}}})});
  const spinner=AppSpinner({computerId:'qa-computer',isMigrating:()=>true});document.body.appendChild(spinner.el);spinner.render({kind:'progress'});await tick();
  assert.equal(spinner.el.querySelector('.ezil-app-spinner-label').textContent,'Computer startup is temporarily paused');
