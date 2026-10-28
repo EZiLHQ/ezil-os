@@ -8,7 +8,8 @@ type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
  * after TerminateInstances refused a transient view). Proven only from that failed execution's own complete history:
  * the exact execution and immutable input of the failed release job, every provider call a release step naming exactly
  * its host and data volume in its region, a connected TerminateInstances chain whose result reported `terminated`
- * (Code 48) for exactly that host, and a terminal Fail state. EC2 absence alone is never evidence. Separate from, and
+ * (Code 48) for exactly that host, and a terminal Fail state. An observe Lambda may hang off its own retryable failure
+ * (the observe Retry, at most 3 per state entry; 2026-10-28). EC2 absence alone is never evidence. Separate from, and
  * never a substitute for, the SUCCEEDED-release proof replacement recovery uses (aws-historical-source.ts). */
 export interface FailedReleaseTermination { instanceId: string; executionArn: string; terminatedAt: Date }
 
@@ -33,6 +34,13 @@ const GROUP: Readonly<Record<string, string>> = { TaskStarted: 'start', TaskStar
     LambdaFunctionStartFailed: 'start', LambdaFunctionSucceeded: 'outcome', LambdaFunctionFailed: 'outcome', LambdaFunctionTimedOut: 'outcome' };
 const FAILURES: ReadonlySet<string> = new Set(['LambdaFunctionFailed', 'LambdaFunctionTimedOut', 'LambdaFunctionStartFailed', 'LambdaFunctionScheduleFailed',
     'TaskFailed', 'TaskTimedOut', 'TaskStartFailed']);
+/** The observe states' Retry (infra lifecycle/definition.ts `observationRetry`): these errors, at most 3 retries per state entry.
+ * EC2 tasks have no Retry, so only an observer Lambda failure carrying one of these may re-schedule its Lambda. */
+const OBSERVE_RETRY_ERRORS: ReadonlySet<string> = new Set(['LifecycleRetryable', 'Lambda.ServiceException', 'Lambda.AWSLambdaException',
+    'Lambda.SdkClientException', 'Lambda.TooManyRequestsException']);
+const OBSERVE_MAX_RETRIES = 3;
+const retryError = (event: HistoryEvent | undefined) => event?.type === 'LambdaFunctionFailed' ? event.lambdaFunctionFailedEventDetails?.error
+    : event?.type === 'LambdaFunctionStartFailed' ? event.lambdaFunctionStartFailedEventDetails?.error : undefined;
 type TaskDetails = { resource?: string; resourceType?: string };
 const taskDetails = (event: HistoryEvent): TaskDetails | undefined => event.taskScheduledEventDetails ?? event.taskStartedEventDetails
     ?? event.taskSucceededEventDetails ?? event.taskFailedEventDetails ?? event.taskTimedOutEventDetails ?? event.taskStartFailedEventDetails;
@@ -81,13 +89,30 @@ export function proveFailedReleaseTermination(e: Execution, events: readonly His
         const type = event.type ?? '', parentType = PARENT[type];
         if (!parentType) continue;
         const parent = byId.get(event.previousEventId!), key = event.previousEventId + ':' + GROUP[type];
-        if (parent?.type !== parentType || seen.has(key)) return null;
+        if (seen.has(key)) return null;
         seen.add(key);
+        if (type === 'LambdaFunctionScheduled' && parent?.type !== parentType) {
+            // An observe Retry: re-scheduled from its own retryable failure, same Lambda, within the retry budget of one state entry.
+            if (!OBSERVE_RETRY_ERRORS.has(retryError(parent) ?? '')) return null;
+            let up: HistoryEvent | undefined = parent, retries = 0;
+            while (up?.type !== parentType) {
+                const schedule = up?.type === 'LambdaFunctionStartFailed' ? byId.get(up.previousEventId!)
+                    : up?.type === 'LambdaFunctionFailed' ? byId.get(byId.get(up.previousEventId!)?.previousEventId ?? -1) : undefined;
+                if (schedule?.type !== 'LambdaFunctionScheduled' || ++retries > OBSERVE_MAX_RETRIES
+                    || schedule.lambdaFunctionScheduledEventDetails?.resource !== event.lambdaFunctionScheduledEventDetails?.resource) return null;
+                up = byId.get(schedule.previousEventId!);
+            }
+            if (!up?.stateEnteredEventDetails?.name?.startsWith('Observe-')) return null;
+            continue;
+        }
+        if (parent?.type !== parentType) return null;
         if (type.startsWith('Task')) {
             const own = taskDetails(event), up = taskDetails(parent);
             if (own?.resourceType !== 'aws-sdk:ec2' || !own.resource || own.resource !== up?.resource || up.resourceType !== 'aws-sdk:ec2') return null;
         }
     }
+    // The failure that ended the execution was not also retried.
+    if (events.some(event => event.type === 'LambdaFunctionScheduled' && event.previousEventId === failure.id)) return null;
     // Every provider call is a release step naming exactly this host (and, to detach, exactly its data volume).
     const scheduled = events.filter(event => event.type === 'TaskScheduled');
     for (const s of scheduled) {

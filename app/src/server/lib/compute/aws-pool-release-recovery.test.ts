@@ -4,10 +4,12 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import { buildLifecycleWork, type LifecycleWork } from './aws-intent';
 import { fixtureDeployment, fixtureIntent } from './aws-intent.test-support';
 import { createFakePlacementDb, DEFAULT_OWNER, placementRow } from './fake-placement-db.test-support';
-import { applyLifecycleReceipt, lifecycleExecutionArn, reconcileAwsFleet, type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
+import { applyLifecycleReceipt, lifecycleExecutionArn, POOL_RELEASED, reconcileAwsFleet, type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
 import { readPlacement, type PlacementDb } from './placement';
 import type { Ec2EnrollmentView } from './aws-enroll';
 import type { Ec2VolumeView } from './aws-clients';
+import type { HistoryEvent } from '@aws-sdk/client-sfn';
+import retryFixture from './aws-failed-release-retry.fixtures.json';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -475,5 +477,83 @@ describe('instance-less placements belong to the other recovery handlers', () =>
         expect(await reconcilePoolReleaseRecovery(s.deps, await s.current(), D)).toBe(true);
         expect((await s.current()).lastError).toContain('placement_identity');
         expect(s.starts).toHaveLength(0);
+    });
+});
+
+// Staging 2026-10-28, computer ca0121a6: the Stop's pool release terminated i-0ffe64bb1397f4852 at 17:36:42.863Z, then failed
+// at Observe-terminated after an earlier observe Retry; the row sat UNCONFIRMED `termination_not_proven`. Its host has since
+// aged out of EC2 (DescribeInstances NotFound -> describeForEnrollment null, aws-clients.ts).
+describe('the real retried-observe failed release heals once its host has aged out of EC2', () => {
+    function realSetup() {
+        const revive = (value: Record<string, unknown>, keys: string[]): unknown =>
+            ({ ...value, ...Object.fromEntries(keys.map(k => [k, new Date(value[k] as string)])) });
+        const events = retryFixture.getExecutionHistory.events.map(e => revive(e, ['timestamp'])) as HistoryEvent[];
+        const failed = revive(retryFixture.describeExecution, ['startDate', 'stopDate']) as Execution;
+        const original = buildLifecycleWork(JSON.parse(JSON.parse(retryFixture.describeExecution.input).document));
+        const i = original.intent, d = i.deployment, now = new Date('2026-10-28T18:30:00Z');
+        const fake = createFakePlacementDb({ computers: [{ id: i.computerId, user_id: DEFAULT_OWNER, deleted_at: null }],
+            placements: [placementRow({ computer_id: i.computerId, state: 'UNCONFIRMED', generation: i.targetGeneration, lease_epoch: i.leaseEpoch,
+                region: d.region, zone_id: d.zoneId, instance_type: i.instanceType, instance_id: i.providerInstanceId, volume_id: i.dataVolumeId,
+                fence_token: i.fenceToken, lifecycle_job_id: i.jobId, lifecycle_digest: original.digest,
+                last_error: 'pool_release_recovery:{"error":"termination_not_proven"}' })],
+            usage: [{ computer_id: i.computerId, user_id: DEFAULT_OWNER, instance_id: i.providerInstanceId, instance_type: i.instanceType,
+                started_at: new Date('2026-10-28T17:30:07Z'), stopped_at: null, observed_by: 'original', updated_at: new Date('2026-10-28T17:30:07Z') }],
+        }, { clock: () => now });
+        const tags = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': d.namespace, 'ezil:computer': i.computerId,
+            'ezil:generation': String(i.targetGeneration), 'ezil:fence': i.fenceToken };
+        const volume: Ec2VolumeView = { volumeId: i.dataVolumeId!, state: 'available', attachments: [], encrypted: true, kmsKeyId: d.dataKeyArn,
+            zoneId: d.zoneId, sizeGiB: 30, volumeType: 'gp3', tags };
+        const starts: LifecycleWork[] = [];
+        const executions = new Map<string, Execution>([[failed.executionArn!, failed]]);
+        vi.spyOn(console, 'info').mockImplementation(() => {});
+        const deps: ReceiptDeps = { db: fake.db, now: () => now, clock: () => now, sleep: async () => {},
+            executions: {
+                describe: vi.fn(async (_region: string, arn: string) => {
+                    const e = executions.get(arn);
+                    if (e) return e;
+                    throw Object.assign(new Error('absent'), { name: 'ExecutionDoesNotExist', $metadata: { httpStatusCode: 400 } });
+                }),
+                history: vi.fn(async (_region: string, arn: string) => {
+                    if (arn !== failed.executionArn) throw Object.assign(new Error('absent'), { name: 'ExecutionDoesNotExist', $metadata: { httpStatusCode: 400 } });
+                    return structuredClone(events);
+                }),
+            },
+            describer: { describeForEnrollment: vi.fn(async () => null), describeVolume: vi.fn(async () => volume) },
+            starter: { start: vi.fn(async (_region: string, request: { input: string }) => {
+                const work = buildLifecycleWork(JSON.parse(JSON.parse(request.input).document));
+                starts.push(work);
+                const executionArn = lifecycleExecutionArn(work.intent.deployment, work.intent.jobId);
+                executions.set(executionArn, { status: 'RUNNING', input: work.input, executionArn, stateMachineVersionArn: work.stateMachineArn, redriveCount: 0, startDate: now });
+            }) as never },
+        };
+        const current = async () => (await readPlacement(fake.db, i.computerId)).record!;
+        /** The replay release succeeds with a retired receipt (its host is gone and the disk is free). */
+        const finish = () => {
+            const work = starts.at(-1)!;
+            Object.assign(executions.get(lifecycleExecutionArn(work.intent.deployment, work.intent.jobId))!, { status: 'SUCCEEDED', stopDate: now,
+                output: JSON.stringify({ schemaVersion: 1, jobId: work.intent.jobId, digest: work.digest, computerId: i.computerId, generation: i.targetGeneration,
+                    leaseEpoch: i.leaseEpoch, fenceToken: i.fenceToken, instanceId: i.providerInstanceId, volumeId: i.dataVolumeId, state: 'retired' }) });
+        };
+        return { ...fake, deps, d, original, failed, starts, current, finish };
+    }
+    it('reconcilePoolReleaseRecovery moves the row to RECOVERING with one release replay at the witnessed termination time', async () => {
+        const s = realSetup();
+        const { reconcilePoolReleaseRecovery } = await import('./aws-pool-release-recovery');
+        await expect(reconcilePoolReleaseRecovery(s.deps, await s.current(), s.d)).resolves.toBe(true);
+        expect(s.deps.describer!.describeForEnrollment).toHaveBeenCalledWith('ap-south-1', 'i-0ffe64bb1397f4852');
+        const after = await s.current();
+        expect(after).toMatchObject({ state: 'RECOVERING', generation: 25, leaseEpoch: 26 });
+        expect(JSON.parse(after.lastError!.slice('pool_release_recovery:'.length))).toMatchObject({ basis: 'failed_release_termination',
+            stoppedAt: '2026-10-28T17:36:42.863Z', sourceJobId: '399e9388-cdf7-4036-abb2-e915492182d3', sourceExecutionArn: s.failed.executionArn, error: null });
+        expect(s.starts).toHaveLength(1);
+        expect(s.starts[0]!.intent).toMatchObject({ operation: 'release', targetGeneration: 25, leaseEpoch: 26,
+            providerInstanceId: 'i-0ffe64bb1397f4852', dataVolumeId: 'vol-0102b0104f1c271de' });
+        expect(s.usage[0]!.stopped_at).toBeNull(); // closes only when the replay settles
+        await reconcilePoolReleaseRecovery(s.deps, await s.current(), s.d); // replay RUNNING: no second start
+        expect(s.starts).toHaveLength(1);
+        s.finish();
+        await reconcilePoolReleaseRecovery(s.deps, await s.current(), s.d);
+        expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED, lifecycleJobId: null });
+        expect(s.usage[0]!.stopped_at).toEqual(new Date('2026-10-28T17:36:42.863Z'));
     });
 });
