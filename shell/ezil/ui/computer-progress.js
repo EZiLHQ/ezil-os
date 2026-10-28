@@ -109,7 +109,13 @@ export function openingAt (view, now = Date.now(), { reducedMotion = false, clie
     return { percent: Math.round(fraction * 100), elapsed, elapsedText: formatElapsed(elapsed), long: !ready && elapsed > expected };
 }
 
-export function progressView(data, computerId, { features = bootFeatures(), now = Date.now(), firstObservedAt = now, appName } = {}) {
+/**
+ * `openRequested`: this tab has asked to open the computer (its open is in flight). Until the server
+ * records that opening, a stopped computer reads "Starting your computer" with an indeterminate bar,
+ * never "Computer stopped". Only the copy changes: `stage`, `active`, `activeAws` and `bar` stay the
+ * server's, so every wait/fail decision that reads them is unchanged.
+ */
+export function progressView(data, computerId, { features = bootFeatures(), now = Date.now(), firstObservedAt = now, appName, openRequested = false } = {}) {
     if (!data || ![1, 2].includes(data.version) || data.computerId !== computerId) return null;
     const stage = data.operationsPaused === true || data.paused === true || data.stage === 'operations_paused' ? 'operations_paused'
         : data.needsOperator === true || ['needs_operator', 'failed_needs_operator'].includes(data.stage) ? 'needs_operator' : data.stage;
@@ -142,8 +148,10 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
     const machine = target ? `Getting ${/^(8|11|18)$/.test(String(target)) ? 'an' : 'a'} ${target} vCPU machine` : 'Getting your new machine';
     const waking = transition?.phase === 'waking';
     const starting = !appName || path === 'switch' ? 'Starting your desktop' : `Starting ${appName}`;
+    const preOpening = openRequested === true && ['stopped', 'purge_eligible'].includes(stage) && !opening && !migration;
     let title = stages[stage][0];
-    if (moving >= 0) title = migrationSteps[moving];
+    if (preOpening) title = 'Starting your computer';
+    else if (moving >= 0) title = migrationSteps[moving];
     else if (opening) {
         if (stage === 'switching') title = waking ? machine : stages.switching[0];
         else if (stage === 'restarting') title = waking ? 'Starting your computer' : stages.restarting[0];
@@ -166,13 +174,15 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
     return {
         stage, path, title,
         // One status line while opening or moving; other states keep one explanatory sentence.
-        body: (opening || moving >= 0) && !hold ? '' : stages[stage][1],
+        body: preOpening || ((opening || moving >= 0) && !hold) ? '' : stages[stage][1],
         bytes: moving === 2 && measured ? `${formatBytes(data.bytes.transferred)} of ${formatBytes(data.bytes.total)}` : '',
         manualAttention: data.recordedStage === 'failed_needs_operator' || data.stage === 'failed_needs_operator',
         active: data.active === true && !['operations_paused', 'needs_operator', 'queued', 'unavailable', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
         activeAws: data.active === true && ['migration', 'opening'].includes(data.operation) && !serverReady
             && !['operations_paused', 'needs_operator', 'queued', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
         elapsed, expected, reached, serverReady, bar,
+        // No server opening to measure yet: the surface shows an indeterminate bar, never a guessed position.
+        indeterminate: preOpening,
         transition: transition ? { transitionId: transition.transitionId, kind: transition.kind, phase: transition.phase, target: transition.target } : null,
         // The opening, not its path: `cold` becomes `warm` when a pool host is adopted mid-opening.
         openingKey: String(openingStartedAt),
@@ -182,7 +192,7 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
     };
 }
 
-export function observeComputerProgress({ computerId, element, onChange, query = trpc.query, appName }) {
+export function observeComputerProgress({ computerId, element, onChange, query = trpc.query, appName, openRequested = () => false }) {
     let watching = false, generation = 0, timer, deadline, operation, firstObservedAt;
     async function poll() {
         if (!watching || document.hidden || !element.isConnected) return;
@@ -196,11 +206,12 @@ export function observeComputerProgress({ computerId, element, onChange, query =
             ]);
             if (watching && own === generation && element.isConnected) {
                 const now = Date.now();
-                let view = result.ok ? progressView(result.data, computerId, { now, appName }) : null;
+                const requested = openRequested() === true;
+                let view = result.ok ? progressView(result.data, computerId, { now, appName, openRequested: requested }) : null;
                 if (view) {
                     const key = JSON.stringify([result.data.operation, result.data.startedAt ?? null]);
                     if (operation !== key) { operation = key; firstObservedAt = now; }
-                    view = progressView(result.data, computerId, { now, firstObservedAt, appName });
+                    view = progressView(result.data, computerId, { now, firstObservedAt, appName, openRequested: requested });
                 }
                 onChange(view);
             }

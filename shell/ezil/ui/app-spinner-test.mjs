@@ -354,6 +354,39 @@ try {
         });
         delete globalThis.window;
     }
+    // F1b: while this window's open is in flight and the server still says stopped (no opening yet), the surface
+    // reads "Starting your computer" with an indeterminate bar, never "Computer stopped — Use the normal computer controls…".
+    const stoppedNow = { ...opening, operation: 'none', stage: 'stopped', recordedStage: 'stopped', active: false, openingStartedAt: null, milestones: [] };
+    for (const stage of ['stopped', 'purge_eligible']) {
+        await observe({ ...stoppedNow, stage }, async spinner => {
+            const label = () => spinner.el.querySelector('.ezil-app-spinner-label').textContent;
+            const bar = spinner.el.querySelector('.ezil-opening-bar');
+            push(`${stage} + open in flight: "Starting your computer", indeterminate bar, no stopped copy`,
+                label() === 'Starting your computer' && !bar.hidden && bar.dataset.indeterminate === 'true'
+                && !/stopped|normal computer controls|No active startup/i.test(spinner.el.textContent), spinner.el.textContent);
+            push(`${stage} + open in flight: the observation keeps the server stage for the window's wait`,
+                spinner.computerProgress()?.stage === stage && spinner.computerProgress()?.activeAws === false);
+            push(`${stage} + open in flight: no Try again or feedback while starting`, spinner.el.querySelector('.ezil-boot-actions').hidden);
+            payload = { ...opening, stage: 'leased', openingStartedAt: '1970-01-01T00:00:00.000Z', expectedSeconds: 240,
+                milestones: [{ key: 'requested', at: '1970-01-01T00:00:00.000Z' }] };
+            now = 30000; await poll();
+            push(`${stage}: the server's opening takes over with its determinate bar`,
+                label() === 'Starting your computer' && bar.dataset.indeterminate === undefined && barOf(spinner) > 0);
+            spinner.render({ kind: 'failed', reason: 'timeout' });
+            push(`${stage}: a failed open shows its failure copy`, label() !== 'Computer stopped');
+        });
+        now = 0;
+    }
+    // Without a request (Settings, transition watchers) the observer keeps the stopped copy.
+    {
+        const element = document.createElement('div'); document.body.appendChild(element);
+        const seen = [];
+        const observer = (await import('./computer-progress.js')).observeComputerProgress({ computerId: 'qa-computer', element,
+            onChange: view => seen.push(view), query: async () => ({ ok: true, data: stoppedNow }) });
+        observer.start(); await tick(); observer.stop(); element.remove();
+        push('stopped without an open request: unchanged "Computer stopped" copy', seen[0]?.title === 'Computer stopped'
+            && seen[0]?.body === 'Use the normal computer controls to start a session.' && seen[0]?.indeterminate === false);
+    }
     push('all observed spinners dispose their polling timers', timers.size === 0);
 } finally {
     globalThis.fetch = originalFetch; globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear;
