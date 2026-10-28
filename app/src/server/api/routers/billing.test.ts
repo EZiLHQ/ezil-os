@@ -1145,9 +1145,9 @@ describe('billing.usage read-only boundary', () => {
         const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('No external calls allowed'));
         const result = await f.caller.usage();
         expect(result).toMatchObject({ enabled: true, version: 1, egress: { state: 'unavailable', usedBytes: null } });
-        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor'] as const)
+        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference'] as const)
             expect(f.store[name].mock.calls[0][0]).toBe(userId);
-        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor']);
+        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference']);
         for (const [name, method] of Object.entries(f.store)) if (!reads.has(name)) expect(method).not.toHaveBeenCalled();
         for (const method of Object.values(f.stripe)) expect(method).not.toHaveBeenCalled();
         expect(fetch).not.toHaveBeenCalled();

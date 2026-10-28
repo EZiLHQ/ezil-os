@@ -112,15 +112,16 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             ]);
             const plan = planFromSubscriptions({ subs, userCreatedAt, now });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, storage, consent, overageInvoices] = await Promise.all([
+            const [epochs, grants, storage, consent, overageInvoices, sizePreference] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
                 deps.store.overageInvoicesFor(ctx.user.id),
+                deps.store.sizePreference(ctx.user.id),
             ]);
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
-                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference: null,
+                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference,
                 hasCustomer: false, computerId: input?.computerId });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {

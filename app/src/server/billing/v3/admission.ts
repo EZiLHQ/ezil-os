@@ -1,5 +1,6 @@
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { SIZES, type SizeCode } from '../v2/contract';
+import { AWS_MONTHLY_CAP_REASON } from '../../lib/compute/usage';
 import { CATALOG_V3, type AdmitStartV3, type AdmitDecisionV3, type FairUseStatusOf } from './contract';
 
 export const fairUseStatusOf: FairUseStatusOf = ({ usedSeconds, fairUseSeconds }) => {
@@ -22,4 +23,16 @@ export const admitStart = (input: Parameters<AdmitStartV3>[0] & { size?: SizeCod
     return { admit: true, size, maxRunSeconds,
         deadline: isoSeconds(epochSeconds(input.now) + maxRunSeconds),
         fromPool: offer.poolPriority > 0 && input.poolHostAvailable, poolPriority: offer.poolPriority };
+};
+
+/**
+ * Round 3 D11: the AWS usage-ledger backstop (`ezil_compute_usage`) refuses with its own
+ * code, never as fair use: the plan can show time left while the operator cap is reached.
+ * The plan's own refusals keep precedence; Cloudflare starts are never affected.
+ */
+export const admitStartWithAwsCap = (input: Parameters<typeof admitStart>[0] & { awsMonthlyCapReached: boolean }):
+    ReturnType<typeof admitStart> | { admit: false; reason: typeof AWS_MONTHLY_CAP_REASON } => {
+    const decision = admitStart(input);
+    return decision.admit && input.awsMonthlyCapReached && SIZES[decision.size].provider === 'aws'
+        ? { admit: false, reason: AWS_MONTHLY_CAP_REASON } : decision;
 };

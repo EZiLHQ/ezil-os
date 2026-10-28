@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { monthUsageFromRows, rowHoursInMonth, rowOverlapsMonth, summarizeUsage, utcMonthStart, utcNextMonthStart } from './usage';
+import { AWS_MONTHLY_CAP_REASON, awsMonthlyCapReached, awsMonthlyCapRefusal, monthUsageFromRows, rowHoursInMonth, rowOverlapsMonth, summarizeUsage, utcMonthStart, utcNextMonthStart } from './usage';
 
 const U1 = 'u1';
 const U2 = 'u2';
@@ -90,5 +90,26 @@ describe('integer weighted usage', () => {
     it.each(['c6i.xlarge', 'm6i.xlarge', 'unknown', null])('%j is weighted without under-metering', instanceType => {
         const rows = [{ ...row(U1, '2026-10-13T11:00:00Z', null), instanceType }];
         expect(monthUsageFromRows(rows, now).global.weightedSeconds).toBe(instanceType?.endsWith('.xlarge') ? 7_200 : 14_400);
+    });
+});
+
+const capNow = new Date('2026-10-28T12:00:00Z');
+const capRow = (over: Partial<ReturnType<typeof row>> = {}) => ({ ...row('User-A', '2026-10-22T00:00:00Z', null), ...over });
+
+describe('round 3 D11 AWS monthly cap (read-only)', () => {
+    it('reads the ledger cap exactly as admission does, including a row left open since the 22nd', () => {
+        // Open since 2026-10-22T00:00Z: 156 h at 2 vCPU by now.
+        const usage = monthUsageFromRows([capRow()], capNow);
+        expect(awsMonthlyCapReached(usage, 'user-a', 156)).toBe(true);
+        expect(awsMonthlyCapReached(usage, 'user-a', 157)).toBe(false);
+        // 4 vCPU counts double (2-vCPU units).
+        expect(awsMonthlyCapReached(monthUsageFromRows([capRow({ instanceType: 'm6i.xlarge', stoppedAt: new Date('2026-10-22T10:00:00Z') })], capNow), 'user-a', 20)).toBe(true);
+        expect(awsMonthlyCapReached(usage, 'someone-else', 1)).toBe(false);
+        expect(awsMonthlyCapReached(usage, 'user-a', Number.NaN)).toBe(false);
+    });
+    it('names the compute refusal for billing without touching other reasons', () => {
+        expect(AWS_MONTHLY_CAP_REASON).toBe('aws_monthly_cap');
+        expect(awsMonthlyCapRefusal('user_hours_cap')).toBe('aws_monthly_cap');
+        for (const reason of ['global_hours_cap', 'max_running', null, undefined]) expect(awsMonthlyCapRefusal(reason)).toBeNull();
     });
 });
