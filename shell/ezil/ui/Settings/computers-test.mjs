@@ -41,7 +41,8 @@ const src = fs.readFileSync(new URL('./tabs/computers.js', import.meta.url), 'ut
     .replace("import session from '../../../session.js';", 'const session = globalThis.__cSession;')
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }), mutate: async () => ({ ok: false }) };')
     .replace("import TabBilling from './billing.js';", 'const TabBilling = { available: () => true };')
-    .replace("import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;');
+    .replace("import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;')
+    .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';");
 assert.ok(! /^import /m.test(src), 'every import of the tab is stubbed');
 const tab = await import(moduleUrl(src));
 const { computerModel, computerHtml, switchSteps, switchRatio, switchRequestId, clearSwitchRequestId, refusalCopy, sizeForInstanceType, AWS_CAP_COPY } = tab;

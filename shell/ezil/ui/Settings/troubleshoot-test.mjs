@@ -16,7 +16,8 @@ const src = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'ut
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }) };')
     .replace("import telemetry from '../../../telemetry.js';", 'const telemetry = { recentEvents: () => [], capture: () => undefined, redact: v => v };')
     .replace("import { ambientCorrelationId } from '../../../trace.js';", 'const ambientCorrelationId = () => null;')
-    .replace("import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';", 'const feedback_enabled = () => false, open_feedback_dialog = () => undefined, list_my_reports = async () => [], delete_my_report = async () => true;');
+    .replace("import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';", 'const feedback_enabled = () => false, open_feedback_dialog = () => undefined, list_my_reports = async () => [], delete_my_report = async () => true;')
+    .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';");
 assert.ok(! /^import /m.test(src), 'every import is stubbed');
 const { reasonCopy } = await import(moduleUrl(src));
 
