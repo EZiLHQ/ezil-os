@@ -364,6 +364,33 @@ try {
         assert.equal(stored(draftKey), null, 'an emptied form leaves no draft behind');
         close();
     });
+    await check('the outbox keeps only the newest 10 unconfirmed sends, and a flush sends no more', async () => {
+        open(); setDescription('Queued report 10');
+        const template = payload();
+        const seeded = Array.from({ length: 10 }, (_, i) => {
+            const clientRequestId = crypto.randomUUID();
+            return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId, description: `Queued report ${i}` }) };
+        });
+        window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
+        setOnline(false);
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => /offline/.test(status()));
+        const kept = stored(outboxKey);
+        assert.deepEqual(kept.map(entry => entry.clientRequestId), [...seeded.slice(1), { clientRequestId: template.clientRequestId }]
+            .map(entry => entry.clientRequestId), 'an 11th queued send drops the oldest');
+        close();
+        // A stored list longer than the cap (an older build, another tab) is read capped too.
+        window.localStorage.setItem(outboxKey, JSON.stringify([seeded[0], ...kept]));
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        await feedback.flush_feedback_outbox();
+        flushing = false;
+        assert.deepEqual(calls.slice(count).filter(c => c.method === 'POST').map(c => JSON.parse(c.body).clientRequestId),
+            kept.map(entry => entry.clientRequestId), 'only the newest 10 are sent, oldest first');
+        assert.equal(stored(outboxKey), null);
+    });
     await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
         open(); setDescription('Half-written report'); change('diagnostics', true);
         form().elements.category.value = 'idea';

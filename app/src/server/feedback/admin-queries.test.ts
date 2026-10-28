@@ -169,6 +169,15 @@ describe('admin SQL scope and projection', () => {
         }
     });
 
+    it('list and detail both project the stamped deploy commit as deploySha', async () => {
+        const row = { id, deploySha: '46698745a1b2c3d4e5f60718293a4b5c6d7e8f90' };
+        const { queries, statements } = queryDb([row]);
+        expect(await queries.listReports([id])).toEqual([row]);
+        expect(await queries.findReport(id)).toEqual(row);
+        expect(statements).toHaveLength(2);
+        for (const { sql } of statements) expect(sql).toMatch(/\br\.deploy_sha AS "deploySha"/);
+    });
+
     it('an empty id set does not fall back to an unscoped content query', async () => {
         const { queries, statements } = queryDb();
         expect(await queries.listReports([])).toEqual([]);
