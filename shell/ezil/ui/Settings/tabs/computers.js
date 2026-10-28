@@ -18,6 +18,7 @@ import UIAlert from '../../../../src/UI/UIAlert.js';
 import registry from '../../../apps/registry.js';
 import session from '../../../session.js';
 import trpc from '../trpc.js';
+import TabBilling from './billing.js';
 import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';
 
 const PHASE = 'ezil-os:settings/computers';
@@ -320,6 +321,7 @@ let paneActive = false;
 let generation = 0;
 let stopBusy = false;
 let paneCtx = null;
+let queuedSwitch = null; // a configuration Billing handed over after an upgrade
 const seenInFlight = new Set(); // transition ids this page saw in flight, so "Done" is never a stale record
 const dismissed = new Set();
 const barFloor = new Map();     // transition id → the highest ratio shown, so the bar never moves back
@@ -617,9 +619,9 @@ function schedulePoll ($win) {
     pollTimer = setTimeout(() => { void refreshProgress($win); }, fast ? 3000 : 20000);
 }
 
-/** Billing's own gate (`tabs/billing.js` `available`): with billing off, no summary is requested. */
+/** Billing's own gate (`tabs/billing.js` `available`): where Billing is off, no summary is requested. */
 function billingOn () {
-    return (paneCtx?.payload?.features ?? session.payload()?.features)?.billing === true;
+    return TabBilling.available(paneCtx ?? { payload: session.payload() });
 }
 
 async function readSummary () {
@@ -858,13 +860,19 @@ async function load ($win) {
     }
     computers = Array.isArray(res.data) ? res.data : [];
     render($win);
-    if ( isNative() ) return;
+    // Only the SHOWN pane reads more: `billing.summary` has side effects
+    // (Stripe preview, Gateway read), so a hidden tab must not call it.
+    if ( isNative() || ! paneActive ) return;
     // The plan, the configurations it allows and the disk come from the billing
     // summary; the live state (running, stopped, switching) from progress.
     const mine = ++generation;
     await readSummary();
     if ( mine !== generation ) return;
     await refreshProgress($win);
+    if ( mine !== generation || ! queuedSwitch ) return;
+    const size = queuedSwitch;
+    queuedSwitch = null;
+    void requestSwitch($win, size, { confirm: true });
 }
 
 async function handleCreate ($win) {
@@ -1118,8 +1126,13 @@ export default {
         }
         paneCtx = ctx ?? null;
         bind($win, ctx);
-        $win.on('remove.computers', () => { paneActive = false; generation++; clearTimeout(pollTimer); pollTimer = null; });
-        paneActive = true;
+        const onSwitchRequest = event => { if ( AWS_SIZES.includes(event.detail?.size) ) queuedSwitch = event.detail.size; };
+        window.addEventListener('ezil:computer-switch-request', onSwitchRequest);
+        $win.on('remove.computers', () => {
+            paneActive = false; generation++; clearTimeout(pollTimer); pollTimer = null; queuedSwitch = null;
+            window.removeEventListener('ezil:computer-switch-request', onSwitchRequest);
+        });
+        paneActive = false;
         void load($win);
     },
 

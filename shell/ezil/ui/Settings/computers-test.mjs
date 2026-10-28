@@ -40,6 +40,7 @@ const src = fs.readFileSync(new URL('./tabs/computers.js', import.meta.url), 'ut
     .replace("import registry from '../../../apps/registry.js';", 'const registry = { launch: async () => undefined };')
     .replace("import session from '../../../session.js';", 'const session = globalThis.__cSession;')
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }), mutate: async () => ({ ok: false }) };')
+    .replace("import TabBilling from './billing.js';", 'const TabBilling = { available: () => true };')
     .replace("import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;');
 assert.ok(! /^import /m.test(src), 'every import of the tab is stubbed');
 const tab = await import(moduleUrl(src));

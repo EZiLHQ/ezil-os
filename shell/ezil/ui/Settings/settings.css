@@ -877,3 +877,7 @@
 .ezil-computer-steps { margin: 0; padding-left: 20px; color: var(--muted); }
 .ezil-computer-steps li[data-state="active"] { color: var(--text); font-weight: 600; }
 .ezil-computer-steps li[data-state="done"] { color: var(--muted); }
+
+/* Billing round 3 (§6.3): three meter rows, each its own card. */
+.ezil-billing-v3-meters { display: grid; gap: 12px; }
+.ezil-billing-credit-line { margin: 4px 0 0; color: var(--text); }
