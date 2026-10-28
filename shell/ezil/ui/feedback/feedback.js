@@ -231,6 +231,7 @@ function read_blob (blob, signal) {
 function error_copy (status) {
     if ( status === 429 ) return "You've sent several reports this hour — try again later.";
     if ( status === 413 ) return 'This report is too large. Remove the screenshot and try again.';
+    if ( status === 415 ) return 'This page could not send the report. Reload EZiL OS and try again.';
     if ( status === 400 ) return 'This report could not be accepted. Check the description or remove the screenshot and try again.';
     if ( status === 401 ) return 'Your session expired — sign in again to send feedback.';
     if ( status === 404 ) return 'Feedback is not available in this deployment right now.';
