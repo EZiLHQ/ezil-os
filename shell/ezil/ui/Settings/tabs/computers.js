@@ -434,8 +434,8 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     }) : [];
     const disk = data?.computer?.disk ?? null;
     const done = ! switching && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
-    const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' ? t : null;
-    return { computer, free, provider: data ? free ? 'Cloudflare' : 'AWS · India' : null, chip, current, nextStart, switching,
+    const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
+    return { computer, data, free, provider: data ? free ? 'Cloudflare' : 'AWS · India' : null, chip, current, nextStart, switching,
         running, stopped, cards, done, failed, disk, busy: !! (switching || flying || prog?.operation === 'opening' || prog?.operation === 'stopping') };
 }
 
@@ -478,7 +478,7 @@ function cardHtml (card, model) {
     else if ( card.state === 'next' ) action = '<span class="ezil-settings-pill" data-role="config-next">Next start</span>';
     else if ( card.state === 'locked' ) action = `<span class="ezil-computer-lock" data-role="config-locked"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>${html_encode(card.plan)}</span>
         <a class="ezil-settings-btn" data-action="config-upgrade" href="/os?settings=billing&amp;upgrade=${card.plan === 'Standard' ? 'standard' : 'premium'}">Upgrade</a>`;
-    else if ( card.state === 'unavailable' ) action = `<span class="ezil-computer-unavailable" data-role="config-unavailable">${html_encode(refusalCopy('capacity_unavailable', card.size, summary, model.current))}</span>`;
+    else if ( card.state === 'unavailable' ) action = `<span class="ezil-computer-unavailable" data-role="config-unavailable">${html_encode(refusalCopy('capacity_unavailable', card.size, model.data, model.current))}</span>`;
     return `<li class="ezil-computer-config" data-size="${html_encode(card.size)}" data-state="${card.state}">
         <div><strong>${html_encode(label)}</strong><span class="ezil-settings-muted">${html_encode(weight)}</span></div>
         <div class="ezil-computer-config-action">${action}</div></li>`;
@@ -486,35 +486,35 @@ function cardHtml (card, model) {
 
 function statusHtml (model, prog) {
     if ( model.switching ) {
-        const { index, steps } = switchSteps(model.switching, prog);
+        const { index, steps } = switchSteps(model.switching, prog, model.data);
         const ratio = switchRatio(model.switching, prog, index);
         const percent = Math.round(ratio * 100);
         return `<div class="ezil-computer-switch" data-role="switch-progress" role="status" aria-live="polite">
             <p data-role="switching-label"><strong>Switching…</strong></p>
-            <p data-role="now-label">Now: ${html_encode(sizeLabel(model.switching.current))}</p>
-            <p data-role="next-label">Next: ${html_encode(sizeLabel(model.switching.target))}</p>
+            <p data-role="now-label">Now: ${html_encode(sizeLabel(model.switching.current, model.data))}</p>
+            <p data-role="next-label">Next: ${html_encode(sizeLabel(model.switching.target, model.data))}</p>
             <div class="ezil-computer-bar" role="progressbar" aria-label="Switch progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
             <ol class="ezil-computer-steps">${steps.map((step, i) => `<li data-step="${i + 1}" data-state="${i < index ? 'done' : i === index ? 'active' : 'todo'}">${html_encode(step)}</li>`).join('')}</ol></div>`;
     }
     if ( model.done ) {
         return `<div class="ezil-computer-switch is-done" data-role="switch-done" role="status">
-            <p>${html_encode(`Now running on ${sizeLabel(model.done.target)}`)}</p>
+            <p>${html_encode(`Now running on ${sizeLabel(model.done.target, model.data)}`)}</p>
             <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop</button></div>`;
     }
     if ( model.failed ) {
         const t = model.failed;
         const cap = CAP_REASONS.has(t.reason);
         const retry = ! cap && RETRYABLE.test(String(t.reason ?? ''));
-        const copy = cap ? AWS_CAP_COPY : `We couldn't switch. Your computer is back on ${sizeLabel(t.current)} and your files are safe.`;
+        const copy = cap ? AWS_CAP_COPY : `We couldn't switch. Your computer is back on ${sizeLabel(t.current, model.data)} and your files are safe.`;
         return `<div class="ezil-computer-switch is-failed" data-role="switch-failed" role="alert">
             <p>${html_encode(copy)}</p><div class="ezil-settings-row-actions">
             ${retry ? `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="switch-retry" data-size="${html_encode(t.target)}">Try again</button>` : ''}
-            ${t.revertAvailable ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current)}`)}</button>` : ''}
+            ${t.revertAvailable ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
             ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="switch-feedback">Send feedback</button>' : ''}</div></div>`;
     }
     if ( model.nextStart ) {
         return `<div class="ezil-computer-switch" data-role="next-start" role="status">
-            <p>${html_encode(`Next start: ${sizeLabel(model.nextStart)}`)}</p>
+            <p>${html_encode(`Next start: ${sizeLabel(model.nextStart, model.data)}`)}</p>
             <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Start now</button></div>`;
     }
     return '';
@@ -550,13 +550,13 @@ function olderHtml (rows) {
 
 /** The whole web pane for one computer. Exported for the unit tests. */
 export function computerHtml (model, prog = progress, older = []) {
-    const { computer } = model;
-    const size = sizeInfo(model.current);
+    const { computer, data } = model;
+    const size = sizeInfo(model.current, data);
     const disk = model.disk?.provisionedGiB;
     const summaryLine = size ? [`${size.vcpu} vCPU`, `${size.memoryGiB} GB memory`, ...(Number.isFinite(disk) ? [`${disk} GB disk`] : [])].join(' · ') : '';
-    const choices = (summary?.computer?.machineChoice ?? []).map(m => m.vcpu);
-    const premiumOnly = AWS_SIZES.filter(code => ! (summary?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
-    const planLine = ! summary ? '' : premiumOnly.length && ! model.free
+    const choices = (data?.computer?.machineChoice ?? []).map(m => m.vcpu);
+    const premiumOnly = AWS_SIZES.filter(code => ! (data?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
+    const planLine = ! data ? '' : premiumOnly.length && ! model.free
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
@@ -575,7 +575,7 @@ export function computerHtml (model, prog = progress, older = []) {
         ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
             <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
             <p class="ezil-settings-muted" data-role="plan-line">${html_encode(planLine)} <a href="/os?settings=billing&amp;upgrade=pro" data-action="compare-plans">Compare plans</a></p></section>` : ''}
-        ${summary ? `<section class="ezil-computer-section" data-role="computer-storage" aria-labelledby="ezil-storage-heading"><h4 id="ezil-storage-heading">Storage</h4>
+        ${data ? `<section class="ezil-computer-section" data-role="computer-storage" aria-labelledby="ezil-storage-heading"><h4 id="ezil-storage-heading">Storage</h4>
             <p>${html_encode(Number.isFinite(disk) ? `${disk} GB disk for your projects` : 'Your files are saved with your computer.')}</p>
             ${used !== null && Number.isFinite(disk) ? `<p data-role="storage-used">${html_encode(`${used.toLocaleString(undefined, { maximumFractionDigits: 1 })} of ${disk} GB used`)}</p>` : ''}
             ${Number.isFinite(disk) ? '<p class="ezil-settings-muted">Stays the same when you switch configuration.</p>' : ''}</section>` : ''}
@@ -680,7 +680,8 @@ export async function requestSwitch ($win, target, { confirm = true } = {}) {
     const computer = mainComputer();
     if ( ! computer || pendingSwitch || inFlight(progress) || stopBusy ) return;
     const model = webModel();
-    if ( ! model || target === model.current && ! model.nextStart ) return;
+    // Back to <previous> after a failure targets the current size on purpose: it reverts the choice.
+    if ( ! model || target === model.current && ! model.nextStart && ! model.failed ) return;
     const restarts = model.running || progress?.lifecycleState === 'RUNNING';
     if ( confirm && restarts ) {
         const ok = await confirmAlert(`Switch to ${sizeLabel(target)}?`,
@@ -697,10 +698,10 @@ export async function requestSwitch ($win, target, { confirm = true } = {}) {
     const answer = await postSwitch(computer.id, target, requestId);
     pendingSwitch = null;
     if ( answer.ok ) {
+        if ( model.failed ) dismissed.add(model.failed.transitionId);
         if ( answer.effective === 'next_start' ) {
             clearSwitchRequestId(computer.id, target);
             if ( summary?.computer ) summary = { ...summary, computer: { ...summary.computer, size: answer.target } };
-            if ( restarts && answer.target === answer.current ) notice = { text: `Staying on ${sizeLabel(answer.target)}.`, tone: 'info' };
         } else {
             seenInFlight.add(answer.transitionId);
             progress = { ...(progress ?? {}), computerId: computer.id,
