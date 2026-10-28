@@ -71,20 +71,34 @@ describe('/computers survives the move of computer management into the OS', () =
         const { default: Page } = await import('@/app/computers/page');
         const html = renderToStaticMarkup(<Page />);
         expect(html.length).toBeGreaterThan(200);
-        expect(html).toContain('Your computers');
+        expect(html).toContain('Your computer');
     });
 
-    it('🔴 renders one row per slot, up to the cap, filled or empty', async () => {
+    // Round 3 (plan §6.1, D6): one computer per person. The page shows that
+    // computer and never offers to create another; the DB cap stays 2.
+    it('🔴 renders the one computer and no slot or create control', async () => {
         const { default: Page } = await import('@/app/computers/page');
         const { MAX_COMPUTERS_PER_USER } = await import('@/utils/constants');
         const html = renderToStaticMarkup(<Page />);
 
-        // The live computer is shown...
         expect(html).toContain('Alpha');
-        // ...and the free slot offers a way to fill it, so a user who deleted
-        // their way out of the cap can get back to two.
-        expect(html).toMatch(/New computer/i);
+        expect(html).not.toMatch(/New computer|computer-row-empty|Empty slot/i);
+        expect(html).toContain('data-testid="computer-row"');
         expect(MAX_COMPUTERS_PER_USER).toBe(2);
+    });
+
+    it('an older second computer is listed read-only with Delete, after "Your computer"', async () => {
+        rows.push({ id: 'c-0', name: 'Older box', slot: 2, createdAt: new Date('2026-06-01T00:00:00Z'), lastOpenedAt: null });
+        try {
+            const { default: Page } = await import('@/app/computers/page');
+            const html = renderToStaticMarkup(<Page />);
+            expect(html.indexOf('Alpha')).toBeLessThan(html.indexOf('Older box'));
+            expect(html).toContain('Older computer');
+            expect(html).toContain('data-testid="computer-row-older"');
+            expect(html.match(/data-testid="computer-row-menu-button"/g)?.length).toBe(2);
+        } finally {
+            rows.pop();
+        }
     });
 
     it('🔴 still reaches Delete — the one action the OS cap depends on', async () => {
