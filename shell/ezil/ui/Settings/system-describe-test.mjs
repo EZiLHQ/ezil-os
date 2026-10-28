@@ -25,6 +25,23 @@ push('🔴 reads off: no Cloudflare size is presented', describeMachine(readsOff
 
 push('actual Cloudflare line never fabricates Mumbai', describeRunningOn(cf).value === 'Cloudflare Containers (2 vCPU / 6 GiB)');
 push('plan line separates entitlement and preparation', describePlan({ ...cf, plan: { vcpu: 2, memoryGB: 8, status: 'preparing' } }).value === '2 vCPU / 8 GB on AWS (India) — being prepared');
+// Round 3 (SWITCH-CONTRACT §4): a size mismatch alone is "ready" with a separate next-start hint;
+// "being prepared" only while a transition is in flight; never "Running on X" next to an unrelated "plan Y — being prepared".
+{
+    const aws = { provider: 'aws-ec2', machine: { region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' } };
+    const ready = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null } });
+    push('ready: the running size, with the next start as a separate hint', ready.value === '2 vCPU / 8 GB on AWS (India)' && ready.hint === 'Next start: 4 vCPU / 16 GB.', JSON.stringify(ready));
+    const same = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'ready', current: 'std-2', selected: 'std-2' } });
+    push('ready with the same choice: no hint', same.value === '2 vCPU / 8 GB on AWS (India)' && same.hint === '');
+    const t = { transitionId: 't', kind: 'switch', current: 'std-2', target: 'cmp-8', phase: 'waking', reason: null, revertAvailable: false };
+    const switching = describePlan({ ...aws, plan: { vcpu: 8, memoryGB: 32, status: 'being_prepared', current: 'std-2', selected: 'cmp-8', transition: t } });
+    push('being_prepared: "Switching to" the target; "Now" in the hint, never in one value',
+        switching.value === 'Switching to 8 vCPU / 32 GB' && switching.hint === 'Now: 2 vCPU / 8 GB.' && ! /2 vCPU/.test(switching.value), JSON.stringify(switching));
+    const restart = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'being_prepared', current: 'std-2', transition: { ...t, kind: 'restart', target: 'std-2' } } });
+    push('being_prepared by a restart says so', restart.value === 'Restarting your computer');
+    const failed = describePlan({ ...aws, plan: { vcpu: 8, memoryGB: 32, status: 'failed', reason: 'capacity_unavailable', current: 'std-2', transition: { ...t, phase: 'failed', revertAvailable: true } } });
+    push('failed switch: back on the previous size, files safe', failed.value === "Switch didn't finish — back on 2 vCPU / 8 GB" && /files are safe/.test(failed.hint), JSON.stringify(failed));
+}
 push('paused plan explains operations', describePlan({ plan: { vcpu: 2, memoryGB: 8, status: 'blocked', reason: 'AWS paused by operations' } }).hint === 'AWS paused by operations');
 
 // Image
