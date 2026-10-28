@@ -83,7 +83,12 @@ describe('qa UI honesty', () => {
             expect(html).not.toMatch(/standard-hour|overage|billed separately|progressbar/i);
             expect(html).toContain('Prices before tax.');
             if (tier === 'free') expect(html).toContain('2 vCPU · 6 GB');
-            if (tier === 'premium') for (const spec of ['2 vCPU · 8 GB', '4 vCPU · 16 GB', '8 vCPU · 32 GB']) expect(html).toContain(spec);
+            if (tier === 'premium') {
+                // Round 3: sizes are chosen on the Computer tab; Billing shows the chosen size and explains the time weights.
+                expect(html).toContain(`${value.computer.vcpu} vCPU · ${value.computer.memoryGiB} GB`);
+                expect(html).toContain('4 vCPU counts double');
+                expect(html).toContain('8 vCPU counts four times');
+            }
         }
     });
 
@@ -99,7 +104,9 @@ describe('qa UI honesty', () => {
             expect(html).not.toMatch(/standard-hour|overage|billed separately/i);
             if (opener === 'openComputeUpgradeSheet') {
                 expect(html).toContain('$100/month');
-                expect(html).toContain('after payment. Your AWS computer is prepared then.');
+                // Round 3 (§6.4): the upgrade sheet explains the outcome as "What happens next".
+                expect(html).toContain('What happens next');
+                expect(html).toContain('Premium starts');
             }
             handle.close();
         }
