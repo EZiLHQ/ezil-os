@@ -26,7 +26,7 @@ export const admitStart = (input: Parameters<AdmitStartV3>[0] & { size?: SizeCod
 };
 
 /**
- * Round 3 D11: the AWS usage-ledger backstop (`ezil_compute_usage`) refuses with its own
+ * Round 3 D11: the AWS usage-ledger backstop (the monthly hour cap) refuses with its own
  * code, never as fair use: the plan can show time left while the operator cap is reached.
  * The plan's own refusals keep precedence; Cloudflare starts are never affected.
  */
