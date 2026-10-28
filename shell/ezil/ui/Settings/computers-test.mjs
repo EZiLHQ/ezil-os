@@ -25,7 +25,7 @@ const results = [];
 function check (name, fn) {
     try { fn(); passed++; results.push(`PASS ${name}`); } catch (error) { results.push(`FAIL ${name}: ${error.message}`); }
 }
-const text = html => html.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+const text = html => html.replace(/<[^>]+>/g, ' ').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
 const scanned = [];
 const scan = html => { scanned.push(html); return html; };
 
@@ -163,7 +163,7 @@ check('failure: copy, Back to <previous>, Try again only when retryable, D11 cop
     assert.doesNotMatch(billing, /switch-retry/);
     assert.match(billing, /switch-back/);
     const cap = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: failed('billing_user_hours_cap') }), failed('billing_user_hours_cap'), []));
-    assert.match(text(cap), new RegExp(AWS_CAP_COPY.replace(/[.?]/g, '\\$&')));
+    assert.match(text(cap), new RegExp(AWS_CAP_COPY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.doesNotMatch(cap, /switch-retry|fair use|standard-hour/i);
     assert.equal(refusalCopy('user_hours_cap', 'cmp-4'), AWS_CAP_COPY);
 });

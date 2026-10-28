@@ -188,7 +188,7 @@ check('round 3: hours left at weight 1, 2 and 4 with the equivalents; never stan
         const el = rendered(withPeriod({ usedStandardSeconds: 169200, allowanceStandardSeconds: 1800000, remainingStandardSeconds: remaining, currentSize: size, currentWeight: weight,
             remainingHoursAtCurrent: Math.floor(remaining / weight / 3600), equivalents }), premium);
         assert.match(meter(el, 'compute').textContent, new RegExp(text));
-        assert.match(meter(el, 'compute').textContent, new RegExp(same.replace(/\./g, '\\.')));
+        assert.match(meter(el, 'compute').textContent, new RegExp(same.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
         assert.doesNotMatch(el.textContent, /\b\d+ h( \d+ min)? (left|of)\b|standard-hour|compute hours/i);
         if (weight > 1) assert.doesNotMatch(meter(el, 'compute').querySelector('.usage-value').textContent, /453/);
         assert.deepEqual(scanCopy(el.textContent), []);

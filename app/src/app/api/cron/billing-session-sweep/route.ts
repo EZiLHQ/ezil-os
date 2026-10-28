@@ -31,7 +31,7 @@ async function isStillRunning(computer: ComputerRef): Promise<boolean> {
  * unproven placement, so the sweep closes metered time only on evidence.
  * `stoppedAt` stays null: the handler then closes at the epoch's last heartbeat.
  */
-export async function awsStopProof(computer: ComputerRef): Promise<{ running: boolean; stoppedAt: Date | null }> {
+async function awsStopProof(computer: ComputerRef): Promise<{ running: boolean; stoppedAt: Date | null }> {
     const routed = await routeComputer(db, computer);
     if (routed.kind !== 'aws-ec2') return { running: true, stoppedAt: null };
     const { record } = await readPlacement(db as unknown as PlacementExecutor, computer.computerId);

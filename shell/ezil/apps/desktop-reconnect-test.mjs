@@ -24,6 +24,7 @@ async function until(fn, what = 'condition') {
 }
 const RUNTIME = 'a'.repeat(32);
 const VIEWER = 'https://viewer.example';
+const atViewer = src => { try { return new URL(src).origin === new URL(VIEWER).origin; } catch { return false; } };
 
 async function open(t, { relay = 'ok' } = {}) {
     const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', {
@@ -82,11 +83,11 @@ async function open(t, { relay = 'ok' } = {}) {
                 vitals: { connectionState: 'connected', bytesReceived: frames * 1000, framesDecoded: frames, width: 1280, height: 720 } } }));
     };
     const live = async () => {
-        await until(() => frame.src.startsWith(VIEWER), 'viewer navigated');
+        await until(() => atViewer(frame.src), 'viewer navigated');
         await until(() => { vitals(); return logs.some(l => l.includes('[desktop] tti=')); }, 'first frame');
     };
     /** Close the window and let its in-flight work drain before jsdom goes away. */
-    const close = async () => { await until(() => frame.src.startsWith(VIEWER), 'settled'); void w.$(win).close(); await wait(80); };
+    const close = async () => { await until(() => atViewer(frame.src), 'settled'); void w.$(win).close(); await wait(80); };
     return { w, win, frame, logs, counts, live, vitals, close,
         setProgress: p => { progress = { ...progress, ...p }; }, setRelay: a => { relayAnswer = a; } };
 }
@@ -141,7 +142,7 @@ test('reconnect: relay_runtime_changed re-opens instead of counting failures; a 
     assert.equal(h.counts.relay, 1, 'one refresh, no retry loop');
     assert.notEqual(h.win.dataset.relayState, 'error');
     assert.ok(!h.win.querySelector('.ezil-boot[data-kind="failed"]'), 'no failure panel');
-    await until(() => h.frame.src.startsWith(VIEWER), 'viewer re-navigated');
+    await until(() => atViewer(h.frame.src), 'viewer re-navigated');
     const again = h.counts.desktop;
     h.w.dispatchEvent(new h.w.Event('online'));
     await until(() => [...h.win.querySelectorAll('[data-kind="failed"]')].length > 0, 'bounded: the second change fails');
