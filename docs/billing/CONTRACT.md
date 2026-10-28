@@ -206,15 +206,18 @@ Alternatively, keep Managed Payments off and enable Stripe Tax with `BILLING_AUT
 
 ## 8. Copy rules (checked by a test)
 
-User-facing pricing and billing copy must not contain any of the following (case-insensitive):
+User-facing pricing and billing copy must not contain any of the following (case-insensitive; this is the list `e2e/billing-e2e-lib.mjs` `scanCopy` enforces — keep them identical):
 - `faster`
 - `instant`
 - `unlimited`
 - `priority`
-- `vcpu`
 - `gpu`
 - `heavy use`
-- `fair use`
 - a model name (`gpt`, `claude`, `gemini`, `llama`)
+- `memory is kept`, `memory survives`, `processes keep running`
+- `ai included`, `includes ai`
+- `compute hours`, `standard-hour`
+
+`vCPU` is allowed in configuration labels ("2 vCPU · 8 GB"); `fair use` left the banned list in c6943c56.
 
 Prices are written as `$20` / `USD`, next to "before applicable tax". AI rows say "AI assistant coming soon" until G4.

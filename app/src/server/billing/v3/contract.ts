@@ -3,8 +3,18 @@
  * Premium. The paid difference is felt, not metered: longer sessions and a
  * dedicated AWS computer in Mumbai; Premium chooses 2, 4 or 8 vCPU. Monthly
  * time is a fair-use guardrail in standard-seconds (a size of weight w uses w
- * per second), shown as a status, never as a meter. Founder 2026-10-20:
+ * per second). Round 3 (founder 2026-10-28): the time left is shown in hours
+ * at the computer's CURRENT configuration (standard-seconds ÷ weight), with
+ * the equivalents at the other sizes; the words "standard-hour" / "compute
+ * hours" never appear in user copy (scanCopy). Founder 2026-10-20:
  * Free / Standard $20 / Premium $100. No speed promise until it is measured.
+ *
+ * Round 3 pins (plan jaunty-singing-tulip §12; implemented by lanes L1/L2/L4):
+ * - D1 `upgradeAiCredits`: a paid Standard → Premium upgrade adds the prorated
+ *   difference of the two plans' period credits when the proration invoice is
+ *   paid (same remaining-fraction as the compute `upgrade_prorated` grant).
+ * - D5 one computer, selectable configuration: `SwitchConfiguration*` below.
+ * - Opening progress: `OpeningProgressV3` (server start time, path, milestones).
  *
  * v2 (Standard/Compute, overage, std-hour meters) stays in the codebase,
  * dormant: already-sold v2 subscriptions keep their v2 terms, new checkouts
@@ -73,7 +83,8 @@ export interface PlanOfferV3 {
      * Fair-use guardrail in STANDARD seconds per allowance window (UTC month
      * for Free, paid billing period otherwise): a running size of weight w
      * (std-2 = 1, cmp-4 = 2, cmp-8 = 4) uses w per second. Enforced
-     * server-side; shown only as a status and in the FAQ.
+     * server-side; shown as hours left at the current configuration (round 3,
+     * `hoursLeftAtWeight`) plus the near/paused status.
      */
     fairUseSeconds: number;
     /** Free accounts created before FREE_V2_EFFECTIVE_AT keep 8 h. */
@@ -124,6 +135,35 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
 export const UPGRADE_TARGET_V3: Readonly<Partial<Record<PlanSkuV3, SellableSkuV3>>> = Object.freeze({
     standard_monthly_v3: 'premium_monthly_v3',
 });
+
+const epochSeconds = (iso: string) => Math.floor(new Date(iso).getTime() / 1000);
+
+/** Suffix of the upgrade grant's entitlement id: `ezil-os:v1:<toSku>:<subscriptionId>:<effectiveAt ISO>:upgrade`. */
+export const UPGRADE_AI_ENTITLEMENT_SUFFIX = 'upgrade' as const;
+
+/**
+ * Round 3 D1 (founder 2026-10-28). Whole credits added by a paid upgrade:
+ * floor((to.period − from.period) × remaining / period), the same integer
+ * proration `upgradeGrantSeconds` applies to compute. Renewal grants the full
+ * amount of the new plan; credits already granted for the old plan are kept.
+ * Reversed only by a refund/dispute of the proration invoice. 0 on any
+ * invalid or non-positive input (never throws, never negative).
+ */
+export function upgradeAiCredits(input: { fromSku: SellableSkuV3; toSku: SellableSkuV3; periodStart: string; periodEnd: string; effectiveAt: string }): number {
+    const delta = CATALOG_V3[input.toSku].aiCredits.amount - CATALOG_V3[input.fromSku].aiCredits.amount;
+    const start = epochSeconds(input.periodStart), end = epochSeconds(input.periodEnd), at = epochSeconds(input.effectiveAt);
+    if (!Number.isSafeInteger(delta) || delta <= 0 || ![start, end, at].every(Number.isFinite)) return 0;
+    const duration = end - start;
+    if (duration <= 0) return 0;
+    const remaining = Math.min(duration, Math.max(0, end - at));
+    return Number(BigInt(delta) * BigInt(remaining) / BigInt(duration));
+}
+
+/** Round 3 D3 display rule: whole hours left at a configuration of weight w (1, 2 or 4). */
+export function hoursLeftAtWeight(remainingStandardSeconds: number, weight: number): number {
+    if (!Number.isFinite(remainingStandardSeconds) || remainingStandardSeconds <= 0 || !Number.isInteger(weight) || weight < 1) return 0;
+    return Math.floor(remainingStandardSeconds / weight / 3600);
+}
 
 // ── Fair use ─────────────────────────────────────────────────────────────────
 
@@ -254,8 +294,55 @@ export interface SelectMachineInputV3 {
     size: SizeCode;
 }
 
-/** Takes effect when the next session opens; a running session keeps its size. */
+/**
+ * `next_open`: the next session opens on `size`; a running session keeps its size
+ * (`billing.selectMachine`, unchanged). `switching`: round 3 — the change was
+ * applied to the RUNNING computer now via `computer.switchConfiguration`.
+ */
 export interface SelectMachineOutputV3 {
     size: SizeCode;
-    effective: 'next_open';
+    effective: 'next_open' | 'switching';
+}
+
+// ── One computer, selectable configuration (round 3, founder 2026-10-28, plan §12 D5) ──
+
+/** How a configuration card renders for this user right now. */
+export type ConfigurationAvailabilityV3 = 'current' | 'available' | 'locked' | 'unavailable';
+
+export type SwitchRefusalV3 = 'switch_in_progress' | 'not_entitled' | 'capacity_unavailable' | 'computer_busy' | 'foreign_computer';
+
+/** `computer.switchConfiguration` input; `requestId` makes a duplicate click / second tab idempotent. */
+export interface SwitchConfigurationInputV3 {
+    computerId: string;
+    size: SizeCode;
+    requestId: string;
+}
+
+/**
+ * RUNNING → `switching` (server: confirm → stop → start on `target`, same data disk, generation +1).
+ * STOPPED → `next_start` (preference stored; nothing starts until the user opens).
+ * The server owns current vs target; a different target while one is in flight → `switch_in_progress`.
+ * A failed switch reverts the preference to `current` and reports phase `failed` with a reason.
+ */
+export type SwitchConfigurationOutputV3 =
+    | { ok: true; effective: 'switching' | 'next_start'; current: SizeCode; target: SizeCode; transitionId: string }
+    | { ok: false; reason: SwitchRefusalV3 };
+
+export type SwitchPhaseV3 = 'requested' | 'stopping' | 'waking' | 'done' | 'failed';
+
+// ── Opening progress (round 3, plan §8 W0.2(e)) ──────────────────────────────
+
+export type OpeningPathV3 = 'warm' | 'cold' | 'switch' | 'migrate' | 'restart';
+
+/** Server milestones in order; the client appends `url_received` and `first_frame` locally. Never regress. */
+export const OPENING_MILESTONES_V3 = ['requested', 'host_claimed', 'files_attached', 'desktop_starting', 'desktop_ready'] as const;
+export type OpeningMilestoneV3 = typeof OPENING_MILESTONES_V3[number];
+
+export interface OpeningProgressV3 {
+    path: OpeningPathV3;
+    /** Server-stamped start of this opening (shared by every tab). */
+    startedAt: string;
+    /** Expected seconds for `path`, from measured timings (warm) or the cold default; never a client guess. */
+    expectedSeconds: number;
+    milestones: readonly { key: OpeningMilestoneV3; at: string }[];
 }
