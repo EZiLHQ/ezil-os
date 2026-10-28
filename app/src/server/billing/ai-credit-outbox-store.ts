@@ -133,6 +133,18 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
                     and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb
             `);
         },
+        async receiptsFor(userId) {
+            const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown }>(sql`
+                select payload->>'entitlementId' as "entitlementId", payload->'credits' as credits,
+                    payload->>'expiresAt' as "expiresAt", delivered_at as "deliveredAt"
+                from ezil_billing_outbox where user_id = ${userId}::uuid and kind = 'ai_grant'
+                    and payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                order by created_at desc, id limit 200`);
+            return rows.flatMap(row => typeof row.entitlementId === 'string' && typeof row.credits === 'number'
+                && Number.isSafeInteger(row.credits) && typeof row.expiresAt === 'string' && Number.isFinite(Date.parse(row.expiresAt))
+                ? [{ entitlementId: row.entitlementId, credits: row.credits, expiresAt: new Date(row.expiresAt).toISOString(),
+                    deliveredAt: row.deliveredAt == null ? null : new Date(row.deliveredAt as string | Date).toISOString() }] : []);
+        },
     };
 }
 

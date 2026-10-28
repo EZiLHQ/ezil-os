@@ -15,11 +15,15 @@ export interface AiCreditDelivery {
     status: 'done' | 'failed' | 'retry'; reason: string | null; nextAttemptAt?: number;
     outcome?: AiRestoreOutcome; reviewRequired?: boolean;
 }
+/** A user's stored AI grant receipt: the frozen wire terms and whether the Gateway acknowledged it. */
+export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null }
 export interface AiCreditOutboxStore {
     claim(now: number): Promise<AiCreditOutboxRow | null>;
     accountFor(row: AiCreditOutboxRow): Promise<string | null>;
     pinAccount(row: AiCreditOutboxRow, accountPublicId: string): Promise<boolean>;
     finish(row: AiCreditOutboxRow, result: AiCreditDelivery, now: number): Promise<void>;
+    /** Newest first, at most 200 grant receipts of one user (read-only; splits the balance by bucket). */
+    receiptsFor?(userId: string): Promise<AiCreditReceipt[]>;
 }
 export const aiCreditBackoffMs = (attempt: number) => Math.min(3_600_000, 60_000 * 2 ** Math.max(0, attempt - 1));
 export const isAiAccountDependency = (reason: string | null) => reason === 'no_ai_account' || reason === 'account_not_found';

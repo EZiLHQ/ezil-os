@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
-import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
@@ -88,6 +88,16 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     return { plan, subscriptionId };
 }
 
+/** Stored receipts split the Gateway balance by bucket; unreadable receipts fall back to the total. */
+async function aiReceipts(deps: BillingDeps, userId: string) {
+    try {
+        return await deps.aiCredits?.receiptsFor?.(userId) ?? null;
+    } catch {
+        console.warn('[billing.ai] receipts unavailable');
+        return null;
+    }
+}
+
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 export function createBillingRouter(getDeps: () => BillingDeps) {
     return createTRPCRouter({
@@ -147,13 +157,15 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     console.error('Billing renewal preview unavailable');
                 }
             }
+            await enqueueFreeAiCredits(deps.store, ctx.user.id, plan.sku, now);
+            const [{ gatewayGrants, ...ai }, receipts] = await Promise.all([aiRead, aiReceipts(deps, ctx.user.id)]);
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro },
             });
-            await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
-            const ai = await aiRead;
-            ai.balanceState = aiMicroBalanceState(ai.balanceMicro, summary.ai.grant.amount);
+            // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
+            ai.balanceState = summary.ai.state;
             return { ...summary, ai: { ...summary.ai, ...ai,
                 // Older consumers cannot describe a pause. They must not call it healthy or exhausted.
                 state: ai.spendingState === 'available' ? ai.balanceState : 'unavailable' } };

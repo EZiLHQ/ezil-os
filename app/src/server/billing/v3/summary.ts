@@ -10,6 +10,10 @@ import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
 import { CATALOG_V3_VERSION, type BillingSummaryV3, type SellableSkuV3 } from './contract';
+import { parseAiUpgradeEntitlement } from '../ai-credits';
+import { aiMicroBalanceState, type AiGatewayGrant } from '../ai-balance';
+import type { AiCreditReceipt } from '../ai-credit-outbox';
+import { creditNumber } from '../ai-read';
 
 const iso = (date: Date) => isoSeconds(epochSeconds(date));
 const sellable = (sku: string | null): sku is SellableSkuV3 => sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3';
@@ -34,11 +38,80 @@ export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow
     return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
 }
 
+type AiBucket = 'included' | 'previous' | 'purchased' | 'starter';
+const PERIOD_ROOT = /^ezil-os:v1:(standard_monthly_v3|premium_monthly_v3):([A-Za-z0-9_]+):(\d{4}-\d{2}-\d{2}T[\d:.]+Z)$/;
+const MICRO = BigInt(1_000_000);
+
+/** Which bucket a stored receipt funds, relative to the plan's current paid period. */
+function receiptBucket(entitlementId: string, plan: ResolvedPlanV3): { bucket: AiBucket; planPeriodSku?: string } {
+    if (entitlementId.startsWith('ezil-os:v1:free-once:')) return { bucket: 'starter' };
+    if (entitlementId.startsWith('ezil-os:v1:topup:')) return { bucket: 'purchased' };
+    const start = Date.parse(plan.window.start), end = Date.parse(plan.window.end);
+    const inWindow = (at: number) => plan.subscriptionId !== null && at >= start && at < end;
+    const upgrade = parseAiUpgradeEntitlement(entitlementId);
+    if (upgrade) return { bucket: upgrade.subscriptionId === plan.subscriptionId && inWindow(upgrade.effectiveAt.getTime()) ? 'included' : 'previous' };
+    const period = PERIOD_ROOT.exec(entitlementId);
+    return period && period[2] === plan.subscriptionId && inWindow(Date.parse(period[3]!))
+        ? { bucket: 'included', planPeriodSku: period[1] } : { bucket: 'previous' };
+}
+
+const credits = (micro: bigint) => creditNumber(micro.toString());
+
+/**
+ * Round 3 D2/D4: split the Gateway balance into the plan's credits for THIS period,
+ * purchased and starter credits. The Gateway `grants[]` carries no entitlement id, so a
+ * live grant is matched to the stored receipt with the same expiry and amount; an
+ * unmatched grant (earlier periods still inside their 3-day tail, legacy or manual
+ * grants) counts in `balance` only. The low/exhausted state never mixes buckets.
+ */
+export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonly AiCreditReceipt[] | null;
+    gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null }): Pick<BillingSummaryV3['ai'],
+    'state' | 'included' | 'purchased' | 'starter' | 'pendingFromRenewal'> {
+    const { plan } = input;
+    const paid = plan.sku === 'standard_monthly_v3' || plan.sku === 'premium_monthly_v3';
+    const receipts = (input.receipts ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
+    const matched = new Map<AiBucket, AiGatewayGrant[]>();
+    const unused = [...receipts];
+    for (const grant of input.gatewayGrants ?? []) {
+        if (!grant.live) continue;
+        const i = unused.findIndex(r => Date.parse(r.expiresAt) === Date.parse(grant.expiresAt) && BigInt(r.credits) * MICRO === BigInt(grant.creditsMicro));
+        if (i < 0) continue;
+        const [receipt] = unused.splice(i, 1);
+        matched.set(receipt!.bucket, [...matched.get(receipt!.bucket) ?? [], grant]);
+    }
+    const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro' | 'remainingMicro') =>
+        (grants ?? []).reduce((total, g) => total + BigInt(g[field]), BigInt(0));
+    const known = input.gatewayGrants !== null;
+    const current = receipts.filter(r => r.bucket === 'included');
+    const includedGrantedMicro = known ? sum(matched.get('included'), 'creditsMicro')
+        : current.filter(r => r.deliveredAt !== null).reduce((total, r) => total + BigInt(r.credits) * MICRO, BigInt(0));
+    const included = paid ? { granted: credits(includedGrantedMicro) ?? 0,
+        remaining: known ? credits(sum(matched.get('included'), 'remainingMicro')) : null, periodEnd: plan.window.end } : null;
+    const live = (bucket: AiBucket) => (matched.get(bucket) ?? []).filter(g => BigInt(g.remainingMicro) > BigInt(0));
+    const purchased = known && live('purchased').length ? { remaining: credits(sum(live('purchased'), 'remainingMicro')) ?? 0,
+        expiresAt: live('purchased').map(g => g.expiresAt).sort()[0]! } : null;
+    const starter = known && live('starter').length ? { remaining: credits(sum(live('starter'), 'remainingMicro')) ?? 0 } : null;
+    const pendingFromRenewal = paid && input.receipts !== null && plan.renewsAt !== null
+        && !current.some(r => r.planPeriodSku === plan.sku) ? { credits: plan.offer.aiCredits.amount, at: plan.renewsAt } : null;
+    // Paid plans judge THIS period's credits; Free judges its starter grant. Unknown → v1 total-vs-catalog rule.
+    const basis = paid ? matched.get('included') : plan.sku === 'free_v3' ? matched.get('starter') : undefined;
+    const basisGranted = sum(basis, 'creditsMicro');
+    let state: BillingSummaryV3['ai']['state'];
+    if (input.balanceMicro === null) state = 'unavailable';
+    else if (BigInt(input.balanceMicro) === BigInt(0)) state = 'exhausted';
+    else if (known && basisGranted > BigInt(0)) state = sum(basis, 'remainingMicro') * BigInt(10) <= basisGranted ? 'low' : 'ok';
+    else state = aiMicroBalanceState(input.balanceMicro, includedGrantedMicro > BigInt(0) ? Number(includedGrantedMicro / MICRO)
+        : plan.sku === 'legacy' ? 0 : plan.offer.aiCredits.amount);
+    return { state, included, purchased, starter, pendingFromRenewal };
+}
+
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
     packs?: readonly StripeAiPack[];
     stripeAvailable?: boolean;
+    /** Round 3: the Gateway balance and stored receipts; omitted = balance filled by the caller (v1 shape). */
+    ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null };
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
@@ -97,7 +170,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
                 size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const })) },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
-        ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable' },
+        ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
+            ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
         storage: { usedBytes: usedBytes.toString(), capBytes: capBytes.toString(), state: storage === 'over_cap' ? 'exhausted' : storage },
         actions: { checkout: enabled && plan.family === 'free', topup: enabled,

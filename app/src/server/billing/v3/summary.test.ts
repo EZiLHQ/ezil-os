@@ -158,3 +158,67 @@ describe('paid fair-use exhaustion deadlines', () => {
             }
         });
 });
+
+describe('round 3 AI credit buckets (D2/D4)', () => {
+    const M = (credits: number) => String(BigInt(credits) * BigInt(1_000_000));
+    const expiry = (date: Date) => new Date(date.getTime() + 3 * 86_400_000).toISOString();
+    const prev = new Date('2026-09-10T00:00:00Z');
+    const receipt = (entitlementId: string, credits: number, expiresAt: string, delivered = true) =>
+        ({ entitlementId, credits, expiresAt, deliveredAt: delivered ? start.toISOString() : null });
+    const standard = receipt(`ezil-os:v1:standard_monthly_v3:sub:${start.toISOString()}`, 200, expiry(end));
+    const upgrade = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-13T00:00:00.000Z:upgrade', 696, expiry(end));
+    const grant = (credits: number, remaining: number, expiresAt: string, live = true) =>
+        ({ creditsMicro: M(credits), remainingMicro: M(remaining), expiresAt, live });
+    function summary(sku: SellableSkuV3 | undefined, receipts: Parameters<typeof buildSummaryV3>[0]['ai'] extends infer A
+        ? A extends { receipts: infer R } ? R : never : never, gatewayGrants: ReturnType<typeof grant>[] | null, balanceMicro?: string | null) {
+        const total = (gatewayGrants ?? []).filter(g => g.live).reduce((sum, g) => sum + BigInt(g.remainingMicro), BigInt(0)).toString();
+        return buildSummaryV3({ ...input(sku), ai: { receipts, gatewayGrants, balanceMicro: balanceMicro === undefined ? total : balanceMicro } }).ai;
+    }
+    it('right after an upgrade, Standard\'s live 90 of 200 is NOT low and the renewal adds 1,000', () => {
+        // Upgrade grant still queued: only the Standard period grant is on the Gateway.
+        const ai = summary('premium_monthly_v3', [standard, { ...upgrade, deliveredAt: null }], [grant(200, 90, standard.expiresAt)]);
+        expect(ai).toMatchObject({ grant: { amount: 1000 }, balance: 90, state: 'ok',
+            included: { granted: 200, remaining: 90, periodEnd: end.toISOString().replace('.000', '') },
+            purchased: null, starter: null, pendingFromRenewal: { credits: 1000, at: end.toISOString().replace('.000', '') } });
+    });
+    it('counts the delivered upgrade grant in this period\'s credits', () => {
+        const ai = summary('premium_monthly_v3', [standard, upgrade], [grant(200, 150, standard.expiresAt), grant(696, 696, upgrade.expiresAt)]);
+        expect(ai).toMatchObject({ balance: 846, state: 'ok', included: { granted: 896, remaining: 846 } });
+        expect(summary('premium_monthly_v3', [standard, upgrade], [grant(200, 0, standard.expiresAt), grant(696, 80, upgrade.expiresAt)]).state).toBe('low');
+    });
+    it('keeps the previous period\'s 3-day tail out of this period\'s meter (no "1,200 of 1,000")', () => {
+        const last = receipt(`ezil-os:v1:premium_monthly_v3:sub:${prev.toISOString()}`, 1000, expiry(start));
+        const renewal = receipt(`ezil-os:v1:premium_monthly_v3:sub:${start.toISOString()}`, 1000, expiry(end));
+        const ai = summary('premium_monthly_v3', [renewal, last], [grant(1000, 200, last.expiresAt), grant(1000, 1000, renewal.expiresAt)]);
+        expect(ai).toMatchObject({ balance: 1200, state: 'ok', included: { granted: 1000, remaining: 1000 }, pendingFromRenewal: null });
+    });
+    it('reports purchased and starter credits separately and never lets them hide a low plan bucket', () => {
+        const topup = receipt('ezil-os:v1:topup:ai_pack_10_v1:pi_1', 500, '2027-09-01T00:00:00.000Z');
+        const starter = receipt('ezil-os:v1:free-once:u', 100, '2027-08-01T00:00:00.000Z');
+        const ai = summary('standard_monthly_v3', [standard, topup, starter],
+            [grant(200, 10, standard.expiresAt), grant(500, 400, topup.expiresAt), grant(100, 30, starter.expiresAt), grant(50, 50, '2026-12-01T00:00:00.000Z')]);
+        expect(ai).toMatchObject({ balance: 490, state: 'low', included: { granted: 200, remaining: 10 },
+            purchased: { remaining: 400, expiresAt: '2027-09-01T00:00:00.000Z' }, starter: { remaining: 30 }, pendingFromRenewal: null });
+    });
+    it('Free judges its starter grant; nothing spendable is exhausted', () => {
+        const starter = receipt('ezil-os:v1:free-once:u', 100, '2027-08-01T00:00:00.000Z');
+        expect(summary(undefined, [starter], [grant(100, 10, starter.expiresAt)])).toMatchObject({ state: 'low', included: null, starter: { remaining: 10 } });
+        expect(summary(undefined, [starter], [grant(100, 11, starter.expiresAt)]).state).toBe('ok');
+        expect(summary(undefined, [starter], [grant(100, 0, starter.expiresAt)]).state).toBe('exhausted');
+    });
+    it('falls back to the total against the period receipts (else the catalog) when the Gateway gives no grants', () => {
+        expect(summary('premium_monthly_v3', [standard], null, M(90))).toMatchObject({ state: 'ok', balance: 90,
+            included: { granted: 200, remaining: null }, purchased: null, starter: null });
+        expect(summary('premium_monthly_v3', [], null, M(90))).toMatchObject({ state: 'low', included: { granted: 0, remaining: null } });
+        expect(summary('premium_monthly_v3', null, null, M(90))).toMatchObject({ state: 'low', pendingFromRenewal: null });
+        expect(summary('premium_monthly_v3', null, null, null).state).toBe('unavailable');
+    });
+    it('ignores revoked or foreign-subscription grants and announces no renewal for a canceling plan', () => {
+        const foreign = receipt(`ezil-os:v1:premium_monthly_v3:sub_other:${start.toISOString()}`, 1000, expiry(end));
+        const ai = summary('premium_monthly_v3', [standard, foreign], [grant(200, 200, standard.expiresAt, false), grant(1000, 1000, foreign.expiresAt)]);
+        expect(ai).toMatchObject({ balance: 1000, included: { granted: 0, remaining: 0 }, pendingFromRenewal: { credits: 1000 } });
+        const args = input('premium_monthly_v3');
+        args.subs[0]!.cancelAtPeriodEnd = true;
+        expect(buildSummaryV3({ ...args, ai: { receipts: [], gatewayGrants: [], balanceMicro: '0' } }).ai.pendingFromRenewal).toBeNull();
+    });
+});
