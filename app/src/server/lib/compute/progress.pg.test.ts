@@ -1,11 +1,16 @@
 /** Disposable PostgreSQL only: the round-3 advisory transition/opening records in `ezil_computers.metadata`. */
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { SQL, StringChunk, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PlacementExecutor } from './placement';
-import { readComputerMeta, TRANSITION_MAX_AGE_MS, writeOpening, writeTransition, type ComputerTransition, type OpeningRecord } from './progress';
+import { readComputerMeta, readComputerProgress, TRANSITION_MAX_AGE_MS, writeOpening, writeTransition, type ComputerTransition, type OpeningRecord } from './progress';
+
+// The billing preference read is not under test here (it never reaches this disposable schema).
+vi.mock('@/server/billing/v2/compute-access', () => ({ billingV2EntitlementReader: () => ({ read: async () => null }) }));
 
 const PG = process.env.EZIL_PG_TEST_URL;
 const schema = `transition_test_${randomUUID().replaceAll('-', '')}`;
@@ -31,12 +36,19 @@ describe.skipIf(!PG)('transition records on production Drizzle PostgreSQL', () =
     const setMetadata = (value: string) => client!.unsafe(`UPDATE ${schema}.ezil_computers SET metadata = ${value} WHERE id = '${C}'`);
     let created = false;
     beforeAll(async () => {
+        await client!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+            DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
         await client!.unsafe(`CREATE SCHEMA ${schema}`); created = true;
         await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, name text NOT NULL DEFAULT 'Computer',
             slot smallint NOT NULL DEFAULT 1, deleted_at timestamptz, metadata jsonb)`);
+        // The real placement, pool, demand and provider-migration tables a progress read touches.
+        for (const file of ['0001_compute_placement.sql.txt', '0002_image_rebase.sql.txt', '0002_ready_pool.sql.txt', '0003_pool_hosts_v2.sql.txt'])
+            await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../../docs/aws-computers/sql', file), 'utf8')));
+        for (const file of ['0006_compute_migrations.sql', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql'])
+            await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle', file), 'utf8')));
     });
     beforeEach(async () => {
-        await client!.unsafe(`TRUNCATE ${schema}.ezil_computers`);
+        await client!.unsafe(`TRUNCATE ${schema}.ezil_computers, ${schema}.ezil_computer_placements, ${schema}.ezil_compute_migrations`);
         await client!.unsafe(`INSERT INTO ${schema}.ezil_computers (id, user_id, metadata) VALUES ('${C}', '${U}', '{"keep": {"x": 1}}')`);
     });
     afterAll(async () => { try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); } finally { await client?.end(); } });
@@ -104,6 +116,38 @@ describe.skipIf(!PG)('transition records on production Drizzle PostgreSQL', () =
         expect(await writeOpening(db, computer, meta!.rawOpening, next)).toBe(true);
         expect(await writeOpening(db, computer, meta!.rawOpening, { ...next, path: 'warm' })).toBe(false);
         expect((await readComputerMeta(db, computer))!.opening).toEqual(next);
+        expect(await metadata()).toMatchObject({ keep: { x: 1 } });
+    });
+
+    it('readComputerProgress: a switch in flight reports its stored opening, milestones and transition view, then stamps the wake', async () => {
+        const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_COMPUTE_PLACEMENT_READS: '1', EZIL_AWS_KILL_SWITCH: '0' };
+        const at = (s: number) => new Date(Date.parse(T0) + s * 1000).toISOString();
+        const place = (state: string, generation: number, epoch: number, instanceType: string) => client!.unsafe(`INSERT INTO ${schema}.ezil_computer_placements
+            (computer_id, owner_user_id, provider, workspace_store, generation, lease_epoch, state, region, zone_id, instance_type, volume_id, updated_at)
+            VALUES ('${C}', '${U}', 'aws-ec2', 'ebs', ${generation}, ${epoch}, '${state}', 'ap-south-1', 'aps1-az1', '${instanceType}', 'vol-11111111111111111', '${at(1)}')`);
+        const view = { transitionId: transition().transitionId, kind: 'switch', current: 'std-2', target: 'cmp-8', reason: null, requestedAt: T0, endedAt: null, revertAvailable: false };
+        // Stopping the old host: the opening belongs to the next lease epoch and starts at the request.
+        await place('STOPPING', 3, 7, 'm6i.large');
+        await writeTransition(db, computer, null, transition({ phase: 'stopping', stoppingAt: at(1) }));
+        const opening: OpeningRecord = { v: 1, generation: 3, leaseEpoch: 8, startedAt: T0, path: 'switch', milestones: { requested: T0 } };
+        await writeOpening(db, computer, null, opening);
+        expect(await readComputerProgress(db, computer, env, new Date(at(30)))).toMatchObject({
+            operation: 'opening', stage: 'switching', openingStartedAt: T0, path: 'switch', expectedSeconds: 300, typicalSeconds: 300,
+            milestones: [{ key: 'requested', at: T0 }], transition: { ...view, phase: 'stopping' },
+        });
+        // Waking on the new epoch: stored stamps win over the read time; a newly reached milestone is stamped once.
+        await client!.unsafe(`TRUNCATE ${schema}.ezil_computer_placements`);
+        await place('MOUNTING', 4, 8, 'm6i.2xlarge');
+        await setMetadata(`jsonb_build_object('keep', '{"x": 1}'::jsonb, 'transition', '${JSON.stringify(transition({ phase: 'waking', stoppingAt: at(1), wakingAt: at(60) }))}'::jsonb,
+            'opening', '${JSON.stringify({ ...opening, milestones: { requested: T0, host_claimed: at(100) } })}'::jsonb)`);
+        const milestones = [{ key: 'requested', at: T0 }, { key: 'host_claimed', at: at(100) }, { key: 'files_attached', at: at(120) }];
+        expect(await readComputerProgress(db, computer, env, new Date(at(120)))).toMatchObject({
+            operation: 'opening', stage: 'mounting', openingStartedAt: T0, path: 'switch', expectedSeconds: 300, milestones, transition: { ...view, phase: 'waking' },
+        });
+        expect((await readComputerMeta(db, computer))!.opening).toEqual({ v: 1, generation: 4, leaseEpoch: 8, startedAt: T0, path: 'switch',
+            milestones: { requested: T0, host_claimed: at(100), files_attached: at(120) } });
+        // A later read keeps the first stamps.
+        expect((await readComputerProgress(db, computer, env, new Date(at(150))))!.milestones).toEqual(milestones);
         expect(await metadata()).toMatchObject({ keep: { x: 1 } });
     });
 });
