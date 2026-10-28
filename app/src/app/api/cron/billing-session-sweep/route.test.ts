@@ -61,8 +61,39 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(response.status).toBe(200);
         expect(await response.json()).toEqual(counts);
         expect(handleBillingSessionSweep).toHaveBeenCalledExactlyOnceWith({ deps, now,
-            stop: expect.any(Function), isStillRunning: expect.any(Function) });
+            stop: expect.any(Function), isStillRunning: expect.any(Function), awsStopProof: expect.any(Function) });
         expect(maxDuration).toBe(300);
+    });
+
+    // Round 3 (D9): stale AWS epochs close only on placement PROOF, never on a read error.
+    it.each(['RUNNING', 'LEASED', 'STARTING', 'MOUNTING', 'STOPPED', 'STOPPING', 'DRAINING', 'RETIRED'])('awsStopProof reports %s from the placement with no stop time', async state => {
+        vi.mocked(routeComputer).mockResolvedValue({ kind: 'aws-ec2', provider: {}, instanceType: null } as RoutedComputer);
+        vi.mocked(readPlacement).mockResolvedValue({ provider: 'aws-ec2', record: {
+            ownerUserId: computer.userId, provider: 'aws-ec2', state,
+        } } as ResolvedPlacement);
+        expect(await (await wiring()).awsStopProof!(computer)).toEqual({
+            running: ['RUNNING', 'LEASED', 'STARTING', 'MOUNTING'].includes(state), stoppedAt: null });
+    });
+
+    it('awsStopProof treats a Cloudflare computer as running (the policy path owns it)', async () => {
+        vi.mocked(routeComputer).mockResolvedValue({ kind: 'cloudflare', provider: { status: vi.fn() }, instanceType: null } as unknown as RoutedComputer);
+        expect(await (await wiring()).awsStopProof!(computer)).toEqual({ running: true, stoppedAt: null });
+        expect(readPlacement).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        { name: 'no placement row', record: null },
+        { name: 'another owner', record: { ownerUserId: 'another-owner', provider: 'aws-ec2', state: 'STOPPED' } },
+        { name: 'a non-AWS provider on the row', record: { ownerUserId: computer.userId, provider: 'cloudflare', state: 'STOPPED' } },
+    ])('awsStopProof THROWS (never running:false) when the placement is unproven: $name', async ({ record }) => {
+        vi.mocked(routeComputer).mockResolvedValue({ kind: 'aws-ec2', provider: {}, instanceType: null } as RoutedComputer);
+        vi.mocked(readPlacement).mockResolvedValue({ provider: 'aws-ec2', record } as unknown as ResolvedPlacement);
+        await expect((await wiring()).awsStopProof!(computer)).rejects.toThrow('placement_unproven');
+    });
+
+    it('awsStopProof propagates a read error instead of answering', async () => {
+        vi.mocked(routeComputer).mockRejectedValue(new Error('db down'));
+        await expect((await wiring()).awsStopProof!(computer)).rejects.toThrow('db down');
     });
 
     it('stops using the epoch owner and the shared policy helper without a session or confirmation poll', async () => {

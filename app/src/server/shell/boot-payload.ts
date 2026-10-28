@@ -181,6 +181,17 @@ export const SHELL_API_ROUTES = {
      * Present only while `src/app/api/shell/capacity-retry/route.ts` exists.
      */
     capacityRetry: '/api/shell/capacity-retry',
+    /**
+     * POST = change the ONE computer's configuration (`{ computerId, size,
+     * requestId }`, round 3): a RUNNING computer stops and restarts on the new
+     * size (same data disk), a STOPPED one records it for the next start. Same
+     * feature-detection contract as `restart`: the Settings computer page reads
+     * `desktopState.endpoints.switch` fresh and draws plain "next start"
+     * copy when it is absent. Present only while
+     * `src/app/api/shell/switch/route.ts` exists. Contract:
+     * `docs/aws-computers/SWITCH-CONTRACT.md`.
+     */
+    switch: '/api/shell/switch',
 } as const;
 
 export interface ShellBootUser {

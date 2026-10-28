@@ -55,6 +55,8 @@ const {
     system: HOSTED_SYSTEM_ROUTE,
     capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
     feedback: HOSTED_FEEDBACK_ROUTE,
+    // Configuration switching moves a hosted AWS computer between sizes; local has one fixed machine.
+    switch: HOSTED_SWITCH_ROUTE,
     ...COMMON_ROUTES
 } = APP_ROUTES;
 
@@ -70,11 +72,12 @@ describe('the route table has not drifted from the app', () => {
         // Without this, a module that somehow resolved to `{}` would make every
         // "same keys" assertion below vacuously true.
         expect(typeof APP_ROUTES).toBe('object');
-        expect(Object.keys(APP_ROUTES).length).toBe(13);
+        expect(Object.keys(APP_ROUTES).length).toBe(14);
         expect(HOSTED_RELAY_ROUTE).toBe('/api/shell/relay-refresh');
         expect(HOSTED_SYSTEM_ROUTE).toBe('/api/shell/system');
         expect(HOSTED_CAPACITY_RETRY_ROUTE).toBe('/api/shell/capacity-retry');
         expect(HOSTED_FEEDBACK_ROUTE).toBe('/api/shell/feedback');
+        expect(HOSTED_SWITCH_ROUTE).toBe('/api/shell/switch');
         expect(typeof appSerialize).toBe('function');
     });
 

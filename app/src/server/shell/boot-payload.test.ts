@@ -300,6 +300,8 @@ describe('toShellDesktopState — never implies an observation it does not have'
             screen: '/api/shell/screen',
             // RETRY-118: explicit user Retry after an expired capacity attempt.
             capacityRetry: '/api/shell/capacity-retry',
+            // Round 3: one computer, selectable configuration (SWITCH-CONTRACT.md).
+            switch: '/api/shell/switch',
         });
     });
 

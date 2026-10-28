@@ -48,6 +48,8 @@ const {
     system: HOSTED_SYSTEM_ROUTE,
     capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
     feedback: HOSTED_FEEDBACK_ROUTE,
+    // Configuration switching is hosted-only (AWS sizes); local has one fixed machine.
+    switch: HOSTED_SWITCH_ROUTE,
     ...COMMON_SHELL_API_ROUTES
 } = APP_SHELL_API_ROUTES;
 

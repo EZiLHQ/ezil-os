@@ -25,6 +25,20 @@ async function isStillRunning(computer: ComputerRef): Promise<boolean> {
     }
 }
 
+/**
+ * Placement proof for stale AWS epochs (round 3, D9). Unlike `isStillRunning`
+ * this THROWS on any read error and never answers `running: false` for an
+ * unproven placement, so the sweep closes metered time only on evidence.
+ * `stoppedAt` stays null: the handler then closes at the epoch's last heartbeat.
+ */
+export async function awsStopProof(computer: ComputerRef): Promise<{ running: boolean; stoppedAt: Date | null }> {
+    const routed = await routeComputer(db, computer);
+    if (routed.kind !== 'aws-ec2') return { running: true, stoppedAt: null };
+    const { record } = await readPlacement(db as unknown as PlacementExecutor, computer.computerId);
+    if (!record || record.ownerUserId !== computer.userId || record.provider !== 'aws-ec2') throw new Error('placement_unproven');
+    return { running: ['RUNNING', 'LEASED', 'STARTING', 'MOUNTING'].includes(record.state), stoppedAt: null };
+}
+
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
@@ -34,6 +48,7 @@ export async function GET(req: Request): Promise<Response> {
         // There is no session user in a cron: the epoch records the checked owner.
         stop: (computer, reason) => stopComputerForPolicy(db, computer, reason),
         isStillRunning,
+        awsStopProof,
     });
     return Response.json(counts);
 }
