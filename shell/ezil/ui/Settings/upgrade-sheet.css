@@ -6,8 +6,9 @@
     --border: rgba(255, 255, 255, 0.08);
     --text: #f5f5f4;
     --muted: #9aa3ad;
-    --accent: #00adb5;
-    --accent-ink: #04060c;
+    /* Round 3: the user's accent (`--ezil-accent`, ezil-tokens.css + Appearance). */
+    --accent: var(--ezil-accent, #00adb5);
+    --accent-ink: var(--ezil-accent-contrast, #04060c);
     --warn: #f5a524;
     --danger: #f05d5e;
     position: fixed;
@@ -173,3 +174,16 @@
 .ezil-billing-fair-use { padding: 12px 0; }
 .ezil-billing-fair-use[data-status="near"] { color: var(--warn); }
 .ezil-billing-fair-use[data-status="paused"] { color: var(--danger); }
+
+/* Round 3 plan sheet (§6.4): three columns, then the bullets in plan order. */
+.ezil-billing-choices { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.ezil-billing-choice { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ezil-billing-choice [data-role="current-plan"] { opacity: 0.7; cursor: default; }
+.ezil-billing-choice-lead { font-weight: 600; margin: 4px 0 0; }
+/* "What happens next" beside the price (M8): a short timeline. */
+.ezil-billing-next { border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08)); margin-top: 12px; padding-top: 12px; }
+.ezil-billing-next h3 { font-size: 14px; margin: 0 0 8px; }
+.ezil-billing-next dl { display: grid; gap: 6px; margin: 0; }
+.ezil-billing-next dl > div { display: grid; grid-template-columns: minmax(96px, max-content) minmax(0, 1fr); gap: 8px; }
+.ezil-billing-next dt { font-weight: 600; color: var(--accent); }
+.ezil-billing-next dd { margin: 0; }

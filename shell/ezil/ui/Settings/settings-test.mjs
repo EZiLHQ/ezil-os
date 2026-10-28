@@ -76,6 +76,7 @@ if ( ! window.crypto?.getRandomValues ) {
 // to compare the DOM against at the exact moment the request leaves.
 const calls = [];
 let listRows = [];
+let progressState = 'RUNNING';
 window.fetch = async (url, opts = {}) => {
     const u = String(url);
     const rec = { url: u, method: opts.method ?? 'GET', at: calls.length, domAtCall: {} };
@@ -108,6 +109,17 @@ window.fetch = async (url, opts = {}) => {
         const row = { id: 'c-new', name: 'New computer', slot: 2, createdAt: new Date().toISOString(), lastOpenedAt: null };
         listRows = [...listRows, row];
         return json({ result: { data: { json: row } } });
+    }
+    // Round 3: the Computer tab reads the live state of its one computer.
+    if ( u.includes('/api/trpc/computer.progress') ) {
+        const id = JSON.parse(decodeURIComponent(u.split('input=')[1] ?? '%7B%7D')).json?.computerId;
+        return json({ result: { data: { json: { version: 2, computerId: id, operation: 'none', lifecycleState: progressState,
+            needsOperator: false, transition: null, milestones: [], hardware: { instanceType: 'm6i.large', source: 'placement' } } } } });
+    }
+    if ( u === '/api/shell/stop' || u.endsWith('/api/shell/stop') ) {
+        rec.body = JSON.parse(opts.body ?? '{}');
+        progressState = 'STOPPED';
+        return json({ ok: true });
     }
     if ( u.includes('/api/trpc/computer.rename') ) {
         const { id, name } = JSON.parse(opts.body ?? '{}').json ?? {};
@@ -247,15 +259,22 @@ push('flag-off Settings still loads Computers without requesting billing',
 click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
 await settle();
 
-// ── Computers tab ──────────────────────────────────────────────────────────
+// ── Computer tab (round 3: ONE computer, no slots) ─────────────────────────
+// Plan §6.1 / D6: the slot list and every "New computer" control are gone. The
+// pane shows "Your computer" with its state, and a manage row (Rename/Delete).
+const pane = q('.window[data-app="settings"] [data-pane="computers"]');
 const rows = qa('.window[data-app="settings"] .ezil-settings-row');
-push('two slot rows, always — the cap is structural', rows.length === 2, `${rows.length} rows`);
-push('slot 1 shows the computer', rows[0]?.textContent.includes('My computer'));
-push('slot 2 is an empty slot offering New', rows[1]?.classList.contains('ezil-settings-row-empty')
-    && !! rows[1]?.querySelector('[data-action="create"]'));
-push('the active computer is marked, not offered a Switch button',
-    rows[0]?.classList.contains('active') && ! rows[0]?.querySelector('[data-action="switch"]'));
-push('Rename and Delete are present on the filled row',
+push('one computer, no slots: a single manage row for the one computer', rows.length === 1, `${rows.length} rows`);
+push('🔴 no slot UI anywhere: no slot numbers, no empty slot, no create control',
+    ! pane?.querySelector('[data-slot], .ezil-settings-row-empty, .ezil-settings-row-slot, [data-action="create"]')
+    && ! /New computer|Empty slot|Up to 2 computers/i.test(pane?.textContent ?? ''), (pane?.textContent ?? '').replace(/\s+/g, ' ').slice(0, 160));
+push('the pane is headed "Your computer" for the session computer',
+    pane?.querySelector('[data-role="your-computer"] h3')?.textContent.trim() === 'Your computer'
+    && pane?.querySelector('[data-role="your-computer"]')?.getAttribute('data-id') === 'c-1');
+push('the server state drives the chip (Running) and Open/Stop are offered',
+    pane?.querySelector('[data-role="computer-chip"]')?.textContent.trim() === 'Running'
+    && !! pane?.querySelector('[data-action="open"]') && !! pane?.querySelector('[data-action="stop"]'));
+push('Rename and Delete are present on the manage row',
     !! rows[0]?.querySelector('[data-action="rename"]') && !! rows[0]?.querySelector('[data-action="delete"]'));
 
 // Rename round-trip.
@@ -271,13 +290,8 @@ await settle();
 push('Rename persists and re-renders',
     q('.window[data-app="settings"] .ezil-settings-row')?.textContent.includes('Renamed box'),
     listRows[0]?.name);
-
-// New computer -> the second slot fills.
-click(qa('.window[data-app="settings"] [data-action="create"]')[0]);
-await settle();
-push('New computer fills the second slot',
-    qa('.window[data-app="settings"] .ezil-settings-row-empty').length === 0
-    && listRows.length === 2, `${listRows.length} rows server-side`);
+push('no computer.create request was ever made from the Computer tab',
+    ! calls.some(c => c.url.includes('computer.create')));
 
 // 🔴 BY NAME, NOT BY INDEX. These were `…ezil-settings-tab')[1]` and friends,
 // which silently pointed at the wrong tab the moment one was added — every
@@ -329,6 +343,9 @@ await settle(4);
 }
 
 // ── Appearance tab ─────────────────────────────────────────────────────────
+// A signed-in page: the payload names the account whose keys are used.
+window.localStorage.setItem('ezil-os:settings.accent', '"amber"'); // a pre-round-3 shared key, migrated once
+window.__EZIL_BOOT__ = REAL_PAYLOAD;
 clickTab('appearance');
 await settle(4);
 push('Appearance pane becomes active',
@@ -344,12 +361,27 @@ push('picking a wallpaper applies it to the desktop root',
     (q('.desktop')?.style.background ?? '') !== '', q('.desktop')?.style.background?.slice(0, 40));
 push('picking a wallpaper persists to localStorage (no server call)',
     JSON.stringify(window.localStorage).includes(wallpaperSwatch?.getAttribute('data-wallpaper')));
+push('the old shared accent key was moved to this account once (Amber shows as chosen)',
+    q('.window[data-app="settings"] [data-accent].active')?.getAttribute('data-accent') === 'amber'
+    && window.localStorage.getItem('ezil-os:settings.accent') === null);
 const accentSwatch = qa('.window[data-app="settings"] [data-accent]')[1];
 click(accentSwatch);
 await settle(4);
 push('picking an accent writes the theme tokens',
     doc.documentElement.style.getPropertyValue('--select-hue') !== '',
     doc.documentElement.style.getPropertyValue('--select-hue'));
+// Round 3 (§6.7): the exact token values, not just "non-empty" (A5).
+push('🔴 Violet sets --ezil-accent and a contrast-safe text colour on <html>',
+    accentSwatch?.getAttribute('data-accent') === 'violet'
+    && doc.documentElement.style.getPropertyValue('--ezil-accent') === '#7c3bed'
+    && doc.documentElement.style.getPropertyValue('--ezil-accent-contrast') === '#ffffff',
+    `${doc.documentElement.style.getPropertyValue('--ezil-accent')} / ${doc.documentElement.style.getPropertyValue('--ezil-accent-contrast')}`);
+push('appearance is saved per account on this browser, and the pane says so',
+    window.localStorage.getItem(`ezil-os:settings.${REAL_PAYLOAD.user.id}.accent`) === '"violet"'
+    && window.localStorage.getItem('ezil-os:settings.accent') === null
+    && /Saved on this browser\./.test(q('.window[data-app="settings"] [data-pane="appearance"]')?.textContent ?? ''),
+    JSON.stringify(Object.keys(window.localStorage)));
+delete window.__EZIL_BOOT__;
 
 // ── Account tab — the one place to sign out ───────────────────────────────
 {
@@ -490,6 +522,55 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
         restartEvents.length === 1 && !! restartedId && restartEvents[0]?.computerId === restartedId,
         JSON.stringify({ restartEvents, restartedId }));
 }
+// ── Troubleshoot: Restart computer (round 3, plan §6.6) ──────────────────────
+// A second, clearly different action: stop + start on the same configuration,
+// followed through the server's transition. Distinct error codes get distinct
+// sentences (never collapsed into "could not be confirmed").
+{
+    const ts = () => q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
+    push('Troubleshoot offers two different restarts with their own descriptions',
+        !! ts()?.querySelector('[data-action="restart"]') && !! ts()?.querySelector('[data-action="restart-computer"]')
+        && /Restarts the desktop and its apps on this machine\. Files stay\. About 20 seconds\./.test(ts()?.textContent ?? '')
+        && /Stops your computer and starts it again\. Files stay\. 1–4 minutes\./.test(ts()?.textContent ?? ''));
+    const realFetch = window.fetch;
+    const bodies = [];
+    let answer = { ok: false, errorCode: 'restart_busy', reason: 'busy' }, transition = null;
+    window.fetch = async (url, opts = {}) => {
+        const u = String(url);
+        if ( u.includes('/api/shell/restart') ) {
+            bodies.push(JSON.parse(opts.body ?? '{}'));
+            return { ok: true, status: 200, json: async () => answer, text: async () => JSON.stringify(answer) };
+        }
+        if ( u.includes('/api/trpc/computer.progress') ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: { version: 2, operation: 'none', lifecycleState: 'RUNNING', transition } } } }) };
+        }
+        return realFetch(url, opts);
+    };
+    const restartComputer = async () => {
+        click(ts()?.querySelector('[data-action="restart-computer"]'));
+        await settle(2);
+        click(Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart computer' && b.closest('.window')?.querySelector('.window-alert-message')));
+        await settle(6);
+    };
+    await restartComputer();
+    push('Restart computer confirms, then POSTs scope "computer" with a request id',
+        bodies.length === 1 && bodies[0].scope === 'computer' && /^[A-Za-z0-9_-]{8,64}$/.test(bodies[0].requestId ?? '') && !! bodies[0].computerId,
+        JSON.stringify(bodies));
+    push('🔴 a busy refusal shows its own reason', /starting, stopping or switching/.test(ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent ?? ''));
+    answer = { ok: false, errorCode: 'restart_not_running', reason: 'not_running' };
+    await restartComputer();
+    push('🔴 …and "not running" a different one', /isn.t running/.test(ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent ?? ''));
+    answer = { ok: true, transitionId: 'tr-1', path: 'restart', size: 'std-2' };
+    transition = { transitionId: 'tr-1', kind: 'restart', current: 'std-2', target: 'std-2', phase: 'stopping', reason: null, revertAvailable: false };
+    await restartComputer();
+    push('an accepted restart shows the in-progress state and disables both restarts',
+        /Restarting your computer/.test(ts()?.textContent ?? '') && ts()?.querySelector('[data-action="restart-computer"]')?.disabled
+        && ts()?.querySelector('[data-action="restart"]')?.disabled);
+    transition = { ...transition, phase: 'done' };
+    await settle(95, 40);
+    push('the server\'s done transition shows the result', /Your computer restarted/.test(ts()?.textContent ?? ''), ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent);
+    window.fetch = realFetch;
+}
 // ── Troubleshoot tab (diagnostic log) ────────────────────────────────────────
 // `shell/ezil/log.js` has kept a 200-entry ring of every debug/info/warn/error
 // call since it was written, explicitly so a support conversation would not
@@ -563,8 +644,9 @@ push('Settings reopens', !! win2);
 push('reopened Settings returns to Account', !!win2?.querySelector('[data-pane="account"].active'));
 click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
 await settle();
-push('reopened Settings still renders two slot rows',
-    qa('.window[data-app="settings"] .ezil-settings-row').length === 2);
+push('reopened Settings still renders the one computer (no slot rows)',
+    qa('.window[data-app="settings"] .ezil-settings-row').length === 1
+    && ! q('.window[data-app="settings"] [data-slot]'));
 push('reopened Settings does not carry stale edit state',
     ! q('.window[data-app="settings"] [data-role="rename-input"]'));
 
@@ -578,7 +660,7 @@ click(q('.window[data-app="settings"] [data-action="cancel-rename"]'));
 await settle(4);
 push('Cancel leaves the row readable again',
     ! q('.window[data-app="settings"] [data-role="rename-input"]')
-    && qa('.window[data-app="settings"] .ezil-settings-row').length === 2,
+    && qa('.window[data-app="settings"] .ezil-settings-row').length === 1,
     `${calls.length - callsBeforeRebind} extra server calls`);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -615,8 +697,9 @@ push('🔴 THE GUARANTEE: no desktop window was still mounted when computer.dele
     deleteCall?.domAtCall.desktopWindows === 0,
     `${deleteCall?.domAtCall.desktopWindows} desktop window(s) at request time`);
 push('🔴 the desktop window is gone from the document', qa('.window[data-app="desktop"]').length === 0);
-push('the deleted computer is gone and its slot is free again',
-    qa('.window[data-app="settings"] .ezil-settings-row-empty').length === 1
+push('the deleted computer is gone, and no create control replaces it',
+    !! q('.window[data-app="settings"] [data-role="no-computer"]')
+    && ! q('.window[data-app="settings"] [data-action="create"]')
     && ! qa('.window[data-app="settings"] .ezil-settings-row').some(r => r.getAttribute('data-id') === 'c-1'));
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -647,10 +730,10 @@ push('a desktop streaming c-a is open', q(`.window[data-app="desktop"][data-ezil
 
 await reopenSettings();
 const rowB = qa('.window[data-app="settings"] .ezil-settings-row').find(r => r.getAttribute('data-id') === 'c-b');
-push('Alpha is shown as the current desktop, Beta is not',
-    qa('.window[data-app="settings"] .ezil-settings-row')
-        .find(r => r.getAttribute('data-id') === 'c-a')?.classList.contains('active') === true
-    && rowB?.classList.contains('active') === false);
+push('Alpha is "Your computer"; Beta is a read-only older computer with Delete only',
+    qa('.window[data-app="settings"] [data-role="your-computer"]')[0]?.getAttribute('data-id') === 'c-a'
+    && rowB?.getAttribute('data-role') === 'older-computer'
+    && [...(rowB?.querySelectorAll('button') ?? [])].map(b => b.dataset.action).join() === 'delete');
 click(rowB?.querySelector('[data-action="delete"]'));
 await settle(6);
 await confirmTheDialog();
@@ -720,70 +803,65 @@ push('all three are gone from the document afterwards',
     && qa('.window[data-app="code"]').length === 0);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5e. 🔴 SWITCH MUST ALSO RE-TARGET PREVIEW AND CODE, NOT JUST THE DESKTOP.
-//     Same defect, the other call site: switching computers left Preview/Code
-//     streaming the OLD container because `switchTo()` only ever closed the
-//     desktop window.
+// 5e. 🔴 STOP CLOSES DESKTOP, PREVIEW AND CODE FIRST (round 3).
+//     Stop is the one-computer page's destructive action. Same guarantee as
+//     Delete: every sandbox window on the computer leaves the document BEFORE
+//     `POST /api/shell/stop` goes out, or its iframe reconnect-loops against
+//     a computer that is shutting down.
 // ═══════════════════════════════════════════════════════════════════════════
 const D = { id: 'c-d', name: 'Delta', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null };
 const E = { id: 'c-e', name: 'Epsilon', slot: 2, createdAt: new Date().toISOString(), lastOpenedAt: null };
 listRows = [D, E];
+progressState = 'RUNNING';
 await ezil.registry.launch('desktop', { ...ctx, computer: D });
 await settle(6);
 await ezil.registry.launch('preview', { ...ctx, computer: D });
 await settle(6);
 await ezil.registry.launch('code', { ...ctx, computer: D });
 await settle(6);
-push('before switching: desktop + preview + code all stream c-d',
+push('before stopping: desktop + preview + code all stream c-d',
     q('.window[data-app="desktop"][data-ezil-computer-id="c-d"]') !== null
     && q('.window[data-app="preview"][data-ezil-computer-id="c-d"]') !== null
     && q('.window[data-app="code"][data-ezil-computer-id="c-d"]') !== null);
 
 await reopenSettings();
-const rowE = qa('.window[data-app="settings"] .ezil-settings-row').find(r => r.getAttribute('data-id') === 'c-e');
-click(rowE?.querySelector('[data-action="switch"]'));
-await settle(20, 40);
-
-// `switchTo()` only relaunches the desktop for the new computer — it does
-// not reopen Preview/Code for it — so the correct end state is that the OLD
-// ones are gone entirely, not merely re-stamped.
-push('🔴 switching away closes the OLD preview window (not left streaming c-d)',
-    qa('.window[data-app="preview"]').length === 0,
-    `${qa('.window[data-app="preview"]').length} preview window(s) remain`);
-push('🔴 switching away closes the OLD code window (not left streaming c-d)',
-    qa('.window[data-app="code"]').length === 0,
-    `${qa('.window[data-app="code"]').length} code window(s) remain`);
-push('the desktop now streams the NEW computer (c-e)',
-    q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
+click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+await settle(10);
+push('c-d is "Your computer"; c-e is an older computer with no Open or Switch',
+    q('.window[data-app="settings"] [data-role="your-computer"]')?.getAttribute('data-id') === 'c-d'
+    && q('.window[data-app="settings"] [data-role="older-computer"][data-id="c-e"]') !== null
+    && ! q('.window[data-app="settings"] [data-role="older-computer"] [data-action="open"], .window[data-app="settings"] [data-action="switch"]'));
+click(q('.window[data-app="settings"] [data-action="stop"]'));
+await settle(6);
+push('Stop asks for confirmation first', /Stop your computer\?/.test(q('.window-alert-message')?.textContent ?? ''));
+const stopConfirm = qa('.window button').find(b => b.textContent.trim() === 'Stop' && b.closest('.window')?.querySelector('.window-alert-message'));
+click(stopConfirm);
+await settle(30, 40);
+const stopCall = calls.find(c => c.url.endsWith('/api/shell/stop'));
+push('POST /api/shell/stop went out for c-d', stopCall?.method === 'POST' && stopCall?.body?.computerId === 'c-d', JSON.stringify(stopCall?.body));
+push('🔴 THE GUARANTEE: desktop, preview AND code were closed BEFORE the stop request',
+    stopCall?.domAtCall.desktopWindows === 0 && stopCall?.domAtCall.previewWindows === 0 && stopCall?.domAtCall.codeWindows === 0,
+    `desktop=${stopCall?.domAtCall.desktopWindows} preview=${stopCall?.domAtCall.previewWindows} code=${stopCall?.domAtCall.codeWindows}`);
+push('after the stop the chip reads Stopped from the server state',
+    q('.window[data-app="settings"] [data-role="computer-chip"]')?.textContent.trim() === 'Stopped');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 5f. 🔴 CLOSING THE DESKTOP WINDOW DOES NOT CHANGE WHICH COMPUTER YOU ARE ON.
 //     Founder-reported 2026-10-02: with the desktop window closed, the
 //     computer the session was on was offered a "Switch" button like a
-//     stranger's computer. It must stay Current (with an Open action), and
-//     only the OTHER computer offers Switch.
+//     stranger's computer. It stays "Your computer" and offers Open desktop.
 // ═══════════════════════════════════════════════════════════════════════════
-$('.window[data-app="desktop"]').close();
-await settle(10);
 push('setup: no desktop window is open', qa('.window[data-app="desktop"]').length === 0);
 await reopenSettings();
-const rowsAfterClose = qa('.window[data-app="settings"] .ezil-settings-row');
-const rowE2 = rowsAfterClose.find(r => r.getAttribute('data-id') === 'c-e');
-const rowD2 = rowsAfterClose.find(r => r.getAttribute('data-id') === 'c-d');
-push('🔴 the computer switched to (c-e) is still marked Current after its desktop window closed',
-    rowE2?.classList.contains('active') && rowE2?.querySelector('.ezil-settings-pill')?.textContent.trim() === 'Current',
-    rowE2?.outerHTML.slice(0, 200));
-push('🔴 with two computers and no desktop open, EXACTLY one is marked Current',
-    rowsAfterClose.filter(r => r.querySelector('.ezil-settings-pill')?.textContent.trim() === 'Current').length === 1,
-    rowsAfterClose.map(r => `${r.getAttribute('data-id')}:${r.querySelector('.ezil-settings-pill')?.textContent.trim() ?? '-'}`).join(','));
-push('…and offers Open (relaunch its desktop), not Switch',
-    rowE2?.querySelector('[data-action="switch"]')?.textContent.trim() === 'Open');
-push('the OTHER computer (c-d) is the one offered Switch',
-    ! rowD2?.classList.contains('active') && rowD2?.querySelector('[data-action="switch"]')?.textContent.trim() === 'Switch');
-click(rowE2?.querySelector('[data-action="switch"]'));
+click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+await settle(10);
+push('🔴 with no desktop open, c-d is still "Your computer" and exactly one computer is current',
+    qa('.window[data-app="settings"] [data-role="your-computer"]').length === 1
+    && q('.window[data-app="settings"] [data-role="your-computer"]')?.getAttribute('data-id') === 'c-d');
+click(q('.window[data-app="settings"] [data-role="your-computer"] [data-action="open"]'));
 await settle(20, 40);
-push('Open relaunches the desktop for the current computer (c-e)',
-    q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
+push('Open desktop relaunches the desktop for c-d',
+    q('.window[data-app="desktop"][data-ezil-computer-id="c-d"]') !== null);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.

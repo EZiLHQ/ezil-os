@@ -7,9 +7,8 @@ import { SelectComputers } from './_components/select-computers';
  *
  * Carried/adapted from EBuilder's `apps/web/client/src/app/computers/page.tsx`
  * (authored post-Onlook-import, listed as safe to carry). The list layout
- * itself (`select-computers.tsx`) is written fresh per this repo's own
- * design decision: a fixed-length list of rows instead of a variable-N
- * grid of cards, since the cap here is a firm 2.
+ * itself (`select-computers.tsx`) is written fresh: one computer per
+ * person (round 3, D6), plus any older computer read-only.
  */
 export default function Page() {
     return (

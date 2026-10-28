@@ -397,13 +397,19 @@ test('v2 copy scan positive controls and responsive/focus/motion styles', async 
     assert.match(css, /flex-wrap: wrap/); assert.match(css, /tabular-nums/);
     assert.match(css, /:focus-visible/); assert.match(css, /prefers-reduced-motion/);
 });
-test('v3 upgrade shows catalog benefits, prorated price, exact target and recoverable failure', async h => {
+test('v3 upgrade shows the round-3 bullets, prorated price, what happens next, exact target and recoverable failure', async h => {
     h.summary = summaryV3();
     h.reply = method => method === 'billing.previewUpgrade' ? ok({ ...preview, toSku: 'premium_monthly_v3', lines: [{ description: 'Remaining Premium', amountCents: 1200 }], amountDueCents: 1200 }) : fail('stripe_unavailable');
     await h.ready('upgrade');
     assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$100\/month/);
-    assert.match(h.text(), /Usage included/); assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 3);
-    assert.match(h.text(), /after payment\. Your AWS computer is prepared then/);
+    // Plan §6.4 bullet order: configurations → storage → AI credits → computer time.
+    assert.deepEqual([...h.doc.querySelectorAll('[data-role="sheet-body"] li')].map(li => li.textContent), [
+        'Choose 2, 4 or 8 vCPU — up to 32 GB', '50 GB disk for your projects', '1,000 AI credits every month', '500 hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)']);
+    // D1: floor(grant × 800 / 1,656,000) — the preview's 212.599 h grant is 369 credits.
+    assert.match(h.text(), /What happens next/);
+    assert.match(h.text(), /TodayPremium starts and 369 AI credits are added\./);
+    assert.match(h.text(), /Your computerSwitch configuration whenever you like\./);
+    assert.match(h.text(), /RenewsNov 1, 2026, with the full monthly credits\./);
     assert.match(h.text(), /Due now \$12/); assert.doesNotMatch(h.text(), /standard-hour|\bcompute\b/i);
     assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
@@ -412,13 +418,27 @@ test('v3 upgrade shows catalog benefits, prorated price, exact target and recove
     h.reply = () => ok(confirmation('applied')); h.click('[data-action="confirm"]'); await settle();
     assert.deepEqual(h.calls.at(-1).input, { toSku: 'premium_monthly_v3', prorationDate: preview.prorationDate });
     assert.match(h.text(), /You're on Premium/);
+    assert.match(h.text(), /369 AI credits added\./);
+    // Success leads straight into the unlocked configuration (plan §6.4).
+    assert.equal(h.q('[data-action="switch-config"]').textContent, 'Switch to 4 vCPU · 16 GB');
+    assert.equal(h.q('[data-action="maybe-later"]').textContent, 'Maybe later');
+});
+test('v3 upgrade success: Switch to 4 vCPU hands the size over; Maybe later just closes', async h => {
+    for ( const [action, expected] of [['switch-config', ['cmp-4']], ['maybe-later', []]] ) {
+        h.summary = summaryV3(); const switched = [];
+        h.reply = method => ok(method === 'billing.previewUpgrade' ? { ...preview, lines: [] } : confirmation('applied'));
+        h.open('upgrade', { onSwitch: size => switched.push(size) }); await settle(); h.audit();
+        h.click('[data-action="confirm"]'); await settle();
+        h.click(`[data-action="${action}"]`); await settle();
+        assert.deepEqual(switched, expected); assert.equal(h.q('[role="dialog"]'), null);
+    }
 });
 for ( const status of ['requires_action', 'payment_failed'] ) test(`v3 upgrade ${status} keeps the plan pending`, async h => {
     h.summary = summaryV3();
     h.reply = method => ok(method === 'billing.previewUpgrade' ? { ...preview, lines: [] } : confirmation(status));
     await h.ready('upgrade'); h.click('[data-action="confirm"]'); await settle();
     assert.doesNotMatch(h.text(), /You're on Premium/); assert.ok(h.q('[data-action="open-invoice"]'));
-    assert.match(h.text(), status === 'requires_action' ? /Confirm the payment with your bank/ : /payment didn't go through/);
+    assert.match(h.text(), status === 'requires_action' ? /Confirm the payment with your bank/ : /Your payment didn't go through\. Try again or use a different payment method\. Your plan is unchanged\./);
 });
 test('v3 preview failure has Retry and never offers payment without a price', async h => {
     h.summary = summaryV3(); h.reply = () => fail('stripe_unavailable');
@@ -426,11 +446,19 @@ test('v3 preview failure has Retry and never offers payment without a price', as
     h.reply = () => ok({ ...preview, lines: [] }); h.click('[data-action="retry"]'); await settle();
     assert.ok(h.q('[data-action="confirm"]'));
 });
-test('v3 plan picker has two choices and catalog benefits, then embedded checkout', async h => {
+test('v3 plan picker: Free / Standard / Premium, Current plan disabled, ordered bullets, then embedded checkout', async h => {
     h.summary = summaryV3('free'); const chosen = [];
     h.window.api.openPlanPickerSheet({ ...h.options(), checkout: options => chosen.push(options) });
+    assert.deepEqual([...h.doc.querySelectorAll('.ezil-billing-choice h3')].map(el => el.textContent), ['Free', 'Standard', 'Premium']);
     assert.equal(h.doc.querySelectorAll('[data-action="checkout"]').length, 2);
-    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 5);
+    const current = h.q('[data-role="current-plan"]');
+    assert.equal(current.textContent, 'Current plan'); assert.equal(current.disabled, true);
+    assert.equal(current.closest('.ezil-billing-choice').dataset.plan, 'free_v3');
+    const bullets = sku => [...h.doc.querySelectorAll(`.ezil-billing-choice[data-plan="${sku}"] li`)].map(li => li.textContent);
+    assert.deepEqual(bullets('free_v3'), ['Cloudflare computer · 2 vCPU · 6 GB memory', 'Your files saved with your computer', '100 AI credits to start', '5 hours of computer time each month']);
+    assert.deepEqual(bullets('standard_monthly_v3'), ['Your own AWS computer · 2 vCPU · 8 GB', '50 GB disk for your projects', '200 AI credits every month', '40 hours of computer time each month']);
+    assert.match(h.q('.ezil-billing-choice[data-plan="premium_monthly_v3"]').textContent, /Everything in Standard, plus:/);
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 12);
     assert.doesNotMatch(h.text(), /Most popular/); assert.match(h.text(), /\$20\/month/); assert.match(h.text(), /\$100\/month/);
     h.click('[data-sku="premium_monthly_v3"]');
     assert.equal(chosen.length, 1); assert.equal(chosen[0].sku, 'premium_monthly_v3');
@@ -450,7 +478,7 @@ for ( const tier of ['free'] ) test(`v3 ${tier} limit stop opens one session-end
     h.window.api.openSessionEndSheet(opts);
     assert.ok(h.q('[data-sheet="session-end"]'));
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
-    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, tier === 'free' ? 2 : 3);
+    assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 4);
     assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard: No session time limit — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
     h.click('[data-action="continue"]'); await settle();
     if ( tier === 'free' ) assert.equal(chosen[0].sku, 'standard_monthly_v3');
@@ -483,6 +511,34 @@ test('v3 session event does not take ownership of an existing billing sheet', as
     emit(); await settle(); assert.ok(h.q('[data-sheet="cancel"]'));
     h.handle.close(); h.summary = summaryV3('free'); emit(); await settle(); assert.ok(h.q('[data-sheet="session-end"]'));
     stop(); assert.equal(h.q('[role="dialog"]'), null);
+});
+test('D1 pin: the shell credit formula equals contract upgradeAiCredits for the compute grant of the same upgrade', async h => {
+    h.summary = summaryV3();
+    const { CATALOG_V3, upgradeAiCredits } = await import('../../../../app/src/server/billing/v3/contract.ts');
+    const { upgradeAiCreditsFromGrant } = await import('./billing-format.js');
+    const offers = summaryV3().catalog.offers;
+    const from = offers.find(o => o.sku === 'standard_monthly_v3'), to = offers.find(o => o.sku === 'premium_monthly_v3');
+    // `upgradeGrantSeconds` (v3/catalog.ts): floor(ΔfairUse × remaining / period) on the same three instants.
+    const grantSeconds = ({ periodStart, periodEnd, effectiveAt }) => {
+        const delta = CATALOG_V3.premium_monthly_v3.fairUseSeconds - CATALOG_V3.standard_monthly_v3.fairUseSeconds;
+        const end = Date.parse(periodEnd) / 1000, duration = end - Date.parse(periodStart) / 1000;
+        const remaining = Math.min(duration, Math.max(0, end - Date.parse(effectiveAt) / 1000));
+        return Number(BigInt(delta) * BigInt(remaining) / BigInt(duration));
+    };
+    let seed = 7, checked = 0;
+    const rand = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    for ( let i = 0; i < 5000; i++ ) {
+        const start = Date.UTC(2026, 9, 1), days = [28, 29, 30, 31][i % 4];
+        const end = start + days * 86400000, at = start + Math.floor(rand() * days * 86400) * 1000;
+        const input = { periodStart: new Date(start).toISOString(), periodEnd: new Date(end).toISOString(), effectiveAt: new Date(at).toISOString() };
+        const expected = upgradeAiCredits({ fromSku: 'standard_monthly_v3', toSku: 'premium_monthly_v3', ...input });
+        assert.equal(upgradeAiCreditsFromGrant(grantSeconds(input), from, to), expected, JSON.stringify(input));
+        checked++;
+    }
+    assert.equal(checked, 5000);
+    assert.equal(upgradeAiCreditsFromGrant(0, from, to), 0);
+    assert.equal(upgradeAiCreditsFromGrant(-5, from, to), 0);
+    assert.equal(upgradeAiCreditsFromGrant(1656000, from, to), 800, 'a whole period adds the full difference');
 });
 let failed = 0, states = 0;
 for ( const { name, fn } of tests ) {

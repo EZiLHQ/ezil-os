@@ -167,9 +167,40 @@ export function describeRunningOn (info, reason) {
     return { value: provider.value + size, hint: provider.hint };
 }
 
+const SIZE_LABEL = { 'std-2': '2 vCPU / 8 GB', 'cmp-4': '4 vCPU / 16 GB', 'cmp-8': '8 vCPU / 32 GB' };
+
+/**
+ * The plan row (round 3, SWITCH-CONTRACT §4). `plan.status` comes from the
+ * server: `being_prepared` ONLY while a switch or restart is in flight;
+ * `ready` once the computer is on AWS, whatever the next-start choice is (a
+ * plain size mismatch is no longer "being prepared"); `failed` for a failed
+ * switch or migration; `preparing` before the computer reaches AWS; `blocked`
+ * while AWS is paused. The running size and the next-start choice are told
+ * apart, never mixed in one value.
+ */
 export function describePlan (info) {
     const p = info && info.plan;
     if ( ! p ) return { value: 'Not reported', hint: 'Plan entitlement is not available.' };
-    const status = { preparing: 'being prepared', blocked: 'paused', failed: 'preparation failed', ready: 'ready' }[p.status] || 'status unknown';
-    return { value: `${p.vcpu} vCPU / ${p.memoryGB} GB on AWS (India) — ${status}`, hint: p.reason || '' };
+    const planned = `${p.vcpu} vCPU / ${p.memoryGB} GB on AWS (India)`;
+    const current = SIZE_LABEL[p.current] ?? null;
+    const selected = SIZE_LABEL[p.selected] ?? null;
+    const t = p.transition && typeof p.transition === 'object' ? p.transition : null;
+    switch ( p.status ) {
+    case 'being_prepared':
+        if ( t && t.kind === 'restart' ) return { value: 'Restarting your computer', hint: current ? `Running on ${current} until it restarts.` : '' };
+        return { value: t && SIZE_LABEL[t.target] ? `Switching to ${SIZE_LABEL[t.target]}` : `${planned} — being prepared`,
+            hint: t && SIZE_LABEL[t.current] ? `Now: ${SIZE_LABEL[t.current]}.` : '' };
+    case 'ready':
+        return { value: current ? `${current} on AWS (India)` : planned,
+            hint: selected && current && selected !== current ? `Next start: ${selected}.` : '' };
+    case 'failed':
+        if ( t && SIZE_LABEL[t.current] ) return { value: `Switch didn't finish — back on ${SIZE_LABEL[t.current]}`, hint: 'Your files are safe. Try again from Settings → Computer.' };
+        return { value: `${planned} — preparation failed`, hint: p.reason || '' };
+    case 'blocked':
+        return { value: `${planned} — paused`, hint: p.reason || '' };
+    case 'preparing':
+        return { value: `${planned} — being prepared`, hint: p.reason || '' };
+    default:
+        return { value: `${planned} — status unknown`, hint: p.reason || '' };
+    }
 }
