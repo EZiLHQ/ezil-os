@@ -40,7 +40,7 @@ export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow
 }
 
 type AiBucket = 'included' | 'previous' | 'purchased' | 'starter';
-const PERIOD_ROOT = /^ezil-os:v1:(standard_monthly_v3|premium_monthly_v3):([A-Za-z0-9_]+):(\d{4}-\d{2}-\d{2}T[\d:.]+Z)$/;
+const PERIOD_ROOT = /^ezil-os:v1:(standard_monthly_v3|premium_monthly_v3):([^:]+):(\d{4}-\d{2}-\d{2}T[\d:.]+Z)$/;
 const MICRO = BigInt(1_000_000);
 
 /** Which bucket a stored receipt funds, relative to the plan's current paid period. */

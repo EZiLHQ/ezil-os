@@ -256,6 +256,38 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         await processStripeEvent(reversal, deps); await processStripeEvent(reversal, deps);
         expect((await rows()).map(r => r.kind).sort()).toEqual(['ai_grant', 'ai_revoke']);
     });
+    it.each(['refund', 'dispute'] as const)('round 3 D1: a replayed paid upgrade enqueues one prorated AI grant and a %s reverses it', async kind => {
+        const subId = `sub_${userId.replace(/-/g, '')}`, customer = `cus_${userId}`, invoiceId = `in_up_${userId}`;
+        const effective = new Date('2026-10-11T12:00:00Z');
+        await billing.linkCustomer(userId, customer);
+        const subscription = { id: subId, customer, status: 'active', sku: 'premium_monthly_v3', currentPeriodStart: start,
+            currentPeriodEnd: end, cancelAtPeriodEnd: false } as StripeSubscription;
+        const invoice: StripeInvoice = { id: invoiceId, customer, status: 'paid', subscriptionId: subId,
+            billingReason: 'subscription_update', metadataKind: null, hostedInvoiceUrl: null, periodStart: start, periodEnd: end,
+            lines: [{ id: 'credit', lookupKey: 'ezil_standard_monthly_v3', subscriptionId: subId, amount: -1000, proration: true, periodStart: effective, periodEnd: end },
+                { id: 'premium', lookupKey: 'ezil_premium_monthly_v3', subscriptionId: subId, amount: 5000, proration: true, periodStart: effective, periodEnd: end }] };
+        const stripe = { retrieveInvoice: async () => invoice, retrieveSubscription: async () => subscription,
+            retrieveCharge: async () => ({ id: 'charge', customer, invoiceId, paymentIntentId: null, refunded: kind === 'refund', amount: 4000, amountRefunded: 4000 }) } as unknown as StripeApi;
+        const deps = { store: billing, stripe, now: () => new Date(NOW) };
+        const event = (type: string, object: Record<string, unknown>): StripeEventLike => ({
+            id: `evt_${randomUUID()}`, type, livemode: false, created: NOW / 1000, data: { object },
+        });
+        const paid = event('invoice.paid', { id: invoiceId, customer, billing_reason: 'subscription_update',
+            parent: { subscription_details: { subscription: subId } }, lines: { data: [] } });
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        expect(await processStripeEvent(paid, deps)).toBe('applied');
+        await processStripeEvent(paid, deps); await processStripeEvent({ ...paid, id: `evt_${randomUUID()}` }, deps);
+        const root = `ezil-os:v1:premium_monthly_v3:${subId}:${effective.toISOString()}:upgrade`;
+        expect(await rows()).toEqual([expect.objectContaining({ eventKey: `${root}:grant`, kind: 'ai_grant',
+            payload: expect.objectContaining({ entitlementId: root, credits: 529, expiresAt: '2026-11-04T00:00:00.000Z', invoiceId }) })]);
+        const reversal = kind === 'refund' ? event('charge.refunded', { id: 'charge', refunds: { data: [{ id: 'refund' }] } })
+            : event('charge.dispute.created', { id: 'dispute', charge: 'charge', status: 'needs_response' });
+        expect(await processStripeEvent(reversal, deps)).toBe('applied');
+        await processStripeEvent(reversal, deps);
+        expect((await rows()).map(r => [r.kind, r.payload.entitlementId, r.payload.credits]).sort()).toEqual([
+            ['ai_grant', root, 529], ['ai_revoke', root, 529]]);
+        info.mockRestore();
+    });
 });
 
 describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('atomic topup receipts with Postgres', () => {
