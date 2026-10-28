@@ -233,6 +233,7 @@ jobs:
                    shell/ezil/ui/Settings/settings-test.mjs \
                    shell/ezil/ui/Settings/current-computer-test.mjs \
                    shell/ezil/ui/Settings/computers-test.mjs \
+                   shell/ezil/ui/Settings/troubleshoot-test.mjs \
                    shell/ezil/ui/Settings/system-describe-test.mjs \
                    shell/ezil/ui/Settings/system-tab-test.mjs \
                    shell/ezil/runtime-recheck-test.mjs \

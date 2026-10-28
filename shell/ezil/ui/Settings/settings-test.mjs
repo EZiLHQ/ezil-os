@@ -504,6 +504,55 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
         restartEvents.length === 1 && !! restartedId && restartEvents[0]?.computerId === restartedId,
         JSON.stringify({ restartEvents, restartedId }));
 }
+// ── Troubleshoot: Restart computer (round 3, plan §6.6) ──────────────────────
+// A second, clearly different action: stop + start on the same configuration,
+// followed through the server's transition. Distinct error codes get distinct
+// sentences (never collapsed into "could not be confirmed").
+{
+    const ts = () => q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
+    push('Troubleshoot offers two different restarts with their own descriptions',
+        !! ts()?.querySelector('[data-action="restart"]') && !! ts()?.querySelector('[data-action="restart-computer"]')
+        && /Restarts the desktop and its apps on this machine\. Files stay\. About 20 seconds\./.test(ts()?.textContent ?? '')
+        && /Stops your computer and starts it again\. Files stay\. 1–4 minutes\./.test(ts()?.textContent ?? ''));
+    const realFetch = window.fetch;
+    const bodies = [];
+    let answer = { ok: false, errorCode: 'restart_busy', reason: 'busy' }, transition = null;
+    window.fetch = async (url, opts = {}) => {
+        const u = String(url);
+        if ( u.includes('/api/shell/restart') ) {
+            bodies.push(JSON.parse(opts.body ?? '{}'));
+            return { ok: true, status: 200, json: async () => answer, text: async () => JSON.stringify(answer) };
+        }
+        if ( u.includes('/api/trpc/computer.progress') ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: { version: 2, operation: 'none', lifecycleState: 'RUNNING', transition } } } }) };
+        }
+        return realFetch(url, opts);
+    };
+    const restartComputer = async () => {
+        click(ts()?.querySelector('[data-action="restart-computer"]'));
+        await settle(2);
+        click(Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart computer' && b.closest('.window')?.querySelector('.window-alert-message')));
+        await settle(6);
+    };
+    await restartComputer();
+    push('Restart computer confirms, then POSTs scope "computer" with a request id',
+        bodies.length === 1 && bodies[0].scope === 'computer' && /^[A-Za-z0-9_-]{8,64}$/.test(bodies[0].requestId ?? '') && !! bodies[0].computerId,
+        JSON.stringify(bodies));
+    push('🔴 a busy refusal shows its own reason', /starting, stopping or switching/.test(ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent ?? ''));
+    answer = { ok: false, errorCode: 'restart_not_running', reason: 'not_running' };
+    await restartComputer();
+    push('🔴 …and "not running" a different one', /isn.t running/.test(ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent ?? ''));
+    answer = { ok: true, transitionId: 'tr-1', path: 'restart', size: 'std-2' };
+    transition = { transitionId: 'tr-1', kind: 'restart', current: 'std-2', target: 'std-2', phase: 'stopping', reason: null, revertAvailable: false };
+    await restartComputer();
+    push('an accepted restart shows the in-progress state and disables both restarts',
+        /Restarting your computer/.test(ts()?.textContent ?? '') && ts()?.querySelector('[data-action="restart-computer"]')?.disabled
+        && ts()?.querySelector('[data-action="restart"]')?.disabled);
+    transition = { ...transition, phase: 'done' };
+    await settle(95, 40);
+    push('the server\'s done transition shows the result', /Your computer restarted/.test(ts()?.textContent ?? ''), ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent);
+    window.fetch = realFetch;
+}
 // ── Troubleshoot tab (diagnostic log) ────────────────────────────────────────
 // `shell/ezil/log.js` has kept a 200-entry ring of every debug/info/warn/error
 // call since it was written, explicitly so a support conversation would not
