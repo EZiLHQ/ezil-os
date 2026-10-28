@@ -129,8 +129,9 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         // window uses it.
     }
 
-    /** The caller's client milestones: `url_received`, then `first_frame` (the bar's 100%). */
+    /** The caller's client milestones: `url_received`, then `first_frame` (the bar's 100%); null starts a new attempt. */
     function stamp (key) {
+        if (key === null) { client = 0; return; }
         const i = OPENING_MILESTONES.indexOf(key);
         if (i > client) { client = i; if (latestState) render(latestState, latestExtra); }
     }

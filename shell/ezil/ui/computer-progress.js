@@ -87,7 +87,8 @@ export function openingFraction ({ floor = 0, ceiling = EASE_CAP, elapsed = 0, e
     const t = expected > 0 ? Math.min(1, Math.max(0, elapsed) / expected) : 0;
     const eased = EASE_CAP * (1 - (1 - t) ** 2);
     let value = Math.max(floor, Math.min(eased, ceiling, EASE_CAP));
-    if (reducedMotion) value = Math.max(floor, Math.floor(value * 10) / 10);
+    // Whole 10% steps: still monotonic, never above the smooth value.
+    if (reducedMotion) value = Math.floor(value * 10 + 1e-9) / 10;
     return Math.min(value, 0.99);
 }
 
@@ -138,17 +139,18 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
         && Number.isFinite(data.bytes?.total) && data.bytes.total >= 0;
     const percent = measured && Number.isFinite(data.percent) && data.percent >= 0 && data.percent <= 100 ? Math.min(99, data.percent) : null;
     const target = vcpuOf(transition?.target);
+    const machine = target ? `Getting ${/^(8|11|18)$/.test(String(target)) ? 'an' : 'a'} ${target} vCPU machine` : 'Getting your new machine';
     const waking = transition?.phase === 'waking';
     const starting = !appName || path === 'switch' ? 'Starting your desktop' : `Starting ${appName}`;
     let title = stages[stage][0];
     if (moving >= 0) title = migrationSteps[moving];
     else if (opening) {
-        if (stage === 'switching') title = waking ? target ? `Getting a ${target} vCPU machine` : 'Getting your new machine' : stages.switching[0];
+        if (stage === 'switching') title = waking ? machine : stages.switching[0];
         else if (stage === 'restarting') title = waking ? 'Starting your computer' : stages.restarting[0];
         else if (stage === 'waiting_capacity') title = stages.waiting_capacity[0];
         else if (reached >= 3) title = starting;
         else if (reached >= 2) title = 'Attaching your files';
-        else if (path === 'switch') title = target ? `Getting a ${target} vCPU machine` : 'Getting your new machine';
+        else if (path === 'switch') title = machine;
         else title = 'Starting your computer';
     }
     const hold = HOLD.includes(stage);
@@ -301,4 +303,35 @@ export function OpeningSurface ({ appName = '', icon, onRetry, feedbackCode, sta
         panel.dataset.long = String(!!model.long);
     }
     return { el: panel, paint, shown: () => high.percent };
+}
+
+/** Shell event a Settings switch/restart dispatches: `{ computerId, transitionId? }`. */
+export const TRANSITION_EVENT = 'ezil:computer-transition';
+const IN_FLIGHT = ['requested', 'stopping', 'waking'];
+/** ~16 minutes of 5 s polls: past every server budget (200 s stop + 600 s wake). */
+const TRANSITION_MAX_POLLS = 200;
+
+/**
+ * Watch one switch or restart until the server settles it, then call `onSettled`
+ * once with the transition (`phase` 'done' or 'failed'). Read-only: the same
+ * `computer.progress` polling as the spinner, hidden-tab aware.
+ *
+ * A settled transition counts only when it is the one asked for (`transitionId`)
+ * or, without an id, after this watch saw one in flight, so the record of an
+ * earlier switch can never trigger a re-open.
+ */
+export function watchComputerTransition ({ computerId, element, transitionId = null, onSettled, query }) {
+    let polls = 0, seenInFlight = false, done = false;
+    const observer = observeComputerProgress({ computerId, element, query, onChange: view => {
+        if (done || !view) return;
+        if (++polls > TRANSITION_MAX_POLLS) { done = true; observer.stop(); return; }
+        const t = view.transition;
+        if (!t || (transitionId && t.transitionId !== transitionId)) return;
+        if (IN_FLIGHT.includes(t.phase)) { seenInFlight = true; transitionId ??= t.transitionId; return; }
+        if (['done', 'failed'].includes(t.phase) && (seenInFlight || transitionId)) {
+            done = true; observer.stop(); onSettled?.(t);
+        }
+    } });
+    observer.start();
+    return { stop () { done = true; observer.stop(); }, active: () => !done };
 }
