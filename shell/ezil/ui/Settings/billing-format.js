@@ -107,31 +107,35 @@ export function upgradeAiCreditsFromGrant (grantStdSeconds, fromOffer, toOffer) 
  * `offer.bullets` (catalog copy that predates round 3).
  */
 export function planBullets (offer) {
-    const credits = whole(offer.aiCredits?.amount);
-    const hours = whole(offer.fairUseHours);
-    if ( offer.sku === 'free_v3' ) return { lead: null, bullets: [
-        `Cloudflare computer · ${offer.vcpu} vCPU · ${offer.memoryGiB} GB memory`,
+    // A field the offer lacks drops its bullet rather than printing "undefined".
+    const known = value => Number.isSafeInteger(value) && value > 0;
+    const credits = known(offer.aiCredits?.amount) ? whole(offer.aiCredits.amount) : null;
+    const hours = known(offer.fairUseHours) ? whole(offer.fairUseHours) : null;
+    const size = known(offer.vcpu) && known(offer.memoryGiB) ? ` · ${offer.vcpu} vCPU · ${offer.memoryGiB} GB` : '';
+    const keep = list => list.filter(Boolean);
+    if ( offer.sku === 'free_v3' ) return { lead: null, bullets: keep([
+        `Cloudflare computer${size}${size ? ' memory' : ''}`,
         'Your files saved with your computer',
-        `${credits} AI credits to start`,
-        `${hours} hours of computer time each month`,
-    ] };
-    if ( offer.sku === 'standard_monthly_v3' ) return { lead: 'Everything in Free, plus:', bullets: [
-        `Your own AWS computer · ${offer.vcpu} vCPU · ${offer.memoryGiB} GB`,
+        credits && `${credits} AI credits to start`,
+        hours && `${hours} hours of computer time each month`,
+    ]) };
+    if ( offer.sku === 'standard_monthly_v3' ) return { lead: 'Everything in Free, plus:', bullets: keep([
+        `Your own AWS computer${size}`,
         `${PAID_DISK_GB} GB disk for your projects`,
-        `${credits} AI credits every month`,
-        `${hours} hours of computer time each month`,
-    ] };
+        credits && `${credits} AI credits every month`,
+        hours && `${hours} hours of computer time each month`,
+    ]) };
     const choices = offer.machineChoice ?? [];
     const vcpus = { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8 };
     const listed = choices.map(code => vcpus[code]).filter(Boolean);
     const memory = { 'std-2': 8, 'cmp-4': 16, 'cmp-8': 32 };
     const most = Math.max(offer.memoryGiB ?? 0, ...choices.map(code => memory[code] ?? 0));
-    return { lead: 'Everything in Standard, plus:', bullets: [
-        listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `${offer.vcpu} vCPU · ${offer.memoryGiB} GB`,
+    return { lead: 'Everything in Standard, plus:', bullets: keep([
+        listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `Your own AWS computer${size}`,
         `${PAID_DISK_GB} GB disk for your projects`,
-        `${credits} AI credits every month`,
-        `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
-    ] };
+        credits && `${credits} AI credits every month`,
+        hours && `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
+    ]) };
 }
 
 /** "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it. */

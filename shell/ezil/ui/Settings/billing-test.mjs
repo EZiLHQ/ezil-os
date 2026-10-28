@@ -25,8 +25,9 @@ function cssRule (selector, last = false, property) {
 }
 const tokens = cssRule('.ezil-settings-window');
 function rgb (value) {
-    const variable = value.match(/^var\((--[\w-]+)\)$/);
-    if ( variable ) return rgb(tokens[variable[1]]);
+    // `var(--name)` or `var(--name, fallback)`: round 3's --accent is `var(--ezil-accent, #00adb5)`.
+    const variable = value.match(/^var\((--[\w-]+)(?:,\s*(.+))?\)$/);
+    if ( variable ) return rgb(tokens[variable[1]] ?? variable[2]);
     const mix = value.match(/^color-mix\(in srgb, (.+) (\d+)%, (.+)\)$/);
     if ( mix ) {
         const front = rgb(mix[1]), back = rgb(mix[3]), alpha = Number(mix[2]) / 100;
@@ -201,7 +202,7 @@ try {
         ['incomplete', '--warn', 12], ['upgrade_pending', '--warn', 12], ['past_due', '--danger', 12],
     ] ) {
         const rule = cssRule(`.ezil-settings-billing [data-role="plan-status"][data-status="${status}"]`);
-        assert.equal(rule.color, status === 'active' ? '#4fd8de' : `var(${token})`);
+        assert.equal(rule.color, status === 'active' ? 'var(--text)' : `var(${token})`);
         assert.equal(rule.background, tint ? `color-mix(in srgb, var(${token}) ${tint}%, var(--surface))` : 'var(--surface-2)');
         const light = luminance(rule.color), dark = luminance(rule.background);
         assert.ok((Math.max(light, dark) + 0.05) / (Math.min(light, dark) + 0.05) >= 4.5, `${status} chip reaches 4.5:1`);

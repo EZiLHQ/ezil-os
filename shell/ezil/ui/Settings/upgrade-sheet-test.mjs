@@ -1191,8 +1191,12 @@ for ( const tier of ['standard', 'premium'] ) test(`v3 ${tier} checkout requires
     h.summary = async () => summaryV3('free');
     h.open({ sku: offer.sku, offer, sizes: undefined }); await settle();
     assert.equal(h.mounted, 1); assert.equal(h.calls[0].input.sku, offer.sku);
-    assert.equal(h.document.querySelectorAll('.ezil-upgrade-allowances li').length, offer.bullets.length);
-    assert.match(h.text(), /Usage included/); assert.doesNotMatch(v3CopyForAudit(h.text()), banned); assert.doesNotMatch(h.text(), honestyBans);
+    // Round 3 (plan §6.4): the four round-3 bullets in plan order, and "What happens next" beside the payment form.
+    assert.equal(h.document.querySelectorAll('.ezil-upgrade-allowances li').length, 4);
+    assert.match(h.document.querySelector('.ezil-upgrade-allowances li').textContent, tier === 'premium' ? /^Choose 2, 4 or 8 vCPU — up to 32 GB$/ : /^Your own AWS computer · 2 vCPU · 8 GB$/);
+    assert.match(h.text(), /What happens next/);
+    assert.match(h.text(), new RegExp(`${offer.name} starts after payment and ${tier === 'premium' ? '1,000' : '200'} AI credits are added\\.`));
+    assert.doesNotMatch(v3CopyForAudit(h.text()), banned); assert.doesNotMatch(h.text(), honestyBans);
     h.complete(); await settle(); assert.equal(h.q('[data-role="upgrade-success"]'), null);
     h.summary = async () => summary;
     await h.tick(1500); assert.match(h.text(), new RegExp(`You're on ${offer.name}`));

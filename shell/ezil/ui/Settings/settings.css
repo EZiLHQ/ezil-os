@@ -643,7 +643,7 @@
 .ezil-billing-price { margin-left: auto; font-size: 20px; font-weight: 600; line-height: 28px; }
 .ezil-billing-status { color: var(--muted); }
 /* These tints keep the status text above 4.5:1 against the card surface. */
-.ezil-settings-billing [data-role="plan-status"][data-status="active"] { background: color-mix(in srgb, var(--accent) 18%, var(--surface)); color: color-mix(in srgb, var(--accent) 55%, #ffffff); }
+.ezil-settings-billing [data-role="plan-status"][data-status="active"] { background: color-mix(in srgb, var(--accent) 18%, var(--surface)); color: var(--text); }
 .ezil-settings-billing [data-role="plan-status"][data-status="free"] { background: var(--surface-2); color: var(--muted); }
 .ezil-settings-billing [data-role="plan-status"][data-status="cancels"],
 .ezil-settings-billing [data-role="plan-status"][data-status="incomplete"],
