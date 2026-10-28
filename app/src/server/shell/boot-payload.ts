@@ -352,7 +352,8 @@ export function toShellDesktopState(
     features: ShellFeatures = NO_SHELL_FEATURES,
 ): ShellDesktopState {
     // `feedback` is the one route gated per user: absent unless switched on.
-    const { feedback: _feedback, ...alwaysOn } = SHELL_API_ROUTES;
+    const endpoints = Object.fromEntries(Object.entries(SHELL_API_ROUTES)
+        .filter(([key]) => features.feedback || key !== 'feedback')) as Partial<typeof SHELL_API_ROUTES>;
     return {
         provider: 'cloudflare-guacamole',
         // A provider lookup that FAILED is reported as not configured, never
@@ -361,7 +362,7 @@ export function toShellDesktopState(
         configured: provider?.isConfigured === true,
         hasHmacSecret: provider?.hasHmacSecret === true,
         status: 'idle',
-        endpoints: features.feedback ? SHELL_API_ROUTES : alwaysOn,
+        endpoints,
         ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots },
     };
 }
