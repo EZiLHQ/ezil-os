@@ -218,6 +218,17 @@ describe('switchConfiguration: RUNNING applies now (stop, then wake on the targe
         expect(h.preference).toBe('cmp-4');
     });
 
+    it('a retried requestId with a different size answers its own transition; a new request with that size is switch_in_progress', async () => {
+        const s = harness();
+        const first = await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        expect(first).toMatchObject({ ok: true, effective: 'switching', target: 'cmp-4' });
+        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-8', requestId: 'click-000001' }, s.deps)).toEqual(first);
+        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-8', requestId: 'click-000002' }, s.deps)).toEqual({ ok: false, reason: 'switch_in_progress' });
+        expect(h.writes).toBe(1);
+        expect(h.preference).toBe('cmp-4');
+        expect(s.stored()).toMatchObject({ requestId: 'click-000001', target: 'cmp-4' });
+    });
+
     it.each([['capacity', 'capacity_unavailable'], ['unconfirmed', 'capacity_unavailable'], ['stuck', 'wake_timeout']] as const)(
         'a failed wake (%s) ends failed with %s, reverts the preference and offers the revert', async (ensure, reason) => {
             const s = harness({}, { ensure });
