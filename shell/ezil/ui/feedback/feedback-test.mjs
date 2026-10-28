@@ -243,7 +243,8 @@ try {
         send();
         await until(() => status().includes(reportId));
         assert.equal(JSON.parse(calls[1].body).clientRequestId, id);
-        assert.match(status(), /image wasn't stored/);
+        // No screenshot was attached, so a server-side screenshotAccepted:false must not claim an image was dropped.
+        assert.doesNotMatch(status(), /image wasn't stored/);
         assert.doesNotMatch(calls[1].body, /SECRET|example\.test/);
         const count = calls.length;
         send(); assert.equal(calls.length, count, 'success cannot be submitted twice');
