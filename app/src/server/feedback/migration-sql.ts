@@ -1,13 +1,13 @@
 /**
- * The reviewed SQL for the feedback tables, kept as constants (not `.sql`
- * files) on purpose: `production-migrations.mjs validate` requires EVERY
- * `.sql` file in the repo to be registered in the manifest with `before`/
- * `after` catalog digests, and the `after` digest only exists once the
- * founder has rehearsed this SQL on a disposable database
- * (`docs/feedback-migration.md`). `migration-sql.test.ts` runs both strings
- * through the production grammar (`additiveSQL`) so they cannot drift out
- * of what the gate accepts. Column-for-column twin of
- * `app/src/server/db/schema/feedback.ts`.
+ * The reviewed SQL for the feedback tables. `migration-sql.test.ts` runs both
+ * strings through the production grammar (`additiveSQL`), checks them column
+ * for column against `app/src/server/db/schema/feedback.ts`, and requires
+ * `app/drizzle/0011_feedback.sql` to equal `FEEDBACK_MIGRATION_SQL` byte for
+ * byte. That file is what the os-staging schema tool applies
+ * (`app/scripts/billing-staging-schema.mjs`, `EXPLICIT_FILES`); it is a
+ * `snapshot` source in `.github/production-migrations.json`, never a grammar
+ * `migration`, and the tool refuses it for `aws-production`
+ * (`docs/feedback-migration.md`).
  */
 
 export const FEEDBACK_REPORTS_SQL = `CREATE TABLE public.ezil_feedback_reports (id uuid NOT NULL, user_id uuid NOT NULL, computer_id uuid NULL, created_at timestamptz NOT NULL, category text NOT NULL, description text NOT NULL, diagnostics jsonb NULL, client_request_id uuid NOT NULL, shell_version text NULL, status text NOT NULL, redaction_count integer NOT NULL, has_screenshot boolean NOT NULL, deploy_sha text NULL);
@@ -25,3 +25,9 @@ CREATE INDEX ezil_feedback_attachments_report ON public.ezil_feedback_attachment
 CREATE INDEX ezil_feedback_attachments_created ON public.ezil_feedback_attachments (created_at);
 ALTER TABLE public.ezil_feedback_attachments ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.ezil_feedback_attachments FROM public, anon, authenticated`;
+
+/** Exact content of `app/drizzle/0011_feedback.sql` (psql `-f`, one transaction). */
+export const FEEDBACK_MIGRATION_SQL = `-- In-product feedback (docs/FEEDBACK-CONTROLS-CONTRACT.md §4). Staging-only; inert while EZIL_OS_FEEDBACK is off.
+${FEEDBACK_REPORTS_SQL};
+${FEEDBACK_ATTACHMENTS_SQL};
+`;
