@@ -284,7 +284,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
             : event('charge.dispute.created', { id: 'dispute', charge: 'charge', status: 'needs_response' });
         expect(await processStripeEvent(reversal, deps)).toBe('applied');
         await processStripeEvent(reversal, deps);
-        expect((await rows()).map(r => [r.kind, r.payload.entitlementId, r.payload.credits]).sort()).toEqual([
+        expect((await rows()).map(r => [r.kind, (r.payload as Record<string, unknown>).entitlementId, (r.payload as Record<string, unknown>).credits]).sort()).toEqual([
             ['ai_grant', root, 529], ['ai_revoke', root, 529]]);
         info.mockRestore();
     });
