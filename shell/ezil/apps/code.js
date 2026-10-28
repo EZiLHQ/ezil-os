@@ -91,6 +91,7 @@ import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-h
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
+import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
@@ -301,7 +302,7 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
-    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', isMigrating: () => session.isComputeMigrating(computer.id),
+    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
         onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
@@ -647,12 +648,24 @@ export async function openCodeWindow (ctx = {}) {
     // Restart desktop (Settings → Troubleshoot) restarts code-server too on an AWS host, and the
     // open frame then shows "Cannot reconnect". Re-mint for the same computer (live 2026-10-22).
     const on_restarted = (e) => { if ( ! disposed && e?.detail?.computerId === computer.id ) void start_boot(); };
+    // A switch or a computer restart replaces the machine; re-mint once the server settles it (round 3).
+    let transition_watch = null;
+    const on_transition = (e) => {
+        if ( disposed || nativeSurface || e?.detail?.computerId !== computer.id || transition_watch?.active() ) return;
+        transition_watch = watchComputerTransition({
+            computerId: computer.id, element: el_window,
+            transitionId: typeof e.detail.transitionId === 'string' ? e.detail.transitionId : null,
+            onSettled: () => { transition_watch = null; if ( ! disposed ) void start_boot(); },
+        });
+    };
 
     const dispose = () => {
         progress.dispose();
         if (disposed) return;
         disposed = true;
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
+        window.removeEventListener(TRANSITION_EVENT, on_transition);
+        transition_watch?.stop();
         nativeSurface?.dispose();
         stop_timers();
         stop_runtime_recheck?.();
@@ -678,6 +691,7 @@ export async function openCodeWindow (ctx = {}) {
     };
     window.addEventListener('ezil:teardown', dispose);
     window.addEventListener('ezil:desktop-restarted', on_restarted);
+    window.addEventListener(TRANSITION_EVENT, on_transition);
 
     void start_boot();
     return el_window;

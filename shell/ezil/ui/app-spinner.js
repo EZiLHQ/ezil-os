@@ -1,16 +1,18 @@
 // EZiL app loading surface. Physical app readiness remains owned by the caller.
 // Hosted computers also show protected, read-only computer.progress observations.
 // Paused/operator/queued states override recorded migration intent; none animate.
-// The separate observer owns polling, estimated timing and disposal, never allocation.
+// The separate observer owns polling, never allocation; this file owns no clock:
+// the elapsed time and bar advance only when the caller paints.
 // Without an authoritative observation, do not infer a transfer from launch flags.
 // Native/local callers retain the original BootUiState and retry behavior.
+// Round 3: renders through the one opening surface (`OpeningSurface`).
 
 import {
     BOOT_FAILURE_COPY,
     BOOT_NOT_CONFIGURED_COPY,
 } from '../boot-phases.js';
 
-import { observeComputerProgress } from './computer-progress.js';
+import { observeComputerProgress, OpeningSurface, OPENING_COPY, OPENING_MILESTONES, formatElapsed, openingAt, prefersReducedMotion } from './computer-progress.js';
 import { isNative } from '../native-runtime.js';
 
 import { LAUNCH_COPY } from '../launch-copy.js';
@@ -21,69 +23,60 @@ const MIGRATION_COPY = {
     body: 'This first start takes a few minutes. Your files come with you.',
 };
 
+/** "Opening Code…" → "Code". */
+const appNameOf = label => String(label ?? '').replace(/^Opening\s+/, '').replace(/…$/, '').trim();
+
 /**
  * Build the spinner once. Returns a controller the caller drives — same
  * `{ el, render }` shape as `BootProgress`, so either can sit in a window
  * body and be driven by the same `paint()` loop.
  *
  * @param {object} opts
- * @param {string} [opts.label] Shown while `state.kind === 'progress'`.
- *   Callers pass the app's own name — "Opening Browser…", "Opening
- *   Preview…", "Opening Code…" — never machine vocabulary.
+ * @param {string} [opts.label] The status line while `state.kind === 'progress'`
+ *   and no observation exists: "Opening Browser…", "Opening Code…".
+ * @param {string} [opts.appName] Shown under the icon; defaults to the label's app.
+ * @param {string} [opts.icon] The app's icon (a data: or same-origin URL).
  * @param {() => void} [opts.onRetry] Called by the failure state's Retry button.
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific
  *   failure guidance. Changes wording only, never readiness or retry behavior.
  */
-export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', onRetry, failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
+export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, onRetry, failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     root.setAttribute('role', 'status');
     root.setAttribute('aria-live', 'polite');
 
-    root.innerHTML = `
-        <div class="ezil-app-spinner-panel">
-            <div class="ezil-app-spinner-ring" aria-hidden="true"></div>
-            <h1 class="ezil-boot-title ezil-app-spinner-label"></h1>
-            <p class="ezil-boot-sub ezil-app-spinner-sub" hidden></p>
-            <div class="ezil-computer-progress" hidden></div>
-            <div class="ezil-boot-actions">
-                <button type="button" class="ezil-boot-retry">Try again</button>
-            </div>
-        </div>`;
+    const name = appName ?? appNameOf(label);
+    let failureCode;
+    const surface = OpeningSurface({ appName: name, icon, onRetry, feedbackCode: () => failureCode,
+        statusClass: 'ezil-app-spinner-label', subClass: 'ezil-app-spinner-sub' });
+    surface.el.classList.add('ezil-app-spinner-panel');
+    root.appendChild(surface.el);
 
-    const el_ring = root.querySelector('.ezil-app-spinner-ring');
-    const el_label = root.querySelector('.ezil-app-spinner-label');
-    const el_sub = root.querySelector('.ezil-app-spinner-sub');
-    const el_actions = root.querySelector('.ezil-boot-actions');
-    const el_retry = root.querySelector('.ezil-boot-retry');
-
-    const el_detail = root.querySelector('.ezil-computer-progress');
-    let observation = null, latestState = null, progressChecked = false, paintedObservation = null;
-    const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, onChange: value => {
+    let observation = null, latestState = null, latestExtra = {}, progressChecked = false, client = 0;
+    const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name, onChange: value => {
         observation = value; progressChecked = true;
-        if (latestState) render(latestState);
+        if (latestState) render(latestState, latestExtra);
         onProgressChange?.();
     } }) : null;
-    el_label.textContent = label;
-    el_actions.hidden = true;
-
-    el_retry.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if ( typeof onRetry === 'function' ) onRetry();
-    });
+    root.dataset.progress = observer ? 'pending' : 'none';
+    surface.paint({ status: label, percent: null });
 
     /**
      * @param {import('../boot-phases.js').BootUiState} state
+     * @param {{elapsedMs?: number}} [extra] The caller's own boot clock, for the
+     *   elapsed time when no server observation exists.
      */
-    function render (state) {
-        latestState = state;
+    function render (state, extra = {}) {
+        latestState = state; latestExtra = extra ?? {};
         const pending = state.kind === 'progress' || state.kind === 'failed';
         if (pending) observer?.start(); else {
             observer?.stop(); observation = null; progressChecked = false;
         }
+        if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
+        failureCode = state.kind === 'failed' ? state.reason : observation?.stage === 'needs_operator' ? 'needs_operator' : undefined;
         const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
         // `observedBudgetSpent`: the desktop window's own ten-minute clock ran out first.
         const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws
@@ -92,105 +85,59 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         root.classList.toggle('ezil-app-spinner-running-long', !!runningLong);
         const showObservation = pending && observation && (state.kind === 'progress' || activeTimeout
             || ['operations_paused', 'needs_operator', 'queued', 'failed_reopened'].includes(observation.stage));
-        const fingerprint = showObservation ? JSON.stringify([state.kind, observation]) : null;
-        if (fingerprint !== null && fingerprint === paintedObservation) return;
-        paintedObservation = fingerprint;
-        el_detail.hidden = true;
         if (showObservation) {
-            el_ring.hidden = !observation.active;
-            el_label.textContent = observation.title;
-            el_sub.hidden = false; el_sub.textContent = runningLong
-                ? "This is taking longer than usual. We're still working on it — you can keep this open or come back later." : observation.body;
-            el_actions.hidden = !(runningLong || observation.stage === 'failed_reopened'
-                || (state.kind === 'failed' && observation.stage === 'needs_operator' && !observation.manualAttention));
-            el_detail.replaceChildren(); el_detail.hidden = false;
-            if (observation.steps.length) {
-                const list = document.createElement('ol'); list.setAttribute('aria-label', observation.stepsLabel);
-                for (const step of observation.steps) {
-                    const item = document.createElement('li'); item.textContent = step.label; item.dataset.state = step.state;
-                    if (step.state === 'complete') {
-                        const tick = document.createElement('span'); tick.textContent = '✓ '; tick.setAttribute('aria-hidden', 'true');
-                        item.prepend(tick);
-                    }
-                    if (step.state === 'current') item.setAttribute('aria-current', 'step');
-                    list.appendChild(item);
-                }
-                el_detail.appendChild(list);
-            }
-            if (observation.reassurance) {
-                const line = document.createElement('p'); line.textContent = observation.reassurance; el_detail.appendChild(line);
-            }
-            if (observation.transfer) {
-                const line = document.createElement('p'); line.textContent = observation.transfer.bytes; el_detail.appendChild(line);
-            }
-            if (observation.meter) {
-                const { percent, estimated } = observation.meter;
-                const bar = document.createElement('progress'); bar.max = 100;
-                bar.setAttribute('aria-label', estimated ? 'Estimated progress' : observation.transfer ? 'Moving your files' : 'Computer ready');
-                if (percent !== null) {
-                    const line = document.createElement('p'); line.textContent = `${estimated ? 'Estimated: ' : ''}${percent}%`; el_detail.appendChild(line);
-                    bar.value = percent;
-                    bar.setAttribute('aria-valuenow', String(percent));
-                    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
-                }
-                el_detail.appendChild(bar);
-            }
-            for (const text of [observation.countdown, observation.guidance, observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : '']) {
-                if (!text) continue;
-                const line = document.createElement('p'); line.textContent = text; el_detail.appendChild(line);
-            }
+            const at = openingAt(observation, Date.now(), { reducedMotion: prefersReducedMotion(), client });
+            const attention = observation.stage === 'needs_operator';
+            const retry = !!(runningLong || observation.stage === 'failed_reopened'
+                || (state.kind === 'failed' && attention && !observation.manualAttention));
+            const meta = !at ? '' : at.long && !runningLong ? `${OPENING_COPY.long} · ${at.elapsedText}` : at.elapsedText;
+            const dev = [observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : ''].filter(Boolean).join(' ');
+            surface.paint({
+                status: observation.title,
+                body: runningLong ? OPENING_COPY.runningLong : [observation.body, observation.bytes, dev].filter(Boolean).join(' · '),
+                percent: at ? at.percent : null, key: observation.openingKey, meta, long: at?.long,
+                retry, feedback: attention || retry,
+            });
             return;
         }
 
-        if (state.kind === 'progress' && observer) {
-            // Optional AWS/migration metadata must not replace physical app startup.
-            el_ring.hidden = false;
-            el_label.textContent = label;
-            el_sub.hidden = !progressChecked;
-            el_sub.textContent = progressChecked ? 'Detailed computer progress is unavailable.' : '';
-            el_actions.hidden = true;
-            return;
-        }
         if ( state.kind === 'progress' ) {
-            const copy = isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
-            el_ring.hidden = false;
-            el_label.textContent = copy ? copy.title : label;
-            el_sub.hidden = !copy;
-            el_sub.textContent = copy ? copy.body : '';
-            el_actions.hidden = true;
+            // Optional AWS/migration metadata must not replace physical app startup.
+            const copy = observer ? null : isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
+            const elapsed = Number.isFinite(extra?.elapsedMs) ? extra.elapsedMs / 1000 : null;
+            surface.paint({ status: copy ? copy.title : label, body: copy ? copy.body : '', percent: 'indeterminate',
+                meta: elapsed === null ? '' : formatElapsed(elapsed) });
             return;
         }
-
-        el_ring.hidden = true;
 
         if ( state.kind === 'not_configured' ) {
-            el_label.textContent = BOOT_NOT_CONFIGURED_COPY.title;
-            el_sub.hidden = false;
-            el_sub.textContent = BOOT_NOT_CONFIGURED_COPY.body;
             // Nothing to retry: no provider is configured, so the next
             // attempt fails identically. Same rule as `BootProgress`.
-            el_actions.hidden = true;
+            surface.paint({ status: BOOT_NOT_CONFIGURED_COPY.title, body: BOOT_NOT_CONFIGURED_COPY.body, percent: null });
             return;
         }
 
         if ( state.kind === 'failed' ) {
             const copy = failureCopy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
-            el_label.textContent = copy.title;
-            el_sub.hidden = false;
-            el_sub.textContent = copy.body;
-            el_actions.hidden = false;
+            surface.paint({ status: copy.title, body: copy.body, percent: null, retry: true, feedback: true });
             return;
         }
 
         // 'ready' and 'ready_unverified' — the caller is about to swap the
         // iframe in over this panel, or has already retired it. Nothing to
-        // draw: this component has no opinion about the unverified strip
-        // either (that is `DisplayNotice`'s, and only the desktop window
-        // uses it — Preview/Code are HTML documents with no separate
-        // "did pixels arrive" question).
+        // draw: the unverified strip is `DisplayNotice`'s, and only the desktop
+        // window uses it.
     }
 
-    return { el: root, render, hasComputerProgress: () => observation !== null, computerProgress: () => observation, dispose: () => observer?.stop() };
+    /** The caller's client milestones: `url_received`, then `first_frame` (the bar's 100%); null starts a new attempt. */
+    function stamp (key) {
+        if (key === null) { client = 0; return; }
+        const i = OPENING_MILESTONES.indexOf(key);
+        if (i > client) { client = i; if (latestState) render(latestState, latestExtra); }
+    }
+
+    return { el: root, render, stamp, hasComputerProgress: () => observation !== null, computerProgress: () => observation,
+        dispose: () => observer?.stop() };
 }
 
 export default AppSpinner;

@@ -13,13 +13,14 @@ async function until(fn) {
     assert.fail('migration UI did not settle');
 }
 
+// Round 3: one status line while opening (no body); hold states keep one sentence.
 const copies = {
-    attention: ['Computer needs attention', 'Check the computer’s current status before trying again.'],
-    unavailable: ['Opening', 'Detailed computer progress is unavailable.'],
+    attention: ['Your computer needs attention', 'Check the computer’s current status before trying again.'],
+    unavailable: ['Opening', ''],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
-    moving: ['Getting your AWS computer', 'Waiting for the new computer before restoring the saved workspace.'],
-    launching: ['Starting your desktop', 'Your AWS computer is on its way. Your desktop will open as soon as it is ready.'],
-    both: ['Getting your AWS computer', 'Waiting for the new computer before restoring the saved workspace.'],
+    moving: ['Getting your AWS computer', ''],
+    launching: ['Starting your computer', ''],
+    both: ['Getting your AWS computer', ''],
 };
 
 async function open(t, app, initialMode = 'moving') {
@@ -70,7 +71,7 @@ async function open(t, app, initialMode = 'moving') {
     await registry.launch(app, { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState });
     const win = await until(() => w.document.querySelector(`.window[data-app="${app}"]`));
     const spinner = win.querySelector('.ezil-app-spinner');
-    await until(() => initialMode === 'unavailable' ? spinner.querySelector('.ezil-app-spinner-label').textContent.startsWith('Opening ') && spinner.querySelector('.ezil-app-spinner-sub').textContent === copies.unavailable[1] : spinner.querySelector('.ezil-app-spinner-label').textContent === copies[initialMode][0]);
+    await until(() => initialMode === 'unavailable' ? spinner.querySelector('.ezil-app-spinner-label').textContent.startsWith('Opening ') && spinner.dataset.progress === 'unavailable' : spinner.querySelector('.ezil-app-spinner-label').textContent === copies[initialMode][0]);
     return { w, win, spinner, asks, setMode: m => { mode = m; }, setNow: ms => { now = ms; } };
 }
 
@@ -90,8 +91,8 @@ for (const app of ['code', 'desktop', 'preview']) {
     test(`${app}: ordinary CF with no AWS record keeps physical pending app copy`, async t => {
         const h = await open(t, app, 'unavailable');
         assert.match(h.spinner.querySelector('.ezil-app-spinner-label').textContent, /^Opening /);
-        assert.equal(h.spinner.querySelector('.ezil-app-spinner-ring').hidden, false);
-        assert.match(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, /progress is unavailable/);
+        assert.equal(h.spinner.querySelector('.ezil-opening-bar').dataset.indeterminate, 'true', 'no basis for a determinate bar');
+        assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').hidden, true, 'one status line, no unavailable notice');
         assert.doesNotMatch(h.spinner.textContent, /Moving your computer/);
         h.setNow(480_000);
         await until(() => h.spinner.dataset.kind === 'failed');
@@ -100,9 +101,9 @@ for (const app of ['code', 'desktop', 'preview']) {
     });
     test(`${app}: authoritative pause wins over recorded migration and hides active transfer`, async t => {
         const h = await open(t, app, 'paused');
-        assert.equal(h.spinner.querySelector('.ezil-app-spinner-ring').hidden, true);
+        assert.equal(h.spinner.querySelector('.ezil-opening-bar').hidden, true, 'a held computer shows no bar');
         assert.equal(h.spinner.querySelector('ol'), null);
-        assert.match(h.spinner.textContent, /Unsaved changes inside apps are not guaranteed/);
+        assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, copies.paused[1]);
         assert.doesNotMatch(h.spinner.textContent, /Moving your computer|\d+%/);
     });
     for (const mode of ['moving', 'launching']) {
@@ -110,16 +111,16 @@ for (const app of ['code', 'desktop', 'preview']) {
             const h = await open(t, app, mode);
             await wait(40); // Past the desktop phase reveal timer: observed copy must remain visible.
             assert.equal(h.spinner.hidden, false);
-            assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').textContent,
-                copies[mode][1]);
+            assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').hidden, true, 'one status line');
+            assert.equal(h.spinner.querySelector('.ezil-opening-bar').hidden, false);
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
             h.setNow(300_000); // Longer than the old AWS timeout.
             await wait(20);
             assert.equal(h.spinner.dataset.kind, 'progress');
             h.setMode('waking');
             await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Attaching your files');
-            assert.match(h.spinner.textContent, /Your files stay on your own disk/);
-            assert.equal(h.spinner.querySelectorAll('ol li').length, 3);
+            assert.equal(h.spinner.querySelector('ol'), null, 'no step list');
+            assert.doesNotMatch(h.spinner.textContent, /\d+%|min left/, 'no percentage text or countdown');
             if (app === 'desktop') {
                 assert.equal(h.spinner.hidden, false);
                 assert.equal(h.win.querySelector('.ezil-boot').hidden, true);
@@ -133,11 +134,12 @@ for (const app of ['code', 'desktop', 'preview']) {
         test(`${app}: ${mode} timeout keeps active progress until the calm ten-minute retry`, async t => {
             const h = await open(t, app, mode);
             h.setNow(480_000);
-            await until(() => h.spinner.textContent.includes('Almost there — finishing up'));
+            await until(() => h.spinner.querySelector('.ezil-opening-meta').textContent.startsWith('Taking a little longer than usual'));
             assert.equal(h.spinner.dataset.kind, 'progress');
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
             assert.doesNotMatch(h.spinner.textContent, /This is taking too long/);
-            assert.equal(h.spinner.querySelector('progress').value, 95);
+            const bar = Number(h.spinner.querySelector('.ezil-opening-bar').getAttribute('aria-valuenow'));
+            assert.ok(bar > 0 && bar <= 90, `an overdue bar holds below 90% until ready (${bar})`);
             h.setNow(599_000);
             await wait(30);
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);

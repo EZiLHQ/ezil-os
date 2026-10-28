@@ -39,3 +39,18 @@ test('API success without resumed frames cannot report connected',async()=>{
   f.queue[0].fn();await pending;
   assert.equal(f.states.includes('connected'),false);assert.equal(f.states.at(-1),'reconnecting');f.loop.stop();
 });
+test('relay_runtime_changed hands over to a re-open instead of counting failures',async()=>{
+  let calls=0,reopened=0;let clock=100000,queue=[];const states=[];
+  const loop=createRelayRenewal({state:{runtimeId:'runtime',expiresAt:clock+300000},refresh:async()=>{calls++;return {ok:false,error:'relay_runtime_changed'};},
+    onState:s=>states.push(s),onRuntimeChanged:()=>{reopened++;},now:()=>clock,
+    schedule:(fn,ms)=>{const timer={fn,ms};queue.push(timer);return timer;},cancel:t=>{queue=queue.filter(x=>x!==t);}});
+  await loop.reconnect();
+  assert.equal(calls,1);assert.equal(reopened,1);assert.equal(queue.length,0,'no retry is scheduled');
+  assert.deepEqual(states,['reconnecting','runtime_changed']);assert.equal(states.includes('error'),false);
+  await loop.reconnect();assert.equal(calls,1,'a stopped loop never asks again');
+});
+test('without a re-open handler relay_runtime_changed keeps the bounded failure',async()=>{
+  let calls=0;const f=fixture(async()=>{calls++;return {ok:false,error:'relay_runtime_changed'};});
+  await f.loop.reconnect();await f.queue[0].fn();await f.queue[0].fn();
+  assert.equal(calls,3);assert.equal(f.states.at(-1),'error');
+});

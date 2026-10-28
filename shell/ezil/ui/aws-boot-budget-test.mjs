@@ -77,30 +77,35 @@ test('pure: the reopen cap is a structural backstop', () => {
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening(), bootElapsedMs: 1, reopens: AWS_BOOT_MAX_REOPENS - 1 }), 'reopen');
     assert.equal(awsBootTimeoutVerdict({ reason: 'timeout', observation: opening(), bootElapsedMs: 1, reopens: AWS_BOOT_MAX_REOPENS }), 'budget_spent');
 });
-test('pure: still-starting copy follows the observation countdown, else "still working"', () => {
-    assert.equal(awsStillStartingCopy('About 2 min left'), 'Your AWS computer is still starting — about 2 min left.');
-    assert.equal(awsStillStartingCopy('Less than a minute left'), 'Your AWS computer is still starting — less than a minute left.');
-    assert.equal(awsStillStartingCopy('Almost there — finishing up'), 'Your AWS computer is still starting — still working.');
-    assert.equal(awsStillStartingCopy(''), 'Your AWS computer is still starting — still working.');
-    assert.equal(awsStillStartingCopy(undefined), 'Your AWS computer is still starting — still working.');
+test('pure: still-starting copy never promises a time (round 3: no countdowns)', () => {
+    for (const countdown of ['About 2 min left', 'Less than a minute left', '', undefined]) {
+        assert.equal(awsStillStartingCopy(countdown), 'Your computer is still starting');
+    }
 });
-test('pure: BootProgress subtext changes, phase rows (checkmarks) do not', () => {
-    const plain = BootProgress(); const aws = BootProgress();
+test('pure: BootProgress is the one opening surface: status line and bar, no rows or checkmarks', () => {
+    const plain = BootProgress({ appName: 'Linux Desktop' }); const aws = BootProgress({ appName: 'Linux Desktop' });
     const state = { kind: 'progress', currentPhase: 'connecting', confirmed: false, isRunningLong: true };
-    plain.render(state); aws.render(state, { countdown: 'About 3 min left' });
-    assert.equal(aws.el.querySelector('.ezil-boot-sub').textContent, 'Your AWS computer is still starting — about 3 min left.');
-    assert.notEqual(plain.el.querySelector('.ezil-boot-sub').textContent, aws.el.querySelector('.ezil-boot-sub').textContent);
-    const rows = el => [...el.querySelectorAll('.ezil-boot-phase')].map(r => r.dataset.state).join();
-    assert.equal(rows(aws.el), rows(plain.el));
-    assert.ok(!rows(aws.el).includes('confirmed'), 'no checkmark from a timer');
+    plain.render(state, null, { elapsedMs: 40_000 }); aws.render(state, {}, { elapsedMs: 40_000 });
+    assert.equal(aws.el.querySelector('.ezil-boot-title').textContent, 'Your computer is still starting');
+    assert.equal(plain.el.querySelector('.ezil-boot-title').textContent, 'Opening the window');
+    assert.equal(plain.el.querySelector('.ezil-opening-name').textContent, 'Linux Desktop');
+    assert.equal(plain.el.querySelectorAll('.ezil-boot-phase, ol, li').length, 0, 'no step list');
+    assert.equal(plain.el.querySelector('.ezil-opening-meta').textContent, 'Taking a little longer than usual · 0:40');
+    const bar = Number(plain.el.querySelector('.ezil-opening-bar').getAttribute('aria-valuenow'));
+    assert.ok(bar > 0 && bar <= 90, `a running-long estimate stays below 90% (${bar})`);
+    assert.equal(aws.el.querySelector('.ezil-opening-bar').dataset.indeterminate, 'true', 'a reopen without an observation has no basis');
+    assert.doesNotMatch(plain.el.textContent, /\d+%|seconds|min left/);
     aws.render({ kind: 'failed', reason: 'timeout' }, null);
     assert.equal(aws.el.querySelector('.ezil-boot-title').textContent, 'This is taking too long');
     assert.equal(aws.el.querySelector('.ezil-boot-actions').hidden, false);
+    assert.equal(aws.el.querySelector('.ezil-opening-bar').hidden, true);
 });
 
 // ── Part 2: the built desktop window ─────────────────────────────────────
-const bundle = readFileSync(new URL('../../../app/public/os/bundle.min.js', import.meta.url), 'utf8');
-const icons = readFileSync(new URL('../../../app/public/os/icons.js', import.meta.url), 'utf8');
+// EZIL_SHELL_OUT_DIR: a bundle built from this tree (`build-shell.sh` honours the same variable).
+const assets = process.env.EZIL_SHELL_OUT_DIR;
+const bundle = readFileSync(assets ? `${assets}/bundle.min.js` : new URL('../../../app/public/os/bundle.min.js', import.meta.url), 'utf8');
+const icons = readFileSync(assets ? `${assets}/icons.js` : new URL('../../../app/public/os/icons.js', import.meta.url), 'utf8');
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(fn, what = 'condition') {
     for (let i = 0; i < 400; i++) { const value = fn(); if (value) return value; await wait(5); }
@@ -198,9 +203,9 @@ async function open(t, progressMode, opts = {}) {
     const spinner = win.querySelector('.ezil-app-spinner');
     const panel = win.querySelector('.ezil-boot');
     const visible = () => [spinner, panel].filter(el => !el.hidden);
-    const tryAgainVisible = () => visible().some(el => el.querySelector('.ezil-boot-actions')?.hidden === false);
-    if (mode === 'opening' || mode === 'attention') await until(() => spinner.querySelector('.ezil-app-spinner-label').textContent === (mode === 'attention' ? 'Computer needs attention' : 'Starting your desktop'), 'observation painted');
-    else if (mode === 'unavailable') await until(() => spinner.querySelector('.ezil-app-spinner-sub').textContent === 'Detailed computer progress is unavailable.', 'no observation');
+    const tryAgainVisible = () => visible().some(el => el.querySelector('.ezil-boot-actions')?.hidden === false && el.querySelector('.ezil-boot-retry')?.hidden === false);
+    if (mode === 'opening' || mode === 'attention') await until(() => spinner.querySelector('.ezil-app-spinner-label').textContent === (mode === 'attention' ? 'Your computer needs attention' : 'Starting your computer'), 'observation painted');
+    else if (mode === 'unavailable') await until(() => spinner.dataset.progress === 'unavailable', 'no observation');
     return {
         w, win, spinner, panel, visible, tryAgainVisible, logs, asks, timeOutOne, pending, signals,
         setMode: m => { mode = m; }, setNow: ms => { now = ms; }, setPerf: ms => { perf = ms; }, setReady: () => { ready = true; },
@@ -218,10 +223,10 @@ test('desktop: 215 s TIMEOUT while activeAws re-opens and the panel stays on pro
     assert.equal(h.panel.dataset.kind, 'progress');
     assert.equal(h.tryAgainVisible(), false);
     assert.ok(h.visible().every(el => !el.textContent.includes('This is taking too long')));
-    assert.match(h.panel.querySelector('.ezil-boot-sub').textContent, /^Your AWS computer is still starting — /);
+    assert.equal(h.panel.querySelector('.ezil-boot-title').textContent, 'Your computer is still starting');
     // What the user actually sees during the re-open is the spinner's live observation.
     assert.equal(h.spinner.hidden, false);
-    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Starting your desktop');
+    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Starting your computer');
     assert.ok(!/taking (too long|longer than usual)|needs attention/i.test(h.spinner.textContent), h.spinner.textContent);
     assert.ok(h.logs.some(l => l.includes('re-opening (#1)')), h.logs.join('\n'));
     // The re-open is a real ask, and its success opens the desktop.
@@ -280,7 +285,7 @@ test('desktop: needs_operator during a re-open stops waiting immediately', async
     assert.ok(reopenSignal?.aborted === true, 'the re-open request was aborted');
     assert.equal(h.pending.length, 0);
     await until(() => h.tryAgainVisible(), 'Try again');
-    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Computer needs attention');
+    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Your computer needs attention');
 });
 
 test('desktop: no observation keeps the unchanged 215 s failure', async t => {
@@ -304,7 +309,7 @@ test('desktop: real AWS protocol, warm joined late: a launch that spent its own 
     await until(() => h.asks() >= 2, 'launching answers');
     h.setPost(() => 'hang');
     h.setNow(45_000); h.setMode('opening');
-    await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Starting your desktop', 'observation painted');
+    await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Starting your computer', 'observation painted');
     await until(() => h.pending.length === 1, 'the wake loop asking');
     h.setPerf(555_000); h.setNow(600_000);
     h.pending.shift().resolve({ ok: true, status: 200, json: async () => launchingBody });
@@ -373,7 +378,7 @@ test('desktop: needs_operator after the first request saw it opening shows Try a
     const atStop = h.asks();
     await wait(40);
     assert.equal(h.asks(), atStop, 'no ask after needs_operator');
-    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Computer needs attention');
+    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Your computer needs attention');
 });
 
 test('desktop: a computer already needing attention when the window opens is still opened (the open is the recovery)', async t => {
@@ -398,7 +403,7 @@ test('desktop: a late success (past t0 + 215 s, no re-open) still gets the origi
     assert.notEqual(h.spinner.dataset.kind, 'failed');
 });
 
-test('desktop: a failed poll at the TIMEOUT keeps the last observation, and the copy drops its stale countdown', async t => {
+test('desktop: a failed poll at the TIMEOUT keeps the last observation, and the panel says only "still starting"', async t => {
     const h = await open(t, 'opening');
     h.setNow(215_000); h.setPerf(215_000);
     await wait(30); // at least one poll at 215 s
@@ -408,5 +413,5 @@ test('desktop: a failed poll at the TIMEOUT keeps the last observation, and the 
     await until(() => h.logs.some(l => l.includes('re-opening (#1)')), 're-open on the kept observation');
     await wait(30);
     assert.equal(h.panel.dataset.kind, 'progress');
-    assert.equal(h.panel.querySelector('.ezil-boot-sub').textContent, 'Your AWS computer is still starting — still working.');
+    assert.equal(h.panel.querySelector('.ezil-boot-title').textContent, 'Your computer is still starting');
 });

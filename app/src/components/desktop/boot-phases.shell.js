@@ -612,7 +612,9 @@ export function classifyPreviewFetchError(err) {
 // `./boot-phases.ts`'s copy of this comment. Kept in lockstep by the drift
 // guard in `boot-phases.shell.test.ts`.
 export const BOOT_PROGRESS_HEADLINE = 'Opening your workspace';
-export const BOOT_PROGRESS_SUBTEXT = 'This usually takes about 20 seconds.';
+// Round 3 (plan §6.5): no time promise. The old "about 20 seconds" was a Cloudflare
+// timing shown on AWS boots that take minutes.
+export const BOOT_PROGRESS_SUBTEXT = 'Your apps open as soon as your computer is ready.';
 export const BOOT_PROGRESS_LONG_SUBTEXT =
     'Still working — first boots and larger workspaces can take a bit longer.';
 
