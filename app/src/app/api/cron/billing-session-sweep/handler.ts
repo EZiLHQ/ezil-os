@@ -78,7 +78,7 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         const heartbeat = new Date(epoch.lastHeartbeatAt ?? epoch.readyAt);
         const stale = heartbeat.getTime() < now.getTime() - HEARTBEAT_STALE_MS;
         if (epoch.size === 'free-cf' && stale) {
-            if (await deps.store.closeEpoch({ computerId: epoch.computerId, endedAt: heartbeat, reason: 'idle_sleep' }) === 'closed') {
+            if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt: heartbeat, reason: 'idle_sleep' }) === 'closed') {
                 counts.closed++;
                 counts.heartbeatClosed++;
             }
@@ -87,7 +87,7 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         const stoppedAt = epoch.size !== 'free-cf' && stale ? await provenStop(epoch, heartbeat) : null;
         if (stoppedAt === null) { policyCandidates.push(epoch); continue; }
         // 'provider_stop' (the AWS receipt's own reason): the end-reason check allows no new value without a migration.
-        if (await deps.store.closeEpoch({ computerId: epoch.computerId, endedAt: stoppedAt, reason: 'provider_stop' }) === 'closed') {
+        if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt: stoppedAt, reason: 'provider_stop' }) === 'closed') {
             counts.closed++;
             counts.awsStaleClosed++;
             console.info(JSON.stringify({ event: 'billing-sweep-close', cause: 'sweep_stale', epochId: epoch.id,
@@ -148,7 +148,7 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         try {
             await tryStop(computer, reason);
         } finally {
-            if (await deps.store.closeEpoch({ computerId: epoch.computerId, endedAt, reason }) === 'closed') counts.closed++;
+            if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt, reason }) === 'closed') counts.closed++;
         }
     }
 

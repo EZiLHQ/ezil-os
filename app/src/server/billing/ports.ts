@@ -82,6 +82,10 @@ export interface OpenEpochInput {
 
 export interface CloseEpochInput {
     computerId: string;
+    /** The open epoch the caller holds (the sweep's row): any other open epoch of the computer stays open. */
+    epochId?: string;
+    /** Only an epoch ready at or before this instant: a stop observed for an earlier generation never closes a later one. */
+    readyBy?: Date;
     endedAt: Date;
     reason: EpochEndReason;
     overheadSeconds?: number;
@@ -224,6 +228,8 @@ export interface BillingStore {
     /** Stored AI receipts retain the original policy when reversing an older invoice. */
     aiCreditGrantsByInvoice?(userId: string, invoiceId: string): Promise<OutboxInsert[]>;
     computerOwner(computerId: string): Promise<string | null>;
+    /** The computer's placement provider (`aws-ec2`, …), or null without a placement or placement table. */
+    placementProvider?(computerId: string): Promise<string | null>;
 
     // writes — each idempotent
     linkCustomer(userId: string, stripeCustomerId: string): Promise<'linked' | 'exists' | 'conflict'>;

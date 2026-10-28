@@ -151,7 +151,7 @@ export function createBillingStore(db: Database): BillingStore {
             return rows.map(computeEpoch);
         },
 
-        async closeEpoch({ computerId, endedAt, reason, overheadSeconds }) {
+        async closeEpoch({ computerId, epochId, readyBy, endedAt, reason, overheadSeconds }) {
             const ended = isoSeconds(epochSeconds(endedAt));
             const rows = await db.update(billingComputeEpochs).set({
                 endedAt: sql`greatest(${billingComputeEpochs.readyAt}, ${ended}::timestamptz)`,
@@ -159,6 +159,8 @@ export function createBillingStore(db: Database): BillingStore {
                 overheadSeconds,
             }).where(and(
                 eq(billingComputeEpochs.computerId, computerId), isNull(billingComputeEpochs.endedAt),
+                epochId === undefined ? undefined : eq(billingComputeEpochs.id, epochId),
+                readyBy === undefined ? undefined : lte(billingComputeEpochs.readyAt, new Date(epochSeconds(readyBy, 'ceil') * 1000)),
             )).returning({ id: billingComputeEpochs.id });
             return rows.length > 0 ? 'closed' : 'not_open';
         },
@@ -416,6 +418,15 @@ export function createBillingStore(db: Database): BillingStore {
             const [row] = await db.select({ userId: computers.userId }).from(computers)
                 .where(eq(computers.id, computerId)).limit(1);
             return row?.userId ?? null;
+        },
+
+        async placementProvider(computerId) {
+            // The placement table is AWS computer SQL (docs/aws-computers/sql), absent from billing-only databases.
+            const [table] = await db.execute<{ present: boolean }>(sql`select to_regclass('public.ezil_computer_placements') is not null as present`);
+            if (!table?.present) return null;
+            const [row] = await db.execute<{ provider: string | null }>(
+                sql`select provider from public.ezil_computer_placements where computer_id = ${computerId}::uuid limit 1`);
+            return row?.provider ?? null;
         },
 
         async linkCustomer(userId, stripeCustomerId) {

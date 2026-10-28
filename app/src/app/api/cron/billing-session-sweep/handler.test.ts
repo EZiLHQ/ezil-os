@@ -53,7 +53,8 @@ function fixture(epochs = [epoch()], { sku = 'standard_monthly_v2', allowance = 
             e.userId === userId && (e.endedAt === null || Date.parse(e.endedAt) > since.getTime()))),
         openEpochsForSweep: vi.fn<BillingStore['openEpochsForSweep']>(async ({ limit }) => epochs.filter(e => e.endedAt === null).slice(0, limit)),
         closeEpoch: vi.fn<BillingStore['closeEpoch']>(async input => {
-            const open = epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
+            const open = epochs.find(e => e.computerId === input.computerId && e.endedAt === null
+                && (input.epochId === undefined || e.id === input.epochId));
             if (!open) return 'not_open';
             open.endedAt = isoSeconds(Math.max(epochSeconds(open.readyAt), epochSeconds(input.endedAt)));
             open.endReason = input.reason;
@@ -110,7 +111,7 @@ describe('billing session sweep', () => {
         expect(f.stop).not.toHaveBeenCalled();
         expect(await f.run(21600)).toEqual({ ...zeros, examined: 1, stopped: 1, closed: 1 });
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
-        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: ref.computerId, endedAt: at(21600), reason: 'session_max' });
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: ref.computerId, epochId: 'epoch', endedAt: at(21600), reason: 'session_max' });
     });
 
     it.each([null, iso(21600), iso(40000)])('late sweeps never extend the six-hour bound (deadline %s)', async deadlineAt => {
@@ -381,9 +382,21 @@ describe('round 3: stale AWS epochs and drain counts (D9/D6)', () => {
         const proof = vi.fn<NonNullable<SweepInput['awsStopProof']>>().mockResolvedValue({ running: false, stoppedAt: at(900) });
         expect(await run(f, 7200, proof)).toEqual({ ...zeros, examined: 1, closed: 1, awsStaleClosed: 1 });
         expect(proof).toHaveBeenCalledExactlyOnceWith(ref);
-        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer', endedAt: at(900), reason: 'provider_stop' });
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer', epochId: 'epoch', endedAt: at(900), reason: 'provider_stop' });
         expect(f.stop).not.toHaveBeenCalled();
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(900), endReason: 'provider_stop' });
+    });
+    it('closes only the epoch it examined: a newer generation opened meanwhile stays open', async () => {
+        const f = fixture([epoch({ lastHeartbeatAt: iso(600) })], { sku: 'premium_monthly_v3', allowance: 1_800_000 });
+        const proof = vi.fn<NonNullable<SweepInput['awsStopProof']>>(async () => {
+            // While the sweep reads the placement, the receipts close the old epoch and the restarted host opens the next one.
+            f.epochs[0]!.endedAt = iso(900); f.epochs[0]!.endReason = 'provider_stop';
+            f.epochs.push(epoch({ id: 'epoch-next', readyAt: iso(7000) }));
+            return { running: false, stoppedAt: at(900) };
+        });
+        expect(await run(f, 7200, proof)).toEqual({ ...zeros, examined: 1 });
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer', epochId: 'epoch', endedAt: at(900), reason: 'provider_stop' });
+        expect(f.epochs[1]).toMatchObject({ id: 'epoch-next', endedAt: null });
     });
     it.each([[null, 600], [at(-5), 600], [at(9000), 7200]] as const)('falls back to the last heartbeat, or bounds by now, when the stop time is %s', async (stoppedAt, endedAt) => {
         const f = fixture([epoch({ lastHeartbeatAt: iso(600) })], { sku: 'premium_monthly_v3', allowance: 1_800_000 });

@@ -51,7 +51,9 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore 
     openEpochsForSweep: BillingStore['openEpochsForSweep'] = async () => { throw new Error('Unused v2 store stub'); };
     policyClosedEpochsSince: BillingStore['policyClosedEpochsSince'] = async () => { throw new Error('Unused v2 store stub'); };
     closeEpoch: BillingStore['closeEpoch'] = async input => {
-        const epoch = this.epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
+        const epoch = this.epochs.find(e => e.computerId === input.computerId && e.endedAt === null
+            && (input.epochId === undefined || e.id === input.epochId)
+            && (input.readyBy === undefined || Date.parse(e.readyAt) <= Math.ceil(input.readyBy.getTime() / 1000) * 1000));
         if (!epoch) return 'not_open';
         epoch.endedAt = input.endedAt.toISOString();
         epoch.endReason = input.reason;
@@ -169,6 +171,8 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore 
         return [...this.grants.values()].filter(row => row.sourceType === sourceType && row.sourceId === sourceId);
     }
     async computerOwner(computerId: string) { return this.computers.get(computerId) ?? null; }
+    providers = new Map<string, string>();
+    async placementProvider(computerId: string) { return this.providers.get(computerId) ?? null; }
     async linkCustomer(userId: string, customer: string): Promise<'linked' | 'exists' | 'conflict'> {
         const owner = this.customers.get(customer);
         if (owner === userId) return 'exists';
@@ -905,13 +909,37 @@ describe('ingestUsageEvents', () => {
             expect(open).toHaveBeenCalledWith({ userId: 'user_local', computerId: 'computer_local',
                 subscriptionId: null, size: 'free-cf', readyAt: now, overheadSeconds: 0 });
             expect(touch).toHaveBeenCalledExactlyOnceWith('computer_local', new Date(now.getTime() + 60_000));
-            expect(close).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer_local',
+            expect(close).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer_local', readyBy: new Date(now.getTime() + 120_000),
                 endedAt: new Date(now.getTime() + 120_000), reason: expected });
             expect(store.epochs).toHaveLength(1);
             expect(store.epochs[0]).toMatchObject({ lastHeartbeatAt: new Date(now.getTime() + 60_000).toISOString(),
                 endedAt: new Date(now.getTime() + 120_000).toISOString(), endReason: expected });
             expect(store.intervals[0]).toMatchObject({ reason: reason ?? 'stop', source: 'start' });
         });
+
+    it('ignores a Worker stop for an AWS computer: its open epoch stays open (the AWS receipts own that close)', async () => {
+        const { store } = fixture();
+        store.providers.set('computer_local', 'aws-ec2');
+        await store.openEpoch({ userId: 'user_local', computerId: 'computer_local', subscriptionId: 'sub_local', size: 'std-2', readyAt: now, overheadSeconds: 0 });
+        const close = vi.spyOn(store, 'closeEpoch');
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        expect(await ingestUsageEvents([usage('stop', 60_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(close).not.toHaveBeenCalled();
+        expect(store.epochs[0]).toMatchObject({ size: 'std-2', endedAt: null });
+        expect(info).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ event: 'billing-usage-stop-ignored', computerId: 'computer_local',
+            at: new Date(now.getTime() + 60_000).toISOString(), provider: 'aws-ec2' }));
+        // A Cloudflare computer's Worker stop still closes its epoch.
+        store.providers.set('computer_local', 'cloudflare');
+        expect(await ingestUsageEvents([usage('stop', 60_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(store.epochs[0]?.endedAt).toBe(new Date(now.getTime() + 60_000).toISOString());
+    });
+
+    it('a Worker stop stamped before the open epoch became ready never closes it', async () => {
+        const { store } = fixture();
+        await ingestUsageEvents([usage('start', 120_000)], { store });
+        expect(await ingestUsageEvents([usage('stop', 60_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(store.epochs[0]?.endedAt).toBeNull();
+    });
 
     it('accepts a concurrent v2 start and preserves the existing v1 interval behavior', async () => {
         const { store } = fixture();
