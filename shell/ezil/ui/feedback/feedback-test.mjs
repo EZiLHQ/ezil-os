@@ -21,7 +21,8 @@ window.HTMLDialogElement.prototype.close = function () { this.open = false; this
 
 const computerId = '11111111-1111-4111-8111-111111111111';
 const reportId = '22222222-2222-4222-8222-222222222222';
-window.__EZIL_BOOT__ = { computer: { id: computerId }, user: { email: 'BOOT_SECRET@example.test' },
+const accountId = '33333333-3333-4333-8333-333333333333';
+window.__EZIL_BOOT__ = { computer: { id: computerId }, user: { id: accountId, email: 'BOOT_SECRET@example.test' },
     desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true } } };
 globalThis.ezil = { version: '1' };
 document.cookie = '__Host-ezil-os-auth=SECRET; Secure; Path=/';
@@ -34,11 +35,13 @@ const captureCalls = [];
 const captureOptions = [];
 const editorOptions = [];
 let supported = true;
+let desktopSupported = true;
 let nextCanvas = () => Promise.resolve(document.createElement('canvas'));
 const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJx8AAAAASUVORK5CYII=', 'base64');
 let editorResult = () => ({ blob: new window.Blob([imageBytes], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
 globalThis.__feedbackCapture = {
     supported: () => supported,
+    desktopSupported: () => desktopSupported,
     capture: (kind, options) => {
         captureCalls.push(kind);
         captureOptions.push(options);
@@ -57,6 +60,7 @@ const editorUrl = new URL('./redact-editor.js', import.meta.url).href;
 const hooks = registerHooks({ load (url, context, next) {
     if ( url === captureUrl ) return { format: 'module', shortCircuit: true, source: `
         export const tab_capture_supported = () => globalThis.__feedbackCapture.supported();
+        export const desktop_capture_supported = () => globalThis.__feedbackCapture.desktopSupported();
         export const capture_shell_snapshot = options => globalThis.__feedbackCapture.capture('shell', options);
         export const capture_tab_frame = options => globalThis.__feedbackCapture.capture('tab', options);
         export const capture_desktop_frame = options => globalThis.__feedbackCapture.capture('desktop', options);` };
@@ -78,17 +82,23 @@ assert.ok(log.ringBuffer().some(entry => entry.msg.includes('LOG_SECRET')));
 const readRing = log.ringBuffer;
 log.ringBuffer = () => { throw new Error('Feedback must not read the log ring'); };
 Object.defineProperty(document, 'cookie', { configurable: true, get () { throw new Error('cookie read'); } });
-Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, get () { throw new Error('boot user read'); } });
+// Only the opaque account id may be read (it keys the local draft); every other user field throws.
+Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: Object.defineProperties({}, {
+    id: { enumerable: true, value: accountId },
+    email: { enumerable: true, get () { throw new Error('boot user email read'); } },
+    name: { enumerable: true, get () { throw new Error('boot user name read'); } },
+}) });
 Object.defineProperty(iframe, 'src', { configurable: true, get () { throw new Error('iframe src read'); } });
 for ( let i = 0; i < 60; i++ ) telemetry.capture({ eventClass: 'api_failure', site: 's'.repeat(96), code: 'failure', detail: 'EVENT_SECRET@example.test' });
 const trace = beginTrace('desktop');
 trace.step('display');
 
 const calls = [];
+let flushing = false;
 let respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
 globalThis.fetch = window.fetch = (url, options) => {
     if ( options.method === 'POST' ) {
-        assert.equal(options.body, document.querySelector('.ezil-feedback-preview pre').textContent, 'preview is the exact request body at dispatch');
+        if ( ! flushing ) assert.equal(options.body, document.querySelector('.ezil-feedback-preview pre').textContent, 'preview is the exact request body at dispatch');
         feedbackSubmitSchema.parse(JSON.parse(options.body));
     }
     calls.push({ url, ...options });
@@ -110,6 +120,10 @@ const change = (name, checked) => { form().elements[name].checked = checked; for
 const send = () => form().dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
 const close = () => current().querySelector('[data-action="cancel"]').click();
 const open = () => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'pill' }); };
+const draftKey = `ezil:feedback:draft:v1:${accountId}`;
+const outboxKey = `ezil:feedback:outbox:v1:${accountId}`;
+const stored = key => JSON.parse(window.localStorage.getItem(key) ?? 'null');
+const setOnline = value => Object.defineProperty(window.navigator, 'onLine', { configurable: true, get: () => value });
 
 try {
     await check('secret scan kinds, exact offsets, repeatability and harmless text', () => {
@@ -159,7 +173,7 @@ try {
         vitals.remove();
         document.body.classList.remove('device-phone');
     });
-    await check('chip mounts once and follows visible fullbleed windows and hidden ancestors', async () => {
+    await check('chip mounts once; stays reachable (compact) in a visible fullbleed window while the pill is off', async () => {
         feedback.mount_feedback_chip(); feedback.mount_feedback_chip();
         assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1);
         const chip = document.querySelector('.ezil-feedback-chip');
@@ -168,16 +182,26 @@ try {
         parent.innerHTML = '<div class="window ezil-fullbleed"></div>';
         document.body.append(parent);
         await tick();
-        assert.equal(chip.style.display, 'none');
+        assert.notEqual(chip.style.display, 'none', 'no pill: the chip is the only Feedback entry in fullbleed');
+        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), true);
+        assert.equal(window.getComputedStyle(chip.querySelector('span')).display, 'none', 'icon only in the control strip');
         assert.equal(build_diagnostics().fullbleed, true);
+        // With the floating-controls pill on, the pill offers Feedback and the chip steps aside.
+        window.__EZIL_BOOT__.desktopState.ui.floatingControls = true;
+        parent.firstChild.setAttribute('style', 'x: 1');
+        await tick();
+        assert.equal(chip.style.display, 'none');
+        delete window.__EZIL_BOOT__.desktopState.ui.floatingControls;
         parent.style.display = 'none';
         await tick();
         assert.notEqual(chip.style.display, 'none');
+        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), false);
         assert.equal(build_diagnostics().fullbleed, false);
         parent.style.display = '';
         parent.firstChild.classList.remove('ezil-fullbleed');
         await tick();
         assert.notEqual(chip.style.display, 'none');
+        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), false);
         parent.remove();
     });
     await check('native dialog semantics, default-off consent, live preview, no pre-submit request', () => {
@@ -212,8 +236,8 @@ try {
         assert.equal(calls[0].credentials, 'same-origin');
         send(); assert.equal(calls.length, 1);
         resolve({ status: 429, json: async () => ({ error: 'rate_limited' }) });
-        await until(() => status().includes("You've sent a lot"));
-        assert.equal(status(), "You've sent a lot of reports recently — try again later.");
+        await until(() => status().includes("You've sent several"));
+        assert.equal(status(), "You've sent several reports this hour — try again later.");
         assert.equal(form().elements.description.value, 'The desktop froze.');
         respond = async () => ({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: false }) });
         send();
@@ -278,6 +302,92 @@ try {
         current().dispatchEvent(new window.Event('cancel', { cancelable: true }));
         assert.equal(current(), null);
         assert.equal(document.activeElement.id, 'opener');
+    });
+    await check('a send that got no answer is kept and re-sent once, byte-for-byte, on `online`', async () => {
+        const queued = stored(outboxKey);
+        assert.equal(queued.length, 1, '400/413 were dropped; only the unanswered send is queued');
+        const sentBefore = calls.filter(c => c.method === 'POST').at(-1).body;
+        assert.equal(queued[0].body, sentBefore, 'the queued body is exactly what was last sent');
+        assert.equal(JSON.parse(queued[0].body).clientRequestId, queued[0].clientRequestId);
+        assert.equal(stored(draftKey).clientRequestId, queued[0].clientRequestId, 'the draft keeps the same id');
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        window.dispatchEvent(new window.Event('online'));
+        await until(() => stored(outboxKey) === null);
+        assert.equal(calls.length, count + 1, 'exactly one request on reconnect');
+        assert.equal(calls.at(-1).body, sentBefore);
+        assert.equal(stored(draftKey), null, 'a confirmed send clears its draft');
+        window.dispatchEvent(new window.Event('online')); await tick();
+        assert.equal(calls.length, count + 1, 'nothing left to resend');
+        flushing = false;
+    });
+    await check('offline submit says so, keeps the open form, and completes it on reconnect', async () => {
+        open(); setDescription('Sent while offline');
+        const id = payload().clientRequestId;
+        const body = current().querySelector('pre').textContent;
+        setOnline(false);
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => /offline/.test(status()));
+        assert.equal(status(), "You're offline. Your report is saved and will be sent when you're back online.");
+        assert.equal(form().elements.description.value, 'Sent while offline');
+        // Still offline: an `online` from a flaky link must not spray requests.
+        let count = calls.length;
+        await feedback.flush_feedback_outbox();
+        assert.equal(calls.length, count);
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        count = calls.length;
+        window.dispatchEvent(new window.Event('online'));
+        await until(() => /Thanks — we got it/.test(status()));
+        flushing = false;
+        assert.equal(calls.length, count + 1);
+        assert.equal(calls.at(-1).body, body);
+        assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id);
+        assert.equal(current().querySelector('[type="submit"]').hidden, true);
+        assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
+        close();
+    });
+    await check('a definitive refusal is not retried and keeps the text for editing', async () => {
+        open(); setDescription('Refused report');
+        respond = async () => ({ status: 415 });
+        send(); await until(() => ! current().querySelector('[type="submit"]').disabled);
+        assert.equal(stored(outboxKey), null);
+        close();
+        open();
+        assert.equal(form().elements.description.value, 'Refused report');
+        const count = calls.length;
+        window.dispatchEvent(new window.Event('online')); await tick();
+        assert.equal(calls.length, count);
+        setDescription('');
+        assert.equal(stored(draftKey), null, 'an emptied form leaves no draft behind');
+        close();
+    });
+    await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
+        open(); setDescription('Half-written report'); change('diagnostics', true);
+        form().elements.category.value = 'idea';
+        form().querySelector('input[value="idea"]').dispatchEvent(new window.Event('change', { bubbles: true }));
+        const id = payload().clientRequestId;
+        close();
+        open();
+        assert.equal(form().elements.description.value, 'Half-written report');
+        assert.equal(form().elements.category.value, 'idea');
+        assert.equal(payload().clientRequestId, id);
+        assert.equal(form().elements.diagnostics.checked, false, 'consent is never remembered');
+        close();
+        for ( let i = 0; i < window.localStorage.length; i++ ) {
+            const key = window.localStorage.key(i);
+            assert.doesNotMatch(key + window.localStorage.getItem(key), /SECRET|example\.test|@/);
+        }
+        const user = window.__EZIL_BOOT__.user;
+        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { id: '44444444-4444-4444-8444-444444444444' } });
+        open();
+        assert.equal(form().elements.description.value, '', 'another account on this browser sees nothing');
+        assert.notEqual(payload().clientRequestId, id);
+        close();
+        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: user });
+        open(); setDescription(''); close();
     });
     await check('teardown and navigation close the form, abort pending captures and leave Back unhandled', async () => {
         const count = calls.length;
@@ -351,8 +461,9 @@ try {
         assert.equal(current(), null);
         editorResult = originalEditor;
         open();
-        assert.equal(form().elements.description.value, '');
-        assert.equal(payload().screenshot, null);
+        assert.equal(form().elements.description.value, 'Keep this draft', 'the text draft survives closing the form');
+        assert.equal(payload().screenshot, null, 'a screenshot is never part of the saved draft');
+        setDescription('');
         close();
     });
     await check('closing during submission is truthful and late success cannot change a new draft', async () => {
@@ -376,6 +487,11 @@ try {
     await check('screenshot and tab support flags hide unavailable controls; disabled feedback stays dark', async () => {
         supported = false;
         open(); assert.equal(current().querySelector('[data-capture="tab"]'), null); close();
+        desktopSupported = false;
+        open(); change('screenshot', true);
+        assert.equal(current().querySelector('[data-capture="desktop"]'), null, 'no registered desktop frame: no dead "Capture the desktop"');
+        assert.notEqual(current().querySelector('[data-capture="shell"]'), null);
+        close();
         window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false;
         open(); assert.equal(form().elements.screenshot, undefined); close();
         delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
@@ -439,6 +555,16 @@ try {
         await until(() => ! pane.querySelector('.ezil-feedback-reports li'));
         assert.equal(calls.at(-1).method, 'DELETE');
         assert.match(pane.textContent, /database backups expire on their own schedule/);
+        // A send from the dialog refreshes the already-loaded list ("Your reports").
+        entry.click(); setDescription('Shows up in Your reports');
+        respond = async (url, options) => options.method === 'POST'
+            ? { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) }
+            : { status: 200, ok: true, json: async () => ({ reports: [{ id: reportId, category: 'bug', createdAt: '2026-10-28',
+                descriptionPreview: 'Shows up in Your reports', hasScreenshot: false, status: 'new' }] }) };
+        send();
+        await until(() => /Shows up in Your reports/.test(pane.querySelector('[data-role="feedback-reports"]').textContent));
+        assert.equal(calls.at(-1).method, 'GET');
+        close();
         delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
         troubleshoot.onActivate($pane);
         assert.equal(pane.querySelector('[data-action="report-problem"]'), null);

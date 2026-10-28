@@ -165,3 +165,14 @@ test('cancellation removes the listener and stale replies cannot complete a late
     assert.equal(await next, blob);
     assert.equal(h.listeners.size, 0);
 });
+
+test('a capture target counts as registered only while its iframe is attached (round-3 F4)', async t => {
+    const h = await harness(t);
+    assert.equal(h.capture_target_registered(), false, 'nothing registered by default');
+    h.register_capture_target(h.iframe, origin);
+    assert.equal(h.capture_target_registered(), true);
+    h.iframe.remove();
+    assert.equal(h.capture_target_registered(), false, 'a detached frame is not a target');
+    h.register_capture_target(null, '');
+    assert.equal(h.capture_target_registered(), false);
+});

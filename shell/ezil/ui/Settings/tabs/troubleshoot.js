@@ -389,6 +389,7 @@ async function loadReports ($win) {
     const host = $win.find('[data-role="feedback-reports"]')[0];
     if ( ! host ) return;
     host.textContent = 'Loading your reports…';
+    host.dataset.loaded = '1';
     try {
         const reports = await list_my_reports();
         if ( ! host.isConnected || ! feedback_enabled() ) return;
@@ -441,6 +442,15 @@ function bind ($win) {
             if ( feedback_enabled() ) open_feedback_dialog({ source: 'troubleshoot' });
         })
         .on('click', '[data-action="load-reports"]', () => { void loadReports($win); });
+    // A report sent from anywhere (chip, this pane, or a queued resend on
+    // reconnect) shows up in an already-loaded "Your reports" list. Loading
+    // stays explicit: an unloaded list is left alone.
+    const body = $win.find('[data-role="troubleshoot-body"]')[0];
+    const onSent = () => {
+        if ( ! body?.isConnected ) { window.removeEventListener('ezil:feedback-sent', onSent); return; }
+        if ( $win.find('[data-role="feedback-reports"]')[0]?.dataset.loaded ) void loadReports($win);
+    };
+    window.addEventListener('ezil:feedback-sent', onSent);
 }
 
 export default {

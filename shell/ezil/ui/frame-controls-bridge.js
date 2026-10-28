@@ -17,6 +17,18 @@ export function register_capture_target (iframe, origin) {
     capture_target = { iframe, origin };
 }
 
+/**
+ * True only while a desktop frame has registered itself as a capture target
+ * and is still in the document. Feedback offers "Capture the desktop" only
+ * then (round-3 F4): in a build without the floating-controls frame lane
+ * nothing registers, and a button that can only time out is not offered.
+ * @returns {boolean}
+ */
+export function capture_target_registered () {
+    const iframe = capture_target?.iframe;
+    return !!(iframe && iframe.isConnected !== false && iframe.contentWindow);
+}
+
 /** @returns {Promise<Blob|null>} */
 export async function request_frame_capture ({ timeoutMs = 4000, signal } = {}) {
     if (signal?.aborted) return null;

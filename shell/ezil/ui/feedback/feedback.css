@@ -100,3 +100,19 @@
     .ezil-feedback-dialog button, .ezil-feedback-dialog summary,
     .ezil-feedback-consent, .ezil-feedback-category label { min-height: 44px; }
 }
+/* Full-bleed desktop (round 3, plan §6.8): without the floating-controls pill
+ * the chip is the only Feedback entry, so it stays — icon only, inside the
+ * top control strip (`--ezil-control-strip-height` in ezil-shell.css: 43px,
+ * 59px under `pointer: coarse`) so it never covers the stream. */
+.ezil-feedback-chip.ezil-feedback-chip-fullbleed {
+    top: 4px;
+    width: 34px;
+    min-width: 34px;
+    min-height: 34px;
+    height: 34px;
+    padding: 6px;
+}
+.ezil-feedback-chip.ezil-feedback-chip-fullbleed span { display: none; }
+@media (pointer: coarse) {
+    .ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 7px; width: 44px; min-width: 44px; min-height: 44px; height: 44px; }
+}

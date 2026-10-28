@@ -2,14 +2,20 @@
 // Wire/API signatures are pinned in docs/FEEDBACK-CONTROLS-CONTRACT.md.
 import { build_diagnostics } from './diagnostics.js';
 import { scan } from './secret-scan.js';
-import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame } from './capture.js';
+import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
 import { open_redact_editor } from './redact-editor.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
     + '<path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V6a2 2 0 0 1 2-2Z"/><path d="M7 9h10M7 13h7"/></svg>';
+const CATEGORIES = ['bug', 'idea', 'other'];
+const DRAFT_KEY = 'ezil:feedback:draft:v1:';
+const OUTBOX_KEY = 'ezil:feedback:outbox:v1:';
+const OUTBOX_MAX = 10;
 let chipObserver = null;
 let activeDialog = null;
+let onlineListening = false;
+const inflight = new Set();
 
 function unmount_feedback_chip () {
     chipObserver?.disconnect();
@@ -18,6 +24,8 @@ function unmount_feedback_chip () {
     window.removeEventListener('ezil:teardown', unmount_feedback_chip);
     window.removeEventListener('pagehide', suspend_feedback_chip);
     window.removeEventListener('pageshow', mount_feedback_chip);
+    window.removeEventListener('online', flush_feedback_outbox);
+    onlineListening = false;
 }
 
 function suspend_feedback_chip () {
@@ -30,6 +38,132 @@ function endpoint () { return globalThis.window?.__EZIL_BOOT__?.desktopState?.en
 
 /** @returns {boolean} true when the boot payload exposes endpoints.feedback */
 export function feedback_enabled () { return !! endpoint(); }
+
+// ── Per-account local state (round 3) ─────────────────────────────────────
+// The DRAFT is what the form holds (category, description and its stable
+// clientRequestId); it survives closing the dialog and is cleared only by a
+// confirmed send. The OUTBOX holds the exact request bodies the user already
+// submitted that have not been confirmed; each is re-sent byte-for-byte (same
+// clientRequestId, so the server answers a replay with 200 and never stores a
+// second row) on the `online` event and when the shell next mounts. Keyed by
+// the account id only — never the email — and never sent anywhere.
+function account_id () {
+    try {
+        const id = window.__EZIL_BOOT__?.user?.id;
+        return typeof id === 'string' && UUID.test(id) ? id.toLowerCase() : null;
+    } catch { return null; }
+}
+
+function store () {
+    try { return window.localStorage ?? null; } catch { return null; }
+}
+
+function read_json (prefix) {
+    const id = account_id(), s = store();
+    if ( ! id || ! s ) return null;
+    try { return JSON.parse(s.getItem(prefix + id) ?? 'null'); } catch { return null; }
+}
+
+function write_json (prefix, value) {
+    const id = account_id(), s = store();
+    if ( ! id || ! s ) return;
+    try {
+        if ( value === null ) s.removeItem(prefix + id);
+        else s.setItem(prefix + id, JSON.stringify(value));
+    } catch { /* Storage is a convenience: full, blocked or private mode only loses the draft. */ }
+}
+
+function read_draft () {
+    const d = read_json(DRAFT_KEY);
+    if ( ! d || typeof d !== 'object' || typeof d.clientRequestId !== 'string' || ! UUID.test(d.clientRequestId) ) return null;
+    return { clientRequestId: d.clientRequestId, category: CATEGORIES.includes(d.category) ? d.category : 'bug',
+        description: typeof d.description === 'string' ? d.description.slice(0, 4000) : '' };
+}
+
+/** @param {{clientRequestId:string,category:string,description:string}|null} draft */
+function write_draft (draft) {
+    write_json(DRAFT_KEY, draft && draft.description.trim() ? draft : null);
+}
+
+function read_outbox () {
+    const list = read_json(OUTBOX_KEY);
+    if ( ! Array.isArray(list) ) return [];
+    return list.filter(entry => {
+        if ( ! entry || typeof entry.body !== 'string' || typeof entry.clientRequestId !== 'string' ) return false;
+        try { return JSON.parse(entry.body)?.clientRequestId === entry.clientRequestId; } catch { return false; }
+    }).slice(-OUTBOX_MAX);
+}
+
+function outbox_put (clientRequestId, body) {
+    const list = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId);
+    list.push({ clientRequestId, body });
+    write_json(OUTBOX_KEY, list.slice(-OUTBOX_MAX));
+}
+
+function outbox_remove (clientRequestId) {
+    const list = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId);
+    write_json(OUTBOX_KEY, list.length ? list : null);
+}
+
+function listen_online () {
+    if ( onlineListening ) return;
+    onlineListening = true;
+    window.addEventListener('online', flush_feedback_outbox);
+}
+
+/** A send that did not reach a definitive answer: kept and retried with the same body. */
+function retryable (status) { return status === 0 || status === 408 || status >= 500; }
+
+/**
+ * POST one submitted body and settle the local state from the answer. Never
+ * throws; resolves `{ status, data }` (status 0 = no response).
+ */
+async function deliver (clientRequestId, body) {
+    if ( inflight.has(clientRequestId) ) return { status: -1, data: null };
+    inflight.add(clientRequestId);
+    let status = 0, data = null;
+    try {
+        // The exact, visible preview string is also the request body.
+        const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body });
+        status = response.status;
+        if ( status === 200 || status === 201 ) {
+            data = await response.json();
+            if ( typeof data?.id !== 'string' || ! UUID.test(data.id) ) { status = 0; data = null; }
+        }
+    } catch { status = 0; data = null; } finally {
+        inflight.delete(clientRequestId);
+    }
+    if ( data ) {
+        outbox_remove(clientRequestId);
+        if ( read_draft()?.clientRequestId === clientRequestId ) write_draft(null);
+        window.dispatchEvent(new window.CustomEvent('ezil:feedback-sent', { detail: { clientRequestId, id: data.id,
+            screenshotAccepted: data.screenshotAccepted } }));
+    } else if ( retryable(status) ) {
+        listen_online();
+    } else {
+        // A definitive refusal (400/401/404/413/415/429): stop retrying, and
+        // put the text back in the draft so it is not lost with the dialog.
+        outbox_remove(clientRequestId);
+        if ( ! read_draft() ) {
+            try {
+                const sent = JSON.parse(body);
+                write_draft({ clientRequestId, category: CATEGORIES.includes(sent.category) ? sent.category : 'bug',
+                    description: String(sent.description ?? '').slice(0, 4000) });
+            } catch { /* An unreadable body has nothing to restore. */ }
+        }
+    }
+    return { status, data };
+}
+
+/** Re-send every submitted-but-unconfirmed report, once each, in order. */
+export async function flush_feedback_outbox () {
+    if ( ! feedback_enabled() || navigator.onLine === false ) return;
+    for ( const entry of read_outbox() ) {
+        const { status } = await deliver(entry.clientRequestId, entry.body);
+        if ( status === 0 ) break; // Still offline or unreachable: wait for the next `online`.
+    }
+}
 
 function fullbleed_visible () {
     return [...document.querySelectorAll('.window.ezil-fullbleed')].some(el => {
@@ -55,8 +189,14 @@ export function mount_feedback_chip () {
         document.body.append(chip);
     }
     const sync = () => {
-        const display = ! feedback_enabled() || fullbleed_visible() ? 'none' : '';
+        // Without the floating-controls pill the chip is the only way to reach
+        // Feedback from a full-bleed desktop, so it stays, compact, in the
+        // top control strip (plan §6.8). With the pill on, the pill offers it.
+        const fullbleed = fullbleed_visible();
+        const pill = window.__EZIL_BOOT__?.desktopState?.ui?.floatingControls === true;
+        const display = ! feedback_enabled() || (fullbleed && pill) ? 'none' : '';
         if ( chip.style.display !== display ) chip.style.display = display;
+        if ( chip.classList.contains('ezil-feedback-chip-fullbleed') !== fullbleed ) chip.classList.toggle('ezil-feedback-chip-fullbleed', fullbleed);
     };
     chipObserver?.disconnect();
     chipObserver = new MutationObserver(sync);
@@ -65,6 +205,9 @@ export function mount_feedback_chip () {
     window.addEventListener('ezil:teardown', unmount_feedback_chip);
     window.addEventListener('pagehide', suspend_feedback_chip);
     sync();
+    // A report submitted while offline (or before the tab closed) goes now.
+    listen_online();
+    if ( read_outbox().length ) void flush_feedback_outbox();
 }
 
 function read_blob (blob, signal) {
@@ -86,7 +229,7 @@ function read_blob (blob, signal) {
 }
 
 function error_copy (status) {
-    if ( status === 429 ) return "You've sent a lot of reports recently — try again later.";
+    if ( status === 429 ) return "You've sent several reports this hour — try again later.";
     if ( status === 413 ) return 'This report is too large. Remove the screenshot and try again.';
     if ( status === 400 ) return 'This report could not be accepted. Check the description or remove the screenshot and try again.';
     if ( status === 401 ) return 'Your session expired — sign in again to send feedback.';
@@ -99,7 +242,9 @@ export function open_feedback_dialog (_opts) {
     if ( ! feedback_enabled() ) return;
     if ( activeDialog?.isConnected ) { activeDialog.focus(); return; }
     const opener = document.activeElement;
-    const clientRequestId = crypto.randomUUID();
+    const draft = read_draft();
+    const clientRequestId = draft?.clientRequestId ?? crypto.randomUUID();
+    const waiting = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId && ! inflight.has(entry.clientRequestId)).length;
     const computer = window.__EZIL_BOOT__?.computer?.id;
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
@@ -126,7 +271,7 @@ export function open_feedback_dialog (_opts) {
                     <div class="ezil-feedback-actions">
                         <button type="button" data-capture="shell">Capture EZiL OS window</button>
                         ${tab_capture_supported() ? '<button type="button" data-capture="tab">Capture what I see</button>' : ''}
-                        <button type="button" data-capture="desktop">Capture the desktop</button>
+                        ${desktop_capture_supported() ? '<button type="button" data-capture="desktop">Capture the desktop</button>' : ''}
                     </div>
                     <div class="ezil-feedback-image" hidden>
                         <img alt="Screenshot to include with this report">
@@ -134,7 +279,8 @@ export function open_feedback_dialog (_opts) {
                     </div>
                 </section>` : ''}
             </fieldset>
-            <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre></details>
+            <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre>
+                <p class="ezil-feedback-muted">EZiL also records which version of EZiL OS received the report.</p></details>
             <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
             <div class="ezil-feedback-actions">
                 <button type="button" data-action="cancel">Cancel</button>
@@ -161,6 +307,32 @@ export function open_feedback_dialog (_opts) {
     let closed = false;
     let restoreCapture = null;
     let captureController = null;
+    if ( draft ) {
+        description.value = draft.description;
+        for ( const radio of form.elements.category ) radio.checked = radio.value === draft.category;
+    }
+
+    function save_draft () {
+        if ( sent || closed ) return;
+        write_draft({ clientRequestId, category: form.elements.category.value, description: description.value });
+    }
+
+    function show_sent (data) {
+        sent = true;
+        fields.hidden = true;
+        dialog.querySelector('.ezil-feedback-preview').hidden = true;
+        submit.hidden = true;
+        cancel.textContent = 'Close';
+        result.textContent = `Thanks — we got it. Report ID: ${data.id}.`
+            + (data.screenshotAccepted === false ? " Your image wasn't stored." : '');
+        cancel.focus();
+    }
+    // A queued copy of THIS report went through on reconnect.
+    function on_sent (event) {
+        if ( closed || sent || sending || event.detail?.clientRequestId !== clientRequestId ) return;
+        show_sent(event.detail);
+    }
+    window.addEventListener('ezil:feedback-sent', on_sent);
 
     function cancel_capture () {
         ++captureGeneration;
@@ -276,8 +448,8 @@ export function open_feedback_dialog (_opts) {
     screenshotConsent?.addEventListener('change', () => {
         if ( ! screenshotConsent.checked ) { cancel_capture(); clear_screenshot(); }
     });
-    form.addEventListener('input', refresh);
-    form.addEventListener('change', refresh);
+    form.addEventListener('input', () => { refresh(); save_draft(); });
+    form.addEventListener('change', () => { refresh(); save_draft(); });
     form.addEventListener('submit', async event => {
         event.preventDefault();
         if ( sending || sent || capturing || closed ) return;
@@ -289,34 +461,30 @@ export function open_feedback_dialog (_opts) {
         submit.disabled = true;
         cancel.textContent = 'Close';
         result.textContent = 'Sending… Closing this window does not cancel the report.';
+        // From here the report belongs to the outbox, not the draft: closing
+        // the dialog no longer discards it, and a failure that never got an
+        // answer is re-sent with this same body when the connection returns.
+        const body = serialized;
+        outbox_put(clientRequestId, body);
+        write_draft(null);
+        let outcome;
         try {
-            // The exact, visible preview string is also the request body.
-            const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
-                headers: { 'Content-Type': 'application/json' }, body: serialized });
-            if ( closed ) return;
-            if ( response.status !== 201 && response.status !== 200 ) {
-                result.textContent = error_copy(response.status);
-                return;
-            }
-            const data = await response.json();
-            if ( typeof data.id !== 'string' || ! UUID.test(data.id) ) throw new Error('invalid_response');
-            if ( closed ) return;
-            sent = true;
-            fields.hidden = true;
-            dialog.querySelector('.ezil-feedback-preview').hidden = true;
-            submit.hidden = true;
-            cancel.textContent = 'Close';
-            result.textContent = `Feedback sent. Report ID: ${data.id}.`
-                + (data.screenshotAccepted === false ? " Your image wasn't stored." : '');
-            cancel.focus();
-        } catch {
-            if ( ! closed ) result.textContent = error_copy(0);
+            outcome = await deliver(clientRequestId, body);
         } finally {
             sending = false;
             fields.disabled = false;
-            if ( ! sent ) cancel.textContent = 'Cancel';
-            refresh();
         }
+        if ( closed ) return;
+        if ( outcome.data ) { show_sent(outcome.data); return; }
+        cancel.textContent = 'Cancel';
+        save_draft();
+        if ( outcome.status === -1 ) result.textContent = 'This report is already being sent.';
+        else if ( retryable(outcome.status) ) {
+            result.textContent = navigator.onLine === false
+                ? "You're offline. Your report is saved and will be sent when you're back online."
+                : error_copy(outcome.status) + " We'll also send it automatically when your connection comes back.";
+        } else result.textContent = error_copy(outcome.status);
+        refresh();
     });
 
     function cleanup () {
@@ -324,6 +492,7 @@ export function open_feedback_dialog (_opts) {
         closed = true;
         cancel_capture();
         for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.removeEventListener(type, close);
+        window.removeEventListener('ezil:feedback-sent', on_sent);
         clear_screenshot();
         dialog.remove();
         if ( activeDialog === dialog ) activeDialog = null;
@@ -335,6 +504,9 @@ export function open_feedback_dialog (_opts) {
     dialog.addEventListener('close', cleanup);
     for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.addEventListener(type, close);
     refresh();
+    if ( waiting ) result.textContent = waiting === 1
+        ? 'One earlier report is waiting to be sent. It will go when you are back online.'
+        : `${waiting} earlier reports are waiting to be sent. They will go when you are back online.`;
     dialog.showModal();
     description.focus();
 }

@@ -47,10 +47,12 @@ const editorSource = await readFile(new URL('./redact-editor.js', import.meta.ur
 const editorUrl = module_url(editorSource);
 const { fit_long_edge, flatten, encode_under_limit, open_redact_editor } = await import(editorUrl);
 let requestFrame = async () => null;
+let targetRegistered = false;
 let snapshotDom = async () => { throw new Error('Not configured'); };
 globalThis.__feedbackCaptureTestDoubles = {
     snapdom: (...args) => snapshotDom(...args),
     request_frame_capture: (...args) => requestFrame(...args),
+    capture_target_registered: () => targetRegistered,
 };
 // Replace only imports, leaving the production implementation intact. This also
 // keeps the concurrently written bridge out of unit-test state and timing.
@@ -58,10 +60,12 @@ const rawCaptureSource = await readFile(new URL('./capture.js', import.meta.url)
 const captureSource = rawCaptureSource
     .replace("const load_snapdom = () => (snapdom_loading ??= import(SNAPDOM_PATH()).then((m) => m.snapdom));",
         'const load_snapdom = async () => globalThis.__feedbackCaptureTestDoubles.snapdom;')
-    .replace("import { request_frame_capture } from '../frame-controls-bridge.js';",
-        'const { request_frame_capture } = globalThis.__feedbackCaptureTestDoubles;')
+    .replace("import { capture_target_registered, request_frame_capture } from '../frame-controls-bridge.js';",
+        'const { capture_target_registered, request_frame_capture } = globalThis.__feedbackCaptureTestDoubles;')
     .replace("'./redact-editor.js'", JSON.stringify(editorUrl));
-const { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame } = await import(module_url(captureSource));
+assert.notEqual(captureSource, rawCaptureSource, 'the bridge import was replaced');
+assert.doesNotMatch(captureSource, /frame-controls-bridge/);
+const { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } = await import(module_url(captureSource));
 
 function canvas (width = 800, height = 600) {
     const result = document.createElement('canvas');
@@ -260,6 +264,14 @@ await test('video fallback captures a loaded frame and removes video on success 
         else { assert.equal(result.width, 640); assert.equal(result.height, 360); }
         all_stopped(stream); assert.equal(document.querySelector('video'), null);
     }
+});
+
+await test('tier C is offered only while the bridge has a registered target (round-3 F4)', () => {
+    targetRegistered = false;
+    assert.equal(desktop_capture_supported(), false);
+    targetRegistered = true;
+    assert.equal(desktop_capture_supported(), true);
+    targetRegistered = false;
 });
 
 await test('tier C passes 4000ms, handles null/rejection, decodes blob and closes bitmap', async () => {

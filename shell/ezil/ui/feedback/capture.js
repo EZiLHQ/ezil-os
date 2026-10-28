@@ -1,5 +1,5 @@
 // One-shot feedback captures. Raw canvases must pass through the redaction editor.
-import { request_frame_capture } from '../frame-controls-bridge.js';
+import { capture_target_registered, request_frame_capture } from '../frame-controls-bridge.js';
 import { fit_long_edge } from './redact-editor.js';
 
 // snapdom (~260 KB, shell/src/lib/snapdom-3.3.4) is NOT bundled: the shell's
@@ -218,6 +218,11 @@ export async function capture_tab_frame ({ hide, signal } = {}) {
         if (stream) stop(stream);
         try { if (typeof restore === 'function') restore(); } catch { /* Capture stays non-throwing. */ }
     }
+}
+
+/** Tier C is offered only while a desktop frame is registered (round-3 F4). */
+export function desktop_capture_supported () {
+    return capture_target_registered();
 }
 
 /** Tier C: cooperative in-frame capture of the remote desktop. */
