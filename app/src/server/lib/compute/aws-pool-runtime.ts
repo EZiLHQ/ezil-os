@@ -3,7 +3,9 @@ import { sharedAwsSdkCollaborators } from './aws-clients';
 import type { Env } from './aws-config';
 import { isAwsComputersEnabled } from './aws-config';
 import { buildLifecycleWork, readLifecycleDeployments } from './aws-intent';
-import { lockPoolClaimPlacement, savePoolEnrollmentNonce, readPoolMigrationReservations, type PlacementDb } from './placement';
+import { lockPoolClaimPlacement, savePoolEnrollmentNonce, readPoolMigrationReservations, type Placement, type PlacementDb, type PlacementExecutor } from './placement';
+import { instanceVcpu } from './aws-config';
+import { admissionDryRun } from './admission';
 import * as poolModule from './ready-pool';
 import type { PoolClaimDeps } from './aws-pool-claim';
 import { PoolCapacityPressure, poolGuard } from './aws-pool-errors';
@@ -14,6 +16,42 @@ import { withPoolReplenishLock, type PoolDispatchStore, type PoolReplenishDeps }
 import { createPoolDispatchStore } from './aws-pool-dispatch';
 import { runPoolReplenish } from './aws-pool-replenish';
 import type { PoolDeps } from './aws-receipts';
+/**
+ * vCPU above the region cap, counted the ONE way pool opens and the round-3 switch preflight
+ * both use: live placements plus every unretired pool host not bound to one (spares count),
+ * other active demands, and two vCPU per migration reservation. `releaseVcpu` is a running
+ * computer that stops before the boot; `addVcpu` is a boot not yet in `vcpuInUse`.
+ */
+export function poolVcpuExcess(input: { vcpuInUse: number; otherDemandVcpu: number; migrations: number; regionVcpuCap: number;
+    releaseVcpu?: number; addVcpu?: number }): number {
+    return input.vcpuInUse - (input.releaseVcpu ?? 0) + input.otherDemandVcpu + input.migrations * 2 + (input.addVcpu ?? 0) - input.regionVcpuCap;
+}
+
+export type SwitchCapacity = { ok: true; wait: boolean } | { ok: false; reason: string };
+
+/**
+ * Round 3 switch preflight (before any stop): can this RUNNING computer come back on
+ * `targetType`? Admission's own rules first (`admissionDryRun`), then the pool count above:
+ * a ready spare of the target class is already counted (adopting it adds nothing); otherwise
+ * the target's vCPU is added and the computer's current vCPU released. Over the cap, only
+ * reclaimable idle pool capacity may stand in the way (as `reservePoolDemand` decides):
+ * enough of it is a capacity wait (`wait: true`), anything else refuses before the stop.
+ */
+export async function preflightSwitchCapacity(db: PlacementExecutor, p: Placement, targetType: string, env: Env, now: Date): Promise<SwitchCapacity> {
+    const decision = await admissionDryRun(db, { userId: p.ownerUserId, placement: p, instanceType: targetType, env, now });
+    if (!decision.admit) return { ok: false, reason: decision.reason };
+    if (!p.region || !p.zoneId || !poolModule.POOL_TYPES.includes(targetType as poolModule.PoolClass['instanceType'])) return { ok: true, wait: false };
+    const demand = await poolModule.readPoolDemand(db, { region: p.region, zoneId: p.zoneId, instanceType: targetType as poolModule.PoolClass['instanceType'] }, now);
+    const migrations = await readPoolMigrationReservations(db);
+    if (env.EZIL_AWS_KILL_SWITCH === '1' || demand.killSwitch || !Number.isSafeInteger(migrations) || migrations < 0) return { ok: false, reason: 'kill_switch' };
+    const excess = poolVcpuExcess({ vcpuInUse: demand.vcpuInUse, otherDemandVcpu: demand.demandVcpu ?? 0, migrations, regionVcpuCap: demand.regionVcpuCap,
+        releaseVcpu: instanceVcpu(p.instanceType), addVcpu: (demand.ready ?? 0) > 0 ? 0 : instanceVcpu(targetType) });
+    if (excess <= 0) return { ok: true, wait: false };
+    // Another demand holds the region, or too little idle pool capacity to reclaim: refuse now.
+    if ((demand.demandVcpu ?? 0) > 0) return { ok: false, reason: 'region_capacity' };
+    return await poolModule.readReclaimablePoolVcpu(db, p.region) >= excess ? { ok: true, wait: true } : { ok: false, reason: 'region_capacity' };
+}
+
 export function createPoolDeps(db: PlacementDb, env: Env): PoolDeps {
     return { readyAt: poolModule.readPoolSessionReadyAt, retireLease: poolModule.retirePoolLease, leasePoolHost: poolModule.leasePoolHost, publishPoolClaim: poolModule.publishPoolClaim, buildWork: buildLifecycleWork,
         async claimDemand(tx, p, lock, b) {
@@ -33,7 +71,7 @@ export function createPoolDeps(db: PlacementDb, env: Env): PoolDeps {
             // Without a claim (legacy callers) there is no credit: every active demand counts as someone else's.
             const credit = own ? own.vcpu : 0;
             const others = Math.max(0, (demand.demandVcpu ?? 0) - credit);
-            if (demand.vcpuInUse + others + migrations * 2 > demand.regionVcpuCap)
+            if (poolVcpuExcess({ vcpuInUse: demand.vcpuInUse, otherDemandVcpu: others, migrations, regionVcpuCap: demand.regionVcpuCap }) > 0)
                 throw new PoolCapacityPressure({ computerId: p.computerId, region: p.region!, zoneId: p.zoneId!, instanceType: p.instanceType! });
             if (own) poolGuard('open_demand_consumed', await closeDemand(tx, lock, own, 'consumed'), 503);
         },

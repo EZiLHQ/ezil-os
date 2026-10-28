@@ -54,6 +54,24 @@ it('logs only numeric phase deltas and a computer prefix after readiness commits
     expect((await handlePoolSessionReady(f.request(), f.deps)).status).toBe(200);
     expect(console.info).toHaveBeenCalledTimes(1);
 });
+it('round 3: persists the same timing once as a durable row, after the readiness commit, never on a lost acknowledgement', async () => {
+    const f = session();
+    const persist = vi.fn(async () => true);
+    f.deps.db.transaction = async run => { const result = await run(f.deps.db); expect(persist).not.toHaveBeenCalled(); return result; };
+    expect((await handlePoolSessionReady(f.request(), f.deps, persist)).status).toBe(200);
+    const phases: Record<string, number> = { ...poolTimingDeltas(timing) };
+    delete phases.claimPublishedAtMs;
+    expect(persist).toHaveBeenCalledExactlyOnceWith(f.deps.db, { site: 'compute.pool_session_timing', code: 'pool_session_timing', outcome: 'ok',
+        ownerUserId: f.p.ownerUserId, computerId: f.p.computerId, durationMs: 1100, phases });
+    f.p.lastError = placement.ENROLLMENT_SUCCEEDED;
+    f.deps.db.transaction = async run => run(f.deps.db);
+    expect((await handlePoolSessionReady(f.request(), f.deps, persist)).status).toBe(200);
+    expect(persist).toHaveBeenCalledTimes(1);
+});
+it('round 3: a persistence failure never fails readiness', async () => {
+    const f = session();
+    expect((await handlePoolSessionReady(f.request(), f.deps, async () => false)).status).toBe(200);
+});
 it.each([{ guardDoneMs: 'secret' }, { desktopHealthyMs: true }, { claimObservedMs: -1 },
     { desktopHealthyMs: Number.MAX_SAFE_INTEGER + 1 }, { secret: 5 }])('rejects invalid telemetry before authentication/writes %j', async value => {
     const f = session(); expect((await handlePoolSessionReady(f.request(value), f.deps)).status).toBe(400);

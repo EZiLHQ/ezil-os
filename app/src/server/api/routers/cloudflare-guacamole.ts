@@ -1379,9 +1379,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             };
             if (routed.kind === 'aws-ec2') {
                 const aws = await routed.provider.restart({ correlationId }, computer);
+                // Round 3: the distinct `restart_<code>` from aws-restart.ts (`restart_unavailable` stays the catch-all).
+                const errorCode = /^restart_(not_running|busy|budget_exhausted|host_unreachable|timeout|unavailable)$/.test(aws.outcome ?? '')
+                    ? aws.outcome! : 'restart_unavailable';
                 return aws.ok
                     ? { ok: true as const, outcome: 'restart_requested', correlationId, provider: 'cloudflare-guacamole' as const }
-                    : { ok: false as const, errorCode: 'restart_unavailable', correlationId, provider: 'cloudflare-guacamole' as const };
+                    : { ok: false as const, errorCode, correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const result = await routed.provider.restart({ correlationId }, computer);
             if (result.ok) {

@@ -78,8 +78,22 @@ describe('shell restart through the real router and provider', () => {
         const response = POST(request());
         await vi.advanceTimersByTimeAsync(0);
         await vi.runAllTimersAsync();
-        expect(await (await response).json()).toMatchObject({ ok: false, errorCode: 'restart_unavailable' });
+        // Round 3: the distinct code reaches the shell route response.
+        expect(await (await response).json()).toMatchObject({ ok: false, errorCode: 'restart_timeout' });
         expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    });
+    it.each([[409, 'restart_busy'], [429, 'restart_budget_exhausted'], [503, 'restart_host_unreachable']])(
+        'round 3: a refused AWS dispatch %s answers %s through the route', async (status, errorCode) => {
+            vi.mocked(fetch).mockImplementation(async (_url, init) => init?.method === 'POST'
+                ? Response.json({ ok: false, outcome: 'restart_unavailable' }, { status }) : relay('a'.repeat(32)));
+            const response = POST(request());
+            await vi.runAllTimersAsync();
+            expect(await (await response).json()).toMatchObject({ ok: false, errorCode });
+        });
+    it('round 3: an unknown restart scope is a 400 before any provider call', async () => {
+        const response = await POST(request(JSON.stringify({ computerId, scope: 'everything' })));
+        expect(response.status).toBe(400);
+        expect(fetch).not.toHaveBeenCalled();
     });
     it('keeps Cloudflare on its existing synchronous restart path without runtime polls', async () => {
         state.cloudflare = true;
