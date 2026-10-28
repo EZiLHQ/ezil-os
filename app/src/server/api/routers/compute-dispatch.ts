@@ -270,6 +270,8 @@ export interface TransitionDeps {
     wake?: { budgetMs?: number; pollMs?: number };
     sleep?: (ms: number) => Promise<void>;
     preflight?: (db: PlacementExecutor, p: Placement, targetType: string, env: Env, now: Date) => Promise<SwitchCapacity>;
+    /** Defaults to `routeComputer` (tests inject a scripted provider). */
+    routeComputer?: (db: unknown, computer: ComputerRef, options: RouteOptions) => Promise<RoutedComputer>;
 }
 
 export type RestartComputerOutput =
@@ -356,7 +358,7 @@ export async function driveTransition(db: PlacementDb, computer: ComputerRef, t:
     try {
         // A restart wakes on the size it stopped on, whatever the stored next-open preference says.
         const route: RouteOptions = { env, ...deps.route, ...(t.kind === 'restart' ? { entitlements: sameSizeReader(deps.route?.entitlements, billing, t.current) } : {}) };
-        const routed = await routeComputer(db, computer, route);
+        const routed = await (deps.routeComputer ?? routeComputer)(db, computer, route);
         if (routed.kind !== 'aws-ec2') return fail('placement_missing');
         if (current.phase === 'requested' && !await advance('stopping', { stoppingAt: clock().toISOString() })) return current;
         if (current.phase === 'stopping') {
@@ -432,7 +434,8 @@ export async function switchComputerConfiguration(db: PlacementDb, computer: Com
     }
     const aws = p?.provider === 'aws-ec2' ? p : null;
     const running = meteredSizeForInstanceType(aws?.instanceType);
-    const current: AwsSizeCode = isAwsSize(running) ? running : isAwsSize(await billing.store.sizePreference(computer.userId)) ? (await billing.store.sizePreference(computer.userId)) as AwsSizeCode : 'std-2';
+    const preferred = isAwsSize(running) ? null : await billing.store.sizePreference(computer.userId);
+    const current: AwsSizeCode = isAwsSize(running) ? running : isAwsSize(preferred) ? preferred : 'std-2';
     const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId).catch(() => null);
     const migrating = !!migration && !TERMINAL_MIGRATION_STATES.includes(migration.state);
     if (aws?.state === 'RUNNING' && !migrating && target !== current) {
