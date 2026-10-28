@@ -131,7 +131,7 @@ const sections: readonly LegalSection[] = [
     {
         id: 'in-product-feedback', title: 'In-product feedback',
         content: <>
-            <p>In-product feedback is initiated by you, with consent and a preview before you submit. We store your description, any optional allowlisted diagnostics you choose to include, and any optional screenshot you redact and submit. Diagnostics never include cookies, page addresses, or your account details, and nothing is recorded continuously.</p>
+            <p>In-product feedback is initiated by you, with consent and a preview before you submit. We store your description, any optional allowlisted diagnostics you choose to include, and any optional screenshot you redact and submit, together with the version of EZiL OS that received it. Diagnostics never include cookies, page addresses, or your account details, and nothing is recorded continuously. Until a report is sent, your browser keeps the unsent text (and a submitted report waiting for a connection) on this device for your account, and removes it once the report is accepted.</p>
             <p>Named administrators on our feedback access allowlist can read these reports. Every report and screenshot view is logged. Feedback is not end-to-end encrypted: it uses TLS in transit and provider encryption at rest.</p>
             <p>Screenshots are retained for 30 days, reports for 180 days, and administrative access logs for 365 days. Cleanup depends on scheduled maintenance running successfully. You can delete your reports in Settings → Troubleshoot. Deleted data persists in database backups until those backups expire. To request account deletion, email <a href="mailto:contact@ezil.work">contact@ezil.work</a>.</p>
         </>,

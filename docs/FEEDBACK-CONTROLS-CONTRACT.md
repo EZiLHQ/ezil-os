@@ -148,6 +148,18 @@ The SQL is also committed as `app/drizzle/0011_feedback.sql` (byte-identical to 
 registered in `.github/production-migrations.json` as a `snapshot` source for the os-staging
 schema tool only (see `docs/feedback-migration.md`); it is refused for `aws-production`.
 
+### 4a. Browser-local state (round 3; `shell/ezil/ui/feedback/feedback.js`)
+Two `localStorage` keys per account, keyed by the opaque account id from
+`__EZIL_BOOT__.user.id` (never the email), never sent anywhere:
+- `ezil:feedback:draft:v1:<accountId>` — `{clientRequestId, category, description}` of the
+  unsent form. Survives closing the dialog; removed when the form is emptied or a send with
+  that id is confirmed (200/201). Consent boxes and screenshots are never remembered.
+- `ezil:feedback:outbox:v1:<accountId>` — at most 10 `{clientRequestId, body}` entries: the
+  exact submitted request bodies (including any diagnostics the user consented to) that have
+  not been confirmed. Re-sent byte-for-byte, same `clientRequestId`, on the `online` event and
+  when the chip mounts; removed on 200/201; dropped on a definitive 4xx (the text then returns
+  to the draft). Storage failures (blocked, quota, private mode) only lose the convenience.
+
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
 clipboard, keystrokes; no continuous recording. Consent checkboxes default OFF; preview shows the
