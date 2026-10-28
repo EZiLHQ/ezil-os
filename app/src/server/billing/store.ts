@@ -18,6 +18,7 @@ import {
     billingUsageIntervals,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
+import { readPlacementProvider } from '@/server/lib/compute/placement';
 import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, OutboxInsert, StoredComputeEpoch } from './ports';
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
@@ -421,12 +422,8 @@ export function createBillingStore(db: Database): BillingStore {
         },
 
         async placementProvider(computerId) {
-            // The placement table is AWS computer SQL (docs/aws-computers/sql), absent from billing-only databases.
-            const [table] = await db.execute<{ present: boolean }>(sql`select to_regclass('public.ezil_computer_placements') is not null as present`);
-            if (!table?.present) return null;
-            const [row] = await db.execute<{ provider: string | null }>(
-                sql`select provider from public.ezil_computer_placements where computer_id = ${computerId}::uuid limit 1`);
-            return row?.provider ?? null;
+            // placement.ts is the one module that names the placement table (C-2), reads included.
+            return readPlacementProvider(db, computerId);
         },
 
         async linkCustomer(userId, stripeCustomerId) {
