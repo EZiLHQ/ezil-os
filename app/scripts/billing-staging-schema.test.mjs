@@ -377,3 +377,30 @@ test('restore progress production apply and baseline refuse before connecting', 
         assert.match(h.output.join('\n'), /staging-only/);
     }
 });
+
+test('feedback follows 0010 and is registered as a production snapshot only', () => {
+    const file = 'app/drizzle/0011_feedback.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0010_migration_restore_progress.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    for (const table of ['ezil_feedback_reports', 'ezil_feedback_attachments', 'ezil_feedback_access_log']) {
+        assert.match(sql, new RegExp(`CREATE TABLE public\\.${table} \\(`));
+        assert.match(sql, new RegExp(`ALTER TABLE public\\.${table} ENABLE ROW LEVEL SECURITY;`));
+        assert.match(sql, new RegExp(`REVOKE ALL ON TABLE public\\.${table} FROM public, anon, authenticated;`));
+    }
+    assert.match(sql, /deploy_sha text NULL/);
+    assert.doesNotMatch(sql, /PRIMARY KEY|DEFAULT|UNIQUE|REFERENCES|CREATE POLICY|DROP |TRUNCATE/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('feedback production apply and baseline refuse before connecting', () => {
+    for (const mode of [['apply', '--yes'], ['baseline', '0011_feedback.sql', '--yes'],
+        ['baseline', './app/drizzle/0011_feedback.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});

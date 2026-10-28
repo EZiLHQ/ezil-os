@@ -42,6 +42,7 @@
 
 import { readBillingConfig, stripeMode, type BillingConfig } from '@/server/billing/config';
 import type { NativeRuntime } from '../../../../native/src/contract';
+import { NO_SHELL_FEATURES, type ShellFeatures } from './features';
 
 /** Structural input keeps this shared transport independent of database packages. */
 interface ShellComputerRecord {
@@ -117,6 +118,14 @@ export const SHELL_API_ROUTES = {
      * `POST /sandbox/:name/restart`.
      */
     restart: '/api/shell/restart',
+    /**
+     * POST = submit an in-product feedback report; GET = list the caller's own
+     * reports; DELETE ?id= = delete one. Same feature-detection contract as
+     * `focus`: present in a payload ONLY when `shellFeaturesFor()` turns
+     * Feedback on for this user, so the shell draws no Feedback entry point at
+     * all otherwise. See `docs/FEEDBACK-CONTROLS-CONTRACT.md`.
+     */
+    feedback: '/api/shell/feedback',
     /**
      * POST = record that a human is present at a computer's desktop
      * (`{ computerId, lastInputAgoMs }`), so the Worker's container-idle
@@ -283,6 +292,8 @@ export interface ShellDesktopState {
      */
     status: 'idle';
     endpoints: Partial<typeof SHELL_API_ROUTES>;
+    /** UI switches (`docs/FEEDBACK-CONTROLS-CONTRACT.md` §1). Absent = all off. */
+    ui?: { floatingControls: boolean; feedbackScreenshots: boolean };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -336,7 +347,13 @@ export function toShellBootComputer(computer: ShellComputerRecord, isNew: boolea
     };
 }
 
-export function toShellDesktopState(provider: DesktopProviderInfo | null): ShellDesktopState {
+export function toShellDesktopState(
+    provider: DesktopProviderInfo | null,
+    features: ShellFeatures = NO_SHELL_FEATURES,
+): ShellDesktopState {
+    // `feedback` is the one route gated per user: absent unless switched on.
+    const endpoints = Object.fromEntries(Object.entries(SHELL_API_ROUTES)
+        .filter(([key]) => features.feedback || key !== 'feedback')) as Partial<typeof SHELL_API_ROUTES>;
     return {
         provider: 'cloudflare-guacamole',
         // A provider lookup that FAILED is reported as not configured, never
@@ -345,7 +362,8 @@ export function toShellDesktopState(provider: DesktopProviderInfo | null): Shell
         configured: provider?.isConfigured === true,
         hasHmacSecret: provider?.hasHmacSecret === true,
         status: 'idle',
-        endpoints: SHELL_API_ROUTES,
+        endpoints,
+        ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots },
     };
 }
 
@@ -354,13 +372,15 @@ export function buildShellBootPayload(input: {
     computer: ShellComputerRecord;
     isNew: boolean;
     provider: DesktopProviderInfo | null;
+    /** Per-user UI switches (`shellFeaturesFor`); distinct from the billing `features` field below. */
+    shellFeatures?: ShellFeatures;
 }): ShellBootPayload {
     const features = shellBootFeatures();
     return {
         user: toShellBootUser(input.user),
         computer: toShellBootComputer(input.computer, input.isNew),
         apps: SHELL_APPS,
-        desktopState: toShellDesktopState(input.provider),
+        desktopState: toShellDesktopState(input.provider, input.shellFeatures),
         ...(features ? { features } : {}),
     };
 }

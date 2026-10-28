@@ -24,6 +24,22 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_AWS_ARBITRARY": "synthetic"})
 
+    def test_feedback_keys_are_optional(self):
+        # In-product feedback (docs/feedback-migration.md): off unless set, so
+        # every key is optional and none is required for a working app.
+        feedback = {"EZIL_OS_FEEDBACK": "1", "EZIL_OS_FEEDBACK_SCREENSHOTS": "1",
+                    "FEEDBACK_PILOT_EMAILS": "a@example.com,b@example.com",
+                    "FEEDBACK_ADMIN_EMAILS": "contact@ezil.work"}
+        self.assertEqual(renderer.validate({**self.values, **feedback}), {**self.values, **feedback})
+        self.assertTrue(set(feedback) <= renderer.OPTIONAL)
+        self.assertFalse(set(feedback) & renderer.REQUIRED)
+        renderer.validate(dict(self.values))
+        # The floating-controls pill is not part of this build; its flag stays refused.
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**self.values, "EZIL_OS_FLOATING_CONTROLS": "1"})
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**self.values, "EZIL_OS_FEEDBACK": ""})
+
     def test_missing_key_refused(self):
         del self.values["AUTH0_SECRET_ID"]
         with self.assertRaises(renderer.RenderError):

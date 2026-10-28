@@ -46,12 +46,15 @@ import {
 
 // The local host has neither hosted TURN renewal, recorded cloud machine
 // metadata, nor AWS capacity attempts to reset (RETRY-118: the hosted shell's
-// explicit Retry). Exclude only these named operations; any other app route
-// must still pass the complete key and path comparisons below.
+// explicit Retry). Feedback is hosted-only too: the app publishes it per user,
+// behind a flag, and stores reports in the hosted database
+// (docs/FEEDBACK-CONTROLS-CONTRACT.md). Exclude only these named operations;
+// any other app route must still pass the complete key and path comparisons below.
 const {
     relayRefresh: HOSTED_RELAY_ROUTE,
     system: HOSTED_SYSTEM_ROUTE,
     capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
+    feedback: HOSTED_FEEDBACK_ROUTE,
     ...COMMON_ROUTES
 } = APP_ROUTES;
 
@@ -67,10 +70,11 @@ describe('the route table has not drifted from the app', () => {
         // Without this, a module that somehow resolved to `{}` would make every
         // "same keys" assertion below vacuously true.
         expect(typeof APP_ROUTES).toBe('object');
-        expect(Object.keys(APP_ROUTES).length).toBe(12);
+        expect(Object.keys(APP_ROUTES).length).toBe(13);
         expect(HOSTED_RELAY_ROUTE).toBe('/api/shell/relay-refresh');
         expect(HOSTED_SYSTEM_ROUTE).toBe('/api/shell/system');
         expect(HOSTED_CAPACITY_RETRY_ROUTE).toBe('/api/shell/capacity-retry');
+        expect(HOSTED_FEEDBACK_ROUTE).toBe('/api/shell/feedback');
         expect(typeof appSerialize).toBe('function');
     });
 
@@ -99,6 +103,10 @@ describe('the route table has not drifted from the app', () => {
 
     it('does not advertise the unsupported hosted system operation', () => {
         expect('system' in LOCAL_ROUTES).toBe(false);
+    });
+
+    it('does not advertise the hosted-only feedback endpoint', () => {
+        expect('feedback' in LOCAL_ROUTES).toBe(false);
     });
 
     it('every path is same-origin and relative — never an absolute URL', () => {

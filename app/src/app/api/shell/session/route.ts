@@ -9,6 +9,8 @@ import {
     type ShellSessionPayload,
     toShellBootUser,
 } from '@/server/shell/boot-payload';
+import { env } from '@/env';
+import { shellFeaturesFor } from '@/server/shell/features';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
 
 /**
@@ -62,7 +64,7 @@ export async function GET(req: Request) {
             user: toShellBootUser(ctx.user),
             computer: lowest ? toShellBootComputer(lowest, false) : null,
             apps: SHELL_APPS,
-            desktopState: toShellDesktopState(provider),
+            desktopState: toShellDesktopState(provider, shellFeaturesFor(ctx.user.email, env)),
         };
 
         return shellJson(payload);
@@ -88,6 +90,7 @@ export async function POST(req: Request) {
                 computer: result.computer,
                 isNew: result.created,
                 provider,
+                shellFeatures: shellFeaturesFor(ctx.user.email, env),
             }),
         );
     } catch (err) {
