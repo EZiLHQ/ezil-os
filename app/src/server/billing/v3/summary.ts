@@ -3,7 +3,8 @@ import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalo
 import { checkoutAvailable } from '../config';
 import { storageState } from '../meters';
 import type { GrantRow } from '../ports';
-import { SIZES, type ComputeEpoch, type Window } from '../v2/contract';
+import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
+import { AWS_TIER_DATA_GIB, AWS_TIERS, type AwsTier } from '../../lib/compute/aws-config';
 import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
@@ -105,6 +106,35 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
     return { state, included, purchased, starter, pendingFromRenewal };
 }
 
+const GIB = BigInt(1024) ** BigInt(3);
+
+/**
+ * Round 3 D10: the real disk. AWS plans have one data volume per computer (`AWS_TIER_DATA_GIB`,
+ * 50 GiB on every paid size today) and the cap is that volume; Free/Cloudflare has no provisioned
+ * figure, so no cap is invented. Only legacy v1/v2 plans keep the v1 constant.
+ */
+export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
+    largeStorageEnabled: boolean): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
+    const newest = new Map<string, typeof storage[number]>();
+    for (const sample of storage) {
+        if (!newest.has(sample.computerId) || newest.get(sample.computerId)!.measuredAt < sample.measuredAt) newest.set(sample.computerId, sample);
+    }
+    const usedBytes = newest.size ? [...newest.values()].reduce((sum, sample) => sum + sample.bytes, BigInt(0)) : null;
+    const meter = (cap: bigint) => {
+        const state = storageState(usedBytes ?? BigInt(0), cap);
+        return state === 'over_cap' ? 'exhausted' as const : state;
+    };
+    if (plan.sku === 'legacy') {
+        const cap = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', largeStorageEnabled);
+        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(cap) };
+    }
+    const tier = SIZES[size].provider === 'aws'
+        ? (Object.keys(AWS_TIERS) as AwsTier[]).find(t => t !== 'free' && AWS_TIERS[t][0] === SIZES[size].machine) : undefined;
+    const provisionedGiB = tier ? AWS_TIER_DATA_GIB[tier] : null;
+    const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
+    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null || usedBytes === null ? 'unavailable' : meter(capBytes) };
+}
+
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
@@ -150,13 +180,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         plan.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
     )) : null;
-    const newest = new Map<string, typeof input.storage[number]>();
-    for (const sample of input.storage) {
-        if (!newest.has(sample.computerId) || newest.get(sample.computerId)!.measuredAt < sample.measuredAt) newest.set(sample.computerId, sample);
-    }
-    const usedBytes = [...newest.values()].reduce((sum, sample) => sum + sample.bytes, BigInt(0));
-    const capBytes = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', input.config.largeStorageEnabled);
-    const storage = storageState(usedBytes, capBytes);
+    const disk = storageDisk(plan, size.code, input.storage, input.config.largeStorageEnabled);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     return {
         enabled: true, version: 3,
@@ -168,12 +192,14 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: plan.sessionMaxSeconds,
             opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline,
             machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
-                size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const })) },
+                size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const })),
+            disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null } },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
-        storage: { usedBytes: usedBytes.toString(), capBytes: capBytes.toString(), state: storage === 'over_cap' ? 'exhausted' : storage },
+        // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
+        storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         actions: { checkout: enabled && plan.family === 'free', topup: enabled,
             upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,

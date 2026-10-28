@@ -1,11 +1,10 @@
-import { storageCapBytes } from '../catalog';
 import type { StoredComputeEpoch } from '../ports';
 import { buildSummaryV2 } from '../v2/summary';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { SIZES, type SizeCode } from '../v2/contract';
 import { planFromSubscriptions } from './catalog';
 import { hoursLeftAtWeight } from './contract';
-import { fairUseAllowance, usedSecondsInWindow } from './summary';
+import { fairUseAllowance, storageDisk, usedSecondsInWindow } from './summary';
 
 type Input = Parameters<typeof buildSummaryV2>[0] & { computerId?: string };
 
@@ -43,6 +42,7 @@ export function buildUsageV3(input: Input) {
         if (!samples.has(sample.computerId) || samples.get(sample.computerId)!.measuredAt < sample.measuredAt)
             samples.set(sample.computerId, sample);
     }
+    const disk = storageDisk(plan, preferred, input.storage, input.config.largeStorageEnabled); // The plan's disk, not a stray epoch's.
     return {
         enabled: true as const, version: 1 as const, asOf: isoSeconds(now),
         session: { computerId: epoch?.computerId ?? input.computerId ?? null, state,
@@ -55,7 +55,9 @@ export function buildUsageV3(input: Input) {
             currentSize, currentWeight, remainingHoursAtCurrent: hoursLeftAtWeight(remaining, currentWeight),
             equivalents: choices.map(size => ({ size, weight: SIZES[size].weight, hours: hoursLeftAtWeight(remaining, SIZES[size].weight) })) },
         storage: { state: samples.size ? 'sampled' as const : 'unavailable' as const,
-            capBytes: storageCapBytes(plan.family === 'free' ? 'free' : 'pro', input.config.largeStorageEnabled).toString(),
+            // Round 3 D10: the provisioned AWS data volume; null on Free (no invented cap).
+            capBytes: disk.capBytes?.toString() ?? null,
+            disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null },
             samples: [...samples.values()].map(sample => ({ computerId: sample.computerId,
                 bytes: sample.bytes.toString(), measuredAt: sample.measuredAt.toISOString() })) },
         egress: { state: 'unavailable' as const, usedBytes: null },

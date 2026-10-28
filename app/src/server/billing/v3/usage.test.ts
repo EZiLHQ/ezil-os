@@ -104,3 +104,14 @@ describe('round 3 hours at the current configuration (D3/D8)', () => {
         expect(period.equivalents.every(item => item.hours === 0)).toBe(true);
     });
 });
+
+describe('round 3 storage in usage (D10)', () => {
+    it('reports the provisioned AWS disk, and no cap at all on Free', () => {
+        expect(buildUsageV3(input()).storage).toEqual({ state: 'unavailable', capBytes: String(50 * 1024 ** 3), samples: [],
+            disk: { provisionedGiB: 50, usedBytes: null } });
+        const free = input(); free.subs = []; free.grants = [];
+        expect(buildUsageV3(free).storage).toMatchObject({ state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null } });
+        free.storage = [{ computerId: 'c', bytes: BigInt(7), measuredAt: now }];
+        expect(buildUsageV3(free).storage).toMatchObject({ state: 'sampled', capBytes: null, disk: { provisionedGiB: null, usedBytes: '7' } });
+    });
+});

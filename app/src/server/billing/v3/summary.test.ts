@@ -137,7 +137,7 @@ describe('v3 summary', () => {
         expect(buildSummaryV3(args).plan).toMatchObject({ status: 'active', pendingUpgrade: null, paymentIssue: null });
     });
     it('uses newest storage samples and maps over-cap to exhausted', () => {
-        const args = input(); args.storage = [{ computerId: 'c', bytes: BigInt(1), measuredAt: start }, { computerId: 'c', bytes: BigInt(10) ** BigInt(15), measuredAt: now }];
+        const args = input('standard_monthly_v3'); args.storage = [{ computerId: 'c', bytes: BigInt(1), measuredAt: start }, { computerId: 'c', bytes: BigInt(10) ** BigInt(15), measuredAt: now }];
         expect(buildSummaryV3(args).storage).toMatchObject({ usedBytes: '1000000000000000', state: 'exhausted' });
     });
 });
@@ -220,5 +220,25 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
         const args = input('premium_monthly_v3');
         args.subs[0]!.cancelAtPeriodEnd = true;
         expect(buildSummaryV3({ ...args, ai: { receipts: [], gatewayGrants: [], balanceMicro: '0' } }).ai.pendingFromRenewal).toBeNull();
+    });
+});
+
+describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () => {
+    const GiB50 = String(50 * 1024 ** 3);
+    it.each([['standard_monthly_v3', null], ['premium_monthly_v3', null], ['premium_monthly_v3', 'cmp-8']] as const)('%s (%s) caps at the 50 GiB AWS data volume', (sku, preference) => {
+        const args = input(sku); args.sizePreference = preference;
+        const summary = buildSummaryV3(args);
+        expect(summary.storage).toEqual({ usedBytes: '0', capBytes: GiB50, state: 'unavailable' });
+        expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null });
+        args.storage = [{ computerId: 'c', bytes: BigInt(43) * BigInt(1024) ** BigInt(3), measuredAt: now }];
+        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: String(43 * 1024 ** 3), capBytes: GiB50, state: 'low' });
+        expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3) });
+    });
+    it('Free shows no invented cap, even with the large-storage flag or a sample', () => {
+        const args = input(); args.config.largeStorageEnabled = true;
+        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: '0', capBytes: '0', state: 'unavailable' });
+        args.storage = [{ computerId: 'c', bytes: BigInt(5), measuredAt: now }];
+        expect(buildSummaryV3(args)).toMatchObject({ storage: { usedBytes: '5', capBytes: '0', state: 'unavailable' },
+            computer: { disk: { provisionedGiB: null, usedBytes: '5' } } });
     });
 });
