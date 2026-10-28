@@ -82,8 +82,12 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
     }
     const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro' | 'remainingMicro') =>
         (grants ?? []).reduce((total, g) => total + BigInt(g[field]), BigInt(0));
-    const known = input.gatewayGrants !== null;
     const current = receipts.filter(r => r.bucket === 'included');
+    // Matching assumes the Gateway stores credits × 10^6 and the sent expiry. If delivered receipts
+    // match nothing (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
+    const delivered = (list: typeof receipts) => list.some(r => r.deliveredAt !== null);
+    const known = input.gatewayGrants !== null && !(delivered(receipts) && matched.size === 0)
+        && !(delivered(current) && !matched.has('included'));
     const includedGrantedMicro = known ? sum(matched.get('included'), 'creditsMicro')
         : current.filter(r => r.deliveredAt !== null).reduce((total, r) => total + BigInt(r.credits) * MICRO, BigInt(0));
     const included = paid ? { granted: credits(includedGrantedMicro) ?? 0,

@@ -213,9 +213,17 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
         expect(summary('premium_monthly_v3', null, null, M(90))).toMatchObject({ state: 'low', pendingFromRenewal: null });
         expect(summary('premium_monthly_v3', null, null, null).state).toBe('unavailable');
     });
+    it('reports unknown, never "0 of 0", when delivered receipts match no Gateway grant (e.g. a unit change)', () => {
+        const ai = summary('premium_monthly_v3', [standard], [grant(20, 9, standard.expiresAt)], M(90));
+        expect(ai).toMatchObject({ state: 'ok', included: { granted: 200, remaining: null }, purchased: null, starter: null });
+        const topup = receipt('ezil-os:v1:topup:ai_pack_10_v1:pi_1', 500, '2027-09-01T00:00:00.000Z');
+        expect(summary('premium_monthly_v3', [standard, topup], [grant(500, 400, topup.expiresAt)], M(400)))
+            .toMatchObject({ included: { granted: 200, remaining: null }, purchased: null });
+    });
     it('ignores revoked or foreign-subscription grants and announces no renewal for a canceling plan', () => {
         const foreign = receipt(`ezil-os:v1:premium_monthly_v3:sub_other:${start.toISOString()}`, 1000, expiry(end));
-        const ai = summary('premium_monthly_v3', [standard, foreign], [grant(200, 200, standard.expiresAt, false), grant(1000, 1000, foreign.expiresAt)]);
+        const ai = summary('premium_monthly_v3', [{ ...standard, deliveredAt: null }, foreign],
+            [grant(200, 200, standard.expiresAt, false), grant(1000, 1000, foreign.expiresAt)]);
         expect(ai).toMatchObject({ balance: 1000, included: { granted: 0, remaining: 0 }, pendingFromRenewal: { credits: 1000 } });
         const args = input('premium_monthly_v3');
         args.subs[0]!.cancelAtPeriodEnd = true;
