@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, aiCreditRestoreItem, parseAiCreditEventId } from './ai-credits';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, aiCreditRestoreItem, aiUpgradeEntitlement,
+    parseAiCreditEventId, parseAiUpgradeEntitlement } from './ai-credits';
 import { findPack, customTopupPack } from './catalog';
 
 const input = { userId: 'user', sku: 'standard_monthly_v3' as const, subscriptionId: 'sub',
@@ -83,5 +84,32 @@ describe('W0.3 canonical root event grammar', () => {
         expect(aiCreditRevokeItem(grant, { type: 'dispute', id }).eventKey).toHaveLength(200);
         expect(() => aiCreditRevokeItem(grant, { type: 'dispute', id: id + 'x' })).toThrow();
         expect(parseAiCreditEventId(root, `${root}:revoke`, 'revoke')).toEqual({ action: 'revoke' });
+    });
+});
+
+describe('round 3 D1 upgrade entitlement', () => {
+    const base = { userId: 'user', subscriptionId: 'sub_1Q2w3E4r5T6y7U8i', periodStart: input.periodStart, periodEnd: input.periodEnd,
+        effectiveAt: new Date('2026-10-04T02:24:00.000Z') };
+    it('builds the pinned id, prorated credits and periodEnd + 3 d expiry, and round-trips through the parsers', () => {
+        const entitlement = aiUpgradeEntitlement(base);
+        expect(entitlement).toEqual({ entitlementId: 'ezil-os:v1:premium_monthly_v3:sub_1Q2w3E4r5T6y7U8i:2026-10-04T02:24:00.000Z:upgrade',
+            credits: 720, expiresAt: '2026-11-04T00:00:00.000Z' }); // floor(800 × 2,410,560 / 2,678,400)
+        expect(parseAiUpgradeEntitlement(entitlement.entitlementId)).toEqual({ subscriptionId: base.subscriptionId, effectiveAt: base.effectiveAt });
+        const grant = aiCreditOutboxItem('user', entitlement, 'grant', 'in_upgrade');
+        expect(parseAiCreditEventId(entitlement.entitlementId, grant.eventKey, 'grant')).toEqual({ action: 'grant' });
+        const revoke = aiCreditRevokeItem(grant, { type: 'refund', id: 're_1Q2w3E4r5T6y7U8iAbCdEfGh' });
+        expect(parseAiCreditEventId(entitlement.entitlementId, revoke.eventKey, 'revoke')).toEqual({ action: 'revoke', cause: 'refund', causeId: 're_1Q2w3E4r5T6y7U8iAbCdEfGh' });
+        expect(parseAiCreditEventId(entitlement.entitlementId, aiCreditRestoreItem(grant, 'dp_1').eventKey, 'restore')).toMatchObject({ action: 'restore' });
+        expect(parseAiCreditEventId(entitlement.entitlementId, `${entitlement.entitlementId}:upgrade:grant`, 'grant')).toBeNull();
+    });
+    it('rejects invalid instants and ids instead of truncating them', () => {
+        expect(() => aiUpgradeEntitlement({ ...base, effectiveAt: input.periodEnd })).toThrow(TypeError);
+        expect(() => aiUpgradeEntitlement({ ...base, effectiveAt: new Date('2026-09-30T23:59:59.000Z') })).toThrow(TypeError);
+        expect(() => aiUpgradeEntitlement({ ...base, subscriptionId: 'sub:other' })).toThrow(TypeError);
+        expect(() => aiUpgradeEntitlement({ ...base, subscriptionId: 's'.repeat(131) })).toThrow(TypeError);
+        expect(aiUpgradeEntitlement({ ...base, subscriptionId: 's'.repeat(130) }).entitlementId).toHaveLength(193);
+        expect(aiUpgradeEntitlement({ ...base, effectiveAt: new Date(input.periodEnd.getTime() - 1000) }).credits).toBe(0);
+        expect(parseAiUpgradeEntitlement('ezil-os:v1:standard_monthly_v3:sub:2026-10-04T02:24:00.000Z:upgrade')).toBeNull();
+        expect(parseAiUpgradeEntitlement('ezil-os:v1:premium_monthly_v3:sub:2026-02-30T00:00:00.000Z:upgrade')).toBeNull();
     });
 });

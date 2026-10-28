@@ -1145,9 +1145,9 @@ describe('billing.usage read-only boundary', () => {
         const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('No external calls allowed'));
         const result = await f.caller.usage();
         expect(result).toMatchObject({ enabled: true, version: 1, egress: { state: 'unavailable', usedBytes: null } });
-        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor'] as const)
+        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference'] as const)
             expect(f.store[name].mock.calls[0][0]).toBe(userId);
-        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor']);
+        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference']);
         for (const [name, method] of Object.entries(f.store)) if (!reads.has(name)) expect(method).not.toHaveBeenCalled();
         for (const method of Object.values(f.stripe)) expect(method).not.toHaveBeenCalled();
         expect(fetch).not.toHaveBeenCalled();
@@ -1160,5 +1160,41 @@ describe('billing.usage read-only boundary', () => {
         f.deps.config.tabEnabled = false;
         await expect(f.caller.usage()).resolves.toEqual({ enabled: false });
         expect(f.store.subscriptionsFor).not.toHaveBeenCalled();
+    });
+});
+
+describe('round 3 D5: operator-only AI requeue', () => {
+    function requeueFixture(operator: boolean | 'throws') {
+        const f = fixture();
+        const isOperator = vi.fn(async (email: string | null | undefined) => {
+            if (operator === 'throws') throw new Error('env unavailable');
+            return operator && email === 'fixture@example.org';
+        });
+        const requeueFailed = vi.fn(async (input: { apply: boolean }) => ({ dryRun: !input.apply, selected: 1, eligible: 1,
+            requeued: input.apply ? 1 : 0, decisions: [] }));
+        f.deps.aiCredits = { claim: vi.fn(), accountFor: vi.fn(), pinAccount: vi.fn(), finish: vi.fn(), requeueFailed };
+        const caller = createBillingRouter(() => f.deps, { isOperator }).createCaller(f.ctx);
+        return { ...f, caller, isOperator, requeueFailed };
+    }
+    it.each([false, 'throws'] as const)('hides the procedure from a non-operator (%s) without reading or writing', async operator => {
+        const f = requeueFixture(operator);
+        await expect(f.caller.requeueAiCredits({ userId })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(f.requeueFailed).not.toHaveBeenCalled();
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).requeueAiCredits({ userId })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+    it('is a dry run by default and applies only when asked', async () => {
+        const f = requeueFixture(true);
+        vi.spyOn(console, 'info').mockImplementation(() => {});
+        expect(await f.caller.requeueAiCredits({ eventKeys: ['k'] })).toMatchObject({ dryRun: true, requeued: 0 });
+        expect(f.requeueFailed).toHaveBeenLastCalledWith({ eventKeys: ['k'], userId: undefined, apply: false, now: now.getTime() });
+        expect(await f.caller.requeueAiCredits({ userId, apply: true })).toMatchObject({ dryRun: false, requeued: 1 });
+        expect(f.isOperator).toHaveBeenCalledWith('fixture@example.org');
+    });
+    it('refuses an empty or malformed selection', async () => {
+        const f = requeueFixture(true);
+        for (const input of [{}, { eventKeys: [] }, { userId: 'not-a-uuid' }, { userId, extra: true }]) {
+            await expect(f.caller.requeueAiCredits(input as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        }
+        expect(f.requeueFailed).not.toHaveBeenCalled();
     });
 });

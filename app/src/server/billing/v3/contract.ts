@@ -229,13 +229,35 @@ export interface BillingSummaryV3 {
         activeDeadline: string | null;
         /** Sizes this plan may choose (one entry unless Premium); x86 only until ARM is verified. */
         machineChoice: readonly MachineOptionV3[];
+        /**
+         * Round 3 (L1, additive): the computer's data disk. `provisionedGiB` is the AWS data volume
+         * (same on every configuration; null on Free/Cloudflare); `usedBytes` only when measured.
+         */
+        disk?: { provisionedGiB: number | null; usedBytes: string | null };
     };
     /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
     ai: {
         grant: AiCreditGrantV3;
         /** Whole credits left on the Gateway, or null when the balance is unavailable. */
         balance: number | null;
+        /**
+         * Round 3: low/exhausted are judged against the plan's credits for THIS period
+         * (`included`), never against a total that mixes earlier periods, top-ups or the
+         * starter grant. `exhausted` = nothing spendable at all.
+         */
         state: 'ok' | 'low' | 'exhausted' | 'unavailable';
+        /**
+         * Round 3 (L1, additive). The plan's credits for the current paid period (the
+         * period grant plus any upgrade grant); `remaining` null when the Gateway
+         * breakdown is unavailable. null on Free and legacy plans.
+         */
+        included?: { granted: number; remaining: number | null; periodEnd: string } | null;
+        /** Live purchased (top-up) credits; `expiresAt` = the earliest expiry. null when none or unknown. */
+        purchased?: { remaining: number; expiresAt: string } | null;
+        /** The Free starter grant still live; null when none or unknown. */
+        starter?: { remaining: number } | null;
+        /** The plan's period amount the next renewal adds when this period has no grant of it yet (e.g. right after an upgrade). */
+        pendingFromRenewal?: { credits: number; at: string } | null;
     };
     fairUse: { status: FairUseStatus; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };

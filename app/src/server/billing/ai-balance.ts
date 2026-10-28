@@ -1,7 +1,7 @@
 import type { BillingStore } from './ports';
 import type { BillingSummaryV3 } from './v3/contract';
 import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
-import { createAiReader, creditNumber, microString, record, type AiReadInput } from './ai-read';
+import { createAiReader, creditNumber, isoTimestamp, microString, record, type AiReadInput } from './ai-read';
 import { readAiUsage, type AiUsagePage } from './ai-usage';
 import { readAiLimits, type AiLimits } from './ai-limits';
 
@@ -29,6 +29,24 @@ export function parseAiBalanceMicro(body: unknown): string | null {
     if (typeof credits !== 'number' || !Number.isFinite(credits) || credits < 0 || credits > Number.MAX_SAFE_INTEGER) return null;
     const decimal = credits.toFixed(6);
     return Number(decimal) === credits ? BigInt(decimal.replace('.', '')).toString() : null;
+}
+
+/** One Gateway grant from `/v1/me/balance` `grants[]` (it carries no entitlement id; see `aiCreditBuckets`). */
+export interface AiGatewayGrant { creditsMicro: string; remainingMicro: string; expiresAt: string; live: boolean }
+
+/** The whole list or null: a partly readable list must not split the balance into wrong buckets. */
+export function parseAiGrants(body: unknown): AiGatewayGrant[] | null {
+    const list = record(body)?.grants;
+    if (!Array.isArray(list) || list.length > 1_000) return null;
+    const grants: AiGatewayGrant[] = [];
+    for (const item of list) {
+        const g = record(item);
+        const creditsMicro = microString(g?.credits_micro), remainingMicro = microString(g?.remaining_micro);
+        const expiresAt = isoTimestamp(g?.expires_at);
+        if (!g || creditsMicro === null || remainingMicro === null || expiresAt === null || typeof g.live !== 'boolean') return null;
+        grants.push({ creditsMicro, remainingMicro, expiresAt, live: g.live && g.revoked_at == null });
+    }
+    return grants;
 }
 
 export function parseAiBalance(body: unknown): number | null {
@@ -66,13 +84,15 @@ function spendingState(balance: unknown, models: unknown, limits: AiLimits | nul
         ? 'available' : 'unavailable';
 }
 
-export async function readAiAccount(input: AiReadInput): Promise<AiAccountView> {
+/** `gatewayGrants` is server-side input for the bucket split; callers strip it before the wire. */
+export async function readAiAccount(input: AiReadInput): Promise<AiAccountView & { gatewayGrants: AiGatewayGrant[] | null }> {
     const read = createAiReader(input);
     const [balanceBody, usage, limitsResult, models] = await Promise.all([
         read('/v1/me/balance'), readAiUsage(input, { limit: 20 }, read), readAiLimits(input, read), read('/v1/models'),
     ]);
     const balanceMicro = parseAiBalanceMicro(balanceBody);
-    return { balanceMicro, heldMicro: microString(record(balanceBody)?.held_micro), balance: creditNumber(balanceMicro),
+    return { gatewayGrants: balanceMicro === null ? null : parseAiGrants(balanceBody),
+        balanceMicro, heldMicro: microString(record(balanceBody)?.held_micro), balance: creditNumber(balanceMicro),
         balanceState: aiMicroBalanceState(balanceMicro, 0), spendingState: spendingState(balanceBody, models, limitsResult.limits),
         recentUsage: usage.recentUsage, limits: limitsResult.limits, usageState: usage.state, limitsState: limitsResult.state };
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -7,7 +7,8 @@ import * as schema from '@/server/db/schema';
 import { authUsers, billingOutbox, billingGrants } from '@/server/db/schema';
 import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts, hasAiReversals, aiCreditRestoreItem } from './ai-credits';
 import { findPack } from './catalog';
-import { createAiCreditOutboxStore } from './ai-credit-outbox-store';
+import { createAiCreditOutboxStore, requeueFailedAiCredits } from './ai-credit-outbox-store';
+import { CATALOG_V3 } from './v3/contract';
 import { drainAiCreditOutbox, type AiCreditOutboxStore } from './ai-credit-outbox';
 import { enqueueFreeAiCredits } from './ai-balance';
 import { createBillingStore } from './store';
@@ -115,7 +116,47 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         await enqueueFreeAiCredits(billing, userId, 'free_v3', new Date(NOW));
         await enqueueFreeAiCredits(billing, userId, 'free_v3', new Date(NOW + 86400000));
         expect(await rows()).toEqual([expect.objectContaining({ eventKey: `ezil-os:v1:free-once:${userId}:grant`,
-            payload: expect.objectContaining({ expiresAt: '2027-10-21T00:00:00.000Z', credits: 500 }) })]);
+            payload: expect.objectContaining({ expiresAt: '2027-10-21T00:00:00.000Z', credits: CATALOG_V3.free_v3.aiCredits.amount }) })]);
+    });
+    it('round 3 D5: requeues only failed, unexpired, unrevoked grants; dry run writes nothing', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const grant = (sub: string, periodEnd = end) => aiCreditOutboxItem(userId, aiCreditEntitlement({ userId, sku: 'standard_monthly_v3',
+            subscriptionId: sub, periodStart: start, periodEnd, invoiceId: `in_${sub}` }), 'grant', `in_${sub}`);
+        const eligible = grant('sub_ok'), expired = grant('sub_old', new Date('2026-10-10Z')), revoked = grant('sub_rev'), permanent = grant('sub_perm');
+        for (const item of [eligible, expired, revoked, permanent]) await billing.enqueueOutbox(item);
+        await billing.enqueueOutbox(aiCreditRevokeItem(revoked));
+        const fail = async (eventKey: string, reason: string, attempts: number) => db.update(billingOutbox).set({ attempts, lastError: reason,
+            payload: sql`jsonb_set(payload, '{delivery}', ${JSON.stringify({ status: 'failed', nextAttemptAt: null })}::jsonb)` })
+            .where(eq(billingOutbox.eventKey, eventKey));
+        await fail(eligible.eventKey, 'attempts_exhausted', 10);
+        await fail(expired.eventKey, 'expired', 4);
+        await fail(revoked.eventKey, 'no_ai_account', 3);
+        await fail(permanent.eventKey, 'event_conflict', 1);
+        const before = await rows();
+        const dry = await requeueFailedAiCredits(db, { userId, apply: false, now: NOW });
+        expect(Object.fromEntries(dry.decisions.map(d => [d.eventKey, d.decision]))).toEqual({ [eligible.eventKey]: 'eligible',
+            [expired.eventKey]: 'still_expired', [revoked.eventKey]: 'revoked', [permanent.eventKey]: 'not_retryable' });
+        expect(await rows()).toEqual(before);
+        expect(await store.claim(NOW)).toMatchObject({ kind: 'ai_revoke' }); // Only the queued revoke is claimable before the reset.
+        expect(await store.claim(NOW)).toBeNull();
+        const applied = await requeueFailedAiCredits(db, { eventKeys: [eligible.eventKey, expired.eventKey], apply: true, now: NOW });
+        expect(applied).toMatchObject({ dryRun: false, selected: 2, requeued: 1 });
+        const reset = (await rows()).find(r => r.eventKey === eligible.eventKey)!;
+        expect(reset).toMatchObject({ attempts: 0, lastError: null, deliveredAt: null,
+            payload: expect.objectContaining({ delivery: { status: 'retry', nextAttemptAt: NOW, requeuedAt: NOW, requeuedFrom: 'attempts_exhausted' } }) });
+        expect((await rows()).find(r => r.eventKey === expired.eventKey)).toEqual(before.find(r => r.eventKey === expired.eventKey));
+        expect((await store.claim(NOW))?.eventKey).toBe(eligible.eventKey);
+        expect((await requeueFailedAiCredits(db, { userId, apply: true, now: NOW })).requeued).toBe(0);
+        info.mockRestore();
+    });
+    it('round 3 D2: reads one user\'s grant receipts with delivery state, never revokes or other users', async () => {
+        const grant = item(); await billing.enqueueOutbox(grant);
+        const claimed = (await store.claim(NOW))!;
+        await store.finish(claimed, { status: 'done', reason: null }, NOW);
+        await billing.enqueueOutbox(aiCreditRevokeItem(grant));
+        expect(await store.receiptsFor!(userId)).toEqual([{ entitlementId: grant.payload.entitlementId, credits: 200,
+            expiresAt: '2026-11-04T00:00:00.000Z', deliveredAt: new Date(NOW).toISOString() }]);
+        expect(await store.receiptsFor!(randomUUID())).toEqual([]);
     });
     it('claims only whole-credit rows and marks success once', async () => {
         await billing.enqueueOutbox({ eventKey: `legacy:${userId}`, userId, kind: 'ai_grant', payload: { amountUsdMicro: '100000' } });
@@ -214,6 +255,38 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
             : event('charge.dispute.created', { id: 'dispute', charge: 'charge', status: 'needs_response' });
         await processStripeEvent(reversal, deps); await processStripeEvent(reversal, deps);
         expect((await rows()).map(r => r.kind).sort()).toEqual(['ai_grant', 'ai_revoke']);
+    });
+    it.each(['refund', 'dispute'] as const)('round 3 D1: a replayed paid upgrade enqueues one prorated AI grant and a %s reverses it', async kind => {
+        const subId = `sub_${userId.replace(/-/g, '')}`, customer = `cus_${userId}`, invoiceId = `in_up_${userId}`;
+        const effective = new Date('2026-10-11T12:00:00Z');
+        await billing.linkCustomer(userId, customer);
+        const subscription = { id: subId, customer, status: 'active', sku: 'premium_monthly_v3', currentPeriodStart: start,
+            currentPeriodEnd: end, cancelAtPeriodEnd: false } as StripeSubscription;
+        const invoice: StripeInvoice = { id: invoiceId, customer, status: 'paid', subscriptionId: subId,
+            billingReason: 'subscription_update', metadataKind: null, hostedInvoiceUrl: null, periodStart: start, periodEnd: end,
+            lines: [{ id: 'credit', lookupKey: 'ezil_standard_monthly_v3', subscriptionId: subId, amount: -1000, proration: true, periodStart: effective, periodEnd: end },
+                { id: 'premium', lookupKey: 'ezil_premium_monthly_v3', subscriptionId: subId, amount: 5000, proration: true, periodStart: effective, periodEnd: end }] };
+        const stripe = { retrieveInvoice: async () => invoice, retrieveSubscription: async () => subscription,
+            retrieveCharge: async () => ({ id: 'charge', customer, invoiceId, paymentIntentId: null, refunded: kind === 'refund', amount: 4000, amountRefunded: 4000 }) } as unknown as StripeApi;
+        const deps = { store: billing, stripe, now: () => new Date(NOW) };
+        const event = (type: string, object: Record<string, unknown>): StripeEventLike => ({
+            id: `evt_${randomUUID()}`, type, livemode: false, created: NOW / 1000, data: { object },
+        });
+        const paid = event('invoice.paid', { id: invoiceId, customer, billing_reason: 'subscription_update',
+            parent: { subscription_details: { subscription: subId } }, lines: { data: [] } });
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        expect(await processStripeEvent(paid, deps)).toBe('applied');
+        await processStripeEvent(paid, deps); await processStripeEvent({ ...paid, id: `evt_${randomUUID()}` }, deps);
+        const root = `ezil-os:v1:premium_monthly_v3:${subId}:${effective.toISOString()}:upgrade`;
+        expect(await rows()).toEqual([expect.objectContaining({ eventKey: `${root}:grant`, kind: 'ai_grant',
+            payload: expect.objectContaining({ entitlementId: root, credits: 529, expiresAt: '2026-11-04T00:00:00.000Z', invoiceId }) })]);
+        const reversal = kind === 'refund' ? event('charge.refunded', { id: 'charge', refunds: { data: [{ id: 'refund' }] } })
+            : event('charge.dispute.created', { id: 'dispute', charge: 'charge', status: 'needs_response' });
+        expect(await processStripeEvent(reversal, deps)).toBe('applied');
+        await processStripeEvent(reversal, deps);
+        expect((await rows()).map(r => [r.kind, (r.payload as Record<string, unknown>).entitlementId, (r.payload as Record<string, unknown>).credits]).sort()).toEqual([
+            ['ai_grant', root, 529], ['ai_revoke', root, 529]]);
+        info.mockRestore();
     });
 });
 

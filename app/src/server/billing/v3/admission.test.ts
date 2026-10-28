@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { admitStart, fairUseStatusOf } from './admission';
+import { admitStart, admitStartWithAwsCap, fairUseStatusOf } from './admission';
 import { CATALOG_V3, type AdmitStartV3 } from './contract';
 
 const base: Parameters<AdmitStartV3>[0] = { sku: 'free_v3', planActive: true, paymentIssue: false,
@@ -48,4 +48,18 @@ describe('v3 admission golden cases', () => {
     });
     it.each([[0, 'ok'], [79, 'ok'], [80, 'near'], [99, 'near'], [100, 'paused'], [101, 'paused']] as const)
     ('status at %s percent', (usedSeconds, expected) => expect(fairUseStatusOf({ usedSeconds, fairUseSeconds: 100 })).toBe(expected));
+});
+
+describe('round 3 D11: the AWS ledger cap is its own refusal', () => {
+    const premium = { ...base, sku: 'premium_monthly_v3' as const };
+    it('refuses with aws_monthly_cap while plan time is left, never as fair use', () => {
+        expect(admitStartWithAwsCap({ ...premium, awsMonthlyCapReached: true })).toEqual({ admit: false, reason: 'aws_monthly_cap' });
+        expect(admitStartWithAwsCap({ ...premium, size: 'cmp-8', awsMonthlyCapReached: true })).toEqual({ admit: false, reason: 'aws_monthly_cap' });
+        expect(admitStartWithAwsCap({ ...premium, awsMonthlyCapReached: false })).toMatchObject({ admit: true });
+        expect(admitStart(premium)).toMatchObject({ admit: true });
+    });
+    it('keeps the plan reason first when fair use is also spent, and never applies to Cloudflare', () => {
+        expect(admitStartWithAwsCap({ ...premium, usedSeconds: 1800000, awsMonthlyCapReached: true })).toEqual({ admit: false, reason: 'fair_use_paused' });
+        expect(admitStartWithAwsCap({ ...base, awsMonthlyCapReached: true })).toMatchObject({ admit: true, size: 'free-cf' });
+    });
 });

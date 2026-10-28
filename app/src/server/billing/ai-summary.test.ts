@@ -38,6 +38,25 @@ describe('billing.summary AI wiring', () => {
         expect(await f.caller.summary()).toMatchObject({ ai: { grant: { amount: 200 }, balance: 20, state: 'low' } });
         expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
     });
+    it('after an upgrade, judges Standard\'s live 90 of 200 against this period, not the Premium catalog total', async () => {
+        const expiresAt = '2026-11-04T00:00:00.000Z';
+        vi.stubGlobal('fetch', gateway({ available_micro: '90000000', grants: [{ id: 'g1', source: 'entitlement', credits_micro: '200000000',
+            remaining_micro: '90000000', expires_at: expiresAt, revoked_at: null, live: true }] }));
+        const f = fixture('standard_monthly_v3');
+        f.store.subscriptionsFor.mockResolvedValue([{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: new Date('2026-10-01Z'), currentPeriodEnd: new Date('2026-11-01Z'), cancelAtPeriodEnd: false }]);
+        const receiptsFor = vi.fn().mockResolvedValue([{ entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-10-01T00:00:00.000Z',
+            credits: 200, expiresAt, deliveredAt: '2026-10-01T00:05:00.000Z' }]);
+        f.deps.aiCredits = { claim: vi.fn(), accountFor: vi.fn(), pinAccount: vi.fn(), finish: vi.fn(), receiptsFor };
+        const summary = await f.caller.summary();
+        expect(summary).toMatchObject({ ai: { grant: { amount: 1000 }, balance: 90, state: 'ok', balanceState: 'ok',
+            included: { granted: 200, remaining: 90 }, pendingFromRenewal: { credits: 1000, at: '2026-11-01T00:00:00Z' } } });
+        expect(summary).not.toHaveProperty('ai.gatewayGrants');
+        expect(receiptsFor).toHaveBeenCalledWith('current-user');
+        receiptsFor.mockRejectedValueOnce(new Error('db down'));
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect(await f.caller.summary()).toMatchObject({ ai: { balance: 90, state: 'low', pendingFromRenewal: null } });
+    });
     it('performs billing reads while balance is stalled and returns unavailable by the timeout', async () => {
         vi.useFakeTimers(); vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(() => new Promise(() => {})));
         const f = fixture(); const pending = f.caller.summary();

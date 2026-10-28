@@ -70,3 +70,48 @@ describe('read-only usage observations', () => {
         expect(result).not.toHaveProperty('usedBytes');
     });
 });
+
+describe('round 3 hours at the current configuration (D3/D8)', () => {
+    // 452 standard-hours left: the founder's example.
+    function at(remainingHours: number) {
+        const args = input();
+        args.grants[0]!.amount = BigInt(remainingHours * 3600);
+        args.epochs = [];
+        return args;
+    }
+    it.each([['std-2', 1, 452], ['cmp-4', 2, 226], ['cmp-8', 4, 113]] as const)('a stopped %s computer shows %s× weight: %s hours', (size, weight, hours) => {
+        const args = at(452); args.sizePreference = size;
+        expect(buildUsageV3(args).period).toMatchObject({ remainingStandardSeconds: 452 * 3600, currentSize: size, currentWeight: weight,
+            remainingHoursAtCurrent: hours, equivalents: [{ size: 'std-2', weight: 1, hours: 452 }, { size: 'cmp-4', weight: 2, hours: 226 },
+                { size: 'cmp-8', weight: 4, hours: 113 }] });
+    });
+    it('a running session wins over the next-open choice, and an invalid choice falls back to the plan default', () => {
+        const args = at(452);
+        args.epochs = [{ ...epoch, size: 'cmp-8', weight: 4, readyAt: '2026-10-26T12:00:00Z', lastHeartbeatAt: null } as StoredComputeEpoch];
+        args.sizePreference = 'std-2';
+        expect(buildUsageV3(args).period).toMatchObject({ currentSize: 'cmp-8', currentWeight: 4, remainingHoursAtCurrent: 113 });
+        const standard = at(30); standard.subs[0]!.sku = 'standard_monthly_v3'; standard.sizePreference = 'cmp-8';
+        expect(buildUsageV3(standard).period).toMatchObject({ currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 30,
+            equivalents: [{ size: 'std-2', weight: 1, hours: 30 }] });
+    });
+    it('rounds down and never goes negative', () => {
+        const args = at(0); args.grants[0]!.amount = BigInt(3599);
+        args.sizePreference = 'std-2';
+        expect(buildUsageV3(args).period.remainingHoursAtCurrent).toBe(0);
+        args.epochs = [{ ...epoch, endedAt: '2026-10-26T11:30:00Z' }];
+        const period = buildUsageV3(args).period; // Rating stops a weight-2 session at the last whole second it can afford.
+        expect(period).toMatchObject({ remainingStandardSeconds: 1, remainingHoursAtCurrent: 0, currentWeight: 1 });
+        expect(period.equivalents.every(item => item.hours === 0)).toBe(true);
+    });
+});
+
+describe('round 3 storage in usage (D10)', () => {
+    it('reports the provisioned AWS disk, and no cap at all on Free', () => {
+        expect(buildUsageV3(input()).storage).toEqual({ state: 'unavailable', capBytes: String(50 * 1024 ** 3), samples: [],
+            disk: { provisionedGiB: 50, usedBytes: null } });
+        const free = input(); free.subs = []; free.grants = [];
+        expect(buildUsageV3(free).storage).toMatchObject({ state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null } });
+        free.storage = [{ computerId: 'c', bytes: BigInt(7), measuredAt: now }];
+        expect(buildUsageV3(free).storage).toMatchObject({ state: 'sampled', capBytes: null, disk: { provisionedGiB: null, usedBytes: '7' } });
+    });
+});

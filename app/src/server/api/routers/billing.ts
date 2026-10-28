@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
-import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
@@ -88,8 +88,26 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     return { plan, subscriptionId };
 }
 
+/** Stored receipts split the Gateway balance by bucket; unreadable receipts fall back to the total. */
+async function aiReceipts(deps: BillingDeps, userId: string) {
+    try {
+        return await deps.aiCredits?.receiptsFor?.(userId) ?? null;
+    } catch {
+        console.warn('[billing.ai] receipts unavailable');
+        return null;
+    }
+}
+
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
-export function createBillingRouter(getDeps: () => BillingDeps) {
+/** The operator gate reuses the `/admin/telemetry` allow-list (`TELEMETRY_ADMIN_EMAILS`, fail-closed); no new env. */
+async function telemetryOperator(email: string | null | undefined): Promise<boolean> {
+    const [{ env }, { isTelemetryAdmin }] = await Promise.all([import('@/env'), import('@/server/telemetry/admin')]);
+    return isTelemetryAdmin(email, env.TELEMETRY_ADMIN_EMAILS);
+}
+
+export function createBillingRouter(getDeps: () => BillingDeps,
+    options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean> } = {}) {
+    const isOperator = options.isOperator ?? telemetryOperator;
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
             const deps = getDeps();
@@ -102,15 +120,16 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             ]);
             const plan = planFromSubscriptions({ subs, userCreatedAt, now });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, storage, consent, overageInvoices] = await Promise.all([
+            const [epochs, grants, storage, consent, overageInvoices, sizePreference] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
                 deps.store.overageInvoicesFor(ctx.user.id),
+                deps.store.sizePreference(ctx.user.id),
             ]);
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
-                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference: null,
+                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference,
                 hasCustomer: false, computerId: input?.computerId });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
@@ -147,13 +166,15 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     console.error('Billing renewal preview unavailable');
                 }
             }
+            await enqueueFreeAiCredits(deps.store, ctx.user.id, plan.sku, now);
+            const [{ gatewayGrants, ...ai }, receipts] = await Promise.all([aiRead, aiReceipts(deps, ctx.user.id)]);
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro },
             });
-            await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
-            const ai = await aiRead;
-            ai.balanceState = aiMicroBalanceState(ai.balanceMicro, summary.ai.grant.amount);
+            // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
+            ai.balanceState = summary.ai.state;
             return { ...summary, ai: { ...summary.ai, ...ai,
                 // Older consumers cannot describe a pause. They must not call it healthy or exhausted.
                 state: ai.spendingState === 'available' ? ai.balanceState : 'unavailable' } };
@@ -476,6 +497,28 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
                 const sku = typeof session.sku === 'string' && session.sku.trim() ? session.sku : null;
                 return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku };
+            }),
+
+        /**
+         * Round 3 D5, operator only (NOT_FOUND to everyone else): reset failed, still-deliverable
+         * AI grants to retry. Dry run unless `apply: true`; every decision is logged.
+         */
+        requeueAiCredits: protectedProcedure.input(z.object({
+            eventKeys: z.array(z.string().min(1).max(200)).max(200).optional(),
+            userId: z.string().uuid().optional(),
+            apply: z.boolean().default(false),
+        }).strict().refine(value => (value.eventKeys?.length ?? 0) > 0 || value.userId !== undefined))
+            .mutation(async ({ ctx, input }) => {
+                let allowed = false;
+                try { allowed = await isOperator(ctx.user.email); } catch { allowed = false; }
+                if (!allowed) throw new TRPCError({ code: 'NOT_FOUND' });
+                const deps = getDeps();
+                if (!deps.aiCredits?.requeueFailed) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+                const result = await deps.aiCredits.requeueFailed({ eventKeys: input.eventKeys, userId: input.userId,
+                    apply: input.apply, now: deps.now().getTime() });
+                console.info(JSON.stringify({ event: 'ai-outbox-requeue-run', operator: ctx.user.id, dryRun: result.dryRun,
+                    selected: result.selected, eligible: result.eligible, requeued: result.requeued }));
+                return result;
             }),
     });
 }
