@@ -189,10 +189,10 @@ describe('switchConfiguration: RUNNING applies now (stop, then wake on the targe
         expect(s.store.setSizePreference).not.toHaveBeenCalled();
     });
 
-    it('a monthly-cap preflight refusal is not_entitled, not capacity', async () => {
+    it('a monthly-cap preflight refusal is aws_monthly_cap (D11), not capacity', async () => {
         const s = harness();
         s.preflight.mockResolvedValueOnce({ ok: false, reason: 'user_hours_cap' } as never);
-        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps)).toEqual({ ok: false, reason: 'not_entitled' });
+        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps)).toEqual({ ok: false, reason: 'aws_monthly_cap' });
     });
 
     it('the same requestId twice, and two concurrent tabs, are ONE transition and ONE host', async () => {

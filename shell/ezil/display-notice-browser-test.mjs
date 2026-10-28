@@ -119,6 +119,12 @@ for ( const vp of VIEWPORTS ) {
         const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
         if (url === `${HOST}/fixture/ui/boot-progress.js`) return route.fulfill({contentType:'text/javascript',body:noticeModule});
         if (url === `${HOST}/fixture/boot-phases.js`) return route.fulfill({contentType:'text/javascript',body:phasesModule});
+        // boot-progress.js now imports the opening surface (computer-progress.js → Settings/trpc.js → native-runtime.js …):
+        // serve any other shell/ezil module under /fixture/ from source so the import chain resolves.
+        if (url.startsWith(`${HOST}/fixture/`) && url.endsWith('.js')) {
+            const file = path.join(here, new URL(url).pathname.slice('/fixture/'.length));
+            if (file.startsWith(here) && fs.existsSync(file)) return route.fulfill({contentType:'text/javascript',body:fs.readFileSync(file,'utf8')});
+        }
         if (new URL(url).origin === new URL(DESKTOP_URL).origin) return route.fulfill({contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) {
             return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });

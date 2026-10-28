@@ -35,7 +35,7 @@ and refused as `not_entitled`.
 ```json
 { "ok": true, "effective": "switching", "current": "std-2", "target": "cmp-8", "transitionId": "<uuid>" }
 { "ok": true, "effective": "next_start", "current": "std-2", "target": "cmp-8", "transitionId": "<uuid>" }
-{ "ok": false, "reason": "switch_in_progress" | "not_entitled" | "capacity_unavailable" | "computer_busy" | "foreign_computer" }
+{ "ok": false, "reason": "switch_in_progress" | "not_entitled" | "capacity_unavailable" | "computer_busy" | "foreign_computer" | "aws_monthly_cap" }
 ```
 
 The checks run in this order:
@@ -45,7 +45,7 @@ The checks run in this order:
 2. `not_entitled`: the same rule as `billing.selectMachine`: an `active` `premium_monthly_v3` plan
    whose `machineChoice` lists `size`, and an active AWS compute entitlement with an allowance and no
    payment issue. A malformed `requestId`, `free-cf`, and a monthly-cap refusal at preflight
-   (`user_hours_cap`, `user_egress_cap`) are also `not_entitled`.
+   (`user_egress_cap`) are also `not_entitled`; the AWS monthly hours cap (`user_hours_cap`) is `aws_monthly_cap` (D11), with its own copy.
 3. An in-flight transition. The same `requestId`, or a switch to the same `target`, returns that
    transition (`ok: true`, `effective: "switching"`). Anything else is `switch_in_progress`. A
    restart in flight also blocks a switch.

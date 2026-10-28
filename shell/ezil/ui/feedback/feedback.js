@@ -311,6 +311,9 @@ export function open_feedback_dialog (_opts) {
     if ( draft ) {
         description.value = draft.description;
         for ( const radio of form.elements.category ) radio.checked = radio.value === draft.category;
+    } else if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
+        // Opened from the opening screen's "Send feedback": name the error code so the report can be routed.
+        description.value = `Error code: ${_opts.errorCode}\n\n`;
     }
 
     function save_draft () {

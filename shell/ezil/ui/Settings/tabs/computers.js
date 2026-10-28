@@ -20,6 +20,7 @@ import session from '../../../session.js';
 import trpc from '../trpc.js';
 import TabBilling from './billing.js';
 import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';
+import { TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/computers';
 
@@ -706,6 +707,8 @@ export async function requestSwitch ($win, target, { confirm = true } = {}) {
             if ( summary?.computer ) summary = { ...summary, computer: { ...summary.computer, size: answer.target } };
         } else {
             seenInFlight.add(answer.transitionId);
+            // Open desktop/Code windows follow the transition and re-open on the new size (L4b).
+            window.dispatchEvent(new CustomEvent(TRANSITION_EVENT, { detail: { computerId: computer.id, transitionId: answer.transitionId } }));
             progress = { ...(progress ?? {}), computerId: computer.id,
                 transition: { transitionId: answer.transitionId, kind: 'switch', current: answer.current, target: answer.target,
                     phase: transitionOf(progress)?.transitionId === answer.transitionId ? transitionOf(progress).phase : 'requested',

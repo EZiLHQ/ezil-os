@@ -341,6 +341,7 @@ PORTABLE_SUITES=(
     "shell/ezil/ui/Settings/stacking-browser-test.mjs"
     "shell/ezil/ui/Settings/provider-modal-browser-test.mjs"
     "shell/ezil/ui/Settings/late-focus-browser-test.mjs"
+    "shell/ezil/ui/opening-progress-browser-test.mjs"
     "shell/ezil/ui/Settings/appearance-browser-test.mjs"
     "shell/ezil/ui/feedback-browser-test.mjs"
 )

@@ -246,7 +246,7 @@ function CouldNotOpen() {
                 href={Routes.COMPUTERS}
                 className="inline-flex items-center gap-2 rounded-md bg-teal px-4 py-2 text-sm font-medium text-black hover:opacity-90"
             >
-                Your computers
+                Your computer
             </Link>
         </main>
     );

@@ -75,6 +75,7 @@ import trpc from '../trpc.js';
 import telemetry from '../../../telemetry.js';
 import { ambientCorrelationId } from '../../../trace.js';
 import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';
+import { TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -473,6 +474,7 @@ async function handleRestartComputer ($win) {
     }
     if ( answer?.ok === true ) {
         computerTransition = typeof answer.transitionId === 'string' ? answer.transitionId : null;
+        if ( computerTransition ) window.dispatchEvent(new CustomEvent(TRANSITION_EVENT, { detail: { computerId, transitionId: computerTransition } }));
         render($win);
         watchComputerRestart($win, computerId);
         return;

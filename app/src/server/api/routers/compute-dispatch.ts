@@ -281,7 +281,7 @@ export interface TransitionDeps {
 
 export type RestartComputerOutput =
     | { ok: true; transitionId: string; path: 'restart'; size: AwsSizeCode }
-    | { ok: false; reason: 'not_running' | 'busy' | 'switch_in_progress' | 'foreign_computer' | 'not_entitled' | 'unavailable' };
+    | { ok: false; reason: 'not_running' | 'busy' | 'switch_in_progress' | 'foreign_computer' | 'not_entitled' | 'aws_monthly_cap' | 'unavailable' };
 
 const TRANSITION_POLL_MS = 5_000;
 const BUSY_STATES: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RECOVERING', 'RETIRING'];
@@ -469,7 +469,9 @@ export async function switchComputerConfiguration(db: PlacementDb, computer: Com
         const preflight = await (deps.preflight ?? preflightSwitchCapacity)(db, aws, SIZES[target].machine, env, now);
         if (!preflight.ok) {
             console.info(JSON.stringify({ event: 'compute-transition', kind: 'switch', phase: 'refused', reason: preflight.reason, current, target }));
-            return { ok: false, reason: ['user_hours_cap', 'user_egress_cap'].includes(preflight.reason) ? 'not_entitled' : 'capacity_unavailable' };
+            // D11: the AWS monthly cap is a distinct, explainable refusal; egress caps stay an entitlement matter.
+            return { ok: false, reason: preflight.reason === 'user_hours_cap' ? 'aws_monthly_cap'
+                : preflight.reason === 'user_egress_cap' ? 'not_entitled' : 'capacity_unavailable' };
         }
         const t = await startTransition(db, computer, 'switch', aws, current, target, input.requestId, deps);
         if (t === 'conflict') {

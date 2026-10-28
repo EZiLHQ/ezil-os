@@ -331,7 +331,7 @@ export interface SelectMachineOutputV3 {
 /** How a configuration card renders for this user right now. */
 export type ConfigurationAvailabilityV3 = 'current' | 'available' | 'locked' | 'unavailable';
 
-export type SwitchRefusalV3 = 'switch_in_progress' | 'not_entitled' | 'capacity_unavailable' | 'computer_busy' | 'foreign_computer';
+export type SwitchRefusalV3 = 'switch_in_progress' | 'not_entitled' | 'capacity_unavailable' | 'computer_busy' | 'foreign_computer' | 'aws_monthly_cap';
 
 /** `computer.switchConfiguration` input; `requestId` makes a duplicate click / second tab idempotent. */
 export interface SwitchConfigurationInputV3 {
