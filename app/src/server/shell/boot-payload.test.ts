@@ -247,7 +247,18 @@ describe('buildShellBootPayload', () => {
             'hasHmacSecret',
             'provider',
             'status',
+            'ui',
         ]);
+        // `ui` carries booleans only, and is all-off unless features are passed.
+        expect(desktopState.ui).toEqual({ floatingControls: false, feedbackScreenshots: false });
+    });
+
+    it('exposes endpoints.feedback ONLY when the feedback feature is on', () => {
+        expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
+        const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
+        expect(on.endpoints.feedback).toBe('/api/shell/feedback');
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true });
+        expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
     });
 });
 

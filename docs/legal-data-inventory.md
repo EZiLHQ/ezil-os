@@ -45,6 +45,14 @@ The admin review page is restricted by a configured email allowlist, default-den
 
 The shell sends diagnostics only with a hosted authenticated boot context; there is no settings toggle. Blocking browser submissions affects that producer, not worker/container diagnostics or infrastructure logs. See [http-handler.ts](../app/src/server/telemetry/http-handler.ts), [shell telemetry](../shell/ezil/telemetry.js), [worker telemetry](../worker/src/telemetry.ts).
 
+## In-product feedback
+
+Feedback is user-initiated, with consent and a preview before submission. A report stores the description, optional allowlisted diagnostics, and an optional screenshot redacted by the user. The [wire contract](../app/src/server/feedback/types.ts) limits diagnostics; the [feedback schema](../app/src/server/db/schema/feedback.ts) stores reports, attachments, and administrative access records.
+
+Named administrators on the `FEEDBACK_ADMIN_EMAILS` allowlist can read feedback through the [admin view](../app/src/app/admin/feedback/page.tsx). Every report and screenshot view is logged before content is returned; deletion is logged too. The [access log](../app/src/server/feedback/access-log.ts) is required, so a failed audit write withholds content. This application access control does not make the data end-to-end encrypted: feedback uses TLS in transit and provider encryption at rest.
+
+[Feedback retention](../app/src/server/feedback/retention.ts) removes screenshots older than **30 days**, reports and their attachments older than **180 days**, and access-log rows older than **365 days**. It runs in the existing [maintenance handler](../app/src/server/telemetry/maintenance-handler.ts); chunking, time budgets, and job failures can delay cleanup. Users can delete their reports in **Settings → Troubleshoot**. Deleted data persists in database backups until those backups expire. Account deletion can be requested at **contact@ezil.work**.
+
 ## Retention, deletion, and export
 
 | Operation / store | Implemented result | Evidence / publication implication |

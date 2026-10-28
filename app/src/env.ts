@@ -39,6 +39,14 @@ const serverSchema = z.object({
      * closed), never "reachable by every signed-in user".
      */
     TELEMETRY_ADMIN_EMAILS: z.string().optional(),
+    /** In-product Feedback. '1' = on (optionally narrowed by FEEDBACK_PILOT_EMAILS). */
+    EZIL_OS_FEEDBACK: z.string().optional(),
+    /** Feedback screenshots. '1' = on; only meaningful with EZIL_OS_FEEDBACK. */
+    EZIL_OS_FEEDBACK_SCREENSHOTS: z.string().optional(),
+    /** Comma list; when set, Feedback is on ONLY for these emails. */
+    FEEDBACK_PILOT_EMAILS: z.string().optional(),
+    /** Comma list allowed to open /admin/feedback. Unset = nobody (fail closed). */
+    FEEDBACK_ADMIN_EMAILS: z.string().optional(),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });
 
@@ -60,6 +68,10 @@ const parsedServer = isServer
           CLOUDFLARE_GUACAMOLE_HMAC_SECRET: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET,
           CRON_SECRET: process.env.CRON_SECRET,
           TELEMETRY_ADMIN_EMAILS: process.env.TELEMETRY_ADMIN_EMAILS,
+          EZIL_OS_FEEDBACK: process.env.EZIL_OS_FEEDBACK,
+          EZIL_OS_FEEDBACK_SCREENSHOTS: process.env.EZIL_OS_FEEDBACK_SCREENSHOTS,
+          FEEDBACK_PILOT_EMAILS: process.env.FEEDBACK_PILOT_EMAILS,
+          FEEDBACK_ADMIN_EMAILS: process.env.FEEDBACK_ADMIN_EMAILS,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -92,6 +104,10 @@ export const env = {
         CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined,
         CRON_SECRET: undefined,
         TELEMETRY_ADMIN_EMAILS: undefined,
+        EZIL_OS_FEEDBACK: undefined,
+        EZIL_OS_FEEDBACK_SCREENSHOTS: undefined,
+        FEEDBACK_PILOT_EMAILS: undefined,
+        FEEDBACK_ADMIN_EMAILS: undefined,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,

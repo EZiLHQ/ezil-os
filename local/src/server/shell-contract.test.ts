@@ -39,13 +39,15 @@ import {
 import { startLocalServer, type LocalServer } from './server.ts';
 
 // Local mode has neither hosted TURN credentials, recorded cloud machine
-// metadata, nor AWS capacity attempts (RETRY-118's hosted explicit Retry). Keep
-// the unsupported routes explicit so new app routes still fail the
-// shared-contract comparison until their local support is decided.
+// metadata, nor AWS capacity attempts (RETRY-118's hosted explicit Retry), and
+// Feedback is hosted-only (per-user flag, hosted database). Keep the
+// unsupported routes explicit so new app routes still fail the shared-contract
+// comparison until their local support is decided.
 const {
     relayRefresh: HOSTED_RELAY_ROUTE,
     system: HOSTED_SYSTEM_ROUTE,
     capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
+    feedback: HOSTED_FEEDBACK_ROUTE,
     ...COMMON_SHELL_API_ROUTES
 } = APP_SHELL_API_ROUTES;
 
@@ -142,6 +144,7 @@ describe('the published endpoint map and the served paths are the same nine', ()
         const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
         expect(body.desktopState.endpoints.relayRefresh).toBeUndefined();
         expect((await get(HOSTED_RELAY_ROUTE)).status).toBe(404);
+        expect((await get(HOSTED_FEEDBACK_ROUTE)).status).toBe(404);
     });
 
     it('does not advertise or serve hosted machine metadata', async () => {
