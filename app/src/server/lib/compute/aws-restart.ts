@@ -1,13 +1,26 @@
 import { createHash } from 'node:crypto';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import { isAwsComputersEnabled, type Env } from './aws-config';
-import { readPlacement, type PlacementExecutor } from './placement';
+import { readPlacement, type PlacementExecutor, type PlacementState } from './placement';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
 import type { ComputerRef, RestartResult } from './provider';
 
-const unavailable = (): RestartResult => ({ ok: false, outcome: 'restart_unavailable', error: 'restart_unavailable' });
+/**
+ * Round 3: distinct desktop-restart outcomes (`outcome`/`error` = `restart_<code>`), never one
+ * collapsed `restart_unavailable`:
+ * - `not_running`: no RUNNING AWS computer to restart; `busy`: it is opening, stopping or its
+ *   lease moved (Worker 409), or the host reports a restart already running;
+ * - `budget_exhausted`: the host's restart budget is spent (only when the Worker says so);
+ * - `host_unreachable`: the Worker or the host did not answer the dispatch (transport, 502-504);
+ * - `timeout`: dispatched, but no new desktop was observed inside the budget;
+ * - `unavailable`: disabled, misconfigured, or any other refusal.
+ */
+export const AWS_RESTART_CODES = ['not_running', 'busy', 'budget_exhausted', 'host_unreachable', 'timeout', 'unavailable'] as const;
+export type AwsRestartCode = typeof AWS_RESTART_CODES[number];
+const refused = (code: AwsRestartCode): RestartResult => ({ ok: false, outcome: `restart_${code}`, error: `restart_${code}` });
 const RESTART_READY_TIMEOUT_MS = 180_000; // Below the shell's 215s and route's 300s budgets.
 const RESTART_POLL_MS = 2_000;
+const BUSY_STATES: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RECOVERING', 'RETIRING'];
 
 /**
  * Restart only the live desktop unit, then wait for its new runtime.
@@ -16,6 +29,11 @@ const RESTART_POLL_MS = 2_000;
  * start-neko.sh gates Neko startup on code-server's listening port, so a NEW identity also
  * proves the old editor is gone and the replacement passed its startup gate. Placement's
  * RUNNING/generation/leaseEpoch describe the host and do not change on a desktop restart.
+ *
+ * Round 3: a frozen desktop cannot answer the pre-read, and that is exactly when a restart is
+ * needed, so the pre-read is a baseline only. Completion is a runtime id different from the
+ * baseline; without a baseline it is a desktop that answers after being seen down (the failed
+ * pre-read or a later failed read), or a second identity different from the first one seen.
  */
 export async function requestAwsRestart(db: PlacementExecutor, computer: ComputerRef, requestId: string, env: Env): Promise<RestartResult> {
     const startedAt = Date.now();
@@ -23,7 +41,7 @@ export async function requestAwsRestart(db: PlacementExecutor, computer: Compute
     let phaseStartedAt = startedAt, status = 0, polls = 0, unreadable = 0;
     let readCode = 'not_read';
     const log = (code: string) => console.info(`[aws-restart] phase=${progress.phase} code=${code} status=${status} elapsed_ms=${Date.now() - startedAt} phase_ms=${Date.now() - phaseStartedAt} polls=${polls} unreadable=${unreadable}`);
-    const fail = (code: string): RestartResult => { log(code); return unavailable(); };
+    const fail = (code: string, outcome: AwsRestartCode = 'unavailable'): RestartResult => { log(code); return refused(outcome); };
     const enter = (next: typeof progress.phase) => { progress.phase = next; phaseStartedAt = Date.now(); status = 0; };
     log('started');
     if (!isAwsComputersEnabled(env) || (env.EZIL_AWS_KILL_SWITCH !== undefined && env.EZIL_AWS_KILL_SWITCH !== '0')) return fail('disabled');
@@ -32,8 +50,9 @@ export async function requestAwsRestart(db: PlacementExecutor, computer: Compute
     if (!secret || !workerUrl || !requestId) return fail('config_invalid');
     try {
         const { record: p } = await readPlacement(db, computer.computerId);
-        if (!p || p.provider !== 'aws-ec2' || p.ownerUserId !== computer.userId.toLowerCase()
-            || p.state !== 'RUNNING' || p.generation < 1 || p.leaseEpoch < 1) return fail('placement_unavailable');
+        if (!p || p.provider !== 'aws-ec2' || p.ownerUserId !== computer.userId.toLowerCase()) return fail('placement_unavailable', 'not_running');
+        if (BUSY_STATES.includes(p.state)) return fail('placement_busy', 'busy');
+        if (p.state !== 'RUNNING' || p.generation < 1 || p.leaseEpoch < 1) return fail('placement_unavailable', 'not_running');
         const sandboxId = deriveGuacamoleSandboxId(p.ownerUserId, p.computerId);
         const endpoint = new URL(`${workerUrl.replace(/\/$/, '')}/sandbox/${sandboxId}/restart`);
         if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return fail('endpoint_invalid');
@@ -69,33 +88,47 @@ export async function requestAwsRestart(db: PlacementExecutor, computer: Compute
         };
         enter('a');
         const previousRuntime = await readRuntime();
-        // Without a baseline, a healthy reply could still belong to the OLD desktop.
-        // Refuse before dispatch rather than claim an unobserved restart completed.
-        if (!previousRuntime) return fail(`baseline_${readCode}`);
-        log('baseline_ready');
+        // The desktop answered, but not with a usable identity: it is down (frozen or crashed).
+        let seenDown = !previousRuntime && readCode !== 'transport_failed';
+        log(previousRuntime ? 'baseline_ready' : `baseline_missing_${readCode}`);
         enter('b');
 
         // Stable across transport retries, including a freshly minted v2 token. Dispatch ONCE.
         const body = JSON.stringify({ requestId: createHash('sha256').update(requestId).digest('hex') });
-        const { response, data } = await request(endpoint, 'POST', body);
-        if (response.status !== 202 || data?.ok !== true || data.outcome !== 'restart_requested') return fail('dispatch_rejected');
+        let dispatched;
+        try { dispatched = await request(endpoint, 'POST', body); }
+        catch { return fail(`dispatch_${readCode}`, readCode === 'transport_failed' ? 'host_unreachable' : 'unavailable'); }
+        const { response, data } = dispatched;
+        if (response.status !== 202 || data?.ok !== true || data.outcome !== 'restart_requested') {
+            const outcome = typeof data?.outcome === 'string' ? data.outcome : '';
+            // Forward-compatible Worker reasons (crossLane: worker/src/aws-restart.ts) take precedence over the status.
+            const code: AwsRestartCode = outcome === 'restart_budget_exhausted' || response.status === 429 ? 'budget_exhausted'
+                : outcome === 'restart_busy' || response.status === 409 ? 'busy'
+                : [502, 503, 504].includes(response.status) ? 'host_unreachable' : 'unavailable';
+            return fail('dispatch_rejected', code);
+        }
         log('dispatch_queued');
         enter('c_or_d');
 
+        let firstSeen: string | null = null;
         while (Date.now() < deadline) {
             polls++;
             const runtime = await readRuntime();
-            if (!runtime) unreadable++;
-            if (Date.now() < deadline && runtime && runtime !== previousRuntime) {
-                log('runtime_changed');
+            // Without a baseline, an answered-but-unusable read after dispatch is the old desktop going down.
+            if (!runtime) { unreadable++; if (readCode !== 'transport_failed') seenDown = true; }
+            const changed = runtime !== null && (previousRuntime !== null ? runtime !== previousRuntime
+                : seenDown || (firstSeen !== null && runtime !== firstSeen));
+            if (Date.now() < deadline && changed) {
+                log(previousRuntime ? 'runtime_changed' : 'runtime_healthy_after_restart');
                 return { ok: true, outcome: 'restart_requested' };
             }
+            if (runtime && previousRuntime === null) firstSeen ??= runtime;
             const remaining = deadline - Date.now();
             if (remaining > 0) await new Promise(resolve => setTimeout(resolve, Math.min(RESTART_POLL_MS, remaining)));
         }
         // The queue ACK cannot prove a unit ran. Neither an unchanged identity nor
         // an unreadable one distinguishes a failed restart (c) from identity loss (d).
-        return fail(readCode === 'runtime_ready' ? 'runtime_unchanged' : `runtime_unreadable_${readCode}`);
+        return fail(readCode === 'runtime_ready' ? 'runtime_unchanged' : `runtime_unreadable_${readCode}`, 'timeout');
     } catch {
         return fail(progress.phase === 'b' ? `dispatch_${readCode}` : 'preflight_failed');
     }

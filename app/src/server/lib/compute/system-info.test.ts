@@ -280,10 +280,27 @@ describe('actual placement versus paid entitlement', () => {
         expect(describePlanPlacement(cf, paid, { state: 'committed', reason: 'fresh_provision', outcome: 'fresh_provision' }, ON_ENV)).toMatchObject({ status: 'preparing', outcome: 'fresh_provision' });
     });
     it('requires actual Mumbai size and a ready lifecycle before saying ready', () => {
-        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192 }, lifecycleState: 'RUNNING' };
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' }, lifecycleState: 'RUNNING' };
         expect(describePlanPlacement(aws, paid, null, ON_ENV)?.status).toBe('ready');
         expect(describePlanPlacement({ ...aws, lifecycleState: 'PROVISIONING' }, paid, null, ON_ENV)?.status).toBe('preparing');
         expect(describePlanPlacement({ ...aws, machine: { ...aws.machine, region: 'us-east-1' } }, paid, null, ON_ENV)?.status).toBe('preparing');
+    });
+    it('round 3: a size mismatch alone is ready (current vs selected), never being prepared', () => {
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' }, lifecycleState: 'RUNNING' };
+        const premium = { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' as const };
+        expect(describePlanPlacement(aws, premium, null, ON_ENV)).toMatchObject({ status: 'ready', current: 'std-2', selected: 'cmp-8', vcpu: 8, transition: null });
+        expect(describePlanPlacement({ ...aws, lifecycleState: 'STOPPED' }, premium, null, ON_ENV)?.status).toBe('ready');
+    });
+    it('round 3: being_prepared ONLY while a transition is in flight; a failed one shows failed with its reason', () => {
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' }, lifecycleState: 'STOPPED' };
+        const premium = { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' as const };
+        const view = { transitionId: 't', kind: 'switch' as const, current: 'std-2' as const, target: 'cmp-8' as const, reason: null, requestedAt: '2026-10-28T00:00:00.000Z', endedAt: null, revertAvailable: false };
+        for (const phase of ['requested', 'stopping', 'waking'] as const)
+            expect(describePlanPlacement(aws, premium, null, ON_ENV, { ...view, phase })?.status).toBe('being_prepared');
+        expect(describePlanPlacement(aws, premium, null, ON_ENV, { ...view, phase: 'failed', reason: 'capacity_unavailable', revertAvailable: true }))
+            .toMatchObject({ status: 'failed', reason: 'capacity_unavailable', transition: { revertAvailable: true } });
+        expect(describePlanPlacement(aws, premium, null, ON_ENV, { ...view, phase: 'done' })?.status).toBe('ready');
+        expect(describePlanPlacement(aws, premium, null, { ...ON_ENV, EZIL_AWS_KILL_SWITCH: '1' }, { ...view, phase: 'waking' })?.status).toBe('blocked');
     });
     it('uses the Premium entitled size', () => {
         expect(describePlanPlacement(cf, { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' }, null, ON_ENV)).toMatchObject({ vcpu: 8, memoryGB: 32 });

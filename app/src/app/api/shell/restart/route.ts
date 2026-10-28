@@ -33,6 +33,13 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  * there from the session, never read from this body.
  *
  *   POST { computerId } -> { ok, errorCode?, correlationId? }
+ *
+ * Round 3: an AWS desktop restart answers a DISTINCT `errorCode`
+ * (`restart_not_running|busy|budget_exhausted|host_unreachable|timeout|unavailable`), and
+ * `{ computerId, scope: 'computer', requestId }` restarts the WHOLE computer (stop, then a
+ * server-initiated open on the same size) and returns at once with its transition:
+ *   -> { ok: true, transitionId, path: 'restart', size } | { ok: false, errorCode: 'restart_<reason>' }
+ * Progress of that restart is `computer.progress` (docs/aws-computers/SWITCH-CONTRACT.md).
  */
 export const maxDuration = 300;
 
@@ -57,9 +64,16 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '' } = (body ?? {}) as { computerId?: string };
+        const { computerId = '', scope = 'desktop', requestId } = (body ?? {}) as { computerId?: string; scope?: unknown; requestId?: string };
+        if (scope !== 'desktop' && scope !== 'computer') {
+            return shellJson({ error: { code: 'BAD_REQUEST', message: 'Unknown restart scope.' } }, 400);
+        }
+        if (scope === 'computer') {
+            const result = await caller.computer.restartComputer({ computerId, requestId: requestId ?? '' });
+            return shellJson(result.ok ? result : { ok: false, errorCode: `restart_${result.reason}`, reason: result.reason });
+        }
 
-        const result = await caller.cloudflareGuacamole.restartDesktop({ computerId });
+        const result = await caller.cloudflareGuacamole.restartDesktop({ computerId, ...(requestId === undefined ? {} : { requestId }) });
 
         return shellJson(result);
     } catch (err) {

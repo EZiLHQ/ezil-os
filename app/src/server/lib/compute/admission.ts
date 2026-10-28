@@ -25,6 +25,7 @@ import {
     peekAdmissionCounters,
     readAdmissionCounters,
     readPlacement,
+    RUNNING_CLASS_STATES,
     type AdmissionCounters,
     type Placement,
     type PlacementDb,
@@ -201,6 +202,43 @@ export async function precheckAdmission(
     return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'create' }, instanceType: instanceTypeForTier(input.tier ?? 'free') });
 }
 
+/**
+ * A placement that is replaced (resize, enrollment recovery) or stopped before its next boot
+ * (round-3 switch preflight) frees its own running slot: count only the new type, never both.
+ */
+export function releaseOwnSlot(counters: AdmissionCounters, placement: Pick<Placement, 'region' | 'instanceType'>): void {
+    if (!placement.region) return;
+    counters.runningCount = Math.max(0, counters.runningCount - 1);
+    const reusedVcpu = instanceVcpu(placement.instanceType);
+    counters.runningVcpu = Math.max(0, counters.runningVcpu - reusedVcpu);
+    counters.runningVcpuByRegion = {
+        ...counters.runningVcpuByRegion,
+        [placement.region]: Math.max(0, (counters.runningVcpuByRegion[placement.region] ?? 0) - reusedVcpu),
+    };
+    counters.runningByRegion = {
+        ...counters.runningByRegion,
+        [placement.region]: Math.max(0, (counters.runningByRegion[placement.region] ?? 0) - 1),
+    };
+}
+
+/**
+ * Round 3 switch preflight: would admission lease this RUNNING computer again on
+ * `instanceType` once it is stopped? Read-only and unlocked (`peekAdmissionCounters`), the
+ * same counters and `decideAdmission` rules as `runAdmission`, with the computer's own slot
+ * released. Not a reservation: the wake re-decides under the admission lock.
+ */
+export async function admissionDryRun(
+    db: PlacementExecutor,
+    input: { userId: string; placement: Placement; instanceType: string; env?: Env; now?: Date },
+): Promise<AdmissionDecision> {
+    const config = readAwsAdmissionConfig(input.env ?? process.env);
+    if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
+    const now = input.now ?? new Date();
+    const counters = await peekAdmissionCounters(db, { userId: input.userId, computerId: input.placement.computerId, monthStart: utcMonthStart(now), now });
+    if (input.placement.provider === 'aws-ec2' && RUNNING_CLASS_STATES.includes(input.placement.state)) releaseOwnSlot(counters, input.placement);
+    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'lease', region: input.placement.region }, instanceType: input.instanceType });
+}
+
 export async function runAdmission(db: PlacementDb, request: AdmissionRequest, deps: AdmissionDeps = {}): Promise<AdmissionOutcome> {
     const config = readAwsAdmissionConfig(deps.env ?? process.env);
     if (!config.enabled) return { admitted: false, reason: config.reason, reasons: [config.reason] };
@@ -236,17 +274,7 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
             ((placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED) ||
                 (placement.state === 'RUNNING' && request.resizeTo !== undefined)) && placement.region &&
             placement.generation === request.expected.generation && placement.leaseEpoch === request.expected.leaseEpoch) {
-            counters.runningCount = Math.max(0, counters.runningCount - 1);
-            const reusedVcpu = instanceVcpu(placement.instanceType);
-            counters.runningVcpu = Math.max(0, counters.runningVcpu - reusedVcpu);
-            counters.runningVcpuByRegion = {
-                ...counters.runningVcpuByRegion,
-                [placement.region]: Math.max(0, (counters.runningVcpuByRegion[placement.region] ?? 0) - reusedVcpu),
-            };
-            counters.runningByRegion = {
-                ...counters.runningByRegion,
-                [placement.region]: Math.max(0, (counters.runningByRegion[placement.region] ?? 0) - 1),
-            };
+            releaseOwnSlot(counters, placement);
         }
         const instanceType = request.kind === 'create' ? instanceTypeForTier(request.tier)
             : request.resizeTo !== undefined ? instanceTypeForTier(request.resizeTo) : placement?.instanceType;

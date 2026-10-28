@@ -430,7 +430,7 @@ describe('ensure: resize to the current paid plan', () => {
             entitlement: paid('cmp-4'), meter: billing, e: resizeEnv(),
             randomBytes: () => { s.placements[0]![counter] = 9; return Buffer.from(NONCE_BYTES); },
         });
-        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'cas_conflict' });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', error: 'cas_conflict', retryable: true });
         expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', [counter]: 9, fence_token: FENCE });
         expect(s.calls).toEqual([]);
         expect(billing.stopped).not.toHaveBeenCalled();
