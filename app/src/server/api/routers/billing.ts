@@ -99,7 +99,15 @@ async function aiReceipts(deps: BillingDeps, userId: string) {
 }
 
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
-export function createBillingRouter(getDeps: () => BillingDeps) {
+/** The operator gate reuses the `/admin/telemetry` allow-list (`TELEMETRY_ADMIN_EMAILS`, fail-closed); no new env. */
+async function telemetryOperator(email: string | null | undefined): Promise<boolean> {
+    const [{ env }, { isTelemetryAdmin }] = await Promise.all([import('@/env'), import('@/server/telemetry/admin')]);
+    return isTelemetryAdmin(email, env.TELEMETRY_ADMIN_EMAILS);
+}
+
+export function createBillingRouter(getDeps: () => BillingDeps,
+    options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean> } = {}) {
+    const isOperator = options.isOperator ?? telemetryOperator;
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
             const deps = getDeps();
@@ -489,6 +497,28 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                     || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
                 const sku = typeof session.sku === 'string' && session.sku.trim() ? session.sku : null;
                 return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku };
+            }),
+
+        /**
+         * Round 3 D5, operator only (NOT_FOUND to everyone else): reset failed, still-deliverable
+         * AI grants to retry. Dry run unless `apply: true`; every decision is logged.
+         */
+        requeueAiCredits: protectedProcedure.input(z.object({
+            eventKeys: z.array(z.string().min(1).max(200)).max(200).optional(),
+            userId: z.string().uuid().optional(),
+            apply: z.boolean().default(false),
+        }).strict().refine(value => (value.eventKeys?.length ?? 0) > 0 || value.userId !== undefined))
+            .mutation(async ({ ctx, input }) => {
+                let allowed = false;
+                try { allowed = await isOperator(ctx.user.email); } catch { allowed = false; }
+                if (!allowed) throw new TRPCError({ code: 'NOT_FOUND' });
+                const deps = getDeps();
+                if (!deps.aiCredits?.requeueFailed) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+                const result = await deps.aiCredits.requeueFailed({ eventKeys: input.eventKeys, userId: input.userId,
+                    apply: input.apply, now: deps.now().getTime() });
+                console.info(JSON.stringify({ event: 'ai-outbox-requeue-run', operator: ctx.user.id, dryRun: result.dryRun,
+                    selected: result.selected, eligible: result.eligible, requeued: result.requeued }));
+                return result;
             }),
     });
 }

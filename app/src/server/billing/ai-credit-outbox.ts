@@ -24,6 +24,38 @@ export interface AiCreditOutboxStore {
     finish(row: AiCreditOutboxRow, result: AiCreditDelivery, now: number): Promise<void>;
     /** Newest first, at most 200 grant receipts of one user (read-only; splits the balance by bucket). */
     receiptsFor?(userId: string): Promise<AiCreditReceipt[]>;
+    /** Operator-only (D5): dry run unless `apply`; see `planAiCreditRequeue`. */
+    requeueFailed?(input: AiCreditRequeueInput): Promise<AiCreditRequeueResult>;
+}
+
+export interface AiCreditRequeueInput { eventKeys?: readonly string[]; userId?: string; apply: boolean; now: number }
+export interface AiCreditRequeueCandidate {
+    id: string; eventKey: string; userId: string; kind: string; payload: Record<string, unknown>;
+    attempts: number; lastError: string | null; revoked: boolean;
+}
+export type AiCreditRequeueDecision = 'eligible' | 'requeued' | 'lost_race' | 'still_expired' | 'revoked' | 'not_retryable' | 'invalid_payload';
+export interface AiCreditRequeueResult {
+    dryRun: boolean; selected: number; eligible: number; requeued: number;
+    decisions: { eventKey: string; userId: string; lastError: string | null; decision: AiCreditRequeueDecision }[];
+}
+
+/**
+ * Round 3 D5: only grants that can still be delivered are reset. The six wire fields are
+ * immutable, so a grant past its expiry stays failed (`still_expired`: it needs a new grant at
+ * current terms, never a replay); a revoked root, a restore, or a permanent payload/review
+ * failure is never replayed.
+ */
+const REQUEUE_REASONS = new Set(['no_ai_account', 'account_not_found', 'attempts_exhausted', 'delivery_unavailable',
+    'deadline_or_lease', 'transport_unavailable', 'expired']);
+const requeueable = (reason: string | null) => reason !== null && (REQUEUE_REASONS.has(reason) || /^http_5\d\d$/.test(reason));
+export function planAiCreditRequeue(row: AiCreditRequeueCandidate, now: number): AiCreditRequeueDecision {
+    const event = plannedAiCreditEvent(row);
+    if (row.kind !== 'ai_grant' || !event || event.action !== 'grant') return 'invalid_payload';
+    if (row.revoked) return 'revoked';
+    if (Date.parse(event.expiresAt) <= now) return 'still_expired';
+    if ((row.payload.delivery as { reviewRequired?: unknown } | undefined)?.reviewRequired === true
+        || !requeueable(row.lastError)) return 'not_retryable';
+    return 'eligible';
 }
 export const aiCreditBackoffMs = (attempt: number) => Math.min(3_600_000, 60_000 * 2 ** Math.max(0, attempt - 1));
 export const isAiAccountDependency = (reason: string | null) => reason === 'no_ai_account' || reason === 'account_not_found';
@@ -99,6 +131,9 @@ export async function drainAiCreditOutbox(deps: {
             else result.nextAttemptAt = clock() + aiCreditBackoffMs(row.attempts);
         }
         await store.finish(row, result, clock());
+        // One structured line per finished delivery (ids and fixed codes only, never payload values).
+        console.info(JSON.stringify({ event: 'ai-outbox', eventKey: row.eventKey, status: result.status,
+            attempts: row.attempts, reason: result.reason }));
         counts[result.status]++;
     }
     return counts;

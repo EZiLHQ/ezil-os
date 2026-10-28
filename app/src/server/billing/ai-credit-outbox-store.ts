@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { AI_CREDIT_PROTOCOL } from './ai-credits';
-import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, isAiDeliveryDependency, plannedAiCreditEvent,
-    type AiCreditOutboxRow, type AiCreditOutboxStore } from './ai-credit-outbox';
+import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, isAiDeliveryDependency, planAiCreditRequeue,
+    plannedAiCreditEvent, type AiCreditOutboxRow, type AiCreditOutboxStore, type AiCreditRequeueCandidate,
+    type AiCreditRequeueInput, type AiCreditRequeueResult } from './ai-credit-outbox';
 
 type Database = typeof import('@/server/db').db;
 
@@ -133,6 +134,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
                     and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb
             `);
         },
+        requeueFailed: input => requeueFailedAiCredits(db, input),
         async receiptsFor(userId) {
             const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown }>(sql`
                 select payload->>'entitlementId' as "entitlementId", payload->'credits' as credits,
@@ -148,7 +150,47 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
     };
 }
 
-/** Read-only recovery preview. No replay/reset path exists in this phase. */
+/**
+ * Round 3 D5: operator requeue of failed AI grants (dry run unless `apply`). Selects at most
+ * 200 failed, undelivered grant rows (by event keys and/or user), decides each with
+ * `planAiCreditRequeue`, and resets only eligible rows to `retry` with attempts 0, under the
+ * same delivery-JSON + attempts fence `finish` uses. One JSON log line per row.
+ */
+export async function requeueFailedAiCredits(db: Pick<Database, 'execute'>, input: AiCreditRequeueInput): Promise<AiCreditRequeueResult> {
+    const keys = [...new Set(input.eventKeys ?? [])];
+    if (!Number.isSafeInteger(input.now) || input.now < 0 || keys.length > 200 || keys.some(key => typeof key !== 'string' || key.length < 1 || key.length > 200)
+        || (input.userId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.userId))
+        || (keys.length === 0 && input.userId === undefined)) throw new TypeError('Invalid AI requeue selection');
+    const rows = await db.execute<AiCreditRequeueCandidate & Record<string, unknown>>(sql`
+        select o.id, o.event_key as "eventKey", o.user_id as "userId", o.kind, o.payload, o.attempts, o.last_error as "lastError",
+            exists (select 1 from ezil_billing_outbox r where r.kind = 'ai_revoke' and r.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                and r.payload->>'entitlementId' = o.payload->>'entitlementId') as revoked
+        from ezil_billing_outbox o
+        where o.payload->>'protocol' = ${AI_CREDIT_PROTOCOL} and o.kind = 'ai_grant' and o.delivered_at is null
+            and o.payload->'delivery'->>'status' = 'failed'
+            ${keys.length ? sql`and o.event_key in (${sql.join(keys.map(key => sql`${key}`), sql`, `)})` : sql``}
+            ${input.userId !== undefined ? sql`and o.user_id = ${input.userId}::uuid` : sql``}
+        order by o.created_at, o.id limit 200`);
+    const decisions: AiCreditRequeueResult['decisions'] = [];
+    for (const row of rows) {
+        let decision = planAiCreditRequeue(row, input.now);
+        if (decision === 'eligible' && input.apply) {
+            const reset = await db.execute(sql`
+                update ezil_billing_outbox set attempts = 0, last_error = null,
+                    payload = jsonb_set(payload, '{delivery}', (${JSON.stringify({ status: 'retry', nextAttemptAt: input.now,
+                        requeuedAt: input.now, requeuedFrom: row.lastError })}::text)::jsonb)
+                where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
+                    and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb returning id`);
+            decision = reset.length ? 'requeued' : 'lost_race';
+        }
+        console.info(JSON.stringify({ event: 'ai-outbox-requeue', eventKey: row.eventKey, decision, lastError: row.lastError, dryRun: !input.apply }));
+        decisions.push({ eventKey: row.eventKey, userId: row.userId, lastError: row.lastError, decision });
+    }
+    return { dryRun: !input.apply, selected: rows.length, eligible: decisions.filter(d => d.decision === 'eligible' || d.decision === 'requeued').length,
+        requeued: decisions.filter(d => d.decision === 'requeued').length, decisions };
+}
+
+/** Read-only recovery preview by event key (no writes); `requeueFailedAiCredits` is the reset path. */
 export async function previewAiCreditRecovery(db: Pick<Database, 'execute'>, input: {
     eventKeys: readonly string[]; now: number;
 }) {
