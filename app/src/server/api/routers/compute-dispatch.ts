@@ -22,6 +22,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
+import { after } from 'next/server';
 
 import { billingV2EntitlementReader, gateComputerStart } from '@/server/billing/v2/compute-access';
 import type { BillingDeps } from '@/server/billing/ports';
@@ -37,7 +38,7 @@ import {
 } from '@/server/lib/compute/progress';
 import { TERMINAL_MIGRATION_STATES } from '@/server/lib/compute/provider-migrate';
 import { createProviderMigrationStore } from '@/server/lib/compute/provider-migrate-store';
-import type { Placement, PlacementState } from '@/server/lib/compute/placement';
+import { POOL_SESSION_PENDING, type Placement, type PlacementState } from '@/server/lib/compute/placement';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
@@ -272,6 +273,10 @@ export interface TransitionDeps {
     preflight?: (db: PlacementExecutor, p: Placement, targetType: string, env: Env, now: Date) => Promise<SwitchCapacity>;
     /** Defaults to `routeComputer` (tests inject a scripted provider). */
     routeComputer?: (db: unknown, computer: ComputerRef, options: RouteOptions) => Promise<RoutedComputer>;
+    /** The pool-session preview exchange for a pending warm adopt (`prepareAwsPoolSession`). */
+    preparePool?: (db: PlacementExecutor, computer: ComputerRef, correlationId: string) => Promise<void>;
+    /** The computer's provider migration, if any (defaults to the migration store). */
+    migration?: (db: PlacementExecutor, computerId: string) => Promise<{ state: string } | null>;
 }
 
 export type RestartComputerOutput =
@@ -288,7 +293,20 @@ async function defaultBilling(): Promise<BillingDeps> {
 }
 function defaultSchedule(work: () => Promise<void>): void {
     const run = () => work().catch(() => console.error('[compute.transition] driver failed'));
-    void import('next/server').then(({ after }) => { try { after(run); } catch { void run(); } }, () => { void run(); });
+    // Registered synchronously, inside the request scope (as provider-migrate-orchestrator.ts does).
+    try { after(run); } catch { void run(); }
+}
+
+/**
+ * A warm adopt reaches session-ready only after the Worker's preview exchange for the new epoch
+ * (the open route runs it as `prepareAwsPoolSession` before its hold). A server-initiated wake
+ * has no browser open, so the driver runs the same exchange once per pool-pending lease epoch.
+ */
+async function defaultPreparePool(db: PlacementExecutor, computer: ComputerRef, correlationId: string): Promise<void> {
+    const [{ prepareAwsPoolSession }, { resolveCloudflareGuacamoleConfig }] = await Promise.all([
+        import('@/server/lib/compute/aws-preview'), import('@/server/lib/cloudflare-guacamole-provider')]);
+    await prepareAwsPoolSession(db, computer, { sessionId: computer.computerId, desktopMode: 'neko' }, resolveCloudflareGuacamoleConfig(),
+        process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', correlationId);
 }
 
 /** The same plan rule `billing.selectMachine` applies: an active Premium plan whose machine choice lists `size`. */
@@ -370,11 +388,16 @@ export async function driveTransition(db: PlacementDb, computer: ComputerRef, t:
         const gate = await gateComputerStart({ deps: billing, ...computer, kind: 'aws-ec2', instanceType: routed.instanceType, now: billing.now() });
         if (!gate.allowed) return fail(`billing_${gate.reason}`);
         const deadline = (Date.parse(current.wakingAt ?? '') || clock().getTime()) + (deps.wake?.budgetMs ?? TRANSITION_WAKE_TIMEOUT_MS);
+        let prepared = -1;
         for (;;) {
             const { record: p } = await readPlacement(db, computer.computerId, computer.userId);
             const resolved = resolveTransition(current, p, clock());
             if (resolved.phase === 'done' || resolved.phase === 'failed') { await finishTransition(db, billing, computer, current, resolved, clock()); return current; }
             if (clock().getTime() >= deadline) return fail('wake_timeout');
+            if (p && p.leaseEpoch > current.fromLeaseEpoch && p.lastError === POOL_SESSION_PENDING && prepared !== p.leaseEpoch) {
+                prepared = p.leaseEpoch;
+                await (deps.preparePool ?? defaultPreparePool)(db, computer, ctx.correlationId).catch(() => undefined);
+            }
             if (p && p.state !== 'RUNNING') {
                 const woke = await routed.provider.ensure(ctx, computer, { sessionId: computer.computerId, desktopMode: 'neko' });
                 if (!woke.ok && !woke.retryable) return fail(woke.errorCode === 'capacity_unavailable' ? 'capacity_unavailable' : woke.errorCode.slice(0, 64));
@@ -436,8 +459,12 @@ export async function switchComputerConfiguration(db: PlacementDb, computer: Com
     const running = meteredSizeForInstanceType(aws?.instanceType);
     const preferred = isAwsSize(running) ? null : await billing.store.sizePreference(computer.userId);
     const current: AwsSizeCode = isAwsSize(running) ? running : isAwsSize(preferred) ? preferred : 'std-2';
-    const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId).catch(() => null);
-    const migrating = !!migration && !TERMINAL_MIGRATION_STATES.includes(migration.state);
+    // Fail closed: an unreadable migration state is busy, never a stop of a computer mid-migration.
+    let migrating: boolean;
+    try {
+        const migration = await (deps.migration ?? ((x, id) => createProviderMigrationStore(x).readByComputer(id)))(db, computer.computerId);
+        migrating = !!migration && !TERMINAL_MIGRATION_STATES.includes(migration.state as never);
+    } catch { return { ok: false, reason: 'computer_busy' }; }
     if (aws?.state === 'RUNNING' && !migrating && target !== current) {
         const preflight = await (deps.preflight ?? preflightSwitchCapacity)(db, aws, SIZES[target].machine, env, now);
         if (!preflight.ok) {

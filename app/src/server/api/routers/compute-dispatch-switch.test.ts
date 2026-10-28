@@ -61,7 +61,8 @@ const computer = { userId: U, computerId: C };
 const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_COMPUTE_PLACEMENT_READS: '1' };
 const TYPE: Record<string, string> = { 'std-2': 'm6i.large', 'cmp-4': 'm6i.xlarge', 'cmp-8': 'm6i.2xlarge' };
 
-function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'capacity' | 'stuck' | 'unconfirmed'; stop?: 'ok' | 'never' } = {}) {
+function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'capacity' | 'stuck' | 'unconfirmed' | 'warm'; stop?: 'ok' | 'never' } = {}) {
+    const prepared = new Set<number>();
     const fake = createFakePlacementDb({ placements: [placementRow({
         computer_id: C, owner_user_id: U, state: 'RUNNING', generation: 3, lease_epoch: 7, region: 'ap-south-1', zone_id: 'aps1-az1',
         instance_id: 'i-1', instance_type: 'm6i.large', volume_id: 'vol-1', fence_token: 'fe0fe0fe-fe0f-4e0f-8e0f-e0fe0fe0fe0f', ...row,
@@ -90,6 +91,8 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
             // Like aws-ec2 `ensure`: an in-flight placement first applies its lifecycle receipt.
             if (p().state !== 'STOPPED') {
                 const next: Record<string, string> = { LEASED: 'STARTING', STARTING: 'MOUNTING', MOUNTING: 'RUNNING' };
+                // A pending warm adopt reaches session-ready only after the preview exchange.
+                if (p().state === 'MOUNTING' && p().last_error === 'pool_session_pending' && !prepared.has(Number(p().lease_epoch))) return { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true };
                 if (next[p().state as string]) p().state = next[p().state as string];
                 return { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true };
             }
@@ -98,9 +101,9 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
             // The replace path: one lease CAS moves generation and epoch by one, with a new fence, onto the entitled size.
             const size = String((await (options.entitlements!).read(U))?.size);
             calls.leases++; calls.leasedSizes.push(size);
-            Object.assign(p(), { state: script.ensure === 'unconfirmed' ? 'UNCONFIRMED' : 'LEASED', generation: Number(p().generation) + 1,
+            Object.assign(p(), { state: script.ensure === 'unconfirmed' ? 'UNCONFIRMED' : script.ensure === 'warm' ? 'MOUNTING' : 'LEASED', generation: Number(p().generation) + 1,
                 lease_epoch: Number(p().lease_epoch) + 1, instance_type: TYPE[size], instance_id: null, fence_token: `fence-${calls.leases}`,
-                last_error: script.ensure === 'unconfirmed' ? 'capacity:region' : null });
+                last_error: script.ensure === 'unconfirmed' ? 'capacity:region' : script.ensure === 'warm' ? 'pool_session_pending' : null });
             return { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true };
         },
         activity: async () => ({ ok: true }), restart: async () => ({ ok: true }), terminate: async () => ({ ok: true, terminated: true }),
@@ -113,8 +116,10 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
     };
     const billing = { store, now: () => new Date(clock), config: {} } as unknown as BillingDeps;
     const preflight = vi.fn(async () => ({ ok: true as const, wait: false }));
+    const preparePool = vi.fn(async () => { prepared.add(Number(p().lease_epoch)); });
+    const migration = vi.fn(async (): Promise<{ state: string } | null> => null);
     const deps: TransitionDeps = {
-        env, billing: () => billing, now: () => new Date(clock), preflight,
+        env, billing: () => billing, now: () => new Date(clock), preflight, preparePool, migration,
         schedule: work => { scheduled.push(work); },
         sleep: async ms => { clock += ms; },
         stop: { pollMs: 5_000 }, wake: { pollMs: 5_000 },
@@ -125,7 +130,7 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
     };
     const run = async () => { while (scheduled.length) await scheduled.shift()!(); };
     const stored = () => h.metadata.transition as ComputerTransition | undefined;
-    return { fake, p, calls, deps, run, store, preflight, stored, tick: (ms: number) => { clock += ms; }, now: () => new Date(clock) };
+    return { fake, p, calls, deps, run, store, preflight, preparePool, migration, stored, tick: (ms: number) => { clock += ms; }, now: () => new Date(clock) };
 }
 
 beforeEach(() => {
@@ -149,6 +154,26 @@ describe('switchConfiguration: RUNNING applies now (stop, then wake on the targe
         expect(s.stored()).toMatchObject({ phase: 'done', reason: null });
         expect(s.stored()!.stoppingAt && s.stored()!.wakingAt && s.stored()!.endedAt).toBeTruthy();
         expect(h.preference).toBe('cmp-8');
+    });
+
+    it('a warm adopt with no browser open: the driver runs the pool-session exchange once, then it is done', async () => {
+        const s = harness({}, { ensure: 'warm' });
+        await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        await s.run();
+        expect(s.preparePool).toHaveBeenCalledTimes(1);
+        expect(s.stored()).toMatchObject({ phase: 'done' });
+        expect(s.p()).toMatchObject({ state: 'RUNNING', instance_type: 'm6i.xlarge', lease_epoch: 8 });
+    });
+
+    it('an unreadable or active provider migration is computer_busy, never a stop', async () => {
+        const s = harness();
+        s.migration.mockRejectedValueOnce(new Error('down'));
+        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps)).toEqual({ ok: false, reason: 'computer_busy' });
+        s.migration.mockResolvedValueOnce({ state: 'exported' });
+        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps)).toEqual({ ok: false, reason: 'computer_busy' });
+        await s.run();
+        expect(s.calls.stop).toBe(0);
+        expect(s.store.setSizePreference).not.toHaveBeenCalled();
     });
 
     it('a preflight capacity refusal (8 vCPU near the cap) answers before any stop: still RUNNING, nothing written', async () => {

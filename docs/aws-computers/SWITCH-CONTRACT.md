@@ -60,8 +60,8 @@ The checks run in this order:
    - **STOPPED, no AWS computer yet, or UNCONFIRMED** (waiting for recovery): the preference is
      stored. The answer is `next_start` (offer "Start now"). The `transitionId` is fresh and no
      transition record is kept.
-   - **Opening, stopping, recovering, retiring, or a provider migration in progress**:
-     `computer_busy`, and nothing is stored.
+   - **Opening, stopping, recovering, retiring, or a provider migration in progress** (an
+     unreadable migration state counts as in progress): `computer_busy`, and nothing is stored.
 
 The preference store is the one `billing.selectMachine` writes (`ezil_billing_size_preferences`). So
 `billing.summary` and the next open both see the new size.
@@ -91,7 +91,10 @@ The preference store is the one `billing.selectMachine` writes (`ezil_billing_si
   target, this is the existing replace path:
   - same data volume, generation + 1, new fence token;
   - the old instance is stopped and terminated by the lifecycle helper;
-  - a warm spare of the target class is adopted when ready, otherwise it is a cold boot.
+  - a warm spare of the target class is adopted when ready, otherwise it is a cold boot;
+  - for a pending warm adopt (`pool_session_pending`), the driver runs the same Worker preview
+    exchange the open route runs (`prepareAwsPoolSession`) once per lease epoch, so the switch
+    completes with no browser open.
 - `done`: the placement is RUNNING on a later lease epoch with the target's instance type.
 - `failed`: `reason` is one of:
   - `stop_timeout`, `stop_<outcome>`, `wake_timeout`;
