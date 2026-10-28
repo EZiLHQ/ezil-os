@@ -1,4 +1,5 @@
 import { createTRPCContext } from '@/server/api/trpc';
+import { deploySha } from '@/server/feedback/deploy-sha';
 import { handleFeedbackRequest } from '@/server/feedback/http-handler';
 import type { ShellFeatureEnv } from '@/server/shell/features';
 
@@ -8,6 +9,7 @@ export const maxDuration = 10;
 async function handle(req: Request): Promise<Response> {
     return handleFeedbackRequest(req, {
         env: process.env as ShellFeatureEnv,
+        deploySha: deploySha(process.env),
         getContext: async (request) => {
             const headers = new Headers(request.headers);
             headers.set('x-trpc-source', 'shell-http');

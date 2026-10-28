@@ -9,7 +9,7 @@ as recommended).
 
 | Env var | Effect |
 |---|---|
-| `EZIL_OS_FLOATING_CONTROLS=1` | `desktopState.ui.floatingControls = true` |
+| `EZIL_OS_FLOATING_CONTROLS=1` | `desktopState.ui.floatingControls = true` — **not read in the round-3 feedback-only port**: the pill lane is not shipped, so `floatingControls` is always `false` |
 | `EZIL_OS_FEEDBACK=1` | `desktopState.endpoints.feedback = '/api/shell/feedback'` (absent otherwise); route returns 404 when off |
 | `EZIL_OS_FEEDBACK_SCREENSHOTS=1` | `desktopState.ui.feedbackScreenshots = true` (only meaningful with feedback on) |
 | `FEEDBACK_PILOT_EMAILS` | comma list; when set, feedback (and screenshots) are on ONLY for these emails |
@@ -115,7 +115,9 @@ the page; a stream granted after cancellation is stopped immediately. Late decod
 bitmaps are closed and never reopen an editor or attach to another draft.
 
 ## 3. Wire format — `app/src/server/feedback/types.ts` is authoritative (zod)
-POST `/api/shell/feedback` (JSON):
+POST `/api/shell/feedback` (JSON; `Content-Type: application/json` required, parameters such as
+`charset` allowed — anything else is `415 {error:'unsupported_media_type'}` before the body is read,
+so a cross-site simple form cannot post a report on the lax session cookie):
 ```
 { v: 1, clientRequestId: uuid, category: 'bug'|'idea'|'other', description: string 1..4000,
   computerId?: uuid|null, diagnostics?: Diagnostics|null,
@@ -127,7 +129,7 @@ Diagnostics (strict, every field optional):
   recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int} }
 ```
 Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
-`400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `429 {error:'rate_limited'}`.
+`400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
 GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).
 DELETE `?id=<uuid>` → `204`; `404` if not the caller's.
 Limits: body 32 KiB without screenshot, 2.5 MiB with; decoded image ≤1.5 MiB, ≤4096 px per side,
@@ -138,9 +140,13 @@ budget 500 MB/day and 5 GB total → over budget: report stored, `screenshotAcce
 `ezil_feedback_reports`, `ezil_feedback_attachments`, `ezil_feedback_access_log` — no PKs,
 defaults or constraints (production grammar). App-generated UUIDv4 ids. All reads/deletes scoped
 by `user_id`. Admin reads write an access-log row first (no content if that write fails).
+`ezil_feedback_reports.deploy_sha` is stamped server-side from the image's `EZIL_GIT_SHA` (the
+same source as `/api/health`; null when unset or not a hex SHA) — never from the client, so it
+is present even when the diagnostics consent is off. Shown on `/admin/feedback`.
 Retention (telemetry-maintenance cron): attachments 30 d, reports 180 d, access log 365 d.
-The SQL is NOT registered in `.github/production-migrations.json` — that needs the founder's
-rehearsal for the `after` digest (see `docs/feedback-migration.md`).
+The SQL is also committed as `app/drizzle/0011_feedback.sql` (byte-identical to the constants),
+registered in `.github/production-migrations.json` as a `snapshot` source for the os-staging
+schema tool only (see `docs/feedback-migration.md`); it is refused for `aws-production`.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,

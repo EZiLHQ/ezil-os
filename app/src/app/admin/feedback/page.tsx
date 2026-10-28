@@ -48,6 +48,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         <p className="text-sm">{timestamp(report.createdAt)} · {report.category} · {report.status}</p>
                         <p className="whitespace-pre-wrap break-words">{report.description}</p>
                         <p className="text-sm">Computer: {report.computerId ?? '—'}</p>
+                        <p className="text-sm">Deployed commit: <span className="font-mono">{report.deploySha ?? '—'}</span></p>
                         <h3 className="font-semibold">Diagnostics</h3>
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(report.diagnostics, null, 2) ?? 'None'}</pre>
                         {report.hasScreenshot ? (
@@ -62,7 +63,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                     <div className="overflow-x-auto">
                         <table className="w-full min-w-[800px] text-left text-sm">
                             <thead><tr className="border-b border-offwhite/20">
-                                {['Report', 'Created', 'Category', 'Description', 'Screenshot', 'Computer', 'Diagnostics'].map((heading) => <th key={heading} className="py-2 pr-4 font-medium">{heading}</th>)}
+                                {['Report', 'Created', 'Category', 'Description', 'Screenshot', 'Computer', 'Commit', 'Diagnostics'].map((heading) => <th key={heading} className="py-2 pr-4 font-medium">{heading}</th>)}
                             </tr></thead>
                             <tbody>{reports.map((row) => (
                                 <tr key={row.id} className="border-b border-offwhite/10">
@@ -72,6 +73,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                                     <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview}</td>
                                     <td className="py-2 pr-4">{row.hasScreenshot ? 'Yes' : 'No'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.computerId ?? '—'}</td>
+                                    <td className="py-2 pr-4 font-mono text-xs">{row.deploySha?.slice(0, 8) ?? '—'}</td>
                                     <td className="py-2 pr-4">{diagnosticsSummary(row.diagnostics)}</td>
                                 </tr>
                             ))}</tbody>

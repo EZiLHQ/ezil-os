@@ -19,6 +19,7 @@ export interface AdminReportSummary {
     hasScreenshot: boolean;
     computerId: string | null;
     diagnostics: unknown;
+    deploySha: string | null;
 }
 
 export interface AdminReport extends Omit<AdminReportSummary, 'descriptionPreview'> {
@@ -69,7 +70,7 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
             return rowsOf<AdminReportSummary>(await db.execute(sql`
                 SELECT r.id, r.created_at AS "createdAt", r.category,
                     left(r.description, ${FEEDBACK_LIMITS.descriptionPreview}) AS "descriptionPreview",
-                    left(r.computer_id::text, 8) AS "computerId", r.diagnostics,
+                    left(r.computer_id::text, 8) AS "computerId", r.diagnostics, r.deploy_sha AS "deploySha",
                     EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
                 FROM ezil_feedback_reports r
                 WHERE r.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
@@ -79,7 +80,7 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
         async findReport(id) {
             return rowsOf<AdminReport>(await db.execute(sql`
                 SELECT r.id, r.created_at AS "createdAt", r.category, r.description,
-                    r.computer_id AS "computerId", r.diagnostics, r.status,
+                    r.computer_id AS "computerId", r.diagnostics, r.status, r.deploy_sha AS "deploySha",
                     EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
                 FROM ezil_feedback_reports r WHERE r.id = ${id} LIMIT 1
             `))[0] ?? null;

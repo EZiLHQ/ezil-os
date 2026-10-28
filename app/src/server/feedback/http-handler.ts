@@ -9,9 +9,18 @@ export interface FeedbackHandlerDeps {
     getContext: (req: Request) => Promise<{ user: { id: string; email?: string | null } | null; db: FeedbackDb }>;
     env: ShellFeatureEnv;
     now?: () => Date;
+    /** The deployed commit stamped on each new report (`deploy-sha.ts`); null when unknown. */
+    deploySha?: string | null;
 }
 
 const invalidRequest = () => shellJson({ error: 'invalid_request' }, 400);
+
+/** Round-3 F10: a cross-site form can only send simple content types, so a
+ * JSON-only POST cannot be forged by a page that rides the lax session cookie. */
+function isJson(req: Request): boolean {
+    const type = req.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+    return type === 'application/json';
+}
 
 /** Byte-counted, like telemetry/http-handler.ts:80: Content-Length is untrusted,
  * and a too-large stream is cancelled before retaining any further chunks. */
@@ -52,6 +61,7 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
         const features = shellFeaturesFor(user.email, deps.env);
         if (!features.feedback) return shellJson({ error: 'not_found' }, 404);
         if (req.method === 'POST') {
+            if (!isJson(req)) return shellJson({ error: 'unsupported_media_type' }, 415);
             let raw: unknown;
             try {
                 const body = await readBoundedBody(req, features.feedbackScreenshots
@@ -61,7 +71,7 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
             } catch { return invalidRequest(); }
             const parsed = feedbackSubmitSchema.safeParse(raw);
             if (!parsed.success || (!features.feedbackScreenshots && parsed.data.screenshot != null)) return invalidRequest();
-            const result = await ingestFeedback(db, user.id, parsed.data, deps.now?.() ?? new Date());
+            const result = await ingestFeedback(db, user.id, parsed.data, deps.now?.() ?? new Date(), deps.deploySha ?? null);
             return result.status === 429 ? shellJson({ error: 'rate_limited' }, 429) : shellJson(result.created, result.status);
         }
         if (req.method === 'GET') return shellJson({ reports: await listFeedback(db, user.id) });

@@ -31,6 +31,8 @@ export const feedbackReports = pgTable(
         status: text('status').notNull(),
         redactionCount: integer('redaction_count').notNull(),
         hasScreenshot: boolean('has_screenshot').notNull(),
+        /** Deployed commit when the report arrived (server-stamped; null if unknown). */
+        deploySha: text('deploy_sha'),
     },
     (t) => [
         index('ezil_feedback_reports_user_created').on(t.userId, t.createdAt),

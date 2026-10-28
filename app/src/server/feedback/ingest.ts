@@ -22,7 +22,9 @@ export type FeedbackIngestResult = { status: 200 | 201; created: FeedbackCreated
 const USER_LOCK = 0x455a6662;
 const ATTACHMENT_LOCK = 0x455a6661;
 
-export async function ingestFeedback(db: FeedbackDb, userId: string, input: FeedbackSubmit, now = new Date()): Promise<FeedbackIngestResult> {
+export async function ingestFeedback(
+    db: FeedbackDb, userId: string, input: FeedbackSubmit, now = new Date(), deploySha: string | null = null,
+): Promise<FeedbackIngestResult> {
     const image = input.screenshot ? decodeScreenshot(input.screenshot) : null;
     const description = redactDescription(input.description);
     const diagnostics = sanitizeDiagnostics(input.diagnostics);
@@ -54,7 +56,7 @@ export async function ingestFeedback(db: FeedbackDb, userId: string, input: Feed
             id, userId, computerId, createdAt: now, category: input.category,
             description: description.text, diagnostics, clientRequestId: input.clientRequestId,
             shellVersion: diagnostics?.shellVersion ?? null, status: 'new', redactionCount: description.count,
-            hasScreenshot: screenshotAccepted,
+            hasScreenshot: screenshotAccepted, deploySha,
         });
         if (image && screenshotAccepted) await tx.insert(feedbackAttachments).values({
             reportId: id, userId, createdAt: now, contentType: image.contentType,

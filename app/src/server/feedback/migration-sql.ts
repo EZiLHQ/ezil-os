@@ -10,7 +10,7 @@
  * `app/src/server/db/schema/feedback.ts`.
  */
 
-export const FEEDBACK_REPORTS_SQL = `CREATE TABLE public.ezil_feedback_reports (id uuid NOT NULL, user_id uuid NOT NULL, computer_id uuid NULL, created_at timestamptz NOT NULL, category text NOT NULL, description text NOT NULL, diagnostics jsonb NULL, client_request_id uuid NOT NULL, shell_version text NULL, status text NOT NULL, redaction_count integer NOT NULL, has_screenshot boolean NOT NULL);
+export const FEEDBACK_REPORTS_SQL = `CREATE TABLE public.ezil_feedback_reports (id uuid NOT NULL, user_id uuid NOT NULL, computer_id uuid NULL, created_at timestamptz NOT NULL, category text NOT NULL, description text NOT NULL, diagnostics jsonb NULL, client_request_id uuid NOT NULL, shell_version text NULL, status text NOT NULL, redaction_count integer NOT NULL, has_screenshot boolean NOT NULL, deploy_sha text NULL);
 CREATE INDEX ezil_feedback_reports_user_created ON public.ezil_feedback_reports (user_id, created_at);
 CREATE INDEX ezil_feedback_reports_id ON public.ezil_feedback_reports (id);
 ALTER TABLE public.ezil_feedback_reports ENABLE ROW LEVEL SECURITY;

@@ -13,7 +13,8 @@ const VALID = { v: 1, clientRequestId: ID, category: 'bug', description: 'The bu
 const SCREENSHOT = { contentType: 'image/png', dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg==' };
 const URL = 'https://example.test/api/shell/feedback';
 
-function request(body: unknown = VALID) { return new Request(URL, { method: 'POST', body: JSON.stringify(body) }); }
+const JSON_HEADERS = { 'content-type': 'application/json' };
+function request(body: unknown = VALID) { return new Request(URL, { method: 'POST', body: JSON.stringify(body), headers: JSON_HEADERS }); }
 function harness(options: { hour?: number; day?: number; budget?: number; replay?: boolean; list?: boolean; owned?: boolean; fail?: boolean } = {}) {
     const statements: { sql: string; params: unknown[] }[] = [];
     const proxy = drizzle(async (sql, params) => {
@@ -73,14 +74,14 @@ describe('feedback HTTP boundary', () => {
 
     it.each(['{not-json', '', 'null', '[]'])('rejects malformed or non-object JSON: %j', async (body) => {
         const h = harness();
-        expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', body }), h.deps)).status).toBe(400);
+        expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', body, headers: JSON_HEADERS }), h.deps)).status).toBe(400);
         expect(h.statements).toEqual([]);
     });
 
     it.each([false, true])('enforces actual body bytes with screenshot flag %s despite false Content-Length', async (screenshots) => {
         const h = harness(); if (screenshots) h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1';
         const limit = screenshots ? FEEDBACK_LIMITS.bodyBytesWithScreenshot : FEEDBACK_LIMITS.bodyBytesNoScreenshot;
-        const response = await handleFeedbackRequest(new Request(URL, { method: 'POST', body: 'x'.repeat(limit + 1), headers: { 'content-length': '10' } }), h.deps);
+        const response = await handleFeedbackRequest(new Request(URL, { method: 'POST', body: 'x'.repeat(limit + 1), headers: { ...JSON_HEADERS, 'content-length': '10' } }), h.deps);
         expect(response.status).toBe(413); expect(h.statements).toEqual([]);
     });
 
@@ -89,7 +90,7 @@ describe('feedback HTTP boundary', () => {
         const body = new ReadableStream<Uint8Array>({
             pull(controller) { chunk++; controller.enqueue(new TextEncoder().encode('🙂'.repeat(4097))); }, cancel,
         });
-        const req = new Request(URL, { method: 'POST', body, duplex: 'half' } as RequestInit);
+        const req = new Request(URL, { method: 'POST', body, headers: JSON_HEADERS, duplex: 'half' } as RequestInit);
         expect((await handleFeedbackRequest(req, h.deps)).status).toBe(413);
         expect(cancel).toHaveBeenCalled(); expect(chunk).toBeLessThanOrEqual(3); expect(h.statements).toEqual([]);
     });
@@ -97,14 +98,49 @@ describe('feedback HTTP boundary', () => {
     it('accepts a body exactly at its byte cap', async () => {
         const h = harness(); const raw = JSON.stringify(VALID);
         const body = raw + ' '.repeat(FEEDBACK_LIMITS.bodyBytesNoScreenshot - Buffer.byteLength(raw));
-        expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', body }), h.deps)).status).toBe(201);
+        expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', body, headers: JSON_HEADERS }), h.deps)).status).toBe(201);
     });
 
     it('rejects malformed UTF-8 rather than storing replacement characters', async () => {
         const h = harness();
         const body = Buffer.concat([Buffer.from(JSON.stringify(VALID).slice(0, -2)), Buffer.from([0xff]), Buffer.from('"}')]);
-        expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', body }), h.deps)).status).toBe(400);
+        expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', body, headers: JSON_HEADERS }), h.deps)).status).toBe(400);
         expect(h.statements).toEqual([]);
+    });
+
+    it.each([undefined, 'text/plain', 'text/plain;charset=UTF-8', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', 'application/jsonp', 'application/json-patch+json'])(
+        'refuses a POST whose content-type is %s with 415, before reading the body or touching the DB', async (type) => {
+            const h = harness();
+            const req = new Request(URL, { method: 'POST', body: JSON.stringify(VALID) });
+            if (type === undefined) req.headers.delete('content-type'); else req.headers.set('content-type', type);
+            const response = await handleFeedbackRequest(req, h.deps);
+            expect(response.status).toBe(415); expect(await response.json()).toEqual({ error: 'unsupported_media_type' });
+            expect(response.headers.get('cache-control')).toContain('no-store');
+            expect(req.bodyUsed).toBe(false); expect(h.statements).toEqual([]);
+        });
+
+    it.each(['application/json', 'application/json; charset=utf-8', 'Application/JSON;charset=UTF-8', ' application/json '])('accepts content-type %j', async (type) => {
+        const h = harness();
+        const response = await handleFeedbackRequest(new Request(URL, { method: 'POST', body: JSON.stringify(VALID), headers: { 'content-type': type } }), h.deps);
+        expect(response.status).toBe(201);
+    });
+
+    it('a wrong content-type is still 404 with the feature off and 401 without a session', async () => {
+        const off = harness(); off.deps.env = {};
+        const text = () => new Request(URL, { method: 'POST', body: 'x', headers: { 'content-type': 'text/plain' } });
+        expect((await handleFeedbackRequest(text(), off.deps)).status).toBe(404);
+        const anon = harness(); anon.getContext.mockResolvedValue({ user: null, db: anon.db });
+        expect((await handleFeedbackRequest(text(), anon.deps)).status).toBe(401);
+    });
+
+    it('stamps the deployed commit from deps on the inserted report, never from the body', async () => {
+        const h = harness(); h.deps.deploySha = '46698745a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        expect((await handleFeedbackRequest(request(), h.deps)).status).toBe(201);
+        const insert = h.statements.find((s) => s.sql.startsWith('insert into "ezil_feedback_reports"'))!;
+        expect(insert.sql).toContain('"deploy_sha"');
+        expect(insert.params).toContain('46698745a1b2c3d4e5f60718293a4b5c6d7e8f90');
+        const forged = harness();
+        expect((await handleFeedbackRequest(request({ ...VALID, deploySha: 'abc1234' }), forged.deps)).status).toBe(400);
     });
 
     it.each([{ hour: 10 }, { day: 30 }])('returns 429 at the DB rate limit %j', async (options) => {

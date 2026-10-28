@@ -89,9 +89,15 @@ describe('feedback ingest SQL and persisted values', () => {
             id: expect.stringMatching(/^[0-9a-f-]{14}4[0-9a-f-]{21}$/), user_id: USER, computer_id: null,
             created_at: NOW.toISOString(), category: 'bug', status: 'new', client_request_id: REQUEST,
             description: 'alice@example.com [redacted:aws-key]', redaction_count: 1, has_screenshot: false,
-            shell_version: '[redacted:email]',
+            shell_version: '[redacted:email]', deploy_sha: null,
         });
         expect(JSON.parse(String(reports[0]!.diagnostics))).toEqual({ shellVersion: '[redacted:email]', appCommit: '[redacted:jwt]' });
+    });
+
+    it('stores the server-stamped deploy SHA on the report row', async () => {
+        const { db, reports } = database();
+        await ingestFeedback(db, USER, input, NOW, '46698745a1b2c3d4e5f60718293a4b5c6d7e8f90');
+        expect(reports[0]).toMatchObject({ deploy_sha: '46698745a1b2c3d4e5f60718293a4b5c6d7e8f90' });
     });
 
     it.each([false, true])('retains a computer only when owner/nondeleted lookup succeeds: %s', async (ownedComputer) => {
