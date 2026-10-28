@@ -1936,14 +1936,38 @@ describe('v3 paid invoice grants', () => {
             expect([...f.store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
         });
         it('reconstructs the missing upgrade receipt byte-for-byte for a refund', async () => {
+            const kept = upgraded();
+            await processStripeEvent(paidV2(), kept.deps);
+            await processStripeEvent(refund(), kept.deps);
             const f = upgraded();
             await processStripeEvent(paidV2(), f.deps);
             const original = structuredClone(f.store.outbox.get(`${upgradeRoot}:grant`)!);
             f.store.outbox.clear();
+            const reversal = vi.spyOn(f.store, 'recordAiReversal');
             expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
-            expect(f.store.outbox.get(`${upgradeRoot}:revoke:refund:re_local`)?.payload).toMatchObject({
-                entitlementId: original.payload.entitlementId, credits: original.payload.credits,
-                expiresAt: original.payload.expiresAt, invoiceId: original.payload.invoiceId });
+            expect(reversal.mock.calls[0]![0].receipts).toStrictEqual([original]);
+            expect(f.store.outbox.get(`${upgradeRoot}:revoke:refund:re_local`))
+                .toStrictEqual(kept.store.outbox.get(`${upgradeRoot}:revoke:refund:re_local`));
+        });
+        it('refuses a stored upgrade receipt whose expiry is not the period end plus three days', async () => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            const root = f.store.outbox.get(`${upgradeRoot}:grant`)!;
+            expect(root.payload.expiresAt).toBe(new Date(periodEnd.getTime() + 3 * 86_400_000).toISOString());
+            root.payload.expiresAt = new Date(periodEnd.getTime() + 2 * 86_400_000).toISOString();
+            const before = [...f.store.writes];
+            expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+            expect(f.store.writes).toEqual(before);
+        });
+        it('sends an upgrade whose AI root cannot be formed to review before any write', async () => {
+            const f = upgraded();
+            f.stripe.subscription.id = f.stripe.invoice.subscriptionId = 'sub-local';
+            for (const line of f.stripe.invoice.lines) line.subscriptionId = 'sub-local';
+            const before = [...f.store.writes];
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('review:invalid_ai_upgrade');
+            expect(f.store.writes).toEqual(before);
+            expect(f.store.grants.size).toBe(0);
+            expect(f.store.subscriptions.size).toBe(0);
         });
         it('the renewal after an upgrade grants the full 1,000 once', async () => {
             const f = upgraded();
