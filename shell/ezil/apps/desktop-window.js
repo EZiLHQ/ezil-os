@@ -1082,7 +1082,9 @@ export async function openDesktopWindow (ctx = {}) {
         const path = opening_path();
         if ( key === 'first_frame' ) console.info(`[desktop] tti=${ms} path=${path}`);
         else console.info(`[desktop] ${key}=${ms} path=${path}`);
-        telemetry.capture({ eventClass: 'boot_phase', site: 'ezil-os:apps/desktop#tti', code: `${key}_${path}`, durationMs: ms });
+        // Boot events share a 12-per-page cap with boot_summary, whose trace already
+        // records the mint (`mint_ok`): only the two milestones it lacks are sent.
+        if ( key !== 'url_received' ) telemetry.capture({ eventClass: 'boot_phase', site: 'ezil-os:apps/desktop#tti', code: `${key}_${path}`, durationMs: ms });
     }
     const on_first_input_blur = () => {
         if ( document.activeElement === el_iframe && el_iframe.getAttribute('src') ) stamp_milestone('first_input');
@@ -1113,7 +1115,7 @@ export async function openDesktopWindow (ctx = {}) {
             last_runtime_reopen = now;
         }
         console.info(`[${PHASE}] the desktop has a new runtime (${why}); re-opening`);
-        telemetry.capture({ eventClass: 'boot_phase', site: 'ezil-os:apps/desktop#reconnect', code: why });
+        telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: why });
         void start_boot();
     }
     // Settings → Troubleshoot → Restart desktop announces a completed restart.
@@ -1125,6 +1127,8 @@ export async function openDesktopWindow (ctx = {}) {
     // A switch or a computer restart replaces the machine: watch the server's
     // transition and re-open once it settles (done, or failed back to the old size).
     let transition_watch = null;
+    /** The transition whose failure was already turned into a re-open (once each). */
+    let reopened_for = null;
     function watch_transition (transitionId) {
         if ( disposed || transition_watch?.active() ) return;
         transition_watch = watchComputerTransition({
@@ -1171,8 +1175,16 @@ export async function openDesktopWindow (ctx = {}) {
             const seen = spinner.computerProgress();
             if ( seen ) aws_observation = seen;
             if ( seen?.activeAws === true ) aws_seen_active = true;
-            // Opened while a switch or restart is in flight: re-open again once it settles.
-            if ( seen?.transition && ['requested', 'stopping', 'waking'].includes(seen.transition.phase) ) watch_transition(seen.transition.transitionId);
+            // A switch or restart is in flight: re-open again once it settles, and a
+            // failure it caused (the old machine stopped under a live desktop) becomes
+            // the opening surface, once per transition.
+            if ( seen?.transition && ['requested', 'stopping', 'waking'].includes(seen.transition.phase) ) {
+                watch_transition(seen.transition.transitionId);
+                if ( last_kind === 'failed' && ! boot_work && reopened_for !== seen.transition.transitionId ) {
+                    reopened_for = seen.transition.transitionId;
+                    reopen_on_new_runtime('transition_in_flight');
+                }
+            }
             check_aws_wait();
             if (last_kind === 'progress') show_panel();
         },
@@ -1597,6 +1609,11 @@ export async function openDesktopWindow (ctx = {}) {
                 if (disposed || my_attempt !== attempt) return;
                 el_window.dataset.relayState = state;
                 if (state === 'confirming') viewer_previous = null;
+                if (state === 'error' && transition_watch?.active()) {
+                    // The old machine is going away for a switch or restart: wait in the opening surface.
+                    reopen_on_new_runtime('transition_in_flight');
+                    return;
+                }
                 if (state === 'error') {
                     render_both({kind:'failed', reason:'desktop_unreachable'});
                     show_panel();

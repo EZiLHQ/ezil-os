@@ -174,7 +174,8 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
             && !['operations_paused', 'needs_operator', 'queued', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
         elapsed, expected, reached, serverReady, bar,
         transition: transition ? { transitionId: transition.transitionId, kind: transition.kind, phase: transition.phase, target: transition.target } : null,
-        openingKey: `${openingStartedAt}|${path ?? ''}`,
+        // The opening, not its path: `cold` becomes `warm` when a pool host is adopted mid-opening.
+        openingKey: String(openingStartedAt),
         next,
         updated: features?.devDetails === true && typeof data.updatedAt === 'string' && Number.isFinite(Date.parse(data.updatedAt))
             ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(data.updatedAt)) : null,
