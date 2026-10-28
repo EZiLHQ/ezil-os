@@ -556,4 +556,19 @@ describe('the real retried-observe failed release heals once its host has aged o
         expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED, lifecycleJobId: null });
         expect(s.usage[0]!.stopped_at).toEqual(new Date('2026-10-28T17:36:42.863Z'));
     });
+    it('the cron path (fleet reconciler, then the receipt pass) heals it without any operator action', async () => {
+        const s = realSetup();
+        const retireLease = vi.fn(async () => {});
+        Object.assign(s.deps, { pool: { retireLease } });
+        await reconcileAwsFleet(s.deps, { [s.d.region]: s.d });
+        expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
+        expect(s.starts).toHaveLength(1);
+        await reconcileAwsFleet(s.deps, { [s.d.region]: s.d }); // replay RUNNING
+        expect(s.starts).toHaveLength(1);
+        s.finish();
+        await applyLifecycleReceipt(s.deps, await s.current(), s.d);
+        expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED });
+        expect(retireLease).toHaveBeenCalledOnce();
+        expect(s.usage[0]!.stopped_at).toEqual(new Date('2026-10-28T17:36:42.863Z'));
+    });
 });
