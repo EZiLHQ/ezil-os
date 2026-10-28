@@ -160,6 +160,13 @@ emit() {
     done
     printf '  return icons;\n})();\n'
   } >"$dir/icons.js"
+
+  # Lazy-loaded vendor modules, copied byte-for-byte (not bundled): Feedback's
+  # tier-A screenshot imports snapdom on first use (shell/ezil/ui/feedback/capture.js),
+  # so sessions that never capture don't pay ~260 KB at boot.
+  echo "[build-shell] vendor: snapdom-3.3.4.mjs -> $dir/vendor/"
+  mkdir -p "$dir/vendor"
+  cp "$here/src/lib/snapdom-3.3.4/snapdom.mjs" "$dir/vendor/snapdom-3.3.4.mjs"
 }
 
 mode="${1:-build}"
