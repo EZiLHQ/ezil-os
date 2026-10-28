@@ -468,6 +468,12 @@ export async function ingestUsageEvents(events: UsageEvent[], deps: { store: Bil
                 break;
             case 'stop':
                 await store.closeInterval(event.computerId, at, event.reason ?? 'stop');
+                // AWS lifecycle receipts own an AWS computer's epoch closes; a Worker stop may describe another generation.
+                if (await store.placementProvider?.(event.computerId) === 'aws-ec2') {
+                    console.info(JSON.stringify({ event: 'billing-usage-stop-ignored', computerId: event.computerId, at: event.at, provider: 'aws-ec2' }));
+                    accepted++;
+                    continue;
+                }
                 break;
             case 'storage':
                 if (typeof event.bytes !== 'string' || event.bytes === '' || /\D/.test(event.bytes)) {
@@ -488,7 +494,7 @@ export async function ingestUsageEvents(events: UsageEvent[], deps: { store: Bil
         } else if (event.type === 'heartbeat') {
             await store.touchEpoch(event.computerId, at);
         } else if (event.type === 'stop') {
-            await store.closeEpoch({ computerId: event.computerId, endedAt: at,
+            await store.closeEpoch({ computerId: event.computerId, readyBy: at, endedAt: at,
                 reason: event.reason === 'idle' ? 'idle_sleep' : 'provider_stop' });
         }
         accepted++;

@@ -396,6 +396,29 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore v2',
         expect(recent.map(row => row.computerId)).toEqual(rows.slice(1).reverse().map(row => row.id));
     });
 
+    it('closes only the expected epoch: a mismatching epoch id or a stop before readiness is a no-op', async () => {
+        const { epoch: opened } = await store.openEpoch(epoch(instant(10)));
+        expect(await store.closeEpoch({ computerId, epochId: randomUUID(), endedAt: instant(20), reason: 'user_stop' })).toBe('not_open');
+        // A stop observed for an earlier generation (before this epoch was ready) never closes it.
+        expect(await store.closeEpoch({ computerId, readyBy: instant(5), endedAt: instant(5), reason: 'provider_stop' })).toBe('not_open');
+        expect(await store.openEpochFor(computerId)).toMatchObject({ id: opened.id, endedAt: null });
+        // The same second as readiness counts (ready is stored rounded up, a stop rounded down).
+        expect(await store.closeEpoch({ computerId, epochId: opened.id, readyBy: instant(9.5), endedAt: instant(9.5), reason: 'user_stop' })).toBe('closed');
+        const [row] = await db.select().from(billingComputeEpochs).where(eq(billingComputeEpochs.id, opened.id));
+        expect(row).toMatchObject({ readyAt: instant(10), endedAt: instant(10), endReason: 'user_stop' });
+    });
+
+    it('reads the placement provider, and null without the AWS placement table or a placement', async () => {
+        const present = (await client`select to_regclass('public.ezil_computer_placements') is not null as present`)[0]!.present;
+        expect(present).toBe(false); // billing-only test databases have no AWS placement SQL
+        expect(await store.placementProvider!(computerId)).toBeNull();
+        // Transactional DDL: rolled back after the test like every other write here.
+        await client`create table public.ezil_computer_placements (computer_id uuid primary key, provider text not null)`;
+        await client`insert into public.ezil_computer_placements (computer_id, provider) values (${computerId}::uuid, 'aws-ec2')`;
+        expect(await store.placementProvider!(computerId)).toBe('aws-ec2');
+        expect(await store.placementProvider!(secondComputerId)).toBeNull();
+    });
+
     it('clamps a subsecond or skewed stop at readiness and handles missing computers', async () => {
         await store.openEpoch({ ...epoch(instant(1.1)), size: 'free-cf', subscriptionId: null });
         expect(await store.closeEpoch({ computerId, endedAt: instant(1.9), reason: 'platform_failure' })).toBe('closed');

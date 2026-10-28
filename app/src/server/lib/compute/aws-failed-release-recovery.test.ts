@@ -7,6 +7,7 @@ import { D, failedReleaseHistory, failedReleaseSetup, NOW, START, STOP, TERMINAT
 import { proveFailedReleaseTermination } from './aws-failed-release-proof';
 import { reconcileFailedRelease, type ReconcileReleaseRequest } from './aws-pool-release-recovery';
 import { applyLifecycleReceipt, lifecycleExecutionArn, POOL_RELEASED } from './aws-receipts';
+import retryFixture from './aws-failed-release-retry.fixtures.json';
 
 afterEach(() => vi.restoreAllMocks());
 type Setup = ReturnType<typeof failedReleaseSetup>;
@@ -301,6 +302,86 @@ describe('failed-release termination witness (the failed execution\'s own histor
     ])('the proof itself refuses %s', (_name, mutate) => {
         const s = failedReleaseSetup(); mutate(s);
         expect(proveFailedReleaseTermination(s.failed, failedReleaseHistory(s.original), s.original)).toBeNull();
+    });
+    // Staging 2026-10-28 (computer ca0121a6): Observe-initial failed LifecycleRetryable and its Retry re-scheduled the Lambda
+    // off that failure (events 7 -> 8); the release then terminated its host and failed at Observe-terminated.
+    const realRelease = () => {
+        const revive = (value: Record<string, unknown>, keys: string[]): unknown =>
+            ({ ...value, ...Object.fromEntries(keys.map(k => [k, new Date(value[k] as string)])) });
+        const events = retryFixture.getExecutionHistory.events.map(e => revive(e, ['timestamp'])) as HistoryEvent[];
+        const e = revive(retryFixture.describeExecution, ['startDate', 'stopDate']) as Parameters<typeof proveFailedReleaseTermination>[0];
+        const work = buildLifecycleWork(JSON.parse(JSON.parse(retryFixture.describeExecution.input).document));
+        return { events, e, work };
+    };
+    it('the real retried-observe history (staging 2026-10-28) proves its TerminateInstances result time', () => {
+        const { events, e, work } = realRelease();
+        expect(events).toHaveLength(115);
+        // The rebuilt job is byte-identical to the execution input (else the proof would refuse for that reason alone).
+        expect(work.input).toBe(events[0]!.executionStartedEventDetails!.input);
+        expect(work.input).toBe(e.input);
+        expect(proveFailedReleaseTermination(e, events, work)).toEqual({ instanceId: 'i-0ffe64bb1397f4852', executionArn: e.executionArn,
+            terminatedAt: new Date('2026-10-28T17:36:42.863Z') });
+    });
+    /** `retries` observe Retry rounds on Observe-initial: Started, Failed(error), Scheduled again off that failure. */
+    const withRetries = (h: HistoryEvent[], retries: number, error = 'LifecycleRetryable', failure: 'LambdaFunctionFailed' | 'LambdaFunctionStartFailed' = 'LambdaFunctionFailed') => {
+        const k = h.findIndex(e => e.type === 'LambdaFunctionScheduled');
+        const scheduled = h[k]!, extra: HistoryEvent[] = [];
+        for (let n = 0; n < retries; n++) {
+            if (failure === 'LambdaFunctionFailed') extra.push({ ...structuredClone(scheduled), type: 'LambdaFunctionStarted', lambdaFunctionScheduledEventDetails: undefined },
+                { ...structuredClone(scheduled), type: failure, lambdaFunctionScheduledEventDetails: undefined, lambdaFunctionFailedEventDetails: { error, cause: '' } });
+            else extra.push({ ...structuredClone(scheduled), type: failure, lambdaFunctionScheduledEventDetails: undefined, lambdaFunctionStartFailedEventDetails: { error, cause: '' } });
+            extra.push(structuredClone(scheduled));
+        }
+        return reid([...h.slice(0, k + 1), ...extra, ...h.slice(k + 1)]);
+    };
+    it.each([
+        ['one LifecycleRetryable retry', 1, 'LifecycleRetryable', 'LambdaFunctionFailed'],
+        ['three retries (the Retry budget)', 3, 'LifecycleRetryable', 'LambdaFunctionFailed'],
+        ['a Lambda service fault that failed the start', 1, 'Lambda.ServiceException', 'LambdaFunctionStartFailed'],
+        ['a throttled Lambda', 2, 'Lambda.TooManyRequestsException', 'LambdaFunctionFailed'],
+    ] as const)('accepts an observe Retry edge: %s', (_name, retries, error, failure) => {
+        const s = failedReleaseSetup();
+        expect(proveFailedReleaseTermination(s.failed, withRetries(failedReleaseHistory(s.original), retries, error, failure), s.original)?.terminatedAt).toEqual(TERMINATED);
+    });
+    const retryDefects: [string, (h: HistoryEvent[]) => HistoryEvent[]][] = [
+        ['a retry off a non-retryable LifecycleFailure', h => withRetries(h, 1, 'LifecycleFailure')],
+        ['a retry off a timed-out Lambda (States.Timeout is not retried)', h => withRetries(h, 1, 'States.Timeout')],
+        ['four retries (five schedules) in one state entry: beyond the Retry budget', h => withRetries(h, 4)],
+        ['two schedules off one failure', h => {
+            const out = withRetries(h, 1), n = out.findIndex((e, k) => k > 0 && e.type === 'LambdaFunctionScheduled' && out[k - 1]!.type === 'LambdaFunctionFailed');
+            const twin = structuredClone(out[n]!);
+            const again = reid([...out.slice(0, n + 1), twin, ...out.slice(n + 1)]);
+            again[n + 1]!.previousEventId = again[n]!.previousEventId; return again; }],
+        ['a retry that schedules another Lambda', h => {
+            const out = withRetries(h, 1), n = out.findIndex((e, k) => k > 0 && e.type === 'LambdaFunctionScheduled' && out[k - 1]!.type === 'LambdaFunctionFailed');
+            out[n]!.lambdaFunctionScheduledEventDetails!.resource = 'arn:aws:lambda:ap-south-1:123456789012:function:other:19'; return out; }],
+        ['a retry of an EC2 task (EC2 tasks have no Retry)', h => {
+            const n = h.findIndex(e => e.type === 'TaskSucceeded' && e.taskSucceededEventDetails?.resource === 'stopInstances');
+            const failed = { ...structuredClone(h[n]!), type: 'LambdaFunctionFailed', taskSucceededEventDetails: undefined, lambdaFunctionFailedEventDetails: { error: 'LifecycleRetryable', cause: '' } } as HistoryEvent;
+            const again = { ...structuredClone(h.find(e => e.type === 'LambdaFunctionScheduled')!), timestamp: h[n]!.timestamp };
+            return reid([...h.slice(0, n), failed, again, ...h.slice(n + 1)]); }],
+        ['the final observe failure was also retried', h => {
+            const n = h.findIndex(e => e.type === 'LambdaFunctionFailed');
+            h[n]!.lambdaFunctionFailedEventDetails!.error = 'LifecycleRetryable';
+            const again = { ...structuredClone(h.find(e => e.type === 'LambdaFunctionScheduled')!), timestamp: h[n]!.timestamp };
+            const out = reid([...h.slice(0, n + 1), again, ...h.slice(n + 1)]);
+            out[n + 2]!.previousEventId = out[n]!.id; // the state exit (and so the Fail state) still descends from that failure
+            return out; }],
+    ];
+    it.each(retryDefects)('refuses %s', (_name, edit) => {
+        const s = failedReleaseSetup();
+        expect(proveFailedReleaseTermination(s.failed, edit(failedReleaseHistory(s.original)), s.original)).toBeNull();
+    });
+    it('only an observe state retries its Lambda', () => {
+        const s = failedReleaseSetup();
+        const rename = (h: HistoryEvent[]) => { for (const e of h) for (const n of [e.stateEnteredEventDetails, e.stateExitedEventDetails]) if (n?.name === 'Observe-initial') n.name = 'Probe-initial'; return h; };
+        expect(proveFailedReleaseTermination(s.failed, rename(failedReleaseHistory(s.original)), s.original)?.terminatedAt).toEqual(TERMINATED);
+        expect(proveFailedReleaseTermination(s.failed, rename(withRetries(failedReleaseHistory(s.original), 1)), s.original)).toBeNull();
+    });
+    it('the real history refuses once its retry edge comes off a non-retryable failure', () => {
+        const { events, e, work } = realRelease();
+        events[6]!.lambdaFunctionFailedEventDetails!.error = 'LifecycleFailure';
+        expect(proveFailedReleaseTermination(e, events, work)).toBeNull();
     });
     it('only a release can be witnessed', () => {
         const s = failedReleaseSetup();

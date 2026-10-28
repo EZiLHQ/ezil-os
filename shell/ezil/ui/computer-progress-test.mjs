@@ -95,6 +95,29 @@ for(const [stage,title] of [['leased','Getting a 4 vCPU machine'],['mounting','A
  assert.equal(progressView({...opening,stage,path:'switch',transition:tr('switch','waking')},'qa-computer',{appName:'Code'}).title,title,stage);
 }
 assert.equal(progressView({...opening,stage:'running',active:false},'qa-computer').activeAws,false,'ready is not opening');
+// F1b: this tab asked to open, the server has no opening yet. Never "Computer stopped"; only the copy changes.
+{const stopped={...base,operation:'none',stage:'stopped',recordedStage:'stopped',active:false,durable:false,openingStartedAt:null,path:null,milestones:[],expectedSeconds:null};
+ for(const stage of ['stopped','purge_eligible']) {
+  const plain=progressView({...stopped,stage},'qa-computer'),asked=progressView({...stopped,stage},'qa-computer',{openRequested:true,appName:'Code'});
+  assert.equal(plain.title,'Computer stopped',stage);assert.equal(plain.indeterminate,false,stage);
+  assert.equal(plain.body,stage==='stopped'?'Use the normal computer controls to start a session.':'No active startup is recorded.');
+  assert.equal(asked.title,'Starting your computer',stage);assert.equal(asked.body,'',stage);assert.equal(asked.indeterminate,true,stage);
+  // Every gate the window's wait reads (stage, activity, bar) is still the server's.
+  for(const key of ['stage','active','activeAws','bar','serverReady','elapsed'])assert.deepEqual(asked[key],plain[key],`${stage} ${key}`);
+  assert.equal(asked.stage,stage);assert.equal(asked.activeAws,false);assert.equal(asked.bar,null);
+  assert.equal(openingAt(asked,0),null,'no guessed bar position');
+ }
+ // The moment the server reports the opening, the milestones take over.
+ const leased=progressView({...opening,stage:'leased',path:'warm',openingStartedAt:T,milestones:[{key:'requested',at:T}]},'qa-computer',{openRequested:true});
+ assert.equal(leased.title,'Starting your computer');assert.equal(leased.indeterminate,false);assert.notEqual(leased.bar,null);
+ // Other hold states keep their own copy even while an open is in flight.
+ for(const [stage,title] of [['queued','Waiting to start'],['needs_operator','Your computer needs attention'],['retired','Previous computer retired']]) {
+  const value=progressView({...stopped,stage},'qa-computer',{openRequested:true});
+  assert.equal(value.title,title,stage);assert.equal(value.indeterminate,false,stage);
+ }
+ assert.equal(progressView({...stopped,stage:'unavailable'},'qa-computer',{openRequested:true}),null,'unavailable stays unobserved');
+ // A migration that reports stopped is not an open this tab started.
+ assert.equal(progressView({...stopped,operation:'migration'},'qa-computer',{openRequested:true}).title,'Computer stopped');}
 
 // ── The bar: pure, monotonic, shared by every tab ──────────────────────────
 assert.equal(openingFraction({ready:true}),1);

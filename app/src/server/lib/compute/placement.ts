@@ -378,6 +378,18 @@ async function selectRows(db: PlacementExecutor, computerId: string): Promise<Re
 }
 
 /**
+ * The computer's placement provider (`aws-ec2`, …) for billing's Worker-usage ingest, or null without a
+ * placement or where the AWS placement SQL is not installed (billing-only databases). Read-only.
+ */
+export async function readPlacementProvider(db: PlacementExecutor, rawComputerId: string): Promise<string | null> {
+    const [table] = rowsOf(await db.execute(sql`/* placement:provider-table */ SELECT to_regclass('public.ezil_computer_placements') IS NOT NULL AS present`));
+    if (table?.present !== true) return null;
+    const [row] = rowsOf(await db.execute(sql`/* placement:provider */ SELECT provider FROM public.ezil_computer_placements
+        WHERE computer_id = ${canonicalId(rawComputerId)}::uuid LIMIT 1`));
+    return typeof row?.provider === 'string' ? row.provider : null;
+}
+
+/**
  * C-2 read rule. Throws `PlacementIntegrityError` rather than guessing.
  * User-facing callers supply the authenticated owner so a foreign placement
  * is refused BEFORE querying image reservations. Ownerless background reads

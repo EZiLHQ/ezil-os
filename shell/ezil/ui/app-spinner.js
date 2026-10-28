@@ -56,7 +56,9 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     root.appendChild(surface.el);
 
     let observation = null, latestState = null, latestExtra = {}, progressChecked = false, client = 0;
-    const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name, onChange: value => {
+    // Rendered as `progress` = this window's open is in flight: a not-yet-recorded opening never reads "stopped".
+    const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name,
+        openRequested: () => latestState?.kind === 'progress', onChange: value => {
         observation = value; progressChecked = true;
         if (latestState) render(latestState, latestExtra);
         onProgressChange?.();
@@ -95,7 +97,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             surface.paint({
                 status: observation.title,
                 body: runningLong ? OPENING_COPY.runningLong : [observation.body, observation.bytes, dev].filter(Boolean).join(' · '),
-                percent: at ? at.percent : null, key: observation.openingKey, meta, long: at?.long,
+                percent: at ? at.percent : observation.indeterminate ? 'indeterminate' : null, key: observation.openingKey, meta, long: at?.long,
                 retry, feedback: attention || retry,
             });
             return;

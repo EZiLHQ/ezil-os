@@ -328,7 +328,7 @@ export function open_feedback_dialog (_opts) {
         submit.hidden = true;
         cancel.textContent = 'Close';
         result.textContent = `Thanks — we got it. Report ID: ${data.id}.`
-            + (data.screenshotAccepted === false ? " Your image wasn't stored." : '');
+            + (screenshot && data.screenshotAccepted === false ? " Your image wasn't stored." : '');
         cancel.focus();
     }
     // A queued copy of THIS report went through on reconnect.

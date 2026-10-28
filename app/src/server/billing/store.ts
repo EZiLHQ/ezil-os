@@ -18,6 +18,7 @@ import {
     billingUsageIntervals,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
+import { readPlacementProvider } from '@/server/lib/compute/placement';
 import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, OutboxInsert, StoredComputeEpoch } from './ports';
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
@@ -151,7 +152,7 @@ export function createBillingStore(db: Database): BillingStore {
             return rows.map(computeEpoch);
         },
 
-        async closeEpoch({ computerId, endedAt, reason, overheadSeconds }) {
+        async closeEpoch({ computerId, epochId, readyBy, endedAt, reason, overheadSeconds }) {
             const ended = isoSeconds(epochSeconds(endedAt));
             const rows = await db.update(billingComputeEpochs).set({
                 endedAt: sql`greatest(${billingComputeEpochs.readyAt}, ${ended}::timestamptz)`,
@@ -159,6 +160,8 @@ export function createBillingStore(db: Database): BillingStore {
                 overheadSeconds,
             }).where(and(
                 eq(billingComputeEpochs.computerId, computerId), isNull(billingComputeEpochs.endedAt),
+                epochId === undefined ? undefined : eq(billingComputeEpochs.id, epochId),
+                readyBy === undefined ? undefined : lte(billingComputeEpochs.readyAt, new Date(epochSeconds(readyBy, 'ceil') * 1000)),
             )).returning({ id: billingComputeEpochs.id });
             return rows.length > 0 ? 'closed' : 'not_open';
         },
@@ -416,6 +419,11 @@ export function createBillingStore(db: Database): BillingStore {
             const [row] = await db.select({ userId: computers.userId }).from(computers)
                 .where(eq(computers.id, computerId)).limit(1);
             return row?.userId ?? null;
+        },
+
+        async placementProvider(computerId) {
+            // placement.ts is the one module that names the placement table (C-2), reads included.
+            return readPlacementProvider(db, computerId);
         },
 
         async linkCustomer(userId, stripeCustomerId) {
