@@ -52,7 +52,8 @@ export async function requestAwsRestart(db: PlacementExecutor, computer: Compute
         const { record: p } = await readPlacement(db, computer.computerId);
         if (!p || p.provider !== 'aws-ec2' || p.ownerUserId !== computer.userId.toLowerCase()) return fail('placement_unavailable', 'not_running');
         if (BUSY_STATES.includes(p.state)) return fail('placement_busy', 'busy');
-        if (p.state !== 'RUNNING' || p.generation < 1 || p.leaseEpoch < 1) return fail('placement_unavailable', 'not_running');
+        if (p.state !== 'RUNNING') return fail('placement_unavailable', 'not_running');
+        if (p.generation < 1 || p.leaseEpoch < 1) return fail('placement_unavailable');
         const sandboxId = deriveGuacamoleSandboxId(p.ownerUserId, p.computerId);
         const endpoint = new URL(`${workerUrl.replace(/\/$/, '')}/sandbox/${sandboxId}/restart`);
         if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return fail('endpoint_invalid');

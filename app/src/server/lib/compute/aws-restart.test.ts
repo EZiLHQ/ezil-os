@@ -174,7 +174,9 @@ it.each([
 it.each([[], [row({ owner_user_id: computerId })], [row({ provider: 'cloudflare' })], [row({ state: 'STOPPED' })],
     [row({ generation: 0 })], [row({ lease_epoch: 0 })]].map(rows => ({ rows })))('placement guard refuses foreign or unavailable target: %j', async ({ rows }) => {
     // An unreadable placement (a Cloudflare row with an AWS store fails the integrity read) is unavailable.
-    expect(await complete(setup(rows).restart())).toEqual(refused(rows[0]?.provider === 'cloudflare' ? 'unavailable' : 'not_running'));
+    const row0 = rows[0] as Record<string, unknown> | undefined;
+    const invalid = row0?.provider === 'cloudflare' || row0?.generation === 0 || row0?.lease_epoch === 0;
+    expect(await complete(setup(rows).restart())).toEqual(refused(invalid ? 'unavailable' : 'not_running'));
     expect(fetchMock).not.toHaveBeenCalled();
 });
 it.each(['LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RECOVERING'])('round 3: a %s computer is busy, never dispatched', async state => {

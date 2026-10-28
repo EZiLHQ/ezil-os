@@ -1343,7 +1343,11 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         const ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '5', AWS_REGIONS: 'ap-south-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '5',
             EZIL_AWS_USER_MONTHLY_HOURS: '75', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '250', EZIL_AWS_USER_MONTHLY_EGRESS_GB: '100',
             EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '1000', EZIL_AWS_KILL_SWITCH: '0' };
-        beforeEach(() => { for (const [k, v] of Object.entries(ENV)) vi.stubEnv(k, v); });
+        beforeEach(async () => {
+            for (const [k, v] of Object.entries(ENV)) vi.stubEnv(k, v);
+            // Earlier suites may leave migration reservations (2 vCPU each); this block starts from none.
+            await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_migrations`);
+        });
         afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
         const xxl: PoolClass = { ...c, instanceType: 'm6i.2xlarge' };
         const live = async (n: number, state: string, instanceType = 'm6i.large', instanceId: string | null = `i-${String(n).padStart(17, '0')}`) => {

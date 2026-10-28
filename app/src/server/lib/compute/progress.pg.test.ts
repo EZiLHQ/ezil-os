@@ -27,7 +27,7 @@ describe.skipIf(!PG)('transition records on production Drizzle PostgreSQL', () =
     const scoped = (q: SQL): SQL => sql.join(q.queryChunks.map(chunk => chunk instanceof StringChunk
         ? sql.raw(local(chunk.value.join(''))) : chunk instanceof SQL ? scoped(chunk) : chunk), sql.empty());
     const db: PlacementExecutor = { execute: q => production!.execute(scoped(q)) };
-    const metadata = async () => ((await client!.unsafe(`SELECT metadata FROM ${schema}.ezil_computers WHERE id = '${C}'`))[0] as { metadata: unknown }).metadata;
+    const metadata = async () => ((await client!.unsafe(`SELECT metadata FROM ${schema}.ezil_computers WHERE id = '${C}'`))[0] as unknown as { metadata: unknown }).metadata;
     const setMetadata = (value: string) => client!.unsafe(`UPDATE ${schema}.ezil_computers SET metadata = ${value} WHERE id = '${C}'`);
     let created = false;
     beforeAll(async () => {
