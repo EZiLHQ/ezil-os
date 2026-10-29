@@ -113,3 +113,23 @@ describe('round 3 D1 upgrade entitlement', () => {
         expect(parseAiUpgradeEntitlement('ezil-os:v1:premium_monthly_v3:sub:2026-02-30T00:00:00.000Z:upgrade')).toBeNull();
     });
 });
+
+describe('HF2 correction child event ids', () => {
+    const ROOT = 'ezil-os:v1:standard_monthly_v3:sub_1UTQgmFKwQk2o9PJhPNd53aL:2026-10-22T18:26:06.000Z';
+    const CORR = `${ROOT}:correction-20261028`;
+    it('reverses a canary correction child under its own root within 193 characters', () => {
+        const grant = aiCreditOutboxItem('user', { entitlementId: CORR, credits: 200, expiresAt: '2026-11-25T18:26:06.000Z' },
+            'grant', 'in_1UTQgkFKwQk2o9PJg1y64j84');
+        const revoke = aiCreditRevokeItem(grant, { type: 'refund', id: 're_3UTQglFKwQk2o9PJ1hjlL3jQ' });
+        expect(revoke.eventKey).toBe(`${CORR}:revoke:refund:re_3UTQglFKwQk2o9PJ1hjlL3jQ`);
+        expect(revoke.eventKey).toHaveLength(146);
+        expect(revoke.eventKey.length).toBeLessThanOrEqual(193);
+        expect(parseAiCreditEventId(CORR, revoke.eventKey, 'revoke')).toEqual({ action: 'revoke', cause: 'refund', causeId: 're_3UTQglFKwQk2o9PJ1hjlL3jQ' });
+        for (const item of [aiCreditRevokeItem(grant, { type: 'dispute', id: 'du_3UTQglFKwQk2o9PJ1hjlL3jQ' }), aiCreditRestoreItem(grant, 'du_3UTQglFKwQk2o9PJ1hjlL3jQ')]) {
+            expect(item.eventKey.length).toBeLessThanOrEqual(193);
+            expect(parseAiCreditEventId(CORR, item.eventKey, String(item.payload.action))).toMatchObject({ cause: 'dispute' });
+        }
+        // The parent's own cause-less revoke never parses as a child event.
+        expect(parseAiCreditEventId(CORR, `${ROOT}:revoke`, 'revoke')).toBeNull();
+    });
+});
