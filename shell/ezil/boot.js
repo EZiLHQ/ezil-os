@@ -88,7 +88,7 @@ import { parseBillingDeepLink } from './ui/Settings/upgrade-sheet.js';
 import { warm } from './warm.js';
 import { parseAppLink } from './app-link.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
-import { feedback_enabled, mount_feedback_chip } from './ui/feedback/feedback.js';
+import { mount_feedback_chip } from './ui/feedback/feedback.js';
 import { applyPersistedAppearance } from './ui/Settings/tabs/appearance.js';
 let nativePersistence = null;
 let billingDeepLinkHandled = false;
@@ -859,7 +859,11 @@ async function build (payload) {
     // unconditionally, so it has to go or the dock is drawn twice.
     $('.taskbar').remove();
     await UITaskbar({});
-    if ( feedback_enabled() ) mount_feedback_chip();
+    // Feedback is not on the home screen; its main entry is Settings →
+    // Feedback. While an app window is open, a very small "Send feedback" icon
+    // sits in the top-right corner. Mounting it also re-sends reports an
+    // earlier session queued.
+    mount_feedback_chip();
 
     // Pinned items, created up front rather than left to `UIWindow` — an app
     // pinned here survives its window being closed (UIWindow's own item is

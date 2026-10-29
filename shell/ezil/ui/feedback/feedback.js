@@ -160,22 +160,62 @@ async function deliver (clientRequestId, body) {
 export async function flush_feedback_outbox () {
     if ( ! feedback_enabled() || navigator.onLine === false ) return;
     for ( const entry of read_outbox() ) {
+        // Flushes can overlap (a back/forward-cache restore runs both the icon's
+        // remount and `flush_after_restore`): skip what another one has settled.
+        if ( ! read_outbox().some(queued => queued.clientRequestId === entry.clientRequestId) ) continue;
         const { status } = await deliver(entry.clientRequestId, entry.body);
         if ( status === 0 ) break; // Still offline or unreachable: wait for the next `online`.
     }
 }
 
-function fullbleed_visible () {
-    return [...document.querySelectorAll('.window.ezil-fullbleed')].some(el => {
-        for ( let node = el; node; node = node.parentElement ) {
-            const style = window.getComputedStyle(node);
-            if ( style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' ) return false;
-        }
-        return true;
-    });
+/** Rendered: neither the element nor an ancestor is display:none or visibility:hidden. */
+function shown (el) {
+    for ( let node = el; node; node = node.parentElement ) {
+        const style = window.getComputedStyle(node);
+        if ( style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' ) return false;
+    }
+    return true;
 }
 
-/** Mount the top-right Feedback chip (idempotent). */
+function fullbleed_visible () {
+    return [...document.querySelectorAll('.window.ezil-fullbleed')].some(shown);
+}
+
+/**
+ * At least one app window is open: a `.window` that names its app (alerts carry
+ * an empty `data-app`), is not a file dialog, is neither minimised nor closing,
+ * and is rendered. None means the home screen. Minimised is read from the
+ * attribute because a minimised window can keep `display: block` at 0×0.
+ */
+function app_window_open () {
+    return [...document.querySelectorAll('.window[data-app]:not(.window-alert):not(.window-filedialog)')].some(el =>
+        el.getAttribute('data-app') && el.getAttribute('data-closing') !== '1'
+        && ! ['true', '1'].includes(el.getAttribute('data-is_minimized')) && shown(el));
+}
+
+/**
+ * Send what was submitted but never confirmed (an offline send, or one cut off
+ * by a reload) and keep watching `online` (idempotent). `mount_feedback_chip()`
+ * calls this, so it runs whenever boot mounts the shell.
+ */
+export function resume_feedback_outbox () {
+    if ( ! feedback_enabled() ) return;
+    listen_online();
+    // A page restored from the back/forward cache does not run shell boot.
+    window.addEventListener('pageshow', flush_after_restore);
+    if ( read_outbox().length ) void flush_feedback_outbox();
+}
+
+function flush_after_restore (event) { if ( event.persisted ) void flush_feedback_outbox(); }
+
+/**
+ * Mount the in-app Feedback icon (idempotent); boot calls this on every mount.
+ * Founder, 2026-10-29: Feedback is not on the home screen, and its main entry
+ * is Settings → Feedback (`../Settings/tabs/feedback.js`). While at least one
+ * app window is open (full-bleed included) a very small icon-only "Send
+ * feedback" button sits in the top-right corner; with no app window open it is
+ * hidden. Mounting also resumes the outbox (`resume_feedback_outbox`).
+ */
 export function mount_feedback_chip () {
     if ( ! feedback_enabled() || ! document.body ) return;
     let chip = document.querySelector('button.ezil-feedback-chip');
@@ -183,31 +223,32 @@ export function mount_feedback_chip () {
         chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'ezil-feedback-chip';
-        chip.setAttribute('aria-label', 'Feedback');
-        chip.innerHTML = ICON + '<span>Feedback</span>';
+        chip.setAttribute('aria-label', 'Send feedback');
+        chip.title = 'Send feedback';
+        chip.innerHTML = ICON;
         chip.addEventListener('click', () => { chip.focus(); open_feedback_dialog({ source: 'chip' }); });
         document.body.append(chip);
     }
     const sync = () => {
-        // Without the floating-controls pill the chip is the only way to reach
-        // Feedback from a full-bleed desktop, so it stays, compact, in the
-        // top control strip (plan §6.8). With the pill on, the pill offers it.
+        // Shown only while an app window is open: never on the home screen.
+        // In a full-bleed desktop it sits inside the top control strip (plan
+        // §6.8); with the floating-controls pill on, the pill offers Feedback.
         const fullbleed = fullbleed_visible();
         const pill = window.__EZIL_BOOT__?.desktopState?.ui?.floatingControls === true;
-        const display = ! feedback_enabled() || (fullbleed && pill) ? 'none' : '';
+        const display = ! feedback_enabled() || ! app_window_open() || (fullbleed && pill) ? 'none' : '';
         if ( chip.style.display !== display ) chip.style.display = display;
         if ( chip.classList.contains('ezil-feedback-chip-fullbleed') !== fullbleed ) chip.classList.toggle('ezil-feedback-chip-fullbleed', fullbleed);
     };
     chipObserver?.disconnect();
     chipObserver = new MutationObserver(sync);
+    // Windows opening, closing, minimising and restoring all show up here.
     chipObserver.observe(document.body, { subtree: true, childList: true, attributes: true,
-        attributeFilter: ['class', 'style', 'hidden'] });
+        attributeFilter: ['class', 'style', 'hidden', 'data-is_minimized', 'data-closing'] });
     window.addEventListener('ezil:teardown', unmount_feedback_chip);
     window.addEventListener('pagehide', suspend_feedback_chip);
     sync();
     // A report submitted while offline (or before the tab closed) goes now.
-    listen_online();
-    if ( read_outbox().length ) void flush_feedback_outbox();
+    resume_feedback_outbox();
 }
 
 function read_blob (blob, signal) {
@@ -238,7 +279,7 @@ function error_copy (status) {
     return 'Could not send feedback. Check your connection and try again.';
 }
 
-/** @param {{ source: 'chip'|'pill'|'troubleshoot' }} [_opts] */
+/** @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string }} [_opts] */
 export function open_feedback_dialog (_opts) {
     if ( ! feedback_enabled() ) return;
     if ( activeDialog?.isConnected ) { activeDialog.focus(); return; }

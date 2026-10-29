@@ -1,23 +1,40 @@
-// Real Chromium against the SOURCE feedback modules (bundled on the fly with
-// Bun; the committed shell bundle is never read or generated). The feedback
-// route is a LOCAL MOCK: every request is intercepted, nothing reaches a
-// network, and no report is stored anywhere. Proves what jsdom cannot: real
-// clicks reach the chip in a full-bleed window with floating controls off,
-// native <dialog> focus, the exact request bytes and header, and Chromium's own
-// offline emulation followed by its `online` event.
+// Real Chromium against the PRODUCTION path: the BUILT shell bundle
+// (`app/public/os`, what `/os` serves — run shell/build-shell.sh first, or point
+// EZIL_SHELL_OUT_DIR or EZIL_OS_DIR at a build), booted with `endpoints.feedback` published so
+// boot.js mounts Feedback itself. Every request is answered by a LOCAL route
+// mock: nothing reaches a network and no report is stored anywhere.
+//
+// Founder, 2026-10-29: no Feedback on the home screen (Settings → Feedback is
+// the main entry); while an app is open, a very small icon. Proves what jsdom
+// cannot, at a fine-pointer desktop and a coarse-pointer phone:
+//   - the empty desktop shows no Feedback control;
+//   - the Browser (opened from the dock, full-bleed) and Settings each show ONE
+//     icon-only "Send feedback" button: a 20px disc in a 24px target, or a
+//     44px target under `pointer: coarse`; on top of the windows (hit-tested),
+//     inside the full-bleed control strip, clear of the drawer and of every
+//     window's traffic lights;
+//   - minimising or closing the last app window hides it again;
+//   - clicking it opens the real dialog: native <dialog> focus, the exact
+//     request bytes and header, refusals, the draft, and Chromium's own offline
+//     emulation followed by its `online` event.
 //
 // PLAYWRIGHT_REQUIRE_DIR=/path/to/existing/node_modules \
 // node shell/ezil/ui/feedback-browser-test.mjs
 // PLAYWRIGHT_CHROMIUM_EXECUTABLE may select an already installed Chromium.
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const OS = process.env.EZIL_SHELL_OUT_DIR || process.env.EZIL_OS_DIR || path.resolve(here, '../../../app/public/os');
+for ( const f of ['icons.js', 'bundle.min.js', 'bundle.min.css'] ) {
+    if ( ! fs.existsSync(path.join(OS, f)) ) {
+        console.error(`SKIP: missing ${path.join(OS, f)} — run shell/build-shell.sh first (or set EZIL_SHELL_OUT_DIR).`);
+        process.exit(2);
+    }
+}
 const require = createRequire(import.meta.url);
 let chromium;
 try { ({ chromium } = require('playwright')); } catch {
@@ -31,34 +48,30 @@ if ( ! chromium ) {
     process.exit(2);
 }
 
-const buildDir = await fs.mkdtemp(path.join(os.tmpdir(), 'feedback-browser-source-'));
-let source;
-try {
-    const entry = path.join(buildDir, 'entry.js');
-    await fs.writeFile(entry, `import * as feedback from ${JSON.stringify(path.join(here, 'feedback', 'feedback.js'))}; window.feedback = feedback;`);
-    source = execFileSync('bun', ['build', entry, '--target=browser', '--format=iife'], { encoding: 'utf8' });
-} finally { await fs.rm(buildDir, { recursive: true, force: true }); }
-const css = await fs.readFile(path.join(here, 'feedback', 'feedback.css'), 'utf8');
+const icons = fs.readFileSync(path.join(OS, 'icons.js'), 'utf8');
+const bundle = fs.readFileSync(path.join(OS, 'bundle.min.js'), 'utf8');
+const css = fs.readFileSync(path.join(OS, 'bundle.min.css'), 'utf8');
 
 const origin = 'https://os-fixture.test';
 const ACCOUNT = '33333333-3333-4333-8333-333333333333';
 const COMPUTER = '11111111-1111-4111-8111-111111111111';
 const REPORT = '22222222-2222-4222-8222-222222222222';
-const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' }, computer: { id: COMPUTER },
-    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { floatingControls: false, feedbackScreenshots: false } } };
-// The real shell's full-bleed window: a fixed, opaque desktop under the top
-// control strip (ezil-shell.css `--ezil-control-strip-height`: 43 px, 59 px
-// under `pointer: coarse`).
+const ENDPOINTS = { session: '/api/shell/session', desktop: '/api/shell/desktop', focus: '/api/shell/focus',
+    feedback: '/api/shell/feedback' };
+const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' },
+    computer: { id: COMPUTER, name: 'Computer', slot: 1, createdAt: '2026-07-31T00:00:00.000Z', lastOpenedAt: null, isNew: false },
+    apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
+    desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
+        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false } } };
 const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>${css}
-body { margin: 0; font: 14px system-ui; }
-.window.ezil-fullbleed { position: fixed; inset: 0; z-index: 600; background: #11151f; }
-.window.ezil-fullbleed { --strip: 43px; }
-@media (pointer: coarse) { .window.ezil-fullbleed { --strip: 59px; } }
-.window.ezil-fullbleed iframe { position: absolute; top: var(--strip); left: 0; width: 100%; height: calc(100% - var(--strip)); border: 0; background: #234; }
-</style>
-<script>window.__EZIL_BOOT__ = ${JSON.stringify(boot)};</script></head>
-<body><div class="window ezil-fullbleed"><iframe title="Desktop stream" srcdoc="<p style='color:white'>stream</p>"></iframe></div></body></html>`;
+<style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
+// The streamed desktop: reports decoded frames so the window goes full-bleed.
+const stream_html = `<!doctype html><html><body style="margin:0;background:#14484c"><script>
+let n = 0;
+setInterval(() => { n++; parent.postMessage({ source: 'ezil-mobile', type: 'stream_vitals',
+    attempt: new URL(location.href).searchParams.get('ezilAttempt'),
+    vitals: { connectionState: 'connected', framesDecoded: n, bytesReceived: n * 100, width: 1280, height: 720 } }, location.origin); }, 100);
+</script></body></html>`;
 
 const browser = await chromium.launch({
     headless: true,
@@ -67,10 +80,12 @@ const browser = await chromium.launch({
 });
 let checks = 0;
 async function check (label, run) { await run(); checks++; console.log(`PASS ${label}`); }
+const overlaps = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
 
 try {
     for ( const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }] ) {
-        const context = await browser.newContext({ viewport, hasTouch: viewport.width < 500 });
+        const touch = viewport.width < 500;
+        const context = await browser.newContext({ viewport, hasTouch: touch, isMobile: touch });
         const page = await context.newPage();
         page.setDefaultTimeout(8000);
         const errors = [];
@@ -85,22 +100,36 @@ try {
         await context.route('**/*', route => {
             const request = route.request();
             const url = new URL(request.url());
-            if ( url.origin === origin && url.pathname === '/os' ) return route.fulfill({ contentType: 'text/html', body: page_html });
-            if ( url.origin === origin && url.pathname === '/api/shell/feedback' ) {
+            const json = body => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+            if ( url.origin !== origin ) return route.abort('blockedbyclient');
+            if ( url.pathname === '/os' ) return route.fulfill({ contentType: 'text/html', body: page_html });
+            if ( url.pathname === '/frame' ) return route.fulfill({ contentType: 'text/html', body: stream_html });
+            if ( url.pathname === '/api/shell/feedback' ) {
                 if ( request.method() === 'POST' ) {
                     if ( offline ) { offlineAttempts++; return route.abort('internetdisconnected'); }
                     posts.push({ body: request.postData(), contentType: request.headers()['content-type'] });
                     const { status, body } = reply();
                     return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body ?? {}) });
                 }
-                if ( request.method() === 'GET' ) return route.fulfill({ status: 200, contentType: 'application/json', body: '{"reports":[]}' });
+                return json({ reports: [] });
             }
-            return route.abort('blockedbyclient');
+            if ( url.pathname.startsWith('/api/') ) {
+                if ( url.searchParams.get('confirm') === 'frame' ) return json({ ok: true, confirmed: true, status: 200 });
+                if ( url.searchParams.get('confirm') === 'display' ) return json({ ok: true, display: 'live' });
+                if ( url.pathname === ENDPOINTS.desktop ) return json(request.method() === 'POST'
+                    ? { ok: true, guacamoleUrl: `${origin}/frame?desktop=1`, frame: { confirmed: true } } : { ok: true, guacamoleRunning: true });
+                return json({ ok: true });
+            }
+            return route.fulfill({ status: 404, body: '' });
         });
         await page.goto(`${origin}/os`);
-        await page.addScriptTag({ content: source });
-        await page.evaluate(() => window.feedback.mount_feedback_chip());
+        await page.evaluate(payload => { window.__EZIL_BOOT__ = payload; }, boot);
+        await page.addScriptTag({ content: icons });
+        await page.addScriptTag({ content: bundle });
+        await page.evaluate(async () => { await window.ezil.boot(); });
         const tag = `${viewport.width}px`;
+        const coarse = await page.evaluate(() => matchMedia('(pointer: coarse)').matches);
+        assert.equal(coarse, touch, 'the emulated pointer is the one this pass is about');
         const chip = page.locator('button.ezil-feedback-chip');
         const dialog = page.locator('dialog.ezil-feedback-dialog');
         const description = page.locator('#ezil-feedback-description');
@@ -108,16 +137,56 @@ try {
         const preview = () => page.locator('.ezil-feedback-preview pre').textContent();
         const openByChip = async () => { await chip.click(); await dialog.waitFor({ state: 'visible' }); };
         const closeDialog = async () => { await page.locator('[data-action="cancel"]').click(); await dialog.waitFor({ state: 'detached' }); };
-
-        await check(`${tag}: the chip is reachable above a full-bleed desktop with floating controls off`, async () => {
+        const launch = id => page.evaluate(app => { window.$(`.taskbar-item[data-app="${app}"]`).trigger('click'); }, id);
+        // The icon, its glyph disc, what is under its centre, and every window
+        // control on screen: traffic lights (with their 6px hit pads) and the
+        // full-bleed drawer with its buttons.
+        const measure = () => page.evaluate(() => {
+            const rect = el => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; };
+            const icon = document.querySelector('button.ezil-feedback-chip');
+            const box = rect(icon);
+            const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+            const open = [...document.querySelectorAll('.window[data-app]')].filter(w => w.dataset.app
+                && ! ['true', '1'].includes(w.getAttribute('data-is_minimized')) && getComputedStyle(w).display !== 'none');
+            const controls = open.flatMap(w => [
+                ...[...w.querySelectorAll(':scope > .window-head > .window-action-btn')].map(rect)
+                    .map(r => ({ x: r.x - 6, y: r.y - 6, width: r.width + 12, height: r.height + 12 })),
+                ...[...w.querySelectorAll('.ezil-app-drawer, .ezil-app-drawer button')].map(rect),
+            ]).filter(r => r.width > 0 && r.height > 0);
+            const strip = document.querySelector('.window.ezil-fullbleed');
+            return { box, disc: rect(icon.querySelector('svg')), hitIsIcon: hit?.closest('button') === icon, controls,
+                strip: strip ? Number.parseFloat(getComputedStyle(strip).getPropertyValue('--ezil-control-strip-height')) : null,
+                label: icon.getAttribute('aria-label'), tooltip: icon.title, text: icon.textContent.trim() };
+        });
+        const assertTiny = async where => {
             await chip.waitFor({ state: 'visible' });
-            const box = await chip.boundingBox();
-            assert.ok(box && box.width >= 34 && box.height >= 34, 'a real target');
-            const strip = await page.evaluate(() => matchMedia('(pointer: coarse)').matches ? 59 : 43);
-            assert.ok(box.y >= 0 && box.y + box.height <= strip, `inside the ${strip} px control strip, not over the stream (${JSON.stringify(box)})`);
-            const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('button')?.className ?? null,
-                { x: box.x + box.width / 2, y: box.y + box.height / 2 });
-            assert.equal(hit, 'ezil-feedback-chip ezil-feedback-chip-fullbleed', 'the chip, not the desktop, receives the click');
+            const m = await measure();
+            assert.equal(await chip.count(), 1, 'one icon');
+            assert.deepEqual([m.label, m.tooltip, m.text], ['Send feedback', 'Send feedback', ''], 'icon only, named "Send feedback"');
+            assert.ok(m.disc.width <= 20 && m.disc.height <= 20 && m.disc.width >= 16, `a small visual (${JSON.stringify(m.disc)})`);
+            if ( coarse ) assert.ok(m.box.width >= 44 && m.box.height >= 44, `a 44px touch target (${JSON.stringify(m.box)})`);
+            else assert.ok(m.box.width === 24 && m.box.height === 24, `a compact 24px target (${JSON.stringify(m.box)})`);
+            assert.ok(m.hitIsIcon, `${where}: the icon, not the window under it, receives the click`);
+            assert.ok(m.box.x + m.box.width <= viewport.width && m.box.y >= 0, 'on screen');
+            const hits = m.controls.filter(r => overlaps(m.box, r));
+            assert.deepEqual(hits, [], `${where}: clear of every window control`);
+            return m;
+        };
+
+        await check(`${tag}: the home screen (no app window) shows no Feedback control`, async () => {
+            await page.waitForSelector('.taskbar-item[data-app="desktop"]');
+            await chip.waitFor({ state: 'attached' });
+            assert.equal(await chip.isVisible(), false);
+        });
+
+        await check(`${tag}: the Browser, full-bleed, shows one tiny icon in the control strip, clear of the drawer`, async () => {
+            await launch('desktop');
+            await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 30_000 });
+            const open = await assertTiny('drawer open');
+            assert.ok(open.strip > 0 && open.box.y + open.box.height <= open.strip, `inside the ${open.strip}px strip, not over the stream (${JSON.stringify(open.box)})`);
+            await page.locator('.window[data-app="desktop"] .dashboard-app-drawer-toggle').click();
+            await page.waitForFunction(() => document.querySelector('.window[data-app="desktop"] .ezil-app-drawer')?.classList.contains('collapsed'));
+            await assertTiny('drawer collapsed');
             await openByChip();
             assert.equal(await page.evaluate(() => document.activeElement?.id), 'ezil-feedback-description', 'focus moves into the dialog');
         });
@@ -135,6 +204,7 @@ try {
             const sent = JSON.parse(posts[0].body);
             assert.equal(sent.computerId, COMPUTER);
             assert.equal(sent.screenshot, null);
+            assert.equal(sent.diagnostics.fullbleed, true, 'sent from the full-bleed desktop');
             assert.doesNotMatch(posts[0].body, /fixture@example\.test|33333333-3333/, 'no email and no account id leave the browser');
             assert.equal(await page.locator('[data-capture]').count(), 0, 'screenshots are off');
             await closeDialog();
@@ -201,12 +271,34 @@ try {
             posts.length = 0;
         });
 
+        await check(`${tag}: minimising the Browser (the last app window) hides the icon`, async () => {
+            await page.evaluate(() => { document.querySelector('.window[data-app="desktop"]')._ezil_minimise(); });
+            await chip.waitFor({ state: 'hidden' });
+        });
+
+        await check(`${tag}: Settings shows the icon again, clear of its traffic lights; closing it hides the icon`, async () => {
+            await launch('settings');
+            await page.waitForSelector('.window[data-app="settings"] .window-close-btn');
+            await assertTiny('Settings');
+            if ( ! coarse ) {
+                // Maximised, the window's head runs under the icon: still clear of the lights.
+                await page.locator('.window[data-app="settings"] .window-scale-btn').click();
+                await page.waitForFunction(() => document.querySelector('.window[data-app="settings"]').getBoundingClientRect().y === 0);
+                const m = await assertTiny('Settings maximised');
+                const head = await page.locator('.window[data-app="settings"] > .window-head').boundingBox();
+                assert.ok(m.box.y >= head.y && m.box.y + m.box.height <= head.y + head.height, `level with the window head (${JSON.stringify({ box: m.box, head })})`);
+            }
+            await page.locator('.window[data-app="settings"] > .window-head > .window-close-btn').click();
+            await page.waitForSelector('.window[data-app="settings"]', { state: 'detached' });
+            await chip.waitFor({ state: 'hidden' });
+        });
+
         await check(`${tag}: no page errors`, async () => {
             assert.deepEqual(errors, []);
         });
         await context.close();
     }
-    console.log(`\n${checks} feedback browser checks passed (local route mock; no network, no stored report).`);
+    console.log(`\n${checks} feedback browser checks passed (built bundle; local route mock; no network, no stored report).`);
 } finally {
     await browser.close();
 }

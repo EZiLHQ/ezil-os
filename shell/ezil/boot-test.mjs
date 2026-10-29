@@ -1762,6 +1762,50 @@ const HEARTBEAT_MS = 60_000; // must match shell/ezil/activity-heartbeat.js's HE
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Scenario 19 — FEEDBACK IS NOT ON THE HOME SCREEN (founder, 2026-10-29). With
+// the feedback endpoint published, the empty desktop shows no Feedback control
+// (the main entry is Settings → Feedback); opening an app shows a very small
+// icon-only "Send feedback" button, and closing the app hides it again. A
+// report an earlier session submitted but never confirmed is still re-sent,
+// once, when the shell mounts.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const ACCOUNT = '33333333-3333-4333-8333-333333333333';
+    const queued = { v: 1, clientRequestId: '44444444-4444-4444-8444-444444444444', category: 'bug',
+        description: 'Queued before a reload', computerId: null, diagnostics: null, screenshot: null };
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url === '/api/shell/feedback' && init.method === 'POST') {
+            return { __status: 201, id: '22222222-2222-4222-8222-222222222222', screenshotAccepted: false };
+        }
+        return { ok: true, guacamoleRunning: false };
+    }, { ...PAYLOAD, user: { id: ACCOUNT, email: 'someone@ezil.work' },
+        desktopState: { ...PAYLOAD.desktopState, endpoints: { ...PAYLOAD.desktopState.endpoints, feedback: '/api/shell/feedback' } } });
+    // Same tick as the bundle's self-boot, so it is there before `build()` reaches the outbox.
+    const key = `ezil:feedback:outbox:v1:${ACCOUNT}`;
+    window.localStorage.setItem(key, JSON.stringify([{ clientRequestId: queued.clientRequestId, body: JSON.stringify(queued) }]));
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    await until(() => window.localStorage.getItem(key) === null);
+    const visible = () => [...$$(window, '.ezil-feedback-chip')].filter(el => el.style.display !== 'none');
+    push('🔴 feedback enabled: no Feedback control on the home screen (empty desktop)',
+        $$(window, '.ezil-feedback-chip').length === 1 && visible().length === 0);
+    const posts = seen.filter(r => r.url === '/api/shell/feedback');
+    push('a report queued by an earlier session is re-sent once when the shell mounts',
+        posts.length === 1 && posts[0].method === 'POST' && window.localStorage.getItem(key) === null,
+        JSON.stringify(seen.map(r => `${r.method} ${r.url}`)));
+    open_desktop(window);
+    await until(() => $1(window, '.window[data-app="desktop"]'));
+    const shown = await until(() => visible().length === 1);
+    const icon = visible()[0];
+    push('🔴 an open app window shows ONE small icon-only "Send feedback" button',
+        !! shown && icon.getAttribute('aria-label') === 'Send feedback' && icon.title === 'Send feedback'
+        && icon.textContent.trim() === '' && icon.querySelector('svg') !== null,
+        icon?.outerHTML.slice(0, 160));
+    await window.$($1(window, '.window[data-app="desktop"]')).close();
+    push('closing the last app window hides it again (home screen)',
+        !! await until(() => ! $1(window, '.window[data-app="desktop"]') && visible().length === 0));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 const failed = checks.filter(c => !c.pass);
 for (const c of checks) {
     console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.name}${c.detail ? `  [${c.detail}]` : ''}`);

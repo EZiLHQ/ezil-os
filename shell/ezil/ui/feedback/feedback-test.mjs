@@ -173,36 +173,60 @@ try {
         vitals.remove();
         document.body.classList.remove('device-phone');
     });
-    await check('chip mounts once; stays reachable (compact) in a visible fullbleed window while the pill is off', async () => {
+    await check('in-app icon: mounted once, icon only, hidden on the home screen, shown only while an app window is open', async () => {
         feedback.mount_feedback_chip(); feedback.mount_feedback_chip();
         assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1);
         const chip = document.querySelector('.ezil-feedback-chip');
-        assert.equal(chip.getAttribute('aria-label'), 'Feedback');
+        assert.equal(chip.getAttribute('aria-label'), 'Send feedback');
+        assert.equal(chip.title, 'Send feedback', 'the tooltip names the action');
+        assert.equal(chip.textContent.trim(), '', 'no text label');
+        assert.equal(chip.querySelectorAll('svg').length, 1);
+        const shown = () => chip.style.display !== 'none';
+        assert.equal(shown(), false, 'home screen (no app window): no icon');
         const parent = document.createElement('div');
-        parent.innerHTML = '<div class="window ezil-fullbleed"></div>';
+        parent.innerHTML = '<div class="window window-alert" data-app=""></div>';
         document.body.append(parent);
         await tick();
-        assert.notEqual(chip.style.display, 'none', 'no pill: the chip is the only Feedback entry in fullbleed');
-        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), true);
-        assert.equal(window.getComputedStyle(chip.querySelector('span')).display, 'none', 'icon only in the control strip');
-        assert.equal(build_diagnostics().fullbleed, true);
-        // With the floating-controls pill on, the pill offers Feedback and the chip steps aside.
-        window.__EZIL_BOOT__.desktopState.ui.floatingControls = true;
-        parent.firstChild.setAttribute('style', 'x: 1');
+        assert.equal(shown(), false, 'an alert is not an app window');
+        parent.insertAdjacentHTML('beforeend', '<div class="window" data-app="settings" data-is_minimized="0"></div>');
+        const win = parent.lastElementChild;
         await tick();
-        assert.equal(chip.style.display, 'none');
+        assert.equal(shown(), true, 'an open app window shows the icon');
+        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), false);
+        win.setAttribute('data-is_minimized', 'true');
+        await tick();
+        assert.equal(shown(), false, 'minimised: back on the home screen');
+        win.setAttribute('data-is_minimized', 'false');
+        await tick();
+        assert.equal(shown(), true, 'restored');
+        win.setAttribute('data-closing', '1');
+        await tick();
+        assert.equal(shown(), false, 'hidden as soon as the window starts closing');
+        win.remove();
+        await tick();
+        assert.equal(shown(), false);
+        parent.insertAdjacentHTML('beforeend', '<div class="window ezil-fullbleed" data-app="desktop"></div>');
+        await tick();
+        assert.equal(shown(), true, 'no pill: shown in a full-bleed desktop');
+        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), true, 'placed in the control strip');
+        assert.equal(build_diagnostics().fullbleed, true);
+        // With the floating-controls pill on, the pill offers Feedback and the icon steps aside.
+        window.__EZIL_BOOT__.desktopState.ui.floatingControls = true;
+        parent.lastElementChild.setAttribute('style', 'x: 1');
+        await tick();
+        assert.equal(shown(), false);
         delete window.__EZIL_BOOT__.desktopState.ui.floatingControls;
         parent.style.display = 'none';
         await tick();
-        assert.notEqual(chip.style.display, 'none');
+        assert.equal(shown(), false, 'a window that is not rendered is not open');
         assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), false);
         assert.equal(build_diagnostics().fullbleed, false);
         parent.style.display = '';
-        parent.firstChild.classList.remove('ezil-fullbleed');
         await tick();
-        assert.notEqual(chip.style.display, 'none');
-        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), false);
+        assert.equal(shown(), true);
         parent.remove();
+        await tick();
+        assert.equal(shown(), false, 'every window closed: hidden again');
     });
     await check('native dialog semantics, default-off consent, live preview, no pre-submit request', () => {
         open();
@@ -391,6 +415,71 @@ try {
         assert.deepEqual(calls.slice(count).filter(c => c.method === 'POST').map(c => JSON.parse(c.body).clientRequestId),
             kept.map(entry => entry.clientRequestId), 'only the newest 10 are sent, oldest first');
         assert.equal(stored(outboxKey), null);
+    });
+    await check('resume_feedback_outbox alone mounts no icon: queued sends go once; `online` and bfcache restore stay watched', async () => {
+        // Drop the icon mounted above (and its `online` listener) to exercise the resume on its own.
+        window.dispatchEvent(new window.Event('ezil:teardown'));
+        assert.equal(document.querySelector('.ezil-feedback-chip'), null);
+        open(); const template = payload(); close();
+        const queue = description => {
+            const clientRequestId = crypto.randomUUID();
+            return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId, description }) };
+        };
+        const first = queue('Queued before a reload');
+        window.localStorage.setItem(outboxKey, JSON.stringify([first]));
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        let count = calls.length;
+        feedback.resume_feedback_outbox(); feedback.resume_feedback_outbox();
+        await until(() => stored(outboxKey) === null);
+        assert.deepEqual(calls.slice(count).map(c => c.body), [first.body], 'sent once, byte for byte');
+        assert.equal(document.querySelector('.ezil-feedback-chip'), null, 'resuming the outbox mounts no icon');
+        count = calls.length;
+        const later = queue('Queued while offline');
+        window.localStorage.setItem(outboxKey, JSON.stringify([later]));
+        window.dispatchEvent(new window.Event('online'));
+        await until(() => stored(outboxKey) === null);
+        const restored = queue('Queued before the page was cached');
+        window.localStorage.setItem(outboxKey, JSON.stringify([restored]));
+        window.dispatchEvent(new window.PageTransitionEvent('pageshow', { persisted: false }));
+        await tick();
+        assert.notEqual(stored(outboxKey), null, 'an ordinary pageshow is not a restore');
+        window.dispatchEvent(new window.PageTransitionEvent('pageshow', { persisted: true }));
+        await until(() => stored(outboxKey) === null);
+        assert.deepEqual(calls.slice(count).map(c => c.body), [later.body, restored.body]);
+        flushing = false;
+    });
+    await check('a back/forward-cache restore runs two flushes (icon remount + restore listener) yet sends each report once', async () => {
+        assert.equal(stored(outboxKey), null);
+        feedback.mount_feedback_chip();
+        open(); const template = payload(); close();
+        const queue = description => {
+            const clientRequestId = crypto.randomUUID();
+            return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId, description }) };
+        };
+        const slow = queue('Queued first, answered slowly');
+        const quick = queue('Queued second, answered at once');
+        window.localStorage.setItem(outboxKey, JSON.stringify([slow, quick]));
+        setOnline(true);
+        flushing = true;
+        let release = null;
+        const created = { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) };
+        respond = (url, options) => JSON.parse(options.body).clientRequestId === slow.clientRequestId
+            ? new Promise(resolve => { release = () => resolve(created); }) : Promise.resolve(created);
+        const count = calls.length;
+        window.dispatchEvent(new window.PageTransitionEvent('pagehide', { persisted: true }));
+        window.dispatchEvent(new window.PageTransitionEvent('pageshow', { persisted: true }));
+        await until(() => release && ! stored(outboxKey)?.some(entry => entry.clientRequestId === quick.clientRequestId));
+        release();
+        await until(() => stored(outboxKey) === null);
+        await tick();
+        const sent = calls.slice(count).map(c => JSON.parse(c.body).description);
+        assert.deepEqual(sent.toSorted(), [quick, slow].map(entry => JSON.parse(entry.body).description).toSorted(),
+            `each queued report is POSTed once (${JSON.stringify(sent)})`);
+        assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1, 'the icon is back, once');
+        window.dispatchEvent(new window.Event('ezil:teardown'));
+        flushing = false;
     });
     await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
         open(); setDescription('Half-written report'); change('diagnostics', true);
@@ -618,6 +707,32 @@ try {
         troubleshoot.onActivate($pane);
         assert.equal(pane.querySelector('[data-action="report-problem"]'), null);
         assert.equal(pane.querySelector('[data-role="feedback-reports"]'), null);
+        pane.remove();
+    });
+    await check('Settings → Feedback: a labelled button opens the existing form, returns focus, and is gated on the endpoint', async () => {
+        window.__EZIL_BOOT__.desktopState.endpoints.feedback = '/api/shell/feedback';
+        const { default: tab } = await import('../Settings/tabs/feedback.js');
+        assert.equal(tab.id, 'feedback');
+        assert.equal(tab.label, 'Feedback');
+        assert.equal(tab.available(), true);
+        const pane = document.createElement('div');
+        pane.innerHTML = tab.html();
+        document.body.append(pane);
+        const count = calls.length;
+        tab.init($(pane));
+        const entry = pane.querySelector('[data-action="send-feedback"]');
+        assert.equal(entry.tagName, 'BUTTON');
+        assert.equal(entry.type, 'button');
+        assert.equal(entry.textContent, 'Send feedback');
+        entry.click();
+        assert.equal(current().querySelector('h2').textContent, 'Send feedback');
+        assert.equal(calls.length, count, 'opening the form sends nothing');
+        close(); assert.equal(document.activeElement, entry, 'closing the form returns focus to the Settings button');
+        delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
+        assert.equal(tab.available(), false, 'no endpoint: no Feedback tab');
+        entry.click();
+        assert.equal(current(), null);
+        assert.equal(calls.length, count);
         pane.remove();
     });
     console.log(`\n${checks} feedback checks passed. jsdom does not validate browser layout or real capture.`);

@@ -90,11 +90,24 @@ allow-listed parent origin, never `'*'`.
 ### `shell/ezil/ui/feedback/feedback.js` (lane FSHELL)
 ```
 feedback_enabled() → boolean          // endpoints.feedback present
-mount_feedback_chip() → void          // top-right corner chip, idempotent
-open_feedback_dialog({ source: 'chip'|'pill'|'troubleshoot' }) → void
+mount_feedback_chip() → void          // the tiny in-app icon (below), idempotent; boot calls it on every mount
+resume_feedback_outbox() → void       // §4a resend + `online`/bfcache-restore watch, idempotent; called by mount_feedback_chip
+open_feedback_dialog({ source: 'chip'|'pill'|'troubleshoot'|'settings' }) → void
 list_my_reports() → Promise<Array<ReportSummary>>
 delete_my_report(id) → Promise<boolean>
 ```
+Founder, 2026-10-29: Feedback is not on the home screen; its main entry is Settings →
+Feedback (`shell/ezil/ui/Settings/tabs/feedback.js`, shown only when `feedback_enabled()`).
+`mount_feedback_chip()` mounts `button.ezil-feedback-chip`, the in-app icon: icon only,
+`aria-label` and `title` "Send feedback", shown only while at least one app window is open
+(`.window[data-app]` with a non-empty app, not an alert or file dialog, not minimised, not
+closing, rendered; full-bleed included) and hidden on the home screen; a MutationObserver
+on `<body>` follows windows opening, closing, minimising and restoring. Top-right corner,
+level with the 30px window head (whose controls are on the left) or centred in the
+full-bleed control strip, right of the centred drawer; never over window controls. A 16px
+glyph on a 20px disc, low emphasis; hit target 24×24 on a fine pointer, 44×44 under
+`pointer: coarse`. z-index above every app window (phone/tablet windows are `9999999
+!important`), below context menus, the upgrade sheet and the dialog's top layer.
 `shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics() → Diagnostics` (§3 shape only).
 Teardown, history navigation and page exit close the form and any nested editor,
 cancel pending captures, and discard late results without suppressing shell Back.
@@ -156,9 +169,12 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   that id is confirmed (200/201). Consent boxes and screenshots are never remembered.
 - `ezil:feedback:outbox:v1:<accountId>` — at most 10 `{clientRequestId, body}` entries: the
   exact submitted request bodies (including any diagnostics the user consented to) that have
-  not been confirmed. Re-sent byte-for-byte, same `clientRequestId`, on the `online` event and
-  when the chip mounts; removed on 200/201; dropped on a definitive 4xx (the text then returns
-  to the draft). Storage failures (blocked, quota, private mode) only lose the convenience.
+  not been confirmed. Re-sent byte-for-byte, same `clientRequestId`, on the `online` event,
+  when the shell mounts (boot → `mount_feedback_chip()` → `resume_feedback_outbox()`, whether
+  or not an app window is open) and on a back/forward-cache restore (`pageshow` with
+  `persisted`); each entry is sent once even when two flushes overlap. Removed on 200/201;
+  dropped on a definitive 4xx (the text then returns to the draft). Storage failures
+  (blocked, quota, private mode) only lose the convenience.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,

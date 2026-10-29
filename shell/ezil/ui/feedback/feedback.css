@@ -1,25 +1,45 @@
-/* feedback.css — EZiL-authored. Below popovers (9999999), above ordinary windows. */
+/* feedback.css — EZiL-authored. The in-app icon is above every app window
+ * (phone/tablet windows are `9999999 !important`, style.css) and below context
+ * menus, the upgrade sheet and the dialog's top layer. */
+/* Founder, 2026-10-29: no Feedback on the home screen (`mount_feedback_chip`
+ * hides this while no app window is open). In an app it is a very small,
+ * low-emphasis icon: a 16px glyph on a 20px disc, top right, level with the
+ * 30px window head (whose controls sit on the left). The button is the hit
+ * target: 24px on a fine pointer, 44px under `pointer: coarse` (the same query
+ * the drawer and the control strip use). */
 .ezil-feedback-chip {
     position: fixed;
-    top: max(8px, env(safe-area-inset-top));
-    right: max(8px, env(safe-area-inset-right));
-    z-index: 9999996;
+    top: calc(3px + env(safe-area-inset-top, 0px));
+    right: calc(6px + env(safe-area-inset-right, 0px));
+    z-index: 10000000;
+    box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 7px;
-    min-height: 36px;
-    padding: 7px 12px;
-    border: 1px solid #d7dbe4;
-    border-radius: 24px;
-    background: #fff;
-    color: #24334c;
-    box-shadow: 0 2px 10px #0002;
-    font: 600 13px/1.3 system-ui, sans-serif;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #fff;
+    opacity: .7;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
 }
-.ezil-feedback-chip svg { width: 19px; height: 19px; }
-.ezil-feedback-chip:focus-visible,
+/* Dark glass with a white hairline, like the drawer: findable on light and dark. */
+.ezil-feedback-chip svg {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    padding: 2px;
+    border-radius: 50%;
+    background: rgba(24, 24, 28, 0.62);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22), 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+.ezil-feedback-chip:hover, .ezil-feedback-chip:focus-visible { opacity: 1; }
+.ezil-feedback-chip:focus-visible { outline: none; }
+.ezil-feedback-chip:focus-visible svg { outline: 3px solid #3479d5; outline-offset: 2px; }
 .ezil-feedback-dialog :focus-visible { outline: 3px solid #3479d5; outline-offset: 3px; }
 .ezil-feedback-dialog {
     box-sizing: border-box;
@@ -91,28 +111,27 @@
 .ezil-feedback-reports li { margin: 12px 0; overflow-wrap: anywhere; }
 .ezil-feedback-reports p { margin: 4px 0; white-space: pre-wrap; }
 @media (max-width: 499px) {
-    .ezil-feedback-chip span { display: none; }
-    .ezil-feedback-chip { width: 36px; padding: 7px; }
     .ezil-feedback-dialog { padding: 18px; }
 }
 @media (any-pointer: coarse) {
-    .ezil-feedback-chip { min-width: 44px; min-height: 44px; }
     .ezil-feedback-dialog button, .ezil-feedback-dialog summary,
     .ezil-feedback-consent, .ezil-feedback-category label { min-height: 44px; }
 }
-/* Full-bleed desktop (round 3, plan §6.8): without the floating-controls pill
- * the chip is the only Feedback entry, so it stays — icon only, inside the
- * top control strip (`--ezil-control-strip-height` in ezil-shell.css: 43px,
- * 59px under `pointer: coarse`) so it never covers the stream. */
-.ezil-feedback-chip.ezil-feedback-chip-fullbleed {
-    top: 4px;
-    width: 34px;
-    min-width: 34px;
-    min-height: 34px;
-    height: 34px;
-    padding: 6px;
-}
-.ezil-feedback-chip.ezil-feedback-chip-fullbleed span { display: none; }
 @media (pointer: coarse) {
-    .ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 7px; width: 44px; min-width: 44px; min-height: 44px; height: 44px; }
+    /* A 44px target from the corner down; the disc stays level with the head. */
+    .ezil-feedback-chip {
+        top: env(safe-area-inset-top, 0px);
+        right: env(safe-area-inset-right, 0px);
+        width: 44px;
+        height: 44px;
+        align-items: flex-start;
+        padding-top: 5px;
+    }
+}
+/* Full-bleed desktop (plan §6.8): centred in the top control strip
+ * (`--ezil-control-strip-height` in ezil-shell.css: 43px, 59px under
+ * `pointer: coarse`), right of the centred drawer, never over the stream. */
+.ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 9.5px; }
+@media (pointer: coarse) {
+    .ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 7.5px; align-items: center; padding-top: 0; }
 }
