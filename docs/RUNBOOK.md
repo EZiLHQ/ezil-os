@@ -165,8 +165,9 @@ digest and publishes the draft with the verified identities. `deploy.yml` and
     then the app's own SSR auth cookie in the browser. The account therefore
     needs an email/password identity on the target's Supabase project, and the
     run needs that project's public `NEXT_PUBLIC_SUPABASE_URL` and
-    `NEXT_PUBLIC_SUPABASE_ANON_KEY`. No allow-list grant is needed since the
-    invite gate was removed.
+    `NEXT_PUBLIC_SUPABASE_ANON_KEY`. `preview.yml`'s live checks read both from
+    the `staging` and `production` GitHub environment variables of the same
+    names. No allow-list grant is needed since the invite gate was removed.
 
 ---
 
