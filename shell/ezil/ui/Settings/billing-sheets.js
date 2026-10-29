@@ -103,7 +103,8 @@ export function openComputeUpgradeSheet (options) {
         node('p', 'Checking the price…');
         void request('billing.previewUpgrade', { toSku: target }, data => {
             body.replaceChildren();
-            if ( v3 ) offerDetails(sheet, offer);
+            // The Standard computer stays the same computer: its disk, not the new-computer figure (D3).
+            if ( v3 ) offerDetails(sheet, offer, sheet.body, { existingDisk: options.summary.computer?.disk ?? {} });
             const fromOffer = v3 ? options.summary.catalog.offers.find(o => o.sku === 'standard_monthly_v3') : null;
             const credits = v3 ? upgradeAiCreditsFromGrant(data.grantStdSeconds, fromOffer, offer) : 0;
             const table = node('table', null);
@@ -244,9 +245,9 @@ export function openOverageSheet (options) {
 }
 
 /** PublicOfferV3 only: price and the round-3 bullets (configurations → storage → AI credits → computer time). */
-function offerDetails (sheet, offer, parent = sheet.body, { price = true } = {}) {
+function offerDetails (sheet, offer, parent = sheet.body, { price = true, existingDisk = null } = {}) {
     if ( price ) sheet.node('p', offer.priceCents ? `${money(offer.priceCents)}/month` : '$0', parent).className = 'ezil-billing-sheet-total';
-    const { lead, bullets } = planBullets(offer);
+    const { lead, bullets } = planBullets(offer, { existingDisk });
     if ( lead ) sheet.node('p', lead, parent).className = 'ezil-billing-choice-lead';
     const list = sheet.node('ul', null, parent);
     for ( const bullet of bullets ) sheet.node('li', bullet, list);
@@ -329,7 +330,7 @@ function openV3DowngradeSheet (options) {
     if ( ! standard ) throw new Error('unavailable');
     const sheet = billingSheet(options, 'downgrade', 'Change to Standard');
     if ( sheet.existing ) return sheet.existing;
-    offerDetails(sheet, standard);
+    offerDetails(sheet, standard, sheet.body, { existingDisk: options.summary.computer?.disk ?? {} });
     const date = options.summary.plan.renewal?.at;
     sheet.node('p', `You keep Premium ${date ? `until ${dateLabel(date)}` : 'until the end of your billing period'}. Standard starts then.`);
     sheet.button('Change to Standard', 'confirm', () => {

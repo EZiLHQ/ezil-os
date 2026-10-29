@@ -65,13 +65,14 @@ check('Premium running on 2 vCPU: current + two available, no slot UI', () => {
     const model = computerModel({ computer: me, data: premium(), prog: running() });
     assert.deepEqual(states(model), { 'std-2': 'current', 'cmp-4': 'available', 'cmp-8': 'available' });
     assert.equal(model.chip.text, 'Running');
-    assert.equal(model.provider, 'AWS · India');
+    assert.equal(model.provider, 'AWS · Mumbai');
     const html = scan(computerHtml(model, running(), []));
     assert.match(html, /<h3>Your computer<\/h3>/);
     assert.match(text(html), /2 vCPU · 8 GB memory · 50 GB disk/);
     assert.match(text(html), /50 GB disk for your projects/);
-    assert.match(text(html), /Stays the same when you switch configuration\./);
-    assert.match(text(html), /counts 2× time/);
+    // Round 5 (D6): the disk does not grow yet (growsOnSwitch false), and the tile names the weight.
+    assert.match(text(html), /It keeps its size when you switch configuration\./);
+    assert.match(text(html), /Counts 2× of your monthly time/);
     assert.equal((html.match(/data-action="switch-config"/g) ?? []).length, 2);
     assert.doesNotMatch(html, /data-slot|New computer|Empty slot|data-action="create"|Add computer/);
 });
@@ -81,7 +82,7 @@ check('Standard: 4 and 8 vCPU are locked with the plan that unlocks them, plus U
     assert.deepEqual(states(model), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
     const html = scan(computerHtml(model, running(), []));
     assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 2);
-    assert.match(html, /Premium<\/span>\s*<a class="ezil-settings-btn" data-action="config-upgrade" href="\/os\?settings=billing&amp;upgrade=premium">Upgrade<\/a>/);
+    assert.match(html, /Included in Premium<\/span><\/div>\s*<div class="ezil-computer-config-action"><a class="ezil-settings-btn ezil-computer-upgrade" data-action="config-upgrade" href="\/os\?settings=billing&amp;upgrade=premium">Upgrade<\/a>/);
     assert.doesNotMatch(html, /data-action="switch-config"/);
     assert.match(text(html), /Your plan includes 2 vCPU\. Premium unlocks 4 and 8 vCPU\. Compare plans/);
 });
@@ -274,7 +275,7 @@ check('Round 4 grace: the paid computer stays usable; banner with the date and F
     assert.match(html, /data-action="fix-payment" href="\/os\?settings=billing">Fix payment<\/a>/);
     assert.equal((html.match(/data-action="switch-config"/g) ?? []).length, 2, 'Switch stays enabled');
     assert.doesNotMatch(html, /data-action="open" disabled/);
-    assert.equal(model.provider, 'AWS · India');
+    assert.equal(model.provider, 'AWS · Mumbai');
 });
 
 check('Round 4 plan_ending: the end date and that nothing is deleted', () => {
@@ -293,7 +294,7 @@ check('Round 4 files_on_aws: AWS (India) · files kept, Open desktop, every AWS 
     assert.equal(model.provider, 'AWS (India) · files kept');
     const html = scan(computerHtml(model, stoppedAws(), []));
     assert.deepEqual(roles(html), ['files-held']);
-    assert.match(text(html), /Your computer Stopped AWS \(India\) · files kept/);
+    assert.match(text(html), /Your computer My computer AWS \(India\) · files kept Stopped/);
     assert.match(text(html), /2 vCPU · 8 GB memory/);
     assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
     assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 3);
@@ -343,7 +344,9 @@ check('Round 4 move (Phase B): dormant while move is null or another direction; 
     const percent = Number(html.match(/aria-valuenow="(\d+)"/)[1]);
     assert.ok(percent > 25 && percent < 50, String(percent));
     const done = scan(computerHtml(computerModel({ computer: me, data: withStanding(free(), 'free', { filesOn: 'cloudflare', move: { direction: 'to_cloudflare', stage: 'committed', bytesDone: '1', bytesTotal: '1' } }) }), null, []));
-    assert.match(text(done), /Your files are on your Free computer\. Open desktop/);
+    assert.match(text(done), /Your files are on your Free computer\. Open your desktop to continue\./);
+    assert.ok(done.includes('data-role="move-done"'));
+    assert.doesNotMatch(done.split('data-role="move-done"')[1].split('</div>')[0], /data-action="open"/, 'Open desktop is the header\'s only');
     const failed = scan(computerHtml(computerModel({ computer: me, data: withStanding(free(), 'files_on_aws', { move: { direction: 'to_cloudflare', stage: 'failed_reopened', bytesDone: '0', bytesTotal: null, reason: 'move_copy_failed' } }), prog: stoppedAws() }), stoppedAws(), []));
     assert.match(text(failed), /We couldn't move your files\. They're still on your AWS computer and nothing was deleted\./);
     assert.match(failed, /data-action="move-retry">Try again<\/button>/);
@@ -353,7 +356,11 @@ check('Round 4 move (Phase B): dormant while move is null or another direction; 
 check('Round 4: the standing copy passes the copy guard and names no region code or city', () => {
     for ( const html of scanned ) {
         assert.doesNotMatch(text(html), honestyBans);
-        assert.doesNotMatch(text(html), /ap-south-1|mumbai/i);
+        assert.doesNotMatch(text(html), /ap-south-1/i);
+        // The standing banners name no city; the header's location line (D6: "AWS · Mumbai") is not standing copy.
+        for ( const [banner] of html.matchAll(/<div class="ezil-computer-switch[^"]*" data-role="(?:payment-grace|plan-ending|files-held)"[\s\S]*?<\/div>/g) ) {
+            assert.doesNotMatch(text(banner), /mumbai/i);
+        }
     }
 });
 
@@ -429,12 +436,23 @@ if ( haveBundle ) {
 
     click(card('cmp-4')?.querySelector('[data-action="switch-config"]'));
     await settle(4);
-    const confirmText = q('.window-alert-message')?.textContent ?? '';
-    const switchNow = qa('.window button').find(b => b.textContent.trim() === 'Switch now' && b.closest('.window')?.querySelector('.window-alert-message'));
-    check('bundle: Switch on a RUNNING computer confirms first with the plan copy, and sends nothing yet', () => {
+    // Round 5 (D6): the confirmation is the sheet frame, not the legacy UIAlert.
+    const sheet = q('[role="dialog"][data-sheet="confirm-switch"]');
+    const confirmText = sheet?.textContent ?? '';
+    const switchNow = sheet?.querySelector('[data-action="confirm"]');
+    check('bundle: Switch on a RUNNING computer confirms first in the sheet frame with the brief copy, and sends nothing yet', () => {
+        assert.ok(sheet, 'sheet-frame dialog');
+        assert.equal(sheet.getAttribute('aria-modal'), 'true');
+        assert.ok(sheet.closest('.ezil-upgrade-backdrop'));
+        assert.equal(q('.window-alert-message'), null, 'no legacy alert');
         assert.match(confirmText, /Switch to 4 vCPU · 16 GB\?/);
-        assert.match(confirmText, /Your computer restarts on a bigger machine\. Your files and settings stay; running apps restart\. Usually about a minute, longer if a machine has to be prepared\./);
-        assert.ok(switchNow, 'Switch now button');
+        assert.match(confirmText, /Your computer restarts on the new size\. Open apps close; save your work first\./);
+        assert.match(confirmText, /Your files stay on your disk\./);
+        assert.match(confirmText, /This usually takes 1-4 minutes\./);
+        assert.match(confirmText, /At this size, an hour of use counts as 2 hours of your monthly time\./);
+        assert.equal(switchNow?.textContent, 'Restart and switch');
+        assert.ok(switchNow?.classList.contains('ezil-settings-btn-primary'));
+        assert.ok(sheet.querySelector('[data-action="cancel"]'));
         assert.equal(switches().length, 0);
     });
     const clickedAt = window.performance.now();
@@ -447,6 +465,8 @@ if ( haveBundle ) {
     check('🔴 bundle: acknowledged in under 200 ms while the request is still unanswered', () => {
         assert.ok(ackAt !== null && ackAt - clickedAt < 200, `ack after ${ackAt === null ? 'never' : Math.round(ackAt - clickedAt)} ms`);
         assert.equal(held !== null, true, 'the request is held open');
+        assert.equal(switchNow.disabled, true, 'the primary is disabled while the request is in flight');
+        assert.equal(switchNow.textContent, 'Starting switch…');
         assert.equal(pane().querySelector('[data-role="computer-chip"]')?.textContent, 'Switching to 4 vCPU');
         assert.equal(pane().querySelector('[data-role="now-label"]')?.textContent, 'Now: 2 vCPU · 8 GB');
         assert.equal(pane().querySelector('[data-role="next-label"]')?.textContent, 'Next: 4 vCPU · 16 GB');
@@ -455,7 +475,7 @@ if ( haveBundle ) {
     await settle(4);
     check('🔴 bundle: a second click while pending sends no second request', () => {
         assert.equal(switches().length, 1);
-        assert.equal(q('.window-alert-message'), null, 'no second confirmation');
+        assert.equal(qa('[role="dialog"][data-sheet^="confirm-"]').length, 1, 'no second confirmation');
     });
     const sent = switches()[0]?.body;
     check('bundle: the switch request carries computer, target and a well-formed requestId, kept in sessionStorage', () => {
@@ -468,6 +488,7 @@ if ( haveBundle ) {
         expectedSeconds: 150, openingStartedAt: '2026-10-28T10:00:00Z', observedAt: '2026-10-28T10:00:40Z', milestones: [{ key: 'requested', at: '2026-10-28T10:00:00Z' }, { key: 'host_claimed', at: '2026-10-28T10:00:30Z' }] });
     held({ ok: true, effective: 'switching', current: 'std-2', target: 'cmp-4', transitionId: 't-1' });
     await settle(10);
+    check('bundle: the confirmation closes once the server answers', () => assert.equal(q('[role="dialog"][data-sheet="confirm-switch"]'), null));
     check('bundle: after the answer, progress comes from the server milestones', () => {
         assert.equal(pane().querySelector('[data-step="3"]')?.dataset.state, 'active');
         assert.match(pane().querySelector('[data-step="2"]')?.textContent ?? '', /ready machine found/);
@@ -494,7 +515,10 @@ if ( haveBundle ) {
     await settle();
     check('bundle: done reads "Now running on 4 vCPU · 16 GB" with Open desktop, and the id is cleared', () => {
         assert.match(pane().querySelector('[data-role="switch-done"]')?.textContent ?? '', /Now running on 4 vCPU · 16 GB/);
-        assert.ok(pane().querySelector('[data-role="switch-done"] [data-action="open"]'));
+        // One primary per state (D6): Open desktop is the header's, not repeated in the done box.
+        assert.equal(pane().querySelector('[data-role="switch-done"] [data-action="open"]'), null);
+        assert.equal(pane().querySelectorAll('.ezil-settings-btn-primary').length, 1);
+        assert.ok(pane().querySelector('[data-role="computer-actions"] [data-action="open"].ezil-settings-btn-primary'));
         assert.equal(card('cmp-4')?.dataset.state, 'current');
         assert.equal(window.sessionStorage.getItem('ezil-os:switch.c-1.cmp-4'), null);
     });
@@ -529,7 +553,8 @@ if ( haveBundle ) {
     await settle();
     check('bundle: Standard shows locked 4 and 8 vCPU with Premium and Upgrade', () => {
         assert.equal(card('cmp-4')?.dataset.state, 'locked');
-        assert.match(card('cmp-8')?.textContent ?? '', /Premium\s*Upgrade/);
+        assert.match(card('cmp-8')?.textContent ?? '', /Included in Premium\s*Upgrade/);
+        assert.ok(card('cmp-8')?.querySelector('[data-action="config-upgrade"].ezil-computer-upgrade'));
     });
     check('bundle: no uncaught page errors', () => assert.deepEqual(uncaught, []));
     dom.window.close();

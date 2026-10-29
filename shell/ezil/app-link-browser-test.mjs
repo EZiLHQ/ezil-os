@@ -78,17 +78,17 @@ try {
     if (dir) { mkdirSync(dir, { recursive: true }); await page.screenshot({ path: path.join(dir, 'ui-windows.png') }); }
     await ordinary.locator('.taskbar-item[data-app="settings"]').click();
     await ordinary.locator('.ezil-settings-tab[data-tab="usage"]').click();
-    await ordinary.locator('[data-usage="session"]', { hasText: 'Update delayed' }).waitFor();
+    await ordinary.locator('[data-usage="session"]', { hasText: 'Measuring this session…' }).waitFor();
     assert.ok((await ordinary.locator('[data-role="usage-body"]').textContent()).includes('Not measured yet'));
     // billing.summary has side effects: read at most once when Usage opens, never on the 30 s poll.
     assert.ok(requests.filter(p => p === '/api/trpc/billing.summary').length <= 1, 'Usage reads the billing summary at most once per open');
     if (dir) await ordinary.screenshot({ path: path.join(dir, 'ui-usage.png') });
     usageFails = true; await ordinary.getByRole('button', { name: 'Refresh', exact: true }).click();
     await ordinary.getByRole('alert').filter({ hasText: "Couldn't refresh. Showing the last update from" }).waitFor();
-    assert.ok((await ordinary.locator('[data-usage="session"]').textContent()).includes('Update delayed'));
+    assert.ok((await ordinary.locator('[data-usage="session"]').textContent()).includes('Measuring this session…'));
     assert.ok((await ordinary.locator('[data-usage="session"]').textContent()).includes('20 min'), 'failed refresh retains recorded runtime');
     usageFails = false; await ordinary.getByRole('button', { name: 'Refresh', exact: true }).click();
-    await ordinary.locator('[data-usage="session"]', { hasText: 'Update delayed' }).waitFor();
+    await ordinary.locator('[data-usage="session"]', { hasText: 'Measuring this session…' }).waitFor();
     assert.deepEqual(errors, []);
     console.log('PASS local Chromium: fresh Code/Browser, refresh, Settings close/reopen/default/deep section, repeated target, two OS tabs, ordinary entry, invalid target, truthful Usage and failed-refresh recovery');
 } finally { await context.close(); await browser.close(); await new Promise(resolve => server.close(resolve)); }

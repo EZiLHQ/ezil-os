@@ -31,9 +31,9 @@
     cursor: pointer;
 }
 .ezil-redact-editor button[aria-pressed="true"],
-.ezil-redact-editor button[data-action="confirm"] { background: #185cb0; }
+.ezil-redact-editor button[data-action="confirm"] { background: var(--ezil-accent, #00adb5); border-color: var(--ezil-accent, #00adb5); color: var(--ezil-accent-contrast, #04060c); }
 .ezil-redact-editor button:disabled { opacity: 0.5; cursor: default; }
-.ezil-redact-editor button:focus-visible { outline: 3px solid #80d8ff; outline-offset: 3px; }
+.ezil-redact-editor button:focus-visible { outline: 3px solid var(--ezil-accent, #00adb5); outline-offset: 3px; }
 .ezil-redact-help { color: #d5dfef; font-size: 12px; }
 .ezil-redact-viewport { display: flex; justify-content: center; max-width: 100%; overflow: hidden; }
 .ezil-redact-stage { position: relative; flex: none; overflow: hidden; touch-action: none; user-select: none; cursor: crosshair; background: #fff; }

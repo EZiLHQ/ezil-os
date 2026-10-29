@@ -404,7 +404,7 @@ export function refusalCopy (reason, target, data = summary, current = null) {
  * Everything the Computer tab shows, from server data only (plus the one
  * pending click). Pure, so the states are unit-tested without a DOM.
  */
-export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false }) {
+export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false, stopping = false }) {
     // Round 4 (STANDING-CONTRACT): the standing decides what opens; an unknown or missing one keeps the
     // plan-only model. The plan block may still describe a past_due paid subscription after grace.
     const standing = standingOf(data);
@@ -427,6 +427,8 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     let chip = null;
     if ( switching ) chip = { state: 'switching', text: `Switching to ${sizeInfo(switching.target, data)?.vcpu ?? ''} vCPU` };
     else if ( flying ) chip = { state: 'switching', text: 'Restarting…' };
+    // D6: the chip says Stopping… the moment the user confirms, not when the server first reports it.
+    else if ( stopping ) chip = { state: 'stopping', text: 'Stopping…' };
     else if ( prog?.needsOperator || t?.phase === 'failed' ) chip = { state: 'attention', text: 'Needs attention' };
     else if ( running ) chip = { state: 'running', text: 'Running' };
     else if ( prog?.operation === 'opening' ) chip = { state: 'starting', text: 'Starting…' };
@@ -438,6 +440,8 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
         const info = sizeInfo(size, data);
         let state = held || (dropped && size !== 'free-cf') ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
         if ( switching && size === switching.target ) state = 'switching';
+        // D6: during a switch only the target is highlighted; the size it leaves is just "from".
+        else if ( switching && size === switching.current ) state = 'from';
         else if ( nextStart === size ) state = 'next';
         return { size, vcpu: info.vcpu, memoryGiB: info.memoryGiB, weight: info.weight, state,
             plan: state === 'locked' ? planFor(size, data) : null };
@@ -447,8 +451,8 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
     const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
     return { computer, data, free, standing, held, move,
-        provider: data ? held ? 'AWS (India) · files kept' : free ? 'Cloudflare' : 'AWS · India' : null, chip, current, nextStart, switching,
-        running, stopped, cards, done, failed, disk, busy: !! (switching || flying || prog?.operation === 'opening' || prog?.operation === 'stopping') };
+        provider: data ? held ? 'AWS (India) · files kept' : free ? 'Cloudflare' : 'AWS · Mumbai' : null, chip, current, nextStart, switching,
+        running, stopped, cards, done, failed, disk, busy: !! (switching || flying || stopping || prog?.operation === 'opening' || prog?.operation === 'stopping') };
 }
 
 const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
@@ -503,13 +507,13 @@ function moveHtml (model) {
     const view = moveView(model.move);
     if ( ! view ) return '';
     if ( view.kind === 'done' ) {
-        return `<div class="ezil-computer-switch is-done" data-role="move-done" role="status"><p>Your files are on your Free computer.</p>
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop</button></div>`;
+        // One primary per state (D6): Open desktop lives in the header.
+        return `<div class="ezil-computer-switch is-done" data-role="move-done" role="status"><p>Your files are on your Free computer. Open your desktop to continue.</p></div>`;
     }
     if ( view.kind === 'failed' ) {
         return `<div class="ezil-computer-switch is-failed" data-role="move-failed" role="alert">
             <p>We couldn't move your files. They're still on your AWS computer and nothing was deleted.</p><div class="ezil-settings-row-actions">
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="move-retry">Try again</button>
+            <button type="button" class="ezil-settings-btn" data-action="move-retry">Try again</button>
             ${feedback_enabled() ? `<button type="button" class="ezil-settings-btn" data-action="move-feedback" data-code="${html_encode(view.code)}">Send feedback</button>` : ''}</div></div>`;
     }
     return `<div class="ezil-computer-switch" data-role="move-progress" role="status" aria-live="polite">
@@ -524,7 +528,7 @@ function standingHtml (model) {
     const copy = standingCopy(model.standing, model.data);
     if ( model.standing === 'grace' ) {
         return `<div class="ezil-computer-switch is-failed" data-role="payment-grace" role="status"><p>${html_encode(copy)}</p>
-            <a class="ezil-settings-btn ezil-settings-btn-primary" data-action="fix-payment" href="/os?settings=billing">Fix payment</a></div>`;
+            <a class="ezil-settings-btn" data-action="fix-payment" href="/os?settings=billing">Fix payment</a></div>`;
     }
     if ( model.standing === 'plan_ending' ) return `<div class="ezil-computer-switch" data-role="plan-ending" role="status"><p>${html_encode(copy)}</p></div>`;
     if ( model.held ) return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(copy)}</p></div>`;
@@ -560,19 +564,34 @@ export function switchRatio (switching, prog, index) {
     return shown;
 }
 
+/**
+ * D6: a configuration tile that sells. Title, ONE honest benefit line, the weight
+ * note ("Counts 2× of your monthly time"), and for a locked tile the plan that
+ * includes it with a visible Upgrade. No speed promise (scanCopy, honestyBans).
+ */
+export const CONFIG_BENEFIT = {
+    'free-cf': 'Room to try EZiL OS and build small projects',
+    'std-2': 'Room for everyday coding with a browser open',
+    'cmp-4': 'Room for builds and a few browsers at once',
+    'cmp-8': 'Room for large builds and many apps open at once',
+};
+const LOCK_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
+
 function cardHtml (card, model) {
-    const label = `${card.vcpu} vCPU · ${card.memoryGiB} GB memory`;
-    const weight = card.size === 'free-cf' ? 'Cloudflare' : card.weight > 1 ? `counts ${card.weight}× time` : 'counts 1× time';
+    const title = `${card.vcpu} vCPU · ${card.memoryGiB} GB`;
+    const weight = card.size === 'free-cf' ? 'Cloudflare · sessions up to 1 hour' : card.weight > 1 ? `Counts ${card.weight}× of your monthly time` : 'Counts 1× of your monthly time';
     let action = '';
     if ( card.state === 'current' ) action = '<span class="ezil-settings-pill" data-role="config-current">Current</span>';
     else if ( card.state === 'available' ) action = `<button type="button" class="ezil-settings-btn" data-action="switch-config" data-size="${html_encode(card.size)}"${model.busy || stopBusy ? ' disabled' : ''}>Switch</button>`;
     else if ( card.state === 'switching' ) action = '<span class="ezil-settings-pill" data-role="config-switching">Switching…</span>';
     else if ( card.state === 'next' ) action = '<span class="ezil-settings-pill" data-role="config-next">Next start</span>';
-    else if ( card.state === 'locked' ) action = `<span class="ezil-computer-lock" data-role="config-locked"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>${html_encode(card.plan)}</span>
-        <a class="ezil-settings-btn" data-action="config-upgrade" href="/os?settings=billing&amp;upgrade=${card.plan === 'Standard' ? 'standard' : 'premium'}">Upgrade</a>`;
+    else if ( card.state === 'locked' ) action = `<a class="ezil-settings-btn ezil-computer-upgrade" data-action="config-upgrade" href="/os?settings=billing&amp;upgrade=${card.plan === 'Standard' ? 'standard' : 'premium'}">Upgrade</a>`;
     else if ( card.state === 'unavailable' ) action = `<span class="ezil-computer-unavailable" data-role="config-unavailable">${html_encode(refusalCopy('capacity_unavailable', card.size, model.data, model.current))}</span>`;
     return `<li class="ezil-computer-config" data-size="${html_encode(card.size)}" data-state="${card.state}">
-        <div><strong>${html_encode(label)}</strong><span class="ezil-settings-muted">${html_encode(weight)}</span></div>
+        <div class="ezil-computer-config-body"><strong data-role="config-title">${html_encode(title)}</strong>
+            <span class="ezil-computer-config-benefit" data-role="config-benefit">${html_encode(CONFIG_BENEFIT[card.size] ?? '')}</span>
+            <span class="ezil-settings-muted" data-role="config-weight">${html_encode(weight)}</span>
+            ${card.state === 'locked' ? `<span class="ezil-computer-lock" data-role="config-locked">${LOCK_ICON}${html_encode(`Included in ${card.plan}`)}</span>` : ''}</div>
         <div class="ezil-computer-config-action">${action}</div></li>`;
 }
 
@@ -581,17 +600,17 @@ function statusHtml (model, prog) {
         const { index, steps } = switchSteps(model.switching, prog, model.data);
         const ratio = switchRatio(model.switching, prog, index);
         const percent = Math.round(ratio * 100);
-        return `<div class="ezil-computer-switch" data-role="switch-progress" role="status" aria-live="polite">
-            <p data-role="switching-label"><strong>Switching…</strong></p>
+        return `<div class="ezil-computer-switch" data-role="switch-progress">
+            <p data-role="switching-label" role="status" aria-live="polite"><strong>Switching…</strong></p>
             <p data-role="now-label">Now: ${html_encode(sizeLabel(model.switching.current, model.data))}</p>
             <p data-role="next-label">Next: ${html_encode(sizeLabel(model.switching.target, model.data))}</p>
             <div class="ezil-computer-bar" role="progressbar" aria-label="Switch progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
             <ol class="ezil-computer-steps">${steps.map((step, i) => `<li data-step="${i + 1}" data-state="${i < index ? 'done' : i === index ? 'active' : 'todo'}">${html_encode(step)}</li>`).join('')}</ol></div>`;
     }
     if ( model.done ) {
+        // One primary per state (D6): Open desktop is the header's.
         return `<div class="ezil-computer-switch is-done" data-role="switch-done" role="status">
-            <p>${html_encode(`Now running on ${sizeLabel(model.done.target, model.data)}`)}</p>
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop</button></div>`;
+            <p>${html_encode(`Now running on ${sizeLabel(model.done.target, model.data)}`)}</p></div>`;
     }
     if ( model.failed ) {
         const t = model.failed;
@@ -602,14 +621,14 @@ function statusHtml (model, prog) {
         const copy = cap ? AWS_CAP_COPY : `We couldn't switch to ${sizeLabel(t.target, model.data)}. Your computer is on ${sizeLabel(on, model.data)} and your files are safe.`;
         return `<div class="ezil-computer-switch is-failed" data-role="switch-failed" role="alert">
             <p>${html_encode(copy)}</p><div class="ezil-settings-row-actions">
-            ${retry ? `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="switch-retry" data-size="${html_encode(t.target)}">Try again</button>` : ''}
+            ${retry ? `<button type="button" class="ezil-settings-btn" data-action="switch-retry" data-size="${html_encode(t.target)}">Try again</button>` : ''}
             ${t.revertAvailable && on !== t.current ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
             ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="switch-feedback">Send feedback</button>' : ''}</div></div>`;
     }
     if ( model.nextStart ) {
         return `<div class="ezil-computer-switch" data-role="next-start" role="status">
             <p>${html_encode(`Next start: ${sizeLabel(model.nextStart, model.data)}`)}</p>
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Start now</button></div>`;
+            <button type="button" class="ezil-settings-btn" data-action="open">Start now</button></div>`;
     }
     return '';
 }
@@ -627,12 +646,13 @@ function manageHtml (computer) {
         <div class="ezil-settings-row-meta"><div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
             <div class="ezil-settings-row-sub">Name shown in your browser tab and window titles</div></div>
         <div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn" data-action="rename"${isBusy ? ' disabled' : ''}>Rename</button>
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete"${isBusy ? ' disabled' : ''}>${isBusy ? 'Removing…' : 'Delete'}</button></div></div>`;
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete" hidden${isBusy ? ' disabled' : ''}>${isBusy ? 'Removing…' : 'Delete'}</button></div></div>`;
 }
 
 function olderHtml (rows) {
     if ( rows.length === 0 ) return '';
-    return `<section class="ezil-computer-section" data-role="older-computers" aria-labelledby="ezil-older-heading">
+    // D6, the one-computer model: an older computer is kept (data and the delete path stay) but not shown on the web.
+    return `<section class="ezil-computer-section" data-role="older-computers" aria-labelledby="ezil-older-heading" hidden>
         <h4 id="ezil-older-heading">Older computer</h4>
         <p class="ezil-settings-muted">Kept from before you had one computer. It can't be opened from here; delete it when you no longer need it.</p>
         ${rows.map(c => `<div class="ezil-settings-row" data-id="${html_encode(c.id)}" data-role="older-computer">
@@ -654,27 +674,31 @@ export function computerHtml (model, prog = progress, older = []) {
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
-    const used = typeof model.disk?.usedBytes === 'string' && /^\d+$/.test(model.disk.usedBytes) ? Number(model.disk.usedBytes) / 1e9 : null;
+    const used = typeof model.disk?.usedBytes === 'string' && /^\d+$/.test(model.disk.usedBytes) ? Number(model.disk.usedBytes) / 2 ** 30 : null; // the disk's own unit (GiB), like its size
     const stoppable = model.running && ! model.busy;
     return `<section class="ezil-computer" data-role="your-computer" data-id="${html_encode(computer.id)}">
-        <header class="ezil-computer-header"><h3>Your computer</h3>
-            ${model.chip ? `<span class="ezil-settings-pill ezil-computer-chip" data-role="computer-chip" data-state="${model.chip.state}">${html_encode(model.chip.text)}</span>` : ''}
-            ${model.provider ? `<span class="ezil-settings-muted" data-role="computer-provider">${html_encode(model.provider)}</span>` : ''}</header>
-        ${summaryLine ? `<p class="ezil-computer-summary" data-role="computer-summary">${html_encode(summaryLine)}</p>` : ''}
-        <div class="ezil-settings-row-actions" data-role="computer-actions">
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>
-            ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
+        <header class="ezil-computer-header" data-role="computer-header">
+            <div class="ezil-computer-identity"><h3>Your computer</h3>
+                <p class="ezil-computer-meta"><span data-role="computer-name">${html_encode(computer.name)}</span>
+                ${model.provider ? `<span class="ezil-settings-muted" data-role="computer-provider">${html_encode(model.provider)}</span>` : ''}
+                ${model.chip ? `<span class="ezil-settings-pill ezil-computer-chip" data-role="computer-chip" data-state="${model.chip.state}">${html_encode(model.chip.text)}</span>` : ''}</p>
+                ${summaryLine ? `<p class="ezil-computer-summary" data-role="computer-summary">${html_encode(summaryLine)}</p>` : ''}</div>
+            <div class="ezil-settings-row-actions" data-role="computer-actions">
+                <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>
+                ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
+        </header>
         ${statusHtml(model, prog)}
         ${model.switching ? '' : moveHtml(model)}
         ${standingHtml(model)}
         ${notice ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
         ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
+            <p class="ezil-settings-muted">${model.free ? 'Pick a size for your computer. More sizes come with Standard and Premium.' : 'Pick a size for your computer. Your files stay on your disk when you switch.'}</p>
             <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
             <p class="ezil-settings-muted" data-role="plan-line">${html_encode(planLine)} <a href="/os?settings=billing&amp;upgrade=pro" data-action="compare-plans">Compare plans</a></p></section>` : ''}
         ${data ? `<section class="ezil-computer-section" data-role="computer-storage" aria-labelledby="ezil-storage-heading"><h4 id="ezil-storage-heading">Storage</h4>
             <p>${html_encode(Number.isFinite(disk) ? `${disk} GB disk for your projects` : 'Your files are saved with your computer.')}</p>
             ${used !== null && Number.isFinite(disk) ? `<p data-role="storage-used">${html_encode(`${used.toLocaleString(undefined, { maximumFractionDigits: 1 })} of ${disk} GB used`)}</p>` : ''}
-            ${Number.isFinite(disk) ? '<p class="ezil-settings-muted">Stays the same when you switch configuration.</p>' : ''}</section>` : ''}
+            ${Number.isFinite(disk) ? `<p class="ezil-settings-muted">${model.disk?.growsOnSwitch === true ? 'It grows when you switch to a larger size and never shrinks.' : 'It keeps its size when you switch configuration.'}</p>` : ''}</section>` : ''}
         ${manageHtml(computer)}
     </section>${olderHtml(older)}`;
 }
@@ -693,7 +717,7 @@ function webModel () {
     if ( t && IN_FLIGHT.has(t.phase) ) seenInFlight.add(t.transitionId);
     return computerModel({ computer, data: summary, prog,
         pending: pendingSwitch?.computerId === computer.id ? pendingSwitch : null,
-        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true });
+        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true, stopping: stopBusy });
 }
 
 function renderWeb ($list) {
@@ -772,6 +796,52 @@ async function postSwitch (computerId, size, requestId) {
  * The switch. The card and chip change BEFORE the request leaves (the
  * acknowledgement), and a second click while it is pending does nothing.
  */
+/**
+ * D6 confirmation copy (mobbin-compute brief): what restarts, what is kept, how
+ * long. Pure, so the copy is unit-tested; `confirmAction` shows it.
+ */
+export function confirmCopy (kind, { target = null, current = null, data = summary } = {}) {
+    if ( kind === 'switch' ) {
+        const to = sizeInfo(target, data)?.weight ?? 1, from = sizeInfo(current, data)?.weight ?? 1;
+        return { title: `Switch to ${sizeLabel(target, data)}?`, confirmLabel: 'Restart and switch', busyLabel: 'Starting switch…', lines: [
+            'Your computer restarts on the new size. Open apps close; save your work first.',
+            'Your files stay on your disk.',
+            'This usually takes 1-4 minutes.',
+            ...(to !== from ? [`At this size, an hour of use counts as ${to} hour${to === 1 ? '' : 's'} of your monthly time.`] : []),
+        ] };
+    }
+    return { title: 'Stop your computer?', confirmLabel: 'Stop', busyLabel: 'Stopping…', lines: [
+        'Open apps close; save your work first.',
+        'Your files stay on your disk.',
+        'Start it again any time with Open desktop.',
+    ] };
+}
+
+/**
+ * Shows the confirmation as the shared sheet frame (`../sheet-frame.js`
+ * `openConfirmSheet`, reached through the Billing tab module so this file keeps
+ * its import list). `onConfirm` runs with the primary disabled; resolves true
+ * once it has run, false when the user declined. Without the sheet (a stubbed
+ * host) it falls back to the legacy alert.
+ */
+async function confirmAction ($win, kind, args, onConfirm) {
+    const copy = confirmCopy(kind, args);
+    if ( typeof TabBilling.confirmSheet === 'function' ) {
+        const container = $win?.find?.('.window-body')?.get?.(0) ?? $win?.get?.(0) ?? document.body;
+        return TabBilling.confirmSheet({ container, sheet: `confirm-${kind}`, title: copy.title, lines: copy.lines,
+            confirmLabel: copy.confirmLabel, busyLabel: copy.busyLabel, onConfirm });
+    }
+    if ( ! await confirmAlert(copy.title, copy.lines.join(' '), copy.confirmLabel) ) return false;
+    await onConfirm?.();
+    return true;
+}
+
+/**
+ * The switch. The card and chip change BEFORE the request leaves (the
+ * acknowledgement), and a second click while it is pending does nothing. On a
+ * running computer the request leaves from the confirmation's primary, which
+ * stays disabled until the server answers.
+ */
 export async function requestSwitch ($win, target, { confirm = true } = {}) {
     const computer = mainComputer();
     if ( ! computer || pendingSwitch || inFlight(progress) || stopBusy ) return;
@@ -779,50 +849,54 @@ export async function requestSwitch ($win, target, { confirm = true } = {}) {
     // Back to <previous> after a failure targets the current size on purpose: it reverts the choice.
     if ( ! model || target === model.current && ! model.nextStart && ! model.failed ) return;
     const restarts = model.running || progress?.lifecycleState === 'RUNNING';
-    if ( confirm && restarts ) {
-        const ok = await confirmAlert(`Switch to ${sizeLabel(target)}?`,
-            'Your computer restarts on a bigger machine. Your files and settings stay; running apps restart. Usually about a minute, longer if a machine has to be prepared.'
-                .replace('a bigger machine', (sizeInfo(target)?.vcpu ?? 0) < (sizeInfo(model.current)?.vcpu ?? 0) ? 'a smaller machine' : 'a bigger machine'),
-            'Switch now');
-        if ( ! ok || pendingSwitch || inFlight(progress) ) return;
-    }
-    pendingSwitch = { computerId: computer.id, current: model.current, target };
-    notice = null;
-    unavailable.delete(target);
-    render($win);
-    const requestId = switchRequestId(computer.id, target);
-    const answer = await postSwitch(computer.id, target, requestId);
-    pendingSwitch = null;
-    if ( answer.ok ) {
-        if ( model.failed ) dismissed.add(model.failed.transitionId);
-        if ( answer.effective === 'next_start' ) {
-            clearSwitchRequestId(computer.id, target);
-            if ( summary?.computer ) summary = { ...summary, computer: { ...summary.computer, size: answer.target } };
+    const run = async () => {
+        if ( pendingSwitch || inFlight(progress) || stopBusy ) return;
+        pendingSwitch = { computerId: computer.id, current: model.current, target };
+        notice = null;
+        unavailable.delete(target);
+        render($win);
+        const requestId = switchRequestId(computer.id, target);
+        const answer = await postSwitch(computer.id, target, requestId);
+        pendingSwitch = null;
+        if ( answer.ok ) {
+            if ( model.failed ) dismissed.add(model.failed.transitionId);
+            if ( answer.effective === 'next_start' ) {
+                clearSwitchRequestId(computer.id, target);
+                if ( summary?.computer ) summary = { ...summary, computer: { ...summary.computer, size: answer.target } };
+            } else {
+                seenInFlight.add(answer.transitionId);
+                // Open desktop/Code windows follow the transition and re-open on the new size (L4b).
+                window.dispatchEvent(new CustomEvent(TRANSITION_EVENT, { detail: { computerId: computer.id, transitionId: answer.transitionId } }));
+                progress = { ...(progress ?? {}), computerId: computer.id,
+                    transition: { transitionId: answer.transitionId, kind: 'switch', current: answer.current, target: answer.target,
+                        phase: transitionOf(progress)?.transitionId === answer.transitionId ? transitionOf(progress).phase : 'requested',
+                        reason: null, revertAvailable: false } };
+            }
         } else {
-            seenInFlight.add(answer.transitionId);
-            // Open desktop/Code windows follow the transition and re-open on the new size (L4b).
-            window.dispatchEvent(new CustomEvent(TRANSITION_EVENT, { detail: { computerId: computer.id, transitionId: answer.transitionId } }));
-            progress = { ...(progress ?? {}), computerId: computer.id,
-                transition: { transitionId: answer.transitionId, kind: 'switch', current: answer.current, target: answer.target,
-                    phase: transitionOf(progress)?.transitionId === answer.transitionId ? transitionOf(progress).phase : 'requested',
-                    reason: null, revertAvailable: false } };
+            if ( answer.reason !== 'switch_in_progress' ) clearSwitchRequestId(computer.id, target);
+            if ( answer.reason === 'capacity_unavailable' ) unavailable.add(target);
+            notice = { text: refusalCopy(answer.reason, target, summary, model.current), tone: 'error' };
         }
-    } else {
-        if ( answer.reason !== 'switch_in_progress' ) clearSwitchRequestId(computer.id, target);
-        if ( answer.reason === 'capacity_unavailable' ) unavailable.add(target);
-        notice = { text: refusalCopy(answer.reason, target, summary, model.current), tone: 'error' };
-    }
-    render($win);
-    void refreshProgress($win);
+        render($win);
+        void refreshProgress($win);
+    };
+    if ( confirm && restarts ) await confirmAction($win, 'switch', { target, current: model.current, data: summary }, run);
+    else await run();
 }
 
 async function handleStop ($win) {
     const computer = mainComputer();
     if ( ! computer || stopBusy || pendingSwitch || inFlight(progress) ) return;
-    if ( ! await confirmAlert('Stop your computer?', 'Open apps close and your files stay. Start it again with Open desktop.', 'Stop') ) return;
-    stopBusy = true;
-    notice = null;
-    render($win);
+    // The chip flips to Stopping… as the user confirms; the stop itself (≈ 40 s) runs after the sheet closes.
+    let confirmed = false;
+    await confirmAction($win, 'stop', { data: summary }, () => {
+        if ( stopBusy || pendingSwitch || inFlight(progress) ) return;
+        confirmed = true;
+        stopBusy = true;
+        notice = null;
+        render($win);
+    });
+    if ( ! confirmed ) return;
     try {
         // Same guarantee as Delete: every window on this computer closes first.
         await closeSandboxWindows(computer.id);
