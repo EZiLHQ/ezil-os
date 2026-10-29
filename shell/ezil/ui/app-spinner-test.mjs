@@ -84,6 +84,8 @@ const NOISE = /\d+%|min left|Estimated|✓|Next session|Last recorded update|App
         && ! barEl(spinner).hasAttribute('aria-valuenow'));
     push('unobserved progress: the title stays "Opening Browser…" and there is no second line', titleOf(spinner) === 'Opening Browser…' && statusOf(spinner).hidden);
     push('unobserved progress: no Retry mid-boot', $(spinner, '.ezil-boot-actions').hidden === true);
+    push('unobserved progress: no machine vocabulary in the surface text, not even in a hidden control',
+        ! /computer|machine/i.test(spinner.el.textContent), spinner.el.textContent.replace(/\s+/g, ' '));
     push('unobserved progress: data-kind reflects the state', spinner.el.getAttribute('data-kind') === 'progress');
     push('unobserved progress: meta hidden in the first 3 s', metaOf(spinner).hidden === true);
     now = 5_000; spinner.render({ kind: 'progress' });

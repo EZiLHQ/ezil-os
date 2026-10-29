@@ -140,7 +140,6 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         const img = document.createElement('img'); img.alt = ''; img.src = icon; el_icon.appendChild(img);
     } else el_icon.textContent = (name || 'E').slice(0, 1).toUpperCase();
     el_retry.textContent = OPEN_COPY.retry;
-    el_view.textContent = OPEN_COPY.viewStatus;
     el_feedback.textContent = OPENING_COPY.feedback;
     el('.ezil-opening-details summary').textContent = OPEN_COPY.details;
 
@@ -207,6 +206,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         }
         el_retry.hidden = !m.retry;
         el_view.hidden = !m.view;
+        // Its words exist only while it is offered: a hidden control adds no copy to the surface.
+        el_view.textContent = m.view ? OPEN_COPY.viewStatus : '';
         el_feedback.hidden = !(m.feedback && feedbackAvailable());
         el_actions.hidden = el_retry.hidden && el_view.hidden && el_feedback.hidden;
         el_details_text.textContent = m.details ?? '';
