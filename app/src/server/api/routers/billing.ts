@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
 import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
@@ -16,7 +17,7 @@ import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/b
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3 } from '@/server/billing/v3/summary';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
-import type { SelectMachineOutputV3 } from '@/server/billing/v3/contract';
+import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
     CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
     type SizeCode,
@@ -100,6 +101,40 @@ async function aiReceipts(deps: BillingDeps, userId: string) {
 }
 
 type PlacementProvider = 'aws-ec2' | 'cloudflare' | null;
+type AiMemberLookup = (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<string | null>;
+type AiEnrollmentState = BillingSummaryV3['ai']['enrollment'];
+
+/** EZiL ID sign-in page that returns to the desktop; the `needs_ezil_id` CTA. */
+export const EZIL_ID_SIGN_IN_URL = '/auth/auth0/login?returnUrl=/os';
+
+/**
+ * Round 5 D1: whether this account can receive AI credits, from the Works member row and the stored
+ * EZiL ID subject (never the Gateway): a member is `enrolled`; a linked subject without a member is
+ * `activating` (the outbox drain enrolls it); otherwise `needs_ezil_id`. A database without the Works
+ * member view (enrollment does not apply there) or a lookup failure keeps the `enrolled` default
+ * (no false CTA, top-up unchanged); only the failure logs a fixed warning.
+ */
+async function aiEnrollmentOf(lookup: AiMemberLookup, db: { execute(query: SQL): Promise<unknown> },
+    user: { id: string; app_metadata?: Record<string, unknown> | null }): Promise<AiEnrollmentState> {
+    try {
+        if (await lookup(db, user.id)) return 'enrolled';
+    } catch (error) {
+        if (!missingAiAccountView(error)) console.warn('[billing.ai] enrollment state unavailable');
+        return 'enrolled';
+    }
+    const sub = user.app_metadata?.auth0_sub;
+    return typeof sub === 'string' && sub.length > 0 ? 'activating' : 'needs_ezil_id';
+}
+
+/** The EZiL ID link when EZiL ID sign-in is configured (lazy: auth0.ts is server-only). */
+async function ezilIdSignInUrl(): Promise<string | null> {
+    try {
+        const { auth0Enabled } = await import('@/server/auth/auth0');
+        return auth0Enabled() ? EZIL_ID_SIGN_IN_URL : null;
+    } catch {
+        return null;
+    }
+}
 
 /**
  * Round 4: where the user's files are, for the computer's standing. Any aws-ec2 placement among the user's
@@ -132,9 +167,13 @@ async function telemetryOperator(email: string | null | undefined): Promise<bool
 
 export function createBillingRouter(getDeps: () => BillingDeps,
     options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean>;
-        placementProvider?: (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<PlacementProvider> } = {}) {
+        placementProvider?: (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<PlacementProvider>;
+        /** Round 5 D1: the Works AI member public id (default: `lookupAiAccount` on ctx.db). */
+        aiMember?: AiMemberLookup } = {}) {
     const isOperator = options.isOperator ?? telemetryOperator;
     const placementOf = options.placementProvider ?? userPlacementProvider;
+    const aiMember: AiMemberLookup = options.aiMember
+        ?? ((db, userId) => lookupAiAccount(db as Parameters<typeof lookupAiAccount>[0], userId, { strict: true }));
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
             const deps = getDeps();
@@ -171,7 +210,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placementProvider] = await Promise.all([
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placementProvider,
+                enrollmentState, ezilIdUrl] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -182,6 +222,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.overageInvoicesFor(ctx.user.id),
                 readStripePacks(deps.stripe),
                 placementOf(ctx.db, ctx.user.id),
+                aiEnrollmentOf(aiMember, ctx.db, ctx.user),
+                ezilIdSignInUrl(),
             ]);
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
@@ -200,6 +242,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
                 ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider,
+                enrollment: { state: enrollmentState, ezilIdUrl },
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
@@ -272,6 +315,10 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const stripe = configuredStripe(deps);
             const publishableKey = deps.config.stripePublishableKey;
             if (!publishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+            // Round 5 D1: credits bought before enrollment would only wait; same rule as summary actions.topup.
+            if (await aiEnrollmentOf(aiMember, ctx.db, ctx.user) !== 'enrolled') {
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+            }
             const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
             if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
 

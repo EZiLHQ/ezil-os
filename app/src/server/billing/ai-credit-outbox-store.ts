@@ -19,14 +19,19 @@ export function missingAiAccountView(error: unknown): boolean {
     return false;
 }
 
-export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: string): Promise<string | null> {
+/**
+ * The Works AI member public id. A missing schema/view reads as "no account" for delivery; with
+ * `strict` it is rethrown so callers that must not confuse "no Works view here" with "not a member"
+ * (round 5 D1 enrollment state) can tell them apart.
+ */
+export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: string, options: { strict?: boolean } = {}): Promise<string | null> {
     try {
         const rows = await db.execute<{ public_id: string | null }>(
             sql`select public_id from ezil_works.ai_members where auth_user_id = ${userId}::uuid limit 1`,
         );
         return rows[0]?.public_id || null;
     } catch (error) {
-        if (missingAiAccountView(error)) return null;
+        if (!options.strict && missingAiAccountView(error)) return null;
         throw error;
     }
 }

@@ -297,3 +297,41 @@ describe('round 5 contract pin (W0): enrollment, storage and heal fields default
         }
     });
 });
+
+describe('round 5 D1: AI enrollment, waiting credits and the EZiL ID action', () => {
+    const link = '/auth/auth0/login?returnUrl=/os';
+    const future = '2027-10-19T12:00:00.000Z', past = '2026-10-19T11:59:59.000Z';
+    const receipts = [
+        { entitlementId: 'ezil-os:v1:free-once:u', credits: 100, expiresAt: future, deliveredAt: null },
+        { entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-10-10T00:00:00.000Z', credits: 200, expiresAt: future, deliveredAt: null },
+        { entitlementId: 'ezil-os:v1:topup:p:pi:grant', credits: 1000, expiresAt: future, deliveredAt: '2026-10-11T00:00:00.000Z' },
+        { entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-09-10T00:00:00.000Z', credits: 200, expiresAt: past, deliveredAt: null },
+    ];
+    const ai = { receipts, gatewayGrants: null, balanceMicro: null };
+    it.each([undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const)('%s needs_ezil_id: CTA link, waiting credits, no top-up', sku => {
+        const summary = buildSummaryV3({ ...input(sku), ai, enrollment: { state: 'needs_ezil_id', ezilIdUrl: link } });
+        expect(summary.ai.enrollment).toBe('needs_ezil_id');
+        expect(summary.ai.waiting).toEqual({ credits: 300 });
+        expect(summary.actions).toMatchObject({ topup: false, ezilId: link });
+    });
+    it('activating: waiting credits, no top-up, no CTA', () => {
+        const summary = buildSummaryV3({ ...input('standard_monthly_v3'), ai, enrollment: { state: 'activating', ezilIdUrl: link } });
+        expect(summary.ai).toMatchObject({ enrollment: 'activating', waiting: { credits: 300 } });
+        expect(summary.actions).toMatchObject({ topup: false, ezilId: null });
+    });
+    it('enrolled: top-up stays, no CTA, nothing parked', () => {
+        const summary = buildSummaryV3({ ...input('standard_monthly_v3'), ai, enrollment: { state: 'enrolled', ezilIdUrl: link } });
+        expect(summary.ai).toMatchObject({ enrollment: 'enrolled', waiting: null });
+        expect(summary.actions).toMatchObject({ topup: true, ezilId: null });
+    });
+    it('needs_ezil_id without EZiL ID sign-in configured has no link; nothing undelivered means waiting null', () => {
+        const summary = buildSummaryV3({ ...input(), ai: { ...ai, receipts: receipts.slice(2) }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: null } });
+        expect(summary.ai.waiting).toBeNull();
+        expect(summary.actions).toMatchObject({ topup: false, ezilId: null });
+        expect(buildSummaryV3({ ...input(), ai: { ...ai, receipts: null }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: null } }).ai.waiting).toBeNull();
+    });
+    it('checkout off keeps top-up off in every state', () => {
+        const args = input(); args.config.checkoutEnabled = false;
+        expect(buildSummaryV3({ ...args, enrollment: { state: 'enrolled', ezilIdUrl: null } }).actions.topup).toBe(false);
+    });
+});
