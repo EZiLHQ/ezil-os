@@ -146,7 +146,7 @@ is present even when the diagnostics consent is off. Shown on `/admin/feedback`.
 Retention (telemetry-maintenance cron): attachments 30 d, reports 180 d, access log 365 d.
 The SQL is also committed as `app/drizzle/0011_feedback.sql` (byte-identical to the constants),
 registered in `.github/production-migrations.json` as a `snapshot` source for the os-staging
-schema tool only (see `docs/feedback-migration.md`); it is refused for `aws-production`.
+schema tool only (see `docs/feedback-migration.md`); on `aws-production` it is applied, never baselined.
 
 ### 4a. Browser-local state (round 3; `shell/ezil/ui/feedback/feedback.js`)
 Two `localStorage` keys per account, keyed by the opaque account id from
