@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Fetch the staging JSON using the EC2 role; emit key names only."""
+"""Fetch the environment's JSON using the EC2 role; emit key names only.
+
+Usage: render-env.py [staging|production]; no argument means staging.
+"""
 import json
 import os
 from pathlib import Path
@@ -7,8 +10,22 @@ import re
 import subprocess
 import sys
 import tempfile
+from urllib.parse import parse_qs, urlsplit
 
 SECRET_ID = "ezil-os/billing-staging/app"
+# Environment -> (secret id, root-only env directory). Staging is the original pair.
+ENVIRONMENTS = {
+    "staging": (SECRET_ID, Path("/etc/ezil-os-staging")),
+    "production": ("ezil-os/production/app", Path("/etc/ezil-os-production")),
+}
+# Production is pinned to the self-hosted API and the private Postgres listener
+# (no proxy in production); staging must never carry either.
+PRODUCTION_API_URL = "https://db.ezil.work"
+PRODUCTION_DB_HOST = "10.63.20.252"
+PRODUCTION_MARKERS = ("db.ezil.work", PRODUCTION_DB_HOST)
+# Preview API, preview DB proxy and the staging hostname.
+STAGING_MARKERS = ("13-203-99-168.sslip.io", "10.61.20.35", "os-staging.ezil.work")
+LIVE_STRIPE = ("pk_live_", "sk_live_", "rk_live_")
 REQUIRED = frozenset("""
 NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY
 SUPABASE_SERVICE_ROLE_KEY SUPABASE_DATABASE_URL AUTH0_CLIENT_ID AUTH0_SECRET_ID
@@ -39,7 +56,7 @@ class RenderError(Exception):
     pass
 
 
-def validate(values):
+def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
     if any(key not in REQUIRED | OPTIONAL and not REGIONAL.fullmatch(key) for key in values):
@@ -53,10 +70,36 @@ def validate(values):
             raise RenderError("Newline or NUL refused")
     if len(values["CRON_SECRET"]) < 32:
         raise RenderError("CRON_SECRET requires at least 32 characters")
+    if environment == "production":
+        validate_production(values)
+    elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
+        raise RenderError("Staging refuses production API or database values")
+    elif any(value.startswith(LIVE_STRIPE) for value in values.values()):
+        raise RenderError("Staging refuses Stripe live-mode keys")
     return values
 
 
-def fetch_secret():
+def validate_production(values):
+    """Pin production to its own API, private database and live Stripe; refuse staging values."""
+    if any(marker in value for value in values.values() for marker in STAGING_MARKERS):
+        raise RenderError("Production refuses staging or preview values")
+    if values["NEXT_PUBLIC_SUPABASE_URL"] != PRODUCTION_API_URL:
+        raise RenderError("Production NEXT_PUBLIC_SUPABASE_URL must be https://db.ezil.work")
+    try:
+        url = urlsplit(values["SUPABASE_DATABASE_URL"])
+        pinned = (url.scheme in ("postgres", "postgresql") and url.hostname == PRODUCTION_DB_HOST
+                  and url.port == 5432 and url.path not in ("", "/") and not url.fragment
+                  and parse_qs(url.query, keep_blank_values=True) == {"sslmode": ["require"]})
+    except ValueError:
+        pinned = False
+    if not pinned:
+        raise RenderError("Production SUPABASE_DATABASE_URL must be postgres://ROLE:PASSWORD@10.63.20.252:5432/DB?sslmode=require")
+    if not values["STRIPE_PUBLISHABLE_KEY"].startswith("pk_live_") \
+            or not values["STRIPE_SECRET"].startswith(("sk_live_", "rk_live_")):
+        raise RenderError("Production requires Stripe live-mode keys")
+
+
+def fetch_secret(secret_id=SECRET_ID):
     # Deliberately exclude profiles, static credentials and container providers.
     # Empty config selectors prevent the CLI from reading credential files.
     environment = {
@@ -67,7 +110,7 @@ def fetch_secret():
     }
     result = subprocess.run(
         ["aws", "--region", "ap-south-1", "--no-cli-pager", "secretsmanager",
-         "get-secret-value", "--secret-id", SECRET_ID, "--output", "json"],
+         "get-secret-value", "--secret-id", secret_id, "--output", "json"],
         env=environment, capture_output=True, text=True, check=False, timeout=60,
     )
     if result.returncode:
@@ -90,8 +133,8 @@ def atomic_write(path, content):
             os.unlink(temporary)
 
 
-def render(values, directory=Path("/etc/ezil-os-staging")):
-    values = validate(values)  # Validate everything before changing either file.
+def render(values, directory=Path("/etc/ezil-os-staging"), environment="staging"):
+    values = validate(values, environment)  # Validate everything before changing either file.
     if os.geteuid() != 0:
         raise RenderError("Run as root on the staging host")
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -108,11 +151,15 @@ def render(values, directory=Path("/etc/ezil-os-staging")):
     print("\n".join(sorted(values)))
 
 
-def main():
+def main(argv=()):
     try:
+        if len(argv) > 1 or (argv and argv[0] not in ENVIRONMENTS):
+            raise RenderError("Usage: render-env.py [staging|production]")
+        environment = argv[0] if argv else "staging"
+        secret_id, directory = ENVIRONMENTS[environment]
         if os.geteuid() != 0:
             raise RenderError("Run as root on the staging host")
-        render(fetch_secret())
+        render(fetch_secret(secret_id), directory, environment)
     except Exception:
         # Never echo AWS stderr, JSON parser context, values, or tracebacks.
         print("Environment rendering failed; check JSON keys, values, IAM and connectivity.", file=sys.stderr)
@@ -121,4 +168,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
