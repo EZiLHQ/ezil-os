@@ -1,12 +1,17 @@
 /** Round 3: switch/restart transitions and the server-stamped opening (contract v3 OpeningProgressV3). */
-import { describe, expect, it } from 'vitest';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OPENING_MILESTONES_V3 } from '@/server/billing/v3/contract';
 import { SWITCH_DEMAND_WINDOW_MS } from './ready-pool';
+import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { Placement } from './placement';
 import {
-    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, resolveTransition, transitionView,
+    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, readComputerProgress, reconcileTransition, resolveTransition, transitionView,
     TRANSITION_MAX_AGE_MS, TRANSITION_STOP_GRACE_MS, TRANSITION_STOP_TIMEOUT_MS, TRANSITION_WAKE_TIMEOUT_MS, type ComputerTransition, type OpeningRecord,
 } from './progress';
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('No live billing DB in tests'); } }));
 
 const C = 'abcdefab-abcd-4abc-8abc-abcdefabcdef';
 const U = '11111111-1111-4111-8111-111111111111';
@@ -61,6 +66,65 @@ describe('resolveTransition: the phase is derived from the placement, never trus
     });
     it('the pool demand window equals the transition budget', () => {
         expect(SWITCH_DEMAND_WINDOW_MS).toBe(TRANSITION_MAX_AGE_MS);
+    });
+});
+
+describe('reconcileTransition: what a stored transition means now against the placement', () => {
+    // The founder's 2026-10-29 case: a std-2 → cmp-4 switch failed in its stop phase at epoch 7 (wake never recorded).
+    const stopFailed = (over: Partial<ComputerTransition> = {}) => transition({ target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed',
+        endedAt: at(200).toISOString(), ...over });
+    const woke = { wakingAt: at(60).toISOString() };
+    it('a real failure at the switch\'s own epoch stays failed and current (old type RUNNING, or STOPPED after a heal)', () => {
+        const stored = { phase: 'failed', reason: 'stop_placement_unconfirmed', current: true };
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 7, instanceType: 'm6i.large' }), at(900))).toEqual(stored);
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 7, state: 'STOPPED' }), at(900))).toEqual(stored);
+        expect(reconcileTransition(stopFailed(), null, at(900))).toEqual(stored);
+        expect(reconcileTransition(stopFailed(), placement({ provider: 'cloudflare', leaseEpoch: 8 }), at(900))).toEqual(stored);
+    });
+    it('recovered: the next epoch RUNNING on the target is done, current, and offers no revert', () => {
+        const r = reconcileTransition(stopFailed(), placement({ leaseEpoch: 8, generation: 4, instanceType: 'm6i.xlarge' }), at(1800));
+        expect(r).toEqual({ phase: 'done', reason: null, current: true });
+        expect(transitionView(stopFailed(), r)).toMatchObject({ phase: 'done', reason: null, revertAvailable: false });
+        expect(reconcileTransition(stopFailed(woke), placement({ leaseEpoch: 8, instanceType: 'm6i.xlarge' }), at(1800))).toEqual({ phase: 'done', reason: null, current: true });
+    });
+    it('superseded: with no wake recorded, the next epoch is the user\'s own opening (any type, any state) and the failure is not current', () => {
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 8, instanceType: 'm6i.large' }), at(1800)).current).toBe(false);
+        for (const state of ['LEASED', 'STARTING', 'UNCONFIRMED', 'STOPPED'] as const)
+            expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 8, state, instanceType: 'm6i.xlarge' }), at(1800)).current, state).toBe(false);
+    });
+    it('its own wake landed on another type: failed size_not_applied, current', () => {
+        expect(reconcileTransition(stopFailed({ ...woke, reason: 'wake_timeout' }), placement({ leaseEpoch: 8, instanceType: 'm6i.large' }), at(1800)))
+            .toEqual({ phase: 'failed', reason: 'size_not_applied', current: true });
+    });
+    it('its own wake not running (stopped again, unconfirmed): the stored failure stays current', () => {
+        const t = stopFailed({ ...woke, reason: 'wake_timeout' });
+        expect(reconcileTransition(t, placement({ leaseEpoch: 8, state: 'STOPPED', instanceType: 'm6i.xlarge' }), at(1800)))
+            .toEqual({ phase: 'failed', reason: 'wake_timeout', current: true });
+        expect(reconcileTransition(t, placement({ leaseEpoch: 8, state: 'UNCONFIRMED' }), at(1800))).toEqual({ phase: 'failed', reason: 'wake_timeout', current: true });
+    });
+    it('a later epoch beyond the switch makes any failure history', () => {
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(1800)).current).toBe(false);
+        expect(reconcileTransition(stopFailed(woke), placement({ leaseEpoch: 9, instanceType: 'm6i.xlarge' }), at(1800)).current).toBe(false);
+        // An unsettled in-flight record (a dead driver never wrote its end) is resolveTransition, current; System drops it past N+1.
+        const dead = transition({ phase: 'waking', wakingAt: at(30).toISOString() });
+        expect(reconcileTransition(dead, placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(5000))).toEqual({ phase: 'failed', reason: 'size_not_applied', current: true });
+    });
+    it('in flight: exactly resolveTransition, current; stored done: as stored', () => {
+        const cases: [ComputerTransition, Placement | null, Date][] = [
+            [transition(), placement({ state: 'DRAINING' }), at(100)],
+            [transition(), placement({ state: 'STOPPED' }), at(30)],
+            [transition(), placement(), at(1000)],
+            [transition({ phase: 'waking', wakingAt: at(30).toISOString() }), placement({ state: 'LEASED', leaseEpoch: 8 }), at(600)],
+            [transition(), placement({ leaseEpoch: 8, instanceType: 'm6i.2xlarge' }), at(60)],
+            [transition(), placement({ leaseEpoch: 8, instanceType: 'm6i.xlarge' }), at(60)],
+            [transition(), null, at(1)],
+            [transition(), placement({ provider: 'cloudflare', leaseEpoch: 9 }), at(1)],
+            [transition({ phase: 'waking', wakingAt: at(30).toISOString() }), placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(5000)],
+        ];
+        for (const [t, p, now] of cases) expect(reconcileTransition(t, p, now)).toEqual({ ...resolveTransition(t, p, now), current: true });
+        const done = transition({ phase: 'done', endedAt: at(200).toISOString() });
+        expect(reconcileTransition(done, placement({ leaseEpoch: 8, instanceType: 'm6i.2xlarge' }), at(300))).toEqual({ phase: 'done', reason: null, current: true });
+        expect(reconcileTransition(done, placement({ leaseEpoch: 12 }), at(300))).toEqual({ phase: 'done', reason: null, current: true });
     });
 });
 
@@ -174,3 +238,66 @@ describe('describeProgress: OpeningProgressV3 fields, capacity wait, expected se
     });
 });
 function nonceIn(s: number) { return new Date(T0.getTime() + s * 1000); }
+
+describe('readComputerProgress: the progress DTO carries the reconciled transition', () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+    const dialect = new PgDialect();
+    const stopFailed = transition({ target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed', endedAt: at(200).toISOString() });
+    // Opening writes are recorded: describeProgress hides the opening while RUNNING, so only the write shows its path.
+    let openingWrites: OpeningRecord[] = [];
+    async function progressOf(row: { lease_epoch: number; instance_type: string; state?: string }, stored: ComputerTransition,
+        extra: { opening?: OpeningRecord; poolLeasedAt?: Date } = {}) {
+        const billing = await import('@/server/billing/v2/compute-access');
+        vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => null });
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: C, owner_user_id: U, region: 'ap-south-1', generation: 4, state: 'RUNNING', ...row })] });
+        openingWrites = [];
+        const wrapped = { execute: async (query: SQL) => {
+            const { sql: text, params } = dialect.sqlToQuery(query);
+            if (text.includes('/* transition:read */')) return { rows: [{ transition: stored, opening: extra.opening ?? null }] };
+            if (text.includes('/* transition:opening */')) {
+                // The new record is the first JSON bind (SET); a later one is the compare-and-swap's previous record.
+                const next = params.find(v => typeof v === 'string' && v.includes('"path"'));
+                if (typeof next === 'string') openingWrites.push(JSON.parse(next) as OpeningRecord);
+                return { rows: [{ id: C }] };
+            }
+            if (text.includes('/* pool:opening */')) return { rows: extra.poolLeasedAt
+                ? [{ leased_at: extra.poolLeasedAt, claim_published_at: extra.poolLeasedAt, session_ready_at: extra.poolLeasedAt }] : [] };
+            return db.execute(query);
+        } };
+        return readComputerProgress(wrapped, { computerId: C, userId: U }, env, at(1800));
+    }
+    it('recovered: done with no revert; superseded: none; a real failure: failed with its revert', async () => {
+        expect((await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed))?.transition)
+            .toMatchObject({ phase: 'done', reason: null, revertAvailable: false, current: 'std-2', target: 'cmp-4' });
+        expect((await progressOf({ lease_epoch: 8, instance_type: 'm6i.large' }, stopFailed))?.transition).toBeNull();
+        expect((await progressOf({ lease_epoch: 7, instance_type: 'm6i.large' }, stopFailed))?.transition)
+            .toMatchObject({ phase: 'failed', reason: 'stop_placement_unconfirmed', revertAvailable: true });
+    });
+    it('an unsettled record that resolves failed is shown as before, even past the next epoch', async () => {
+        const dead = transition({ phase: 'waking', wakingAt: at(30).toISOString() });
+        expect((await progressOf({ lease_epoch: 9, instance_type: 'm6i.large' }, dead))?.transition)
+            .toMatchObject({ phase: 'failed', reason: 'size_not_applied', revertAvailable: true });
+    });
+    it('a recovered failure never relabels the RUNNING computer as a switch opening', async () => {
+        expect(await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed)).toMatchObject({ stage: 'running', operation: 'none', path: null, openingStartedAt: null });
+        // No opening was stored: none is created (a reconciled `done` would stamp a switch opening from the 09:36 request).
+        expect(openingWrites).toEqual([]);
+    });
+    it('a stored warm opening of the recovered epoch keeps its path and start', async () => {
+        const leasedAt = at(1700);
+        const warm: OpeningRecord = { v: 1, generation: 4, leaseEpoch: 8, startedAt: leasedAt.toISOString(), path: 'warm',
+            milestones: Object.fromEntries(OPENING_MILESTONES_V3.map(key => [key, leasedAt.toISOString()])) };
+        const stale: OpeningRecord = { ...warm, milestones: { requested: leasedAt.toISOString() } };
+        expect(await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed, { opening: stale, poolLeasedAt: leasedAt }))
+            .toMatchObject({ stage: 'running', transition: { phase: 'done' } });
+        expect(openingWrites.length).toBe(1);
+        expect(openingWrites[0]).toMatchObject({ leaseEpoch: 8, path: 'warm', startedAt: leasedAt.toISOString() });
+    });
+    it('a complete stored warm opening of the recovered epoch is not rewritten', async () => {
+        const leasedAt = at(1700);
+        const warm: OpeningRecord = { v: 1, generation: 4, leaseEpoch: 8, startedAt: leasedAt.toISOString(), path: 'warm',
+            milestones: Object.fromEntries(OPENING_MILESTONES_V3.map(key => [key, leasedAt.toISOString()])) };
+        await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed, { opening: warm, poolLeasedAt: leasedAt });
+        expect(openingWrites).toEqual([]);
+    });
+});
