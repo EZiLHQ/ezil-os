@@ -145,7 +145,7 @@ refused. The founder/lead order (stacks, DB access, secret, DNS, cutover) is in
 | Caddy site | `os-staging.ezil.work` | `os-prod.ezil.work, os.ezil.work` |
 | Timers | all six `ezil-os-staging-*` | `ezil-os-production-*`: telemetry-maintenance, sandbox-reap, billing-session-sweep; the AWS three only when the secret has `EZIL_AWS_COMPUTERS_ENABLED` |
 | Cron target | `https://os-staging.ezil.work/api/cron/*` | `https://os-prod.ezil.work/api/cron/*` (always) |
-| Smoke | `https://os-staging.ezil.work/api/health` | `https://os-prod.ezil.work/api/health`; `smoke public` probes `https://os.ezil.work` after cutover |
+| Smoke | `https://os-staging.ezil.work/api/health`, HTTP 200 | `https://os-prod.ezil.work/api/health` (`smoke public`: `https://os.ezil.work`, after cutover); HTTP 200 from the instance's public IP serving the container's SHA. Run without an HTTP(S) proxy |
 
 `render-runtime.py` derives the production `compose.yaml`, `Caddyfile` and cron
 units from the checked-in staging files at build time; a rename that no longer
@@ -177,9 +177,10 @@ The production secret `ezil-os/production/app` uses the same key names as above.
 - `SUPABASE_DATABASE_URL` as
   `postgres://ROLE:PASSWORD@10.63.20.252:5432/postgres?sslmode=require`: the
   private Postgres listener (no HAProxy in production; `db-proxy.sh` stays
-  staging-only), a dedicated role rather than `postgres`, and no other query
-  parameters. `sslmode=require` encrypts but does not authenticate the
-  self-signed server certificate;
+  staging-only) and no other query parameters (postgres.js would send them as
+  startup parameters). `sslmode=require` encrypts but does not authenticate the
+  self-signed server certificate. Which ROLE to use is an open DB-owner decision
+  (see `INFRASTRUCTURE.md`);
 - Stripe live keys: `STRIPE_PUBLISHABLE_KEY` `pk_live_`, `STRIPE_SECRET`
   `sk_live_` or `rk_live_`, plus the live `STRIPE_WEBHOOK_SECRET`;
 - new `CRON_SECRET` (at least 32 characters) and `BILLING_USAGE_HMAC_SECRET`;

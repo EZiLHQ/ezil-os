@@ -51,12 +51,14 @@ guard_production_instance() {
     local pinned
     [[ $instance_id =~ ^i-[0-9a-f]{8,17}$ ]] || fail 'Set OS_PRODUCTION_INSTANCE_ID.'
     [[ $instance_id != i-09012068d96166828 ]] || fail 'Refusing the production database host.'
-    # Pin: exact Name, environment tag and the prod VPC (tab-separated text output).
+    # Pin: exact Name, environment tag and the prod VPC (tab-separated text output);
+    # the public IP is kept so smoke can prove which host answered.
     pinned=$(aws_call ec2 describe-instances --instance-ids "$instance_id" \
-        --query 'Reservations[0].Instances[0].[VpcId, Tags[?Key==`Name`].Value | [0], Tags[?Key==`ezil:env`].Value | [0]]' \
+        --query 'Reservations[0].Instances[0].[VpcId, Tags[?Key==`Name`].Value | [0], Tags[?Key==`ezil:env`].Value | [0], PublicIpAddress]' \
         --output text)
-    [[ $pinned == $'vpc-040bdd6e09e35425f\tezil-os-prod-host\tproduction' ]] \
+    [[ ${pinned%$'\t'*} == $'vpc-040bdd6e09e35425f\tezil-os-prod-host\tproduction' ]] \
         || fail 'Refusing instance: production needs Name ezil-os-prod-host, tag ezil:env=production and VPC vpc-040bdd6e09e35425f.'
+    public_ip=${pinned##*$'\t'}
 }
 if [[ -n $instance_id || $command_name == install || $command_name == smoke ]]; then
     guard_instance
@@ -176,10 +178,14 @@ PY
         ssm_run "$temporary/host.sh";;
     smoke)
         result=0
+        write_out='%{http_code}'
+        if [[ $environment == production ]]; then
+            write_out='%{http_code} %{remote_ip}'  # Run without an HTTP(S) proxy.
+        fi
         status=$(curl -fsS --connect-timeout 10 --max-time 50 \
-            --output "$temporary/health" --write-out '%{http_code}' \
+            --output "$temporary/health" --write-out "$write_out" \
             "https://$smoke_host/api/health") || result=1
-        [[ $status == 200 ]] || result=1
+        [[ ${status%% *} == 200 ]] || result=1
         printf 'HTTPS /api/health: %s\n' "$status"
         # Report the running image's SHA through SSM even when the HTTP probe fails.
         { printf 'set -euo pipefail\nset +x\ncd /opt/%s\n' "$image"; cat <<'HOST'; } >"$temporary/host.sh"
@@ -195,17 +201,17 @@ HOST
             fi
         else
             ssm_run "$temporary/host.sh" | tee "$temporary/deployed"
-            # The name must serve this host's SHA, not another deployment's (Vercel).
-            python3 - "$temporary/health" "$temporary/deployed" <<'PY' || result=1
+            # This host must answer (Vercel may serve the same SHA) with the SHA it runs.
+            python3 - "$temporary/health" "$temporary/deployed" "${status#* }" "$public_ip" <<'PY' || result=1
 import json, pathlib, re, sys
 try:
     served = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("sha")
 except (OSError, ValueError, AttributeError):
     served = None
 deployed = re.findall(r"^Deployed SHA: ([0-9a-f]{40}|[0-9a-f]{64})$", pathlib.Path(sys.argv[2]).read_text(), re.M)
-print(f"Served SHA: {served}")
-sys.exit(0 if deployed and served == deployed[-1] else 1)
+print(f"Served SHA: {served}; answered by {sys.argv[3] or 'nobody'}; instance public IP {sys.argv[4]}")
+sys.exit(0 if deployed and served == deployed[-1] and sys.argv[3] == sys.argv[4] else 1)
 PY
-            [[ $result == 0 ]] || fail "Smoke failed: https://$smoke_host/api/health must return 200 with this host's deployed SHA."
+            [[ $result == 0 ]] || fail "Smoke failed: https://$smoke_host/api/health must return 200 from this instance's public IP with its deployed SHA."
         fi;;
 esac

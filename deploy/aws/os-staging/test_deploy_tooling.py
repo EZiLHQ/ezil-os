@@ -20,7 +20,8 @@ import unittest
 HERE = Path(__file__).parent
 SHA = "0123456789abcdef0123456789abcdef01234567"
 PROD_BUCKET = "ezil-main-prod-artifacts-452630323510-aps1"
-PROD_PIN = "vpc-040bdd6e09e35425f\tezil-os-prod-host\tproduction"
+HOST_IP = "203.0.113.10"
+PROD_PIN = f"vpc-040bdd6e09e35425f\tezil-os-prod-host\tproduction\t{HOST_IP}"
 JOBS = ("telemetry-maintenance", "sandbox-reap", "billing-session-sweep",
         "aws-stop-settle", "pool-replenish", "aws-reconcile")
 AWS_JOBS = ("aws-stop-settle", "pool-replenish", "aws-reconcile")
@@ -67,7 +68,8 @@ elif name == "docker":
         print("Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
     pathlib.Path(after("--output")).write_text(os.environ.get("FAKE_HEALTH", ""))
-    sys.stdout.write(os.environ.get("FAKE_STATUS", "200"))
+    sys.stdout.write(after("--write-out").replace("%{http_code}", os.environ.get("FAKE_STATUS", "200"))
+                     .replace("%{remote_ip}", os.environ.get("FAKE_REMOTE_IP", "203.0.113.10")))
 '''
 
 RENDER_ENV_STUB = r'''import json, os, sys
@@ -259,11 +261,13 @@ class DeployScriptTests(SandboxTestCase):
             ({"OS_STAGING_INSTANCE_ID": "i-0123456789abcdef0"}, "Set OS_PRODUCTION_INSTANCE_ID.", False),
             ({"OS_PRODUCTION_INSTANCE_ID": "i-09012068d96166828"}, "Refusing the production database host.", False),
             ({"OS_PRODUCTION_INSTANCE_ID": "i-0123456789abcdef0",
-              "FAKE_DESCRIBE": "vpc-0f6bc19fdfd4209aa\tezil-os-billing-staging-host\tbilling-staging"}, "Refusing instance", True),
+              "FAKE_DESCRIBE": "vpc-0f6bc19fdfd4209aa\tezil-os-billing-staging-host\tbilling-staging\t198.51.100.7"}, "Refusing instance", True),
             ({"OS_PRODUCTION_INSTANCE_ID": "i-0123456789abcdef0",
-              "FAKE_DESCRIBE": "vpc-040bdd6e09e35425f\tezil-os-prod-host\tbilling-staging"}, "Refusing instance", True),
+              "FAKE_DESCRIBE": f"vpc-040bdd6e09e35425f\tezil-os-prod-host\tbilling-staging\t{HOST_IP}"}, "Refusing instance", True),
             ({"OS_PRODUCTION_INSTANCE_ID": "i-0123456789abcdef0",
-              "FAKE_DESCRIBE": "vpc-040bdd6e09e35425f\tezil-os-prod-host-2\tproduction"}, "Refusing instance", True),
+              "FAKE_DESCRIBE": f"vpc-040bdd6e09e35425f\tezil-os-prod-host-2\tproduction\t{HOST_IP}"}, "Refusing instance", True),
+            ({"OS_PRODUCTION_INSTANCE_ID": "i-0123456789abcdef0",
+              "FAKE_DESCRIBE": "vpc-040bdd6e09e35425f\tezil-os-prod-host\tproduction"}, "Refusing instance", True),
         )
         for environment, message, described in cases:
             with self.subTest(message=message, environment=environment):
@@ -349,10 +353,13 @@ class DeployScriptTests(SandboxTestCase):
                 result = self.box.deploy_sh(*args, **base)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual([c[-1] for c in self.box.calls() if c[0] == "curl"], [url])
-        # Another deployment's SHA (e.g. Vercel before cutover) fails the smoke.
-        result = self.box.deploy_sh("smoke", "public", **{**base, "FAKE_HEALTH": json.dumps({"ok": True, "sha": "f" * 40})})
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("must return 200 with this host's deployed SHA", result.stderr)
+        # Another SHA, or the same SHA from another address (Vercel before cutover), fails the smoke.
+        for change in ({"FAKE_HEALTH": json.dumps({"ok": True, "sha": "f" * 40})}, {"FAKE_REMOTE_IP": "76.76.21.21"},
+                       {"FAKE_REMOTE_IP": ""}):
+            with self.subTest(change=change):
+                result = self.box.deploy_sh("smoke", "public", **{**base, **change})
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must return 200 from this instance's public IP with its deployed SHA", result.stderr)
         result = self.box.deploy_sh("smoke", **{**base, "FAKE_STATUS": "502"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("/opt/ezil-os-production\n", self.box.payloads()[-1])

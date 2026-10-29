@@ -170,12 +170,11 @@ the Gateway: these steps never touch it, its volumes or the SG's other rules.
        ParameterKey=SubnetId,ParameterValue=subnet-0e7c19ed848d0fcea \
        ParameterKey=InstanceType,ParameterValue=t3.medium \
        ParameterKey=ArtifactBucket,ParameterValue=ezil-main-prod-artifacts-452630323510-aps1 \
-       ParameterKey=AppCallerRoleArn,ParameterValue= \
      --tags Key=ezil:env,Value=production Key=ezil:purpose,Value=os
    ```
-   The template's Rules refuse production with any other VPC, subnet or bucket,
-   or a non-empty AppCallerRoleArn, and refuse staging with any of these prod
-   values. Review, execute, then record `InstanceId` (`OS_PRODUCTION_INSTANCE_ID`),
+   AppCallerRoleArn keeps its default `''`. The template's Rules refuse
+   production with any other VPC, subnet or bucket, or a non-empty
+   AppCallerRoleArn, and refuse staging with any of these prod values. Review, execute, then record `InstanceId` (`OS_PRODUCTION_INSTANCE_ID`),
    `PublicIp` and `AppSecurityGroupId`. Do **not** add `InstanceRoleArn` to the
    staging app-caller trust. Termination protection stays off, as for staging.
 2. Create `ezil-os-prod-db-access` from `db-access.yaml` the same way with
@@ -195,7 +194,13 @@ the Gateway: these steps never touch it, its volumes or the SG's other rules.
    `aws secretsmanager create-secret --region ap-south-1 --name ezil-os/production/app
    --secret-string file://PRIVATE_FILE --tags Key=ezil:env,Value=production Key=ezil:purpose,Value=os`,
    then shred `PRIVATE_FILE`. `SUPABASE_DATABASE_URL` is
-   `postgres://ROLE:PASSWORD@10.63.20.252:5432/postgres?sslmode=require`.
+   `postgres://ROLE:PASSWORD@10.63.20.252:5432/postgres?sslmode=require`
+   (postgres.js 3.4.9 turns `sslmode=require` into TLS without certificate
+   verification and would forward any other query key as a startup parameter,
+   so the renderer refuses other keys). **ROLE is an open DB-owner decision:** a
+   dedicated role like Universe's `ezil_universe_app` needs explicit grants on
+   the OS tables and on what the Auth0 bridge reads in `auth.*`; no step here
+   creates it.
 5. In Auth0 (`id.ezil.work`), add callbacks
    `https://os.ezil.work/auth/auth0/callback` and
    `https://os-prod.ezil.work/auth/auth0/callback`, logout URLs
@@ -213,8 +218,9 @@ the Gateway: these steps never touch it, its volumes or the SG's other rules.
 **F. Smoke on the private hostname**
 7. Add a DNS-only A record `os-prod.ezil.work` to `PublicIp`. Caddy obtains its
    certificate; it keeps retrying `os.ezil.work` until cutover (expected log noise).
-8. `OS_ENV=production deploy.sh smoke` must pass (200 and the served SHA equals
-   the container's). Then check by hand: Auth0 sign-in and sign-out, one new
+8. `OS_ENV=production deploy.sh smoke` must pass: HTTP 200, the connection's
+   remote IP equals the instance's public IP from `describe-instances`, and the
+   served SHA equals the container's. Run it without an HTTP(S) proxy. Then check by hand: Auth0 sign-in and sign-out, one new
    `auth.users` row, `/os` loads and Settings renders, and
    `systemctl list-timers 'ezil-os-production-*'` shows three timers whose last
    runs succeeded (`journalctl -u ezil-os-production-billing-session-sweep`).
@@ -223,10 +229,14 @@ the Gateway: these steps never touch it, its volumes or the SG's other rules.
 9. Finish the main push to Vercel first (`preview.yml` live-checks
    `os.ezil.work`) and record the Vercel deployment ID as the rollback target.
 10. Lower the `os.ezil.work` TTL to 60 s, then replace the CNAME
-    `570c89d9a01c497d.vercel-dns-017.com` with a DNS-only A record to `PublicIp`.
-    Expect a short TLS gap while Caddy obtains the certificate.
+    `570c89d9a01c497d.vercel-dns-017.com` with a DNS-only A record to `PublicIp`
+    (and no AAAA record). Caddy has been failing ACME for `os.ezil.work` until
+    now and backs off between retries, so restart it over SSM to retry at once:
+    `cd /opt/ezil-os-production && docker compose --env-file compose.env restart caddy`.
+    Expect a short TLS gap while it obtains the certificate.
 11. `OS_ENV=production deploy.sh smoke public` passes only when `os.ezil.work`
-    serves this host's SHA rather than Vercel's.
+    is answered from this instance's public IP with its SHA; Vercel serving the
+    same frozen SHA still fails it.
 12. Cron deliberately stays on `https://os-prod.ezil.work` (the read-only runbook
     suggested moving it to `os.ezil.work`): Caddy serves both names, so nothing
     changes at cutover and the production `CRON_SECRET` never reaches Vercel.
