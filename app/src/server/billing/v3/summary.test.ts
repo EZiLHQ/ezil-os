@@ -259,6 +259,12 @@ describe('round 4: standing fields (additive)', () => {
         expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2' }).computer).toMatchObject({ standing: 'files_on_aws', filesOn: 'aws' });
         expect(buildSummaryV3(input()).plan).toMatchObject({ graceEndsAt: null, planEndsAt: null });
     });
+    it('files_on_aws reports the held std-2 computer, not the Free offer size (Billing agrees with Computer/System)', () => {
+        expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2' }).computer)
+            .toMatchObject({ standing: 'files_on_aws', size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: 3600, disk: { provisionedGiB: 50 } });
+        expect(buildSummaryV3(input()).computer).toMatchObject({ standing: 'free', size: 'free-cf', vcpu: 2, memoryGiB: 6 });
+        expect(buildSummaryV3({ ...input('standard_monthly_v3'), placementProvider: 'aws-ec2' }).computer).toMatchObject({ standing: 'paid', size: 'std-2' });
+    });
     it('grace keeps the paid allowance when the unpaid renewal has no receipt, and a refund reversal still pauses', () => {
         const args = { ...input('premium_monthly_v3'), grants: [], placementProvider: 'aws-ec2' as const,
             subs: [{ sku: 'premium_monthly_v3' as const, stripeSubscriptionId: 'sub', status: 'past_due', currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }],

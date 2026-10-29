@@ -8,7 +8,7 @@ import { AWS_TIER_DATA_GIB, AWS_TIERS, type AwsTier } from '../../lib/compute/aw
 import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
-import { fairUseStatusOf } from './admission';
+import { fairUseStatusOf, HOLD_SIZE } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
 import { CATALOG_V3_VERSION, type BillingSummaryV3, type SellableSkuV3 } from './contract';
 import { deriveStanding } from './standing';
@@ -173,7 +173,10 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants, { grace: standing.standing === 'grace' });
     const bounds = { sessionMaxSeconds: plan.sessionMaxSeconds, allowanceStdSeconds: allowance };
     const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now, bounds);
+    // Round 4 D16: under the hold the computer that opens is the held AWS computer at HOLD_SIZE, not the
+    // Free offer's Cloudflare size, so Billing agrees with the Computer and System tabs (2 vCPU / 8 GB).
     const size = legacy ? SIZES[legacy.compute.selectedSize] : plan.sku === 'legacy' ? SIZES[plan.offer.defaultSize]
+        : standing.standing === 'files_on_aws' ? SIZES[HOLD_SIZE]
         : SIZES[input.sizePreference !== null && plan.offer.machineChoice.includes(input.sizePreference)
             ? input.sizePreference : plan.offer.size];
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
