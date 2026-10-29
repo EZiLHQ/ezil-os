@@ -31,6 +31,21 @@ export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: str
     }
 }
 
+/**
+ * Round 5 D1 "kick": after a successful EZiL ID sign-in enrollment, wake that user's undelivered rows
+ * that wait on the AI account ($1 user uuid, $2 now in epoch ms, $3 the protocol). Only `retry` rows
+ * whose last error is an account dependency move; `processing` rows (held by a worker) are never
+ * touched, and `attempts` and every other delivery field stay as they are, so the claim/finish fences
+ * (attempts + the delivery JSON) keep working. Under READ COMMITTED a row that a concurrent claim just
+ * turned into `processing` fails the re-checked status and is skipped. Run with app privileges.
+ */
+export const AI_CREDIT_KICK_SQL = `update public.ezil_billing_outbox
+    set payload = jsonb_set(payload, '{delivery,nextAttemptAt}', to_jsonb($2::bigint))
+    where user_id = $1::uuid and delivered_at is null
+        and payload->>'protocol' = $3
+        and payload->'delivery'->>'status' = 'retry'
+        and last_error in ('no_ai_account', 'account_not_found')`;
+
 /** Delivery metadata lives under payload.delivery; the six wire fields are immutable.
  * One atomic claim commits before HTTP. A 30 s lease recovers crashed workers;
  * attempt fencing keeps an expired worker from overwriting its successor.
