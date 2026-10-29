@@ -194,7 +194,7 @@
 .ezil-app-spinner .ezil-opening-action:hover { filter: brightness(1.08); }
 .ezil-app-spinner .ezil-opening-action:focus-visible { outline: 2px solid var(--open-focus); outline-offset: 2px; }
 
-/* Dev details: closed by default, only when the deployment flags them. */
+/* Dev details: data for diagnostics only; the block is always `hidden` on the surface. */
 .ezil-app-spinner .ezil-opening-details { font-size: 11px; line-height: 1.4; color: var(--open-faint); }
 .ezil-app-spinner .ezil-opening-details summary {
     display: inline-flex;
@@ -209,16 +209,17 @@
 /* Every part retires with `hidden`; this wins over the display rules above. */
 .ezil-app-spinner .ezil-opening [hidden] { display: none; }
 
-/* Reduced motion: whole 5% steps from JS, a static fill, no sheen, no fades. */
+/* Reduced motion: whole 5% steps from JS, a static fill, no sheen, no fades. With no basis for a
+ * position yet the bar is the bare track: a static full fill would read as done. */
 @media (prefers-reduced-motion: reduce) {
     .ezil-app-spinner > .ezil-opening { animation: none; }
     .ezil-app-spinner .ezil-opening-fill { transition: none; }
     .ezil-app-spinner .ezil-opening-fill::after { content: none; animation: none; }
-    .ezil-app-spinner .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+    .ezil-app-spinner .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 0; }
     .ezil-app-spinner[data-state='done'] > .ezil-opening { animation: none; }
 }
 .ezil-app-spinner[data-reduced-motion='true'] > .ezil-opening { animation: none; }
 .ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-fill { transition: none; }
 .ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-fill::after { content: none; animation: none; }
-.ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+.ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 0; }
 .ezil-app-spinner[data-reduced-motion='true'][data-state='done'] > .ezil-opening { animation: none; }

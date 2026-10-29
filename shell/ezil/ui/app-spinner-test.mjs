@@ -75,6 +75,7 @@ const NOISE = /\d+%|min left|Estimated|✓|Next session|Last recorded update|App
         ! spinner.el.hasAttribute('aria-live') && statusOf(spinner).getAttribute('aria-live') === 'polite'
         && metaOf(spinner).getAttribute('aria-hidden') === 'true');
     push('title is the "Opening {App}" label before the first render()', titleOf(spinner) === 'Opening Browser…');
+    push('the title is announced when it changes (attention / failed headline)', $(spinner, 'h1').getAttribute('aria-live') === 'polite');
     push('icon falls back to the app initial', $(spinner, '.ezil-opening-icon')?.textContent === 'B');
     push('actions start hidden — nothing to retry before a state has rendered', $(spinner, '.ezil-boot-actions')?.hidden === true);
 
@@ -317,6 +318,74 @@ try {
         push('null poll during a re-open still shows the held stage (one surface, no swap)', statusOf(spinner).textContent === status);
     });
     now = 0;
+    // 🔴 MONOTONIC: a re-open never discards the high-water mark, even when the recomputed value is lower.
+    await observe(opening, async spinner => {
+        now = 20_000; await poll(); spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
+        const high = barOf(spinner);
+        push('url_received lifts the bar to the opening-app floor', high >= 85 && high < 100, String(high));
+        spinner.stamp(null); spinner.render({ kind: 'progress' }, { reopening: true });
+        push('🔴 re-open at the same instant: the bar keeps its high-water and stays determinate',
+            barOf(spinner) >= high && barEl(spinner).dataset.indeterminate === undefined, `${barOf(spinner)} ${barEl(spinner).dataset.indeterminate}`);
+        now = 21_000; await poll(); spinner.render({ kind: 'progress' });
+        push('🔴 ...and after the next poll', barOf(spinner) >= high, String(barOf(spinner)));
+    });
+    now = 0;
+    {
+        const s = AppSpinner({ label: 'Opening Browser…' });
+        document.body.appendChild(s.el);
+        s.render({ kind: 'progress' }); now = 20_000; s.stamp('url_received'); s.render({ kind: 'progress' });
+        const high = barOf(s);
+        s.stamp(null); s.render({ kind: 'progress' }, { reopening: true });
+        push('🔴 unobserved re-open: the bar keeps its high-water and stays determinate', high >= 85
+            && barOf(s) >= high && barEl(s).dataset.indeterminate === undefined, `${high} → ${barOf(s)}`);
+        s.dispose(); s.el.remove(); now = 0;
+    }
+    // 🔴 A concluded open (ready) never lends its clock or first sight to the next one (restart, new tab).
+    await observe({ ...opening, openingStartedAt: null, milestones: [] }, async spinner => {
+        now = 30_000; await poll(); spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
+        spinner.render({ kind: 'ready' });
+        push('ready concludes the open', stateOf(spinner) === 'done' && barOf(spinner) === 100);
+        now = 3_600_000; spinner.render({ kind: 'progress' }); await tick();
+        push('🔴 an hour later the next open is fresh: opening, no "Taking longer", no Try again, no carried 85%',
+            stateOf(spinner) === 'opening' && ! /Taking longer|60:/.test(metaOf(spinner).textContent)
+            && $(spinner, '.ezil-boot-actions').hidden && ! (barOf(spinner) >= 85),
+            `${stateOf(spinner)} "${metaOf(spinner).textContent}" ${barOf(spinner)} actions=${! $(spinner, '.ezil-boot-actions').hidden}`);
+        push('🔴 ...and its observation counts from this open, not the last one', (spinner.computerProgress()?.elapsed ?? 0) < 60,
+            String(spinner.computerProgress()?.elapsed));
+    });
+    now = 0;
+    // 🔴 One clock for the ten-minute stop: the server's opening start resets at 88 s (the live 1:25 → 0:01
+    // case), yet the clock the user reads reaches 10:00 and Try again appears there, not 88 s later.
+    await observe({ ...opening, startedAt: T0 }, async spinner => {
+        now = 88_000; payload = { ...opening, startedAt: '1970-01-01T00:01:28.000Z', openingStartedAt: '1970-01-01T00:01:28.000Z' }; await poll();
+        now = 599_000; await poll(); spinner.render({ kind: 'progress' });
+        push('client 9:59 (server 8:31): still opening, no Try again', $(spinner, '.ezil-boot-retry').hidden === true, stateOf(spinner));
+        now = 600_000; await poll(); spinner.render({ kind: 'progress' });
+        push('🔴 client 10:00 (server 8:32): Try again, the calm ten-minute copy', $(spinner, '.ezil-boot-retry').hidden === false
+            && statusOf(spinner).textContent === "This is taking longer than usual. We're still working on it — you can keep this open or come back later.",
+            `${stateOf(spinner)} ${statusOf(spinner).textContent}`);
+        now = 600_250; spinner.render({ kind: 'progress' });
+        push('🔴 the stop holds on the next tick (never flips back to a fresh 0:00 open)', $(spinner, '.ezil-boot-retry').hidden === false
+            && stateOf(spinner) === 'attention', `${stateOf(spinner)} "${metaOf(spinner).textContent}"`);
+        $(spinner, '.ezil-boot-retry').click();
+        now = 601_000; spinner.render({ kind: 'progress' });
+        push('Try again releases the hold: a fresh open', stateOf(spinner) !== 'attention' && $(spinner, '.ezil-boot-retry').hidden === true,
+            `${stateOf(spinner)} "${metaOf(spinner).textContent}"`);
+    });
+    now = 0;
+    // An AWS observer that has not answered yet: elapsed only, never the Cloudflare expectation or "taking longer".
+    {
+        const hold = globalThis.fetch; globalThis.fetch = () => new Promise(() => {});
+        const s = AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…' });
+        document.body.appendChild(s.el);
+        s.render({ kind: 'progress' }); await tick();
+        now = 5_000; s.render({ kind: 'progress' });
+        push('observer pending at 0:05: elapsed only, no expectation', s.el.dataset.progress === 'pending' && metaOf(s).textContent === '0:05', metaOf(s).textContent);
+        now = 40_000; s.render({ kind: 'progress' });
+        push('observer pending at 0:40: not "taking longer" (the expectation is unknown)', stateOf(s) === 'opening' && metaOf(s).textContent === '0:40',
+            `${stateOf(s)} ${metaOf(s).textContent}`);
+        s.dispose(); s.el.remove(); globalThis.fetch = hold; timers.clear(); now = 0;
+    }
     // Long: t ≥ T turns the meta warn; the status line keeps following the server; no button.
     await observe({ ...opening, expectedSeconds: 90 }, async spinner => {
         now = 91_000; await poll();
@@ -349,6 +418,9 @@ try {
                 await poll();
                 spinner.render({ kind: 'failed', reason: 'unknown' });
                 const status = $(spinner, '.ezil-opening-view-status');
+                push(`attention (${recordedStage}): the body matches the one action offered`,
+                    statusOf(spinner).textContent === (retryable ? 'Starting it stopped before it finished.'
+                        : 'Your computer needs a fix on our side. Your files stay on your own disk.'), statusOf(spinner).textContent);
                 push(`attention (${recordedStage}, feedback ${feedback}): copy, amber frozen fill, one action`,
                     titleOf(spinner) === 'Your computer needs attention' && stateOf(spinner) === 'attention'
                     && ! barEl(spinner).hidden && barOf(spinner) === high
@@ -390,9 +462,9 @@ try {
         await observe({ ...opening, updatedAt: '2026-10-27T00:00:00Z', selectedNextOpenHardware: { effective: 'next_open', vcpu: 2, memoryGiB: 8 } }, spinner => {
             const details = $(spinner, 'details.ezil-opening-details');
             push(`devDetails ${devDetails}: no dev paragraph on the visible surface`, ! NOISE.test(visibleText(spinner)), visibleText(spinner));
-            push(`devDetails ${devDetails}: the update line exists only inside a CLOSED <details>, only for boolean true`,
+            push(`devDetails ${devDetails}: the update line exists only inside a CLOSED, HIDDEN <details>, only for boolean true`,
                 devDetails === true
-                    ? details && details.hidden === false && details.open === false && details.textContent.includes('Last recorded update:')
+                    ? details && details.hidden === true && details.open === false && details.textContent.includes('Last recorded update:')
                     : (! details || details.hidden === true) && ! spinner.el.textContent.includes('Last recorded update'));
             push(`devDetails ${devDetails}: the status line is the loading stage, never "Next session"`,
                 statusOf(spinner).textContent === 'A machine is ready and starting up.' && ! /Next session|GiB memory/.test(spinner.el.textContent));

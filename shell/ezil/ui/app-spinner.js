@@ -5,7 +5,8 @@
 // elapsed/expected line. Nothing else unless the server says something needs the user (a hold,
 // needs_operator, the ten-minute budget) or the open failed. No step list, no ticks, no ring, no
 // reassurance/bytes/"Estimated" lines and never a dev paragraph: dev details live only in a
-// closed <details>, and only when `features.devDetails` is boolean true.
+// closed, always-`hidden` <details> (data for diagnostics), and only when `features.devDetails`
+// is boolean true.
 //
 // THE BAR (one source of truth per open):
 //   fill = max(previous, 0.88·(1 − e^(−2.2·t/T)), stage floor)
@@ -43,6 +44,9 @@ const MIGRATION_COPY = {
 export const OPEN_COPY = {
     long: 'Taking longer than usual',
     stillStarting: 'Your computer is still starting',
+    /** needs_operator, by the action the surface offers (never "check status" beside a Try again). */
+    attentionRetry: 'Starting it stopped before it finished.',
+    attentionManual: 'Your computer needs a fix on our side. Your files stay on your own disk.',
     retry: 'Try again',
     viewStatus: 'View computer status',
     details: 'Details',
@@ -118,7 +122,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     root.innerHTML = `
         <div class="ezil-opening ezil-app-spinner-panel">
             <div class="ezil-opening-icon" aria-hidden="true"></div>
-            <h1 class="ezil-opening-title ezil-boot-title ezil-app-spinner-label"></h1>
+            <h1 class="ezil-opening-title ezil-boot-title ezil-app-spinner-label" aria-live="polite"></h1>
             <div class="ezil-opening-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="ezil-opening-fill"></div></div>
             <p class="ezil-opening-status ezil-boot-sub ezil-app-spinner-sub" aria-live="polite" hidden></p>
             <p class="ezil-opening-meta" aria-hidden="true" hidden></p>
@@ -145,7 +149,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
     let failureCode;
     const swallow = e => { e.preventDefault(); e.stopPropagation(); };
-    el_retry.addEventListener('click', e => { swallow(e); if (typeof onRetry === 'function') onRetry(); });
+    // Try again releases a ten-minute hold: the next progress paint may start a fresh open.
+    el_retry.addEventListener('click', e => { swallow(e); if (open) open.hold = false; if (typeof onRetry === 'function') onRetry(); });
     el_view.addEventListener('click', e => { swallow(e); (typeof onViewStatus === 'function' ? onViewStatus : viewComputerStatus)(); });
     el_feedback.addEventListener('click', e => {
         swallow(e);
@@ -163,12 +168,14 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     let aria = { at: -Infinity, key: null };
 
     // Rendered as `progress` = this window's open is in flight: a not-yet-recorded opening never reads "stopped".
-    const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name,
+    // A fresh open after a concluded one gets a fresh observer, so no first-sight clock carries over.
+    const makeObserver = () => computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name,
         openRequested: () => latestState?.kind === 'progress', onChange: value => {
             observation = value; progressChecked = true;
             if (latestState) render(latestState, latestExtra);
             onProgressChange?.();
         } }) : null;
+    let observer = makeObserver();
     root.dataset.progress = observer ? 'pending' : 'none';
     el_title.textContent = label;
 
@@ -182,8 +189,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         const changed = root.dataset.state !== m.state || el_status.textContent !== (m.status ?? '');
         root.dataset.state = m.state;
         root.dataset.reducedMotion = String(prefersReducedMotion());
-        el_title.textContent = m.title;
-        el_status.textContent = m.status ?? ''; el_status.hidden = !m.status;
+        // Live regions are written only when their words change: a 250 ms tick never re-announces.
+        if (el_title.textContent !== m.title) el_title.textContent = m.title;
+        if (el_status.textContent !== (m.status ?? '')) el_status.textContent = m.status ?? '';
+        el_status.hidden = !m.status;
         el_meta.textContent = m.meta ?? ''; el_meta.hidden = !m.meta;
         el_bar.hidden = m.bar === null;
         el_bar.setAttribute('aria-label', m.title);
@@ -210,11 +219,14 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         el_view.textContent = m.view ? OPEN_COPY.viewStatus : '';
         el_feedback.hidden = !(m.feedback && feedbackAvailable());
         el_actions.hidden = el_retry.hidden && el_view.hidden && el_feedback.hidden;
+        // Dev details are data for diagnostics only: the block never paints on the surface.
         el_details_text.textContent = m.details ?? '';
-        el_details.hidden = !m.details;
-        if (!m.details) el_details.open = false;
+        el_details.hidden = true;
+        el_details.open = false;
     }
 
+    /** This open concluded (ready, failed, not configured): the next progress paint is a fresh open. */
+    const endOpen = () => { if (open) { open.ended = true; open.hold = false; } };
     const elapsedOf = () => open ? Math.max(0, (Date.now() - open.t0) / 1000) : 0;
     const metaFor = (t, T, long) => long ? `${OPEN_COPY.long} · ${formatElapsed(t)}` : t >= META_AFTER_S ? `${formatElapsed(t)} · ${expectText(T)}` : '';
     const reduced = () => prefersReducedMotion();
@@ -228,16 +240,17 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     function render (state, extra = {}) {
         latestState = state; latestExtra = extra ?? {};
         const pending = state.kind === 'progress' || state.kind === 'failed';
-        if (pending) observer?.start(); else {
-            observer?.stop(); observation = null; progressChecked = false;
-        }
-        if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
+        if (!pending) { observer?.stop(); observation = null; progressChecked = false; }
         // Round 4: the raw server code (e.g. `billing_files_on_aws`), not the classified reason.
         failureCode = state.kind === 'failed' ? state.errorCode ?? state.reason : observation?.stage === 'needs_operator' ? 'needs_operator' : undefined;
         const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
-        // `observedBudgetSpent`: the desktop window's own ten-minute clock ran out first.
+        // The ten-minute stop reads the longer of the clock the user sees (this live open's) and the
+        // server's; `observedBudgetSpent`: the desktop window's own ten-minute clock ran out first.
+        // An open the ten-minute stop ended keeps its clock (`hold`) until Try again, so the stop
+        // never flips back to a fresh 0:00 open on the next tick.
+        const clientT = open && (!open.ended || open.hold) ? elapsedOf() : 0;
         const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws
-            && (observation.elapsed >= 600 || state.observedBudgetSpent === true);
+            && (Math.max(clientT, observation.elapsed) >= 600 || state.observedBudgetSpent === true);
         root.setAttribute('data-kind', activeTimeout ? 'progress' : state.kind);
         // The caller's estimate and its one real signal, as data for diagnostics; never drawn.
         if (state.kind === 'progress') { root.dataset.phase = state.currentPhase ?? ''; root.dataset.confirmed = String(state.confirmed === true); }
@@ -247,9 +260,12 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
         // The open: started by the first progress paint after a concluded one, never by a re-open.
         if (progressing && !runningLong && (!open || open.ended)) {
-            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false };
+            if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; progressChecked = false; }
+            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false };
             client = 0;
         }
+        if (pending) observer?.start();
+        if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
         if (open && observation && progressing) { open.view = observation; open.T = observation.expected ?? open.T; }
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);
         const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
@@ -265,11 +281,12 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             const retry = !!(runningLong || reopened || (state.kind === 'failed' && attention && !view.manualAttention));
             const viewStatus = !retry && ((attention && view.manualAttention) || stage === 'operations_paused');
             if (runningLong || attention || hold || reopened) {
-                if (open) open.ended = runningLong || state.kind === 'failed' ? true : open.ended;
+                if (open && runningLong) { open.ended = true; open.hold = true; } else if (open && state.kind === 'failed') endOpen();
                 paint({
                     state: reopened ? 'failed' : 'attention',
                     title: runningLong ? label : view.title,
-                    status: runningLong ? OPENING_COPY.runningLong : view.body,
+                    status: runningLong ? OPENING_COPY.runningLong
+                        : attention ? (view.manualAttention ? OPEN_COPY.attentionManual : OPEN_COPY.attentionRetry) : view.body,
                     bar: attention || runningLong ? frozen() : null,
                     retry, view: viewStatus, feedback: attention || retry, details,
                 });
@@ -298,7 +315,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             // Optional AWS/migration metadata must not replace physical app startup.
             const copy = observer ? null : isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
             const t = elapsedOf();
-            const long = t >= LONG_BOOT_MS / 1000;
+            // An AWS observer that has not answered yet: elapsed only. Its expectation is unknown,
+            // so neither "under a minute" nor "taking longer" may be claimed.
+            const awaiting = root.dataset.progress === 'pending';
+            const long = !awaiting && t >= LONG_BOOT_MS / 1000;
             // No observation: no basis for a position until a real signal (the desktop process is
             // up, or the open answered with a URL). Then the stage floor, never a timer, sets it.
             let bar = 'indeterminate';
@@ -309,20 +329,20 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
                 state: long ? 'long' : 'opening',
                 title: copy ? copy.title : label,
                 status: copy ? copy.body : extra?.reopening ? OPEN_COPY.stillStarting : '',
-                meta: metaFor(t, TYPICAL_BOOT_MS / 1000, long), bar,
+                meta: awaiting ? (t >= META_AFTER_S ? formatElapsed(t) : '') : metaFor(t, TYPICAL_BOOT_MS / 1000, long), bar,
             });
             return;
         }
 
         if ( state.kind === 'not_configured' ) {
             // Nothing to retry: no provider is configured, so the next attempt fails identically.
-            if (open) open.ended = true;
+            endOpen();
             paint({ state: 'attention', title: BOOT_NOT_CONFIGURED_COPY.title, status: BOOT_NOT_CONFIGURED_COPY.body, bar: null });
             return;
         }
 
         if ( state.kind === 'failed' ) {
-            if (open) open.ended = true;
+            endOpen();
             const copy = failureCopy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
             paint({ state: 'failed', title: copy.title, status: copy.body, bar: null, retry: true, feedback: true });
             return;
@@ -330,7 +350,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
         // 'ready' and 'ready_unverified': the real ready signal. The bar completes and the surface
         // fades; the caller reveals the frame under it (the last frame stays, so no white flash).
-        if (open) open.ended = true;
+        endOpen();
         paint({ state: 'done', title: el_title.textContent || label, status: el_status.textContent, bar: 1 });
     }
 

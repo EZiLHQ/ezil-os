@@ -1354,13 +1354,13 @@ to{opacity:0}
 .ezil-app-spinner>.ezil-opening{animation:none}
 .ezil-app-spinner .ezil-opening-fill{transition:none}
 .ezil-app-spinner .ezil-opening-fill::after{content:none;animation:none}
-.ezil-app-spinner .ezil-opening-bar[data-indeterminate=true] .ezil-opening-fill{animation:none;width:100%;opacity:.35}
+.ezil-app-spinner .ezil-opening-bar[data-indeterminate=true] .ezil-opening-fill{animation:none;width:0}
 .ezil-app-spinner[data-state=done]>.ezil-opening{animation:none}
 }
 .ezil-app-spinner[data-reduced-motion=true]>.ezil-opening{animation:none}
 .ezil-app-spinner[data-reduced-motion=true] .ezil-opening-fill{transition:none}
 .ezil-app-spinner[data-reduced-motion=true] .ezil-opening-fill::after{content:none;animation:none}
-.ezil-app-spinner[data-reduced-motion=true] .ezil-opening-bar[data-indeterminate=true] .ezil-opening-fill{animation:none;width:100%;opacity:.35}
+.ezil-app-spinner[data-reduced-motion=true] .ezil-opening-bar[data-indeterminate=true] .ezil-opening-fill{animation:none;width:0}
 .ezil-app-spinner[data-reduced-motion=true][data-state=done]>.ezil-opening{animation:none}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#04060c;background-image:radial-gradient(24% 6% at 50% 91.2%,rgba(255,200,150,.6) 0,rgba(255,150,100,.18) 55%,rgba(255,150,100,0) 100%),radial-gradient(150% 72% at 50% 138%,#04060c 0,#04060c 62%,rgba(0,200,208,.72) 63.1%,rgba(96,110,255,.38) 65.4%,rgba(112,86,255,.1) 70%,rgba(112,86,255,0) 78%),radial-gradient(55% 45% at 82% 6%,rgba(0,190,200,.4) 0,rgba(0,190,200,0) 62%),radial-gradient(50% 55% at 8% 22%,rgba(112,86,255,.34) 0,rgba(112,86,255,0) 64%),linear-gradient(180deg,#0a0e1d 0,#070a14 50%,#04060c 100%)}

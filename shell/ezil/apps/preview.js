@@ -417,6 +417,9 @@ export async function openPreviewWindow (ctx = {}) {
             stop_timers();
 
             if ( seen === true ) {
+                // The real ready signal concludes this open on the one surface (bar to 100), so a
+                // later start_boot (restart, switch, reboot) is a fresh open with its own clock.
+                progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
                 stop_monitor = watchNativeSurface(nativeSurface, () => {

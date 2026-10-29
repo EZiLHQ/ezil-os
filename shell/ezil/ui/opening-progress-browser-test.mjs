@@ -112,6 +112,7 @@ try {
                 const bar = s.el.querySelector('.ezil-opening-bar').getBoundingClientRect();
                 const fill = getComputedStyle(s.el.querySelector('.ezil-opening-fill'));
                 return { align: getComputedStyle(panel).textAlign, h: bar.height, w: bar.width,
+                    fillW: s.el.querySelector('.ezil-opening-fill').getBoundingClientRect().width,
                     centre: Math.abs((bar.left + bar.width / 2) - window.innerWidth / 2), ring: !!s.el.querySelector('.ezil-app-spinner-ring'),
                     animation: fill.animationName, colour: fill.backgroundColor, title: s.el.querySelector('h1').textContent,
                     name: !!s.el.querySelector('.ezil-opening-name'), bg: getComputedStyle(s.el).backgroundColor,
@@ -128,6 +129,7 @@ try {
             assert.equal(box.bg, 'rgb(22, 22, 22)', 'dark default background');
             assert.equal(box.overflow, 0, 'no sideways scroll');
             assert.equal(box.animation, reducedMotion === 'reduce' ? 'none' : 'ezil-open-sweep', 'no basis yet: a sweep, not a position');
+            if ( reducedMotion === 'reduce' ) assert.equal(box.fillW, 0, 'reduced motion with no basis: the bare track, never a static full bar that reads as done');
         });
 
         await check(`${tag}: observed opening — determinate bar on every paint, 600 ms transition, monotonic and no elapsed reset across a re-open, no dev line painted`, async () => {
@@ -164,42 +166,96 @@ try {
             assert.equal(out.width, `${out.after.pct}%`, 'the fill width follows the paint');
             assert.equal(out.transition, reducedMotion === 'reduce' ? '0s' : '0.6s, 0.2s');
             assert.equal(out.sheen, reducedMotion === 'reduce' ? 'none' : 'ezil-open-sheen');
-            assert.equal(out.detailsHidden, false, 'devDetails on: the details block exists');
+            assert.equal(out.detailsHidden, true, 'devDetails on: the details block exists for diagnostics but never paints (no "Details" row)');
             assert.equal(out.detailsOpen, false, 'closed by default');
             assert.equal(out.devPainted, false, 'the dev line is never painted on the surface');
             assert.equal(out.devInText, false, 'nor in the rendered text');
             assert.doesNotMatch(out.visible, /Last recorded update|Next session/);
         });
 
-        await check(`${tag}: attention — amber frozen fill, one 44 px action, no sheen`, async () => {
+        await check(`${tag}: attention — amber frozen fill, one 44 px action, no sheen; manual: two 44 px actions`, async () => {
             const out = await page.evaluate(async () => {
                 const T = new Date(Date.now()).toISOString();
                 let payload = { version: 2, computerId: 'qa-computer', operation: 'opening', stage: 'starting', recordedStage: 'starting', active: true,
-                    path: 'warm', openingStartedAt: T, expectedSeconds: 240, milestones: [{ key: 'requested', at: T }], bytes: { transferred: null, total: null }, percent: null };
+                    path: 'warm', openingStartedAt: T, expectedSeconds: 240, milestones: [{ key: 'requested', at: T }, { key: 'host_claimed', at: T }],
+                    bytes: { transferred: null, total: null }, percent: null };
                 window.__EZIL_BOOT__ = {};
                 window.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
-                const s = window.AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…' });
-                document.getElementById('host').replaceChildren(s.el);
-                s.render({ kind: 'progress' });
-                for ( let i = 0; i < 100 && s.el.dataset.progress !== 'observed'; i++ ) await new Promise(r => setTimeout(r, 20));
-                payload = { ...payload, stage: 'needs_operator', recordedStage: 'unconfirmed', active: false };
-                s.dispose();
+                const wait = async test => { for ( let i = 0; i < 100 && ! test(); i++ ) await new Promise(r => setTimeout(r, 20)); };
+                const repoll = () => document.dispatchEvent(new Event('visibilitychange'));
                 const a = window.AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…' });
                 document.getElementById('host').replaceChildren(a.el);
                 a.render({ kind: 'progress' });
-                for ( let i = 0; i < 100 && a.el.dataset.progress !== 'observed'; i++ ) await new Promise(r => setTimeout(r, 20));
+                await wait(() => a.el.dataset.progress === 'observed');
+                a.render({ kind: 'progress' });
+                const bar = a.el.querySelector('.ezil-opening-bar'), fill = a.el.querySelector('.ezil-opening-fill');
+                const high = Number(bar.dataset.percent);
+                const probe = document.createElement('i'); a.el.appendChild(probe);
+                const token = name => { probe.style.color = `var(${name})`; return getComputedStyle(probe).color; };
+                payload = { ...payload, stage: 'needs_operator', recordedStage: 'unconfirmed', active: false };
+                repoll(); await wait(() => a.el.dataset.state === 'attention');
                 a.render({ kind: 'failed', reason: 'unknown' });
+                await new Promise(r => setTimeout(r, 300)); // past the 200 ms colour transition
                 const retry = a.el.querySelector('.ezil-boot-retry').getBoundingClientRect();
-                const out = { state: a.el.dataset.state, retryH: retry.height, retryW: retry.width,
+                const after = getComputedStyle(fill, '::after');
+                const out = { state: a.el.dataset.state, retryH: retry.height, retryW: retry.width, high, pct: Number(bar.dataset.percent),
+                    barShown: bar.checkVisibility(), fillBg: getComputedStyle(fill).backgroundColor, warn: token('--open-warn'), accent: token('--open-accent'),
+                    sheenContent: after.content, sheenAnimation: after.animationName,
                     actions: [...a.el.querySelectorAll('.ezil-opening-action')].filter(b => b.getClientRects().length > 0).length,
-                    title: a.el.querySelector('h1').textContent };
+                    title: a.el.querySelector('h1').textContent, status: a.el.querySelector('.ezil-opening-status').textContent };
+                // Manual attention with feedback on: "View computer status" + "Send feedback", both 44 px.
+                window.__EZIL_BOOT__ = { desktopState: { endpoints: { feedback: '/api/shell/feedback' } } };
+                payload = { ...payload, recordedStage: 'failed_needs_operator' };
+                repoll(); await wait(() => ! a.el.querySelector('.ezil-opening-view-status').hidden);
+                a.render({ kind: 'failed', reason: 'unknown' });
+                out.manual = [...a.el.querySelectorAll('.ezil-opening-action')].filter(b => b.getClientRects().length > 0)
+                    .map(b => ({ text: b.textContent, w: b.getBoundingClientRect().width, h: b.getBoundingClientRect().height }));
+                out.manualStatus = a.el.querySelector('.ezil-opening-status').textContent;
                 a.dispose();
                 return out;
             });
             assert.equal(out.state, 'attention');
             assert.equal(out.title, 'Your computer needs attention');
+            assert.equal(out.status, 'Starting it stopped before it finished.', 'the body matches the one action (Try again)');
             assert.ok(out.retryH >= 44 && out.retryW >= 44, `${out.retryW}x${out.retryH}`);
             assert.equal(out.actions, 1, 'exactly one action (feedback is off)');
+            assert.ok(out.barShown && out.high > 0 && out.pct === out.high, `the fill is frozen where it was (${out.pct}/${out.high})`);
+            assert.equal(out.fillBg, out.warn, 'the attention fill is amber (--open-warn)');
+            assert.notEqual(out.fillBg, out.accent);
+            assert.equal(out.sheenContent, 'none', 'no sheen in attention');
+            assert.equal(out.sheenAnimation, 'none');
+            assert.deepEqual(out.manual.map(b => b.text), ['View computer status', 'Send feedback']);
+            assert.ok(out.manual.every(b => b.w >= 44 && b.h >= 44), JSON.stringify(out.manual));
+            assert.equal(out.manualStatus, 'Your computer needs a fix on our side. Your files stay on your own disk.');
+        });
+
+        await check(`${tag}: long — the meta turns warn, no button`, async () => {
+            const out = await page.evaluate(async () => {
+                const T = new Date(Date.now()).toISOString();
+                const payload = { version: 2, computerId: 'qa-computer', operation: 'opening', stage: 'starting', recordedStage: 'starting', active: true,
+                    path: 'warm', openingStartedAt: T, expectedSeconds: 90, milestones: [{ key: 'requested', at: T }], bytes: { transferred: null, total: null }, percent: null };
+                window.__EZIL_BOOT__ = {};
+                window.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+                const realNow = Date.now; let skew = 0; Date.now = () => realNow() + skew;
+                const s = window.AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…' });
+                document.getElementById('host').replaceChildren(s.el);
+                s.render({ kind: 'progress' });
+                for ( let i = 0; i < 100 && s.el.dataset.progress !== 'observed'; i++ ) await new Promise(r => setTimeout(r, 20));
+                const meta = s.el.querySelector('.ezil-opening-meta');
+                const calm = getComputedStyle(meta).color;
+                skew = 91_000; s.render({ kind: 'progress' });
+                await new Promise(r => setTimeout(r, 300));
+                const probe = document.createElement('i'); s.el.appendChild(probe); probe.style.color = 'var(--open-warn)';
+                const out = { state: s.el.dataset.state, text: meta.textContent, colour: getComputedStyle(meta).color, calm,
+                    warn: getComputedStyle(probe).color, actions: [...s.el.querySelectorAll('.ezil-opening-action')].filter(b => b.getClientRects().length > 0).length };
+                s.dispose(); Date.now = realNow;
+                return out;
+            });
+            assert.equal(out.state, 'long');
+            assert.equal(out.text, 'Taking longer than usual · 1:31');
+            assert.equal(out.colour, out.warn, 'the long meta is warn-coloured');
+            assert.notEqual(out.calm, out.warn, 'and was not before');
+            assert.equal(out.actions, 0, 'no button while long');
         });
         assert.deepEqual(errors, []);
         await context.close();
