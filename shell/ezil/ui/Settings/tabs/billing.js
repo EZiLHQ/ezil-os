@@ -336,7 +336,7 @@ function storageMeterV3 ({ computer }) {
     const left = Math.max(0, gb - used);
     const percent = percentOf(left, gb);
     return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gbText(left)} GB left`, percent,
-        tone: percent === 0 ? 'danger' : percent <= 10 ? 'warn' : 'ok', notes: [`${gbText(used)} GB used of your ${gb} GB disk`] });
+        tone: percent === 0 ? 'danger' : percent <= 20 ? 'warn' : 'ok', notes: [`${gbText(used)} GB used of your ${gb} GB disk`] });
 }
 
 /** The one state banner, or null. It carries the page's only primary in its state. */

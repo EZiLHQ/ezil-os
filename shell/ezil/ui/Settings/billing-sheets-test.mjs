@@ -399,12 +399,14 @@ test('v2 copy scan positive controls and responsive/focus/motion styles', async 
 });
 test('v3 upgrade shows the round-3 bullets, prorated price, what happens next, exact target and recoverable failure', async h => {
     h.summary = summaryV3();
+    // Round 5 D3: the Standard computer keeps its own disk on the upgrade (it does not grow yet).
+    h.summary.computer.disk = { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false };
     h.reply = method => method === 'billing.previewUpgrade' ? ok({ ...preview, toSku: 'premium_monthly_v3', lines: [{ description: 'Remaining Premium', amountCents: 1200 }], amountDueCents: 1200 }) : fail('stripe_unavailable');
     await h.ready('upgrade');
     assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$100\/month/);
     // Plan §6.4 bullet order: configurations → storage → AI credits → computer time.
     assert.deepEqual([...h.doc.querySelectorAll('[data-role="sheet-body"] li')].map(li => li.textContent), [
-        'Choose 2, 4 or 8 vCPU — up to 32 GB', '50 GB disk for your projects', '1,000 AI credits every month', '500 hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)']);
+        'Choose 2, 4 or 8 vCPU — up to 32 GB', 'Your computer keeps its 50 GB disk', '1,000 AI credits every month', '500 hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)']);
     // D1: floor(grant × 800 / 1,656,000) — the preview's 212.599 h grant is 369 credits.
     assert.match(h.text(), /What happens next/);
     assert.match(h.text(), /TodayPremium starts and 369 AI credits are added\./);

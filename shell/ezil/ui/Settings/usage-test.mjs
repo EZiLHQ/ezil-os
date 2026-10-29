@@ -14,11 +14,13 @@ const { default: tab, usageHtml } = await import(moduleUrl(src));
 let passed = 0;
 function check(name, fn) { fn(); passed++; console.log(`PASS ${name}`); }
 // Render checks also run where the worker cannot access the jsdom dependency.
-for (const [state, used, balance, bytes] of [
-    ['ok', 86400, 120, '1200000000'], ['warn', 115200, 40, '1600000000'],
-    ['danger', 144000, 0, '2000000000'], ['unavailable', null, null, null],
+// Round 5 (D6): warn/danger come from the server (fair use, AI state); storage from the disk left.
+for (const [state, used, balance, bytes, fair, aiState] of [
+    ['ok', 86400, 120, '1200000000', 'ok', 'ok'], ['warn', 115200, 40, '1600000000', 'near', 'low'],
+    ['danger', 144000, 0, '2000000000', 'paused', 'exhausted'], ['unavailable', null, null, null, 'ok', 'ok'],
 ]) {
-    const html = usageHtml({ ...sample, period: { ...sample.period, usedStandardSeconds: used }, storage: { ...sample.storage, samples: [{ ...sample.storage.samples[0], bytes }] } }, { ...summary, ai: { ...summary.ai, balance } });
+    const html = usageHtml({ ...sample, period: { ...sample.period, usedStandardSeconds: used, remainingStandardSeconds: used === null ? null : 144000 - used }, storage: { ...sample.storage, samples: [{ ...sample.storage.samples[0], bytes }] } },
+        { ...summary, fairUse: { ...summary.fairUse, status: fair }, ai: { ...summary.ai, balance, state: aiState } });
     for (const id of ['compute', 'ai', 'storage']) check(`render ${id}: ${state}`, () => {
         const row = html.match(new RegExp(`<section[^>]*data-usage="${id}"[^>]*>[\\s\\S]*?</section>`))[0];
         assert.match(row, new RegExp(`data-state="${state}"`));
@@ -30,7 +32,8 @@ check('render uses server grants, decimal storage and Billing deep links', () =>
     const html = usageHtml(sample, summary);
     assert.match(html, /href="\/os\?settings=billing&amp;section=ai-credits"/);
     assert.match(html, /Your plan adds 200 every month/);
-    assert.match(html, /1.2 GB of 2 GB/);
+    assert.match(html, /800 MB left/);
+    assert.match(html, /1.2 GB used of your 2 GB disk/);
     assert.match(usageHtml(sample, { ...summary, ai: { ...summary.ai, grant: { amount: 73, per: 'once' } } }), /Includes 73 one-time trial credits/);
 });
 check('render keeps null sources honest and escapes plan names', () => {
@@ -43,7 +46,9 @@ check('render keeps null sources honest and escapes plan names', () => {
 check('render has no proportions for invalid compute and storage caps', () => {
     for (const value of [null, undefined, -1, NaN, Infinity, Number.MAX_SAFE_INTEGER * 2]) {
         const html = usageHtml({ ...sample, period: { ...sample.period, allowanceStandardSeconds: value }, storage: { ...sample.storage, capBytes: value } }, summary);
-        assert.equal((html.match(/role="progressbar"/g) ?? []).length, 1, 'only the AI bar remains');
+        const storage = usageHtml({ ...sample, period: { ...sample.period, allowanceStandardSeconds: value }, storage: { ...sample.storage, disk: { provisionedGiB: value, usedBytes: null } } }, summary);
+        assert.equal((storage.match(/role="progressbar"/g) ?? []).length, 1, 'only the AI bar remains');
+        assert.equal((html.match(/role="progressbar"/g) ?? []).length, 2, 'the capBytes constant is never a disk: storage is measured against the real disk');
     }
 });
 if (process.argv.includes('--render-only')) {
@@ -73,29 +78,32 @@ check('normal layout, units, reset date and collapsed disclosures', () => {
     assert.doesNotMatch(meter(el, 'compute').textContent, /24 h of 40 h/);
     assert.match(meter(el, 'ai').textContent, /120 of 200 left/);
     assert.match(meter(el, 'ai').textContent, /Your plan adds 200 every month/);
-    assert.match(meter(el, 'storage').textContent, /1.2 GB of 2 GB/);
+    assert.match(meter(el, 'storage').textContent, /800 MB left/);
+    assert.match(meter(el, 'storage').textContent, /1.2 GB used of your 2 GB disk/);
     assert.match(meter(el, 'session').textContent, /This session: 1 h 30 min · running · ends/);
     assert.deepEqual([...el.querySelectorAll('details')].map(el => el.dataset.usageDetail), ['period', 'storage', 'session']);
     assert.equal(el.querySelectorAll('details[open]').length, 0);
     assert.doesNotMatch(el.textContent, /Standard time|Compute allowance|Network transfer|Meter recording|Unlimited|compute hours|standard-hour|%/i);
 });
-for (const [state, used, balance, storage, percent] of [
-    ['ok', 86400, 120, '1200000000', 60], ['warn', 115200, 40, '1600000000', 80],
-    ['danger', 144000, 0, '2000000000', 100], ['unavailable', null, null, null, null],
+// Round 5 (D6): every bar is what is LEFT; warn/danger follow the server state (time, AI) or the disk left.
+for (const [state, used, balance, storage, percent, fair, aiState] of [
+    ['ok', 86400, 120, '1200000000', 40, 'ok', 'ok'], ['warn', 115200, 40, '1600000000', 20, 'near', 'low'],
+    ['danger', 144000, 0, '2000000000', 0, 'paused', 'exhausted'], ['unavailable', null, null, null, null, 'ok', 'ok'],
 ]) {
     for (const id of ['compute', 'ai', 'storage']) check(`${id}: ${state} state and accessible bar`, () => {
-        const el = rendered({ ...withPeriod({ usedStandardSeconds: used }), storage: withStorage(storage).storage }, withAI({ balance }));
+        const el = rendered({ ...withPeriod({ usedStandardSeconds: used, remainingStandardSeconds: used === null ? null : 144000 - used }), storage: withStorage(storage).storage },
+            { ...withAI({ balance, state: aiState }), fairUse: { ...summary.fairUse, status: fair } });
         const section = meter(el, id), bar = progress(el, id);
         assert.equal(section.dataset.state, state);
         assert.ok(section.classList.contains(`usage-${state}`));
         assert.equal(section.getAttribute('aria-labelledby'), section.querySelector('h4').id);
         if (percent === null) {
             assert.equal(bar, null);
-            assert.match(section.textContent, id === 'ai' ? /Unavailable/ : /Not measured/);
+            assert.match(section.textContent, id === 'ai' ? /Unavailable/ : id === 'storage' ? /2 GB disk/ : /Not measured/);
         } else {
             assert.equal(bar.getAttribute('aria-valuemin'), '0');
             assert.equal(bar.getAttribute('aria-valuemax'), '100');
-            assert.equal(Number(bar.getAttribute('aria-valuenow')), id === 'ai' ? balance / 200 * 100 : percent);
+            assert.equal(Number(bar.getAttribute('aria-valuenow')), id === 'ai' ? Math.floor(balance / 200 * 100) : percent);
             assert.equal(bar.getAttribute('aria-labelledby'), section.querySelector('h4').id);
             assert.equal(bar.hasAttribute('tabindex'), false);
             assert.ok(bar.getAttribute('aria-valuetext').length > 10);
@@ -108,7 +116,7 @@ check('bar descriptions identify used time, credits left and measured storage', 
     const el = rendered();
     assert.equal(progress(el, 'compute').getAttribute('aria-valuetext'), 'About 16 hours left at 2 vCPU.');
     assert.equal(progress(el, 'ai').getAttribute('aria-valuetext'), '120 credits left. Plan adds 200 every month.');
-    assert.equal(progress(el, 'storage').getAttribute('aria-valuetext'), '1.2 GB used of 2 GB.');
+    assert.equal(progress(el, 'storage').getAttribute('aria-valuetext'), '800 MB left of 2 GB.');
 });
 check('invalid caps and readings never create a proportion', () => {
     for (const value of [null, undefined, -1, NaN, Infinity, '100', Number.MAX_SAFE_INTEGER * 2]) {
@@ -117,23 +125,24 @@ check('invalid caps and readings never create a proportion', () => {
         assert.equal(progress(el, 'ai'), null);
         assert.match(meter(el, 'compute').textContent, /Not measured/);
         assert.doesNotMatch(el.textContent, /Unlimited/);
-        assert.equal(progress(rendered(withPeriod({ usedStandardSeconds: value })), 'compute'), null);
-        const storage = rendered({ ...sample, storage: { ...sample.storage, capBytes: value } });
-        if (value !== '100') assert.equal(progress(storage, 'storage'), null);
+        assert.equal(progress(rendered(withPeriod({ usedStandardSeconds: value, remainingStandardSeconds: value })), 'compute'), null);
+        const storage = rendered({ ...sample, storage: { ...sample.storage, disk: { provisionedGiB: value, usedBytes: null } } });
+        assert.equal(progress(storage, 'storage'), null);
     }
     assert.equal(progress(rendered(withPeriod({ usedStandardSeconds: 0, allowanceStandardSeconds: 0 })), 'compute'), null);
     assert.match(meter(rendered(withPeriod({ allowanceStandardSeconds: 0 })), 'compute').textContent, /No computer time included this period/);
 });
-check('zero, tiny and over-cap usage; server remaining is authoritative', () => {
-    const zero = rendered(withPeriod({ usedStandardSeconds: 0 }));
-    assert.equal(progress(zero, 'compute').getAttribute('aria-valuenow'), '0');
-    assert.match(meter(zero, 'compute').textContent, /About 16 hours left at 2 vCPU/);
-    assert.equal(progress(zero, 'compute').querySelector('.usage-fill'), null);
-    const tiny = rendered(withPeriod({ usedStandardSeconds: 1 }));
-    assert.equal(Number(progress(tiny, 'compute').getAttribute('aria-valuenow')), 1 / 144000 * 100);
-    assert.ok(progress(tiny, 'compute').querySelector('.usage-fill'));
-    const over = rendered(withPeriod({ usedStandardSeconds: 200000, remainingStandardSeconds: 7 }));
-    assert.equal(progress(over, 'compute').getAttribute('aria-valuenow'), '100');
+check('full, tiny and used-up time; server remaining is authoritative', () => {
+    const full = rendered(withPeriod({ usedStandardSeconds: 0, remainingStandardSeconds: 144000 }));
+    assert.equal(progress(full, 'compute').getAttribute('aria-valuenow'), '100');
+    assert.ok(progress(full, 'compute').querySelector('.usage-fill'));
+    const tiny = rendered(withPeriod({ usedStandardSeconds: 143999, remainingStandardSeconds: 1 }));
+    assert.equal(progress(tiny, 'compute').getAttribute('aria-valuenow'), '0');
+    assert.equal(progress(tiny, 'compute').querySelector('.usage-fill'), null);
+    // The server's remaining wins over a used figure that disagrees.
+    assert.equal(progress(rendered(withPeriod({ usedStandardSeconds: 0 })), 'compute').getAttribute('aria-valuenow'), '40');
+    const over = rendered(withPeriod({ usedStandardSeconds: 200000, remainingStandardSeconds: 0 }));
+    assert.equal(progress(over, 'compute').getAttribute('aria-valuenow'), '0');
     assert.match(meter(over, 'compute').textContent, /No computer time left · new sessions paused/);
     assert.equal(over.querySelectorAll('.ezil-settings-btn-primary').length, 1);
     assert.ok(over.querySelector('.usage-banner .ezil-settings-btn-primary'));
@@ -144,35 +153,43 @@ check('server fair-use state and reset fallback', () => {
     assert.equal(meter(el, 'compute').dataset.state, 'warn');
     assert.match(meter(el, 'compute').textContent, /this session ends and new sessions pause until/);
     assert.equal(el.querySelector('.usage-plan time').getAttribute('datetime'), summary.fairUse.resetsAt);
-    assert.equal(meter(rendered(withPeriod({ usedStandardSeconds: 144000 }), { ...summary, fairUse: { ...summary.fairUse, status: 'near' } }), 'compute').dataset.state, 'danger');
+    assert.equal(meter(rendered(withPeriod({ usedStandardSeconds: 144000, remainingStandardSeconds: 0 }), { ...summary, fairUse: { ...summary.fairUse, status: 'near' } }), 'compute').dataset.state, 'danger');
+    // Low is the server's call only: 15 % left with state ok is not "Running low".
+    assert.equal(meter(rendered(withPeriod({ usedStandardSeconds: 122400, remainingStandardSeconds: 21600 }), summary), 'compute').dataset.state, 'ok');
+    assert.doesNotMatch(meter(rendered(sample, withAI({ balance: 30 })), 'ai').textContent, /Running low/);
 });
 check('AI topups, trial grants, zero grants and microcredits', () => {
     const topup = rendered(sample, withAI({ balance: 1200 }));
     assert.equal(progress(topup, 'ai').getAttribute('aria-valuenow'), '100');
-    assert.match(meter(topup, 'ai').textContent, /1,200 of 200 left/);
+    assert.match(meter(topup, 'ai').textContent, /1,200 left/);
+    assert.match(meter(topup, 'ai').textContent, /200 from your plan \+ 1,000 extra/);
+    assert.doesNotMatch(meter(topup, 'ai').textContent, /1,200 of 200/);
     const trial = rendered(sample, withAI({ grant: { amount: 73, per: 'once' }, balance: 50 }));
     assert.match(meter(trial, 'ai').textContent, /Includes 73 one-time trial credits/);
     const zero = rendered(sample, withAI({ grant: { amount: 0, per: 'period' } }));
     assert.equal(progress(zero, 'ai'), null);
     assert.doesNotMatch(meter(zero, 'ai').textContent, /Your plan adds|of 0/);
     const micro = rendered(sample, withAI({ balance: null, balanceMicro: '123456789' }));
-    assert.match(meter(micro, 'ai').textContent, /123.456789/);
-    assert.equal(Number(progress(micro, 'ai').getAttribute('aria-valuenow')), 123.456789 / 200 * 100);
+    // Whole credits only: the microcredit balance floors to 123.
+    assert.match(meter(micro, 'ai').textContent, /123 of 200 left/);
+    assert.doesNotMatch(meter(micro, 'ai').textContent, /123\.4/);
+    assert.equal(progress(micro, 'ai').getAttribute('aria-valuenow'), '61');
     assert.equal(progress(rendered(sample, withAI({ balance: -1 })), 'ai'), null);
 });
 check('storage sampling gate, totals, latest measurement and 100% danger threshold', () => {
-    const absent = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '2000000000', samples: [] } }, { ...summary, storage: { ...summary.storage, usedBytes: '0' } });
+    const absent = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '2000000000', samples: [] } }, { ...summary, storage: { ...summary.storage, usedBytes: '0' } }); // no disk reported
     // Round 3 D4: no invented "Limit 2 GB" (the legacy v1 Free constant).
     assert.match(meter(absent, 'storage').textContent, /Not measured yet/);
     assert.doesNotMatch(meter(absent, 'storage').textContent, /Limit|2 GB/);
     assert.equal(progress(absent, 'storage'), null);
     const two = rendered({ ...sample, storage: { ...sample.storage, samples: [...sample.storage.samples, { computerId: '<img src=x>', bytes: '200000000', measuredAt: '2026-10-26T00:00:00Z' }] } });
-    assert.match(meter(two, 'storage').textContent, /1.4 GB of 2 GB/);
+    assert.match(meter(two, 'storage').textContent, /1.4 GB used of your 2 GB disk/);
+    assert.match(meter(two, 'storage').textContent, /600 MB left/);
     assert.equal(meter(two, 'storage').querySelector('time').getAttribute('datetime'), '2026-10-26T00:00:00Z');
     assert.doesNotMatch(two.textContent, /<img|computer-a/);
     assert.match(meter(rendered(withStorage('123')), 'storage').textContent, /123 bytes/);
     assert.equal(meter(rendered(withStorage('1900000000'), { ...summary, storage: { ...summary.storage, state: 'exhausted' } }), 'storage').dataset.state, 'warn');
-    assert.equal(progress(rendered(withStorage('3000000000')), 'storage').getAttribute('aria-valuenow'), '100');
+    assert.equal(progress(rendered(withStorage('3000000000')), 'storage').getAttribute('aria-valuenow'), '0');
     assert.equal(progress(rendered(withStorage('9007199254740992')), 'storage'), null);
 });
 check('round 3: hours left at weight 1, 2 and 4 with the equivalents; never standard-seconds as hours', () => {
@@ -204,7 +221,7 @@ check('round 3: AI credits split into this period, purchased, starter and renewa
         purchased: { remaining: 500, expiresAt: '2027-01-15T00:00:00Z' }, starter: null, pendingFromRenewal: null }));
     assert.match(meter(el, 'ai').textContent, /812 of 1,000 left/);
     assert.match(meter(el, 'ai').textContent, /\+ 500 purchased · expire/);
-    assert.equal(Number(progress(el, 'ai').getAttribute('aria-valuenow')), 81.2);
+    assert.equal(progress(el, 'ai').getAttribute('aria-valuenow'), '81');
     assert.doesNotMatch(meter(el, 'ai').textContent, /Your plan adds/);
     const upgraded = rendered(sample, withAI({ balance: 569, included: { granted: 369, remaining: 369, periodEnd: '2026-11-27T00:00:00Z' }, pendingFromRenewal: { credits: 1000, at: '2026-11-27T00:00:00Z' } }));
     assert.match(meter(upgraded, 'ai').textContent, /369 of 369 left/);
@@ -216,20 +233,24 @@ check('round 3: AI credits split into this period, purchased, starter and renewa
 check('round 3: storage is the provisioned disk; used only when measured; Free shows no number', () => {
     const disk = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: null }, samples: [] } });
     assert.match(meter(disk, 'storage').textContent, /50 GB disk/);
-    assert.match(meter(disk, 'storage').textContent, /For your projects · the same on every configuration/);
+    assert.match(meter(disk, 'storage').textContent, /50 GB disk for your projects/);
+    assert.doesNotMatch(disk.textContent, /same on every configuration|stays the same/i);
     assert.equal(progress(disk, 'storage'), null);
     const used = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: '12000000000' }, samples: [] } });
-    assert.match(meter(used, 'storage').textContent, /12 GB of 50 GB/);
+    assert.match(meter(used, 'storage').textContent, /38 GB left/);
+    assert.match(meter(used, 'storage').textContent, /12 GB used of your 50 GB disk/);
+    assert.equal(progress(used, 'storage').getAttribute('aria-valuenow'), '76');
     assert.ok(progress(used, 'storage'));
     const free = rendered({ ...sample, storage: { state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null }, samples: [] } });
     assert.doesNotMatch(meter(free, 'storage').textContent, /\d+ GB|Limit/);
-    assert.match(meter(free, 'storage').textContent, /Your files are saved with your computer\./);
+    assert.match(meter(free, 'storage').textContent, /Your files are saved between sessions\./);
 });
 check('session states and null runtime remain honest', () => {
     for (const state of ['stale', 'ended', 'unavailable']) {
         const el = rendered({ ...sample, session: { ...sample.session, state, endedAt: state === 'ended' ? sample.asOf : null } });
         assert.doesNotMatch(meter(el, 'session').textContent, /running/);
-        assert.match(meter(el, 'session').textContent, state === 'stale' ? /so far · Update delayed/ : state === 'ended' ? /Last session:.*ended/ : /No session recorded yet/);
+        assert.match(meter(el, 'session').textContent, state === 'stale' ? /Measuring this session…/ : state === 'ended' ? /Last session:.*ended/ : /No session recorded yet/);
+        assert.doesNotMatch(meter(el, 'session').textContent, /Update delayed|0 s so far/);
     }
     assert.match(meter(rendered({ ...sample, session: { ...sample.session, elapsedSeconds: null } }), 'session').textContent, /Unavailable/);
     assert.match(meter(rendered({ ...sample, session: { ...sample.session, elapsedSeconds: 7 } }), 'session').textContent, /7 s/);
@@ -330,10 +351,11 @@ try {
     details.querySelector('summary').focus();
     u = deferred(); s = deferred(); replies = { 'billing.usage': u.promise, 'billing.summary': s.promise };
     await triggerTimer(30000);
-    assert.match(win.text(), /1 h 30 min/);
+    // While the poll is out, the last observations stay; the session line says it is measuring (D6).
+    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
     assert.equal(win.find('details[data-usage-detail="session"]').get(0), details);
     assert.equal(document.activeElement, details.querySelector('summary'));
-    assert.match(win.find('.usage-session-line').text(), /Update delayed/);
+    assert.match(win.find('.usage-session-line').text(), /Measuring this session…/);
     s.resolve({ ok: true, data: summary }); await tick();
     assert.doesNotMatch(win.find('.usage-session-line').text(), /running/);
     u.resolve({ ok: true, data: sample }); await tick();
@@ -346,8 +368,8 @@ try {
 
     success(); replies['billing.usage'] = Promise.resolve({ ok: false }); await triggerTimer(30000);
     assert.match(win.text(), /Couldn't refresh/);
-    assert.match(win.text(), /1 h 30 min/);
-    assert.match(win.find('.usage-session-line').text(), /Update delayed/);
+    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
+    assert.match(win.find('.usage-session-line').text(), /Measuring this session…/);
     assert.doesNotMatch(win.find('.usage-session-line').text(), /running/);
     assert.match(win.text(), /120 of 200 left/);
     success(); replies['billing.summary'] = Promise.reject(Error('summary failed')); await refresh();
@@ -356,13 +378,13 @@ try {
     assert.equal(win.find('[data-action="usage-add-credits"]').length, 0);
     passed++; console.log('PASS partial failures retain usage honestly without blanking successful sections');
 
-    const near = withPeriod({ usedStandardSeconds: 115200 }); success(near); await refresh();
+    const near = withPeriod({ usedStandardSeconds: 115200, remainingStandardSeconds: 28800 }); success(near, { ...summary, fairUse: { ...summary.fairUse, status: 'near' } }); await refresh();
     const live = win.find('[data-role="usage-announcement"]').get(0), announced = live.firstChild;
     assert.match(live.textContent, /nearly used up/);
-    success(near); await triggerTimer(30000);
+    success(near, { ...summary, fairUse: { ...summary.fairUse, status: 'near' } }); await triggerTimer(30000);
     assert.equal(live.firstChild, announced, 'unchanged polling does not rewrite the live region');
     assert.equal(win.find('[data-role="usage-refresh-status"]').attr('role'), undefined);
-    success(withPeriod({ usedStandardSeconds: 144000 })); await refresh();
+    success(withPeriod({ usedStandardSeconds: 144000, remainingStandardSeconds: 0 })); await refresh();
     assert.match(live.textContent, /Computer time is used up/);
     passed++; console.log('PASS only state changes are announced during automatic refresh');
 

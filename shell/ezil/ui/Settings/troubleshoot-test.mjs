@@ -48,8 +48,13 @@ check('the restart copy passes scanCopy', () => {
     const all = [...codes, 'unsupported', 'timeout', 'fetch_failed', 'unauthorized', 'bad_request', 'stop_timed_out', 'boot_failed', 'user_hours_cap'].map(reasonCopy).join(' ');
     assert.deepEqual(scanCopy(all), []);
     const tab = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'utf8');
-    for ( const copy of ['Restarts the desktop and its apps on this machine. Files stay. About 20 seconds.', 'Stops your computer and starts it again. Files stay. 1–4 minutes.'] ) {
-        assert.ok(tab.includes(copy), copy);
+    // Round 5 (D6): one Restart duration, quoted in the description and while it runs.
+    const restartTime = 'Restarting usually takes about 45 seconds and can take up to 3 minutes.';
+    assert.ok(tab.includes(`const RESTART_DESKTOP_TIME = '${restartTime}';`));
+    assert.ok(tab.includes('Restarts the desktop and its apps on this machine. Files stay. ${RESTART_DESKTOP_TIME}'));
+    assert.doesNotMatch(tab, /About 20 seconds/);
+    for ( const copy of [`Restarts the desktop and its apps on this machine. Files stay. ${restartTime}`, 'Stops your computer and starts it again. Files stay. 1–4 minutes.'] ) {
+        assert.ok(tab.includes(copy) || copy.endsWith(restartTime), copy);
         assert.deepEqual(scanCopy(copy), []);
     }
 });

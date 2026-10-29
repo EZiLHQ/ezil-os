@@ -105,7 +105,7 @@ export function upgradeAiCreditsFromGrant (grantStdSeconds, fromOffer, toOffer) 
  * credits → computer time. Built from the offer's numbers, never from
  * `offer.bullets` (catalog copy that predates round 3).
  */
-export function planBullets (offer) {
+export function planBullets (offer, { existingDisk } = {}) {
     // A field the offer lacks drops its bullet rather than printing "undefined".
     const known = value => Number.isSafeInteger(value) && value > 0;
     const credits = known(offer.aiCredits?.amount) ? whole(offer.aiCredits.amount) : null;
@@ -118,11 +118,16 @@ export function planBullets (offer) {
         credits && `${credits} AI credits to start`,
         hours && `${hours} hours of computer time each month`,
     ]) };
-    // Round 5 D3: the plan's disk for a new computer (`offer.storageGiB`); 50 GB when an older server omits it.
+    // Round 5 D3: the plan's disk for a NEW computer (`offer.storageGiB`); 50 GB when an older server omits it.
+    // An existing AWS computer (an upgrade or a change to a lower plan) keeps its own disk until the
+    // server can grow it (`computer.disk.growsOnSwitch`), so its bullet names that disk, never the plan's.
     const disk = known(offer.storageGiB) ? offer.storageGiB : PAID_DISK_GB;
+    const keeps = existingDisk && existingDisk.growsOnSwitch !== true;
+    const diskBullet = ! keeps ? `${disk} GB disk for your projects`
+        : known(existingDisk.provisionedGiB) ? `Your computer keeps its ${existingDisk.provisionedGiB} GB disk` : 'Your computer keeps its disk';
     if ( offer.sku === 'standard_monthly_v3' ) return { lead: 'Everything in Free, plus:', bullets: keep([
         `Your own AWS computer${size}`,
-        `${disk} GB disk for your projects`,
+        diskBullet,
         credits && `${credits} AI credits every month`,
         hours && `${hours} hours of computer time each month`,
     ]) };
@@ -133,7 +138,7 @@ export function planBullets (offer) {
     const most = Math.max(offer.memoryGiB ?? 0, ...choices.map(code => memory[code] ?? 0));
     return { lead: 'Everything in Standard, plus:', bullets: keep([
         listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `Your own AWS computer${size}`,
-        `${disk} GB disk for your projects`,
+        diskBullet,
         credits && `${credits} AI credits every month`,
         hours && `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
     ]) };

@@ -530,7 +530,7 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
     const ts = () => q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
     push('Troubleshoot offers two different restarts with their own descriptions',
         !! ts()?.querySelector('[data-action="restart"]') && !! ts()?.querySelector('[data-action="restart-computer"]')
-        && /Restarts the desktop and its apps on this machine\. Files stay\. About 20 seconds\./.test(ts()?.textContent ?? '')
+        && /Restarts the desktop and its apps on this machine\. Files stay\. Restarting usually takes about 45 seconds and can take up to 3 minutes\./.test(ts()?.textContent ?? '')
         && /Stops your computer and starts it again\. Files stay\. 1–4 minutes\./.test(ts()?.textContent ?? ''));
     const realFetch = window.fetch;
     const bodies = [];
@@ -833,8 +833,10 @@ push('c-d is "Your computer"; c-e is an older computer with no Open or Switch',
     && ! q('.window[data-app="settings"] [data-role="older-computer"] [data-action="open"], .window[data-app="settings"] [data-action="switch"]'));
 click(q('.window[data-app="settings"] [data-action="stop"]'));
 await settle(6);
-push('Stop asks for confirmation first', /Stop your computer\?/.test(q('.window-alert-message')?.textContent ?? ''));
-const stopConfirm = qa('.window button').find(b => b.textContent.trim() === 'Stop' && b.closest('.window')?.querySelector('.window-alert-message'));
+// Round 5 (D6): the confirmation is the sheet frame (openConfirmSheet), not the legacy UIAlert.
+const stopSheet = q('[role="dialog"][data-sheet="confirm-stop"]');
+push('Stop asks for confirmation first', /Stop your computer\?/.test(stopSheet?.textContent ?? '') && q('.window-alert-message') === null);
+const stopConfirm = stopSheet?.querySelector('[data-action="confirm"]');
 click(stopConfirm);
 await settle(30, 40);
 const stopCall = calls.find(c => c.url.endsWith('/api/shell/stop'));

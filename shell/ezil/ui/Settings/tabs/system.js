@@ -309,7 +309,7 @@ function paint () {
     }
     // D6: the plain answer (where it runs, on which configuration) stays in view; identifiers, the
     // slot, the image, the measurements and how each value was obtained sit behind a closed Details.
-    const detailsOpen = host.querySelector('details[data-role="sys-details"]')?.open === true;
+    const detailsOpen = host.querySelector?.('details[data-role="sys-details"]')?.open === true;
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to.</p>

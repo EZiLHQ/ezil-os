@@ -104,7 +104,7 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     ].filter(Boolean);
     const aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
         : enrollment === 'activating' ? (waiting ? `${esc(creditsLabel(null, waiting))} credits are added when this finishes.` : '')
-        : [aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : split || grantNote, ...(split && aiState !== 'ok' ? [split] : []), ...extras].filter(Boolean).join('<br>');
+        : (status => [status, split, status ? '' : grantNote, ...extras])(aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : '').filter(Boolean).join('<br>');
     const aiValue = enrollment === 'needs_ezil_id' ? waiting ? `${esc(creditsLabel(null, waiting))} credits waiting` : 'Not active yet'
         : enrollment === 'activating' ? 'Setting up your AI credits…'
         : balance === null ? 'Unavailable' : aboveGrant ? `${esc(balanceLabel)} left`
@@ -124,7 +124,7 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const leftBytes = usedBytes !== null && capBytes !== null ? Math.max(0, capBytes - usedBytes) : null;
     const storageLeft = ratio(leftBytes, capBytes);
     const storagePercent = storageLeft === null ? null : Math.floor(storageLeft);
-    const storageState = storagePercent === null ? 'unavailable' : storagePercent === 0 ? 'danger' : storagePercent <= 10 ? 'warn' : 'ok';
+    const storageState = storagePercent === null ? 'unavailable' : storagePercent === 0 ? 'danger' : storagePercent <= 20 ? 'warn' : 'ok';
     const measuredAt = samples.map(sample => sample.measuredAt).filter(validDate).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
     const freePlan = summary?.plan?.sku === 'free_v3';
     const storageValue = leftBytes !== null ? `${esc(bytes(leftBytes))} left`

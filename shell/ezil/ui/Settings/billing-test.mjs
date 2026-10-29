@@ -172,6 +172,8 @@ function audit () {
         assert.ok(element.getAttribute('aria-label') || (element.type === 'radio' ? [...element.labels].map(label => label.textContent).join('').trim() : element.textContent.trim()), 'control has an accessible name');
     }
     assert.ok(qa('.ezil-billing-header .ezil-settings-btn-primary, [data-role="plan-card"] .ezil-settings-btn-primary, [data-role="billing-nudge"] .ezil-settings-btn-primary').length <= 1, 'at most one primary on the main surface');
+    // Round 5 (D6): on v3 the WHOLE pane has at most one primary, whatever the state.
+    if ( summary?.version === 3 ) assert.ok(qa('[data-pane="billing"] .ezil-settings-btn-primary').length <= 1, 'v3: at most one primary in the pane');
     assert.equal(qa('.ezil-billing-card h3, .ezil-billing-meter h3').length, 0, 'card headings use h4');
     assert.deepEqual(errors, []);
     assert.doesNotMatch(text(), honestyBans);
@@ -837,37 +839,45 @@ try {
     await refresh(); contains('[data-role="plan-card"]', '90 standard-hours each billing period'); contains('.ezil-billing-price', '$30/month');
     pass('disabled/v1 summaries, failed summary retry, loading state and prorated plan-card source');
 
+    // Round 5 (D6): one column — header, one state banner, current plan + Your computer, one usage card,
+    // three plan cards, the AI top-up disclosure, invoices, footer. At most one primary per state (audit).
     for ( const tier of ['free', 'standard', 'premium'] ) {
         summary = summaryV3(tier); await open();
         contains('[data-role="plan-card"]', summary.plan.name);
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
         contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === null ? 'No session time limit' : 'Sessions up to 1 hour');
+        contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Change configuration ›');
         if ( tier !== 'free' ) {
-            contains('[data-role="plan-card"]', `$${tier === 'standard' ? 20 : 100}/month · renews Nov 1, 2026`);
-            contains('[data-role="plan-status"]', 'Current');
-            contains('[data-role="your-computer"]', 'Your own computer on AWS (India)');
-            contains('[data-action="portal"]', 'Manage payment');
-            contains('[data-action="cancel"]', 'Cancel');
-        }
+            contains('[data-role="plan-card"]', `$${tier === 'standard' ? 20 : 100} / month`);
+            contains('[data-role="plan-card"]', `Renews on Nov 1, 2026 for $${tier === 'standard' ? 20 : 100}.`);
+            contains('[data-role="plan-status"]', 'Active');
+            contains('[data-role="your-computer"]', 'AWS (India)');
+            contains('.ezil-billing-header [data-action="portal"]', 'Manage payment');
+            has('.ezil-billing-header [data-action="portal"].ezil-settings-btn-primary', false);
+            contains('.ezil-billing-v3-footer [data-action="cancel"]', 'Cancel plan');
+        } else contains('[data-role="plan-card"]', 'Free · no card on file');
         contains('[data-role="fair-use"]', 'Within fair use');
-        for ( const selector of ['[role="progressbar"]', '[data-meter]', '[data-role="size-selector"]', '[data-role="overage"]', '[data-role="estimate"]'] ) has(selector, false);
-        assert.doesNotMatch(text(), /\bcompute\b|standard-hour|instant|unlimited/i);
-        const action = tier === 'free' ? 'choose' : tier === 'standard' ? 'upgrade' : 'downgrade';
-        click(q(`[data-action="${action}"]`));
+        for ( const selector of ['[role="progressbar"]', '[data-meter]', '[data-role="size-selector"]', '[data-role="overage"]', '[data-role="estimate"]', '[data-role="ai-usage"]'] ) has(selector, false);
+        assert.doesNotMatch(text(), /\bcompute\b|standard-hour|instant|unlimited|Next start:/i);
+        assert.deepEqual(qa('[data-role="plans"] [data-role="plan-offer"]').map(card => card.dataset.sku), ['free_v3', 'standard_monthly_v3', 'premium_monthly_v3']);
+        contains(`[data-role="plan-offer"][data-sku="${summary.plan.sku}"][data-current]`, 'Current plan');
+        const primary = qa('[data-pane="billing"] .ezil-settings-btn-primary');
+        assert.deepEqual(primary.map(button => button.textContent), tier === 'free' ? ['Upgrade to Standard'] : tier === 'standard' ? ['Upgrade to Premium'] : []);
+        const action = tier === 'free' ? '[data-role="plan-actions"] [data-action="checkout"]' : tier === 'standard' ? '[data-role="plan-actions"] [data-action="upgrade"]' : '[data-action="downgrade"]';
+        click(q(action));
         if ( tier === 'free' ) {
-            has('[data-sheet="choose"]');
-            assert.equal(qa('[data-sheet="choose"] li').length, 12);
-            assert.equal(q('[data-sheet="choose"] [data-role="current-plan"]').disabled, true);
-            click(q('[data-sheet="choose"] [data-sku="standard_monthly_v3"]'));
             assert.equal(sheets.at(-1).kind, 'checkout');
             assert.equal(sheets.at(-1).sku, 'standard_monthly_v3');
-            has('[data-sheet="choose"]', false);
-        } else assert.equal(sheets.at(-1).kind, action);
+        } else assert.equal(sheets.at(-1).kind, tier === 'standard' ? 'upgrade' : 'downgrade');
         await closeSheet();
     }
-    // Round 3 (plan §6.3): the configuration choice moved to Settings → Computer.
-    // Billing shows the three meters and, on Premium, a way to that tab.
+    // From Free, every higher plan card is a secondary checkout; Premium reaches Standard as a link.
+    summary = summaryV3('free'); await refresh();
+    assert.deepEqual(qa('[data-role="plan-offer"] [data-action="checkout"]').map(button => [button.dataset.sku, button.textContent, button.classList.contains('ezil-settings-btn-primary')]),
+        [['standard_monthly_v3', 'Choose Standard', false], ['premium_monthly_v3', 'Choose Premium', false]]);
     summary = summaryV3('premium'); await refresh();
+    contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-action="downgrade"]', 'Switch to Standard');
+    // Round 3 (plan §6.3): the configuration choice lives in Settings → Computer; Billing links there.
     has('[data-role="machine-picker"]', false);
     assert.equal(qa('input[name="ezil-billing-machine"]').length, 0);
     assert.ok(! /Next session's computer/.test(text()));
@@ -878,80 +888,102 @@ try {
     for ( const tier of ['free', 'standard'] ) {
         summary = summaryV3(tier); await refresh();
         has('[data-role="machine-picker"]', false);
-        has('[data-action="computer-tab"]', false);
+        has('[data-action="computer-tab"]');
     }
-    // The three rows with round-3 data (plan §6.3): split AI credits, hours at
-    // the CURRENT configuration with equivalents, and the provisioned disk.
+    // The three rows (D6): every row means "left"; split AI credits, hours at the CURRENT configuration, the real disk.
     summary = summaryV3('premium');
     Object.assign(summary.ai, { included: { granted: 1000, remaining: 812, periodEnd: END }, purchased: { remaining: 500, expiresAt: '2027-01-15T00:00:00Z' }, starter: null, pendingFromRenewal: null });
-    summary.computer.disk = { provisionedGiB: 50, usedBytes: null };
-    getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 1630800,
+    summary.computer.disk = { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false };
+    getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 1630800, allowanceStandardSeconds: 1800000,
         currentSize: 'cmp-8', currentWeight: 4, remainingHoursAtCurrent: 113, equivalents: [{ size: 'std-2', weight: 1, hours: 453 }, { size: 'cmp-4', weight: 2, hours: 226 }, { size: 'cmp-8', weight: 4, hours: 113 }] } });
     await refresh(); audit();
-    contains('[data-role="meter-ai"]', '812 of 1,000 left this period · resets Nov 1');
+    contains('[data-role="meter-ai"]', '812 of 1,000 left');
+    assert.equal(q('[data-role="meter-ai"] [role="meter"]').getAttribute('aria-valuenow'), '81');
     contains('[data-role="meter-ai"]', '+ 500 purchased · expire Jan 15, 2027');
     contains('[data-role="meter-ai"]', 'Used by EZiL AI in Code and Chat.');
+    contains('[data-role="meter-time"]', '113 h left');
+    assert.equal(q('[data-role="meter-time"] [role="meter"]').getAttribute('aria-valuenow'), '90');
     contains('[data-role="meter-time"]', 'About 113 hours left at 8 vCPU · resets Nov 1');
     contains('[data-role="meter-time"]', 'Same as 226 hours at 4 vCPU or 453 hours at 2 vCPU.');
     contains('[data-role="meter-time"]', 'Bigger configurations use your monthly time sooner: 4 vCPU counts double, 8 vCPU counts four times.');
     contains('[data-role="meter-storage"]', '50 GB disk for your projects');
+    contains('[data-role="your-computer"]', '50 GB disk');
+    contains('[data-role="plans"]', 'Your computer keeps its 50 GB disk when you change plan.');
     assert.equal(calls.filter(call => call.url.includes('/billing.usage')).at(-1)?.url.includes('billing.usage'), true);
     summary.ai.pendingFromRenewal = { credits: 1000, at: END }; summary.ai.included = null; summary.ai.balance = 369; await refresh();
+    contains('[data-role="meter-ai"]', '369 of 1,000 left');
     contains('[data-role="meter-ai"]', '1,000 more from Nov 1');
     getUsage = () => failure('unavailable'); summary = summaryV3('free'); summary.computer.disk = { provisionedGiB: null, usedBytes: null }; await refresh(); audit();
-    contains('[data-role="meter-storage"]', 'Your files are saved with your computer.');
+    contains('[data-role="meter-storage"]', 'Your files are saved between sessions.');
     assert.doesNotMatch(q('[data-role="meter-storage"]').textContent, /\d+ GB/);
     contains('[data-role="meter-time"]', 'Resets Nov 1');
-    pass('no machine picker in Billing (moved to the Computer tab); Premium links there; three meter rows');
+    has('[data-role="meter-time"] [role="meter"]', false);
+    pass('D6 one column: plan card, Your computer, three left-meters, plan cards; no machine picker; Change configuration links to Computer');
     summary = summaryV3(); await refresh();
-    for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1.']] ) {
+    for ( const [status, copy] of [['near', '! Running low. A smaller configuration makes your time last longer.'], ['paused', '■ Used up. You can start your computer again on Nov 1.']] ) {
         summary.fairUse.status = status; await refresh(); contains('[data-role="fair-use"]', copy);
     }
+    contains('[data-role="fair-use-paused"]', 'Computer time is used up.');
+    contains('[data-role="fair-use-paused"] .ezil-settings-btn-primary', 'Upgrade to Premium');
+    has('[data-role="plan-actions"] .ezil-settings-btn-primary', false);
+    summary.fairUse.status = 'ok';
     summary.plan.status = 'cancels'; summary.plan.cancelsAt = END; await refresh();
-    contains('[data-role="cancels-banner"]', 'Standard ends on Nov 1. Your files are kept.'); assert.ok(!text().includes('renews'));
-    contains('[data-role="plan-actions"] [data-action="resume"].ezil-settings-btn-primary', 'Keep Standard');
+    contains('[data-role="cancels-banner"]', 'Your plan ends on Nov 1, 2026');
+    contains('[data-role="cancels-banner"]', 'You keep Standard and your computer until then. After that you move to Free. Your files are kept.');
+    assert.ok(! /renews/i.test(text()));
+    contains('[data-role="cancels-banner"] [data-action="resume"].ezil-settings-btn-primary', 'Resume plan');
+    has('.ezil-billing-v3-footer [data-action="cancel"]', false);
     summary.plan.status = 'past_due'; summary.plan.paymentIssue = 'payment_failed'; await refresh();
-    contains('[data-role="payment-banner"]', "Your last payment didn't go through. Update your payment method to keep Standard.");
-    contains('[data-role="payment-banner"] [data-action="portal"]', 'Update payment');
-    mutation = () => failure('stripe_unavailable'); click(q('[data-action="portal"]')); await settle();
-    contains('[data-role="billing-action-error"]', 'Payments are unavailable'); assert.equal(q('[data-action="portal"]').disabled, false);
+    contains('[data-role="payment-banner"]', "Your last payment didn't go through");
+    contains('[data-role="payment-banner"]', 'Update your payment method to keep Standard and your computer.');
+    contains('[data-role="payment-banner"] [data-action="portal"].ezil-settings-btn-primary', 'Update payment method');
+    mutation = () => failure('stripe_unavailable'); click(q('[data-role="payment-banner"] [data-action="portal"]')); await settle();
+    contains('[data-role="billing-action-error"]', 'Payments are unavailable'); assert.equal(q('[data-role="payment-banner"] [data-action="portal"]').disabled, false);
     mutation = () => reply({ url: 'javascript:alert(1)' }); const previousOpened = opened.length;
-    click(q('[data-action="portal"]')); await settle(); assert.equal(opened.length, previousOpened);
-    mutation = () => reply({ url: 'https://billing.example.test/v3' }); click(q('[data-action="portal"]')); await settle();
+    click(q('[data-role="payment-banner"] [data-action="portal"]')); await settle(); assert.equal(opened.length, previousOpened);
+    mutation = () => reply({ url: 'https://billing.example.test/v3' }); click(q('[data-role="payment-banner"] [data-action="portal"]')); await settle();
     assert.equal(opened.at(-1)[0], 'https://billing.example.test/v3');
+    // Upgrade waiting for payment: the banner's Finish payment opens the pending invoice.
+    summary = summaryV3(); Object.assign(summary.plan, { status: 'upgrade_pending', pendingUpgrade: { toSku: 'premium_monthly_v3', expiresAt: '2026-10-20T00:00:00Z', hostedInvoiceUrl: 'https://invoice.example.test/pending' } }); await refresh();
+    contains('[data-role="upgrade-pending"]', 'Premium starts once payment is confirmed. This link expires Oct 20.');
+    click(q('[data-role="upgrade-pending"] [data-action="open-invoice"].ezil-settings-btn-primary')); await settle();
+    assert.equal(opened.at(-1)[0], 'https://invoice.example.test/pending');
+    has('[data-role="plan-offer"][data-sku="premium_monthly_v3"] [data-action="upgrade"]', false);
     // Round 4 (D16-D18): the standing banners. Dates are UTC; the dead past_due-without-issue branch is gone.
     {
         const GRACE = '2026-11-05T00:00:00Z', ENDS = '2026-11-26T00:00:00Z';
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: GRACE });
         Object.assign(summary.computer, { standing: 'grace', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="payment-grace"]', "Your payment didn't go through — update it by Nov 5, 2026 to keep your AWS computer.");
-        contains('[data-role="payment-grace"] [data-action="portal"]', 'Fix payment');
+        contains('[data-role="payment-grace"] [data-action="portal"]', 'Update payment method');
         has('[data-role="payment-banner"]', false);
         assert.equal(qa('[data-role="payment-grace"], [data-role="payment-banner"]').length, 1, 'one payment banner');
         // In grace the new period's plan credits wait for the payment: never "0 of 0 left" + "more from <renewal>".
         Object.assign(summary.ai, { included: { granted: 0, remaining: 0, periodEnd: END }, pendingFromRenewal: { credits: 1000, at: END }, starter: { remaining: 100 } }); await refresh();
-        contains('[data-role="meter-ai"]', '0 of 1,000 this period · added once your payment goes through');
+        contains('[data-role="meter-ai"]', '0 of 1,000 this period');
+        contains('[data-role="meter-ai"]', 'Added once your payment goes through.');
         contains('[data-role="meter-ai"]', '100 starter credits left');
         assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /0 of 0|more from/);
         Object.assign(summary.ai, { included: { granted: 1000, remaining: 640, periodEnd: END } }); await refresh();
-        contains('[data-role="meter-ai"]', '640 of 1,000 left this period');
-        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/);
+        contains('[data-role="meter-ai"]', '640 of 1,000 left');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/i);
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
         Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');
         has('[data-role="cancels-banner"]', false);
-        contains('[data-role="plan-actions"] [data-action="resume"]', 'Keep Premium');
+        contains('[data-role="plan-ending"] [data-action="resume"].ezil-settings-btn-primary', 'Resume plan');
         summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.');
-        contains('[data-role="your-computer"]', 'Your files are kept on your AWS (India) computer. It opens with Free limits.');
-        contains('[data-role="plan-actions"]', 'Upgrade');
+        assert.equal(qa('[data-role="files-held"]').length, 1, 'the hold is said once');
+        contains('[data-role="your-computer"]', 'AWS (India), with Free limits');
+        contains('[data-role="plan-actions"] .ezil-settings-btn-primary', 'Upgrade to Standard');
         // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
         Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
         has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
         assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
         assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
-        // Unknown or missing standing: the round-3 Billing tab exactly.
+        // Unknown or missing standing: no standing banner.
         for ( const standing of [undefined, 'moved'] ) {
             summary = summaryV3('free'); summary.computer.standing = standing; await refresh();
             for ( const role of ['payment-grace', 'plan-ending', 'files-held'] ) has(`[data-role="${role}"]`, false);
@@ -986,7 +1018,7 @@ try {
     summary = summaryV3(); summary.plan.name = '<img src=x onerror=alert(1)>'; await refresh();
     has('[data-role="plan-card"] img', false); contains('[data-role="plan-card"]', '<img');
     for ( const key of Object.keys(summary.actions) ) summary.actions[key] = false;
-    await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false);
+    await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false); has('[data-action="cancel"]', false);
     pass('v3 DTO-only plans, fair-use states, cancellation/payment, invoices, actions, deep links, escaping and failure recovery');
 
     const packs = [
@@ -995,24 +1027,27 @@ try {
     ];
     summary = summaryV3(); summary.ai.balance = 4000; await refresh();
     contains('#ai-credits h4', 'AI credits');
-    assert.equal(q('#ai-credits strong').textContent, '4,000');
-    contains('#ai-credits', 'credits left'); has('#ai-credits button', false);
-    assert.equal(cssRule('.ezil-billing-credit-balance strong')['font-size'], '32px');
-    summary.catalog.packs = packs; await refresh(); has('#ai-credits button', false);
-    summary.actions.topup = false; await refresh(); has('#ai-credits button', false);
-    summary.actions.topup = true; summary.catalog.packs = []; await refresh(); has('#ai-credits button', false);
-    delete summary.catalog.packs; await refresh(); has('#ai-credits button', false);
+    assert.equal(q('#ai-credits .ezil-billing-meter-value').textContent, '4,000 left');
+    contains('#ai-credits', '200 from your plan + 3,800 extra');
+    assert.equal(q('#ai-credits [role="meter"]').getAttribute('aria-valuenow'), '100');
+    has('#ai-credits button', false); has('[data-role="ai-topup"]', false);
+    summary.catalog.packs = packs; await refresh(); has('[data-role="ai-topup"]', false);
+    summary.actions.topup = false; await refresh(); has('[data-role="ai-topup"]', false);
+    summary.actions.topup = true; summary.catalog.packs = []; await refresh(); has('[data-role="ai-topup"]', false);
+    delete summary.catalog.packs; await refresh(); has('[data-role="ai-topup"]', false);
     summary.catalog.packs = packs;
-    for ( const [balance, state, label] of [[0, 'exhausted', '0'], [17, 'low', '17'], [null, 'unavailable', 'Not available']] ) {
+    for ( const [balance, state, label, tone] of [[0, 'exhausted', '0 of 200 left', 'danger'], [17, 'low', '17 of 200 left', 'warn'], [null, 'unavailable', '—', 'ok']] ) {
         summary.ai.balance = balance; summary.ai.state = state; await refresh();
-        contains('#ai-credits .ezil-billing-credit-balance', label);
-        assert.equal(q('#ai-credits').classList.contains(`is-${state}`), true);
-        assert.equal(qa('#ai-credits button').length, 2);
-        if ( balance === null ) { has('#ai-credits strong', false); assert.doesNotMatch(q('#ai-credits .ezil-billing-credit-balance').textContent, /1\.000001/); }
+        contains('#ai-credits .ezil-billing-meter-value', label);
+        assert.equal(q('#ai-credits').classList.contains(`is-${tone}`), true);
+        assert.equal(qa('[data-role="ai-topup"] [data-action="topup"]').length, 2);
+        assert.equal(q('[data-role="ai-topup"]').open, false, 'the top-up is a closed disclosure');
+        if ( balance === null ) { has('#ai-credits [role="meter"]', false); assert.doesNotMatch(q('#ai-credits').textContent, /1\.000001|Not available|Unavailable/); }
     }
-    assert.deepEqual(qa('#ai-credits button').map(button => button.textContent), ['Add 2,000 credits — $10', 'Add 5,000 credits — $25']);
+    assert.deepEqual(qa('[data-role="ai-topup"] [data-action="topup"]').map(button => button.textContent), ['Add 2,000 credits — $10', 'Add 5,000 credits — $25']);
     for ( const pack of packs ) {
-        const button = q(`#ai-credits [data-sku="${pack.sku}"]`);
+        const button = q(`[data-role="ai-topup"] [data-sku="${pack.sku}"]`);
+        assert.equal(button.classList.contains('ezil-settings-btn-primary'), false);
         const before = sheets.length;
         click(button); click(button);
         assert.equal(sheets.length, before + 1);
@@ -1023,14 +1058,28 @@ try {
         sheets.at(-1).onDone(); await closeSheet();
         assert.equal(count(), reads + 1, 'finishing a top-up refreshes Billing');
     }
-    packs[0].totalCents = 1234; await refresh(); contains('#ai-credits button', 'Add 2,000 credits — $12.34');
+    packs[0].totalCents = 1234; await refresh(); contains('[data-role="ai-topup"] button', 'Add 2,000 credits — $12.34');
     const beforeInvalid = sheets.length;
-    q('#ai-credits button').dataset.sku = 'unknown_pack'; click(q('#ai-credits button'));
+    q('[data-role="ai-topup"] button').dataset.sku = 'unknown_pack'; click(q('[data-role="ai-topup"] button'));
     assert.equal(sheets.length, beforeInvalid, 'unknown packs cannot open a checkout');
-    const staleButton = q('#ai-credits button'); staleButton.dataset.sku = packs[0].sku;
+    const staleButton = q('[data-role="ai-topup"] button'); staleButton.dataset.sku = packs[0].sku;
     summary.actions.topup = false; await refresh(); q('#ai-credits').append(staleButton); click(staleButton);
     assert.equal(sheets.length, beforeInvalid, 'top-up actions are checked again at click time');
-    pass('AI credit card balance, missing/disabled top-ups, empty packs, exact labels, checkout gating and refresh');
+    // Premium with credits running low: the page's one primary opens the top-up disclosure.
+    summary = summaryV3('premium'); summary.ai.state = 'low'; summary.actions.topup = true; summary.catalog.packs = packs; await refresh();
+    assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Add AI credits']);
+    click(q('[data-action="open-topup"]')); await settle();
+    assert.equal(q('[data-role="ai-topup"]').open, true);
+    assert.equal(window.document.activeElement, q('[data-role="ai-topup"] summary'));
+    // needs_ezil_id (D1): the waiting credits and the EZiL ID link; no top-up and no "Unavailable".
+    summary = summaryV3('free'); Object.assign(summary.ai, { enrollment: 'needs_ezil_id', waiting: { credits: 100 }, balance: null, state: 'unavailable' });
+    summary.actions.ezilId = '/login?method=ezil-id'; summary.actions.topup = true; summary.catalog.packs = packs; await refresh();
+    contains('#ai-credits', '100 credits waiting');
+    contains('#ai-credits', 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.');
+    assert.equal(q('#ai-credits a[data-action="ezil-id"]').getAttribute('href'), '/login?method=ezil-id');
+    has('[data-role="ai-topup"]', false);
+    assert.doesNotMatch(text(), /Unavailable|Not available/);
+    pass('AI credit row: whole numbers, above-grant split, server states, top-up disclosure, checkout gating, Add AI credits primary and EZiL ID');
 
     let creditsScrolled = 0;
     window.HTMLElement.prototype.scrollIntoView = function () { if ( this.id === 'ai-credits' ) creditsScrolled++; };
@@ -1048,46 +1097,32 @@ try {
         assert.equal(creditsScrolled, 1, 'only the Billing AI credits deep link focuses the card');
     }
     pass('AI credits deep-link heading focus survives URL cleanup and a failed summary without refocusing');
+    // Round 5 (D6): no operator internals on the user surface, in any AI state.
     summary = summaryV3(); await refresh();
-    contains('[data-role="ai-usage"]', 'Balance: 1.000001 credits');
-    contains('[data-role="ai-usage"]', 'Commitments include held credits');
-    contains('[data-role="ai-usage"]', 'not a billing-period total');
-    contains('[data-role="ai-limits"]', 'Not reported');
-    contains('[data-role="ai-recent"]', 'charged: Not reported');
-    for ( const [micro, expected] of [['1', '0.000001'], ['999999', '0.999999'], ['1000001', '1.000001'],
-        ['9007199254740991000001', '9,007,199,254,740,991.000001']] ) {
-        summary.ai.balanceMicro = micro; summary.ai.balance = null; await refresh();
-        contains('[data-role="ai-usage"]', `Balance: ${expected} credits`);
-    }
+    for ( const role of ['ai-usage', 'ai-limits', 'ai-recent', 'ai-spending'] ) has(`[data-role="${role}"]`, false);
+    assert.doesNotMatch(text(), /service ceiling|Held for requests|Requests per minute|Tokens per minute|Recent AI requests|Commitments|charged: /i);
     for ( const state of ['paused_operations', 'paused_reconciliation', 'paused_policy', 'unavailable'] ) {
-        summary.ai.spendingState = state; summary.ai.balanceMicro = '1000001'; await refresh();
-        const section = q('[data-role="ai-usage"]').textContent;
-        assert.doesNotMatch(section, /spending is available|No AI credits remain|upgrade|top.?up|add credits/i);
-        assert.equal(q('[data-role="ai-spending"]').dataset.state, state);
+        summary.ai.spendingState = state; await refresh();
+        assert.doesNotMatch(text(), /spending is|paused by operations|reconciled/i);
     }
-    summary.ai.recentUsage = null; summary.ai.limits = null; summary.ai.balance = null; summary.ai.balanceMicro = null; await refresh();
-    contains('[data-role="ai-usage"]', 'Balance: Not reported');
-    contains('[data-role="ai-usage"]', 'AI limits are unavailable');
-    contains('[data-role="ai-usage"]', 'Recent AI usage is unavailable');
-    summary.ai.balanceMicro = '0'; summary.ai.balanceState = 'exhausted'; summary.ai.spendingState = 'available'; await refresh();
-    contains('[data-role="ai-usage"]', 'Balance: 0 credits'); contains('[data-role="ai-spending"]', 'No AI credits remain');
-    const old = summaryV3(); old.ai.balanceMicro = '123000000';
+    // Stale summaries never overwrite a newer one (whole credits on the AI row).
+    const old = summaryV3(); old.ai.balance = 123;
     let releaseOld;
     getSummary = () => new Promise(resolve => { releaseOld = resolve; });
     click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
     click(q('[data-tab="account"]'));
-    summary = summaryV3(); summary.ai.balanceMicro = '7000000'; getSummary = () => reply(summary);
+    summary = summaryV3(); summary.ai.balance = 7; getSummary = () => reply(summary);
     click(q('[data-tab="billing"]')); await settle();
     releaseOld(reply(old)); await settle();
-    contains('[data-role="ai-usage"]', 'Balance: 7 credits');
-    assert.doesNotMatch(q('[data-role="ai-usage"]').textContent, /123 credits/);
+    contains('[data-role="meter-ai"]', '7 of 200 left');
+    assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /123 of 200/);
     let releaseClosed;
     getSummary = () => new Promise(resolve => { releaseClosed = resolve; });
     click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
     await window.$(q('.window[data-app="settings"]')).close(); await settle();
     getSummary = () => reply(summary); await open(); releaseClosed(reply(old)); await settle();
-    contains('[data-role="ai-usage"]', 'Balance: 7 credits');
-    pass('AI fractions, exact large balances, partial unknowns, holds, pauses and canceled stale summaries');
+    contains('[data-role="meter-ai"]', '7 of 200 left');
+    pass('no operator AI internals in any spending state; stale and closed-window summaries cannot repaint');
     summary = v2(); history = []; await refresh();
 
     const billingRequests = () => calls.filter(call => call.url.includes('/billing.')).length;
