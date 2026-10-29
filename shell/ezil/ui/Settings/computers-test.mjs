@@ -10,7 +10,8 @@
 // What it pins: no slot UI; current / available / locked / unavailable / next
 // start per plan; the acknowledgement before the request leaves; a duplicate
 // click sends nothing; a reload reuses the requestId; "Now" and "Next" are
-// never mixed in one label; failure shows Back to <previous> and Try again
+// never mixed in one label; failure names the size it is on, shows Back to <previous>
+// only when the computer is on another size, and Try again
 // only when retryable; D11 copy; the copy passes scanCopy.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -153,20 +154,51 @@ check('done: "Now running on" + Open desktop only for a transition seen in fligh
     assert.equal(unseen.done, null);
 });
 
-check('failure: copy, Back to <previous>, Try again only when retryable, D11 copy for the AWS cap', () => {
-    const failed = reason => running('m6i.large', { transition: { transitionId: `t-${reason}`, kind: 'switch', current: 'std-2', target: 'cmp-8', phase: 'failed', reason, revertAvailable: true } });
+check('failure: names the target and the size it is on, Back to only when elsewhere, Try again only when retryable, D11 copy for the AWS cap', () => {
+    const failed = (reason, type = 'm6i.large') => running(type, { transition: { transitionId: `t-${reason}`, kind: 'switch', current: 'std-2', target: 'cmp-8', phase: 'failed', reason, revertAvailable: true } });
     const html = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: failed('capacity_unavailable') }), failed('capacity_unavailable'), []));
-    assert.match(text(html), /We couldn't switch\. Your computer is back on 2 vCPU · 8 GB and your files are safe\./);
+    assert.match(text(html), /We couldn't switch to 8 vCPU · 32 GB\. Your computer is on 2 vCPU · 8 GB and your files are safe\./);
+    assert.doesNotMatch(text(html), /back on/);
     assert.match(html, /data-action="switch-retry" data-size="cmp-8">Try again/);
-    assert.match(html, /data-action="switch-back" data-size="std-2">Back to 2 vCPU · 8 GB/);
+    // HF3: already on the pre-switch size, so "Back to" it would be a switch to the size it runs.
+    assert.doesNotMatch(html, /switch-back/);
     assert.match(html, /data-role="computer-chip" data-state="attention">Needs attention/);
-    const billing = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: failed('billing_payment_issue') }), failed('billing_payment_issue'), []));
+    // The placement is on another size (the switch left it elsewhere): name it, and offer Back to the previous one.
+    const elsewhere = failed('size_not_applied', 'm6i.xlarge');
+    const moved = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: elsewhere }), elsewhere, []));
+    assert.match(text(moved), /We couldn't switch to 8 vCPU · 32 GB\. Your computer is on 4 vCPU · 16 GB and your files are safe\./);
+    assert.match(moved, /data-action="switch-back" data-size="std-2">Back to 2 vCPU · 8 GB/);
+    assert.match(moved, /data-action="switch-retry" data-size="cmp-8">Try again/);
+    // No placement size and no preference: the pre-switch size, and no Back to it.
+    const bare = { ...failed('wake_timeout'), hardware: null };
+    const data = premium(); data.computer.size = null;
+    const unknown = scan(computerHtml(computerModel({ computer: me, data, prog: bare }), bare, []));
+    assert.match(text(unknown), /Your computer is on 2 vCPU · 8 GB and your files are safe\./);
+    assert.doesNotMatch(unknown, /switch-back/);
+    const billing = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: failed('billing_payment_issue', 'm6i.xlarge') }), failed('billing_payment_issue', 'm6i.xlarge'), []));
     assert.doesNotMatch(billing, /switch-retry/);
     assert.match(billing, /switch-back/);
     const cap = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: failed('billing_user_hours_cap') }), failed('billing_user_hours_cap'), []));
     assert.match(text(cap), new RegExp(AWS_CAP_COPY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.doesNotMatch(cap, /switch-retry|fair use|standard-hour/i);
     assert.equal(refusalCopy('user_hours_cap', 'cmp-4'), AWS_CAP_COPY);
+});
+
+check('HF3: after a failure, the server decides the card: reopened (no transition) shows none; a second switch shows progress', () => {
+    // Settings reopened after a failure the server no longer reports (superseded or recovered): no failure card.
+    const reopened = running('m6i.xlarge');
+    const gone = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: reopened }), reopened, []));
+    assert.doesNotMatch(gone, /switch-failed|couldn't switch/);
+    assert.match(gone, /data-role="computer-chip" data-state="running">Running/);
+    assert.match(text(gone), /4 vCPU · 16 GB memory/);
+    // A second switch (cmp-4 → cmp-8) after the earlier failure: progress only, no stale failure copy.
+    const again = running('m6i.xlarge', { transition: { transitionId: 't-again', kind: 'switch', current: 'cmp-4', target: 'cmp-8', phase: 'waking', reason: null, revertAvailable: false } });
+    const model = computerModel({ computer: me, data: premium(), prog: again });
+    assert.equal(model.failed, null);
+    const html = scan(computerHtml(model, again, []));
+    assert.match(html, /data-role="switch-progress"/);
+    assert.doesNotMatch(html, /switch-failed|couldn't switch|back on/);
+    assert.match(text(html), /Now: 4 vCPU · 16 GB Next: 8 vCPU · 32 GB/);
 });
 
 check('STOPPED with a different next-start choice: "Next start" + Start now, nothing starts', () => {
@@ -456,13 +488,15 @@ if ( haveBundle ) {
         assert.equal(window.sessionStorage.getItem('ezil-os:switch.c-1.cmp-4'), null);
     });
 
-    progress = running('m6i.xlarge', { transition: { transitionId: 't-2', kind: 'switch', current: 'cmp-4', target: 'cmp-8', phase: 'failed', reason: 'capacity_unavailable', revertAvailable: true } });
+    // HF3: the placement is not on the pre-switch size (2 vCPU after cmp-4 → cmp-8), so "Back to" is offered.
+    progress = running('m6i.large', { transition: { transitionId: 't-2', kind: 'switch', current: 'cmp-4', target: 'cmp-8', phase: 'failed', reason: 'capacity_unavailable', revertAvailable: true } });
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
     await settle(3);
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
     await settle();
-    check('bundle: a failed switch shows Back to <previous> and Try again', () => {
-        assert.match(pane().querySelector('[data-role="switch-failed"]')?.textContent ?? '', /We couldn't switch\. Your computer is back on 4 vCPU · 16 GB and your files are safe\./);
+    check('bundle: a failed switch names the size it is on, with Back to <previous> and Try again', () => {
+        assert.match(pane().querySelector('[data-role="switch-failed"]')?.textContent ?? '', /We couldn't switch to 8 vCPU · 32 GB\. Your computer is on 2 vCPU · 8 GB and your files are safe\./);
+        assert.ok(pane().querySelector('[data-action="switch-retry"]'));
         assert.equal(pane().querySelector('[data-action="switch-back"]')?.textContent, 'Back to 4 vCPU · 16 GB');
     });
     window.sessionStorage.setItem('ezil-os:switch.c-1.cmp-4', 'stale-id-123');

@@ -597,11 +597,13 @@ function statusHtml (model, prog) {
         const t = model.failed;
         const cap = CAP_REASONS.has(t.reason);
         const retry = ! cap && RETRYABLE.test(String(t.reason ?? ''));
-        const copy = cap ? AWS_CAP_COPY : `We couldn't switch. Your computer is back on ${sizeLabel(t.current, model.data)} and your files are safe.`;
+        // HF3: the size it actually runs (the placement), else the pre-switch size; never offer a switch to that same size.
+        const on = model.current ?? t.current;
+        const copy = cap ? AWS_CAP_COPY : `We couldn't switch to ${sizeLabel(t.target, model.data)}. Your computer is on ${sizeLabel(on, model.data)} and your files are safe.`;
         return `<div class="ezil-computer-switch is-failed" data-role="switch-failed" role="alert">
             <p>${html_encode(copy)}</p><div class="ezil-settings-row-actions">
             ${retry ? `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="switch-retry" data-size="${html_encode(t.target)}">Try again</button>` : ''}
-            ${t.revertAvailable ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
+            ${t.revertAvailable && on !== t.current ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
             ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="switch-feedback">Send feedback</button>' : ''}</div></div>`;
     }
     if ( model.nextStart ) {
