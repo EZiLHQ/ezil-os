@@ -405,11 +405,13 @@ export function refusalCopy (reason, target, data = summary, current = null) {
  * pending click). Pure, so the states are unit-tested without a DOM.
  */
 export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false }) {
-    const free = data?.plan?.sku === 'free_v3';
-    // Round 4 (STANDING-CONTRACT): an unknown or missing standing keeps the plan-only model.
+    // Round 4 (STANDING-CONTRACT): the standing decides what opens; an unknown or missing one keeps the
+    // plan-only model. The plan block may still describe a past_due paid subscription after grace.
     const standing = standingOf(data);
-    // D16: Free, but the files are still on the AWS computer. It opens under Free limits; nothing has moved.
-    const held = free && standing === 'files_on_aws';
+    // D16: on Free, but the files are still on the AWS computer. It opens under Free limits; nothing has moved.
+    const held = standing === 'files_on_aws';
+    const dropped = held || standing === 'free';
+    const free = data?.plan?.sku === 'free_v3' || dropped;
     const t = transitionOf(prog);
     const flying = IN_FLIGHT.has(t?.phase) ? t : null;
     const lifecycle = typeof prog?.lifecycleState === 'string' ? prog.lifecycleState : null;
@@ -434,7 +436,7 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const sizes = free && ! held ? ['free-cf', ...AWS_SIZES] : AWS_SIZES;
     const cards = data ? sizes.map(size => {
         const info = sizeInfo(size, data);
-        let state = held ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
+        let state = held || (dropped && size !== 'free-cf') ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
         if ( switching && size === switching.target ) state = 'switching';
         else if ( nextStart === size ) state = 'next';
         return { size, vcpu: info.vcpu, memoryGiB: info.memoryGiB, weight: info.weight, state,

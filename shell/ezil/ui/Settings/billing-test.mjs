@@ -937,6 +937,11 @@ try {
         contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.');
         contains('[data-role="your-computer"]', 'Your files are kept on your AWS (India) computer. It opens with Free limits.');
         contains('[data-role="plan-actions"]', 'Upgrade');
+        // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
+        Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
+        has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
         assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
         // Unknown or missing standing: the round-3 Billing tab exactly.
         for ( const standing of [undefined, 'moved'] ) {

@@ -342,7 +342,8 @@ export function summaryV3Html (summary, usage = null) {
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
             ${paragraph(choices ? `Next start: ${computer.vcpu} vCPU · ${computer.memoryGiB} GB` : `${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
             ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
-            ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : standing === 'files_on_aws' ? paragraph('Your files are kept on your AWS (India) computer. It opens with Free limits.') : ''}
+            ${standing === 'files_on_aws' ? paragraph('Your files are kept on your AWS (India) computer. It opens with Free limits.')
+                : plan.sku !== 'free_v3' && standing !== 'free' ? paragraph('Your own computer on AWS (India)') : ''}
             ${choices ? `<div class="ezil-billing-actions">${actionHtml('computer-tab', 'Change configuration')}</div>` : ''}
         </section>
         <div class="ezil-billing-v3-meters" data-role="billing-meters">${aiCreditsV3Html(summary)}<div data-role="time-slot">${timeV3Html(summary, usage)}</div>${storageV3Html(summary)}</div>

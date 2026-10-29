@@ -262,6 +262,18 @@ check('Round 4 files_on_aws: AWS (India) · files kept, Open desktop, every AWS 
     assert.equal(runningHeld.chip.text, 'Running');
 });
 
+check('Round 4: after grace the plan block may still describe the past_due paid plan; the standing decides the card', () => {
+    const lapsed = withStanding(premium(), 'files_on_aws', {}, { status: 'past_due', paymentIssue: 'payment_failed' });
+    const held = computerModel({ computer: me, data: lapsed, prog: stoppedAws() });
+    assert.equal(held.held, true);
+    assert.deepEqual(states(held), { 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });
+    assert.ok(! /data-action="switch-config"/.test(computerHtml(held, stoppedAws(), [])));
+    const onCf = computerModel({ computer: me, data: withStanding(premium(), 'free', { filesOn: 'cloudflare' }, { status: 'past_due', paymentIssue: 'payment_failed' }),
+        prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
+    assert.deepEqual(states(onCf), { 'free-cf': 'current', 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });
+    assert.equal(onCf.provider, 'Cloudflare');
+});
+
 check('Round 4: Free on Cloudflare and an unknown standing keep the round-3 card exactly', () => {
     const base = computerModel({ computer: me, data: free(), prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
     for ( const standing of ['free', undefined, 'moved'] ) {
