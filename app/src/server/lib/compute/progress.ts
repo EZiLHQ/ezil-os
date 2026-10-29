@@ -332,7 +332,7 @@ export interface ReconciledTransition { phase: SwitchPhaseV3; reason: string | n
  * advisory history: a later lease epoch may have run the target anyway (a heal released the
  * host and the user's own open booted the switch's size), or the user's own later opening
  * may have replaced it. In flight → `resolveTransition`, current; stored `done` → as stored.
- * Any failure is obsolete once the placement is past the switch's own epoch (> from + 1).
+ * A stored failure is obsolete once the AWS placement is past the switch's own epoch (> from + 1).
  * At exactly from + 1: RUNNING on the target is `done` (recovered); with no wake recorded the
  * epoch is the user's later opening (superseded, not current); its own wake RUNNING elsewhere
  * is `size_not_applied`; its own wake not running keeps the stored failure. At or before the
@@ -340,10 +340,9 @@ export interface ReconciledTransition { phase: SwitchPhaseV3; reason: string | n
  */
 export function reconcileTransition(t: ComputerTransition, p: Placement | null, now: Date): ReconciledTransition {
     const resolved = resolveTransition(t, p, now);
+    // In flight (even one that resolves failed) and stored `done`: the resolved phase, current.
+    if (t.phase !== 'failed') return { ...resolved, current: true };
     const aws = p?.provider === 'aws-ec2' ? p : null;
-    if (resolved.phase !== 'failed') return { ...resolved, current: true };
-    // An in-flight record that resolves failed keeps today's System rule: past the next epoch it is history.
-    if (t.phase !== 'failed') return { ...resolved, current: !p || p.leaseEpoch <= t.fromLeaseEpoch + 1 };
     if (!aws || aws.leaseEpoch <= t.fromLeaseEpoch) return { ...resolved, current: true };
     if (aws.leaseEpoch > t.fromLeaseEpoch + 1) return { ...resolved, current: false };
     if (aws.state === 'RUNNING' && aws.instanceType === SIZES[t.target].machine) return { phase: 'done', reason: null, current: true };

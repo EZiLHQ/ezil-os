@@ -354,6 +354,13 @@ describe('hotfix 3: a stored switch failure is reconciled against the placement 
         expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }, woke), 'cmp-4'))?.plan)
             .toMatchObject({ status: 'failed', reason: 'size_not_applied', transition: { reason: 'size_not_applied', revertAvailable: true } });
     });
+    it('an unsettled record that resolves failed keeps the existing rule: shown at the next epoch, history past it', async () => {
+        const dead = { ...stopFailed, phase: 'waking', reason: null, wakingAt: '2026-10-29T09:37:00.000Z', endedAt: null };
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }, dead), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'failed', reason: 'size_not_applied', transition: { phase: 'failed', reason: 'size_not_applied' } });
+        expect((await system(awsDb({ lease_epoch: 9, instance_type: 'm6i.large' }, dead), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null });
+    });
 });
 
 it('wires computer-scoped migration status into the production System data path', async () => {

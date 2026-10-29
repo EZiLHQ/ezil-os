@@ -145,6 +145,8 @@ async function currentTransition(db: PlacementExecutor, computer: { computerId: 
         if (!meta?.transition) return null;
         const r = reconcileTransition(meta.transition, p, new Date());
         if (!r.current || r.phase === 'done') return null;
+        // An unsettled record that resolves failed keeps the existing System rule: past the next opening it is history.
+        if (r.phase === 'failed' && meta.transition.phase !== 'failed' && p && p.leaseEpoch > meta.transition.fromLeaseEpoch + 1) return null;
         return transitionView(meta.transition, r);
     } catch { return null; }
 }

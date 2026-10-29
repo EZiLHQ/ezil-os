@@ -105,9 +105,9 @@ describe('reconcileTransition: what a stored transition means now against the pl
     it('a later epoch beyond the switch makes any failure history', () => {
         expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(1800)).current).toBe(false);
         expect(reconcileTransition(stopFailed(woke), placement({ leaseEpoch: 9, instanceType: 'm6i.xlarge' }), at(1800)).current).toBe(false);
-        // An unsettled in-flight record that resolves failed keeps the same rule (a dead driver never wrote its end).
+        // An unsettled in-flight record (a dead driver never wrote its end) is resolveTransition, current; System drops it past N+1.
         const dead = transition({ phase: 'waking', wakingAt: at(30).toISOString() });
-        expect(reconcileTransition(dead, placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(5000))).toEqual({ phase: 'failed', reason: 'size_not_applied', current: false });
+        expect(reconcileTransition(dead, placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(5000))).toEqual({ phase: 'failed', reason: 'size_not_applied', current: true });
     });
     it('in flight: exactly resolveTransition, current; stored done: as stored', () => {
         const cases: [ComputerTransition, Placement | null, Date][] = [
@@ -118,6 +118,8 @@ describe('reconcileTransition: what a stored transition means now against the pl
             [transition(), placement({ leaseEpoch: 8, instanceType: 'm6i.2xlarge' }), at(60)],
             [transition(), placement({ leaseEpoch: 8, instanceType: 'm6i.xlarge' }), at(60)],
             [transition(), null, at(1)],
+            [transition(), placement({ provider: 'cloudflare', leaseEpoch: 9 }), at(1)],
+            [transition({ phase: 'waking', wakingAt: at(30).toISOString() }), placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(5000)],
         ];
         for (const [t, p, now] of cases) expect(reconcileTransition(t, p, now)).toEqual({ ...resolveTransition(t, p, now), current: true });
         const done = transition({ phase: 'done', endedAt: at(200).toISOString() });
@@ -271,11 +273,17 @@ describe('readComputerProgress: the progress DTO carries the reconciled transiti
         expect((await progressOf({ lease_epoch: 7, instance_type: 'm6i.large' }, stopFailed))?.transition)
             .toMatchObject({ phase: 'failed', reason: 'stop_placement_unconfirmed', revertAvailable: true });
     });
+    it('an unsettled record that resolves failed is shown as before, even past the next epoch', async () => {
+        const dead = transition({ phase: 'waking', wakingAt: at(30).toISOString() });
+        expect((await progressOf({ lease_epoch: 9, instance_type: 'm6i.large' }, dead))?.transition)
+            .toMatchObject({ phase: 'failed', reason: 'size_not_applied', revertAvailable: true });
+    });
     it('a recovered failure never relabels the RUNNING computer as a switch opening', async () => {
         expect(await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed)).toMatchObject({ stage: 'running', operation: 'none', path: null, openingStartedAt: null });
         // No opening was stored: none is created (a reconciled `done` would stamp a switch opening from the 09:36 request).
         expect(openingWrites).toEqual([]);
-        // A stored warm opening of the recovered epoch keeps its path.
+    });
+    it('a stored warm opening of the recovered epoch keeps its path and start', async () => {
         const leasedAt = at(1700);
         const warm: OpeningRecord = { v: 1, generation: 4, leaseEpoch: 8, startedAt: leasedAt.toISOString(), path: 'warm',
             milestones: Object.fromEntries(OPENING_MILESTONES_V3.map(key => [key, leasedAt.toISOString()])) };
@@ -284,7 +292,11 @@ describe('readComputerProgress: the progress DTO carries the reconciled transiti
             .toMatchObject({ stage: 'running', transition: { phase: 'done' } });
         expect(openingWrites.length).toBe(1);
         expect(openingWrites[0]).toMatchObject({ leaseEpoch: 8, path: 'warm', startedAt: leasedAt.toISOString() });
-        // A complete stored warm opening is not rewritten at all.
+    });
+    it('a complete stored warm opening of the recovered epoch is not rewritten', async () => {
+        const leasedAt = at(1700);
+        const warm: OpeningRecord = { v: 1, generation: 4, leaseEpoch: 8, startedAt: leasedAt.toISOString(), path: 'warm',
+            milestones: Object.fromEntries(OPENING_MILESTONES_V3.map(key => [key, leasedAt.toISOString()])) };
         await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed, { opening: warm, poolLeasedAt: leasedAt });
         expect(openingWrites).toEqual([]);
     });
