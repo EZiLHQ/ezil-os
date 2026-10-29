@@ -63,3 +63,26 @@ describe('round 3 D11: the AWS ledger cap is its own refusal', () => {
         expect(admitStartWithAwsCap({ ...base, awsMonthlyCapReached: true })).toMatchObject({ admit: true, size: 'free-cf' });
     });
 });
+
+describe('round 4 D16: the Free hold on an AWS computer', () => {
+    const hold = { ...base, size: 'std-2' as const, hold: true };
+    it('admits std-2 at weight 1 under the Free session cap and fair use, and marks the decision', () => {
+        expect(admitStart(hold)).toEqual({ admit: true, size: 'std-2', maxRunSeconds: 3600, fromPool: false, poolPriority: 0, hold: true,
+            deadline: '2026-10-19T13:00:00Z' });
+        expect(admitStart({ ...hold, usedSeconds: 5 * 3600 - 600 })).toMatchObject({ admit: true, maxRunSeconds: 600, hold: true });
+        expect(admitStart({ ...hold, usedSeconds: 5 * 3600 })).toEqual({ admit: false, reason: 'fair_use_paused' });
+        expect(admitStart({ ...hold, legacyFree: true, usedSeconds: 7.5 * 3600 })).toMatchObject({ admit: true, maxRunSeconds: 1800 });
+    });
+    it.each(['cmp-4', 'cmp-8'] as const)('never opens %s', size => {
+        expect(admitStart({ ...hold, size })).toEqual({ admit: false, reason: 'size_not_allowed' });
+    });
+    it('is Free-only and needs the flag', () => {
+        expect(admitStart({ ...hold, hold: false })).toEqual({ admit: false, reason: 'size_not_allowed' });
+        expect(admitStart({ ...hold, sku: 'standard_monthly_v3' })).not.toHaveProperty('hold');
+        expect(admitStart({ ...hold, runningComputers: 1 })).toEqual({ admit: false, reason: 'concurrent_limit' });
+        expect(admitStart({ ...hold, paymentIssue: true })).toEqual({ admit: false, reason: 'payment_issue' });
+    });
+    it('still meets the AWS ledger cap', () => {
+        expect(admitStartWithAwsCap({ ...hold, awsMonthlyCapReached: true })).toEqual({ admit: false, reason: 'aws_monthly_cap' });
+    });
+});

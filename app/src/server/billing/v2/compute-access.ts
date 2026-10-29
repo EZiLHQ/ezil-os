@@ -5,7 +5,8 @@ import { getBillingDeps } from '../deps';
 import type { BillingDeps } from '../ports';
 import { freeSkuFor, planFromSubscriptions } from './catalog';
 import { planFromSubscriptions as planV3 } from '../v3/catalog';
-import { admitStart as admitStartV3 } from '../v3/admission';
+import { admitStart as admitStartV3, HOLD_SIZE } from '../v3/admission';
+import { deriveStanding, paidAccess } from '../v3/standing';
 import { buildSummaryV3, fairUseAllowance, usedSecondsInWindow } from '../v3/summary';
 import { CATALOG_V3, type PlanSkuV3, type BillingSummaryV3, type AdmitDecisionV3, type AdmitRefusalV3 } from '../v3/contract';
 import { CATALOG_V2, SESSION_MAX_SECONDS, type ComputeEpoch, type AdmitDecision, type AdmitRefusal, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
@@ -56,17 +57,35 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
         ]);
         const summary = buildSummaryV3({ config: deps.config, now, userCreatedAt, subs, epochs, grants, planChanges,
             paymentIssues, consent: null, storage: [], sizePreference, hasCustomer: false });
-        const paymentIssue = summary.plan.paymentIssue !== null;
-        return {
+        // Round 4 D17: in grace the paid computer stays usable (the gate's payment refusal runs before
+        // decideStart, so the state itself carries no payment issue); the Billing summary still reports it.
+        const { standing } = deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: null, now });
+        const allowance = fairUseAllowance(resolved, grants, { grace: standing === 'grace' });
+        const state: ComputeBillingState = {
             planSku: resolved.sku, v3: { sku: resolved.sku, legacyFree: resolved.legacyFree },
             sessionMaxSeconds: resolved.sessionMaxSeconds, subscriptionId: resolved.subscriptionId,
             openEpochs: epochs.filter(epoch => epoch.endedAt === null), family: resolved.family,
-            planActive: resolved.planActive, delinquent: resolved.status === 'past_due' || resolved.status === 'incomplete',
-            paymentIssue, upgradePending: summary.plan.pendingUpgrade !== null,
+            planActive: resolved.planActive || standing === 'grace', delinquent: resolved.status === 'past_due' || resolved.status === 'incomplete',
+            paymentIssue: standing !== 'grace' && summary.plan.paymentIssue !== null, upgradePending: summary.plan.pendingUpgrade !== null,
             entitledSize: summary.computer.size, provider: resolved.offer.provider, window: resolved.window,
-            usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now, { sessionMaxSeconds: resolved.sessionMaxSeconds, allowanceStdSeconds: fairUseAllowance(resolved, grants) }),
-            allowanceStdSeconds: fairUseAllowance(resolved, grants), overage: null, summary,
+            usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now, { sessionMaxSeconds: resolved.sessionMaxSeconds, allowanceStdSeconds: allowance }),
+            allowanceStdSeconds: allowance, overage: null, summary,
         };
+        if (resolved.sku !== 'free_v3' && !paidAccess(standing)) {
+            // D17/D18: grace over, raw unpaid or never paid (incomplete): Free now, with Free's window and limits
+            // (mirrors the legacy fallback below). Free has no payment issue, so the D16 hold can still open.
+            const free = CATALOG_V3.free_v3;
+            const freeWindow = planV3({ subs: [], now, userCreatedAt }).window;
+            const freeEpochs = new Date(freeWindow.start) < new Date(resolved.window.start)
+                ? await deps.store.epochsFor(userId, new Date(freeWindow.start)) : epochs;
+            const freeAllowance = resolved.legacyFree ? free.legacyFairUseSeconds ?? free.fairUseSeconds : free.fairUseSeconds;
+            Object.assign(state, { planSku: 'free_v3', v3: { sku: 'free_v3', legacyFree: resolved.legacyFree },
+                sessionMaxSeconds: free.sessionMaxSeconds, planActive: true, paymentIssue: false, entitledSize: free.size,
+                provider: free.provider, window: freeWindow, allowanceStdSeconds: freeAllowance,
+                usedStdSeconds: usedSecondsInWindow(freeEpochs, freeWindow, now, { sessionMaxSeconds: free.sessionMaxSeconds, allowanceStdSeconds: freeAllowance }),
+            } satisfies Partial<ComputeBillingState>);
+        }
+        return state;
     }
     const plan = planFromSubscriptions({ subs, now, userCreatedAt });
     const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
@@ -119,7 +138,10 @@ function decideStart(state: ComputeBillingState, computerId: string, size: SizeC
         const offer = CATALOG_V3[state.v3.sku];
         if (size !== 'free-cf' && state.paymentIssue) return { admit: false, reason: 'payment_issue' };
         const ceiling = state.v3.legacyFree ? offer.legacyFairUseSeconds ?? offer.fairUseSeconds : offer.fairUseSeconds;
-        return admitStartV3({ sku: state.v3.sku, legacyFree: state.v3.legacyFree,
+        // Round 4 D16: on Free only an existing AWS computer rates std-2 (Cloudflare rates free-cf), so this is the
+        // hold. Deciding it here keeps it for the second decideStart at readiness (openComputeEpochAtReady).
+        const hold = state.v3.sku === 'free_v3' && size === HOLD_SIZE;
+        return admitStartV3({ sku: state.v3.sku, legacyFree: state.v3.legacyFree, hold,
             // An existing Cloudflare machine consumes weight one on a paid plan.
             size: size === 'free-cf' && state.provider === 'aws' ? 'std-2' : size,
             planActive: state.v3.sku === 'free_v3' || state.planActive,
@@ -185,10 +207,14 @@ export async function gateComputerStart({ deps, userId, computerId, kind, instan
             ? instanceType !== null && meteredSize === null ? null
                 : state.provider === 'aws' ? state.entitledSize : instanceType !== null ? meteredSize : state.entitledSize
             : state.provider === 'aws' ? 'std-2' : 'free-cf';
+        // Round 4 D16 (C8 hold): a Free user's existing AWS computer opens as std-2 under Free limits, never
+        // resized; a larger one stays closed (files_on_aws). With no placement type (a Free canary) it is refused.
+        const held = kind === 'aws-ec2' && !!state.v3 && state.provider !== 'aws' && instanceType !== null;
         const decision: AdmitDecision | AdmitDecisionV3 = size === null
             ? { admit: false, reason: 'size_not_allowed' }
             : kind === 'aws-ec2' && state.paymentIssue
             ? { admit: false, reason: 'payment_issue' }
+            : held ? size === HOLD_SIZE ? decideStart(state, computerId, size, now) : { admit: false, reason: 'files_on_aws' }
             : kind === 'aws-ec2' && state.v3 && state.provider !== 'aws' ? { admit: false, reason: 'size_not_allowed' }
             : decideStart(state, computerId, size, now);
         if (!deps.config.enforcementEnabled) {

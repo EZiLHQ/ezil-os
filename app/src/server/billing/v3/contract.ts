@@ -177,10 +177,19 @@ export type FairUseStatusOf = (input: { usedSeconds: number; fairUseSeconds: num
 
 // ── Admission (v3) ───────────────────────────────────────────────────────────
 
-export type AdmitRefusalV3 = 'no_plan' | 'fair_use_paused' | 'payment_issue' | 'concurrent_limit' | 'upgrade_pending';
+/**
+ * Round 4 (additive): `files_on_aws` = a Free user's computer is still an AWS computer larger than
+ * std-2; the D16 hold opens only std-2, so it stays closed until an upgrade (copy: the files are kept).
+ */
+export type AdmitRefusalV3 = 'no_plan' | 'fair_use_paused' | 'payment_issue' | 'concurrent_limit' | 'upgrade_pending' | 'files_on_aws';
 
+/**
+ * Round 4 D16 (additive): `hold: true` = the C8 hold. A Free user whose computer is still on AWS
+ * opens it at std-2 (weight 1) under Free limits: the Free session cap and Free fair use. Never a
+ * resize. Carried so the ready-time decision (`openComputeEpochAtReady`) admits the same session.
+ */
 export type AdmitDecisionV3 =
-    | { admit: true; size: SizeCode; maxRunSeconds: number; deadline: string; fromPool: boolean; poolPriority: PoolPriority }
+    | { admit: true; size: SizeCode; maxRunSeconds: number; deadline: string; fromPool: boolean; poolPriority: PoolPriority; hold?: true }
     | { admit: false; reason: AdmitRefusalV3 };
 
 /**
