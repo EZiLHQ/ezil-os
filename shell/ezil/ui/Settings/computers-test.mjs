@@ -154,6 +154,17 @@ check('done: "Now running on" + Open desktop only for a transition seen in fligh
     assert.equal(unseen.done, null);
 });
 
+check('HF3 lead: a release that failed to heal is retryable; an 8 vCPU step reads "an"', () => {
+    for ( const reason of ['release_heal_failed', 'release_heal_timeout'] ) {
+        const prog = running('m6i.large', { transition: { transitionId: `t-${reason}`, kind: 'switch', current: 'std-2', target: 'cmp-4', phase: 'failed', reason, revertAvailable: true } });
+        const html = scan(computerHtml(computerModel({ computer: me, data: premium(), prog }), prog, []));
+        assert.match(html, /data-action="switch-retry" data-size="cmp-4">Try again/, reason);
+        assert.match(text(html), /We couldn't switch to 4 vCPU · 16 GB\. Your computer is on 2 vCPU · 8 GB/);
+    }
+    const big = switchSteps({ current: 'cmp-4', target: 'cmp-8', phase: 'waking', acknowledged: true }, { milestones: [{ key: 'host_claimed' }], expectedSeconds: 90 }, premium());
+    assert.equal(big.steps[1], 'Getting an 8 vCPU machine — ready machine found');
+});
+
 check('failure: names the target and the size it is on, Back to only when elsewhere, Try again only when retryable, D11 copy for the AWS cap', () => {
     const failed = (reason, type = 'm6i.large') => running(type, { transition: { transitionId: `t-${reason}`, kind: 'switch', current: 'std-2', target: 'cmp-8', phase: 'failed', reason, revertAvailable: true } });
     const html = scan(computerHtml(computerModel({ computer: me, data: premium(), prog: failed('capacity_unavailable') }), failed('capacity_unavailable'), []));
