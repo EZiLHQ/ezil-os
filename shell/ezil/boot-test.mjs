@@ -254,26 +254,27 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         !!panel && panel.closest('.window-body') !== null);
     push('panel shows the progress state', panel?.getAttribute('data-kind') === 'progress',
         panel?.getAttribute('data-kind'));
-    // Round 3 (plan §6.5): the one opening surface — one status line, one bar, no step list.
+    // Round 5 (D5): the one opening surface — "Opening {App}", one status line, one bar, no step list.
+    // The timer-driven phase labels are estimates and are never drawn as the title.
     const PHASE_LABELS = ['Getting your workspace', 'Loading your files', 'Starting your apps', 'Opening the window'];
     push('no step list: one status line and one bar', $$(window, '.ezil-boot-phase, .ezil-boot ol').length === 0
         && !!$1(window, '.ezil-boot .ezil-opening-bar'), `${$$(window, '.ezil-boot-phase').length} rows`);
-    push('the status line is the estimated phase, never a time promise',
-        PHASE_LABELS.includes($1(window, '.ezil-boot-title')?.textContent)
+    push('the title names the app, never an estimated phase or a time promise',
+        $1(window, '.ezil-boot-title')?.textContent === 'Opening Browser…'
+        && !PHASE_LABELS.some(l => (panel?.textContent ?? '').includes(l))
         && !/seconds|\d+%/.test(panel?.textContent ?? ''),
         $1(window, '.ezil-boot-title')?.textContent);
 
-    // 🔴 PROGRESSIVE DISCLOSURE (W3). The window opens showing `AppSpinner`,
-    // not the phase panel — "a circular thing rotates a few seconds", not a
-    // machine checklist. The phase panel above is built and kept up to date
-    // the whole time, it is just not what is ON SCREEN yet. See Scenario 1b,
-    // below, for the crisp 4s-reveal proof; this only pins the initial state.
+    // 🔴 ONE SURFACE (round 5, D5; retires W3's spinner → phase-panel swap).
+    // The window opens showing `AppSpinner`, and the legacy `.ezil-boot` hook IS
+    // that same element: there is no second panel behind it to swap to. See
+    // Scenario 1b, below, for the proof across the old 4s line.
     const spinner = $1(window, '.ezil-app-spinner');
-    push('🔴 the window opens showing the app spinner, not the phase panel',
+    push('🔴 the window opens showing the one opening surface',
         !!spinner && spinner.hidden === false,
         `spinner hidden=${spinner?.hidden}`);
-    push('🔴 ...and the phase panel is hidden behind it',
-        panel?.hidden === true, `panel hidden=${panel?.hidden}`);
+    push('🔴 ...and `.ezil-boot` is that same surface, not a hidden phase panel behind it',
+        panel === spinner && $$(window, '.ezil-boot').length === 1, `panel is spinner=${panel === spinner} count=${$$(window, '.ezil-boot').length}`);
     push('the spinner says what is opening, not what is booting',
         $1(window, '.ezil-app-spinner-label')?.textContent === 'Opening Browser…',
         $1(window, '.ezil-app-spinner-label')?.textContent);
@@ -397,21 +398,16 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Scenario 1b — PROGRESSIVE DISCLOSURE, measured against the real deadline
+// Scenario 1b — ONE SURFACE across the retired 4s line (round 5, D5)
 //
-// Scenario 1 pinned the INITIAL state (spinner up, phase panel hidden) but
-// deliberately did not depend on wall-clock timing to do it — it asserted
-// that state well inside any reasonable margin of `PHASE_LIST_AFTER_MS`. This
-// scenario is the one that actually crosses the 4s line: the preview request
-// is held open the whole time (same `preview_gate` pattern as Scenario 1), so
-// the boot is GENUINELY still pending on both sides of the deadline, and
-// nothing here can pass by accident.
+// Round 3 swapped the spinner for a phase panel at `PHASE_LIST_AFTER_MS` (4s);
+// D5 retires that swap. This scenario crosses the old 4s line with the
+// preview request held open the whole time (same `preview_gate` pattern as
+// Scenario 1), so the boot is GENUINELY still pending on both sides of it,
+// and nothing here can pass by accident.
 //
-// 🔴 Both directions: comment out `desktop-window.js`'s reveal-timer and this
-// scenario's second assertion goes red forever (the phase panel never
-// appears); make the reveal fire immediately instead of waiting for the
-// timer and the FIRST assertion goes red (a warm-looking open would show a
-// phase list before it earned one).
+// 🔴 Bring back any reveal timer that hides the spinner or shows a second
+// panel and the second assertion goes red.
 // ───────────────────────────────────────────────────────────────────────────
 {
     let release;
@@ -427,24 +423,24 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     open_desktop(window);
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
 
-    await sleep(3_000); // well before PHASE_LIST_AFTER_MS (4s)
-    push('🔴 a boot that is only 3s in still shows the spinner, not the phase list',
-        $1(window, '.ezil-app-spinner')?.hidden === false
-        && $1(window, '.ezil-boot')?.hidden === true,
-        `spinner hidden=${$1(window, '.ezil-app-spinner')?.hidden}`
-        + ` panel hidden=${$1(window, '.ezil-boot')?.hidden}`);
+    const one_surface = () => {
+        const loaders = [...new Set(win.querySelectorAll('.ezil-app-spinner, .ezil-boot'))];
+        return loaders.length === 1 && loaders[0].hidden === false
+            && win.querySelectorAll('.ezil-boot-phase, .ezil-boot ol').length === 0;
+    };
+    const describe = () => `loaders=${new Set(win.querySelectorAll('.ezil-app-spinner, .ezil-boot')).size}`
+        + ` spinner hidden=${$1(window, '.ezil-app-spinner')?.hidden}`;
+    await sleep(3_000); // before the retired 4s reveal
+    push('🔴 a boot 3s in shows the one opening surface', one_surface(), describe());
 
-    await sleep(2_000); // now ~5s in — past PHASE_LIST_AFTER_MS (4s), still pending
-    push('🔴 a boot still pending past 4s earns the phase list, and the spinner steps aside',
-        $1(window, '.ezil-boot')?.hidden === false
-        && $1(window, '.ezil-app-spinner')?.hidden === true,
-        `spinner hidden=${$1(window, '.ezil-app-spinner')?.hidden}`
-        + ` panel hidden=${$1(window, '.ezil-boot')?.hidden}`);
-    push('the opening bar itself is now visible, not just the panel',
+    await sleep(2_000); // now ~5s in — past the retired 4s reveal, still pending
+    push('🔴 a boot still pending past 4s keeps the SAME one surface: no swap to a phase list',
+        one_surface() && $1(window, '.ezil-boot-title')?.textContent === 'Opening Browser…', describe());
+    push('the opening bar itself is visible on that one surface',
         $1(window, '.ezil-boot .ezil-opening-bar')?.hidden === false);
 
     // Not this scenario's concern whether the boot then succeeds or fails —
-    // only that the panel swap already happened correctly. Let the released
+    // only that no panel swap happened. Let the released
     // request settle before tearing down, so nothing here leaves a dangling
     // timer for the next scenario to trip over.
     release();

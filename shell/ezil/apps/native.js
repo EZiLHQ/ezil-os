@@ -57,7 +57,7 @@ export function bindNativeBrowser (el, ctx) {
                 setup_failed: 'Embedded Touch ID could not be configured.' }[result.reason] || 'Embedded Touch ID is unavailable.');
     }).catch(() => {});
     const trace = ctx.trace ?? { step () {}, end () {} };
-    const progress = AppSpinner({ label: 'Opening Browser…', onRetry: () => { if (active) void start(active); },
+    const progress = AppSpinner({ label: `Opening ${ctx?.appName || 'Browser'}…`, appName: ctx?.appName || 'Browser', icon: ctx?.icon, onRetry: () => { if (active) void start(active); },
         failureCopy: { title: 'Browser is unavailable', body: 'The local browser could not start. Try again. If this continues, relaunch EZiL OS.' } });
     viewport.appendChild(progress.el);
     const alive = tab => !disposed && tabs.includes(tab);
@@ -92,6 +92,8 @@ export function bindNativeBrowser (el, ctx) {
         const title = el.querySelector('.window-head-title'); if (title) title.textContent = state.title || 'Browser';
         progress.el.hidden = !tab.opening && !tab.failed;
         if (!progress.el.hidden) progress.render(computeBootUiState({ requestStatus: tab.failed ? 'error' : 'pending', elapsedMs: 0, errorCode: tab.failed ? 'native_surface_failed' : undefined }));
+        // No tab is opening: the open is over, so the next tab's open starts its own clock.
+        else if (!tabs.some(t => t.opening)) progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
     }
     async function start (tab) {
         if (!alive(tab) || tab.opening || tab.ready) return;

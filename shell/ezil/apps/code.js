@@ -467,6 +467,9 @@ export async function openCodeWindow (ctx = {}) {
         // the input that means "no observation exists", and the panel shows
         // the `connecting` phase until there is one. The boot still ends on
         // its own: `FRAME_CONFIRM_DEADLINE_MS` is measured from `t_handoff`.
+        // The open answered with a URL: a real signal, so the one bar takes the
+        // opening-app floor (never 100 before the frame is confirmed).
+        progress.stamp('url_received');
         const t_handoff = performance.now();
         const paint_handoff = () => {
             if ( disposed || my_attempt !== attempt ) return;
@@ -511,6 +514,9 @@ export async function openCodeWindow (ctx = {}) {
             stop_timers();
 
             if ( seen === true ) {
+                // The real ready signal concludes this open on the one surface (bar to 100), so a
+                // later start_boot (restart, switch, reboot) is a fresh open with its own clock.
+                progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
                 stop_monitor = watchNativeSurface(nativeSurface, reason => {

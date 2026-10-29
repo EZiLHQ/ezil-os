@@ -5,8 +5,13 @@
 // A cold AWS replace measures 210-250 s against the desktop window's 215 s
 // boot budget. While `computer.progress` reports the AWS computer actively
 // opening, a TIMEOUT must re-open (never replay the warm result) and keep the
-// panel on progress; ten minutes or `needs_operator` end it with Try again;
+// surface on progress; ten minutes or `needs_operator` end it with Try again;
 // with no observation (Cloudflare/native) nothing changes.
+//
+// Round 5 (D5): the window has ONE opening surface (`AppSpinner`, which also
+// carries the legacy `.ezil-boot` hooks). The phase panel and its 4 s swap are
+// retired, so every assertion below reads that one surface, and the re-open
+// never resets its elapsed clock or its bar.
 //
 // Part 1 pins the pure verdicts and copy in `boot-progress.js`. Part 2 drives
 // the COMMITTED bundle (`app/public/os`, rebuilt by `shell/build-shell.sh`)
@@ -21,10 +26,11 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 // ── Part 1: pure verdicts ────────────────────────────────────────────────
 const unitDom = new JSDOM('<!doctype html><html><body></body></html>');
 globalThis.document = unitDom.window.document;
+const bootProgress = await import('./boot-progress.js');
 const {
-    AWS_BOOT_HARD_STOP_MS, AWS_BOOT_MAX_REOPENS, BootProgress,
+    AWS_BOOT_HARD_STOP_MS, AWS_BOOT_MAX_REOPENS,
     awsBootTimeoutVerdict, awsBootWaitVerdict, awsStillStartingCopy,
-} = await import('./boot-progress.js');
+} = bootProgress;
 
 const opening = (extra = {}) => ({ stage: 'starting', activeAws: true, active: true, elapsed: 215, countdown: 'Less than a minute left', ...extra });
 
@@ -82,23 +88,12 @@ test('pure: still-starting copy never promises a time (round 3: no countdowns)',
         assert.equal(awsStillStartingCopy(countdown), 'Your computer is still starting');
     }
 });
-test('pure: BootProgress is the one opening surface: status line and bar, no rows or checkmarks', () => {
-    const plain = BootProgress({ appName: 'Linux Desktop' }); const aws = BootProgress({ appName: 'Linux Desktop' });
-    const state = { kind: 'progress', currentPhase: 'connecting', confirmed: false, isRunningLong: true };
-    plain.render(state, null, { elapsedMs: 40_000 }); aws.render(state, {}, { elapsedMs: 40_000 });
-    assert.equal(aws.el.querySelector('.ezil-boot-title').textContent, 'Your computer is still starting');
-    assert.equal(plain.el.querySelector('.ezil-boot-title').textContent, 'Opening the window');
-    assert.equal(plain.el.querySelector('.ezil-opening-name').textContent, 'Linux Desktop');
-    assert.equal(plain.el.querySelectorAll('.ezil-boot-phase, ol, li').length, 0, 'no step list');
-    assert.equal(plain.el.querySelector('.ezil-opening-meta').textContent, 'Taking a little longer than usual · 0:40');
-    const bar = Number(plain.el.querySelector('.ezil-opening-bar').getAttribute('aria-valuenow'));
-    assert.ok(bar > 0 && bar <= 90, `a running-long estimate stays below 90% (${bar})`);
-    assert.equal(aws.el.querySelector('.ezil-opening-bar').dataset.indeterminate, 'true', 'a reopen without an observation has no basis');
-    assert.doesNotMatch(plain.el.textContent, /\d+%|seconds|min left/);
-    aws.render({ kind: 'failed', reason: 'timeout' }, null);
-    assert.equal(aws.el.querySelector('.ezil-boot-title').textContent, 'This is taking too long');
-    assert.equal(aws.el.querySelector('.ezil-boot-actions').hidden, false);
-    assert.equal(aws.el.querySelector('.ezil-opening-bar').hidden, true);
+test('pure: the phase panel is retired; the pure exports and DisplayNotice stay', () => {
+    assert.equal(bootProgress.BootProgress, undefined, 'no BootProgress component');
+    assert.equal(bootProgress.default, undefined, 'no default panel export');
+    assert.equal(typeof bootProgress.DisplayNotice, 'function');
+    assert.equal(typeof bootProgress.awsBootTimeoutVerdict, 'function');
+    assert.equal(typeof bootProgress.awsBootWaitVerdict, 'function');
 });
 
 // ── Part 2: the built desktop window ─────────────────────────────────────
@@ -113,6 +108,9 @@ async function until(fn, what = 'condition') {
 }
 const timeoutError = () => Object.assign(new Error('The operation timed out.'), { name: 'TimeoutError' });
 
+/** The loading-stage sentence for the fake observation (stage `starting`, reached 1). */
+const STARTING = 'A machine is ready and starting up.';
+const RUNNING_LONG = "This is taking longer than usual. We're still working on it — you can keep this open or come back later.";
 const abortError = () => Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
 const launchingBody = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2', computeLaunching: true };
 
@@ -201,33 +199,44 @@ async function open(t, progressMode, opts = {}) {
     await w.ezil.registry.launch('desktop', { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState });
     const win = await until(() => w.document.querySelector('.window[data-app="desktop"]'), 'window');
     const spinner = win.querySelector('.ezil-app-spinner');
-    const panel = win.querySelector('.ezil-boot');
-    const visible = () => [spinner, panel].filter(el => !el.hidden);
+    // Every loading/failure surface in the window (both selectors), de-duplicated.
+    const loaders = () => [...new Set(win.querySelectorAll('.ezil-app-spinner, .ezil-boot'))];
+    const visible = () => loaders().filter(el => !el.hidden);
     const tryAgainVisible = () => visible().some(el => el.querySelector('.ezil-boot-actions')?.hidden === false && el.querySelector('.ezil-boot-retry')?.hidden === false);
-    if (mode === 'opening' || mode === 'attention') await until(() => spinner.querySelector('.ezil-app-spinner-label').textContent === (mode === 'attention' ? 'Your computer needs attention' : 'Starting your computer'), 'observation painted');
+    const title = () => spinner.querySelector('.ezil-app-spinner-label').textContent;
+    const status = () => spinner.querySelector('.ezil-app-spinner-sub').textContent;
+    const meta = () => spinner.querySelector('.ezil-opening-meta').textContent;
+    const bar = () => Number(spinner.querySelector('.ezil-opening-bar').dataset.percent);
+    if (mode === 'opening') await until(() => spinner.dataset.progress === 'observed' && status() === STARTING, 'observation painted');
+    else if (mode === 'attention') await until(() => title() === 'Your computer needs attention', 'observation painted');
     else if (mode === 'unavailable') await until(() => spinner.dataset.progress === 'unavailable', 'no observation');
     return {
-        w, win, spinner, panel, visible, tryAgainVisible, logs, asks, timeOutOne, pending, signals,
+        w, win, spinner, loaders, visible, tryAgainVisible, title, status, meta, bar, logs, asks, timeOutOne, pending, signals,
         setMode: m => { mode = m; }, setNow: ms => { now = ms; }, setPerf: ms => { perf = ms; }, setReady: () => { ready = true; },
         setPost: fn => { post = fn; }, setRunning: v => { running = v; },
     };
 }
 
-test('desktop: 215 s TIMEOUT while activeAws re-opens and the panel stays on progress', async t => {
+test('desktop: 215 s TIMEOUT while activeAws re-opens and the one surface stays on progress', async t => {
     const h = await open(t, 'opening');
     h.setNow(215_000); h.setPerf(215_000);
+    await wait(30);
+    const [metaBefore, barBefore] = [h.meta(), h.bar()];
+    assert.equal(metaBefore, '3:35 · usually about 4 min');
     await h.timeOutOne();
     await until(() => h.asks() === 3 && h.pending.length === 1, 'a re-open POST');
     await wait(30);
     assert.equal(h.spinner.dataset.kind, 'progress');
-    assert.equal(h.panel.dataset.kind, 'progress');
     assert.equal(h.tryAgainVisible(), false);
+    assert.deepEqual(h.loaders(), [h.spinner], 'one surface');
     assert.ok(h.visible().every(el => !el.textContent.includes('This is taking too long')));
-    assert.equal(h.panel.querySelector('.ezil-boot-title').textContent, 'Your computer is still starting');
-    // What the user actually sees during the re-open is the spinner's live observation.
     assert.equal(h.spinner.hidden, false);
-    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Starting your computer');
+    assert.equal(h.title(), 'Opening Browser…');
+    assert.equal(h.status(), STARTING);
     assert.ok(!/taking (too long|longer than usual)|needs attention/i.test(h.spinner.textContent), h.spinner.textContent);
+    // 🔴 The re-open never resets the elapsed clock or the bar.
+    assert.equal(h.meta(), metaBefore, 'elapsed continues across the re-open');
+    assert.ok(h.bar() >= barBefore && h.bar() < 100, `${h.bar()} vs ${barBefore}`);
     assert.ok(h.logs.some(l => l.includes('re-opening (#1)')), h.logs.join('\n'));
     // The re-open is a real ask, and its success opens the desktop.
     h.setReady();
@@ -242,10 +251,11 @@ test('desktop: 600 s total ends the re-open with the failure and Try again', asy
     await until(() => h.asks() === 3 && h.pending.length === 1, 'a re-open POST');
     h.setPerf(599_000); h.setNow(400_000);
     await wait(30);
-    assert.equal(h.panel.dataset.kind, 'progress', 'not before ten minutes');
+    assert.equal(h.spinner.dataset.kind, 'progress', 'not before ten minutes');
+    assert.equal(h.tryAgainVisible(), false, 'no Try again before ten minutes');
     h.setPerf(600_000); // The window's clock; the observation's own elapsed is still 400 s.
     const reopenSignal = h.signals.at(-1);
-    await until(() => h.panel.dataset.kind === 'failed', 'hard stop with the re-open still in flight');
+    await until(() => h.tryAgainVisible(), 'hard stop with the re-open still in flight');
     // The abandoned re-open is CANCELLED, not orphaned: its request is aborted and,
     // even if the hung request still answers, the wake loop never asks again.
     assert.ok(reopenSignal?.aborted === true, 'the abandoned re-open request was aborted');
@@ -253,7 +263,10 @@ test('desktop: 600 s total ends the re-open with the failure and Try again', asy
     for (const p of h.pending.splice(0)) p.reject(timeoutError());
     await wait(40);
     assert.equal(h.asks(), atStop, 'no ask after the hard stop');
-    assert.equal(h.panel.querySelector('.ezil-boot-title').textContent, 'This is taking too long');
+    // The active AWS timeout stays calm: the ten-minute guidance and ONE action, never a bare failure.
+    assert.equal(h.spinner.dataset.state, 'attention');
+    assert.equal(h.status(), RUNNING_LONG);
+    assert.ok(!h.spinner.textContent.includes('This is taking too long'));
     await until(() => h.tryAgainVisible(), 'Try again');
     assert.ok(h.logs.some(l => l.includes('budget_spent')), h.logs.join('\n'));
     const before = h.asks();
@@ -267,7 +280,7 @@ test('desktop: needs_operator at the TIMEOUT fails immediately, no re-open', asy
     const h = await open(t, 'attention');
     h.setNow(215_000); h.setPerf(215_000);
     await h.timeOutOne();
-    await until(() => h.panel.dataset.kind === 'failed', 'failure');
+    await until(() => h.spinner.dataset.kind === 'failed', 'failure');
     await wait(30);
     assert.equal(h.asks(), 2, 'no re-open');
     assert.ok(h.tryAgainVisible());
@@ -280,12 +293,13 @@ test('desktop: needs_operator during a re-open stops waiting immediately', async
     await until(() => h.asks() === 3 && h.pending.length === 1, 'a re-open POST');
     const reopenSignal = h.signals.at(-1);
     h.setMode('attention');
-    await until(() => h.panel.dataset.kind === 'failed', 'failure on needs_operator');
+    await until(() => h.spinner.dataset.kind === 'failed', 'failure on needs_operator');
     // Did not wait for the hung request, and cancelled it rather than orphaning it.
     assert.ok(reopenSignal?.aborted === true, 'the re-open request was aborted');
     assert.equal(h.pending.length, 0);
     await until(() => h.tryAgainVisible(), 'Try again');
-    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Your computer needs attention');
+    assert.equal(h.title(), 'Your computer needs attention');
+    assert.equal(h.spinner.dataset.state, 'attention');
 });
 
 test('desktop: no observation keeps the unchanged 215 s failure', async t => {
@@ -309,7 +323,7 @@ test('desktop: real AWS protocol, warm joined late: a launch that spent its own 
     await until(() => h.asks() >= 2, 'launching answers');
     h.setPost(() => 'hang');
     h.setNow(45_000); h.setMode('opening');
-    await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Starting your computer', 'observation painted');
+    await until(() => h.status() === STARTING, 'observation painted');
     await until(() => h.pending.length === 1, 'the wake loop asking');
     h.setPerf(555_000); h.setNow(600_000);
     h.pending.shift().resolve({ ok: true, status: 200, json: async () => launchingBody });
@@ -349,8 +363,8 @@ test('desktop: two consecutive client TIMEOUTs both re-open and stay on progress
     await h.timeOutOne();
     await until(() => h.logs.some(l => l.includes('re-opening (#2)')), 're-open #2');
     await wait(30);
-    assert.equal(h.panel.dataset.kind, 'progress');
     assert.equal(h.spinner.dataset.kind, 'progress');
+    assert.deepEqual(h.loaders(), [h.spinner], 'one surface');
     assert.equal(h.tryAgainVisible(), false);
 });
 
@@ -378,7 +392,7 @@ test('desktop: needs_operator after the first request saw it opening shows Try a
     const atStop = h.asks();
     await wait(40);
     assert.equal(h.asks(), atStop, 'no ask after needs_operator');
-    assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, 'Your computer needs attention');
+    assert.equal(h.title(), 'Your computer needs attention');
 });
 
 test('desktop: a computer already needing attention when the window opens is still opened (the open is the recovery)', async t => {
@@ -399,19 +413,42 @@ test('desktop: a late success (past t0 + 215 s, no re-open) still gets the origi
     await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://viewer.example/'), 'desktop frame');
     await wait(80);
     assert.ok(!h.logs.some(l => l.includes('not a desktop')), h.logs.join('\n'));
-    assert.notEqual(h.panel.dataset.kind, 'failed');
-    assert.notEqual(h.spinner.dataset.kind, 'failed');
+    assert.ok(h.loaders().every(el => el.dataset.kind !== 'failed'));
 });
 
-test('desktop: a failed poll at the TIMEOUT keeps the last observation, and the panel says only "still starting"', async t => {
+test('desktop: a failed poll at the TIMEOUT keeps the held stage on the one surface; the re-open uses the kept observation', async t => {
     const h = await open(t, 'opening');
     h.setNow(215_000); h.setPerf(215_000);
     await wait(30); // at least one poll at 215 s
+    const [barBefore, metaBefore] = [h.bar(), h.meta()];
     h.setMode('broken');
-    await until(() => h.spinner.querySelector('.ezil-app-spinner-sub')?.textContent !== undefined && !h.panel.hidden, 'the poll failed and the phase panel shows');
+    await until(() => h.spinner.dataset.progress === 'unavailable', 'the poll failed');
+    // 🔴 No swap to a second surface and no reset: the held stage, a determinate bar, the same clock.
+    assert.deepEqual(h.visible(), [h.spinner]);
+    assert.equal(h.status(), STARTING);
+    assert.equal(h.spinner.querySelector('.ezil-opening-bar').dataset.indeterminate, undefined);
+    assert.ok(h.bar() >= barBefore);
+    assert.equal(h.meta(), metaBefore);
     await h.timeOutOne();
     await until(() => h.logs.some(l => l.includes('re-opening (#1)')), 're-open on the kept observation');
     await wait(30);
-    assert.equal(h.panel.dataset.kind, 'progress');
-    assert.equal(h.panel.querySelector('.ezil-boot-title').textContent, 'Your computer is still starting');
+    assert.equal(h.spinner.dataset.kind, 'progress');
+    assert.equal(h.status(), STARTING);
+    assert.equal(h.tryAgainVisible(), false);
+});
+
+test('desktop: no surface swap past the old 4 s phase-list deadline', async t => {
+    // The harness maps the old 4 000 ms reveal timer to 15 ms; 60 ms is well past it.
+    const h = await open(t, 'unavailable');
+    const first = h.visible();
+    h.setNow(5_000); h.setPerf(5_000);
+    await wait(60);
+    assert.deepEqual(first, [h.spinner]);
+    assert.deepEqual(h.visible(), [h.spinner], 'still the same one surface at 5 s');
+    assert.deepEqual(h.loaders(), [h.spinner], 'no second (phase) panel exists at all');
+    assert.equal(h.spinner.dataset.kind, 'progress');
+    assert.equal(h.title(), 'Opening Browser…');
+    assert.equal(h.meta(), '0:05 · usually under a minute');
+    assert.doesNotMatch(h.spinner.textContent, /Getting your workspace|Loading your files|Starting your apps|Opening the window/,
+        'no timer-estimated phase labels');
 });
