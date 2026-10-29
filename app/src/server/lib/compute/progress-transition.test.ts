@@ -4,7 +4,7 @@ import { OPENING_MILESTONES_V3 } from '@/server/billing/v3/contract';
 import { SWITCH_DEMAND_WINDOW_MS } from './ready-pool';
 import type { Placement } from './placement';
 import {
-    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, resolveTransition, transitionView,
+    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, reconcileTransition, resolveTransition, transitionView,
     TRANSITION_MAX_AGE_MS, TRANSITION_STOP_GRACE_MS, TRANSITION_STOP_TIMEOUT_MS, TRANSITION_WAKE_TIMEOUT_MS, type ComputerTransition, type OpeningRecord,
 } from './progress';
 
@@ -61,6 +61,63 @@ describe('resolveTransition: the phase is derived from the placement, never trus
     });
     it('the pool demand window equals the transition budget', () => {
         expect(SWITCH_DEMAND_WINDOW_MS).toBe(TRANSITION_MAX_AGE_MS);
+    });
+});
+
+describe('reconcileTransition: what a stored transition means now against the placement', () => {
+    // The founder's 2026-10-29 case: a std-2 → cmp-4 switch failed in its stop phase at epoch 7 (wake never recorded).
+    const stopFailed = (over: Partial<ComputerTransition> = {}) => transition({ target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed',
+        endedAt: at(200).toISOString(), ...over });
+    const woke = { wakingAt: at(60).toISOString() };
+    it('a real failure at the switch\'s own epoch stays failed and current (old type RUNNING, or STOPPED after a heal)', () => {
+        const stored = { phase: 'failed', reason: 'stop_placement_unconfirmed', current: true };
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 7, instanceType: 'm6i.large' }), at(900))).toEqual(stored);
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 7, state: 'STOPPED' }), at(900))).toEqual(stored);
+        expect(reconcileTransition(stopFailed(), null, at(900))).toEqual(stored);
+        expect(reconcileTransition(stopFailed(), placement({ provider: 'cloudflare', leaseEpoch: 8 }), at(900))).toEqual(stored);
+    });
+    it('recovered: the next epoch RUNNING on the target is done, current, and offers no revert', () => {
+        const r = reconcileTransition(stopFailed(), placement({ leaseEpoch: 8, generation: 4, instanceType: 'm6i.xlarge' }), at(1800));
+        expect(r).toEqual({ phase: 'done', reason: null, current: true });
+        expect(transitionView(stopFailed(), r)).toMatchObject({ phase: 'done', reason: null, revertAvailable: false });
+        expect(reconcileTransition(stopFailed(woke), placement({ leaseEpoch: 8, instanceType: 'm6i.xlarge' }), at(1800))).toEqual({ phase: 'done', reason: null, current: true });
+    });
+    it('superseded: with no wake recorded, the next epoch is the user\'s own opening (any type, any state) and the failure is not current', () => {
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 8, instanceType: 'm6i.large' }), at(1800)).current).toBe(false);
+        for (const state of ['LEASED', 'STARTING', 'UNCONFIRMED', 'STOPPED'] as const)
+            expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 8, state, instanceType: 'm6i.xlarge' }), at(1800)).current, state).toBe(false);
+    });
+    it('its own wake landed on another type: failed size_not_applied, current', () => {
+        expect(reconcileTransition(stopFailed({ ...woke, reason: 'wake_timeout' }), placement({ leaseEpoch: 8, instanceType: 'm6i.large' }), at(1800)))
+            .toEqual({ phase: 'failed', reason: 'size_not_applied', current: true });
+    });
+    it('its own wake not running (stopped again, unconfirmed): the stored failure stays current', () => {
+        const t = stopFailed({ ...woke, reason: 'wake_timeout' });
+        expect(reconcileTransition(t, placement({ leaseEpoch: 8, state: 'STOPPED', instanceType: 'm6i.xlarge' }), at(1800)))
+            .toEqual({ phase: 'failed', reason: 'wake_timeout', current: true });
+        expect(reconcileTransition(t, placement({ leaseEpoch: 8, state: 'UNCONFIRMED' }), at(1800))).toEqual({ phase: 'failed', reason: 'wake_timeout', current: true });
+    });
+    it('a later epoch beyond the switch makes any failure history', () => {
+        expect(reconcileTransition(stopFailed(), placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(1800)).current).toBe(false);
+        expect(reconcileTransition(stopFailed(woke), placement({ leaseEpoch: 9, instanceType: 'm6i.xlarge' }), at(1800)).current).toBe(false);
+        // An unsettled in-flight record that resolves failed keeps the same rule (a dead driver never wrote its end).
+        const dead = transition({ phase: 'waking', wakingAt: at(30).toISOString() });
+        expect(reconcileTransition(dead, placement({ leaseEpoch: 9, instanceType: 'm6i.large' }), at(5000))).toEqual({ phase: 'failed', reason: 'size_not_applied', current: false });
+    });
+    it('in flight: exactly resolveTransition, current; stored done: as stored', () => {
+        const cases: [ComputerTransition, Placement | null, Date][] = [
+            [transition(), placement({ state: 'DRAINING' }), at(100)],
+            [transition(), placement({ state: 'STOPPED' }), at(30)],
+            [transition(), placement(), at(1000)],
+            [transition({ phase: 'waking', wakingAt: at(30).toISOString() }), placement({ state: 'LEASED', leaseEpoch: 8 }), at(600)],
+            [transition(), placement({ leaseEpoch: 8, instanceType: 'm6i.2xlarge' }), at(60)],
+            [transition(), placement({ leaseEpoch: 8, instanceType: 'm6i.xlarge' }), at(60)],
+            [transition(), null, at(1)],
+        ];
+        for (const [t, p, now] of cases) expect(reconcileTransition(t, p, now)).toEqual({ ...resolveTransition(t, p, now), current: true });
+        const done = transition({ phase: 'done', endedAt: at(200).toISOString() });
+        expect(reconcileTransition(done, placement({ leaseEpoch: 8, instanceType: 'm6i.2xlarge' }), at(300))).toEqual({ phase: 'done', reason: null, current: true });
+        expect(reconcileTransition(done, placement({ leaseEpoch: 12 }), at(300))).toEqual({ phase: 'done', reason: null, current: true });
     });
 });
 

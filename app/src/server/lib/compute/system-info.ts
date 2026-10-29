@@ -20,7 +20,7 @@ import { CATALOG_V3, type ComputeStandingV3 } from '@/server/billing/v3/contract
 import { deriveGuacamoleSandboxId, getGuacamoleSandboxSystem, resolveCloudflareGuacamoleConfig } from '../cloudflare-guacamole-provider';
 import { isAwsComputersEnabled, isPlacementReadEnabled, meteredSizeForInstanceType, type Env } from './aws-config';
 import { PlacementOwnerError, readPlacement, type Placement, type PlacementExecutor, type ResolvedPlacement } from './placement';
-import { readComputerMeta, resolveTransition, transitionView, type TransitionView } from './progress';
+import { readComputerMeta, reconcileTransition, transitionView, type TransitionView } from './progress';
 
 /**
  * Configured size of every AWS instance type a computer may record (aws-config.ts
@@ -135,14 +135,17 @@ export function describeFreePlan(info: SystemInfo, entitlement: import('./tier')
         current, selected: null, transition: null };
 }
 
-/** The computer's switch/restart transition with its resolved phase, while it is current: a failed one stays shown until a later opening. */
+/**
+ * The computer's switch/restart transition reconciled against the placement, while it is current: a real
+ * failure stays shown; one the placement has since recovered (running the target) or superseded is not.
+ */
 async function currentTransition(db: PlacementExecutor, computer: { computerId: string; userId: string }, p: Placement | null): Promise<TransitionView | null> {
     try {
         const meta = await readComputerMeta(db, computer);
         if (!meta?.transition) return null;
-        const resolved = resolveTransition(meta.transition, p, new Date());
-        if (resolved.phase === 'done' || (resolved.phase === 'failed' && p && p.leaseEpoch > meta.transition.fromLeaseEpoch + 1)) return null;
-        return transitionView(meta.transition, resolved);
+        const r = reconcileTransition(meta.transition, p, new Date());
+        if (!r.current || r.phase === 'done') return null;
+        return transitionView(meta.transition, r);
     } catch { return null; }
 }
 
