@@ -216,9 +216,8 @@ function localReversalDeltas(input: AiReversalInput, corrections: GrantRow[], re
         if (remaining < BigInt(0) || remaining > original.amount) return false;
         const existing = corrections.find(g => localKey(g) === localKey(grant));
         if (existing) {
-            // With every root operator-revoked no receipt binds this cause: only its own untouched full delta replays.
-            if (!linked.has(localKey(existing)) && !(unbound && remaining === original.amount
-                && sameLocalGrant(existing, { ...grant, amount: -original.amount }))) return false;
+            // With every root operator-revoked no receipt binds this cause: only its own exact delta replays.
+            if (!linked.has(localKey(existing)) && !(unbound && sameLocalGrant(existing, { ...grant, amount: -remaining }))) return false;
             grant.amount = existing.amount; // A replay retains its committed delta, regardless of later events.
         } else if (input.action === 'restore') {
             const suspend = linked.get(localKey({ ...grant, kind: 'suspend' }))?.row;

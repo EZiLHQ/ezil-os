@@ -2461,6 +2461,20 @@ describe('HF2 operator correction rows', () => {
         expect(await processStripeEvent(refund(), f.deps)).toBe('review:local_reversal_mismatch');
         expect(f.store.writes).toEqual(before);
     });
+    it('replays a zero refund row after an earlier dispute took the compute under an operator revoke', async () => {
+        const f = await canary('root first', { correction: false, revoke: false });
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        await f.store.enqueueOutbox(f.revoke);
+        f.stripe.charge.refunded = true;
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(f.store.writes.slice(before.length)).toEqual(['refund:re_local:compute_std_seconds:revoke']);
+        expect(f.store.grants.get('refund:re_local:compute_std_seconds:revoke')!.amount).toBe(BigInt(0));
+        const after = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('applied');
+        expect(f.store.writes).toEqual(after);
+    });
     it('reverses a correction whose credits equal the parent', async () => {
         const f = await canary('correction first', { defect: r => { r.correction.payload.credits = 4000; } });
         f.stripe.charge.refunded = true;
