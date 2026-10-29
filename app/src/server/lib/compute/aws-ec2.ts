@@ -70,6 +70,7 @@ import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, Comput
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 import { requestAwsRestart } from './aws-restart';
 import { poolPriorityForEntitlement } from './select';
+import { releaseHealOf } from './release-heal';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -799,7 +800,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             p = settled.placement;
             const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p)
                 || await isStalledPoolAdoptPending(deps, p) ? 'starting' : isEnrollmentHostRetire(p) ? 'stopping' : AWS_STATE_FOR[p.state];
-            return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}) };
+            // Round 5 D2: a failed pool release being healed (release-heal.ts); present only when there is one. Only a
+            // pool-mode deployment heals one (reconcilePoolReleaseRecovery), so elsewhere the stop fails fast as before.
+            const healer = cfg.deployments[p.region ?? ''];
+            const releaseHeal = healer && isPoolMode(healer) ? releaseHealOf(p) : null;
+            return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}),
+                ...(releaseHeal ? { releaseHeal } : {}) };
         },
 
         async stop(_ctx, c): Promise<StopResult> {

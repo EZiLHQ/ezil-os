@@ -9,6 +9,8 @@ import { ENROLLMENT_SUCCEEDED, isUnenrolledPastGrace, POOL_SESSION_PENDING, Plac
 import { ENROLL_NONCE_TTL_SECONDS } from './aws-rebase-lease';
 import { MIGRATION_STATES, pendingRecovery, TERMINAL_MIGRATION_STATES, type MigrationState } from './provider-migrate';
 import { createProviderMigrationStore, snapshotChunkSizes, type ComputeMigration } from './provider-migrate-store';
+import { releaseHeal, releaseHealOf } from './release-heal';
+import type { SwitchHealReasonV3 } from '@/server/billing/v3/contract';
 
 function transferProgress(migration: ComputeMigration | null, stage: string, stopped: boolean) {
     const workspace = migration && !['requested', 'fenced'].includes(migration.state) ? snapshotChunkSizes(migration.workspaceHead) : null;
@@ -86,11 +88,19 @@ export function describeProgress(computerId: string, placement: Placement | null
     }
     const switching = options.transition && TRANSITION_IN_FLIGHT.includes(options.transition.phase) ? options.transition : null;
     let transitionStage: 'switching' | 'restarting' | 'waiting_capacity' | null = null;
-    if (!active && !relevantFailure && lifecycle && ['STOPPED', 'RUNNING', 'DRAINING', 'STOPPING'].includes(lifecycle)) {
+    // Round 5 D2: the switch's failed pool release is being healed (resolveTransition reason `stop_healing`): still switching.
+    const healing = !!switching && switching.reason === 'stop_healing' && (lifecycle === 'UNCONFIRMED' || lifecycle === 'RECOVERING');
+    if (!active && !relevantFailure && lifecycle && (['STOPPED', 'RUNNING', 'DRAINING', 'STOPPING'].includes(lifecycle) || healing)) {
         // A capacity wait is an opening that has not leased yet, never "stopped".
         if (lifecycle === 'STOPPED' && options.capacityWaiting) transitionStage = 'waiting_capacity';
         else if (switching) transitionStage = switching.kind === 'restart' ? 'restarting' : 'switching';
         if (transitionStage) operation = 'opening';
+    }
+    // A plain Stop whose release is being replayed (RECOVERING with its replay intent) is still that stop. A bare
+    // UNCONFIRMED failed:* row is not: any failed lifecycle job writes it, so without a transition it keeps its hold.
+    if (!active && !relevantFailure && !switching && lifecycle === 'RECOVERING' && releaseHealOf(placement) === 'pending') {
+        stage = 'stopping';
+        operation = 'stopping';
     }
     const selectedSize = entitlement?.source === 'billing_v2' && entitlement.status === 'active' && !entitlement.paymentIssue && entitlement.provider === 'aws' && entitlement.size && entitlement.planId ? SIZES[entitlement.size] : null;
     const selected = selectedSize?.provider === 'aws' ? selectedSize : null;
@@ -99,7 +109,7 @@ export function describeProgress(computerId: string, placement: Placement | null
     // UNCONFIRMED. Same MOUNTING-only predicate as that CAS, so progress never shows a failure
     // that no transition resolves.
     const enrollmentExpired = !active && !relevantFailure && !!placement && isUnenrolledPastGrace(placement, now);
-    const needsOperator = stage === 'failed_needs_operator' || lifecycle === 'UNCONFIRMED' || enrollmentExpired;
+    const needsOperator = stage === 'failed_needs_operator' || (lifecycle === 'UNCONFIRMED' && !healing) || enrollmentExpired;
     // A cutoff must never be presented as active transfer. Keep recordedStage for diagnostics.
     const opening = (operation === 'opening' || operation === 'migration') && !paused && !needsOperator ? options.opening ?? null : null;
     return {
@@ -312,6 +322,13 @@ export function resolveTransition(t: ComputerTransition, p: Placement | null, no
     if (!p || p.provider !== 'aws-ec2') return { phase: 'failed', reason: 'placement_missing' };
     const moved = p.leaseEpoch > t.fromLeaseEpoch;
     if (moved && p.state === 'RUNNING') return p.instanceType === SIZES[t.target].machine ? { phase: 'done', reason: null } : { phase: 'failed', reason: 'size_not_applied' };
+    // Round 5 D2: this switch's own release failed and is being healed: still stopping, bounded by the existing stop bound.
+    const heal = releaseHeal(t, p);
+    if (heal === 'failed') return { phase: 'failed', reason: 'release_heal_failed' satisfies SwitchHealReasonV3 };
+    if (heal === 'pending') {
+        return now.getTime() - (ms(t.stoppingAt) || ms(t.requestedAt)) > TRANSITION_STOP_TIMEOUT_MS + TRANSITION_STOP_GRACE_MS
+            ? { phase: 'failed', reason: 'release_heal_timeout' satisfies SwitchHealReasonV3 } : { phase: t.phase, reason: 'stop_healing' satisfies SwitchHealReasonV3 };
+    }
     if (p.state === 'UNCONFIRMED' || p.state === 'RECOVERING') {
         return { phase: 'failed', reason: p.lastError?.startsWith('capacity:') ? 'capacity_unavailable' : 'unconfirmed' };
     }
