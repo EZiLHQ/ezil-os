@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
 import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { honestyBans } from './billing-copy-test-helpers.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let passed = 0;
@@ -45,7 +46,7 @@ const src = fs.readFileSync(new URL('./tabs/computers.js', import.meta.url), 'ut
     .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';");
 assert.ok(! /^import /m.test(src), 'every import of the tab is stubbed');
 const tab = await import(moduleUrl(src));
-const { computerModel, computerHtml, switchSteps, switchRatio, switchRequestId, clearSwitchRequestId, refusalCopy, sizeForInstanceType, AWS_CAP_COPY } = tab;
+const { computerModel, computerHtml, switchSteps, switchRatio, switchRequestId, clearSwitchRequestId, refusalCopy, sizeForInstanceType, AWS_CAP_COPY, moveView, standingOf } = tab;
 
 const me = { id: 'c-1', name: 'My computer', slot: 1, createdAt: '2026-10-01T00:00:00Z', lastOpenedAt: null };
 const running = (type = 'm6i.large', extra = {}) => ({ version: 2, computerId: 'c-1', operation: 'none', lifecycleState: 'RUNNING', needsOperator: false,
@@ -205,6 +206,99 @@ check('every refusal reads as a sentence', () => {
         const copy = refusalCopy(reason, 'cmp-8', premium(), 'std-2');
         assert.match(copy, /^[A-Z].+[.]$/, reason);
         scanned.push(copy);
+    }
+});
+
+// ── Round 4 (D16-D18): the Computer card from the server's standing ──────────
+const GRACE = '2026-11-05T00:00:00Z', ENDS = '2026-11-26T00:00:00Z';
+const withStanding = (data, standing, extra = {}, plan = {}) => ({ ...data, plan: { ...data.plan, ...plan },
+    computer: { ...data.computer, standing, filesOn: 'aws', heldSince: null, move: null, ...extra } });
+const stoppedAws = (type = 'm6i.large') => running(type, { lifecycleState: 'STOPPED' });
+const roles = html => ['payment-grace', 'plan-ending', 'files-held', 'move-progress', 'move-done', 'move-failed'].filter(role => html.includes(`data-role="${role}"`));
+
+check('Round 4 paid: unchanged, no standing banner', () => {
+    const model = computerModel({ computer: me, data: withStanding(premium(), 'paid'), prog: running() });
+    assert.deepEqual(states(model), { 'std-2': 'current', 'cmp-4': 'available', 'cmp-8': 'available' });
+    assert.deepEqual(roles(scan(computerHtml(model, running(), []))), []);
+});
+
+check('Round 4 grace: the paid computer stays usable; banner with the date and Fix payment', () => {
+    const data = withStanding(premium(), 'grace', {}, { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: GRACE });
+    const model = computerModel({ computer: me, data, prog: running() });
+    const html = scan(computerHtml(model, running(), []));
+    assert.deepEqual(roles(html), ['payment-grace']);
+    assert.match(text(html), /Your payment didn't go through — update it by Nov 5, 2026 to keep your AWS computer\./);
+    assert.match(html, /data-action="fix-payment" href="\/os\?settings=billing">Fix payment<\/a>/);
+    assert.equal((html.match(/data-action="switch-config"/g) ?? []).length, 2, 'Switch stays enabled');
+    assert.doesNotMatch(html, /data-action="open" disabled/);
+    assert.equal(model.provider, 'AWS · India');
+});
+
+check('Round 4 plan_ending: the end date and that nothing is deleted', () => {
+    const data = withStanding(premium(), 'plan_ending', {}, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
+    const html = scan(computerHtml(computerModel({ computer: me, data, prog: running() }), running(), []));
+    assert.deepEqual(roles(html), ['plan-ending']);
+    assert.match(text(html), /Premium ends on Nov 26, 2026\. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted\./);
+});
+
+check('Round 4 files_on_aws: AWS (India) · files kept, Open desktop, every AWS configuration locked with Upgrade, no Cloudflare "Current"', () => {
+    const data = withStanding(free(), 'files_on_aws');
+    const model = computerModel({ computer: me, data, prog: stoppedAws(), streaming: false });
+    assert.equal(model.held, true);
+    assert.deepEqual(states(model), { 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });
+    assert.equal(model.chip.text, 'Stopped');
+    assert.equal(model.provider, 'AWS (India) · files kept');
+    const html = scan(computerHtml(model, stoppedAws(), []));
+    assert.deepEqual(roles(html), ['files-held']);
+    assert.match(text(html), /Your computer Stopped AWS \(India\) · files kept/);
+    assert.match(text(html), /2 vCPU · 8 GB memory/);
+    assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
+    assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 3);
+    assert.equal((html.match(/data-action="config-upgrade"/g) ?? []).length, 3);
+    assert.doesNotMatch(html, /data-role="config-current"|data-size="free-cf"|data-action="switch-config"/);
+    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. Open it on the Free plan with Free limits, or upgrade to restore full use\./);
+    assert.match(text(html), /Upgrade to restore full use\. Compare plans/);
+    const runningHeld = computerModel({ computer: me, data, prog: running() });
+    assert.equal(runningHeld.chip.text, 'Running');
+});
+
+check('Round 4: Free on Cloudflare and an unknown standing keep the round-3 card exactly', () => {
+    const base = computerModel({ computer: me, data: free(), prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
+    for ( const standing of ['free', undefined, 'moved'] ) {
+        const model = computerModel({ computer: me, data: withStanding(free(), standing, standing === 'free' ? { filesOn: 'cloudflare' } : {}),
+            prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
+        assert.deepEqual(states(model), states(base), String(standing));
+        assert.equal(model.provider, 'Cloudflare');
+        assert.deepEqual(roles(computerHtml(model, null, [])), []);
+    }
+    assert.equal(standingOf({ computer: { standing: 'moved' } }), null);
+});
+
+check('Round 4 move (Phase B): dormant while move is null or another direction; progress, done and failed from server stages', () => {
+    for ( const move of [null, undefined, { direction: 'to_aws', stage: 'exporting', bytesDone: '1', bytesTotal: '2' }] ) {
+        assert.equal(moveView(move), null);
+        const html = computerHtml(computerModel({ computer: me, data: withStanding(free(), 'files_on_aws', { move }), prog: stoppedAws() }), stoppedAws(), []);
+        assert.ok(! /data-role="move-/.test(html), JSON.stringify(move));
+    }
+    const moving = withStanding(free(), 'files_on_aws', { move: { direction: 'to_cloudflare', stage: 'exporting', bytesDone: '120000000', bytesTotal: '2400000000' } });
+    const html = scan(computerHtml(computerModel({ computer: me, data: moving, prog: stoppedAws() }), stoppedAws(), []));
+    assert.ok(html.includes('data-role="move-progress"'));
+    assert.match(text(html), /Moving your files to your Free computer 120 MB of 2\.4 GB copied/);
+    assert.match(html, /<li data-step="1" data-state="done">Saving your files<\/li><li data-step="2" data-state="active">Copying your files to your Free computer<\/li>/);
+    const percent = Number(html.match(/aria-valuenow="(\d+)"/)[1]);
+    assert.ok(percent > 25 && percent < 50, String(percent));
+    const done = scan(computerHtml(computerModel({ computer: me, data: withStanding(free(), 'free', { filesOn: 'cloudflare', move: { direction: 'to_cloudflare', stage: 'committed', bytesDone: '1', bytesTotal: '1' } }) }), null, []));
+    assert.match(text(done), /Your files are on your Free computer\. Open desktop/);
+    const failed = scan(computerHtml(computerModel({ computer: me, data: withStanding(free(), 'files_on_aws', { move: { direction: 'to_cloudflare', stage: 'failed_reopened', bytesDone: '0', bytesTotal: null, reason: 'move_copy_failed' } }), prog: stoppedAws() }), stoppedAws(), []));
+    assert.match(text(failed), /We couldn't move your files\. They're still on your AWS computer and nothing was deleted\./);
+    assert.match(failed, /data-action="move-retry">Try again<\/button>/);
+    assert.match(failed, /data-action="move-feedback" data-code="move_copy_failed">Send feedback/);
+});
+
+check('Round 4: the standing copy passes the copy guard and names no region code or city', () => {
+    for ( const html of scanned ) {
+        assert.doesNotMatch(text(html), honestyBans);
+        assert.doesNotMatch(text(html), /ap-south-1|mumbai/i);
     }
 });
 
