@@ -3,6 +3,9 @@
 Author-only templates for account **452630323510**, **ap-south-1**. No AWS calls,
 network access, deployment, credential reads, DNS changes or DB changes were
 performed while authoring. See `README.md` for the separate app release flow.
+Both templates take `Environment` (default `staging`, which resolves to the same
+resource properties as before the parameter existed); production is the last
+section.
 
 ## Founder / lead order
 
@@ -129,3 +132,115 @@ app-caller trust; run proxy `remove` **on the verified preview host**; remove on
 any reviewed firewall exception; delete the DB ingress stack; withdraw staging
 DNS and delete the app-host stack (including EIP, root disk, role/profile/SG).
 No shared DB, VPC, subnet, Supabase containers, artifacts or secrets are deleted.
+
+Updating an existing staging stack to the `Environment` version changes no
+resource property, but CloudFormation re-resolves the `AmazonLinuxAmi` SSM
+parameter on every update: if AL2023 has a newer AMI, the change set replaces the
+instance. There is no need to update the staging stacks; if you do, review the
+change set first.
+
+## Production order (`Environment=production`, `OS_ENV=production`)
+
+Nothing here has been executed. Account **452630323510**, **ap-south-1**. The
+production database host `i-09012068d96166828` already serves Universe, Works and
+the Gateway: these steps never touch it, its volumes or the SG's other rules.
+
+**Blockers to clear first**
+- `https://db.ezil.work` had no certificate on 443 and GoTrue `SITE_URL` was
+  still the sslip.io name (read-only probe, 2026-10-29). The build bakes
+  `NEXT_PUBLIC_SUPABASE_URL=https://db.ezil.work` and both `deploy.sh` and
+  `render-env.py` enforce it, so the DB owner must serve that hostname first.
+- App code: `https://os-prod.ezil.work` is not in `OWNED_APP_ORIGINS`
+  (`app/src/utils/forwarded.ts`); until it is, Auth0 sign-in on the smoke
+  hostname redirects to the canonical origin.
+- Schema `apply --target aws-production` must be allowed by the reviewed
+  `app/scripts/billing-staging-schema.mjs` change; run it (SSM port forward to
+  `i-09012068d96166828`, `--expect-system-id 7698288507300208674`) before install.
+- Backups (wal-g archiving, fresh snapshots) are the DB owner's maintenance
+  window and come before the schema.
+
+**C. Host**
+1. Create `ezil-os-prod-host` from `app-host.yaml` through a reviewed change set:
+   ```bash
+   aws cloudformation create-change-set --region ap-south-1 --change-set-type CREATE \
+     --stack-name ezil-os-prod-host --change-set-name create \
+     --template-body file://deploy/aws/os-staging/app-host.yaml --capabilities CAPABILITY_IAM \
+     --parameters ParameterKey=Environment,ParameterValue=production \
+       ParameterKey=VpcId,ParameterValue=vpc-040bdd6e09e35425f \
+       ParameterKey=SubnetId,ParameterValue=subnet-0e7c19ed848d0fcea \
+       ParameterKey=InstanceType,ParameterValue=t3.medium \
+       ParameterKey=ArtifactBucket,ParameterValue=ezil-main-prod-artifacts-452630323510-aps1 \
+       ParameterKey=AppCallerRoleArn,ParameterValue= \
+     --tags Key=ezil:env,Value=production Key=ezil:purpose,Value=os
+   ```
+   The template's Rules refuse production with any other VPC, subnet or bucket,
+   or a non-empty AppCallerRoleArn, and refuse staging with any of these prod
+   values. Review, execute, then record `InstanceId` (`OS_PRODUCTION_INSTANCE_ID`),
+   `PublicIp` and `AppSecurityGroupId`. Do **not** add `InstanceRoleArn` to the
+   staging app-caller trust. Termination protection stays off, as for staging.
+2. Create `ezil-os-prod-db-access` from `db-access.yaml` the same way with
+   `Environment=production`, `DbSecurityGroupId=sg-0f3151c94e0ed4ee6`,
+   `AppSecurityGroupId=<step 1 output>` and the same two stack tags. Its only
+   resource is TCP 5432 from the app SG ("OS production app to private
+   PostgreSQL"); deleting the stack removes only that rule. No proxy is needed:
+   the private listener `10.63.20.252:5432` already exists, and `db-proxy.sh`
+   stays staging-only.
+3. Through SSM on the new instance, confirm
+   `/var/lib/ezil-os-production/bootstrap.done` exists and
+   `timeout 5 bash -c '</dev/tcp/10.63.20.252/5432'` succeeds.
+
+**D. Secret and Auth0**
+4. The founder creates `ezil-os/production/app` (no customer-managed KMS key)
+   with the key names and production shapes in `README.md` ("Production"):
+   `aws secretsmanager create-secret --region ap-south-1 --name ezil-os/production/app
+   --secret-string file://PRIVATE_FILE --tags Key=ezil:env,Value=production Key=ezil:purpose,Value=os`,
+   then shred `PRIVATE_FILE`. `SUPABASE_DATABASE_URL` is
+   `postgres://ROLE:PASSWORD@10.63.20.252:5432/postgres?sslmode=require`.
+5. In Auth0 (`id.ezil.work`), add callbacks
+   `https://os.ezil.work/auth/auth0/callback` and
+   `https://os-prod.ezil.work/auth/auth0/callback`, logout URLs
+   `https://os.ezil.work/login` and `https://os-prod.ezil.work/login`, and web
+   origins `https://os.ezil.work` and `https://os-prod.ezil.work`. Keep the
+   staging entries.
+
+**E. Build, upload, install** (`README.md`, "Production")
+6. From a clean checkout of the frozen main SHA:
+   `OS_ENV=production deploy.sh build TAG`, then `upload TAG`, then `install TAG`.
+   Upload needs `s3:PutObject` on `ezil-main-prod-artifacts-452630323510-aps1/os/images/*`
+   from the workstation; confirm the bucket policy allows it from outside the VPC
+   endpoint. Install enables only the three non-AWS timers and prints which.
+
+**F. Smoke on the private hostname**
+7. Add a DNS-only A record `os-prod.ezil.work` to `PublicIp`. Caddy obtains its
+   certificate; it keeps retrying `os.ezil.work` until cutover (expected log noise).
+8. `OS_ENV=production deploy.sh smoke` must pass (200 and the served SHA equals
+   the container's). Then check by hand: Auth0 sign-in and sign-out, one new
+   `auth.users` row, `/os` loads and Settings renders, and
+   `systemctl list-timers 'ezil-os-production-*'` shows three timers whose last
+   runs succeeded (`journalctl -u ezil-os-production-billing-session-sweep`).
+
+**G. Cutover**
+9. Finish the main push to Vercel first (`preview.yml` live-checks
+   `os.ezil.work`) and record the Vercel deployment ID as the rollback target.
+10. Lower the `os.ezil.work` TTL to 60 s, then replace the CNAME
+    `570c89d9a01c497d.vercel-dns-017.com` with a DNS-only A record to `PublicIp`.
+    Expect a short TLS gap while Caddy obtains the certificate.
+11. `OS_ENV=production deploy.sh smoke public` passes only when `os.ezil.work`
+    serves this host's SHA rather than Vercel's.
+12. Cron deliberately stays on `https://os-prod.ezil.work` (the read-only runbook
+    suggested moving it to `os.ezil.work`): Caddy serves both names, so nothing
+    changes at cutover and the production `CRON_SECRET` never reaches Vercel.
+    Keep the `os-prod.ezil.work` record after cutover.
+13. Redirecting `os.ezil.org` to `os.ezil.work` is a separate Cloudflare approval.
+
+**H. Rollback**
+14. Restore the Vercel CNAME. On the host, `OS_ENV=production deploy.sh install
+    PREVIOUS_TAG` for an earlier AWS build. The schema is forward-only and
+    additive; the first real user write on the AWS host is the point of no return.
+
+**Teardown** (before any user data only): stop and disable the
+`ezil-os-production-*` timers, Compose down with
+`--env-file /opt/ezil-os-production/compose.env`, delete `ezil-os-prod-db-access`,
+remove the `os-prod.ezil.work` record, delete `ezil-os-prod-host`. Keep the
+secret and `os/images/` objects until no rollback needs them. The DB host, its
+SG, VPC, subnet, endpoint and buckets are shared and never deleted here.
