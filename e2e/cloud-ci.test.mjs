@@ -659,13 +659,54 @@ function runWorkflowScript(command, args, options = {}) {
   } finally { fs.closeSync(fd); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
-test('deployment triggers are preview/main and version-tag pushes plus manual dispatch', () => {
+test('deployment triggers are preview/main and version-tag pushes plus manual dispatch with a production confirmation', () => {
   const triggers = outline(workflowText).children.find(node => node.line === 'on:');
   assert.ok(triggers, 'deployment workflow must declare its triggers');
   assert.deepEqual(triggers.children.map(node => node.line).sort(), ['push:', 'workflow_dispatch:']);
   const push = triggers.children.find(node => node.line === 'push:');
   assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]', "tags: ['v*']"]);
-  assert.equal(triggers.children.find(node => node.line === 'workflow_dispatch:').children.length, 0);
+  const dispatch = triggers.children.find(node => node.line === 'workflow_dispatch:');
+  assert.deepEqual(dispatch.children.map(node => node.line), ['inputs:']);
+  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:']);
+  assert.deepEqual(dispatch.children[0].children[0].children.map(node => node.line).filter(line => !line.startsWith('description:')),
+    ['type: boolean', 'default: false']);
+});
+
+test('a push or merge to main never deploys production; only a confirmed main dispatch or a tag check admits it', () => {
+  const jobs = outline(workflowText).children.find(node => node.line === 'jobs:');
+  const condition = name => {
+    const gate = jobs.children.find(node => node.line === `${name}:`).children.find(node => node.line.startsWith('if:'));
+    const text = gate.line === 'if: >-' ? gate.children.map(node => [node.line, ...node.children.map(c => c.line)].join(' ')).join(' ') : gate.line.slice(4);
+    return new Function('github', 'inputs', 'needs', 'cancelled', 'startsWith',
+      `return (${text.replace(/^\$\{\{|\}\}$/g, '').trim()})`);
+  };
+  const [images, preview, production] = ['images', 'preview', 'production'].map(condition);
+  const startsWith = (value, prefix) => value.startsWith(prefix);
+  // [ref, event, inputs, staging deploys, production job runs]
+  for (const [ref, event_name, inputs, staging, prod] of [
+    ['refs/heads/main', 'push', {}, false, false],
+    ['refs/heads/main', 'workflow_dispatch', {}, false, false],
+    ['refs/heads/main', 'workflow_dispatch', { deploy_production: false }, false, false],
+    ['refs/heads/main', 'workflow_dispatch', { deploy_production: true }, false, true],
+    ['refs/heads/preview', 'push', {}, true, false],
+    ['refs/heads/preview', 'workflow_dispatch', { deploy_production: true }, true, false],
+    ['refs/heads/feature', 'workflow_dispatch', { deploy_production: true }, false, false],
+    ['refs/tags/v1.2.3', 'push', {}, false, true],
+  ]) {
+    const github = { ref, event_name };
+    for (const imagesResult of ['success', 'skipped', 'failure']) {
+      const needs = { changes: { result: 'success', outputs: { image_changed: 'true' } }, images: { result: imagesResult } };
+      const admitted = imagesResult !== 'failure';
+      const label = `${event_name} ${ref} ${JSON.stringify(inputs)} images=${imagesResult}`;
+      assert.equal(preview(github, inputs, needs, () => false, startsWith), staging && admitted, `staging: ${label}`);
+      assert.equal(production(github, inputs, needs, () => false, startsWith), prod && admitted, `production: ${label}`);
+      assert.equal(production(github, inputs, needs, () => true, startsWith), false, `cancelled: ${label}`);
+    }
+    // Branch pushes and dispatches still build, test and sign changed images.
+    const needs = { changes: { outputs: { image_changed: 'true' } } };
+    assert.equal(images(github, inputs, needs, () => false, startsWith), /^refs\/heads\/(?:main|preview)$/.test(ref), `images: ${ref}`);
+  }
+  assert.equal(workflowText.match(/inputs\.deploy_production/g).length, 1);
 });
 
 test('both live-check steps require their environment isolated computer secret', () => {

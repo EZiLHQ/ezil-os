@@ -1,4 +1,7 @@
-# Pushes deploy the selected environment before running its live check.
+# Preview pushes deploy staging before running its live check. Production is
+# moving to AWS: a push to main builds and tests images but never deploys. The
+# legacy Vercel/Worker production deploy (and its rollback) runs only from a
+# manual dispatch on main with deploy_production set; version tags only verify.
 # Configure staging/production environment secrets and OS_WORKER_URL separately.
 # Vercel rootDirectory=app; this workflow owns deployments and preview aliasing.
 name: Deploy and live check
@@ -8,6 +11,11 @@ on:
     branches: [preview, main]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      deploy_production:
+        description: 'On main only - deploy the legacy Vercel and Worker production (rollback path)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -407,9 +415,10 @@ jobs:
   production:
     name: Deploy and verify production
     needs: [changes, images]
-    # A skipped image build must not skip deployments for app/Worker-only pushes.
+    # A skipped image build must not skip deployments for app/Worker-only runs.
+    # Main deploys only from a confirmed manual dispatch, never from a push or merge.
     if: >-
-      ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
+      ${{ !cancelled() && ((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_production == true) || startsWith(github.ref, 'refs/tags/v')) &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest

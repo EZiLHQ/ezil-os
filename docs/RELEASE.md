@@ -1,7 +1,10 @@
 # OS production releases
 
-Successful push CI for the current `main` commit starts
-[Cloud preview and main deploy](../.github/workflows/preview.yml).
+Production is moving to AWS. A push or merge to `main` runs
+[Cloud preview and main deploy](../.github/workflows/preview.yml) to build and
+test images only; it never deploys production. The legacy Vercel/Worker
+production deploy, with its rollback, runs only when an operator dispatches that
+workflow on `main` with `deploy_production` set.
 Manual **Deploy**, **Deploy App**, and `v*` tags call that same workflow and
 require successful push CI for exactly the current main SHA. Deploy App is
 now a full gated release; its former frontend-only and verify-only bypasses

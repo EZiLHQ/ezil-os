@@ -30,8 +30,10 @@ system, which is out of scope for a docs-only pass.
 Open a feature PR and merge it to the long-lived `preview` branch. Each push
 runs `preview.yml`: deploy the staging Worker and app, update the stable preview
 URL <https://ezil-os-staging.vercel.app>, then run `e2e/live-check.mjs`.
-After that check passes, merge `preview` to `main`. The same workflow deploys
-production at <https://os.ezil.work> and runs the live check. Main first applies
+After that check passes, merge `preview` to `main`. That push builds and tests
+images but never deploys production, which is moving to AWS. Dispatching the same
+workflow on `main` with `deploy_production` set deploys the legacy production at
+<https://os.ezil.work> and runs the live check. It first applies
 reviewed production migrations; a failed apply stops deployment. A failed deploy
 or live check restores the previous Worker version and Vercel deployment and,
 when the image changed, restores the captured container image and waits for its

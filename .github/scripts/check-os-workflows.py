@@ -74,7 +74,8 @@ browser_paths = {
 assert family_paths == browser_paths, family_paths ^ browser_paths
 assert 'shell/ezil/boot-test.mjs' in next(step['run'] for step in shell_steps if step.get('name') == 'Shell unit suites')
 
-# Push/dispatch deployment uses only the jobs designated by the shared contract.
+# Deployment uses only the jobs designated by the shared contract. A push to main
+# never deploys production: only a dispatch on main with deploy_production does.
 # YAML 1.1 interprets "on" as True.
 preview = workflows['preview']
 preview_text = (root / '.github/workflows/preview.yml').read_text()
@@ -83,13 +84,19 @@ assert not re.search(r'\bvercel\s+(?:alias\s+set|promote)\b', preview_text)
 triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
+assert set(triggers['workflow_dispatch']) == {'inputs'}
+assert set(triggers['workflow_dispatch']['inputs']) == {'deploy_production'}
+confirm = triggers['workflow_dispatch']['inputs']['deploy_production']
+assert confirm['type'] == 'boolean' and confirm['default'] is False and 'required' not in confirm
+# Only the production job gate reads it, as a boolean (github.event.inputs is a string).
+assert preview_text.count('inputs.deploy_production') == 1 and 'github.event.inputs' not in preview_text
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
 assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production'}
 assert not (root / '.github/workflows/live.yml').exists()
 assert 'live.yml' not in (root / '.github/workflows/ci.yml').read_text()
 
-# Legacy entry points retain their designated job but direct operators to main.
+# Legacy entry points retain their designated job but direct operators to the main dispatch.
 for name in ('deploy', 'deploy-app'):
     fallback = workflows[name]
     assert set(fallback.get('on', fallback.get(True))) == {'workflow_dispatch'}, name
@@ -101,7 +108,8 @@ for name in ('deploy', 'deploy-app'):
     assert len(job['steps']) == 1, name
     step = job['steps'][0]
     assert set(step) <= {'name', 'run'}, name
-    assert 'push/merge to main runs preview.yml#production' in step['run'], name
+    assert 'push/merge to main never deploys production' in step['run'], name
+    assert 'dispatch preview.yml on main with deploy_production set' in step['run'], name
     assert step['run'].strip().endswith('exit 1'), name
 
 # Keep the CI scan unconditional; deployment assertions must precede any work.
@@ -197,8 +205,11 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert job['environment'] == environment
     assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (42 if job_name == 'preview' else 71)
     assert job['needs'] == ['changes', 'images']
+    # Production on main needs the event and the confirmation, so a push or a
+    # merge to main can never satisfy it; tags only verify (asserted below).
     ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
-                     "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))")
+                     "((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && "
+                     "inputs.deploy_production == true) || startsWith(github.ref, 'refs/tags/v'))")
     assert ' '.join(job['if'].split()) == (
         "${{ !cancelled() && " + ref_condition + " && "
         "needs.changes.result == 'success' && "
