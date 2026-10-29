@@ -21,7 +21,7 @@ export type ReleaseHeal = 'pending' | 'failed' | null;
 /** Recovery errors the next pass retries on an UNCONFIRMED row. */
 const TRANSIENT_RECOVERY_ERRORS: readonly string[] = ['execution_unavailable', 'describe_unavailable'];
 
-type HealFields = Pick<Placement, 'provider' | 'state' | 'lastError' | 'lifecycleJobId' | 'lifecycleDigest'>;
+type HealFields = Pick<Placement, 'provider' | 'state' | 'lastError' | 'lifecycleJobId' | 'lifecycleDigest' | 'instanceId'>;
 
 function recoveryContext(lastError: string): { intent?: unknown; error?: unknown } | null {
     try {
@@ -33,10 +33,12 @@ function recoveryContext(lastError: string): { intent?: unknown; error?: unknown
 /**
  * The placement-only half: `pending` while a release heal can still settle STOPPED, `failed`
  * once the recovery recorded a non-retryable error, null when the row is not a release heal.
- * - pending: UNCONFIRMED `failed:*` with job and digest (what the recovery accepts);
+ * - pending: UNCONFIRMED `failed:*` with job, digest and host (what the recovery accepts: any failed lifecycle
+ *   job writes `failed:*`, aws-receipts.ts:340-345, but a cold replace/provision has no host and the recovery
+ *   leaves it to other handlers, aws-pool-release-recovery.ts `!p.instanceId && !saved?.intent`);
  *   RECOVERING with a replay intent (`isPoolReleaseRecovering`; its kept errors are retryable);
  *   UNCONFIRMED with the prefix, job and digest, and a transient error;
- *   UNCONFIRMED with the prefix, job and digest and NO saved replay intent: the recovery's first
+ *   UNCONFIRMED with the prefix, job, digest and host and NO saved replay intent: the recovery's first
  *   evaluation found the resources still moving (e.g. instance_identity while the host is still
  *   stopping, volume_attachment while the volume detaches). Nothing was replayed, so the next pass
  *   re-evaluates the original job (aws-pool-release-recovery.ts `fail` keeps job and digest; the
@@ -48,12 +50,12 @@ export function releaseHealOf(p: HealFields | null | undefined): ReleaseHeal {
     if (!p || p.provider !== 'aws-ec2' || (p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING')) return null;
     const error = p.lastError ?? '';
     const job = !!p.lifecycleJobId && !!p.lifecycleDigest;
-    if (p.state === 'UNCONFIRMED' && error.startsWith('failed:')) return job ? 'pending' : null;
+    if (p.state === 'UNCONFIRMED' && error.startsWith('failed:')) return job && p.instanceId ? 'pending' : null;
     if (!error.startsWith(POOL_RELEASE_RECOVERY_PREFIX)) return null;
     const context = recoveryContext(error);
     if (p.state === 'RECOVERING') return context?.intent ? 'pending' : null;
     if (!job || !context) return 'failed';
-    if (!context.intent) return 'pending';
+    if (!context.intent) return p.instanceId ? 'pending' : 'failed';
     return typeof context.error === 'string' && TRANSIENT_RECOVERY_ERRORS.includes(context.error) ? 'pending' : 'failed';
 }
 

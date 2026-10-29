@@ -36,6 +36,8 @@ describe('releaseHealOf: what the placement alone says about a pool-release heal
     it('not a heal: a failed row without its job or digest, capacity, drift, or any other state', () => {
         expect(releaseHealOf(failedRelease({ lifecycleJobId: null }))).toBeNull();
         expect(releaseHealOf(failedRelease({ lifecycleDigest: null }))).toBeNull();
+        // Any failed lifecycle job writes failed:*; a cold replace/provision (no host) is never a release heal.
+        expect(releaseHealOf(failedRelease({ instanceId: null }))).toBeNull();
         expect(releaseHealOf(failedRelease({ lastError: 'capacity:InsufficientInstanceCapacity:m6i.xlarge' }))).toBeNull();
         expect(releaseHealOf(failedRelease({ lastError: 'generation_drift' }))).toBeNull();
         expect(releaseHealOf(failedRelease({ lastError: null }))).toBeNull();
@@ -73,6 +75,7 @@ describe('releaseHealOf: what the placement alone says about a pool-release heal
         expect(releaseHealOf(failedRelease({ lastError: 'pool_release_recovery:{not json' }))).toBe('failed');
         expect(releaseHealOf(failedRelease({ lastError: recovery({ error: 'execution_unavailable' }), lifecycleJobId: null }))).toBe('failed');
         expect(releaseHealOf(failedRelease({ lastError: recovery({ error: 'instance_identity' }), lifecycleDigest: null }))).toBe('failed');
+        expect(releaseHealOf(failedRelease({ lastError: recovery({ error: 'instance_identity' }), instanceId: null }))).toBe('failed');
     });
 });
 
