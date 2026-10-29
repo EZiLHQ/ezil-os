@@ -305,7 +305,8 @@ export async function runLiveCheck({
   try {
     await check('setup', 30_000, async () => {
       mkdirSync(out, { recursive: true, mode: 0o700 });
-      if (!env.EZIL_E2E_EMAIL || !env.EZIL_E2E_PASSWORD || !env.PLAYWRIGHT_REQUIRE_DIR) {
+      if (!env.EZIL_E2E_EMAIL || !env.EZIL_E2E_PASSWORD || !env.PLAYWRIGHT_REQUIRE_DIR
+          || !env.NEXT_PUBLIC_SUPABASE_URL || !env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
         throw new Error('Missing live check inputs');
       }
       let chromium;
@@ -319,8 +320,9 @@ export async function runLiveCheck({
       page = await context.newPage();
     });
     await check('sign-in', 90_000, async () => {
-      await go('/login?method=email&returnUrl=%2Fcomputers');
-      await signIn(page, { email: env.EZIL_E2E_EMAIL, password: env.EZIL_E2E_PASSWORD, destination: '/computers' });
+      // No login page load: /login has no form to fill (see sign-in.mjs).
+      await signIn(page, { email: env.EZIL_E2E_EMAIL, password: env.EZIL_E2E_PASSWORD, destination: '/computers',
+        app: target.app, env });
     });
     const computerId = await check('os-session-ready', 60_000, async () => {
       const selected = await sessionReady();

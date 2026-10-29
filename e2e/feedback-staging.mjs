@@ -5,10 +5,12 @@
  * request. Without E2E_CREDS_FILE it prints {"feedback":"SKIP"} and exits 2.
  *
  *   E2E_CREDS_FILE=<json {email,password}> [E2E_BASE_URL=https://os-staging.ezil.work]
+ *   NEXT_PUBLIC_SUPABASE_URL=… NEXT_PUBLIC_SUPABASE_ANON_KEY=… (the target's public values)
  *   [E2E_OUT=e2e-results/feedback-staging-<run>] node e2e/feedback-staging.mjs
  *
- * Signs in by email/password (e2e/billing-staging-journey.mjs's path and its
- * redaction helpers), opens Settings → Troubleshoot → "Report a problem",
+ * Signs in by email/password through Supabase Auth, not the UI (e2e/sign-in.mjs;
+ * /login offers only EZiL ID), with billing-staging-journey.mjs's redaction
+ * helpers, opens Settings → Troubleshoot → "Report a problem",
  * submits ONE report whose description starts with "[synthetic r3]" and the
  * run id (diagnostics consent on, no screenshot), expects 201 and the
  * "Thanks — we got it" outcome, finds it under "Your reports", then deletes it
@@ -27,6 +29,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { closeApp, createRedactor, guardPlaywright, redactEvidence } from './billing-staging-journey.mjs';
+import { signIn } from './sign-in.mjs';
 
 export const STEP_IDS = ['health', 'sign_in', 'open_form', 'submit', 'listed', 'deleted'];
 const elapsed = start => Math.round(performance.now() - start);
@@ -115,11 +118,7 @@ export async function main(env = process.env) {
         page.setDefaultTimeout(15_000);
         page.setDefaultNavigationTimeout(60_000);
         const signedIn = await record('sign_in', async () => {
-            await page.goto(new URL('/login?method=email', base).href, { waitUntil: 'domcontentloaded' });
-            await page.locator('input[type="email"]').fill(credentials.email);
-            await page.locator('input[type="password"]').fill(credentials.password);
-            await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-            await page.waitForURL(url => url.origin === base.origin && /^\/os\/?$/.test(url.pathname));
+            await signIn(page, { email: credentials.email, password: credentials.password, app: base.origin, destination: '/os', env });
             await dock(page, 'settings').waitFor({ state: 'visible' });
         });
         const dialog = page.locator('dialog.ezil-feedback-dialog');

@@ -102,8 +102,7 @@ export async function main(output = resolve('aws-display-correlation.json')) {
     });
 
     phase = 'sign_in';
-    await page.goto(`${base.origin}/login?method=email`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await signIn(page, { email, password });
+    await signIn(page, { email, password, app: base.origin });
     phase = 'open_browser';
     await page.goto(`${base.origin}/os`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForFunction(() => !!window.ezil?.session?.payload?.()?.computer && !!window.ezil?.registry, null, { timeout: 60_000 });

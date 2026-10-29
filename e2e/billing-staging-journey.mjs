@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
  * Opt-in staging journey. Importing this file does not read credentials, load
- * Playwright, start a browser, or make requests. Run with E2E_CREDS_FILE and
- * optionally E2E_BASE_URL, E2E_OUT, E2E_UPGRADE=standard|premium|none.
+ * Playwright, start a browser, or make requests. Run with E2E_CREDS_FILE,
+ * NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY (the target's
+ * public Supabase settings, for e2e/sign-in.mjs) and optionally E2E_BASE_URL,
+ * E2E_OUT, E2E_UPGRADE=standard|premium|none.
  *
  * Static selector references (the deployed version may differ):
- * login: app/src/app/login/login-form.tsx:121,135,143
+ * login: none; e2e/sign-in.mjs signs in without the UI (EZiL ID only)
  * dock: shell/ezil/boot.js:854; shell/src/UI/UITaskbarItem.js:50
  * names: shell/ezil/apps/registry.js:309,333,359,372
  * frames: shell/ezil/apps/code.js:279; apps/desktop-window.js:597
@@ -30,6 +32,7 @@ import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { desktopQuality, installNekoClipboardProbe, QUALITY_STEP_IDS } from './desktop-quality.mjs';
+import { signIn } from './sign-in.mjs';
 
 const STEP_IDS = ['health', 'sign_in', 'billing', 'code', 'browser', ...QUALITY_STEP_IDS, 'chat', 'persistence'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -740,12 +743,9 @@ export async function main(env = process.env) {
     page.setDefaultTimeout(15_000);
     page.setDefaultNavigationTimeout(60_000);
     const signedIn = await record('sign_in', async evidence => {
-      await page.goto(new URL('/login?method=email', base).href, { waitUntil: 'domcontentloaded' });
-      await page.locator('input[type="email"]').fill(credentials.email);
-      await page.locator('input[type="password"]').fill(credentials.password);
+      // /login offers only EZiL ID; sign in through Supabase Auth instead.
       const started = performance.now();
-      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-      await page.waitForURL(url => url.origin === base.origin && /^\/os\/?$/.test(url.pathname));
+      await signIn(page, { email: credentials.email, password: credentials.password, app: base.origin, destination: '/os', env });
       evidence.timeToOsMs = elapsed(started);
       await dock(page, 'settings').waitFor({ state: 'visible' });
     });

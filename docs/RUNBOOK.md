@@ -152,8 +152,13 @@ digest and publishes the draft with the verified identities. `deploy.yml` and
     `/auth/confirm`, and that path needs allow-listing too.
   - **E2E default-host prerequisite:**
     Every `e2e/prod*.mjs` suite and `e2e/release-and-wait.mjs` sign in as
-    `$EZIL_E2E_EMAIL` and then load `/os`. Any account that can sign in works;
-    no allow-list grant is needed since the invite gate was removed.
+    `$EZIL_E2E_EMAIL` and then load `/os`. `/login` offers only EZiL ID, so
+    they sign in without the UI (`e2e/sign-in.mjs`): a Supabase password grant,
+    then the app's own SSR auth cookie in the browser. The account therefore
+    needs an email/password identity on the target's Supabase project, and the
+    run needs that project's public `NEXT_PUBLIC_SUPABASE_URL` and
+    `NEXT_PUBLIC_SUPABASE_ANON_KEY`. No allow-list grant is needed since the
+    invite gate was removed.
 
 ---
 

@@ -69,8 +69,7 @@ async function openDesktop(ctx) {
   const p = await ctx.newPage();
   const resizes = observeScreenResizes(p, APP);
   try {
-    await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-    await signIn(p, { email: EMAIL, password: PASS });
+    await signIn(p, { email: EMAIL, password: PASS, app: APP });
     await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
     await verifySelectedComputer(p);
     await p.waitForTimeout(3500);

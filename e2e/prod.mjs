@@ -107,8 +107,7 @@ async function browserTiers() {
       const badResponses = [];
       p.on('response', r => { if (r.status() >= 400) badResponses.push(`${r.status()} ${r.url()}`); });
 
-      await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-      await signIn(p, { email: EMAIL, password: PASS });
+      await signIn(p, { email: EMAIL, password: PASS, app: APP });
       check(shape.tier, `${shape.label}: sign-in leaves /login`, !/\/login/.test(p.url()), p.url().slice(0, 60));
       await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
       await verifySelectedComputer(p);
