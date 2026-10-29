@@ -310,6 +310,8 @@ function paint () {
     // D6: the plain answer (where it runs, on which configuration) stays in view; identifiers, the
     // slot, the image, the measurements and how each value was obtained sit behind a closed Details.
     const detailsOpen = host.querySelector?.('details[data-role="sys-details"]')?.open === true;
+    // Vitals and refreshes repaint this pane; a keyboard user on "Details" keeps their place.
+    const summaryFocused = document.activeElement != null && document.activeElement === host.querySelector?.('details[data-role="sys-details"] > summary');
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to.</p>
@@ -356,6 +358,7 @@ function paint () {
         ${row('Packets lost', num(v.packetsLost))}`)}
         </details>
     `;
+    if ( summaryFocused ) host.querySelector('details[data-role="sys-details"] > summary')?.focus();
 }
 
 export default {

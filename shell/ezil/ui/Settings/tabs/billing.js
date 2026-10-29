@@ -274,7 +274,7 @@ export function timeV3Html ({ computer, fairUse }, usage = null) {
     const weighted = computer.machineChoice.filter(machine => machine.weight > 1);
     const why = weighted.length ? `Bigger configurations use your monthly time sooner: ${weighted.map(machine => `${machine.vcpu} vCPU counts ${machine.weight === 2 ? 'double' : machine.weight === 4 ? 'four times' : `${machine.weight} times`}`).join(', ')}.` : '';
     return meterRowV3({ role: 'meter-time', label: 'Computer time', value, percent, tone, notes: [
-        lines ? `${lines.main} · resets ${dateLabel(fairUse.resetsAt)}` : `Resets ${dateLabel(fairUse.resetsAt)}`,
+        lines ? lines.main : '', // the reset date is in the usage card's header
         lines?.equivalents ?? '',
         { html: `<p class="ezil-billing-note ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fair)}</p>` },
         why,
@@ -328,7 +328,9 @@ function aiMeterV3 (summary) {
     split = split ? `${whole(split.plan)} from your plan + ${whole(split.extra)} extra` : '';
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
-        ...extras, included ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote, 'Used by EZiL AI in Code and Chat.',
+        // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
+        ...extras, included && dateLabel(included.periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote,
+        'Used by EZiL AI in Code and Chat.',
     ] });
 }
 

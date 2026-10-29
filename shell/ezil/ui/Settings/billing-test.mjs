@@ -903,7 +903,9 @@ try {
     contains('[data-role="meter-ai"]', 'Used by EZiL AI in Code and Chat.');
     contains('[data-role="meter-time"]', '113 h left');
     assert.equal(q('[data-role="meter-time"] [role="meter"]').getAttribute('aria-valuenow'), '90');
-    contains('[data-role="meter-time"]', 'About 113 hours left at 8 vCPU · resets Nov 1');
+    contains('[data-role="meter-time"]', 'About 113 hours left at 8 vCPU');
+    assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /resets/i, 'the reset date lives in the usage card header');
+    contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Resets Nov 1, 2026');
     contains('[data-role="meter-time"]', 'Same as 226 hours at 4 vCPU or 453 hours at 2 vCPU.');
     contains('[data-role="meter-time"]', 'Bigger configurations use your monthly time sooner: 4 vCPU counts double, 8 vCPU counts four times.');
     contains('[data-role="meter-storage"]', '50 GB disk for your projects');
@@ -916,7 +918,8 @@ try {
     getUsage = () => failure('unavailable'); summary = summaryV3('free'); summary.computer.disk = { provisionedGiB: null, usedBytes: null }; await refresh(); audit();
     contains('[data-role="meter-storage"]', 'Your files are saved between sessions.');
     assert.doesNotMatch(q('[data-role="meter-storage"]').textContent, /\d+ GB/);
-    contains('[data-role="meter-time"]', 'Resets Nov 1');
+    assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /resets/i);
+    contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Resets Nov 1, 2026');
     has('[data-role="meter-time"] [role="meter"]', false);
     pass('D6 one column: plan card, Your computer, three left-meters, plan cards; no machine picker; Change configuration links to Computer');
     summary = summaryV3(); await refresh();
