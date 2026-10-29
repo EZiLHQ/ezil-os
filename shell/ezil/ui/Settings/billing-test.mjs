@@ -25,8 +25,9 @@ function cssRule (selector, last = false, property) {
 }
 const tokens = cssRule('.ezil-settings-window');
 function rgb (value) {
-    const variable = value.match(/^var\((--[\w-]+)\)$/);
-    if ( variable ) return rgb(tokens[variable[1]]);
+    // `var(--name)` or `var(--name, fallback)`: round 3's --accent is `var(--ezil-accent, #00adb5)`.
+    const variable = value.match(/^var\((--[\w-]+)(?:,\s*(.+))?\)$/);
+    if ( variable ) return rgb(tokens[variable[1]] ?? variable[2]);
     const mix = value.match(/^color-mix\(in srgb, (.+) (\d+)%, (.+)\)$/);
     if ( mix ) {
         const front = rgb(mix[1]), back = rgb(mix[3]), alpha = Number(mix[2]) / 100;
@@ -108,20 +109,21 @@ function invoice (kind = 'subscription', created = '2026-10-14T12:00:00Z', statu
     return { id: 'in_test', number: null, status, kind, amountPaidCents: 1200, amountDueCents: 2345, currency: 'usd', created, url: `https://invoice.example.test/${kind}`, description: null };
 }
 let summary = v2(), history = [];
-let getSummary = () => reply(summary), getHistory = () => reply(history);
+let getSummary = () => reply(summary), getHistory = () => reply(history), getUsage = () => failure('unavailable');
 let mutation = () => reply({ url: 'https://billing.example.test/session' });
 window.fetch = async (url, options = {}) => {
     const call = { url: String(url), method: options.method, input: options.body ? JSON.parse(options.body).json : undefined };
     calls.push(call);
     if ( call.url.includes('/api/trpc/billing.summary') ) return getSummary();
     if ( call.url.includes('/api/trpc/billing.history') ) return getHistory();
+    if ( call.url.includes('/api/trpc/billing.usage') ) return getUsage();
     if ( call.url.includes('/api/trpc/billing.') ) return mutation(call);
     if ( call.url.includes('/api/trpc/computer.list') ) return reply([]);
     return failure('Stubbed endpoint');
 };
 const bundled = await build({
     stdin: {
-        contents: "import './shell/ezil/boot.js'; import * as billing from './shell/ezil/ui/Settings/tabs/billing.js'; import * as format from './shell/ezil/ui/Settings/billing-format.js'; window.billing = billing; window.billingFormat = format;",
+        contents: "import './shell/ezil/boot.js'; import * as billing from './shell/ezil/ui/Settings/tabs/billing.js'; import * as format from './shell/ezil/ui/Settings/billing-format.js'; import * as computersTab from './shell/ezil/ui/Settings/tabs/computers.js'; window.billing = billing; window.billingFormat = format; window.computersTab = computersTab;",
         resolveDir: path.resolve(here, '../../../..'),
     },
     bundle: true, write: false, format: 'iife', target: 'es2022',
@@ -200,7 +202,7 @@ try {
         ['incomplete', '--warn', 12], ['upgrade_pending', '--warn', 12], ['past_due', '--danger', 12],
     ] ) {
         const rule = cssRule(`.ezil-settings-billing [data-role="plan-status"][data-status="${status}"]`);
-        assert.equal(rule.color, status === 'active' ? '#4fd8de' : `var(${token})`);
+        assert.equal(rule.color, status === 'active' ? 'var(--text)' : `var(${token})`);
         assert.equal(rule.background, tint ? `color-mix(in srgb, var(${token}) ${tint}%, var(--surface))` : 'var(--surface-2)');
         const light = luminance(rule.color), dark = luminance(rule.background);
         assert.ok((Math.max(light, dark) + 0.05) / (Math.min(light, dark) + 0.05) >= 4.5, `${status} chip reaches 4.5:1`);
@@ -841,7 +843,8 @@ try {
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
         contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === null ? 'No session time limit' : 'Sessions up to 1 hour');
         if ( tier !== 'free' ) {
-            contains('[data-role="plan-card"]', `Renews on Nov 1 for $${tier === 'standard' ? 20 : 100}`);
+            contains('[data-role="plan-card"]', `$${tier === 'standard' ? 20 : 100}/month · renews Nov 1, 2026`);
+            contains('[data-role="plan-status"]', 'Current');
             contains('[data-role="your-computer"]', 'Your own computer on AWS (India)');
             contains('[data-action="portal"]', 'Manage payment');
             contains('[data-action="cancel"]', 'Cancel');
@@ -853,7 +856,8 @@ try {
         click(q(`[data-action="${action}"]`));
         if ( tier === 'free' ) {
             has('[data-sheet="choose"]');
-            assert.equal(qa('[data-sheet="choose"] li').length, 5);
+            assert.equal(qa('[data-sheet="choose"] li').length, 12);
+            assert.equal(q('[data-sheet="choose"] [data-role="current-plan"]').disabled, true);
             click(q('[data-sheet="choose"] [data-sku="standard_monthly_v3"]'));
             assert.equal(sheets.at(-1).kind, 'checkout');
             assert.equal(sheets.at(-1).sku, 'standard_monthly_v3');
@@ -861,64 +865,114 @@ try {
         } else assert.equal(sheets.at(-1).kind, action);
         await closeSheet();
     }
+    // Round 3 (plan §6.3): the configuration choice moved to Settings → Computer.
+    // Billing shows the three meters and, on Premium, a way to that tab.
     summary = summaryV3('premium'); await refresh();
-    assert.equal(qa('[data-role="machine-picker"] input').length, 3);
-    assert.equal(q('input[name="ezil-billing-machine"]:checked').value, 'std-2');
-    for ( const [size, label, weight] of [['std-2', '2 vCPU · 8 GB', 1], ['cmp-4', '4 vCPU · 16 GB', 2], ['cmp-8', '8 vCPU · 32 GB', 4]] ) {
-        const radio = q(`input[name="ezil-billing-machine"][value="${size}"]`);
-        assert.ok(radio.labels[0].textContent.includes(label));
-        assert.equal(radio.labels[0].textContent.includes('uses time'), weight > 1);
-        if ( weight > 1 ) assert.ok(radio.labels[0].textContent.includes(`uses time ${weight}× faster`));
-    }
-    let releaseMachine;
-    mutation = () => new Promise(resolve => { releaseMachine = resolve; });
-    changeSize('cmp-4');
-    assert.ok(calls.at(-1).url.endsWith('/billing.selectMachine'));
-    assert.deepEqual(calls.at(-1).input, { size: 'cmp-4' });
-    assert.equal(qa('[data-role="machine-picker"] input:disabled').length, 3);
-    contains('[data-role="machine-status"]', 'Saving…');
-    releaseMachine(reply({ size: 'cmp-4', effective: 'next_open' })); await settle(); audit();
-    assert.equal(q('[data-role="machine-status"]').textContent, 'Your files stay on your disk. Your next session starts on 4 vCPU · 16 GB — about 30 seconds after you stop and reopen your computer.');
-    assert.equal(q('input[name="ezil-billing-machine"]:checked').value, 'cmp-4');
-    const savedCallCount = count('selectMachine');
-    changeSize('cmp-4'); await settle(); assert.equal(count('selectMachine'), savedCallCount);
-    mutation = () => failure('size_not_allowed');
-    changeSize('cmp-8'); await settle(); audit();
-    contains('[data-role="machine-status"]', "That size isn't included in your plan.");
-    assert.equal(q('input[name="ezil-billing-machine"]:checked').value, 'cmp-4');
-    assert.equal(qa('[data-role="machine-picker"] input:disabled').length, 0);
-    mutation = call => reply({ size: call.input.size, effective: 'next_open' });
-    const key = (value, key) => {
-        const radio = q(`input[name="ezil-billing-machine"][value="${value}"]`);
-        radio.focus();
-        radio.dispatchEvent(new window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
-    };
-    for ( const [from, pressed, to] of [['cmp-4', 'ArrowRight', 'cmp-8'], ['cmp-8', 'ArrowDown', 'std-2'], ['std-2', 'ArrowLeft', 'cmp-8'], ['cmp-8', 'Home', 'std-2'], ['std-2', 'End', 'cmp-8'], ['cmp-4', ' ', 'cmp-4']] ) {
-        key(from, pressed); await settle(); audit();
-        assert.deepEqual(calls.at(-1).input, { size: to });
-        assert.equal(q('input[name="ezil-billing-machine"]:checked').value, to);
-        assert.equal(window.document.activeElement.value, to);
-    }
+    has('[data-role="machine-picker"]', false);
+    assert.equal(qa('input[name="ezil-billing-machine"]').length, 0);
+    assert.ok(! /Next session's computer/.test(text()));
+    for ( const role of ['meter-ai', 'meter-time', 'meter-storage'] ) has(`[data-role="${role}"]`);
+    click(q('[data-action="computer-tab"]')); await settle();
+    assert.equal(active(), 'computers');
+    click(q('.ezil-settings-tab[data-tab="billing"]')); await settle();
     for ( const tier of ['free', 'standard'] ) {
         summary = summaryV3(tier); await refresh();
         has('[data-role="machine-picker"]', false);
-        assert.equal(qa('input[name="ezil-billing-machine"]').length, 0);
+        has('[data-action="computer-tab"]', false);
     }
-    pass('Premium machine picker labels, exact mutation, pending guard, rollback and keyboard navigation; other plans read-only');
+    // The three rows with round-3 data (plan §6.3): split AI credits, hours at
+    // the CURRENT configuration with equivalents, and the provisioned disk.
+    summary = summaryV3('premium');
+    Object.assign(summary.ai, { included: { granted: 1000, remaining: 812, periodEnd: END }, purchased: { remaining: 500, expiresAt: '2027-01-15T00:00:00Z' }, starter: null, pendingFromRenewal: null });
+    summary.computer.disk = { provisionedGiB: 50, usedBytes: null };
+    getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 1630800,
+        currentSize: 'cmp-8', currentWeight: 4, remainingHoursAtCurrent: 113, equivalents: [{ size: 'std-2', weight: 1, hours: 453 }, { size: 'cmp-4', weight: 2, hours: 226 }, { size: 'cmp-8', weight: 4, hours: 113 }] } });
+    await refresh(); audit();
+    contains('[data-role="meter-ai"]', '812 of 1,000 left this period · resets Nov 1');
+    contains('[data-role="meter-ai"]', '+ 500 purchased · expire Jan 15, 2027');
+    contains('[data-role="meter-ai"]', 'Used by EZiL AI in Code and Chat.');
+    contains('[data-role="meter-time"]', 'About 113 hours left at 8 vCPU · resets Nov 1');
+    contains('[data-role="meter-time"]', 'Same as 226 hours at 4 vCPU or 453 hours at 2 vCPU.');
+    contains('[data-role="meter-time"]', 'Bigger configurations use your monthly time sooner: 4 vCPU counts double, 8 vCPU counts four times.');
+    contains('[data-role="meter-storage"]', '50 GB disk for your projects');
+    assert.equal(calls.filter(call => call.url.includes('/billing.usage')).at(-1)?.url.includes('billing.usage'), true);
+    summary.ai.pendingFromRenewal = { credits: 1000, at: END }; summary.ai.included = null; summary.ai.balance = 369; await refresh();
+    contains('[data-role="meter-ai"]', '1,000 more from Nov 1');
+    getUsage = () => failure('unavailable'); summary = summaryV3('free'); summary.computer.disk = { provisionedGiB: null, usedBytes: null }; await refresh(); audit();
+    contains('[data-role="meter-storage"]', 'Your files are saved with your computer.');
+    assert.doesNotMatch(q('[data-role="meter-storage"]').textContent, /\d+ GB/);
+    contains('[data-role="meter-time"]', 'Resets Nov 1');
+    pass('no machine picker in Billing (moved to the Computer tab); Premium links there; three meter rows');
     summary = summaryV3(); await refresh();
     for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1.']] ) {
         summary.fairUse.status = status; await refresh(); contains('[data-role="fair-use"]', copy);
     }
     summary.plan.status = 'cancels'; summary.plan.cancelsAt = END; await refresh();
-    contains('[data-role="cancels-banner"]', 'Your plan ends on Nov 1'); assert.ok(!text().includes('Renews on'));
+    contains('[data-role="cancels-banner"]', 'Standard ends on Nov 1. Your files are kept.'); assert.ok(!text().includes('renews'));
+    contains('[data-role="plan-actions"] [data-action="resume"].ezil-settings-btn-primary', 'Keep Standard');
     summary.plan.status = 'past_due'; summary.plan.paymentIssue = 'payment_failed'; await refresh();
-    contains('[data-role="payment-banner"]', "Your last payment didn't go through");
+    contains('[data-role="payment-banner"]', "Your last payment didn't go through. Update your payment method to keep Standard.");
+    contains('[data-role="payment-banner"] [data-action="portal"]', 'Update payment');
     mutation = () => failure('stripe_unavailable'); click(q('[data-action="portal"]')); await settle();
     contains('[data-role="billing-action-error"]', 'Payments are unavailable'); assert.equal(q('[data-action="portal"]').disabled, false);
     mutation = () => reply({ url: 'javascript:alert(1)' }); const previousOpened = opened.length;
     click(q('[data-action="portal"]')); await settle(); assert.equal(opened.length, previousOpened);
     mutation = () => reply({ url: 'https://billing.example.test/v3' }); click(q('[data-action="portal"]')); await settle();
     assert.equal(opened.at(-1)[0], 'https://billing.example.test/v3');
+    // Round 4 (D16-D18): the standing banners. Dates are UTC; the dead past_due-without-issue branch is gone.
+    {
+        const GRACE = '2026-11-05T00:00:00Z', ENDS = '2026-11-26T00:00:00Z';
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: GRACE });
+        Object.assign(summary.computer, { standing: 'grace', filesOn: 'aws', heldSince: null, move: null }); await refresh();
+        contains('[data-role="payment-grace"]', "Your payment didn't go through — update it by Nov 5, 2026 to keep your AWS computer.");
+        contains('[data-role="payment-grace"] [data-action="portal"]', 'Fix payment');
+        has('[data-role="payment-banner"]', false);
+        assert.equal(qa('[data-role="payment-grace"], [data-role="payment-banner"]').length, 1, 'one payment banner');
+        // In grace the new period's plan credits wait for the payment: never "0 of 0 left" + "more from <renewal>".
+        Object.assign(summary.ai, { included: { granted: 0, remaining: 0, periodEnd: END }, pendingFromRenewal: { credits: 1000, at: END }, starter: { remaining: 100 } }); await refresh();
+        contains('[data-role="meter-ai"]', '0 of 1,000 this period · added once your payment goes through');
+        contains('[data-role="meter-ai"]', '100 starter credits left');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /0 of 0|more from/);
+        Object.assign(summary.ai, { included: { granted: 1000, remaining: 640, periodEnd: END } }); await refresh();
+        contains('[data-role="meter-ai"]', '640 of 1,000 left this period');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/);
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
+        Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
+        contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');
+        has('[data-role="cancels-banner"]', false);
+        contains('[data-role="plan-actions"] [data-action="resume"]', 'Keep Premium');
+        summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
+        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.');
+        contains('[data-role="your-computer"]', 'Your files are kept on your AWS (India) computer. It opens with Free limits.');
+        contains('[data-role="plan-actions"]', 'Upgrade');
+        // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
+        Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
+        has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
+        assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
+        // Unknown or missing standing: the round-3 Billing tab exactly.
+        for ( const standing of [undefined, 'moved'] ) {
+            summary = summaryV3('free'); summary.computer.standing = standing; await refresh();
+            for ( const role of ['payment-grace', 'plan-ending', 'files-held'] ) has(`[data-role="${role}"]`, false);
+        }
+        // The dead branch: past_due without a payment issue never painted its own banner (summary.ts always sets one).
+        summary = summaryV3(); Object.assign(summary.plan, { status: 'past_due', paymentIssue: null }); await refresh();
+        has('[data-role="payment-banner"]', false);
+        // Billing and Settings → Computer say the same thing (two copies of one function, pinned here).
+        const shapes = [
+            ['grace', { plan: { graceEndsAt: GRACE }, computer: { filesOn: 'aws' } }], ['grace', { plan: {}, computer: { filesOn: 'cloudflare' } }],
+            ['plan_ending', { plan: { name: 'Standard', planEndsAt: ENDS }, computer: { filesOn: 'aws' } }],
+            ['plan_ending', { plan: { name: 'Premium', cancelsAt: ENDS }, computer: { filesOn: 'cloudflare' } }], ['plan_ending', { plan: {}, computer: {} }],
+            ['files_on_aws', { plan: {}, computer: {} }], ['paid', { plan: {}, computer: {} }], ['free', { plan: {}, computer: {} }],
+        ];
+        for ( const [standing, data] of shapes ) {
+            const copy = window.billing.standingCopy(standing, data);
+            assert.equal(window.computersTab.standingCopy(standing, data), copy, `${standing} copy agrees across tabs`);
+            assert.doesNotMatch(copy, banned); assert.doesNotMatch(copy, honestyBans); assert.doesNotMatch(copy, /ap-south-1|mumbai/i);
+        }
+        pass('Round 4 standing banners: grace, plan ending, files held on AWS; unknown standing unchanged; copy pinned across tabs');
+    }
     summary = summaryV3(); history = [invoice()]; getHistory = () => failure('private invoice failure'); await refresh();
     contains('[data-role="invoice-rows"]', "Couldn't load invoices.");
     getHistory = () => reply(history); click(q('[data-role="invoice-rows"] [data-action="retry"]')); await settle();

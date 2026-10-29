@@ -749,8 +749,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     try {
                         if (!leased.admitted && leased.reason === 'capacity_waiting') return notReady('computer_starting', true);
                         if (!leased.admitted && leased.reason === 'capacity_attempt_expired') return attemptExpired(leased.capacityAttemptId);
+                        // A lost lease CAS is another tab or the server's switch winning the same wake:
+                        // only one host boots, and this caller keeps waiting on it (never "Something went wrong").
                         if (!leased.admitted) return leased.reason === 'cas_conflict'
-                            ? notReady(resizeTo ? 'cas_conflict' : 'computer_starting', true)
+                            ? notReady('computer_starting', true, resizeTo ? 'cas_conflict' : 'computer_starting')
                             : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
                         const p = leased.placement;
                         // A replace cannot be undone by compare-and-swap (the generation already moved):

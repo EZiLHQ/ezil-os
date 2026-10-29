@@ -247,7 +247,18 @@ describe('buildShellBootPayload', () => {
             'hasHmacSecret',
             'provider',
             'status',
+            'ui',
         ]);
+        // `ui` carries booleans only, and is all-off unless features are passed.
+        expect(desktopState.ui).toEqual({ floatingControls: false, feedbackScreenshots: false });
+    });
+
+    it('exposes endpoints.feedback ONLY when the feedback feature is on', () => {
+        expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
+        const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
+        expect(on.endpoints.feedback).toBe('/api/shell/feedback');
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true });
+        expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
     });
 });
 
@@ -289,6 +300,8 @@ describe('toShellDesktopState — never implies an observation it does not have'
             screen: '/api/shell/screen',
             // RETRY-118: explicit user Retry after an expired capacity attempt.
             capacityRetry: '/api/shell/capacity-retry',
+            // Round 3: one computer, selectable configuration (SWITCH-CONTRACT.md).
+            switch: '/api/shell/switch',
         });
     });
 

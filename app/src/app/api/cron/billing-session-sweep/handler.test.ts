@@ -17,7 +17,8 @@ const T = new Date('2026-10-18T00:00:00Z');
 const at = (seconds: number) => new Date(T.getTime() + seconds * 1000);
 const iso = (seconds: number) => isoSeconds(epochSeconds(at(seconds)));
 const window = { start: '2026-10-01T00:00:00Z', end: '2026-11-01T00:00:00Z' };
-const zeros = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0 };
+const zeros = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0,
+    ai: { drained: 0, delivered: 0, retried: 0, failed: 0 } };
 const ref = { userId: 'owner', computerId: 'computer' };
 type SweepInput = Parameters<typeof handleBillingSessionSweep>[0];
 
@@ -52,7 +53,8 @@ function fixture(epochs = [epoch()], { sku = 'standard_monthly_v2', allowance = 
             e.userId === userId && (e.endedAt === null || Date.parse(e.endedAt) > since.getTime()))),
         openEpochsForSweep: vi.fn<BillingStore['openEpochsForSweep']>(async ({ limit }) => epochs.filter(e => e.endedAt === null).slice(0, limit)),
         closeEpoch: vi.fn<BillingStore['closeEpoch']>(async input => {
-            const open = epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
+            const open = epochs.find(e => e.computerId === input.computerId && e.endedAt === null
+                && (input.epochId === undefined || e.id === input.epochId));
             if (!open) return 'not_open';
             open.endedAt = isoSeconds(Math.max(epochSeconds(open.readyAt), epochSeconds(input.endedAt)));
             open.endReason = input.reason;
@@ -109,7 +111,7 @@ describe('billing session sweep', () => {
         expect(f.stop).not.toHaveBeenCalled();
         expect(await f.run(21600)).toEqual({ ...zeros, examined: 1, stopped: 1, closed: 1 });
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
-        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: ref.computerId, endedAt: at(21600), reason: 'session_max' });
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: ref.computerId, epochId: 'epoch', endedAt: at(21600), reason: 'session_max' });
     });
 
     it.each([null, iso(21600), iso(40000)])('late sweeps never extend the six-hour bound (deadline %s)', async deadlineAt => {
@@ -201,7 +203,8 @@ describe('billing session sweep', () => {
         expect(await f.run(21600)).toEqual({ ...zeros, examined: 2, closed: 1, heartbeatClosed: 1, shadow: 1 });
         expect(f.stop).not.toHaveBeenCalled();
         expect(f.epochs[0]!.endedAt).toBeNull();
-        expect(console.info).toHaveBeenCalledExactlyOnceWith('[billing.sweep] shadow', expect.objectContaining({ epochId: 'epoch', reason: 'session_max' }));
+        expect(vi.mocked(console.info).mock.calls.filter(call => call[0] === '[billing.sweep] shadow'))
+            .toEqual([['[billing.sweep] shadow', expect.objectContaining({ epochId: 'epoch', reason: 'session_max' })]]);
         expect(f.store.policyClosedEpochsSince).not.toHaveBeenCalled();
         expect(f.isStillRunning).not.toHaveBeenCalled();
     });
@@ -350,13 +353,23 @@ describe('paid sessions have no time cap', () => {
         expect(f.stop).not.toHaveBeenCalled();
         expect(f.isStillRunning).not.toHaveBeenCalled();
     });
-    it('stops a paid session with a subscription payment issue before fair use', async () => {
+    // Round 4 (D17): a fresh subscription payment issue opens a 7-day grace, so the paid session keeps running.
+    it('keeps a paid session running during the payment grace', async () => {
         const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
         f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in', userId: ref.userId, subscriptionId: 'sub',
             invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: T, updatedAt: T, resolvedAt: null }]);
         await f.run(10);
-        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
-        expect(f.epochs[0].endedAt).toBe(iso(10));
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0].endedAt).toBeNull();
+    });
+    it('cuts a paid session to the Free limits once the payment grace has ended', async () => {
+        const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
+        const eightDaysAgo = new Date(T.getTime() - 8 * 86_400_000);
+        f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in', userId: ref.userId, subscriptionId: 'sub',
+            invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: eightDaysAgo, updatedAt: eightDaysAgo, resolvedAt: null }]);
+        await f.run(3601);
+        expect(f.stop).toHaveBeenCalledTimes(1);
+        expect(f.epochs[0].endedAt).not.toBeNull();
     });
     it('runs reconciliation after existing migration work with the original launch budget', async () => {
         const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
@@ -367,5 +380,60 @@ describe('paid sessions have no time cap', () => {
         expect(advanceStaleMigrations).toHaveBeenCalledExactlyOnceWith(1234);
         expect(reconcilePaidCloudflareUsers).toHaveBeenCalledExactlyOnceWith(1234);
         expect(vi.mocked(advanceStaleMigrations).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(reconcilePaidCloudflareUsers).mock.invocationCallOrder[0]!);
+    });
+});
+
+describe('round 3: stale AWS epochs and drain counts (D9/D6)', () => {
+    function run(f: ReturnType<typeof fixture>, seconds: number, awsStopProof?: SweepInput['awsStopProof']) {
+        return handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop, isStillRunning: f.isStillRunning, awsStopProof });
+    }
+    it('closes a stale AWS epoch whose placement stopped at the proven stop time, without stopping anything', async () => {
+        const f = fixture([epoch({ lastHeartbeatAt: iso(600) })], { sku: 'premium_monthly_v3', allowance: 1_800_000 });
+        const proof = vi.fn<NonNullable<SweepInput['awsStopProof']>>().mockResolvedValue({ running: false, stoppedAt: at(900) });
+        expect(await run(f, 7200, proof)).toEqual({ ...zeros, examined: 1, closed: 1, awsStaleClosed: 1 });
+        expect(proof).toHaveBeenCalledExactlyOnceWith(ref);
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer', epochId: 'epoch', endedAt: at(900), reason: 'provider_stop' });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(900), endReason: 'provider_stop' });
+    });
+    it('closes only the epoch it examined: a newer generation opened meanwhile stays open', async () => {
+        const f = fixture([epoch({ lastHeartbeatAt: iso(600) })], { sku: 'premium_monthly_v3', allowance: 1_800_000 });
+        const proof = vi.fn<NonNullable<SweepInput['awsStopProof']>>(async () => {
+            // While the sweep reads the placement, the receipts close the old epoch and the restarted host opens the next one.
+            f.epochs[0]!.endedAt = iso(900); f.epochs[0]!.endReason = 'provider_stop';
+            f.epochs.push(epoch({ id: 'epoch-next', readyAt: iso(7000) }));
+            return { running: false, stoppedAt: at(900) };
+        });
+        expect(await run(f, 7200, proof)).toEqual({ ...zeros, examined: 1 });
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer', epochId: 'epoch', endedAt: at(900), reason: 'provider_stop' });
+        expect(f.epochs[1]).toMatchObject({ id: 'epoch-next', endedAt: null });
+    });
+    it.each([[null, 600], [at(-5), 600], [at(9000), 7200]] as const)('falls back to the last heartbeat, or bounds by now, when the stop time is %s', async (stoppedAt, endedAt) => {
+        const f = fixture([epoch({ lastHeartbeatAt: iso(600) })], { sku: 'premium_monthly_v3', allowance: 1_800_000 });
+        await run(f, 7200, async () => ({ running: false, stoppedAt }));
+        expect(f.epochs[0]!.endedAt).toBe(iso(endedAt));
+    });
+    it.each(['running', 'throws', 'fresh heartbeat', 'no proof port', 'cloudflare'] as const)('keeps the AWS epoch open when %s', async scenario => {
+        const e = epoch({ lastHeartbeatAt: scenario === 'fresh heartbeat' ? iso(7000) : iso(600), size: scenario === 'cloudflare' ? 'free-cf' : 'std-2' });
+        const f = fixture([e], { sku: 'premium_monthly_v3', allowance: 1_800_000 });
+        const proof = vi.fn<NonNullable<SweepInput['awsStopProof']>>(async () => {
+            if (scenario === 'throws') throw new Error('placement read failed');
+            return { running: scenario === 'running', stoppedAt: at(900) };
+        });
+        const counts = await run(f, 7200, scenario === 'no proof port' ? undefined : proof);
+        expect(counts.awsStaleClosed).toBe(0);
+        if (scenario === 'cloudflare') { expect(counts.heartbeatClosed).toBe(1); expect(proof).not.toHaveBeenCalled(); return; }
+        expect(f.epochs[0]!.endedAt).toBeNull();
+        expect(f.store.closeEpoch).not.toHaveBeenCalled();
+        if (scenario === 'fresh heartbeat' || scenario === 'no proof port') expect(proof).not.toHaveBeenCalled();
+    });
+    it('returns and logs the AI outbox drain counts', async () => {
+        vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockResolvedValue({ claimed: 5, done: 3, failed: 1, retry: 1, skipped: 1 });
+        const f = fixture([]);
+        expect(await f.run(0)).toEqual({ ...zeros, ai: { drained: 5, delivered: 3, retried: 1, failed: 1 } });
+        expect(vi.mocked(console.info).mock.calls.map(call => String(call[0])).filter(line => line.startsWith('{')).map(line => JSON.parse(line)))
+            .toEqual([{ event: 'billing-sweep', ...zeros, ai: { drained: 5, delivered: 3, retried: 1, failed: 1 } }]);
+        f.deps.config.enforcementEnabled = false; f.deps.config.tabEnabled = false;
+        expect((await f.run(0)).ai).toEqual({ drained: 5, delivered: 3, retried: 1, failed: 1 });
     });
 });

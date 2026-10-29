@@ -69,7 +69,8 @@ describe('every lifecycle router call inherits the billing reader', () => {
         ['server/api/routers/cloudflare-guacamole.ts', 7, './compute-dispatch'],
         ['server/api/routers/computer.ts', 1, './compute-dispatch'],
         ['server/lib/compute/stop-policy.ts', 1, '@/server/api/routers/compute-dispatch'],
-        ['app/api/cron/billing-session-sweep/route.ts', 1, '@/server/api/routers/compute-dispatch'],
+        // isStillRunning plus the round-3 awsStopProof (both take the dispatch default).
+        ['app/api/cron/billing-session-sweep/route.ts', 2, '@/server/api/routers/compute-dispatch'],
     ] as const)('%s uses the dispatch default on every routeComputer call', (file, expectedCalls, dispatchImport) => {
         const source = ts.createSourceFile(file, readFileSync(path.resolve(__dirname, '../../..', file), 'utf8'), ts.ScriptTarget.Latest, true);
         const calls: ts.CallExpression[] = [];

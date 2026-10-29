@@ -1,7 +1,7 @@
 // Authenticated observations. Durations and balances never advance on the client.
 import trpc from '../trpc.js';
 import session from '../../../session.js';
-import { creditsLabel } from '../billing-format.js';
+import { creditsLabel, hoursLeftLines } from '../billing-format.js';
 
 const states = new WeakMap();
 let active = null;
@@ -53,55 +53,81 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         : plan?.sku === 'free_v3' && actions.checkout === true ? billingLink('Upgrade', 'usage-upgrade', true, '&amp;upgrade=pro')
         : plan?.sku === 'standard_monthly_v3' && actions.upgrade === true ? billingLink('Upgrade to Premium', 'usage-upgrade', true, '&amp;upgrade=premium') : '';
     const pill = plan?.status === 'past_due' ? 'Payment due' : plan?.status === 'cancels' ? `Ends ${timestamp(plan.cancelsAt)}` : plan?.status === 'upgrade_pending' ? 'Upgrade pending' : '';
-    const remaining = count(period.remainingStandardSeconds) ? `${duration(period.remainingStandardSeconds)} left` : 'Remaining time unavailable';
-    const timeNote = period.allowanceStandardSeconds === 0 ? 'No compute time included this period.'
+    // Round 3 (D3): time left is hours at the CURRENT configuration (the server's
+    // `remainingHoursAtCurrent`), never raw standard-seconds shown as hours.
+    const choices = summary?.computer?.machineChoice ?? [];
+    const weight = count(period.currentWeight) && period.currentWeight >= 1 ? period.currentWeight : 1;
+    // An older server sends no current size: fall back to the plan's chosen size, then 2 vCPU (weight 1).
+    const currentSize = period.currentSize ?? summary?.computer?.size ?? 'std-2';
+    const hoursPeriod = Number.isSafeInteger(period.remainingHoursAtCurrent) ? { ...period, currentSize }
+        : count(period.remainingStandardSeconds) ? { ...period, currentSize, remainingHoursAtCurrent: Math.floor(period.remainingStandardSeconds / weight / 3600) } : null;
+    const lines = hoursLeftLines(hoursPeriod, choices);
+    const lessThanHour = lines && hoursPeriod.remainingHoursAtCurrent === 0 && period.remainingStandardSeconds > 0;
+    const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
+    const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
         : timePercent === null ? "We couldn't read your usage. Try Refresh."
-        : timeState === 'danger' ? `■ ${remaining} · new sessions paused`
-        : timeState === 'warn' ? `! ${remaining}. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.` : remaining;
+        : timeState === 'danger' ? '■ No computer time left · new sessions paused'
+        : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
+        : esc(lines?.equivalents ?? '');
     const ai = summary?.ai, grant = ai?.grant;
+    const included = ai?.included && Number.isSafeInteger(ai.included.remaining) && Number.isSafeInteger(ai.included.granted) && ai.included.granted > 0 ? ai.included : null;
     const balanceLabel = creditsLabel(ai?.balanceMicro, ai?.balance);
-    const balance = balanceLabel === 'Not reported' ? null : typeof ai?.balanceMicro === 'string' && /^\d{1,100}$/.test(ai.balanceMicro) ? Number(ai.balanceMicro) / 1000000 : ai.balance;
-    const aiPercent = ratio(balance, grant?.amount);
+    const balance = included ? included.remaining : balanceLabel === 'Not reported' ? null : typeof ai?.balanceMicro === 'string' && /^\d{1,100}$/.test(ai.balanceMicro) ? Number(ai.balanceMicro) / 1000000 : ai.balance;
+    const aiPercent = ratio(balance, included ? included.granted : grant?.amount);
     const aiState = balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
         : ai?.state === 'low' || (aiPercent !== null && aiPercent <= 20) ? 'warn' : 'ok';
-    const grantLabel = count(grant?.amount) && grant.amount > 0 ? creditsLabel(null, grant.amount) : null;
-    const grantNote = grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
+    const grantLabel = included ? creditsLabel(null, included.granted) : count(grant?.amount) && grant.amount > 0 ? creditsLabel(null, grant.amount) : null;
+    // "Your plan adds N every month" only when this period's grant is not split out: right after an upgrade it was false.
+    const grantNote = included ? `Resets ${timestamp(included.periodEnd)}` : grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
         : grant.per === 'once' ? `Includes ${grantLabel} one-time trial credits` : '' : '';
-    const aiNote = aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : grantNote;
-    const aiValue = balance === null ? 'Unavailable' : `${esc(balanceLabel)}${grantLabel ? ` of ${esc(grantLabel)}` : ''} left`;
+    const extras = [
+        ai?.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining > 0 ? `+ ${esc(creditsLabel(null, ai.purchased.remaining))} purchased · expire ${timestamp(ai.purchased.expiresAt)}` : '',
+        ai?.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining > 0 ? `${esc(creditsLabel(null, ai.starter.remaining))} starter credits left` : '',
+        ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
+    ].filter(Boolean);
+    const aiNote = [aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : grantNote, ...extras].filter(Boolean).join('<br>');
+    const aiValue = balance === null ? 'Unavailable' : `${esc(included ? creditsLabel(null, included.remaining) : balanceLabel)}${grantLabel ? ` of ${esc(grantLabel)}` : ''} left`;
+    // Round 3 (D4): the provisioned disk; a used figure only when measured; Free shows no invented number.
     const storage = usage?.storage, samples = storage?.state === 'sampled' && Array.isArray(storage.samples) ? storage.samples : [];
+    const disk = storage?.disk && typeof storage.disk === 'object' ? storage.disk : null;
+    const diskGB = count(disk?.provisionedGiB) && disk.provisionedGiB > 0 ? disk.provisionedGiB : null;
     const sizes = samples.map(sample => byteCount(sample.bytes));
     const total = sizes.length && sizes.every(count) ? sizes.reduce((sum, size) => sum + size, 0) : null;
-    const usedBytes = count(total) ? total : null;
+    const usedBytes = byteCount(disk?.usedBytes) ?? (count(total) ? total : null);
     const capBytes = byteCount(storage ? storage.capBytes : summary?.storage?.capBytes);
     const storagePercent = ratio(usedBytes, capBytes), storageState = threshold(storagePercent);
     const measuredAt = samples.map(sample => sample.measuredAt).filter(validDate).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
-    const storageNote = usedBytes === null ? `Limit ${esc(bytes(capBytes))}` : storageState === 'danger' ? '■ Full. Delete files you no longer need.'
-        : storageState === 'warn' ? '! Almost full. Delete files you no longer need.' : `Last measured ${timestamp(measuredAt)}`;
+    const storageValue = usedBytes !== null && capBytes !== null ? `${esc(bytes(usedBytes))} of ${esc(diskGB ? `${diskGB} GB` : bytes(capBytes))}`
+        : diskGB ? `${diskGB} GB disk` : storage && storage.capBytes === null ? 'Saved with your computer' : 'Not measured yet';
+    const storageNote = storageState === 'danger' ? '■ Full. Delete files you no longer need.'
+        : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
+        : diskGB ? `For your projects · the same on every configuration${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
+        : usedBytes !== null ? `Last measured ${timestamp(measuredAt)}` : storage && storage.capBytes === null ? 'Your files are saved with your computer.' : '';
     const sessionLine = !['recording', 'stale', 'ended'].includes(current.state) ? 'No session recorded yet.'
         : current.state === 'ended' ? `Last session: ${duration(current.elapsedSeconds)} · ended ${timestamp(current.endedAt)}`
         : current.state === 'stale' || stale ? `This session: ${duration(current.elapsedSeconds)} so far · Update delayed`
         : `This session: ${duration(current.elapsedSeconds)} · running${validDate(summary?.computer?.activeDeadline) ? ` · ends ${timestamp(summary.computer.activeDeadline, true)}` : ''}`;
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
-    ${paused ? `<aside class="usage-banner"><strong>Compute time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}
+    ${paused ? `<aside class="usage-banner"><strong>Computer time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}
     <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : 'Plan unavailable'}</h4>
         ${validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
         <div class="usage-plan-actions">${paused ? '' : primary}${billingLink('Billing details ›', 'usage-billing')}</div></header>
     <div class="usage-meters">
-        ${meter('compute', 'Compute time', timePercent === null ? 'Not measured' : `${duration(period.usedStandardSeconds)} of ${duration(period.allowanceStandardSeconds)}`, timePercent,
-            `${seconds(period.usedStandardSeconds)} used of ${seconds(period.allowanceStandardSeconds)}. ${count(period.remainingStandardSeconds) ? `${seconds(period.remainingStandardSeconds)} left.` : 'Remaining time unavailable.'}`, timeNote, timeState)}
-        ${meter('ai', 'AI credits', aiValue, aiPercent, `${balanceLabel} credits left.${grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, esc(aiNote), aiState,
+        ${meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
+            `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
+        ${meter('ai', 'AI credits', aiValue, aiPercent, `${included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${!included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState,
             actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '')}
-        ${meter('storage', 'Storage', usedBytes === null ? 'Not measured yet' : `${esc(bytes(usedBytes))} of ${esc(bytes(capBytes))}`, storagePercent,
+        ${meter('storage', 'Storage', storageValue, storagePercent,
             `${bytes(usedBytes)} used of ${bytes(capBytes)}.`, storageNote, storageState)}
     </div>
     <p class="usage-session-line" data-usage="session">${sessionLine}</p>
     <div class="usage-details">
-        <details data-usage-detail="period"><summary>How compute time works</summary><p class="usage-note">Time counts while your computer is running.</p>
+        <details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
             ${weights.map(option => `<p class="usage-note">${esc(option.vcpu)} vCPU counts ${esc(option.weight)} h for each hour it runs.</p>`).join('')}
+            ${weights.length ? '<p class="usage-note">Bigger configurations use your monthly time sooner, so the hours left depend on the configuration you run.</p>' : ''}
             <p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p></details>
-        <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Saved files across your computers. Measured from time to time, so the total can lag behind.</p></details>
+        <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Your computer's disk for your projects. It stays the same when you switch configuration. A used figure appears once it is measured.</p></details>
         <details data-usage-detail="session"><summary>Session details</summary><dl>${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}</dl></details>
     </div>`;
 }
@@ -141,7 +167,7 @@ function announce(state, body) {
         next[id] = status;
         if (state.meterStates?.[id] === status) continue;
         const message = {
-            compute: { warn: 'Compute time: nearly used up.', danger: 'Compute time is used up. New sessions are paused.', ok: 'Compute time: within your allowance.' },
+            compute: { warn: 'Computer time: nearly used up.', danger: 'Computer time is used up. New sessions are paused.', ok: 'Computer time: within your allowance.' },
             ai: { warn: 'AI credits: running low.', danger: 'AI credits: no credits left.', ok: 'AI credits available.' },
             storage: { warn: 'Storage: almost full.', danger: 'Storage: full.', ok: 'Storage: within your limit.' },
         }[id]?.[status];

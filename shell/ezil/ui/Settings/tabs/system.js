@@ -249,8 +249,8 @@ async function refreshSystemInfo () {
     systemInfoTimer = setTimeout(() => { void refreshSystemInfo(); }, delay);
 }
 
-function row (label, value, hint) {
-    return `<div class="ezil-sys-row">
+function row (label, value, hint, role) {
+    return `<div class="ezil-sys-row"${role ? ` data-role="${role}"` : ''}>
         <div class="ezil-sys-k">${label}</div>
         <div class="ezil-sys-v">${value}</div>
         ${hint ? `<div class="ezil-sys-h">${hint}</div>` : ''}
@@ -319,8 +319,8 @@ function paint () {
               'The sandbox this session is bound to.')}
 
         <h4>Machine</h4>
-        ${(() => { const p = describeRunningOn(systemInfo, systemInfoReason); return row('Running on', esc(p.value), esc(p.hint)); })()}
-        ${(() => { const p = describePlan(systemInfo); return row('Your plan', esc(p.value), esc(p.hint)); })()}
+        ${(() => { const p = describeRunningOn(systemInfo, systemInfoReason); return row('Running on', esc(p.value), esc(p.hint), 'sys-running-on'); })()}
+        ${(() => { const p = describePlan(systemInfo); return row('Configuration', esc(p.value), esc(p.hint), 'sys-configuration'); })()}
         ${(() => { const i = describeImage(systemInfo); return row('Image', i.title ? `<code title="${esc(i.title)}">${esc(i.value)}</code>` : esc(i.value)); })()}
         ${(() => { const m = describeMachine(systemInfo); return row('Size', esc(m.value), esc(m.hint)); })()}
         ${(() => { const u = describeUsage(); return row('CPU and memory use', esc(u.value), esc(u.hint)); })()}

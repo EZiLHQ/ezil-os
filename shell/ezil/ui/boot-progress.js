@@ -5,27 +5,23 @@
 // It renders `boot-phases.js`'s pure state into DOM and NOTHING else: no
 // timers, no fetches, no knowledge of what a container is. The caller
 // (`apps/desktop-window.js`) owns the clock and the two requests and pushes
-// state in. That split is what makes the honesty constraint enforceable —
-// this file physically cannot invent a phase, because it is never told the
-// time.
+// state (and, as an argument, its elapsed time) in.
 //
-// 🔴 The one rule inherited from `boot-phases.js`: a checkmark is a CLAIM.
-// Only `phaseVisualState() === 'confirmed'` draws one, and that state is
-// reachable only from the real `guacamoleRunning` signal. `passed` and
-// `current` are estimates and are drawn as estimates. A spinner that fills
-// four checkmarks on a timer while the container is dead is worse than no
-// progress at all, because the user then blames themselves.
+// Round 3: it renders through the one opening surface (`computer-progress.js`
+// `OpeningSurface`), the same one `AppSpinner` uses. There is no step list and
+// no checkmark: an estimated phase only lifts the bar's floor, the real
+// `guacamoleRunning` signal lifts it further, and only the caller's ready event
+// (which hides this panel) completes it.
 
 import {
     BOOT_PHASES,
     BOOT_FAILURE_COPY,
     BOOT_NOT_CONFIGURED_COPY,
     BOOT_PROGRESS_HEADLINE,
-    BOOT_PROGRESS_LONG_SUBTEXT,
-    BOOT_PROGRESS_SUBTEXT,
     BOOT_UNVERIFIED_COPY,
-    phaseVisualState,
+    TYPICAL_BOOT_MS,
 } from '../boot-phases.js';
+import { OpeningSurface, OPENING_COPY, formatElapsed, openingFraction, prefersReducedMotion } from './computer-progress.js';
 
 // ── the AWS boot budget ─────────────────────────────────────────────────────
 // A cold AWS replace measures 210-250 s, so a TIMEOUT at `DESKTOP_BOOT_TIMEOUT_MS`
@@ -85,121 +81,86 @@ export function awsBootWaitVerdict ({ observation, bootElapsedMs, clock = true }
 }
 
 /**
- * The phase panel's subtext while a reopen is in flight, from the observation's
- * own countdown ("About 2 min left", "Less than a minute left"); anything else,
- * including "Almost there" past the typical time, is only "still working".
- *
- * @param {string} [countdown]
+ * The status line while a reopen is in flight and the spinner has no live
+ * observation (failed poll, hidden tab). Round 3 dropped countdowns: any
+ * argument is ignored, and the line never promises a time.
  */
-export function awsStillStartingCopy (countdown) {
-    const left = typeof countdown === 'string' && /^(About \d+ min|Less than a minute) left$/.test(countdown)
-        ? countdown[0].toLowerCase() + countdown.slice(1) : 'still working';
-    return `Your AWS computer is still starting — ${left}.`;
+export function awsStillStartingCopy () {
+    return 'Your computer is still starting';
 }
 
-const CHECK = '<svg class="ezil-boot-check" viewBox="0 0 16 16" aria-hidden="true">'
-    + '<path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="2"'
-    + ' stroke-linecap="round" stroke-linejoin="round"/></svg>';
+// Cloudflare boots have no server milestones; the window's own clock and the
+// estimated phase drive the same bar. A phase is an ESTIMATE, so it only lifts
+// the floor; `confirmed` (the real `guacamoleRunning` signal) lifts it further.
+const PHASE_FLOOR = { waking: 0, mounting: 0.25, starting: 0.45, connecting: 0.6 };
+const CONFIRMED_FLOOR = 0.78;
 
 /**
  * Build the panel once. Returns a controller the caller drives; the DOM is
  * created here and only ever UPDATED afterwards, so nothing flashes between
- * ticks and the phase rows never re-mount mid-animation.
+ * ticks. Renders through the same `OpeningSurface` as `AppSpinner`.
+ *
+ * 🔴 No checkmarks and no step list: the honesty rule now lives in the bar,
+ * which reaches 100% only on the caller's ready event and otherwise stays
+ * below 90% whatever the clock says.
  *
  * @param {object} opts
  * @param {() => void} opts.onRetry Called by the failure state's Retry button.
+ * @param {string} [opts.appName]
+ * @param {string} [opts.icon]
  */
-export function BootProgress ({ onRetry } = {}) {
+export function BootProgress ({ onRetry, appName, icon } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-boot';
     root.setAttribute('role', 'status');
-    // The phase list changes on a timer; announcing every change would make a
-    // screen reader read four labels over 22 seconds. The headline and the
-    // failure copy are the parts worth announcing, so politeness lives there.
     root.setAttribute('aria-live', 'polite');
-
-    root.innerHTML = `
-        <div class="ezil-boot-panel">
-            <div class="ezil-boot-mark" aria-hidden="true"></div>
-            <h1 class="ezil-boot-title"></h1>
-            <p class="ezil-boot-sub"></p>
-            <ol class="ezil-boot-phases"></ol>
-            <div class="ezil-boot-actions">
-                <button type="button" class="ezil-boot-retry">Try again</button>
-            </div>
-        </div>`;
-
-    const el_title = root.querySelector('.ezil-boot-title');
-    const el_sub = root.querySelector('.ezil-boot-sub');
-    const el_phases = root.querySelector('.ezil-boot-phases');
-    const el_actions = root.querySelector('.ezil-boot-actions');
-    const el_retry = root.querySelector('.ezil-boot-retry');
-
-    // One row per phase, created once and reused. `data-phase` is the hook
-    // the tests and the CSS both read.
-    const rows = new Map();
-    for ( const phase of BOOT_PHASES ) {
-        const li = document.createElement('li');
-        li.className = 'ezil-boot-phase';
-        li.setAttribute('data-phase', phase.id);
-        li.setAttribute('data-state', 'upcoming');
-        li.innerHTML = `<span class="ezil-boot-dot" aria-hidden="true">${CHECK}</span>`
-            + `<span class="ezil-boot-label"></span>`;
-        // textContent, not innerHTML: the labels are product copy today, but
-        // this is the kind of place a translated string eventually lands.
-        li.querySelector('.ezil-boot-label').textContent = phase.label;
-        el_phases.appendChild(li);
-        rows.set(phase.id, li);
-    }
-
-    el_retry.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if ( typeof onRetry === 'function' ) onRetry();
-    });
+    let failureCode;
+    const surface = OpeningSurface({ appName, icon, onRetry, feedbackCode: () => failureCode });
+    surface.el.classList.add('ezil-boot-panel');
+    root.appendChild(surface.el);
+    let opening = 0, last_elapsed = Infinity;
 
     /**
      * @param {import('../boot-phases.js').BootUiState} state
-     * @param {{countdown?: string} | null} [aws] Set only while the window is
-     *   re-asking because the AWS observation says the computer is still opening.
-     *   Changes the subtext only; the phase rows are drawn exactly as before.
+     * @param {object | null} [aws] Set only while the window is re-asking because
+     *   the AWS observation says the computer is still opening. Changes the
+     *   status line only.
+     * @param {{elapsedMs?: number}} [extra] The window's boot clock.
      */
-    function render (state, aws = null) {
+    function render (state, aws = null, extra = {}) {
         root.setAttribute('data-kind', state.kind);
+        // Round 4: the raw server code (e.g. `billing_files_on_aws`), not the classified reason.
+        failureCode = state.kind === 'failed' ? state.errorCode ?? state.reason : undefined;
 
         if ( state.kind === 'progress' ) {
-            el_title.textContent = BOOT_PROGRESS_HEADLINE;
-            el_sub.textContent = aws ? awsStillStartingCopy(aws.countdown)
-                : state.isRunningLong
-                ? BOOT_PROGRESS_LONG_SUBTEXT
-                : BOOT_PROGRESS_SUBTEXT;
-            el_phases.hidden = false;
-            el_actions.hidden = true;
-            for ( const phase of BOOT_PHASES ) {
-                // The ONLY source of a checkmark. `phaseVisualState` returns
-                // 'confirmed' exclusively when the progress state was built
-                // from the real status signal.
-                rows.get(phase.id).setAttribute('data-state', phaseVisualState(phase.id, state));
-            }
+            root.dataset.phase = state.currentPhase ?? '';
+            root.dataset.confirmed = String(state.confirmed === true);
+            const elapsed = Number.isFinite(extra?.elapsedMs) ? extra.elapsedMs / 1000 : null;
+            // A fresh attempt restarts the window clock: a new opening for the never-regress guard.
+            if ( elapsed !== null ) { if ( elapsed < last_elapsed ) opening++; last_elapsed = elapsed; }
+            const label = BOOT_PHASES.find(p => p.id === state.currentPhase)?.label ?? BOOT_PROGRESS_HEADLINE;
+            const floor = state.confirmed === true ? CONFIRMED_FLOOR : PHASE_FLOOR[state.currentPhase] ?? 0;
+            const percent = aws || elapsed === null ? 'indeterminate' : Math.round(100 * openingFraction({
+                floor, ceiling: 0.9, elapsed, expected: TYPICAL_BOOT_MS / 1000, reducedMotion: prefersReducedMotion() }));
+            surface.paint({
+                status: aws ? awsStillStartingCopy() : label, percent, key: `boot-${opening}`,
+                meta: elapsed === null ? '' : state.isRunningLong ? `${OPENING_COPY.long} · ${formatElapsed(elapsed)}` : formatElapsed(elapsed),
+                long: state.isRunningLong === true,
+            });
             return;
         }
-
-        el_phases.hidden = true;
+        delete root.dataset.phase;
 
         if ( state.kind === 'not_configured' ) {
-            el_title.textContent = BOOT_NOT_CONFIGURED_COPY.title;
-            el_sub.textContent = BOOT_NOT_CONFIGURED_COPY.body;
             // Nothing to retry: no provider is configured, so the next
             // attempt fails identically. Offering a button would be a lie.
-            el_actions.hidden = true;
+            surface.paint({ status: BOOT_NOT_CONFIGURED_COPY.title, body: BOOT_NOT_CONFIGURED_COPY.body, percent: null });
             return;
         }
 
         if ( state.kind === 'failed' ) {
             const copy = BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
-            el_title.textContent = copy.title;
-            el_sub.textContent = copy.body;
-            el_actions.hidden = false;
+            surface.paint({ status: copy.title, body: copy.body, percent: null, retry: true, feedback: true });
             return;
         }
 
@@ -210,8 +171,7 @@ export function BootProgress ({ onRetry } = {}) {
         // 🔴 The two are NOT the same to the user, and this file is not where
         // the difference is drawn: `ready_unverified` means the desktop is
         // shown but nothing checked it, and `DisplayNotice` below is what says
-        // so, on top of the frame. Rendering that text into a panel that is
-        // about to be hidden would be the same as not saying it.
+        // so, on top of the frame.
     }
 
     return { el: root, render };

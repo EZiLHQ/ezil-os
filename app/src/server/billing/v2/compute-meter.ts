@@ -33,8 +33,9 @@ export function billingComputeMeter(getDeps: () => BillingDeps = getBillingDeps)
             try {
                 const deps = getDeps();
                 if (!billingMeteringActive(deps.config)) return;
+                // Only the epoch this stop can belong to: one ready at or before it, never a later generation's.
                 await deps.store.closeEpoch({
-                    computerId: input.computerId, endedAt: new Date(epochSeconds(input.endedAt) * 1000),
+                    computerId: input.computerId, readyBy: input.endedAt, endedAt: new Date(epochSeconds(input.endedAt) * 1000),
                     reason: input.reason, overheadSeconds: input.overheadSeconds,
                 });
             } catch (error) {

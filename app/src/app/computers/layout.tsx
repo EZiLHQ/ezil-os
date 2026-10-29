@@ -6,8 +6,8 @@ import { createTRPCContext } from '@/server/api/trpc';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
 
 export const metadata: Metadata = {
-    title: 'EZiL OS — Your computers',
-    description: 'Your computers',
+    title: 'EZiL OS — Your computer',
+    description: 'Your computer',
 };
 
 /**

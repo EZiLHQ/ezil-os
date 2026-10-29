@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PRO_PLAN } from './catalog';
 import * as catalog from './catalog';
-import { planAiReversal, type AiReversalStore, type AiReversalReceipt, type AiTopupReceiptStore } from './ai-credits';
+import { aiCreditOutboxItem, aiCreditRevokeItem, planAiReversal, type AiReversalStore, type AiReversalReceipt, type AiTopupReceiptStore } from './ai-credits';
 import { drainAiCreditOutbox, type AiCreditOutboxRow } from './ai-credit-outbox';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
@@ -51,7 +51,9 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore 
     openEpochsForSweep: BillingStore['openEpochsForSweep'] = async () => { throw new Error('Unused v2 store stub'); };
     policyClosedEpochsSince: BillingStore['policyClosedEpochsSince'] = async () => { throw new Error('Unused v2 store stub'); };
     closeEpoch: BillingStore['closeEpoch'] = async input => {
-        const epoch = this.epochs.find(e => e.computerId === input.computerId && e.endedAt === null);
+        const epoch = this.epochs.find(e => e.computerId === input.computerId && e.endedAt === null
+            && (input.epochId === undefined || e.id === input.epochId)
+            && (input.readyBy === undefined || Date.parse(e.readyAt) <= Math.ceil(input.readyBy.getTime() / 1000) * 1000));
         if (!epoch) return 'not_open';
         epoch.endedAt = input.endedAt.toISOString();
         epoch.endReason = input.reason;
@@ -169,6 +171,8 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore 
         return [...this.grants.values()].filter(row => row.sourceType === sourceType && row.sourceId === sourceId);
     }
     async computerOwner(computerId: string) { return this.computers.get(computerId) ?? null; }
+    providers = new Map<string, string>();
+    async placementProvider(computerId: string) { return this.providers.get(computerId) ?? null; }
     async linkCustomer(userId: string, customer: string): Promise<'linked' | 'exists' | 'conflict'> {
         const owner = this.customers.get(customer);
         if (owner === userId) return 'exists';
@@ -905,13 +909,37 @@ describe('ingestUsageEvents', () => {
             expect(open).toHaveBeenCalledWith({ userId: 'user_local', computerId: 'computer_local',
                 subscriptionId: null, size: 'free-cf', readyAt: now, overheadSeconds: 0 });
             expect(touch).toHaveBeenCalledExactlyOnceWith('computer_local', new Date(now.getTime() + 60_000));
-            expect(close).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer_local',
+            expect(close).toHaveBeenCalledExactlyOnceWith({ computerId: 'computer_local', readyBy: new Date(now.getTime() + 120_000),
                 endedAt: new Date(now.getTime() + 120_000), reason: expected });
             expect(store.epochs).toHaveLength(1);
             expect(store.epochs[0]).toMatchObject({ lastHeartbeatAt: new Date(now.getTime() + 60_000).toISOString(),
                 endedAt: new Date(now.getTime() + 120_000).toISOString(), endReason: expected });
             expect(store.intervals[0]).toMatchObject({ reason: reason ?? 'stop', source: 'start' });
         });
+
+    it('ignores a Worker stop for an AWS computer: its open epoch stays open (the AWS receipts own that close)', async () => {
+        const { store } = fixture();
+        store.providers.set('computer_local', 'aws-ec2');
+        await store.openEpoch({ userId: 'user_local', computerId: 'computer_local', subscriptionId: 'sub_local', size: 'std-2', readyAt: now, overheadSeconds: 0 });
+        const close = vi.spyOn(store, 'closeEpoch');
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        expect(await ingestUsageEvents([usage('stop', 60_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(close).not.toHaveBeenCalled();
+        expect(store.epochs[0]).toMatchObject({ size: 'std-2', endedAt: null });
+        expect(info).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ event: 'billing-usage-stop-ignored', computerId: 'computer_local',
+            at: new Date(now.getTime() + 60_000).toISOString(), provider: 'aws-ec2' }));
+        // A Cloudflare computer's Worker stop still closes its epoch.
+        store.providers.set('computer_local', 'cloudflare');
+        expect(await ingestUsageEvents([usage('stop', 60_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(store.epochs[0]?.endedAt).toBe(new Date(now.getTime() + 60_000).toISOString());
+    });
+
+    it('a Worker stop stamped before the open epoch became ready never closes it', async () => {
+        const { store } = fixture();
+        await ingestUsageEvents([usage('start', 120_000)], { store });
+        expect(await ingestUsageEvents([usage('stop', 60_000)], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(store.epochs[0]?.endedAt).toBeNull();
+    });
 
     it('accepts a concurrent v2 start and preserves the existing v1 interval behavior', async () => {
         const { store } = fixture();
@@ -1856,6 +1884,143 @@ describe('v3 paid invoice grants', () => {
         expect(await processStripeEvent(paidV2(), other.deps)).toBe('ignored');
         expect(other.store.grants.size).toBe(0);
     });
+    describe('round 3 D1: upgrade AI credits', () => {
+        const upgradeRoot = `ezil-os:v1:premium_monthly_v3:sub_local:${now.toISOString()}:upgrade`;
+        const upgradeCredits = Number(BigInt(800) * BigInt((periodEnd.getTime() - now.getTime()) / 1000)
+            / BigInt((periodEnd.getTime() - periodStart.getTime()) / 1000));
+        function upgraded() {
+            const f = v3Fixture('premium_monthly_v3');
+            f.stripe.invoice.id = 'in_upgrade';
+            f.stripe.invoice.billingReason = 'subscription_update';
+            f.stripe.invoice.lines = [
+                { ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3', amount: -1000, proration: true, periodStart: now },
+                { ...baseLine('compute_monthly_v2'), lookupKey: 'ezil_premium_monthly_v3', amount: 2000, proration: true, periodStart: now },
+            ];
+            f.stripe.charge.invoiceId = 'in_upgrade';
+            return f;
+        }
+        const aiRows = (store: MemoryStore) => [...store.outbox.values()].filter(item => item.kind === 'ai_grant');
+        it('enqueues exactly one prorated AI grant with the pinned id and expiry, once across replays', async () => {
+            const f = upgraded();
+            expect(upgradeCredits).toBe(529); // floor(800 × 20.5 / 31)
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(await processStripeEvent({ ...paidV2(), id: 'evt_redelivered' }, f.deps)).toBe('applied');
+            expect(aiRows(f.store)).toEqual([{ eventKey: `${upgradeRoot}:grant`, userId: 'user_local', kind: 'ai_grant',
+                payload: expect.objectContaining({ entitlementId: upgradeRoot, credits: upgradeCredits, action: 'grant',
+                    invoiceId: 'in_upgrade', expiresAt: '2026-11-04T00:00:00.000Z', eventId: `${upgradeRoot}:grant` }) }]);
+            expect(f.store.planChanges.every(change => change.state !== 'pending')).toBe(true);
+        });
+        it('repairs an outbox write interrupted after the compute grant on the next delivery', async () => {
+            const f = upgraded();
+            vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('interrupted'));
+            await expect(processStripeEvent(paidV2(), f.deps)).rejects.toThrow('interrupted');
+            expect(f.store.grants.size).toBe(1); expect(aiRows(f.store)).toHaveLength(0);
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(f.store.grants.size).toBe(1); expect(aiRows(f.store)).toHaveLength(1);
+        });
+        it.each(['unpaid', 'late renewal', 'mismatched end', 'v2 credit line', 'no credit line'] as const)('a %s upgrade invoice enqueues no AI credits', async scenario => {
+            const f = upgraded();
+            if (scenario === 'unpaid') f.stripe.invoice.status = 'open';
+            if (scenario === 'late renewal') f.stripe.subscription.currentPeriodEnd = new Date('2026-12-01T00:00:00.000Z');
+            if (scenario === 'mismatched end') f.stripe.invoice.lines[1]!.periodEnd = new Date('2026-11-02T00:00:00.000Z');
+            if (scenario === 'v2 credit line') f.stripe.invoice.lines[0]!.lookupKey = 'ezil_standard_monthly_v2';
+            if (scenario === 'no credit line') f.stripe.invoice.lines.shift();
+            const outcome = await processStripeEvent(paidV2(), f.deps);
+            expect(outcome).not.toBe('applied');
+            expect(aiRows(f.store)).toHaveLength(0);
+            expect(f.store.grants.size).toBe(0);
+        });
+        it('a v2 Compute upgrade keeps compute-only terms', async () => {
+            const f = fixture();
+            f.stripe.subscription.sku = 'compute_monthly_v2';
+            f.stripe.invoice.billingReason = 'subscription_update';
+            f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), amount: -1000, proration: true, periodStart: now },
+                { ...baseLine('compute_monthly_v2'), amount: 2000, proration: true, periodStart: now }];
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(f.store.grants.size).toBe(1);
+            expect(aiRows(f.store)).toHaveLength(0);
+        });
+        it('skips a zero-credit upgrade in the last instant of the period and logs it', async () => {
+            const f = upgraded();
+            const last = new Date(periodEnd.getTime() - 1000);
+            f.stripe.invoice.lines[1]!.periodStart = last;
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+            expect(aiRows(f.store)).toHaveLength(0);
+            expect(info.mock.calls.map(call => JSON.parse(String(call[0])))).toContainEqual(
+                { event: 'ai-upgrade-grant', outcome: 'skipped_zero', invoiceId: 'in_upgrade' });
+            info.mockRestore();
+        });
+        it.each(['refund', 'dispute'] as const)('a %s of the upgrade invoice reverses exactly the upgrade grant', async cause => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            if (cause === 'dispute') f.stripe.charge.refunded = false;
+            expect(await processStripeEvent(cause === 'refund' ? refund() : dispute(), f.deps)).toBe('applied');
+            const key = cause === 'refund' ? `${upgradeRoot}:revoke:refund:re_local` : `${upgradeRoot}:revoke:dispute:dp_local`;
+            expect(f.store.outbox.get(key)).toMatchObject({ kind: 'ai_revoke', payload: { entitlementId: upgradeRoot,
+                credits: upgradeCredits, action: 'revoke', expiresAt: '2026-11-04T00:00:00.000Z' } });
+            expect(f.store.outbox.size).toBe(2);
+            expect([...f.store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
+        });
+        it('reconstructs the missing upgrade receipt byte-for-byte for a refund', async () => {
+            const kept = upgraded();
+            await processStripeEvent(paidV2(), kept.deps);
+            await processStripeEvent(refund(), kept.deps);
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            const original = structuredClone(f.store.outbox.get(`${upgradeRoot}:grant`)!);
+            f.store.outbox.clear();
+            const reversal = vi.spyOn(f.store, 'recordAiReversal');
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(reversal.mock.calls[0]![0].receipts).toStrictEqual([original]);
+            expect(f.store.outbox.get(`${upgradeRoot}:revoke:refund:re_local`))
+                .toStrictEqual(kept.store.outbox.get(`${upgradeRoot}:revoke:refund:re_local`));
+        });
+        it('refuses a stored upgrade receipt whose expiry is not the period end plus three days', async () => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            const root = f.store.outbox.get(`${upgradeRoot}:grant`)!;
+            expect(root.payload.expiresAt).toBe(new Date(periodEnd.getTime() + 3 * 86_400_000).toISOString());
+            root.payload.expiresAt = new Date(periodEnd.getTime() + 2 * 86_400_000).toISOString();
+            const before = [...f.store.writes];
+            expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+            expect(f.store.writes).toEqual(before);
+        });
+        it('sends an upgrade whose AI root cannot be formed to review before any write', async () => {
+            const f = upgraded();
+            f.stripe.subscription.id = f.stripe.invoice.subscriptionId = 'sub-local';
+            for (const line of f.stripe.invoice.lines) line.subscriptionId = 'sub-local';
+            const before = [...f.store.writes];
+            expect(await processStripeEvent(paidV2(), f.deps)).toBe('review:invalid_ai_upgrade');
+            expect(f.store.writes).toEqual(before);
+            expect(f.store.grants.size).toBe(0);
+            expect(f.store.subscriptions.size).toBe(0);
+        });
+        it('the renewal after an upgrade grants the full 1,000 once', async () => {
+            const f = upgraded();
+            await processStripeEvent(paidV2(), f.deps);
+            const nextStart = periodEnd, nextEnd = new Date('2026-12-01T00:00:00.000Z');
+            Object.assign(f.stripe.subscription, { currentPeriodStart: nextStart, currentPeriodEnd: nextEnd });
+            Object.assign(f.stripe.invoice, { id: 'in_renewal', billingReason: 'subscription_cycle', periodStart: nextStart, periodEnd: nextEnd,
+                lines: [{ ...baseLine('compute_monthly_v2'), lookupKey: 'ezil_premium_monthly_v3', periodStart: nextStart, periodEnd: nextEnd }] });
+            expect(await processStripeEvent({ ...paidV2(), id: 'evt_renewal' }, f.deps)).toBe('applied');
+            expect(await processStripeEvent({ ...paidV2(), id: 'evt_renewal_again' }, f.deps)).toBe('applied');
+            const renewal = `ezil-os:v1:premium_monthly_v3:sub_local:${nextStart.toISOString()}`;
+            expect(aiRows(f.store).map(item => [item.payload.entitlementId, item.payload.credits])).toEqual([
+                [upgradeRoot, upgradeCredits], [renewal, 1000]]);
+        });
+        it('logs one structured line per webhook outcome', async () => {
+            const f = upgraded();
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            await processStripeEvent(paidV2(), f.deps);
+            await processStripeEvent(event('invoice.paid', { id: 'in_local' }), f.deps);
+            expect(info.mock.calls.map(call => JSON.parse(String(call[0]))).filter(line => line.event === 'billing-webhook')).toEqual([
+                { event: 'billing-webhook', type: 'invoice.paid', outcome: 'applied', eventId: 'evt_local' },
+                { event: 'billing-webhook', type: 'invoice.paid', outcome: expect.any(String), eventId: 'evt_local' }]);
+            info.mockRestore();
+        });
+    });
     it('resolves Premium from the line lookup key despite stale Standard checkout metadata', async () => {
         const f = v3Fixture('premium_monthly_v3');
         const client = createStripeClient({ secretKey: 'fixture', fetch: vi.fn<typeof fetch>().mockResolvedValue(Response.json({
@@ -2151,6 +2316,212 @@ describe('W0.3 dispute restore receipts', () => {
         const before = [...f.store.writes];
         expect(await processStripeEvent(d('dp_' + 'x'.repeat(200)), f.deps)).toBe('review:invalid_ai_event_id');
         expect(f.store.writes).toEqual(before);
+    });
+});
+
+describe('HF2 operator correction rows', () => {
+    type Rows = { root: AiReversalReceipt; revoke: OutboxInsert; correction: OutboxInsert; ROOT: string; CORR: string };
+    /** Canary shape: paid root, operator bare revoke (invoice cleared), same-invoice 200-credit correction. */
+    async function canary(order: 'root first' | 'correction first' = 'root first',
+        options: { revoke?: boolean; correction?: boolean; defect?: (rows: Rows) => OutboxInsert[] | void } = {}) {
+        const f = fixture();
+        f.stripe.charge.refunded = false;
+        f.stripe.subscription.sku = 'standard_monthly_v3';
+        f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3' }];
+        f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+        const root = [...f.store.outbox.values()][0]!;
+        Object.assign(root.payload, { credits: 4000, accountPublicId: 'canary-payer' });
+        const ROOT = String(root.payload.entitlementId), CORR = `${ROOT}:correction-20261028`;
+        const note = { operatorNote: 'r3-20261028 legacy amount correction' };
+        const revoke = aiCreditRevokeItem(root);
+        Object.assign(revoke.payload, { invoiceId: null, ...note });
+        const correction = aiCreditOutboxItem('user_local', { entitlementId: CORR, credits: 200,
+            expiresAt: String(root.payload.expiresAt) }, 'grant', String(root.payload.invoiceId));
+        Object.assign(correction.payload, { accountPublicId: 'canary-payer', ...note });
+        const extra = options.defect?.({ root, revoke, correction, ROOT, CORR }) ?? [];
+        if (options.revoke !== false) await f.store.enqueueOutbox(revoke);
+        if (options.correction !== false) await f.store.enqueueOutbox(correction);
+        for (const item of extra) await f.store.enqueueOutbox(item);
+        if (order === 'correction first') { f.store.outbox.delete(root.eventKey); f.store.outbox.set(root.eventKey, root); }
+        const compute = [...f.store.grants.values()].find(g => g.kind === 'plan_period')!;
+        return { ...f, root, revoke, correction, ROOT, CORR, compute };
+    }
+    const rekey = (item: OutboxInsert, entitlementId: string) => {
+        item.eventKey = `${entitlementId}:grant`;
+        Object.assign(item.payload, { entitlementId, eventId: item.eventKey });
+    };
+
+    it.each(['root first', 'correction first'] as const)(
+        'a full refund reverses compute and the correction only, never the operator-revoked parent (%s)', async order => {
+            const f = await canary(order);
+            expect(f.compute.amount).toBe(BigInt(144000));
+            const before = [...f.store.writes];
+            f.stripe.charge.refunded = true;
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(f.store.writes.slice(before.length)).toEqual(['refund:re_local:compute_std_seconds:revoke', `${f.CORR}:revoke:refund:re_local`]);
+            expect(f.store.grants.get('refund:re_local:compute_std_seconds:revoke')).toMatchObject({ amount: BigInt(-144000),
+                meter: 'compute_std_seconds', kind: 'revoke', sourceType: 'refund', sourceId: 're_local', subscriptionId: f.compute.subscriptionId });
+            expect(f.store.outbox.get(`${f.CORR}:revoke:refund:re_local`)).toMatchObject({ kind: 'ai_revoke', userId: 'user_local',
+                payload: { action: 'revoke', entitlementId: f.CORR, credits: 200, expiresAt: f.root.payload.expiresAt,
+                    invoiceId: f.root.payload.invoiceId, accountPublicId: 'canary-payer',
+                    reversal: { causeType: 'refund', causeId: 're_local' },
+                    localDeltas: [{ originalGrantId: f.compute.id, meter: 'compute_std_seconds', amount: '-144000' }] } });
+            expect([...f.store.outbox.keys()].filter(key => key.startsWith(`${f.ROOT}:revoke:`))).toEqual([]);
+        },
+    );
+    it.each(['root first', 'correction first'] as const)('replays of the same refund write nothing (%s)', async order => {
+        const f = await canary(order);
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        const after = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('applied');
+        expect(f.store.writes).toEqual(after);
+    });
+    it.each([
+        ['correction expiry', (r: Rows) => { r.correction.payload.expiresAt = '2026-12-01T00:00:00.000Z'; }],
+        ['correction credits above the parent', (r: Rows) => { r.correction.payload.credits = 4001; }],
+        ['correction foreign account', (r: Rows) => { r.correction.payload.accountPublicId = 'other-payer'; }],
+        ['correction payment intent', (r: Rows) => { r.correction.payload.paymentIntentId = 'pi_other'; }],
+        ['orphan correction', (r: Rows) => rekey(r.correction, `${r.ROOT.replace(':sub_local:', ':sub_other:')}:correction-20261028`)],
+        ['malformed correction suffix', (r: Rows) => rekey(r.correction, `${r.ROOT}:correction-2026102`)],
+        ['chained correction', (r: Rows) => {
+            const chained = structuredClone(r.correction);
+            rekey(chained, `${r.CORR}:correction-20261029`);
+            return [chained];
+        }],
+        ['bare revoke credits', (r: Rows) => { r.revoke.payload.credits = 3999; }],
+        ['bare revoke expiry', (r: Rows) => { r.revoke.payload.expiresAt = '2026-12-01T00:00:00.000Z'; }],
+        ['bare revoke foreign invoice', (r: Rows) => { r.revoke.payload.invoiceId = 'in_other'; }],
+        ['bare revoke foreign account', (r: Rows) => { r.revoke.payload.accountPublicId = 'other-payer'; }],
+        ['bare revoke owner', (r: Rows) => { r.revoke.userId = 'other-user'; }],
+        ['bare revoke kind', (r: Rows) => { r.revoke.kind = 'ai_grant'; }],
+        ['bare revoke action', (r: Rows) => { r.revoke.payload.action = 'grant'; }],
+        ['bare revoke event id', (r: Rows) => { r.revoke.payload.eventId = `${r.ROOT}:revoke:operator`; }],
+    ] as const)('refuses a %s with zero writes, compute included', async (_, defect) => {
+        for (const order of ['root first', 'correction first'] as const) {
+            const f = await canary(order, { defect });
+            const before = [...f.store.writes];
+            f.stripe.charge.refunded = true;
+            expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+            expect(f.store.writes).toEqual(before);
+        }
+    });
+    it('refuses a correction whose invoice differs from its parent when the planner is handed it', async () => {
+        const f = await canary();
+        const plan = (correction: OutboxInsert) => planAiReversal({ action: 'revoke', causeId: 're_local', chargeId: 'ch_local',
+            customerId: 'cus_local', userId: 'user_local', originals: [f.compute], receipts: [f.root, correction] },
+        { originals: [f.compute], corrections: [], receipts: [...f.store.outbox.values()].map(r => r.eventKey === correction.eventKey ? correction : r) });
+        expect(plan(f.correction)).toMatchObject({ outcome: 'applied', outbox: [{ eventKey: `${f.CORR}:revoke:refund:re_local` }] });
+        for (const invoiceId of ['in_other', null]) {
+            const foreign = structuredClone(f.correction);
+            foreign.payload.invoiceId = invoiceId;
+            expect(plan(foreign)).toEqual({ outcome: 'review:restore_mismatch', grants: [], outbox: [] });
+        }
+    });
+    const ledger = (f: Awaited<ReturnType<typeof canary>>) => [...f.store.grants.values()].filter(g => g.meter === 'compute_std_seconds')
+        .map(g => `${g.kind}:${g.sourceType}:${g.sourceId}:${g.amount}`);
+    it('refuses dispute and refund with zero writes when every root is operator-revoked and no child binds the cause', async () => {
+        const f = await canary('root first', { correction: false });
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('review:restore_mismatch');
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+        expect(f.store.writes).toEqual(before);
+        expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`]);
+        expect([...f.store.outbox.keys()].filter(key => key.startsWith(`${f.ROOT}:revoke:`))).toEqual([]);
+    });
+    it('refuses replays of an unbound dispute and refund, and a restore, with zero writes', async () => {
+        const f = await canary('root first', { correction: false });
+        const before = [...f.store.writes];
+        for (const replay of [dispute(), dispute()]) expect(await processStripeEvent(replay, f.deps)).toBe('review:restore_mismatch');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        f.stripe.charge.refunded = true;
+        for (const replay of [refund(), refund(), event('refund.updated', { id: 're_local', charge: 'ch_local' })]) {
+            expect(await processStripeEvent(replay, f.deps)).toBe('review:restore_mismatch');
+        }
+        expect(f.store.writes).toEqual(before);
+        expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`]);
+    });
+    it('refuses an unbound plan in the planner itself with zero writes, for every action', async () => {
+        const f = await canary('root first', { correction: false });
+        for (const action of ['revoke', 'suspend', 'restore'] as const) {
+            expect(planAiReversal({ action, causeId: action === 'revoke' ? 're_local' : 'dp_local', chargeId: 'ch_local',
+                customerId: 'cus_local', userId: 'user_local', originals: [f.compute], receipts: [f.root] },
+            { originals: [f.compute], corrections: [], receipts: [...f.store.outbox.values()] }))
+                .toEqual({ outcome: action === 'restore' ? 'review:restore_refused_terminal' : 'review:restore_mismatch', grants: [], outbox: [] });
+        }
+    });
+    it.each([
+        ['without an operator revoke', { revoke: false }, BigInt(-144000), 'review:local_reversal_mismatch'],
+        ['with a partial amount under an operator revoke', {}, BigInt(-100000), 'review:restore_mismatch'],
+        ['with the full amount under an operator revoke', {}, BigInt(-144000), 'review:restore_mismatch'],
+    ] as const)('refuses an unbound local refund row %s with zero writes', async (_, options, amount, outcome) => {
+        const f = await canary('root first', { correction: false, ...options });
+        await f.store.insertGrant({ ...f.compute, kind: 'revoke', amount, sourceType: 'refund', sourceId: 're_local' });
+        f.stripe.charge.refunded = true;
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe(outcome);
+        expect(f.store.writes).toEqual(before);
+    });
+    it('refuses a refund after an operator revoke even when an earlier dispute was bound on the root, with zero writes', async () => {
+        const f = await canary('root first', { correction: false, revoke: false });
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        await f.store.enqueueOutbox(f.revoke);
+        f.stripe.charge.refunded = true;
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('review:restore_mismatch');
+        expect(f.store.writes).toEqual(before);
+        expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`, 'suspend:dispute:dp_local:-144000']);
+    });
+    it.each(['root first', 'correction first'] as const)(
+        'a dispute then a refund never double-debit compute when a correction child binds the cause (%s)', async order => {
+            const f = await canary(order);
+            expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+            f.stripe.charge.refunded = true;
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`, 'suspend:dispute:dp_local:-144000',
+                'revoke:refund:re_local:0']);
+            expect([...f.store.grants.values()].filter(g => g.meter === 'compute_std_seconds')
+                .reduce((total, g) => total + g.amount, BigInt(0))).toBe(BigInt(0));
+            expect([...f.store.outbox.keys()].filter(key => key.includes(':revoke:'))).toEqual([
+                `${f.CORR}:revoke:dispute:dp_local`, `${f.CORR}:revoke:refund:re_local`]);
+        },
+    );
+    it('reverses a correction whose credits equal the parent', async () => {
+        const f = await canary('correction first', { defect: r => { r.correction.payload.credits = 4000; } });
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(f.store.outbox.get(`${f.CORR}:revoke:refund:re_local`)).toMatchObject({ kind: 'ai_revoke',
+            payload: { entitlementId: f.CORR, credits: 4000 } });
+    });
+    it('suspends the correction alone on a dispute; a win then stays terminal with zero writes', async () => {
+        const f = await canary('correction first');
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(f.store.writes.slice(before.length)).toEqual(['dispute:dp_local:compute_std_seconds:suspend', `${f.CORR}:revoke:dispute:dp_local`]);
+        expect(f.store.grants.get('dispute:dp_local:compute_std_seconds:suspend')!.amount).toBe(BigInt(-144000));
+        expect(f.store.outbox.get(`${f.CORR}:revoke:dispute:dp_local`)).toMatchObject({ kind: 'ai_revoke',
+            payload: { entitlementId: f.CORR, credits: 200, accountPublicId: 'canary-payer', overlappingDisputes: false } });
+        const after = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect(f.store.writes).toEqual(after);
+        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
+    });
+    it('suspends and restores a correction child under its own root when no operator revoke exists', async () => {
+        const f = await canary('root first', { revoke: false });
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
+        for (const root of [f.ROOT, f.CORR]) {
+            expect(f.store.outbox.get(`${root}:revoke:dispute:dp_local`)).toMatchObject({ kind: 'ai_revoke' });
+            expect(f.store.outbox.get(`${root}:restore:dp_local`)).toMatchObject({ kind: 'ai_restore',
+                payload: { entitlementId: root, credits: root === f.CORR ? 200 : 4000, accountPublicId: 'canary-payer' } });
+        }
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([BigInt(144000), BigInt(-144000), BigInt(144000)]);
     });
 });
 

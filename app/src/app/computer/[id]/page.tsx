@@ -60,7 +60,7 @@ export default async function Page({ params }: { params: Promise<{ id: string }>
                         className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-offwhite"
                     >
                         <BackIcon className="h-3.5 w-3.5" />
-                        Your computers
+                        Your computer
                     </Link>
                     <span className="text-xs font-medium text-offwhite">{computer.name}</span>
                     <DesktopStatusBadge />

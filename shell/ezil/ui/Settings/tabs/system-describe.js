@@ -29,11 +29,14 @@ export function describeProvider (info, reason) {
         };
     }
     switch ( info.provider ) {
-    case 'aws-ec2':
+    case 'aws-ec2': {
+        // Round 4 copy guard: "AWS (India)", never a region code or a city.
+        const region = info.machine && info.machine.region;
         return {
-            value: info.machine && info.machine.region ? `AWS EC2 (${info.machine.region})` : 'AWS EC2',
+            value: region === 'ap-south-1' ? 'AWS (India)' : region ? `AWS (${region})` : 'AWS',
             hint: info.lifecycleState ? `Recorded placement. State: ${String(info.lifecycleState).toLowerCase()}.` : 'Recorded placement.',
         };
+    }
     case 'cloudflare':
         return { value: 'Cloudflare Containers', hint: 'Recorded placement.' };
     case 'unassigned':
@@ -158,18 +161,74 @@ export function describeScreenError (code, message) {
     return 'unavailable';
 }
 
-/** Actual placement and plan entitlement are independent claims. */
+/**
+ * Actual placement and plan entitlement are independent claims. Round 4: one line,
+ * "AWS (India) · 2 vCPU / 8 GiB · stopped" (data-role sys-running-on).
+ */
 export function describeRunningOn (info, reason) {
     const provider = describeProvider(info, reason);
     const m = info && info.machine;
-    const size = m && Number.isFinite(m.vcpu) && Number.isFinite(m.memoryMiB)
-        ? ` (${m.vcpu} vCPU / ${m.memoryMiB / 1024} GiB)` : '';
-    return { value: provider.value + size, hint: provider.hint };
+    const size = m && Number.isFinite(m.vcpu) && Number.isFinite(m.memoryMiB) ? `${m.vcpu} vCPU / ${m.memoryMiB / 1024} GiB` : '';
+    const state = info && info.provider === 'aws-ec2' && typeof info.lifecycleState === 'string' && info.lifecycleState
+        ? info.lifecycleState.toLowerCase() : '';
+    return { value: [provider.value, size, state].filter(Boolean).join(' · '), hint: state ? 'Recorded placement.' : provider.hint };
 }
 
+const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
+
+/**
+ * Round 4: the server's standing for this computer (docs/billing/STANDING-CONTRACT.md §4), read
+ * only from explicit fields — `info.plan.standing` (or `info.standing`). Null when not reported.
+ */
+export function standingOf (info) {
+    const value = info && (info.plan && info.plan.standing !== undefined ? info.plan.standing : info.standing);
+    return STANDINGS.has(value) ? value : null;
+}
+
+const SIZE_LABEL = { 'std-2': '2 vCPU / 8 GB', 'cmp-4': '4 vCPU / 16 GB', 'cmp-8': '8 vCPU / 32 GB' };
+
+/**
+ * The plan row (round 3, SWITCH-CONTRACT §4). `plan.status` comes from the
+ * server: `being_prepared` ONLY while a switch or restart is in flight;
+ * `ready` once the computer is on AWS, whatever the next-start choice is (a
+ * plain size mismatch is no longer "being prepared"); `failed` for a failed
+ * switch or migration; `preparing` before the computer reaches AWS; `blocked`
+ * while AWS is paused. The running size and the next-start choice are told
+ * apart, never mixed in one value.
+ */
 export function describePlan (info) {
     const p = info && info.plan;
+    // Round 4: Free is told only from an explicit server field (a standing, sku or status), never
+    // from a missing plan. Files on the AWS computer are kept there; nothing is said to have moved.
+    const standing = standingOf(info);
+    const free = standing === 'files_on_aws' || standing === 'free' || (p && (p.name === 'Free' || p.sku === 'free_v3'));
+    if ( free ) {
+        const onAws = standing === 'files_on_aws' || (p && (p.provider === 'aws' || p.filesOn === 'aws'));
+        if ( onAws ) return { value: 'Plan: Free · files kept on this computer', hint: 'It opens with Free limits. Upgrade to restore full use.' };
+        const size = p && Number.isFinite(p.vcpu) && Number.isFinite(p.memoryGB) ? ` · ${p.vcpu} vCPU / ${p.memoryGB} GB on Cloudflare` : '';
+        return { value: `Plan: Free${size}`, hint: '' };
+    }
     if ( ! p ) return { value: 'Not reported', hint: 'Plan entitlement is not available.' };
-    const status = { preparing: 'being prepared', blocked: 'paused', failed: 'preparation failed', ready: 'ready' }[p.status] || 'status unknown';
-    return { value: `${p.vcpu} vCPU / ${p.memoryGB} GB on AWS (India) — ${status}`, hint: p.reason || '' };
+    const planned = `${p.vcpu} vCPU / ${p.memoryGB} GB on AWS (India)`;
+    const current = SIZE_LABEL[p.current] ?? null;
+    const selected = SIZE_LABEL[p.selected] ?? null;
+    const t = p.transition && typeof p.transition === 'object' ? p.transition : null;
+    switch ( p.status ) {
+    case 'being_prepared':
+        if ( t && t.kind === 'restart' ) return { value: 'Restarting your computer', hint: current ? `Running on ${current} until it restarts.` : '' };
+        return { value: t && SIZE_LABEL[t.target] ? `Switching to ${SIZE_LABEL[t.target]}` : `${planned} — being prepared`,
+            hint: t && SIZE_LABEL[t.current] ? `Now: ${SIZE_LABEL[t.current]}.` : '' };
+    case 'ready':
+        return { value: current ? `${current} on AWS (India)` : planned,
+            hint: selected && current && selected !== current ? `Next start: ${selected}.` : '' };
+    case 'failed':
+        if ( t && SIZE_LABEL[t.current] ) return { value: `Switch didn't finish — back on ${SIZE_LABEL[t.current]}`, hint: 'Your files are safe. Try again from Settings → Computer.' };
+        return { value: `${planned} — preparation failed`, hint: p.reason || '' };
+    case 'blocked':
+        return { value: `${planned} — paused`, hint: p.reason || '' };
+    case 'preparing':
+        return { value: `${planned} — being prepared`, hint: p.reason || '' };
+    default:
+        return { value: `${planned} — status unknown`, hint: p.reason || '' };
+    }
 }

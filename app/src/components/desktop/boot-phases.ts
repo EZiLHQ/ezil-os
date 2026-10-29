@@ -243,11 +243,17 @@ export type BootFailureReason =
     | 'desktop_unreachable'
     | 'display_not_streaming'
     | 'timeout'
+    | 'payment_issue'
+    | 'plan_required'
+    | 'fair_use_paused'
+    | 'files_on_aws'
     | 'unknown';
 
 export interface BootFailureState {
     kind: 'failed';
     reason: BootFailureReason;
+    /** Round 4: the raw server code (e.g. `billing_files_on_aws`) for the feedback prefill; absent when nothing failed with a code. */
+    errorCode?: string;
 }
 
 /**
@@ -317,7 +323,26 @@ export type BootErrorCode =
     | 'worker_http_error'
     | 'desktop_unreachable'
     | 'timeout'
+    | BillingBootErrorCode
     | 'unknown';
+
+/**
+ * Round 4: the billing gate's refusals, returned as values (`billing_<reason>`) by the
+ * preview routers. Every one is deterministic except `billing_unavailable`.
+ */
+export type BillingBootErrorCode =
+    | 'billing_payment_issue'
+    | 'billing_no_plan'
+    | 'billing_size_not_allowed'
+    | 'billing_fair_use_paused'
+    | 'billing_files_on_aws'
+    | 'billing_concurrent_limit'
+    | 'billing_upgrade_pending'
+    | 'billing_allowance_exhausted'
+    | 'billing_overage_cap_reached'
+    | 'billing_user_hours_cap'
+    | 'billing_aws_monthly_cap'
+    | 'billing_unavailable';
 
 /**
  * The deterministic family, restated for the browser. Byte-for-byte the same
@@ -361,6 +386,9 @@ const AWS_REFUSAL_ERROR_CODES: readonly string[] = [
  */
 export function isRetryableBootErrorCode(code: string | undefined): boolean {
     if (!code) return true;
+    // Round 4: a billing refusal answers the same until the plan or payment changes. Only
+    // `billing_unavailable` (the billing state could not be read) may answer differently.
+    if (typeof code === 'string' && code.startsWith('billing_')) return code === 'billing_unavailable';
     return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code) && !AWS_REFUSAL_ERROR_CODES.includes(code);
 }
 
@@ -431,6 +459,22 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
             return 'sandbox_crashed';
         case 'desktop_unreachable':
             return 'desktop_unreachable';
+        // Round 4: billing gate refusals. Each has its own copy; `billing_unavailable`
+        // takes the generic copy and stays retryable.
+        case 'billing_payment_issue':
+            return 'payment_issue';
+        case 'billing_no_plan':
+        case 'billing_size_not_allowed':
+            return 'plan_required';
+        case 'billing_fair_use_paused':
+        case 'billing_allowance_exhausted':
+        case 'billing_overage_cap_reached':
+            return 'fair_use_paused';
+        case 'billing_files_on_aws':
+            return 'files_on_aws';
+        case 'billing_user_hours_cap':
+        case 'billing_aws_monthly_cap':
+            return 'user_hours_cap';
         // `sandbox_starting` is the server saying "still waking, ask again" —
         // it is normally consumed as PROGRESS by the caller's wake loop and
         // never reaches here at all. It only lands in this switch when that
@@ -530,7 +574,10 @@ export function computeBootUiState(input: ComputeBootUiStateInput): BootUiState 
         };
     }
     if (input.requestStatus === 'error') {
-        return { kind: 'failed', reason: classifyFailure(input.errorCode) };
+        // The raw code travels with the classified reason, so "Send feedback" names what the server said.
+        return typeof input.errorCode === 'string' && input.errorCode
+            ? { kind: 'failed', reason: classifyFailure(input.errorCode), errorCode: input.errorCode }
+            : { kind: 'failed', reason: classifyFailure(input.errorCode) };
     }
 
     // pending
@@ -625,7 +672,9 @@ export function classifyPreviewFetchError(err: unknown): 'timeout' | undefined {
 // `BOOT_PHASES` doc comment above for why. Kept in lockstep with
 // `boot-phases.shell.js` by the drift guard in `boot-phases.shell.test.ts`.
 export const BOOT_PROGRESS_HEADLINE = 'Opening your workspace';
-export const BOOT_PROGRESS_SUBTEXT = 'This usually takes about 20 seconds.';
+// Round 3 (plan §6.5): no time promise. The old "about 20 seconds" was a Cloudflare
+// timing shown on AWS boots that take minutes.
+export const BOOT_PROGRESS_SUBTEXT = 'Your apps open as soon as your computer is ready.';
 export const BOOT_PROGRESS_LONG_SUBTEXT =
     'Still working — first boots and larger workspaces can take a bit longer.';
 
@@ -680,6 +729,23 @@ export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
     timeout: {
         title: 'This is taking too long',
         body: "Starting your computer is taking longer than it should. It may still come up in the background — try again.",
+    },
+    // Round 4 (D16-D18): billing refusals. Never retried automatically.
+    payment_issue: {
+        title: "Your payment didn't go through",
+        body: 'Update your payment method in Settings → Billing to keep using your computer.',
+    },
+    plan_required: {
+        title: 'This configuration needs a paid plan.',
+        body: 'Your files are kept. Choose a plan in Settings → Billing.',
+    },
+    fair_use_paused: {
+        title: 'Computer time is paused',
+        body: "You've reached fair use for now. Your files are kept. Settings → Billing shows when it resets.",
+    },
+    files_on_aws: {
+        title: 'Your files are on a bigger AWS (India) computer.',
+        body: "That size can't open on the Free plan. Your files are kept. Upgrade to open it again.",
     },
     unknown: {
         title: 'Something went wrong',

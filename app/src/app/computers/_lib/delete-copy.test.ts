@@ -13,9 +13,10 @@ describe('deleteComputerCopy', () => {
     const copy = deleteComputerCopy({ name: 'Workhorse', slot: 2 });
     const body = copy.body.join(' ');
 
-    it('names the computer and the slot the delete frees', () => {
+    it('names the computer and never mentions a slot (one computer per person, round 3 D6)', () => {
         expect(copy.title).toContain('Workhorse');
-        expect(body).toContain('frees slot 2');
+        expect(body).not.toMatch(/\bslot\b/i);
+        expect(body).toContain('removes it from your account');
     });
 
     it('says the desktop shuts down', () => {

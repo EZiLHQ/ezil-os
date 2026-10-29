@@ -77,6 +77,19 @@
     --color-offwhite: #f5f5f4;
     --color-teal: #00adb5;
 
+    /* ── ADDED BY EZIL 2026-10-28 (round 3, plan §6.7) ──────────────────────
+       The accent the user picks in Settings → Appearance. Every
+       accent-bearing shell control reads these (Settings and its sheets,
+       buttons, focus rings, progress, the boot panel, window controls);
+       `tabs/appearance.js` `applyAccent()` overrides them inline on <html>.
+       Defaults are the brand teal. `--ezil-accent-contrast` is the text
+       colour ON the accent (AA-checked per preset), `--ezil-accent-strong` a
+       darker shade for gradients and hovers. */
+    --ezil-accent: #00adb5;
+    --ezil-accent-strong: #007c82;
+    --ezil-accent-contrast: #04060c;
+    --ezil-accent-rgb: 0, 173, 181;
+
     /* ── window controls ────────────────────────────────────────────────────
        The close / minimise / expand discs (`ezil-shell.css`). Sizes are here
        rather than there because the titlebar's own centring maths has to add

@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { BillingStore, GrantInsert, GrantRow, OutboxInsert } from './ports';
 import type { CatalogPack } from './types';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP_SKU } from './catalog';
-import { AI_CREDIT_POLICY_VERSION, CATALOG_V3, type PlanSkuV3 } from './v3/contract';
+import { AI_CREDIT_POLICY_VERSION, CATALOG_V3, UPGRADE_AI_ENTITLEMENT_SUFFIX, upgradeAiCredits, type PlanSkuV3 } from './v3/contract';
 
 const DAY = 86_400_000;
 export const AI_CREDIT_PROTOCOL = 'ezil-ai-credits-v1';
@@ -30,6 +30,36 @@ export function aiCreditEntitlement(input: {
         credits: policy.amount,
         expiresAt: new Date(policy.per === 'once' ? start + 365 * DAY : input.periodEnd!.getTime() + 3 * DAY).toISOString(),
     };
+}
+
+const UPGRADE_ENTITLEMENT = /^ezil-os:v1:premium_monthly_v3:([A-Za-z0-9_]+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z):upgrade$/;
+
+/**
+ * Round 3 D1: the prorated Standard → Premium credits of one paid upgrade invoice.
+ * `credits` may be 0 (the caller then enqueues nothing); the id never exceeds 193 chars.
+ */
+export function aiUpgradeEntitlement(input: {
+    userId: string; subscriptionId: string; periodStart: Date; periodEnd: Date; effectiveAt: Date;
+}): AiCreditEntitlement {
+    const [start, end, at] = [input.periodStart, input.periodEnd, input.effectiveAt].map(date => date.getTime());
+    if (!input.userId || ![start, end, at].every(Number.isFinite) || end! <= start! || at! < start! || at! >= end!) {
+        throw new TypeError('Invalid AI upgrade period');
+    }
+    const entitlementId = `ezil-os:v${AI_CREDIT_POLICY_VERSION}:premium_monthly_v3:${input.subscriptionId}:`
+        + `${input.effectiveAt.toISOString()}:${UPGRADE_AI_ENTITLEMENT_SUFFIX}`;
+    if (entitlementId.length > 193 || !UPGRADE_ENTITLEMENT.test(entitlementId)) throw new TypeError('Invalid AI upgrade entitlement');
+    return {
+        entitlementId,
+        credits: upgradeAiCredits({ fromSku: 'standard_monthly_v3', toSku: 'premium_monthly_v3',
+            periodStart: input.periodStart.toISOString(), periodEnd: input.periodEnd.toISOString(), effectiveAt: input.effectiveAt.toISOString() }),
+        expiresAt: new Date(end! + 3 * DAY).toISOString(),
+    };
+}
+
+export function parseAiUpgradeEntitlement(entitlementId: string): { subscriptionId: string; effectiveAt: Date } | null {
+    const match = entitlementId.length <= 193 ? UPGRADE_ENTITLEMENT.exec(entitlementId) : null;
+    const effectiveAt = match ? new Date(match[2]!) : null;
+    return match && effectiveAt && effectiveAt.toISOString() === match[2] ? { subscriptionId: match[1]!, effectiveAt } : null;
 }
 
 export function aiCreditOutboxItem(userId: string, entitlement: AiCreditEntitlement, action: 'grant' | 'revoke', invoiceId: string | null): OutboxInsert {
@@ -131,6 +161,12 @@ const receiptTermsMatch = (a: OutboxInsert, b: OutboxInsert) => a.userId === b.u
     && a.payload.protocol === b.payload.protocol && a.payload.entitlementId === b.payload.entitlementId
     && a.payload.credits === b.payload.credits && a.payload.expiresAt === b.payload.expiresAt
     && a.payload.invoiceId === b.payload.invoiceId && a.payload.paymentIntentId === b.payload.paymentIntentId;
+/** Operator repair rows (round 4): a cause-less root revoke and a same-invoice `:correction-YYYYMMDD` child grant. */
+const CORRECTION_ENTITLEMENT = /^(.+):correction-\d{8}$/;
+const bareRevoke = (root: OutboxInsert, r: OutboxInsert) => r.eventKey === `${root.payload.entitlementId}:revoke`
+    && r.kind === 'ai_revoke' && r.payload.action === 'revoke' && r.payload.eventId === r.eventKey
+    && receiptTermsMatch(root, { ...r, payload: { ...r.payload,
+        invoiceId: r.payload.invoiceId === null ? root.payload.invoiceId : r.payload.invoiceId } });
 const deliveredRestore = (r: AiReversalReceipt) => r.deliveredAt != null
     && ['restored', 'already_restored'].includes(String((r.payload.delivery as { outcome?: string } | undefined)?.outcome));
 
@@ -192,6 +228,14 @@ function localReversalDeltas(input: AiReversalInput, corrections: GrantRow[], re
     return true;
 }
 
+/** The upgrade grant row keeps the subscription period; the root carries the effective instant inside it. */
+function upgradeRootMatches(entitlementId: string, expiresAt: string, g: GrantRow): boolean {
+    const root = parseAiUpgradeEntitlement(entitlementId);
+    return root !== null && g.subscriptionId === root.subscriptionId && g.periodStart !== null && g.periodEnd !== null
+        && root.effectiveAt >= g.periodStart && root.effectiveAt < g.periodEnd
+        && expiresAt === new Date(g.periodEnd.getTime() + 3 * DAY).toISOString();
+}
+
 /** Pure financial guard, run against a fresh snapshot under the store's cause/root locks. */
 export function planAiReversal(input: AiReversalInput, snapshot: {
     originals: GrantRow[]; corrections: GrantRow[]; receipts: AiReversalReceipt[];
@@ -210,6 +254,21 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
     // The existing ledger key has one row per meter/cause. Never partially apply an ambiguous purchase.
     if (new Set(grants.map(localKey)).size !== grants.length) return refuse('review:restore_mismatch');
     const outbox: OutboxInsert[] = [];
+    const operatorRevoked = (root: OutboxInsert) => snapshot.receipts.some(r => r.payload.entitlementId === root.payload.entitlementId
+        && bareRevoke(root, r));
+    // A local reversal needs an AI receipt reversed in the same plan to bind its cause; an unbound plan stays in review.
+    // A restore of an operator-revoked root keeps its own terminal refusal below.
+    if (input.action !== 'restore' && input.receipts.every(operatorRevoked)) return refuse('review:restore_mismatch');
+    const matchesSource = (p: Record<string, unknown>) => snapshot.originals.some(g => g.sourceType === 'payment_intent'
+        ? p.paymentIntentId === g.sourceId && p.entitlementId === `ezil-os:v1:topup:${p.packSku}:${g.sourceId}`
+            && p.expiresAt === g.periodEnd?.toISOString()
+        : p.invoiceId === g.sourceId && g.kind === 'plan_period' && g.subscriptionId && g.periodStart
+            && ['standard_monthly_v3', 'premium_monthly_v3'].some(sku => p.entitlementId
+                === `ezil-os:v1:${sku}:${g.subscriptionId}:${g.periodStart!.toISOString()}`)
+        || p.invoiceId === g.sourceId && g.kind === 'upgrade_prorated' && upgradeRootMatches(String(p.entitlementId), String(p.expiresAt), g));
+    const accountsOf = (root: OutboxInsert) => [...new Set([root, ...snapshot.receipts.filter(r => r.payload.entitlementId
+        === root.payload.entitlementId)].flatMap(r => typeof r.payload.accountPublicId === 'string'
+        && r.payload.accountPublicId ? [r.payload.accountPublicId] : []))];
     for (const root of input.receipts) {
         const p = root.payload;
         if (root.userId !== input.userId || root.kind !== 'ai_grant' || p.protocol !== AI_CREDIT_PROTOCOL
@@ -217,19 +276,20 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
             || !parseAiCreditEventId(p.entitlementId, p.eventId, 'grant') || p.action !== 'grant'
             || !Number.isSafeInteger(p.credits) || Number(p.credits) < 1 || Number(p.credits) > 1_000_000
             || typeof p.expiresAt !== 'string' || !Number.isFinite(Date.parse(p.expiresAt))) return refuse('review:restore_mismatch');
-        const matchesSource = snapshot.originals.some(g => g.sourceType === 'payment_intent'
-            ? p.paymentIntentId === g.sourceId && p.entitlementId === `ezil-os:v1:topup:${p.packSku}:${g.sourceId}`
-                && p.expiresAt === g.periodEnd?.toISOString()
-            : p.invoiceId === g.sourceId && g.kind === 'plan_period' && g.subscriptionId && g.periodStart
-                && ['standard_monthly_v3', 'premium_monthly_v3'].some(sku => p.entitlementId
-                    === `ezil-os:v1:${sku}:${g.subscriptionId}:${g.periodStart!.toISOString()}`));
-        if (!matchesSource) return refuse('review:restore_mismatch');
+        // A correction child is reversible only under its own sourced parent on identical, no larger terms.
+        const parentId = CORRECTION_ENTITLEMENT.exec(p.entitlementId)?.[1];
+        const parent = parentId === undefined ? undefined : input.receipts.find(r => r.payload.entitlementId === parentId);
+        if (!matchesSource(p) && !(parent && matchesSource(parent.payload) && parent.payload.invoiceId === p.invoiceId
+            && parent.payload.expiresAt === p.expiresAt && parent.payload.paymentIntentId === p.paymentIntentId
+            && Number(p.credits) <= Number(parent.payload.credits)
+            && isDeepStrictEqual(accountsOf(parent), accountsOf(root)))) return refuse('review:restore_mismatch');
         const family = snapshot.receipts.filter(r => r.payload.entitlementId === p.entitlementId);
-        if (family.some(r => !receiptTermsMatch(root, r))) return refuse('review:restore_mismatch');
-        const accounts = new Set([root, ...family].flatMap(r => typeof r.payload.accountPublicId === 'string'
-            && r.payload.accountPublicId ? [r.payload.accountPublicId] : []));
-        if (accounts.size > 1) return refuse('review:restore_mismatch');
-        const account = [...accounts][0];
+        if (family.some(r => !receiptTermsMatch(root, r) && !bareRevoke(root, r))) return refuse('review:restore_mismatch');
+        // An operator's cause-less revoke already removed this root; a second revoke ID is not known safe downstream.
+        const revoked = operatorRevoked(root);
+        const accounts = accountsOf(root);
+        if (accounts.length > 1) return refuse('review:restore_mismatch');
+        const account = accounts[0];
         let item: OutboxInsert;
         try {
             item = input.action === 'restore' ? aiCreditRestoreItem(root, input.causeId)
@@ -249,6 +309,7 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
                     || !input.receipts.some(x => x.payload.entitlementId === r.payload.entitlementId));
         })) return refuse('review:restore_mismatch');
         if (input.action === 'restore' && !previous) {
+            if (revoked) return refuse('review:restore_refused_terminal');
             const suspend = family.find(r => r.eventKey === `${p.entitlementId}:revoke:dispute:${input.causeId}`);
             if (!suspend) return refuse('failed:restore_suspend_pending');
             if (suspend.kind !== 'ai_revoke' || suspend.payload.action !== 'revoke'
@@ -276,7 +337,7 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
                     && !family.some(done => done.eventKey === `${p.entitlementId}:restore:${parsed.causeId}` && deliveredRestore(done));
             });
         }
-        if (!previous) outbox.push(item);
+        if (!previous && !revoked) outbox.push(item);
     }
     if (new Set(input.receipts.map(r => r.payload.entitlementId)).size !== input.receipts.length) return refuse('review:restore_mismatch');
     if (!localReversalDeltas(input, snapshot.corrections, snapshot.receipts, grants)) {

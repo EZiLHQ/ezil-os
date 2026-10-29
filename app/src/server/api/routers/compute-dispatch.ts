@@ -20,9 +20,25 @@
  * returned, so no provider call can happen for a foreign computer.
  */
 
+import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
+import { after } from 'next/server';
 
-import { billingV2EntitlementReader } from '@/server/billing/v2/compute-access';
+import { billingV2EntitlementReader, gateComputerStart } from '@/server/billing/v2/compute-access';
+import type { BillingDeps } from '@/server/billing/ports';
+import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
+import { planFromSubscriptions } from '@/server/billing/v3/catalog';
+import type { SwitchConfigurationOutputV3, SwitchPhaseV3 } from '@/server/billing/v3/contract';
+import { meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
+import { preflightSwitchCapacity, type SwitchCapacity } from '@/server/lib/compute/aws-pool-runtime';
+import { recordComputeTiming } from '@/server/lib/compute/aws-pool-timing';
+import {
+    AWS_SIZE_CODES, readComputerMeta, resolveTransition, TRANSITION_IN_FLIGHT, TRANSITION_REQUEST_ID, TRANSITION_STOP_TIMEOUT_MS,
+    TRANSITION_WAKE_TIMEOUT_MS, writeTransition, type AwsSizeCode, type ComputerTransition, type TransitionKind,
+} from '@/server/lib/compute/progress';
+import { TERMINAL_MIGRATION_STATES } from '@/server/lib/compute/provider-migrate';
+import { createProviderMigrationStore } from '@/server/lib/compute/provider-migrate-store';
+import { POOL_SESSION_PENDING, type Placement, type PlacementState } from '@/server/lib/compute/placement';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
@@ -237,4 +253,277 @@ export function awsStatusAnswer(status: ComputeStatus) {
     const state = (status as AwsComputeStatus).state;
     return { ...status, guacamoleRunning: status.ok === true && state === 'running', computeProvider: 'aws-ec2' as const,
         ...awsMigrationAnswer(status) };
+}
+
+// ── One computer, selectable configuration (round 3, contract v3 D5) ─────────
+
+/** What the switch and restart drivers touch beyond the placement: billing, routing and time. */
+export interface TransitionDeps {
+    env?: Env;
+    now?: () => Date;
+    newId?: () => string;
+    billing?: () => BillingDeps;
+    /** `routeComputer` options for the driver's own provider (tests inject collaborators). */
+    route?: RouteOptions;
+    /** Runs the stop → wake driver after the answer (`after()` in production, awaited in tests). */
+    schedule?: (work: () => Promise<void>) => void;
+    stop?: { budgetMs?: number; pollMs?: number };
+    wake?: { budgetMs?: number; pollMs?: number };
+    sleep?: (ms: number) => Promise<void>;
+    preflight?: (db: PlacementExecutor, p: Placement, targetType: string, env: Env, now: Date) => Promise<SwitchCapacity>;
+    /** Defaults to `routeComputer` (tests inject a scripted provider). */
+    routeComputer?: (db: unknown, computer: ComputerRef, options: RouteOptions) => Promise<RoutedComputer>;
+    /** The pool-session preview exchange for a pending warm adopt (`prepareAwsPoolSession`). */
+    preparePool?: (db: PlacementExecutor, computer: ComputerRef, correlationId: string) => Promise<void>;
+    /** The computer's provider migration, if any (defaults to the migration store). */
+    migration?: (db: PlacementExecutor, computerId: string) => Promise<{ state: string } | null>;
+}
+
+export type RestartComputerOutput =
+    | { ok: true; transitionId: string; path: 'restart'; size: AwsSizeCode }
+    | { ok: false; reason: 'not_running' | 'busy' | 'switch_in_progress' | 'foreign_computer' | 'not_entitled' | 'aws_monthly_cap' | 'unavailable' };
+
+const TRANSITION_POLL_MS = 5_000;
+const BUSY_STATES: readonly PlacementState[] = ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RECOVERING', 'RETIRING'];
+const isAwsSize = (size: unknown): size is AwsSizeCode => (AWS_SIZE_CODES as readonly unknown[]).includes(size);
+
+async function defaultBilling(): Promise<BillingDeps> {
+    const { getBillingDeps } = await import('@/server/billing/deps');
+    return getBillingDeps();
+}
+function defaultSchedule(work: () => Promise<void>): void {
+    const run = () => work().catch(() => console.error('[compute.transition] driver failed'));
+    // Registered synchronously, inside the request scope (as provider-migrate-orchestrator.ts does).
+    try { after(run); } catch { void run(); }
+}
+
+/**
+ * A warm adopt reaches session-ready only after the Worker's preview exchange for the new epoch
+ * (the open route runs it as `prepareAwsPoolSession` before its hold). A server-initiated wake
+ * has no browser open, so the driver runs the same exchange once per pool-pending lease epoch.
+ */
+async function defaultPreparePool(db: PlacementExecutor, computer: ComputerRef, correlationId: string): Promise<void> {
+    const [{ prepareAwsPoolSession }, { resolveCloudflareGuacamoleConfig }] = await Promise.all([
+        import('@/server/lib/compute/aws-preview'), import('@/server/lib/cloudflare-guacamole-provider')]);
+    await prepareAwsPoolSession(db, computer, { sessionId: computer.computerId, desktopMode: 'neko' }, resolveCloudflareGuacamoleConfig(),
+        process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', correlationId);
+}
+
+/** The same plan rule `billing.selectMachine` applies: an active Premium plan whose machine choice lists `size`. */
+async function entitledTo(billing: BillingDeps, userId: string, size: SizeCode): Promise<boolean> {
+    try {
+        const [subs, userCreatedAt] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.userCreatedAt(userId)]);
+        const plan = planFromSubscriptions({ subs, now: billing.now(), userCreatedAt });
+        if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active' || !plan.offer.machineChoice.includes(size)) return false;
+        // The compute entitlement itself (allowance granted, no payment issue), as every AWS open reads it.
+        const record = await billingV2EntitlementReader(() => billing).read(userId);
+        return record?.status === 'active' && record.provider === 'aws' && !record.paymentIssue;
+    } catch { return false; }
+}
+
+/** End a transition once (compare-and-swap on its id and phase); a failed switch reverts the preference it set. */
+async function finishTransition(db: PlacementExecutor, billing: BillingDeps, computer: ComputerRef, t: ComputerTransition,
+    resolved: { phase: SwitchPhaseV3; reason: string | null }, now: Date): Promise<void> {
+    if (resolved.phase !== 'done' && resolved.phase !== 'failed') return;
+    const ended = await writeTransition(db, computer, { transitionId: t.transitionId, phase: t.phase },
+        { ...t, phase: resolved.phase, reason: resolved.reason, endedAt: now.toISOString() });
+    if (!ended) return;
+    console.info(JSON.stringify({ event: 'compute-transition', kind: t.kind, phase: resolved.phase, reason: resolved.reason,
+        current: t.current, target: t.target, ms: now.getTime() - Date.parse(t.requestedAt) }));
+    // The switch phases as one durable row (telemetry ingestion): requested → stopping → waking → end.
+    const at = (v: string | null) => v ? Date.parse(v) - Date.parse(t.requestedAt) : NaN;
+    await recordComputeTiming(db, { site: 'compute.transition', code: `${t.kind}_${resolved.phase}`, outcome: resolved.phase === 'done' ? 'ok' : 'error',
+        ownerUserId: computer.userId, computerId: computer.computerId, durationMs: now.getTime() - Date.parse(t.requestedAt),
+        phases: { stopping: at(t.stoppingAt), waking: at(t.wakingAt), end: now.getTime() - Date.parse(t.requestedAt) } });
+    if (resolved.phase === 'failed' && t.kind === 'switch' && t.current !== t.target) {
+        // Only the preference this switch wrote: a later explicit choice is never overwritten.
+        try { if (await billing.store.sizePreference(computer.userId) === t.target) await billing.store.setSizePreference(computer.userId, t.current); }
+        catch { console.error('[compute.transition] preference revert failed'); }
+    }
+}
+
+/** Settle a stored transition whose resolved phase ended (a driver that died); returns what is now true. */
+async function settleStored(db: PlacementExecutor, billing: BillingDeps, computer: ComputerRef, p: Placement | null, now: Date) {
+    const meta = await readComputerMeta(db, computer);
+    if (!meta) return null;
+    const t = meta.transition;
+    if (!t) return { meta, t: null, resolved: null };
+    const resolved = resolveTransition(t, p, now);
+    if (TRANSITION_IN_FLIGHT.includes(t.phase) && !TRANSITION_IN_FLIGHT.includes(resolved.phase)) await finishTransition(db, billing, computer, t, resolved, now);
+    return { meta, t, resolved };
+}
+
+/**
+ * The server-side stop → wake of one transition. Every step is the existing lifecycle:
+ * `confirmAwsStop` (≤ 200 s), then `ensure` on the STOPPED placement, which replaces onto the
+ * same data volume as generation + 1 with a fresh fence (warm adopt of the target class, else
+ * cold) because the stored preference now names the target. `ensure` is only ever called on a
+ * non-RUNNING placement (it never renews a lease as owner presence). Completion is RUNNING on
+ * a later lease epoch; UNCONFIRMED, `capacity:*`, a refused open or a budget overrun fails.
+ */
+export async function driveTransition(db: PlacementDb, computer: ComputerRef, t: ComputerTransition, deps: TransitionDeps = {}): Promise<ComputerTransition> {
+    const env = deps.env ?? process.env, clock = deps.now ?? (() => new Date());
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+    const billing = deps.billing ? deps.billing() : await defaultBilling();
+    const ctx = { correlationId: t.transitionId };
+    let current = t;
+    const advance = async (phase: SwitchPhaseV3, fields: Partial<ComputerTransition>) => {
+        const next = { ...current, ...fields, phase };
+        if (await writeTransition(db, computer, { transitionId: current.transitionId, phase: current.phase }, next)) current = next;
+        return current.phase === phase;
+    };
+    const fail = async (reason: string) => { await finishTransition(db, billing, computer, current, { phase: 'failed', reason }, clock()); return current; };
+    try {
+        // A restart wakes on the size it stopped on, whatever the stored next-open preference says.
+        const route: RouteOptions = { env, ...deps.route, ...(t.kind === 'restart' ? { entitlements: sameSizeReader(deps.route?.entitlements, billing, t.current) } : {}) };
+        const routed = await (deps.routeComputer ?? routeComputer)(db, computer, route);
+        if (routed.kind !== 'aws-ec2') return fail('placement_missing');
+        if (current.phase === 'requested' && !await advance('stopping', { stoppingAt: clock().toISOString() })) return current;
+        if (current.phase === 'stopping') {
+            const stopped = await confirmAwsStop(routed.provider, ctx, computer, { budgetMs: deps.stop?.budgetMs ?? TRANSITION_STOP_TIMEOUT_MS,
+                pollMs: deps.stop?.pollMs, sleep, now: () => clock().getTime() });
+            if (!stopped.ok) return fail(stopped.outcome === 'still_running' ? 'stop_timeout' : `stop_${stopped.outcome ?? 'refused'}`.slice(0, 64));
+            if (!await advance('waking', { wakingAt: clock().toISOString() })) return current;
+        }
+        const gate = await gateComputerStart({ deps: billing, ...computer, kind: 'aws-ec2', instanceType: routed.instanceType, now: billing.now() });
+        if (!gate.allowed) return fail(`billing_${gate.reason}`);
+        const deadline = (Date.parse(current.wakingAt ?? '') || clock().getTime()) + (deps.wake?.budgetMs ?? TRANSITION_WAKE_TIMEOUT_MS);
+        let prepared = -1;
+        for (;;) {
+            const { record: p } = await readPlacement(db, computer.computerId, computer.userId);
+            const resolved = resolveTransition(current, p, clock());
+            if (resolved.phase === 'done' || resolved.phase === 'failed') { await finishTransition(db, billing, computer, current, resolved, clock()); return current; }
+            if (clock().getTime() >= deadline) return fail('wake_timeout');
+            if (p && p.leaseEpoch > current.fromLeaseEpoch && p.lastError === POOL_SESSION_PENDING && prepared !== p.leaseEpoch) {
+                prepared = p.leaseEpoch;
+                await (deps.preparePool ?? defaultPreparePool)(db, computer, ctx.correlationId).catch(() => undefined);
+            }
+            if (p && p.state !== 'RUNNING') {
+                const woke = await routed.provider.ensure(ctx, computer, { sessionId: computer.computerId, desktopMode: 'neko' });
+                if (!woke.ok && !woke.retryable) return fail(woke.errorCode === 'capacity_unavailable' ? 'capacity_unavailable' : woke.errorCode.slice(0, 64));
+            } else await routed.provider.status(ctx, computer);
+            await sleep(Math.max(0, Math.min(deps.wake?.pollMs ?? TRANSITION_POLL_MS, deadline - clock().getTime())));
+        }
+    } catch (error) {
+        if (error instanceof TRPCError) return fail('placement_unavailable');
+        console.error('[compute.transition] driver error');
+        return current;
+    }
+}
+
+function sameSizeReader(inner: EntitlementReader | undefined, billing: BillingDeps, size: AwsSizeCode): EntitlementReader {
+    const base = inner ?? billingV2EntitlementReader(() => billing);
+    return { async read(userId) { const record = await base.read(userId); return record ? { ...record, size } : record; } };
+}
+
+async function startTransition(db: PlacementDb, computer: ComputerRef, kind: TransitionKind, p: Placement, current: AwsSizeCode, target: AwsSizeCode,
+    requestId: string, deps: TransitionDeps): Promise<ComputerTransition | 'conflict'> {
+    const now = (deps.now ?? (() => new Date()))();
+    const t: ComputerTransition = { v: 1, transitionId: (deps.newId ?? randomUUID)(), requestId, kind,
+        computerId: computer.computerId.toLowerCase(), userId: computer.userId.toLowerCase(), current, target, phase: 'requested', reason: null,
+        fromGeneration: p.generation, fromLeaseEpoch: p.leaseEpoch, requestedAt: now.toISOString(), stoppingAt: null, wakingAt: null, endedAt: null };
+    return await writeTransition(db, computer, null, t) ? t : 'conflict';
+}
+
+function runDriver(db: PlacementDb, computer: ComputerRef, t: ComputerTransition, deps: TransitionDeps): void {
+    (deps.schedule ?? defaultSchedule)(async () => { await driveTransition(db, computer, t, deps); });
+}
+
+const sameRequest = (t: ComputerTransition, requestId: string, target: SizeCode) => t.requestId === requestId || (t.kind === 'switch' && t.target === target);
+
+/**
+ * `computer.switchConfiguration` (contract v3 `SwitchConfiguration*`). Checks in order:
+ * ownership, the `selectMachine` plan rule, an in-flight transition (the same request id or the
+ * same target answers that transition; another target is `switch_in_progress`), then by state:
+ * RUNNING → capacity preflight before any stop, then a persisted transition and the server
+ * stop → wake (`switching`); STOPPED (or no AWS host yet) → the preference only (`next_start`);
+ * opening, stopping or migrating → `computer_busy`.
+ */
+export async function switchComputerConfiguration(db: PlacementDb, computer: ComputerRef, input: { size: SizeCode; requestId: string },
+    deps: TransitionDeps = {}): Promise<SwitchConfigurationOutputV3> {
+    const env = deps.env ?? process.env, now = (deps.now ?? (() => new Date()))();
+    const billing = deps.billing ? deps.billing() : await defaultBilling();
+    let p: Placement | null;
+    try { p = isPlacementReadEnabled(env) ? (await readPlacement(db, computer.computerId, computer.userId)).record : null; }
+    catch (error) { if (error instanceof PlacementOwnerError) return { ok: false, reason: 'foreign_computer' }; throw error; }
+    const settled = await settleStored(db, billing, computer, p, now);
+    if (!settled) return { ok: false, reason: 'foreign_computer' };
+    if (!isAwsSize(input.size) || !TRANSITION_REQUEST_ID.test(input.requestId) || !await entitledTo(billing, computer.userId, input.size)) return { ok: false, reason: 'not_entitled' };
+    const target = input.size;
+    if (settled.t && settled.resolved && TRANSITION_IN_FLIGHT.includes(settled.resolved.phase)) {
+        return sameRequest(settled.t, input.requestId, target)
+            ? { ok: true, effective: 'switching', current: settled.t.current, target: settled.t.target, transitionId: settled.t.transitionId }
+            : { ok: false, reason: 'switch_in_progress' };
+    }
+    const aws = p?.provider === 'aws-ec2' ? p : null;
+    const running = meteredSizeForInstanceType(aws?.instanceType);
+    const preferred = isAwsSize(running) ? null : await billing.store.sizePreference(computer.userId);
+    const current: AwsSizeCode = isAwsSize(running) ? running : isAwsSize(preferred) ? preferred : 'std-2';
+    // Fail closed: an unreadable migration state is busy, never a stop of a computer mid-migration.
+    let migrating: boolean;
+    try {
+        const migration = await (deps.migration ?? ((x, id) => createProviderMigrationStore(x).readByComputer(id)))(db, computer.computerId);
+        migrating = !!migration && !TERMINAL_MIGRATION_STATES.includes(migration.state as never);
+    } catch { return { ok: false, reason: 'computer_busy' }; }
+    if (aws?.state === 'RUNNING' && !migrating && target !== current) {
+        const preflight = await (deps.preflight ?? preflightSwitchCapacity)(db, aws, SIZES[target].machine, env, now);
+        if (!preflight.ok) {
+            console.info(JSON.stringify({ event: 'compute-transition', kind: 'switch', phase: 'refused', reason: preflight.reason, current, target }));
+            // D11: the AWS monthly cap is a distinct, explainable refusal; egress caps stay an entitlement matter.
+            return { ok: false, reason: preflight.reason === 'user_hours_cap' ? 'aws_monthly_cap'
+                : preflight.reason === 'user_egress_cap' ? 'not_entitled' : 'capacity_unavailable' };
+        }
+        const t = await startTransition(db, computer, 'switch', aws, current, target, input.requestId, deps);
+        if (t === 'conflict') {
+            // A concurrent tab won: answer its transition when it is this same request, else refuse.
+            const again = await readComputerMeta(db, computer);
+            return again?.transition && TRANSITION_IN_FLIGHT.includes(again.transition.phase) && sameRequest(again.transition, input.requestId, target)
+                ? { ok: true, effective: 'switching', current: again.transition.current, target: again.transition.target, transitionId: again.transition.transitionId }
+                : { ok: false, reason: 'switch_in_progress' };
+        }
+        await billing.store.setSizePreference(computer.userId, target);
+        console.info(JSON.stringify({ event: 'compute-transition', kind: 'switch', phase: 'requested', current, target }));
+        runDriver(db, computer, t, deps);
+        return { ok: true, effective: 'switching', current, target, transitionId: t.transitionId };
+    }
+    if (migrating || (aws && BUSY_STATES.includes(aws.state))) return { ok: false, reason: 'computer_busy' };
+    // Stopped, not yet on AWS, already on this size, or waiting on recovery: the next start opens on `target`.
+    await billing.store.setSizePreference(computer.userId, target);
+    return { ok: true, effective: 'next_start', current, target, transitionId: (deps.newId ?? randomUUID)() };
+}
+
+/**
+ * `computer.restartComputer`: the whole computer, not only its desktop service. A confirmed
+ * stop, then a server-initiated open on the SAME size (warm adopt or cold), reported as a
+ * transition whose opening path is `restart`. Only a RUNNING AWS computer restarts.
+ */
+export async function restartWholeComputer(db: PlacementDb, computer: ComputerRef, input: { requestId: string }, deps: TransitionDeps = {}): Promise<RestartComputerOutput> {
+    const env = deps.env ?? process.env, now = (deps.now ?? (() => new Date()))();
+    const billing = deps.billing ? deps.billing() : await defaultBilling();
+    if (!isPlacementReadEnabled(env) || !isAwsComputersEnabled(env)) return { ok: false, reason: 'unavailable' };
+    let p: Placement | null;
+    try { p = (await readPlacement(db, computer.computerId, computer.userId)).record; }
+    catch (error) { if (error instanceof PlacementOwnerError) return { ok: false, reason: 'foreign_computer' }; throw error; }
+    const settled = await settleStored(db, billing, computer, p, now);
+    if (!settled) return { ok: false, reason: 'foreign_computer' };
+    if (!TRANSITION_REQUEST_ID.test(input.requestId)) return { ok: false, reason: 'unavailable' };
+    if (settled.t && settled.resolved && TRANSITION_IN_FLIGHT.includes(settled.resolved.phase)) {
+        return settled.t.kind === 'restart' && settled.t.requestId === input.requestId
+            ? { ok: true, transitionId: settled.t.transitionId, path: 'restart', size: settled.t.current } : { ok: false, reason: 'switch_in_progress' };
+    }
+    if (!p || p.provider !== 'aws-ec2') return { ok: false, reason: 'not_running' };
+    if (BUSY_STATES.includes(p.state)) return { ok: false, reason: 'busy' };
+    const size = meteredSizeForInstanceType(p.instanceType);
+    if (p.state !== 'RUNNING' || !isAwsSize(size)) return { ok: false, reason: 'not_running' };
+    const gate = await gateComputerStart({ deps: billing, ...computer, kind: 'aws-ec2', instanceType: p.instanceType, now: billing.now() });
+    if (!gate.allowed) return { ok: false, reason: 'not_entitled' };
+    const t = await startTransition(db, computer, 'restart', p, size, size, input.requestId, deps);
+    if (t === 'conflict') {
+        const again = await readComputerMeta(db, computer);
+        return again?.transition?.kind === 'restart' && again.transition.requestId === input.requestId
+            ? { ok: true, transitionId: again.transition.transitionId, path: 'restart', size } : { ok: false, reason: 'switch_in_progress' };
+    }
+    console.info(JSON.stringify({ event: 'compute-transition', kind: 'restart', phase: 'requested', current: size, target: size }));
+    runDriver(db, computer, t, deps);
+    return { ok: true, transitionId: t.transitionId, path: 'restart', size };
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { usage as sample, summary } from './usage-fixtures.mjs';
+import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
 const calls = []; let computer = { id: 'computer-a' }; let owner = 'user'; let replies = {};
 globalThis.__usageTrpc = { query: (path, input) => { calls.push({ path, input }); return replies[path]; } };
 globalThis.__usageSession = { currentComputer: () => computer, payload: () => ({ user: { id: owner } }) };
@@ -67,8 +68,9 @@ check('normal layout, units, reset date and collapsed disclosures', () => {
     assert.match(el.querySelector('.usage-plan').textContent, /Standard plan/);
     assert.equal(el.querySelector('.usage-plan time').getAttribute('datetime'), sample.period.resetsAt);
     assert.equal(el.querySelector('.usage-plan time').title, new Date(sample.period.resetsAt).toISOString());
-    assert.match(meter(el, 'compute').textContent, /24 h of 40 h/);
-    assert.match(meter(el, 'compute').textContent, /16 h left/);
+    // Round 3 D3: hours at the current configuration, never raw standard-seconds as hours.
+    assert.match(meter(el, 'compute').textContent, /About 16 hours left at 2 vCPU/);
+    assert.doesNotMatch(meter(el, 'compute').textContent, /24 h of 40 h/);
     assert.match(meter(el, 'ai').textContent, /120 of 200 left/);
     assert.match(meter(el, 'ai').textContent, /Your plan adds 200 every month/);
     assert.match(meter(el, 'storage').textContent, /1.2 GB of 2 GB/);
@@ -104,7 +106,7 @@ for (const [state, used, balance, storage, percent] of [
 }
 check('bar descriptions identify used time, credits left and measured storage', () => {
     const el = rendered();
-    assert.equal(progress(el, 'compute').getAttribute('aria-valuetext'), '24 h used of 40 h. 16 h left.');
+    assert.equal(progress(el, 'compute').getAttribute('aria-valuetext'), 'About 16 hours left at 2 vCPU.');
     assert.equal(progress(el, 'ai').getAttribute('aria-valuetext'), '120 credits left. Plan adds 200 every month.');
     assert.equal(progress(el, 'storage').getAttribute('aria-valuetext'), '1.2 GB used of 2 GB.');
 });
@@ -120,19 +122,19 @@ check('invalid caps and readings never create a proportion', () => {
         if (value !== '100') assert.equal(progress(storage, 'storage'), null);
     }
     assert.equal(progress(rendered(withPeriod({ usedStandardSeconds: 0, allowanceStandardSeconds: 0 })), 'compute'), null);
-    assert.match(meter(rendered(withPeriod({ allowanceStandardSeconds: 0 })), 'compute').textContent, /No compute time included this period/);
+    assert.match(meter(rendered(withPeriod({ allowanceStandardSeconds: 0 })), 'compute').textContent, /No computer time included this period/);
 });
 check('zero, tiny and over-cap usage; server remaining is authoritative', () => {
     const zero = rendered(withPeriod({ usedStandardSeconds: 0 }));
     assert.equal(progress(zero, 'compute').getAttribute('aria-valuenow'), '0');
-    assert.match(meter(zero, 'compute').textContent, /0 s/);
+    assert.match(meter(zero, 'compute').textContent, /About 16 hours left at 2 vCPU/);
     assert.equal(progress(zero, 'compute').querySelector('.usage-fill'), null);
     const tiny = rendered(withPeriod({ usedStandardSeconds: 1 }));
     assert.equal(Number(progress(tiny, 'compute').getAttribute('aria-valuenow')), 1 / 144000 * 100);
     assert.ok(progress(tiny, 'compute').querySelector('.usage-fill'));
     const over = rendered(withPeriod({ usedStandardSeconds: 200000, remainingStandardSeconds: 7 }));
     assert.equal(progress(over, 'compute').getAttribute('aria-valuenow'), '100');
-    assert.match(meter(over, 'compute').textContent, /7 s left · new sessions paused/);
+    assert.match(meter(over, 'compute').textContent, /No computer time left · new sessions paused/);
     assert.equal(over.querySelectorAll('.ezil-settings-btn-primary').length, 1);
     assert.ok(over.querySelector('.usage-banner .ezil-settings-btn-primary'));
     assert.equal(over.querySelector('.usage-banner').hasAttribute('role'), false);
@@ -160,7 +162,9 @@ check('AI topups, trial grants, zero grants and microcredits', () => {
 });
 check('storage sampling gate, totals, latest measurement and 100% danger threshold', () => {
     const absent = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '2000000000', samples: [] } }, { ...summary, storage: { ...summary.storage, usedBytes: '0' } });
-    assert.match(meter(absent, 'storage').textContent, /Not measured yet.*Limit 2 GB/s);
+    // Round 3 D4: no invented "Limit 2 GB" (the legacy v1 Free constant).
+    assert.match(meter(absent, 'storage').textContent, /Not measured yet/);
+    assert.doesNotMatch(meter(absent, 'storage').textContent, /Limit|2 GB/);
     assert.equal(progress(absent, 'storage'), null);
     const two = rendered({ ...sample, storage: { ...sample.storage, samples: [...sample.storage.samples, { computerId: '<img src=x>', bytes: '200000000', measuredAt: '2026-10-26T00:00:00Z' }] } });
     assert.match(meter(two, 'storage').textContent, /1.4 GB of 2 GB/);
@@ -170,6 +174,56 @@ check('storage sampling gate, totals, latest measurement and 100% danger thresho
     assert.equal(meter(rendered(withStorage('1900000000'), { ...summary, storage: { ...summary.storage, state: 'exhausted' } }), 'storage').dataset.state, 'warn');
     assert.equal(progress(rendered(withStorage('3000000000')), 'storage').getAttribute('aria-valuenow'), '100');
     assert.equal(progress(rendered(withStorage('9007199254740992')), 'storage'), null);
+});
+check('round 3: hours left at weight 1, 2 and 4 with the equivalents; never standard-seconds as hours', () => {
+    const choice = [{ size: 'std-2', vcpu: 2, memoryGiB: 8, weight: 1 }, { size: 'cmp-4', vcpu: 4, memoryGiB: 16, weight: 2 }, { size: 'cmp-8', vcpu: 8, memoryGiB: 32, weight: 4 }];
+    const premium = { ...summary, plan: { ...summary.plan, sku: 'premium_monthly_v3', name: 'Premium' }, computer: { ...summary.computer, machineChoice: choice } };
+    const remaining = 1630800; // 453 h at weight 1
+    const equivalents = choice.map(c => ({ size: c.size, weight: c.weight, hours: Math.floor(remaining / c.weight / 3600) }));
+    for (const [size, weight, text, same] of [
+        ['std-2', 1, 'About 453 hours left at 2 vCPU', 'Same as 113 hours at 8 vCPU or 226 hours at 4 vCPU.'],
+        ['cmp-4', 2, 'About 226 hours left at 4 vCPU', 'Same as 113 hours at 8 vCPU or 453 hours at 2 vCPU.'],
+        ['cmp-8', 4, 'About 113 hours left at 8 vCPU', 'Same as 226 hours at 4 vCPU or 453 hours at 2 vCPU.'],
+    ]) {
+        const el = rendered(withPeriod({ usedStandardSeconds: 169200, allowanceStandardSeconds: 1800000, remainingStandardSeconds: remaining, currentSize: size, currentWeight: weight,
+            remainingHoursAtCurrent: Math.floor(remaining / weight / 3600), equivalents }), premium);
+        assert.match(meter(el, 'compute').textContent, new RegExp(text));
+        assert.match(meter(el, 'compute').textContent, new RegExp(same.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        assert.doesNotMatch(el.textContent, /\b\d+ h( \d+ min)? (left|of)\b|standard-hour|compute hours/i);
+        if (weight > 1) assert.doesNotMatch(meter(el, 'compute').querySelector('.usage-value').textContent, /453/);
+        assert.deepEqual(scanCopy(el.textContent), []);
+    }
+    // An older server without the round-3 fields: the client divides by the weight itself.
+    const old = rendered(withPeriod({ remainingStandardSeconds: 57600, currentWeight: 2, currentSize: 'cmp-4' }), premium);
+    assert.match(meter(old, 'compute').textContent, /About 8 hours left at 4 vCPU/);
+    const tiny = rendered(withPeriod({ remainingStandardSeconds: 600, remainingHoursAtCurrent: 0, currentSize: 'std-2', equivalents: [] }), summary);
+    assert.match(meter(tiny, 'compute').textContent, /Less than an hour left at 2 vCPU/);
+});
+check('round 3: AI credits split into this period, purchased, starter and renewal rows', () => {
+    const el = rendered(sample, withAI({ balance: 1312, included: { granted: 1000, remaining: 812, periodEnd: '2026-11-27T00:00:00Z' },
+        purchased: { remaining: 500, expiresAt: '2027-01-15T00:00:00Z' }, starter: null, pendingFromRenewal: null }));
+    assert.match(meter(el, 'ai').textContent, /812 of 1,000 left/);
+    assert.match(meter(el, 'ai').textContent, /\+ 500 purchased · expire/);
+    assert.equal(Number(progress(el, 'ai').getAttribute('aria-valuenow')), 81.2);
+    assert.doesNotMatch(meter(el, 'ai').textContent, /Your plan adds/);
+    const upgraded = rendered(sample, withAI({ balance: 569, included: { granted: 369, remaining: 369, periodEnd: '2026-11-27T00:00:00Z' }, pendingFromRenewal: { credits: 1000, at: '2026-11-27T00:00:00Z' } }));
+    assert.match(meter(upgraded, 'ai').textContent, /369 of 369 left/);
+    assert.match(meter(upgraded, 'ai').textContent, /1,000 more from/);
+    const free = rendered(sample, withAI({ grant: { amount: 100, per: 'once' }, balance: 60, starter: { remaining: 60 } }));
+    assert.match(meter(free, 'ai').textContent, /60 starter credits left/);
+    for (const node of [el, upgraded, free]) assert.deepEqual(scanCopy(node.textContent), []);
+});
+check('round 3: storage is the provisioned disk; used only when measured; Free shows no number', () => {
+    const disk = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: null }, samples: [] } });
+    assert.match(meter(disk, 'storage').textContent, /50 GB disk/);
+    assert.match(meter(disk, 'storage').textContent, /For your projects · the same on every configuration/);
+    assert.equal(progress(disk, 'storage'), null);
+    const used = rendered({ ...sample, storage: { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: '12000000000' }, samples: [] } });
+    assert.match(meter(used, 'storage').textContent, /12 GB of 50 GB/);
+    assert.ok(progress(used, 'storage'));
+    const free = rendered({ ...sample, storage: { state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null }, samples: [] } });
+    assert.doesNotMatch(meter(free, 'storage').textContent, /\d+ GB|Limit/);
+    assert.match(meter(free, 'storage').textContent, /Your files are saved with your computer\./);
 });
 check('session states and null runtime remain honest', () => {
     for (const state of ['stale', 'ended', 'unavailable']) {
@@ -261,7 +315,7 @@ try {
     assert.match(win.text(), /Loading usage/);
     assert.deepEqual(calls.slice(0, 2), [{ path: 'billing.usage', input: { computerId: 'computer-a' } }, { path: 'billing.summary', input: undefined }]);
     u.resolve({ ok: true, data: sample }); await tick();
-    assert.match(win.text(), /24 h of 40 h/);
+    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
     assert.match(win.text(), /Plan unavailable/);
     assert.equal(win.find('[data-role="usage-body"]').attr('aria-busy'), 'true');
     s.resolve({ ok: true, data: summary }); await tick();
@@ -298,7 +352,7 @@ try {
     assert.match(win.text(), /120 of 200 left/);
     success(); replies['billing.summary'] = Promise.reject(Error('summary failed')); await refresh();
     assert.match(win.text(), /Plan unavailable/);
-    assert.match(win.text(), /24 h of 40 h/);
+    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
     assert.equal(win.find('[data-action="usage-add-credits"]').length, 0);
     passed++; console.log('PASS partial failures retain usage honestly without blanking successful sections');
 
@@ -309,7 +363,7 @@ try {
     assert.equal(live.firstChild, announced, 'unchanged polling does not rewrite the live region');
     assert.equal(win.find('[data-role="usage-refresh-status"]').attr('role'), undefined);
     success(withPeriod({ usedStandardSeconds: 144000 })); await refresh();
-    assert.match(live.textContent, /Compute time is used up/);
+    assert.match(live.textContent, /Computer time is used up/);
     passed++; console.log('PASS only state changes are announced during automatic refresh');
 
     u = deferred(); s = deferred(); replies = { 'billing.usage': u.promise, 'billing.summary': s.promise }; await refresh();

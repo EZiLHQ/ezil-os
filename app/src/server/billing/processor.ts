@@ -10,7 +10,7 @@ import { stripePackCredits, stripePackSku } from './stripe/packs';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
 import { CATALOG_V3 } from './v3/contract';
-import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, hasAiTopupReceipts, hasAiReversals } from './ai-credits';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiUpgradeEntitlement, hasAiTopupReceipts, hasAiReversals } from './ai-credits';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
 
@@ -166,6 +166,13 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     fromSku: 'standard_monthly_v2', toSku: 'compute_monthly_v2',
                     periodStart: periodStart!.toISOString(), periodEnd: periodEnd.toISOString(), effectiveAt: effectiveAt.toISOString(),
                 });
+                // Round 3 D1: v3 Premium upgrades also add prorated AI credits; v2 Compute upgrades grant none.
+                let aiUpgrade: ReturnType<typeof aiUpgradeEntitlement> | null = null;
+                if (compute.lookupKey === CATALOG_V3.premium_monthly_v3.stripeLookupKey) {
+                    try {
+                        aiUpgrade = aiUpgradeEntitlement({ userId, subscriptionId: subscription.id, periodStart: periodStart!, periodEnd, effectiveAt });
+                    } catch { return 'review:invalid_ai_upgrade'; }
+                }
                 const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                 if (result === 'conflict') return 'review:customer_mismatch';
                 await store.resolvePaymentIssue(invoice.id, eventCreated);
@@ -173,6 +180,9 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'upgrade_prorated',
                     amount: BigInt(amount), periodStart, periodEnd, sourceType: 'invoice', sourceId: invoice.id,
                 }, compute.lookupKey === CATALOG_V3.premium_monthly_v3.stripeLookupKey ? 'premium_monthly_v3' : 'compute_monthly_v2');
+                // Queued after the compute grant, on replay too; the event key keeps it to one row.
+                if (aiUpgrade && aiUpgrade.credits > 0) await store.enqueueOutbox(aiCreditOutboxItem(userId, aiUpgrade, 'grant', invoice.id));
+                else if (aiUpgrade) logLine({ event: 'ai-upgrade-grant', outcome: 'skipped_zero', invoiceId: invoice.id });
                 await store.setPlanChangeState({ userId, subscriptionId: subscription.id, kind: 'upgrade', state: 'applied', effectiveAt });
                 return 'applied';
             }
@@ -322,9 +332,21 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             // A missing subscription outbox receipt can be reconstructed only for a reversal,
             // from the sold line and immutable local grant. Never reconstruct restore evidence.
             if (receipts.length === 0 && action.type !== 'restore' && charge.invoiceId !== null
-                && originals.some(grant => grant.kind === 'plan_period')) {
+                && originals.some(grant => grant.kind === 'plan_period' || grant.kind === 'upgrade_prorated')) {
                 const invoice = await stripe.retrieveInvoice(charge.invoiceId);
                 if (invoice.customer !== charge.customer) return 'review:customer_mismatch';
+                // The upgrade root's instant is the sold Premium line's start, never the grant row's period start.
+                const upgrade = invoiceGrantKind(invoice);
+                for (const original of originals.filter(grant => grant.kind === 'upgrade_prorated')) {
+                    if (upgrade.kind !== 'upgrade' || upgrade.compute.lookupKey !== CATALOG_V3.premium_monthly_v3.stripeLookupKey
+                        || !original.subscriptionId || !original.periodStart || !original.periodEnd
+                        || upgrade.compute.periodEnd?.getTime() !== original.periodEnd.getTime()) continue;
+                    try {
+                        const entitlement = aiUpgradeEntitlement({ userId, subscriptionId: original.subscriptionId,
+                            periodStart: original.periodStart, periodEnd: original.periodEnd, effectiveAt: upgrade.compute.periodStart! });
+                        if (entitlement.credits > 0) receipts.push(aiCreditOutboxItem(userId, entitlement, 'grant', invoice.id));
+                    } catch { /* An invalid root never reconstructs a receipt. */ }
+                }
                 for (const original of originals.filter(grant => grant.kind === 'plan_period')) {
                     for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
                         const line = invoice.lines.find(line => line.lookupKey === CATALOG_V3[sku].stripeLookupKey
@@ -384,8 +406,27 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
     }
 }
 
+/** One structured JSON line per outcome; never payload values beyond ids and codes. */
+function logLine(fields: Record<string, unknown>): void {
+    console.info(JSON.stringify(fields));
+}
+
 /** Permanent payload defects are acknowledged; provider/store failures retry. */
 export async function processStripeEvent(event: StripeEventLike, deps: ProcessorDeps): Promise<string> {
+    const type = typeof event?.type === 'string' ? event.type : null;
+    const eventId = typeof event?.id === 'string' ? event.id : null;
+    let outcome: string;
+    try {
+        outcome = await processPlannedEvent(event, deps);
+    } catch (error) {
+        logLine({ event: 'billing-webhook', type, outcome: 'error', eventId });
+        throw error;
+    }
+    logLine({ event: 'billing-webhook', type, outcome, eventId });
+    return outcome;
+}
+
+async function processPlannedEvent(event: StripeEventLike, deps: ProcessorDeps): Promise<string> {
     let actions: BillingAction[];
     try {
         actions = planStripeEvent(event);
@@ -427,6 +468,12 @@ export async function ingestUsageEvents(events: UsageEvent[], deps: { store: Bil
                 break;
             case 'stop':
                 await store.closeInterval(event.computerId, at, event.reason ?? 'stop');
+                // AWS lifecycle receipts own an AWS computer's epoch closes; a Worker stop may describe another generation.
+                if (await store.placementProvider?.(event.computerId) === 'aws-ec2') {
+                    console.info(JSON.stringify({ event: 'billing-usage-stop-ignored', computerId: event.computerId, at: event.at, provider: 'aws-ec2' }));
+                    accepted++;
+                    continue;
+                }
                 break;
             case 'storage':
                 if (typeof event.bytes !== 'string' || event.bytes === '' || /\D/.test(event.bytes)) {
@@ -447,7 +494,7 @@ export async function ingestUsageEvents(events: UsageEvent[], deps: { store: Bil
         } else if (event.type === 'heartbeat') {
             await store.touchEpoch(event.computerId, at);
         } else if (event.type === 'stop') {
-            await store.closeEpoch({ computerId: event.computerId, endedAt: at,
+            await store.closeEpoch({ computerId: event.computerId, readyBy: at, endedAt: at,
                 reason: event.reason === 'idle' ? 'idle_sleep' : 'provider_stop' });
         }
         accepted++;

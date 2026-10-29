@@ -23,7 +23,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const OS = path.resolve(here, '../../app/public/os');
+// EZIL_SHELL_OUT_DIR: a bundle built from this tree (`build-shell.sh` honours the same variable).
+const OS = process.env.EZIL_SHELL_OUT_DIR || path.resolve(here, '../../app/public/os');
 const icons = fs.readFileSync(`${OS}/icons.js`, 'utf8');
 const bundle = fs.readFileSync(`${OS}/bundle.min.js`, 'utf8');
 
@@ -253,10 +254,13 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         !!panel && panel.closest('.window-body') !== null);
     push('panel shows the progress state', panel?.getAttribute('data-kind') === 'progress',
         panel?.getAttribute('data-kind'));
-    push('four phase rows rendered', $$(window, '.ezil-boot-phase').length === 4,
-        `${$$(window, '.ezil-boot-phase').length} rows`);
-    push('boot headline is the honest one',
-        $1(window, '.ezil-boot-title')?.textContent === 'Opening your workspace',
+    // Round 3 (plan §6.5): the one opening surface — one status line, one bar, no step list.
+    const PHASE_LABELS = ['Getting your workspace', 'Loading your files', 'Starting your apps', 'Opening the window'];
+    push('no step list: one status line and one bar', $$(window, '.ezil-boot-phase, .ezil-boot ol').length === 0
+        && !!$1(window, '.ezil-boot .ezil-opening-bar'), `${$$(window, '.ezil-boot-phase').length} rows`);
+    push('the status line is the estimated phase, never a time promise',
+        PHASE_LABELS.includes($1(window, '.ezil-boot-title')?.textContent)
+        && !/seconds|\d+%/.test(panel?.textContent ?? ''),
         $1(window, '.ezil-boot-title')?.textContent);
 
     // 🔴 PROGRESSIVE DISCLOSURE (W3). The window opens showing `AppSpinner`,
@@ -282,10 +286,9 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     // long the clock runs.
     await sleep(400);
     push('🔴 no phase claims "confirmed" without a real signal',
-        $$(window, '.ezil-boot-phase[data-state="confirmed"]').length === 0,
-        [...$$(window, '.ezil-boot-phase')].map(r => r.getAttribute('data-state')).join(','));
-    push('a phase IS highlighted as current (an estimate, drawn as one)',
-        $$(window, '.ezil-boot-phase[data-state="current"]').length === 1);
+        panel?.dataset.confirmed === 'false', String(panel?.dataset.confirmed));
+    push('a phase IS current (an estimate, drawn as one)',
+        ['waking', 'mounting', 'starting', 'connecting'].includes(panel?.dataset.phase), String(panel?.dataset.phase));
 
     // The cheap status probe runs on a 2s interval WHILE the long POST is
     // still in flight — the one genuine mid-boot signal the browser has.
@@ -300,11 +303,11 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     // 🔴 The ONLY way a checkmark is allowed to appear: a real
     // `guacamoleRunning: true` off that probe. Flip it and watch.
     guac_running = true;
-    const confirmed = await until(() => $1(window, '.ezil-boot-phase[data-state="confirmed"]'), 4000);
-    push('🔴 a REAL running signal is what draws the checkmark', !!confirmed,
-        [...$$(window, '.ezil-boot-phase')].map(r => r.getAttribute('data-state')).join(','));
+    const confirmed = await until(() => $1(window, '.ezil-boot[data-confirmed="true"]'), 4000);
+    push('🔴 a REAL running signal is what marks the panel confirmed', !!confirmed,
+        String(panel?.dataset.confirmed));
     push('and it confirms "connecting", the phase the signal actually means',
-        confirmed?.getAttribute('data-phase') === 'connecting', confirmed?.getAttribute('data-phase'));
+        confirmed?.dataset.phase === 'connecting', confirmed?.dataset.phase);
 
     // The drawer — the only chrome once the taskbar is hidden. It is attached
     // up front (so `go_fullbleed` cannot fire without an exit existing) but it
@@ -437,8 +440,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         && $1(window, '.ezil-app-spinner')?.hidden === true,
         `spinner hidden=${$1(window, '.ezil-app-spinner')?.hidden}`
         + ` panel hidden=${$1(window, '.ezil-boot')?.hidden}`);
-    push('the phase list itself is now visible, not just the panel',
-        $1(window, '.ezil-boot-phases')?.hidden === false);
+    push('the opening bar itself is now visible, not just the panel',
+        $1(window, '.ezil-boot .ezil-opening-bar')?.hidden === false);
 
     // Not this scenario's concern whether the boot then succeeds or fails —
     // only that the panel swap already happened correctly. Let the released
@@ -469,7 +472,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('failure copy is the specific one, not a generic spinner',
         $1(window, '.ezil-boot-title')?.textContent === "Can't reach your computer",
         $1(window, '.ezil-boot-title')?.textContent);
-    push('phase list is hidden on failure', $1(window, '.ezil-boot-phases')?.hidden === true);
+    push('the bar is hidden on failure', $1(window, '.ezil-boot .ezil-opening-bar')?.hidden === true);
     const retry = $1(window, '.ezil-boot-retry');
     push('Retry is offered', !!retry && $1(window, '.ezil-boot-actions')?.hidden === false);
 
@@ -583,8 +586,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         !saw_failure, `saw_failure=${saw_failure}`);
     push('🔴 ...it really did re-ask, rather than one lucky first attempt',
         posts === WAKES + 1, `${posts} POSTs`);
-    push('the phase list was live throughout — this is the UI that was dead',
-        $$(window, '.ezil-boot-phase').length === 4);
+    push('the opening surface was live throughout — this is the UI that was dead',
+        !!$1(window, '.ezil-boot .ezil-opening-bar'));
 
     // And the wake must not have burned the one automatic retry: that is owed
     // to a genuine failure, and `sandbox_starting` is not one.
@@ -965,10 +968,10 @@ async function boot_to_display_gate (answer, { framesAtMs } = {}) {
         !win.classList.contains('ezil-fullbleed'), win.className);
     push('...so the taskbar is still there and the OS is still usable',
         window.$('.taskbar').css('display') !== 'none', window.$('.taskbar').css('display'));
-    push('the phase list is hidden, as it is for every other failure',
-        $1(window, '.ezil-boot-phases')?.hidden === true);
+    push('the bar is hidden, as it is for every other failure',
+        $1(window, '.ezil-boot .ezil-opening-bar')?.hidden === true);
     push('🔴 no checkmark survived into the failure',
-        $$(window, '.ezil-boot-phase[data-state="confirmed"]').length === 0);
+        $1(window, '.ezil-boot .ezil-opening-bar')?.getAttribute('aria-valuenow') !== '100');
 
     // Retry must re-run the WHOLE boot, not just the gate.
     const posts_before = seen.filter(r => r.method === 'POST').length;

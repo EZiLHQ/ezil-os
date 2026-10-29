@@ -4,7 +4,9 @@ import { redirect } from 'next/navigation';
 
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
+import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
+import { shellFeaturesFor } from '@/server/shell/features';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
@@ -154,6 +156,7 @@ export default async function Page({ searchParams }: {
         computer: computerResult.computer,
         isNew: computerResult.created,
         provider: providerResult,
+        shellFeatures: shellFeaturesFor(user.email, env),
     });
 
     return (
@@ -243,7 +246,7 @@ function CouldNotOpen() {
                 href={Routes.COMPUTERS}
                 className="inline-flex items-center gap-2 rounded-md bg-teal px-4 py-2 text-sm font-medium text-black hover:opacity-90"
             >
-                Your computers
+                Your computer
             </Link>
         </main>
     );

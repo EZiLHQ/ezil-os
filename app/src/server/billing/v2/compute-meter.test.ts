@@ -76,7 +76,7 @@ describe('billingComputeMeter', () => {
     it('floors stop time and passes optional overhead; heartbeat keeps its observation time', async () => {
         const f = fixture();
         await f.meter.stopped({ ...stopped, overheadSeconds: 5 });
-        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: ref.computerId,
+        expect(f.store.closeEpoch).toHaveBeenCalledExactlyOnceWith({ computerId: ref.computerId, readyBy: stopped.endedAt,
             endedAt: new Date('2026-10-19T12:10:00Z'), reason: 'user_stop', overheadSeconds: 5 });
         await f.meter.heartbeat(heartbeat);
         expect(f.store.touchEpoch).toHaveBeenCalledExactlyOnceWith(ref.computerId, READY);

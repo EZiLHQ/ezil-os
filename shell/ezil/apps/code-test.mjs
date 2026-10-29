@@ -339,10 +339,11 @@ push('\u{1f534} the panel between the mint and the answer is PROGRESS, not a fai
 // ring and swaps the label to the failure copy. Both halves are asserted, so
 // this cannot pass on a failure panel. The `connecting`-phase claim itself is
 // unit-pinned in `boot-phases.test.ts`.
-push('\u{1f534} ...and it is still visibly WORKING — ring up, app copy, not the dead end',
-    win2?.querySelector('.ezil-app-spinner-ring')?.hidden === false
+// Round 3: the ring became the one opening surface's thin bar (plan §6.5).
+push('\u{1f534} ...and it is still visibly WORKING — bar up, app copy, not the dead end',
+    win2?.querySelector('.ezil-opening-bar')?.hidden === false
     && win2?.querySelector('.ezil-app-spinner-label')?.textContent === 'Opening Code…',
-    `ring hidden=${win2?.querySelector('.ezil-app-spinner-ring')?.hidden}`
+    `bar hidden=${win2?.querySelector('.ezil-opening-bar')?.hidden}`
     + ` label=${win2?.querySelector('.ezil-app-spinner-label')?.textContent}`);
 push('\u{1f534} ...and offers no Retry, because there is nothing to retry yet',
     win2?.querySelector('.ezil-boot-actions')?.hidden === true,

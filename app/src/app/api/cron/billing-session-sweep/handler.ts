@@ -14,42 +14,85 @@ export interface BillingSessionSweepCounts {
     examined: number;
     /** Successful stop calls, including retries. */
     stopped: number;
-    /** All newly closed epochs; heartbeatClosed is a subset. */
+    /** All newly closed epochs; heartbeatClosed and awsStaleClosed are subsets. */
     closed: number;
     stopFailed: number;
     heartbeatClosed: number;
     retried: number;
     shadow: number;
+    /** Round 3 D9: open AWS epochs whose computer is proven not running (stop receipt never arrived). */
+    awsStaleClosed?: number;
+    /** Round 3 D6: the AI credit outbox drain of this sweep. */
+    ai?: { drained: number; delivered: number; retried: number; failed: number };
 }
 
-export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, limit = 50 }: {
+/** Placement evidence for a stale AWS epoch; `stoppedAt` is the provider-observed stop, when recorded. */
+export type AwsStopProof = (computer: ComputerRef) => Promise<{ running: boolean; stoppedAt: Date | null }>;
+
+export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, limit = 50 }: {
     deps: BillingDeps;
     now: Date;
     stop: (computer: ComputerRef, reason: SweepReason) => Promise<StopOutcome>;
     isStillRunning: (computer: ComputerRef) => Promise<boolean>;
+    /** Placement proof for stale AWS epochs (with the proven stop time); omitted = no AWS stale closes. */
+    awsStopProof?: AwsStopProof;
     limit?: number;
 }): Promise<BillingSessionSweepCounts> {
     const startedAt = Date.now();
-    const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0 };
+    const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0,
+        ai: { drained: 0, delivered: 0, retried: 0, failed: 0 } };
     const drain = async () => {
-        try { await drainAiCreditOutbox(deps, { limit: 25, deadlineMs: startedAt + 40_000 }); }
-        catch { console.warn('[billing.ai] outbox sweep unavailable'); }
+        try {
+            const drained = await drainAiCreditOutbox(deps, { limit: 25, deadlineMs: startedAt + 40_000 });
+            counts.ai = { drained: drained.claimed, delivered: drained.done, retried: drained.retry, failed: drained.failed };
+        } catch { console.warn('[billing.ai] outbox sweep unavailable'); }
     };
-    if (!billingMeteringActive(deps.config)) { await drain(); return counts; }
+    const finish = () => {
+        console.info(JSON.stringify({ event: 'billing-sweep', ...counts }));
+        return counts;
+    };
+    if (!billingMeteringActive(deps.config)) { await drain(); return finish(); }
 
     const epochs = await deps.store.openEpochsForSweep({ limit });
     counts.examined = epochs.length;
     const policyCandidates: StoredComputeEpoch[] = [];
+    // An AWS heartbeat only proves the owner was present, never that the host stopped: a stale
+    // AWS epoch closes only on placement proof, at the proven stop time, else its last heartbeat.
+    // `isStillRunning` is not proof (the route maps read errors to false), so without
+    // `awsStopProof` AWS epochs keep the policy path only.
+    async function provenStop(epoch: StoredComputeEpoch, heartbeat: Date): Promise<Date | null> {
+        if (!awsStopProof) return null;
+        try {
+            const proof = await awsStopProof({ userId: epoch.userId, computerId: epoch.computerId });
+            if (proof.running !== false) return null;
+            const stoppedAt = proof.stoppedAt?.getTime();
+            return stoppedAt !== undefined && Number.isFinite(stoppedAt) && stoppedAt >= Date.parse(epoch.readyAt)
+                ? new Date(Math.min(stoppedAt, now.getTime())) : heartbeat;
+        } catch {
+            return null; // Unknown placement state never closes metered time.
+        }
+    }
     // Correct stale Cloudflare usage before caching monthly state. The Worker
     // already idles these containers; this is accounting, even in shadow mode.
     for (const epoch of epochs) {
         const heartbeat = new Date(epoch.lastHeartbeatAt ?? epoch.readyAt);
-        if (epoch.size === 'free-cf' && heartbeat.getTime() < now.getTime() - HEARTBEAT_STALE_MS) {
-            if (await deps.store.closeEpoch({ computerId: epoch.computerId, endedAt: heartbeat, reason: 'idle_sleep' }) === 'closed') {
+        const stale = heartbeat.getTime() < now.getTime() - HEARTBEAT_STALE_MS;
+        if (epoch.size === 'free-cf' && stale) {
+            if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt: heartbeat, reason: 'idle_sleep' }) === 'closed') {
                 counts.closed++;
                 counts.heartbeatClosed++;
             }
-        } else policyCandidates.push(epoch);
+            continue;
+        }
+        const stoppedAt = epoch.size !== 'free-cf' && stale ? await provenStop(epoch, heartbeat) : null;
+        if (stoppedAt === null) { policyCandidates.push(epoch); continue; }
+        // 'provider_stop' (the AWS receipt's own reason): the end-reason check allows no new value without a migration.
+        if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt: stoppedAt, reason: 'provider_stop' }) === 'closed') {
+            counts.closed++;
+            counts.awsStaleClosed++;
+            console.info(JSON.stringify({ event: 'billing-sweep-close', cause: 'sweep_stale', epochId: epoch.id,
+                computerId: epoch.computerId, endedAt: stoppedAt.toISOString(), proven: stoppedAt !== heartbeat }));
+        }
     }
 
     const states = new Map<string, Promise<ComputeBillingState>>();
@@ -105,7 +148,7 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         try {
             await tryStop(computer, reason);
         } finally {
-            if (await deps.store.closeEpoch({ computerId: epoch.computerId, endedAt, reason }) === 'closed') counts.closed++;
+            if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt, reason }) === 'closed') counts.closed++;
         }
     }
 
@@ -126,5 +169,5 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     await advanceStaleMigrations(startedAt);
     await reconcilePaidCloudflareUsers(startedAt);
     await drain();
-    return counts;
+    return finish();
 }

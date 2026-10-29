@@ -1,4 +1,4 @@
-import { poolTimingSchema, poolTimingDeltas } from './aws-pool-timing';
+import { poolTimingSchema, poolTimingDeltas, recordComputeTiming, type ComputeTiming } from './aws-pool-timing';
 import { recordPoolSessionReady } from './ready-pool';
 import { parseRebaseJson } from './aws-rebase-json';
 import { finishEnrollment, ENROLLMENT_SUCCEEDED, POOL_SESSION_PENDING, readPlacement, type PlacementExecutor } from './placement';
@@ -66,7 +66,8 @@ export async function primePoolRelay(deps: { db: PlacementExecutor; env: Env; fe
 }
 
 /** The host reports this only after the single desktop switch, mounted disk and healthy relay/editor. */
-export async function handlePoolSessionReady(req: Request, deps: PoolClaimDeps): Promise<Response> {
+export async function handlePoolSessionReady(req: Request, deps: PoolClaimDeps,
+    persistTiming: (db: unknown, timing: ComputeTiming) => Promise<boolean> = recordComputeTiming): Promise<Response> {
     try {
         let body: { sessionReady?: boolean; timing?: unknown };
         try { body = parseRebaseJson(await req.text(), 1024) as typeof body; }
@@ -96,9 +97,16 @@ export async function handlePoolSessionReady(req: Request, deps: PoolClaimDeps):
                 { computerId: p.computerId, expected: p, success: true, poolClaim: true, sessionReady: true });
             poolGuard('session_finished', result.ok, 503);
             poolGuard('session_timestamp', await recordPoolSessionReady(tx, row.poolHostId, p, result.placement.updatedAt), 503);
-            return p.computerId.slice(0, 8);
+            return { computerId: p.computerId, ownerUserId: p.ownerUserId };
         });
-        if (computer && timing) console.info(JSON.stringify({ event: 'pool-session-timing', computer, ...poolTimingDeltas(timing) }));
+        if (computer && timing) {
+            const deltas = poolTimingDeltas(timing);
+            console.info(JSON.stringify({ event: 'pool-session-timing', computer: computer.computerId.slice(0, 8), ...deltas }));
+            // Round 3: the same timing as a durable row (telemetry ingestion), after the readiness commit.
+            await persistTiming(deps.db, { site: 'compute.pool_session_timing', code: 'pool_session_timing', outcome: 'ok',
+                ownerUserId: computer.ownerUserId, computerId: computer.computerId, durationMs: deltas.claimToHealthyMs ?? null,
+                phases: Object.fromEntries(Object.entries(deltas).filter(([k]) => k !== 'claimPublishedAtMs')) });
+        }
         return Response.json({ ok: true }, { headers: POOL_NO_STORE });
     } catch (error) { return poolErrorResponse(error); }
 }

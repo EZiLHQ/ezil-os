@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
+import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, parseAiGrants, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
 import type { OutboxInsert } from './ports';
 
 const input = { config: { fundingUrl: 'https://gateway.test/' }, userId: 'current-user', headers: new Headers(),
@@ -7,6 +7,16 @@ const input = { config: { fundingUrl: 'https://gateway.test/' }, userId: 'curren
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('AI balance', () => {
+    it('parses the Gateway grants[] whole or not at all', () => {
+        const row = { id: 'g', source: 'entitlement', credits_micro: '200000000', remaining_micro: 90_000_000,
+            expires_at: '2026-11-04T00:00:00+00:00', revoked_at: null, live: true };
+        expect(parseAiGrants({ grants: [row, { ...row, revoked_at: '2026-10-05T00:00:00Z' }] })).toEqual([
+            { creditsMicro: '200000000', remainingMicro: '90000000', expiresAt: '2026-11-04T00:00:00.000Z', live: true },
+            { creditsMicro: '200000000', remainingMicro: '90000000', expiresAt: '2026-11-04T00:00:00.000Z', live: false }]);
+        expect(parseAiGrants({ grants: [] })).toEqual([]);
+        for (const body of [{}, { grants: null }, { grants: [{ ...row, live: 'yes' }] }, { grants: [{ ...row, remaining_micro: -1 }] },
+            { grants: [row, { ...row, expires_at: 'soon' }] }, null]) expect(parseAiGrants(body)).toBeNull();
+    });
     it.each([[null, 500, 'unavailable'], [0, 500, 'exhausted'], [1, 500, 'low'], [50, 500, 'low'], [51, 500, 'ok'],
         [20, 200, 'low'], [21, 200, 'ok'], [100, 1000, 'low'], [101, 1000, 'ok'], [1, 0, 'ok']] as const)
     ('balance %s against grant %s is %s', (balance, grant, state) => expect(aiBalanceState(balance, grant)).toBe(state));

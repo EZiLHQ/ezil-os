@@ -1,11 +1,11 @@
 // Versioned billing views. The summary owns plan details and action availability.
 import TabAccount from './account.js';
-import { payload as bootPayload } from '../../../session.js';
+import { payload as bootPayload, currentComputer } from '../../../session.js';
 import { isNative } from '../../../native-runtime.js';
 import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, creditsLabel } from '../billing-format.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, creditsLabel, hoursLeftLines } from '../billing-format.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -52,10 +52,41 @@ function sizesLine (summary, codes, memory = true) {
     return `${cpus.slice(0, -1).join(', ')} or ${cpus.at(-1)} vCPU${memory ? ` · up to ${Math.max(...sizes.map(size => size.memoryGiB))} GiB` : ''}`;
 }
 
-function paymentHtml ({ plan, actions }) {
+const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
+/** Round 4: the server's standing (`computer.standing`, STANDING-CONTRACT), or null when not reported. */
+function standingOf (summary) {
+    const value = summary?.computer?.standing;
+    return STANDINGS.has(value) ? value : null;
+}
+
+/** Round 4 copy (D16-D18). Same function as `computers.js` `standingCopy`; billing-test pins the two equal. */
+export function standingCopy (standing, data) {
+    const plan = data?.plan ?? {};
+    const day = iso => Number.isFinite(Date.parse(iso ?? '')) ? dateLabel(iso, true) : null;
+    if ( standing === 'grace' ) {
+        const by = day(plan.graceEndsAt);
+        return `Your payment didn't go through — update it${by ? ` by ${by}` : ''} to keep your ${data?.computer?.filesOn === 'cloudflare' ? 'plan' : 'AWS computer'}.`;
+    }
+    if ( standing === 'plan_ending' ) {
+        const on = day(plan.planEndsAt ?? plan.cancelsAt);
+        const name = plan.name || 'Your plan';
+        const ends = on ? `${name} ends on ${on}.` : `${name} ends at the end of this period.`;
+        return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
+            : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
+    }
+    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.';
+    return '';
+}
+
+function paymentHtml (summary) {
+    const { plan, actions, version } = summary;
+    // Round 4 (D17): in grace the paid computer stays usable until the date; the banner says so.
+    if ( version === 3 && standingOf(summary) === 'grace' && plan.paymentIssue !== 'requires_action' ) {
+        return `<aside class="ezil-billing-card ezil-billing-payment is-danger" role="status" data-role="payment-grace">${paragraph(standingCopy('grace', summary))}${actions.portal ? actionHtml('portal', 'Fix payment') : ''}</aside>`;
+    }
     if ( ! plan.paymentIssue ) return '';
     const banners = {
-        payment_failed: ["Your last payment didn't go through. Update your payment method to keep your plan.", actions.portal ? actionHtml('portal', 'Update payment method') : ''],
+        payment_failed: [`Your last payment didn't go through. Update your payment method to keep ${version === 3 ? plan.name : 'your plan'}.`, actions.portal ? actionHtml('portal', version === 3 ? 'Update payment' : 'Update payment method') : ''],
         requires_action: ['Your bank needs you to confirm a payment.', '<button type="button" class="ezil-settings-btn" data-action="open-invoice" data-kind="subscription">Confirm payment</button>'],
         overage_unpaid: ['Overage is paused until your usage invoice is paid. Your computer stops at your included allowance; saved files are kept.', '<button type="button" class="ezil-settings-btn" data-action="open-invoice" data-kind="overage">Pay usage invoice</button>'],
     };
@@ -187,23 +218,61 @@ function nudgeHtml (summary) {
             ? actionHtml('overage', 'Turn on overage…') : ''}</aside>` : '';
 }
 
-function machineV3Html ({ plan, computer }) {
-    if ( plan.sku !== 'premium_monthly_v3' ) return paragraph(`${computer.vcpu} vCPU · ${computer.memoryGiB} GB`);
-    return `<fieldset class="ezil-billing-sizes" data-role="machine-picker"><legend>Next session's computer</legend>
-        <div class="ezil-billing-size-options">${computer.machineChoice.map(machine => `<label class="ezil-billing-size">
-            <input type="radio" name="ezil-billing-machine" value="${encode(machine.size)}"${machine.size === computer.size ? ' checked' : ''}>
-            <span><strong>${encode(`${machine.vcpu} vCPU · ${machine.memoryGiB} GB`)}</strong>${machine.weight > 1 ? `<span>${encode(`uses time ${machine.weight}× faster`)}</span>` : ''}</span>
-        </label>`).join('')}</div><p data-role="machine-status" role="status" aria-live="polite"></p></fieldset>`;
-}
+const whole = value => Number(value).toLocaleString('en-US');
 
-function aiCreditsV3Html ({ ai, actions, catalog }) {
+/** AI credits row (plan §6.3): this period's plan credits, then purchased, starter and renewal on their own lines. */
+function aiCreditsV3Html ({ ai, actions, catalog, plan }) {
     const state = STATES.has(ai.state) ? ai.state : 'unavailable';
     const packs = actions.topup === true ? catalog.packs ?? [] : [];
-    return `<section id="ai-credits" class="ezil-billing-card ezil-billing-ai-credits is-${state}" aria-labelledby="ai-credits-heading">
+    const included = ai.included && Number.isSafeInteger(ai.included.remaining) ? ai.included : null;
+    const pending = ai.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+    // Round 4 D17: during the payment grace this period's plan credits are granted only once the
+    // invoice is paid — never "0 of 0 left" with "more from <renewal>" (ACCEPT-R4A S-C finding).
+    const awaitingPayment = plan?.paymentIssue != null && included !== null && included.granted === 0 && pending !== null;
+    const main = awaitingPayment
+        ? `<strong>0</strong> <span>${encode(`of ${whole(pending.credits)} this period · added once your payment goes through`)}</span>`
+        : included
+        ? `<strong>${encode(whole(included.remaining))}</strong> <span>${encode(`of ${whole(included.granted)} left this period · resets ${dateLabel(included.periodEnd)}`)}</span>`
+        : ai.balance == null ? 'Not available' : `<strong>${encode(creditsLabel(null, ai.balance))}</strong> <span>credits left</span>`;
+    const purchased = ai.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining > 0
+        ? paragraph(`+ ${whole(ai.purchased.remaining)} purchased · expire ${dateLabel(ai.purchased.expiresAt, true)}`, 'ezil-billing-credit-line') : '';
+    const starter = ai.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining > 0
+        ? paragraph(`${whole(ai.starter.remaining)} starter credits left`, 'ezil-billing-credit-line') : '';
+    const renewal = pending && ! awaitingPayment
+        ? paragraph(`${whole(pending.credits)} more from ${dateLabel(pending.at)}`, 'ezil-billing-credit-line') : '';
+    return `<section id="ai-credits" class="ezil-billing-card ezil-billing-ai-credits is-${state}" data-role="meter-ai" aria-labelledby="ai-credits-heading">
         <h4 id="ai-credits-heading" tabindex="-1">AI credits</h4>
-        <p class="ezil-billing-credit-balance">${ai.balance == null ? 'Not available' : `<strong>${encode(creditsLabel(null, ai.balance))}</strong> <span>credits left</span>`}</p>
+        <p class="ezil-billing-credit-balance">${main}</p>${purchased}${starter}${renewal}
+        ${paragraph('Used by EZiL AI in Code and Chat.', 'ezil-billing-note')}
         ${packs.length ? `<div class="ezil-billing-actions">${packs.map(pack => actionHtml('topup', `Add ${creditsLabel(null, pack.aiCredits)} credits — ${dollars(pack.totalCents, { compact: true })}`, false, pack.sku)).join('')}</div>` : ''}
     </section>`;
+}
+
+/**
+ * Computer time row (plan §6.3, D3): hours left at the CURRENT configuration
+ * from `billing.usage`, the same time at the other configurations, and why.
+ * Never "standard-hour" or "compute hours" (scanCopy).
+ */
+export function timeV3Html ({ computer, fairUse }, usage = null) {
+    const lines = hoursLeftLines(usage?.period, computer.machineChoice);
+    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status];
+    const weighted = computer.machineChoice.filter(machine => machine.weight > 1);
+    const why = weighted.length ? `Bigger configurations use your monthly time sooner: ${weighted.map(machine => `${machine.vcpu} vCPU counts ${machine.weight === 2 ? 'double' : machine.weight === 4 ? 'four times' : `${machine.weight} times`}`).join(', ')}.` : '';
+    return `<section class="ezil-billing-card" data-role="meter-time" aria-labelledby="time-heading"><h4 id="time-heading">Computer time</h4>
+        ${paragraph(lines ? `${lines.main} · resets ${dateLabel(fairUse.resetsAt)}` : `Resets ${dateLabel(fairUse.resetsAt)}`, 'ezil-billing-usage')}
+        ${lines?.equivalents ? paragraph(lines.equivalents, 'ezil-billing-credit-line') : ''}
+        <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
+        ${why ? paragraph(why, 'ezil-billing-note') : ''}</section>`;
+}
+
+/** Storage row (plan §6.3, D4): the provisioned disk; a used figure only once something measures it. */
+function storageV3Html ({ computer }) {
+    const disk = computer.disk;
+    const gb = Number.isFinite(disk?.provisionedGiB) ? disk.provisionedGiB : null;
+    const used = typeof disk?.usedBytes === 'string' && /^\d+$/.test(disk.usedBytes) ? Number(disk.usedBytes) / 1e9 : null;
+    return `<section class="ezil-billing-card" data-role="meter-storage" aria-labelledby="storage-heading"><h4 id="storage-heading">Storage</h4>
+        ${paragraph(gb === null ? 'Your files are saved with your computer.' : used !== null ? `${used.toLocaleString('en-US', { maximumFractionDigits: 1 })} of ${gb} GB used` : `${gb} GB disk for your projects`, 'ezil-billing-usage')}
+        ${gb !== null ? paragraph('The same disk on every configuration.', 'ezil-billing-note') : ''}</section>`;
 }
 
 function aiV3Html (ai) {
@@ -246,35 +315,48 @@ function aiV3Html (ai) {
     </section>`;
 }
 
-export function summaryV3Html (summary) {
-    const { plan, computer, fairUse, actions } = summary;
-    const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
+/** Plan action by state (plan §6.3): one primary per state. */
+function planActionsV3 ({ plan, actions }) {
+    if ( plan.status === 'cancels' ) return actions.cancel ? actionHtml('resume', `Keep ${plan.name}`, true) : '';
+    const main = plan.sku === 'free_v3' ? actions.checkout ? actionHtml('choose', 'Upgrade', true) : ''
+        : plan.sku === 'standard_monthly_v3' ? actions.upgrade ? actionHtml('upgrade', 'Upgrade to Premium', true) : ''
+            : actions.downgrade ? actionHtml('downgrade', 'Change plan') : actions.upgrade ? actionHtml('upgrade', 'Change plan') : '';
+    return main + (actions.cancel ? actionHtml('cancel', 'Cancel plan') : '');
+}
+
+export function summaryV3Html (summary, usage = null) {
+    const { plan, computer, actions } = summary;
+    const status = { free: 'Current', active: 'Current', cancels: 'Ends soon', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
     const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
-    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status];
-    const changeAction = actions.downgrade ? actionHtml('downgrade', 'Change plan')
-        : actions.upgrade ? actionHtml('upgrade', 'Change plan') : actions.checkout ? actionHtml('choose', 'Change plan', true) : '';
+    const price = plan.sku === 'free_v3' ? '$0' : plan.renewal && ! ['cancels', 'past_due'].includes(plan.status)
+        ? `${dollars(plan.renewal.amountCents, { compact: true })}/month · renews ${dateLabel(plan.renewal.at, true)}` : '';
+    const choices = computer.machineChoice.length > 1;
+    const standing = standingOf(summary);
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div>
-        ${actions.portal ? actionHtml('portal', 'Manage payment') : ''}</header>
+        <div class="ezil-billing-actions">${actions.portal ? actionHtml('portal', 'Manage payment') : ''}${actionHtml('invoices', 'Invoices')}</div></header>
         ${paymentHtml(summary)}
         <section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3" aria-label="Current plan">
             <div class="ezil-billing-plan-heading"><h4>${encode(plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(plan.status)}">${encode(status)}</span></div>
-            ${plan.status !== 'cancels' && plan.status !== 'past_due' && plan.renewal ? paragraph(`Renews on ${dateLabel(plan.renewal.at)} for ${dollars(plan.renewal.amountCents, { compact: true })}`, 'ezil-billing-status') : ''}
-            ${plan.status === 'cancels' ? `<aside role="status" data-role="cancels-banner">${paragraph(`Your plan ends on ${dateLabel(plan.cancelsAt)}. You keep your plan until then.`)}</aside>` : ''}
-            ${plan.status === 'past_due' && ! plan.paymentIssue ? '<aside role="status" data-role="payment-banner">Your payment is past due. Manage payment to keep your plan.</aside>' : ''}
+            ${price ? paragraph(price, 'ezil-billing-status') : ''}
+            ${standing === 'plan_ending' ? `<aside role="status" data-role="plan-ending">${paragraph(standingCopy('plan_ending', summary))}</aside>`
+                : plan.status === 'cancels' ? `<aside role="status" data-role="cancels-banner">${paragraph(`${plan.name} ends on ${dateLabel(plan.cancelsAt)}. Your files are kept.`)}</aside>` : ''}
+            ${standing === 'files_on_aws' ? `<aside role="status" data-role="files-held">${paragraph(standingCopy('files_on_aws', summary))}</aside>` : ''}
             ${plan.scheduledChange ? paragraph(`Changes to ${offerFor(summary, plan.scheduledChange.toSku)?.name ?? 'Standard'} on ${dateLabel(plan.scheduledChange.effectiveAt)}.`) : ''}
             ${plan.pendingUpgrade ? paragraph(`Premium starts once payment is confirmed. This upgrade expires ${dateLabel(plan.pendingUpgrade.expiresAt)}.`) : ''}
-            <div class="ezil-billing-actions" data-role="plan-actions">${actions.upgrade ? actionHtml('upgrade', 'Upgrade', true) : ''}${changeAction}${actions.cancel ? actionHtml(plan.status === 'cancels' ? 'resume' : 'cancel', plan.status === 'cancels' ? 'Resume plan' : 'Cancel') : ''}</div>
+            <div class="ezil-billing-actions" data-role="plan-actions">${planActionsV3(summary)}</div>
         </section>
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
-            ${machineV3Html(summary)}
+            ${paragraph(choices ? `Next start: ${computer.vcpu} vCPU · ${computer.memoryGiB} GB` : `${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
             ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
-            ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
+            ${standing === 'files_on_aws' ? paragraph('Your files are kept on your AWS (India) computer. It opens with Free limits.')
+                : plan.sku !== 'free_v3' && standing !== 'free' ? paragraph('Your own computer on AWS (India)') : ''}
+            ${choices ? `<div class="ezil-billing-actions">${actionHtml('computer-tab', 'Change configuration')}</div>` : ''}
         </section>
-        <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
-        ${aiCreditsV3Html(summary)}${aiV3Html(summary.ai)}
+        <div class="ezil-billing-v3-meters" data-role="billing-meters">${aiCreditsV3Html(summary)}<div data-role="time-slot">${timeV3Html(summary, usage)}</div>${storageV3Html(summary)}</div>
+        ${aiV3Html(summary.ai)}
         <p class="ezil-billing-note">Prices before tax.</p>
         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
-        <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3>Invoices</h3>
+        <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3 tabindex="-1">Invoices</h3>
             <div data-role="invoice-rows" aria-busy="true"><p class="ezil-billing-note">Loading invoices…</p></div></section>`;
 }
 
@@ -360,6 +442,7 @@ async function load ($win, state) {
             $body.html(result.data.version === 3 ? summaryV3Html(result.data) : summaryHtml(result.data));
             state.summary = result.data;
             startCountdown($win, state);
+            if ( result.data.version === 3 ) void loadUsage($win, state, request);
         }
     } catch {
         if ( request !== state.request || ! state.active || state.closed ) return;
@@ -401,6 +484,15 @@ async function load ($win, state) {
     if ( state.pending ) $rows.find('button').prop('disabled', true);
 }
 
+/** The time row needs `billing.usage` (hours at the current configuration); it fills in when that answers. */
+async function loadUsage ($win, state, request) {
+    const computerId = currentComputer()?.id;
+    const result = await trpc.query('billing.usage', computerId ? { computerId } : undefined).catch(() => ({ ok: false }));
+    if ( request !== state.request || state.closed || ! state.summary || ! $win.get(0).isConnected ) return;
+    const usage = result?.ok && result.data?.enabled === true && result.data.period ? result.data : null;
+    if ( usage ) $win.find('[data-role="time-slot"]').html(timeV3Html(state.summary, usage));
+}
+
 function actionError ($win, copy) { $win.find('[data-role="billing-action-error"]').text(copy); }
 
 function openSheet ($win, state, action, sku) {
@@ -421,7 +513,12 @@ function openSheet ($win, state, action, sku) {
     const onDone = () => { onClose(); void load($win, state); };
     actionError($win, '');
     try {
-        const options = { container, trpc, onDone, onClose, checkout: params => openSheet($win, state, 'checkout', params.sku) };
+        // After an upgrade, "Switch to 4 vCPU · 16 GB" hands over to the Computer tab, which owns the switch.
+        const onSwitch = size => {
+            window.dispatchEvent(new CustomEvent('ezil:computer-switch-request', { detail: { size } }));
+            $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
+        };
+        const options = { container, trpc, onDone, onClose, onSwitch, checkout: params => openSheet($win, state, 'checkout', params.sku) };
         token.handle = action === 'topup' ? upgradeSheetOpener({ ...options, sku, pack })
             : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes })
             : sheetOpeners[action]({ ...options, summary });
@@ -536,25 +633,16 @@ export default {
             if ( this.disabled ) return;
             const action = this.dataset.action;
             if ( action === 'retry' ) void load($win, state);
+            else if ( action === 'invoices' ) {
+                const heading = $pane.find('[data-role="invoices"] h3').get(0);
+                heading?.scrollIntoView?.({ block: 'start' });
+                heading?.focus({ preventScroll: true });
+            } else if ( action === 'computer-tab' ) $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
             else if ( ['checkout', 'topup', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
             else void act($win, state, action, this.dataset.kind);
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {
             if ( ! this.disabled && this.checked ) void act($win, state, 'size', this.value);
-        });
-        $pane.on('change', 'input[name="ezil-billing-machine"]', function () {
-            if ( ! this.disabled && this.checked ) void act($win, state, 'machine', this.value);
-        });
-        $pane.on('keydown', 'input[name="ezil-billing-machine"]', function (event) {
-            if ( this.disabled || ! ['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End', ' '].includes(event.key) ) return;
-            event.preventDefault();
-            const radios = $pane.find('input[name="ezil-billing-machine"]:enabled').get();
-            const index = radios.indexOf(this);
-            const next = event.key === 'Home' ? 0 : event.key === 'End' ? radios.length - 1
-                : event.key === ' ' ? index : (index + (['ArrowDown', 'ArrowRight'].includes(event.key) ? 1 : -1) + radios.length) % radios.length;
-            radios[next].focus();
-            radios[next].checked = true;
-            void act($win, state, 'machine', radios[next].value);
         });
         $win.on('remove.billing', () => {
             state.closed = true;

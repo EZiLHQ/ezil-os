@@ -249,6 +249,24 @@ export async function readPaidPoolEligibility(db: PlacementExecutor, userId: str
     return rows[0] ? { instanceType: String(rows[0].instance_type) } : null;
 }
 
+/**
+ * Round 3 demand signal: an eligible subscriber of this class whose configuration switch to it
+ * is in flight (the computer row's advisory `transition`, at most one unit per user, inside the
+ * transition's own time budget) is one waiting open, so the next replenish pass warms the
+ * class within the region cap. Only the larger classes: the base class always keeps a spare.
+ */
+function switchingDemand(c: PoolClass, at: string) {
+    const size = c.instanceType === 'm6i.2xlarge' ? 'cmp-8' : c.instanceType === 'm6i.xlarge' ? 'cmp-4' : null;
+    if (!size) return sql`0`;
+    return sql`(SELECT count(DISTINCT c.user_id) FROM public.ezil_computers c JOIN subscribers s ON s.user_id = c.user_id
+        WHERE c.deleted_at IS NULL AND jsonb_typeof(c.metadata) = 'object' AND jsonb_typeof(c.metadata->'transition') = 'object'
+            AND c.metadata->'transition'->>'kind' = 'switch' AND c.metadata->'transition'->>'target' = ${size}
+            AND c.metadata->'transition'->>'phase' IN ('requested', 'stopping', 'waking')
+            AND COALESCE(c.metadata->'transition'->>'requestedAt', '') > ${new Date(Date.parse(at) - SWITCH_DEMAND_WINDOW_MS).toISOString()})`;
+}
+/** A switch's whole budget (stop 200 s + grace 30 s + wake 600 s); older records are stale. */
+export const SWITCH_DEMAND_WINDOW_MS = 830_000;
+
 /** One snapshot: billing epochs measure recent demand, never subscription eligibility.
  * Paid subscribers use their stored size selection and sticky placement zone; new users default to Mumbai.
  * Hosts linked to a live placement count only once in regional capacity, including during adoption.
@@ -292,6 +310,7 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
             (SELECT count(*) FROM class_placements p JOIN subscribers s ON s.user_id = p.owner_user_id
                 WHERE p.state IN ('PROVISIONING', 'STARTING') AND p.instance_id IS NULL
                     AND p.lifecycle_job_id IS NULL) AS pending,
+            ${switchingDemand(c, at)} AS switching,
             (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (ready_at - created_at)) / 60)
                 FROM class_hosts WHERE ready_at > ${at}::timestamptz - interval '24 hours'
                     AND ready_at <= ${at}::timestamptz AND ready_at > created_at) AS boot_minutes,
@@ -316,7 +335,7 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
     const regions = readAwsRegions(process.env);
     const regionVcpuCap = regions.ok ? (regions.regions.find(r => r.name === c.region)?.maxRunning ?? 0) * 2 : 0;
     return {
-        pending: count(row.pending ?? 0), opens15m: count(row.opens), activeStandard: count(row.standard), activePremium: count(row.premium),
+        pending: count(row.pending ?? 0) + count(row.switching ?? 0), opens15m: count(row.opens), activeStandard: count(row.standard), activePremium: count(row.premium),
         bootMinutes: row.boot_minutes == null ? null : Number(row.boot_minutes), spares: count(row.spares), ready: count(row.ready ?? 0),
         vcpuInUse: count(row.vcpu), regionVcpuCap, killSwitch: process.env.EZIL_AWS_KILL_SWITCH === '1',
         demandVcpu: count(row.demand_vcpu ?? 0), earmarked: ((row.earmarked ?? []) as unknown[]).map(String),
@@ -408,4 +427,49 @@ export async function readPendingPoolAdopt(db: PlacementExecutor, poolHostId: st
             AND leased_computer_id IS NOT NULL AND claim_generation IS NULL AND claim_lease_epoch IS NULL
             AND claim_fence IS NULL AND claim_volume_serial IS NULL
     `));
+}
+
+/** Round 3 progress: the durable warm-open times of THIS lease epoch's pool host for `computerId`, or null (a cold open). */
+export async function readPoolOpening(db: PlacementExecutor, p: { computerId: string; leaseEpoch: number }, now: Date):
+    Promise<{ leasedAt: Date | null; claimPublishedAt: Date | null; sessionReadyAt: Date | null } | null> {
+    const row = rowsOf(await db.execute(sql`/* pool:opening */ SELECT leased_at,
+            CASE WHEN claim_generation IS NOT NULL THEN updated_at END AS claim_published_at, session_ready_at
+        FROM public.ezil_compute_pool_hosts
+        WHERE leased_computer_id = ${p.computerId}::uuid AND state = 'leased' AND leased_at IS NOT NULL
+            AND (claim_lease_epoch IS NULL OR claim_lease_epoch = ${p.leaseEpoch})
+            AND leased_at > ${now.toISOString()}::timestamptz - interval '1 hour'
+        ORDER BY leased_at DESC, id LIMIT 1`))[0];
+    return row ? { leasedAt: date(row.leased_at), claimPublishedAt: date(row.claim_published_at), sessionReadyAt: date(row.session_ready_at) } : null;
+}
+
+/** Median measured warm open (pool `leased_at` → tenant `session_ready_at`) over the class's last `limit` adoptions, in seconds. */
+export async function readWarmOpenSeconds(db: PlacementExecutor, c: { region: string; instanceType: string }, limit = 20): Promise<number | null> {
+    const row = rowsOf(await db.execute(sql`/* pool:warm-median */ SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY seconds) AS median
+        FROM (SELECT extract(epoch FROM (session_ready_at - leased_at)) AS seconds FROM public.ezil_compute_pool_hosts
+            WHERE region = ${c.region} AND instance_type = ${c.instanceType} AND leased_at IS NOT NULL
+                AND session_ready_at IS NOT NULL AND session_ready_at > leased_at
+            ORDER BY session_ready_at DESC, id LIMIT ${Math.max(1, Math.min(100, Math.floor(limit)))}) recent`))[0];
+    const median = row?.median == null ? null : Number(row.median);
+    return median !== null && Number.isFinite(median) && median > 0 ? median : null;
+}
+
+/** An active capacity demand holds this computer's open: the wake waits for room (never shown as "stopped"). */
+export async function hasActiveCapacityDemand(db: PlacementExecutor, computerId: string, now: Date): Promise<boolean> {
+    return rowsOf(await db.execute(sql`/* pool:demand-active */ SELECT 1 AS active FROM public.ezil_compute_capacity_demands
+        WHERE computer_id = ${computerId}::uuid AND closed_at IS NULL AND expires_at > ${now.toISOString()}::timestamptz LIMIT 1`)).length === 1;
+}
+
+/** Read-only twin of placement.ts `lockReclaimablePoolHosts` (same predicate, no lock): idle pool vCPU a capacity demand could reclaim. */
+export async function readReclaimablePoolVcpu(db: PlacementExecutor, region: string): Promise<number> {
+    const vcpu = sql.join(Object.entries(INSTANCE_VCPU).map(([type, n]) => sql`WHEN ${type} THEN ${n}::int`), sql` `);
+    const row = rowsOf(await db.execute(sql`/* pool:reclaimable */ SELECT COALESCE(sum(CASE h.instance_type ${vcpu} ELSE 8 END), 0) AS vcpu
+        FROM public.ezil_compute_pool_hosts h
+        WHERE h.region = ${region} AND h.state IN ('ready', 'booting')
+            AND h.leased_computer_id IS NULL AND h.leased_at IS NULL AND h.leased_generation IS NULL AND h.lease_token IS NULL
+            AND h.claim_generation IS NULL AND h.claim_lease_epoch IS NULL AND h.claim_fence IS NULL AND h.claim_volume_serial IS NULL
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.provider = 'aws-ec2'
+                AND p.state NOT IN ('RETIRED', 'PURGE_ELIGIBLE') AND h.instance_id IS NOT NULL AND p.instance_id = h.instance_id)
+            AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_capacity_demands d, jsonb_array_elements(d.cleanup) t
+                WHERE d.closed_at IS NULL AND t->>'poolHostId' = h.id::text)`))[0];
+    return count(row?.vcpu ?? 0);
 }

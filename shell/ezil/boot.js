@@ -88,6 +88,8 @@ import { parseBillingDeepLink } from './ui/Settings/upgrade-sheet.js';
 import { warm } from './warm.js';
 import { parseAppLink } from './app-link.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
+import { feedback_enabled, mount_feedback_chip } from './ui/feedback/feedback.js';
+import { applyPersistedAppearance } from './ui/Settings/tabs/appearance.js';
 let nativePersistence = null;
 let billingDeepLinkHandled = false;
 let appLinkListenerBound = false;
@@ -830,6 +832,10 @@ async function build (payload) {
 
     set_device_class();
     shell.desktop = mount_desktop_root();
+    // Round 3 (plan §6.7): wallpaper + accent after hydration, on the first
+    // mount AND on every `ensure_intact` rebuild (a rebuilt `.desktop` used to
+    // come back without the saved wallpaper).
+    applyPersistedAppearance();
     const nativeDesktop = ctx.desktopState?.provider === 'native-macos' ? await prepareNativePersistence(ctx) : null;
     watch_for_removal();
     const apps = registry.resolve(payload);
@@ -853,6 +859,7 @@ async function build (payload) {
     // unconditionally, so it has to go or the dock is drawn twice.
     $('.taskbar').remove();
     await UITaskbar({});
+    if ( feedback_enabled() ) mount_feedback_chip();
 
     // Pinned items, created up front rather than left to `UIWindow` — an app
     // pinned here survives its window being closed (UIWindow's own item is

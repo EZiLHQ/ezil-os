@@ -330,8 +330,11 @@ async function stripeField(page, name, role = 'textbox', timeout = 20_000) {
 
 async function checkout(page, upgrade, email, evidence) {
   const pane = appWindow(page, 'settings').locator('[data-pane="billing"]');
+  // Round 3: Free opens the plan picker with [Upgrade] (data-action="choose"); older builds used a 'Change plan' button.
+  const choose = pane.locator('[data-action="choose"]').first();
   const change = pane.getByRole('button', { name: 'Change plan', exact: true });
-  if (await change.isVisible()) await change.click();
+  if (await choose.isVisible().catch(() => false)) await choose.click();
+  else if (await change.isVisible()) await change.click();
   await page.locator(`[data-action="checkout"][data-sku="${upgrade}_monthly_v3"]`).click();
   await page.locator('#ezil-embedded-checkout iframe').first().waitFor({ state: 'visible', timeout: 60_000 });
   // With several payment methods enabled Stripe shows them as a radio list (Card / Cash App Pay / Bank);

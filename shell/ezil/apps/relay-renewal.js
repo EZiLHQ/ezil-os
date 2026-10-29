@@ -1,5 +1,10 @@
-/** One serialized renewal loop per viewer; short-lived credentials stay server-side. */
-export function createRelayRenewal({ state, refresh, onState, now = Date.now,
+/**
+ * One serialized renewal loop per viewer; short-lived credentials stay server-side.
+ * A `relay_runtime_changed` refusal is not a failure to count: the desktop was
+ * restarted under this viewer (Restart desktop, a switch, a computer restart), so
+ * the loop stops and hands over to `onRuntimeChanged`, which re-opens the desktop.
+ */
+export function createRelayRenewal({ state, refresh, onState, onRuntimeChanged, now = Date.now,
     schedule = setTimeout, cancel = clearTimeout }) {
     let current = state, timer, frame_timer, confirm_frame, flight, stopped = false, failures = 0;
     const arm = () => {
@@ -14,6 +19,9 @@ export function createRelayRenewal({ state, refresh, onState, now = Date.now,
         const runtime = current.runtimeId;
         flight = Promise.resolve().then(() => refresh(runtime)).then(async result => {
             if (stopped) return;
+            if (result?.ok !== true && result?.error === 'relay_runtime_changed' && typeof onRuntimeChanged === 'function') {
+                stopped = true; cancel(timer); onState('runtime_changed'); onRuntimeChanged(); return;
+            }
             if (!result?.ok || result.runtimeId !== runtime || !Number.isSafeInteger(result.expiresAt)
                 || result.expiresAt <= now() + 60000) throw new Error('relay_refresh_failed');
             current = { runtimeId: runtime, expiresAt: result.expiresAt };

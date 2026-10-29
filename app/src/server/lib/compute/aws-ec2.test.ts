@@ -417,6 +417,20 @@ describe('ensure: resize to the current paid plan', () => {
             dataVolumeId: 'vol-11111111111111111', targetGeneration: 4, leaseEpoch: 8 });
     });
 
+    it('round 3 switch: the wake after a confirmed stop is a replace that fences the old host (generation + 1, new fence)', async () => {
+        const s = setup({ placements: [stopped({ instance_type: 'm6i.large', generation: 3, lease_epoch: 7 })] },
+            { entitlement: paid('cmp-4'), e: resizeEnv() });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting', computeLaunching: true });
+        const intent = s.calls[0]!.intent;
+        expect(intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.xlarge', targetGeneration: 4, previousGeneration: 3,
+            previousFenceToken: FENCE, dataVolumeId: 'vol-11111111111111111', dataVolumeGiB: null });
+        expect(intent.fenceToken).not.toBe(FENCE);
+        expect(s.placements[0]).toMatchObject({ generation: 4, lease_epoch: 8, instance_type: 'm6i.xlarge', fence_token: intent.fenceToken, instance_id: null });
+        // A second tab racing the same wake: one host, and that caller keeps waiting (never cas_conflict to the user).
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(s.calls).toHaveLength(1);
+    });
+
     it('global capacity checks the new vCPU, even with room in the home region', async () => {
         const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('cmp-4'), e: resizeEnv({ AWS_MAX_RUNNING: '1' }) });
         expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable', error: 'max_running' });
@@ -430,7 +444,7 @@ describe('ensure: resize to the current paid plan', () => {
             entitlement: paid('cmp-4'), meter: billing, e: resizeEnv(),
             randomBytes: () => { s.placements[0]![counter] = 9; return Buffer.from(NONCE_BYTES); },
         });
-        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'cas_conflict' });
+        expect(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', error: 'cas_conflict', retryable: true });
         expect(s.placements[0]).toMatchObject({ instance_type: 'm6i.large', state: 'STOPPED', [counter]: 9, fence_token: FENCE });
         expect(s.calls).toEqual([]);
         expect(billing.stopped).not.toHaveBeenCalled();
@@ -449,6 +463,21 @@ describe('ensure: resize to the current paid plan', () => {
         const s = setup({ placements: [stopped({ instance_type: 'm6i.large' })] }, { entitlement: paid('std-2'), meter: billing, e: resizeEnv() });
         await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
         expect(s.calls[0]!.intent).toMatchObject({ operation: 'start', instanceType: 'm6i.large', targetGeneration: 1 });
+        expect(billing.stopped).not.toHaveBeenCalled();
+    });
+
+    it('round 4 D16: a Free entitlement never resizes (hold): start in place on its own type, replace onto m6i.large when lost', async () => {
+        const free: EntitlementRecord = { source: 'billing_v2', status: 'active', planId: 'free_v3', size: 'free-cf', provider: 'cloudflare', paymentIssue: false };
+        const billing = meter();
+        const big = setup({ placements: [stopped({ instance_type: 'm6i.xlarge' })] }, { entitlement: free, meter: billing, e: resizeEnv() });
+        await big.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(big.calls[0]!.intent).toMatchObject({ operation: 'start', instanceType: 'm6i.xlarge', targetGeneration: 1 });
+        expect(big.placements[0]).toMatchObject({ instance_type: 'm6i.xlarge' });
+        const lost = setup({ placements: [stopped({ instance_type: 'm6i.large', last_error: 'instance_lost', generation: 3, lease_epoch: 7 })] },
+            { entitlement: free, meter: billing, e: resizeEnv() });
+        await lost.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(lost.calls[0]!.intent).toMatchObject({ operation: 'replace', instanceType: 'm6i.large', targetGeneration: 4,
+            dataVolumeId: 'vol-11111111111111111', dataVolumeGiB: null });
         expect(billing.stopped).not.toHaveBeenCalled();
     });
 

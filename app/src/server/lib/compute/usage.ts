@@ -124,3 +124,19 @@ export function totalsOf(perUser: Iterable<UsageTotals>): UsageTotals {
 export function usageFor(usage: MonthUsage, userId: string): { user: UsageTotals; global: UsageTotals } {
     return { user: usage.byUser.get(userId.toLowerCase()) ?? ZERO, global: usage.global };
 }
+
+/**
+ * Round 3 D11: the AWS usage-ledger backstop (`EZIL_AWS_USER_MONTHLY_HOURS`, weighted
+ * 2-vCPU hours per UTC month) as its own refusal, distinct from the plan's fair use.
+ * Same comparison as `decideAdmission`'s `user_hours_cap`; it reads, it never writes.
+ */
+export const AWS_MONTHLY_CAP_REASON = 'aws_monthly_cap' as const;
+
+export function awsMonthlyCapReached(usage: MonthUsage, userId: string, userMonthlyHours: number): boolean {
+    return Number.isFinite(userMonthlyHours) && usageFor(usage, userId).user.weightedSeconds >= userMonthlyHours * 3_600;
+}
+
+/** Billing's name for a compute admission refusal; null when it is not the AWS ledger cap. */
+export function awsMonthlyCapRefusal(reason: string | null | undefined): typeof AWS_MONTHLY_CAP_REASON | null {
+    return reason === 'user_hours_cap' ? AWS_MONTHLY_CAP_REASON : null;
+}

@@ -1,7 +1,7 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
 // the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy } from './billing-format.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets } from './billing-format.js';
 
 let stripePromise = null;
 
@@ -162,10 +162,29 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     let lines;
     if ( pack ) lines = [allowance];
     else if ( v3 ) {
-        lines = offer.bullets;
-        const included = doc.createElement('p');
-        included.textContent = `${allowance}. Your plan takes effect after payment. Your AWS computer is prepared then.`;
-        dialog.querySelector('.ezil-upgrade-allowances').before(included);
+        // Round 3 (plan §6.4, M8): the bullets in plan order, then "What happens next" beside the payment form.
+        lines = planBullets(offer).bullets;
+        const next = doc.createElement('section');
+        next.className = 'ezil-billing-next';
+        next.setAttribute('aria-label', 'What happens next');
+        const heading = doc.createElement('h3');
+        heading.textContent = 'What happens next';
+        const list = doc.createElement('dl');
+        const credits = Number.isSafeInteger(offer.aiCredits?.amount) && offer.aiCredits.amount > 0 ? offer.aiCredits.amount.toLocaleString('en-US') : null;
+        for ( const [term, detail] of [
+            ['Today', credits ? `${offer.name} starts after payment and ${credits} AI credits are added.` : `${offer.name} starts after payment.`],
+            ['Your computer', (offer.machineChoice ?? []).length > 1 ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.'],
+            ['Renews', 'Every month until you cancel in Settings → Billing.'],
+        ] ) {
+            const row = doc.createElement('div');
+            const dt = doc.createElement('dt'), dd = doc.createElement('dd');
+            dt.textContent = term;
+            dd.textContent = detail;
+            row.append(dt, dd);
+            list.append(row);
+        }
+        next.append(heading, list);
+        dialog.querySelector('.ezil-upgrade-allowances').after(next);
     } else {
         const offeredSizes = offer.sizes.map(code => sizes.find(size => size.code === code));
         const cpus = offeredSizes.map(size => size.vcpu);

@@ -15,10 +15,12 @@
  * row is reported as `unassigned`, not as Cloudflare: until its next start
  * decides, nothing has recorded where it runs.
  */
-import { SIZES } from '@/server/billing/v2/contract';
+import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
+import { CATALOG_V3, type ComputeStandingV3 } from '@/server/billing/v3/contract';
 import { deriveGuacamoleSandboxId, getGuacamoleSandboxSystem, resolveCloudflareGuacamoleConfig } from '../cloudflare-guacamole-provider';
-import { isAwsComputersEnabled, isPlacementReadEnabled, type Env } from './aws-config';
-import { PlacementOwnerError, readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { isAwsComputersEnabled, isPlacementReadEnabled, meteredSizeForInstanceType, type Env } from './aws-config';
+import { PlacementOwnerError, readPlacement, type Placement, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { readComputerMeta, resolveTransition, transitionView, type TransitionView } from './progress';
 
 /**
  * Configured size of every AWS instance type a computer may record (aws-config.ts
@@ -67,31 +69,94 @@ export interface SystemInfo {
     lifecycleState: string | null;
     /** No live resource metrics exist yet. */
     usage: null;
-    plan?: { vcpu: number; memoryGB: number; region: 'ap-south-1'; status: 'preparing' | 'failed' | 'blocked' | 'ready'; reason: string | null; outcome: 'fresh_provision' | null };
+    plan?: {
+        /**
+         * Round 4 (additive; docs/billing/STANDING-CONTRACT.md §System): `Free` with `provider` 'cloudflare'
+         * (2 vCPU / 6 GB on Cloudflare) or 'aws' (`standing` files_on_aws: the recorded AWS computer, held at
+         * std-2 under Free limits). Paid plans carry their name and provider 'aws'. A client must branch on
+         * `provider` before saying "on AWS (India)".
+         */
+        name?: 'Free' | 'Standard' | 'Premium'; provider?: 'aws' | 'cloudflare'; standing?: ComputeStandingV3;
+        vcpu: number; memoryGB: number; region: 'ap-south-1' | null;
+        /**
+         * Round 3: `being_prepared` ONLY while a configuration switch/restart is in flight; `ready` once
+         * the computer is on AWS (`current` = what it runs, `selected` = the next start's choice, which
+         * may differ without anything being prepared); `failed` for a failed switch or migration
+         * (`reason`); `preparing` while the computer has not reached AWS yet; `blocked` when paused.
+         */
+        status: 'preparing' | 'being_prepared' | 'failed' | 'blocked' | 'ready'; reason: string | null; outcome: 'fresh_provision' | null;
+        current?: SizeCode | null; selected?: SizeCode | null; transition?: TransitionView | null;
+    };
 }
 
 export function describePlanPlacement(info: SystemInfo, entitlement: import('./tier').EntitlementRecord | null,
-    migration: { state: string; reason: string | null; outcome: string | null } | null, env: Env): SystemInfo['plan'] | undefined {
+    migration: { state: string; reason: string | null; outcome: string | null } | null, env: Env,
+    transition: TransitionView | null = null): SystemInfo['plan'] | undefined {
     if (entitlement?.source !== 'billing_v2' || entitlement.status !== 'active' || entitlement.paymentIssue
         || entitlement.provider !== 'aws' || !['standard_monthly_v3', 'premium_monthly_v3'].includes(entitlement.planId ?? '')) return;
-    const size = entitlement.planId === 'standard_monthly_v3' ? SIZES['std-2'] : entitlement.size && SIZES[entitlement.size];
+    const selected: SizeCode | null = entitlement.planId === 'standard_monthly_v3' ? 'std-2' : entitlement.size ?? null;
+    const size = selected && SIZES[selected];
     if (!size || size.provider !== 'aws') return;
     const blocked = !isAwsComputersEnabled(env) || (env.EZIL_AWS_KILL_SWITCH !== undefined && env.EZIL_AWS_KILL_SWITCH !== '0');
-    const ready = info.provider === 'aws-ec2' && info.machine.region === 'ap-south-1'
-        && info.machine.vcpu === size.vcpu && info.machine.memoryMiB === size.memoryGiB * 1024
+    const current = info.provider === 'aws-ec2' ? meteredSizeForInstanceType(info.machine.instanceType) : null;
+    // On AWS at a settled state: ready, whatever the next start's selection says. A size mismatch
+    // alone is a choice for the next start, never "being prepared".
+    const onAws = info.provider === 'aws-ec2' && info.machine.region === 'ap-south-1' && current !== null
         && ['RUNNING', 'STOPPED'].includes(info.lifecycleState ?? '');
+    const switching = !!transition && ['requested', 'stopping', 'waking'].includes(transition.phase);
+    const switchFailed = transition?.phase === 'failed' ? transition : null;
     const failed = migration?.state.startsWith('failed_');
-    return { vcpu: size.vcpu, memoryGB: size.memoryGiB, region: 'ap-south-1',
-        status: blocked ? 'blocked' : ready ? 'ready' : failed ? 'failed' : 'preparing',
-        reason: blocked ? 'AWS paused by operations' : failed ? 'AWS preparation failed; your existing workspace is retained' : null,
-        outcome: migration?.outcome === 'fresh_provision' ? 'fresh_provision' : null };
+    const status = blocked ? 'blocked' : switching ? 'being_prepared' : switchFailed ? 'failed' : onAws ? 'ready' : failed ? 'failed' : 'preparing';
+    return { name: entitlement.planId === 'premium_monthly_v3' ? 'Premium' : 'Standard', provider: 'aws',
+        vcpu: size.vcpu, memoryGB: size.memoryGiB, region: 'ap-south-1', status,
+        reason: blocked ? 'AWS paused by operations' : status === 'failed' ? switchFailed ? switchFailed.reason ?? 'switch_failed'
+            : 'AWS preparation failed; your existing workspace is retained' : null,
+        outcome: migration?.outcome === 'fresh_provision' ? 'fresh_provision' : null,
+        current, selected, transition };
 }
 
-async function withPlanInfo(info: SystemInfo, db: PlacementExecutor, computer: { computerId: string; userId: string }, env: Env): Promise<SystemInfo> {
+/**
+ * Round 4 (D16): a Free plan is reported, never "not available". On Cloudflare (or with no placement yet) it is
+ * Free's own configuration; with an aws-ec2 placement it is that computer's configuration (files_on_aws).
+ * Nothing here says the files moved.
+ */
+export function describeFreePlan(info: SystemInfo, entitlement: import('./tier').EntitlementRecord | null): SystemInfo['plan'] | undefined {
+    if (entitlement?.source !== 'billing_v2' || entitlement.planId !== 'free_v3' || entitlement.provider === 'aws') return;
+    const free = CATALOG_V3.free_v3;
+    // Free's own configuration. With the placement unread (`unknown`) the standing is not claimed.
+    if (info.provider !== 'aws-ec2') return { name: 'Free', provider: 'cloudflare', ...(info.provider === 'unknown' ? {} : { standing: 'free' as const }),
+        vcpu: free.vcpu, memoryGB: free.memoryGiB, region: null, status: 'ready', reason: null, outcome: null, current: free.size, selected: null, transition: null };
+    const current = meteredSizeForInstanceType(info.machine.instanceType);
+    // An unrecorded type falls back to the only configuration the hold opens (std-2); `current` stays null.
+    const size = SIZES[current ?? 'std-2'];
+    return { name: 'Free', provider: 'aws', standing: 'files_on_aws',
+        vcpu: info.machine.vcpu ?? size.vcpu, memoryGB: info.machine.memoryMiB !== null ? info.machine.memoryMiB / 1024 : size.memoryGiB,
+        region: info.machine.region === 'ap-south-1' ? 'ap-south-1' : null, status: 'ready', reason: null, outcome: null,
+        current, selected: null, transition: null };
+}
+
+/** The computer's switch/restart transition with its resolved phase, while it is current: a failed one stays shown until a later opening. */
+async function currentTransition(db: PlacementExecutor, computer: { computerId: string; userId: string }, p: Placement | null): Promise<TransitionView | null> {
+    try {
+        const meta = await readComputerMeta(db, computer);
+        if (!meta?.transition) return null;
+        const resolved = resolveTransition(meta.transition, p, new Date());
+        if (resolved.phase === 'done' || (resolved.phase === 'failed' && p && p.leaseEpoch > meta.transition.fromLeaseEpoch + 1)) return null;
+        return transitionView(meta.transition, resolved);
+    } catch { return null; }
+}
+
+async function withPlanInfo(info: SystemInfo, db: PlacementExecutor, computer: { computerId: string; userId: string }, env: Env,
+    placement: Placement | null = null): Promise<SystemInfo> {
     try {
         const { billingV2EntitlementReader } = await import('@/server/billing/v2/compute-access');
         const entitlement = await billingV2EntitlementReader().read(computer.userId);
-        if (!entitlement || entitlement.provider !== 'aws') return info;
+        if (!entitlement) return info;
+        if (entitlement.provider !== 'aws') {
+            const free = describeFreePlan(info, entitlement);
+            if (free) info.plan = free;
+            return info;
+        }
         let migration = null;
         if (isPlacementReadEnabled(env)) {
             const { migrationStatusFor } = await import('./provider-migrate-orchestrator');
@@ -100,7 +165,8 @@ async function withPlanInfo(info: SystemInfo, db: PlacementExecutor, computer: {
                 if (status && typeof status === 'object') migration = status;
             } catch { migration = { state: 'failed_needs_operator', reason: 'status_unavailable', outcome: null }; }
         }
-        const plan = describePlanPlacement(info, entitlement, migration, env);
+        const transition = isPlacementReadEnabled(env) ? await currentTransition(db, computer, placement) : null;
+        const plan = describePlanPlacement(info, entitlement, migration, env, transition);
         if (plan) info.plan = plan;
     } catch { /* Optional billing metadata cannot hide actual placement. */ }
     return info;
@@ -194,5 +260,5 @@ export async function readSystemInfo(
             // An unavailable image must never hide the recorded provider or configured size.
         }
     }
-    return withPlanInfo(info, db, computer, env);
+    return withPlanInfo(info, db, computer, env, placement.record);
 }

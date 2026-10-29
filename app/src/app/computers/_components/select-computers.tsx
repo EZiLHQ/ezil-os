@@ -4,52 +4,33 @@ import { useState } from 'react';
 import { toast } from 'sonner';
 
 import { api } from '@/trpc/react';
-import { MAX_COMPUTERS_PER_USER } from '@/utils/constants';
 import { ComputerRow } from './computer-row';
 import { DeleteComputerDialog } from './delete-computer-dialog';
 
 /**
- * `/computers` — always renders exactly `MAX_COMPUTERS_PER_USER` rows,
- * lowest slot first. A slot with a live computer renders it; a free slot
- * renders the SAME shape with a "New computer" affordance instead — there
- * is no separate "at cap" visual state to manage, because with only 2
- * slots ever on screen the cap is structural, not a counter.
+ * `/computers` — the fallback page for your computer (round 3, plan §6.1,
+ * decision D6): ONE computer per person, so there are no slots and nothing
+ * here creates a computer. "Your computer" is the one `/os` opens — the same
+ * order `getOrCreateDefaultComputer` uses (most recently opened, then lowest
+ * slot). Any other live row predates the one-computer model and is listed
+ * read-only under "Older computer", with Delete only.
  *
- * The limit is surfaced on the action, not proactively: nothing on this
- * page warns "you're at your limit" ahead of time — with both slots filled
- * there's simply no empty row left to click. The one edge case that IS
- * surfaced is a genuine race (two tabs both try to fill the last slot at
- * once) — the loser's `create` call gets the server's typed
- * `computer_limit_reached` error, shown as a toast on that click.
- *
- * Deleting is the ONLY way a slot is ever freed — without it a user with
- * both slots filled is permanently stuck with the two computers they first
- * made. It sits behind the row's overflow menu rather than on the row's
+ * Deleting sits behind the row's overflow menu rather than on the row's
  * main surface (which opens the computer), and behind a confirmation that
  * states plainly what deleting does and does not do — see
  * `../_lib/delete-copy.ts`, where every clause is tied to the code it
- * describes.
+ * describes. This page is the escape hatch when the OS shell cannot boot.
  */
+export function orderComputers<T extends { slot: number; lastOpenedAt: string | Date | null }>(rows: readonly T[]): T[] {
+    const opened = (row: T) => (row.lastOpenedAt ? new Date(row.lastOpenedAt).getTime() : Number.NEGATIVE_INFINITY);
+    return [...rows].sort((a, b) => opened(b) - opened(a) || a.slot - b.slot);
+}
+
 export function SelectComputers() {
     const utils = api.useUtils();
     const { data: computers, isLoading, error, refetch } = api.computer.list.useQuery();
-    const { mutateAsync: createComputer, isPending: isCreating } = api.computer.create.useMutation();
     const { mutateAsync: deleteComputer, isPending: isDeleting } = api.computer.delete.useMutation();
     const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
-
-    const handleCreate = async () => {
-        try {
-            await createComputer({});
-            await utils.computer.list.invalidate();
-        } catch (err) {
-            const code = (err as { data?: { code?: string } } | undefined)?.data?.code;
-            if (code === 'FORBIDDEN') {
-                toast.error("You've reached your computer limit.");
-                return;
-            }
-            toast.error('Failed to create computer. Please try again.');
-        }
-    };
 
     const handleDelete = async (id: string) => {
         try {
@@ -59,8 +40,8 @@ export function SelectComputers() {
         } catch (err) {
             const code = (err as { data?: { code?: string } } | undefined)?.data?.code;
             if (code === 'NOT_FOUND') {
-                // Already gone (another tab, or a stale list). The slot is
-                // free either way, so this is a refresh, not an error.
+                // Already gone (another tab, or a stale list): a refresh,
+                // not an error.
                 setConfirmingDeleteId(null);
                 await utils.computer.list.invalidate();
                 return;
@@ -102,25 +83,44 @@ export function SelectComputers() {
         );
     }
 
-    const bySlot = new Map((computers ?? []).map((c) => [c.slot, c]));
+    const [yours, ...older] = orderComputers(computers ?? []);
     const confirming = (computers ?? []).find((c) => c.id === confirmingDeleteId);
+    const row = (computer: NonNullable<typeof yours>, readOnly: boolean) => (
+        <ComputerRow
+            key={computer.id}
+            computer={computer}
+            readOnly={readOnly}
+            onDelete={() => setConfirmingDeleteId(computer.id)}
+            isDeleting={isDeleting && confirmingDeleteId === computer.id}
+        />
+    );
 
     return (
         <div className="mx-auto w-full max-w-2xl px-6 py-8">
-            <h1 className="mb-6 text-3xl font-semibold tracking-tight text-offwhite">Your computers</h1>
+            <h1 className="mb-6 text-3xl font-semibold tracking-tight text-offwhite">Your computer</h1>
             <div className="flex flex-col gap-3">
-                {Array.from({ length: MAX_COMPUTERS_PER_USER }, (_, i) => i + 1).map((slot) => (
-                    <ComputerRow
-                        key={slot}
-                        slot={slot}
-                        computer={bySlot.get(slot)}
-                        onCreate={handleCreate}
-                        isCreating={isCreating}
-                        onDelete={() => setConfirmingDeleteId(bySlot.get(slot)?.id ?? null)}
-                        isDeleting={isDeleting && confirmingDeleteId === bySlot.get(slot)?.id}
-                    />
-                ))}
+                {yours ? (
+                    row(yours, false)
+                ) : (
+                    <a
+                        href="/os"
+                        data-testid="computer-open-os"
+                        className="flex h-20 w-full items-center justify-between gap-4 rounded-lg border border-white/10 px-5 text-sm text-gray-300 hover:border-teal"
+                    >
+                        <span>Your computer is set up the first time you open EZiL OS.</span>
+                        <span className="shrink-0 font-medium text-offwhite">Open EZiL OS</span>
+                    </a>
+                )}
             </div>
+            {older.length ? (
+                <section className="mt-8" aria-labelledby="older-computers-heading">
+                    <h2 id="older-computers-heading" className="mb-1 text-sm font-medium text-gray-300">Older computer</h2>
+                    <p className="mb-3 text-xs text-gray-500">
+                        Kept from before you had one computer. Delete it when you no longer need it.
+                    </p>
+                    <div className="flex flex-col gap-3">{older.map((computer) => row(computer, true))}</div>
+                </section>
+            ) : null}
 
             {confirming ? (
                 <DeleteComputerDialog

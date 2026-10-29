@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
-import { aiCreditBackoffMs, drainAiCreditOutbox, type AiCreditOutboxRow, type AiCreditOutboxStore } from './ai-credit-outbox';
-import { lookupAiAccount, missingAiAccountView, previewAiCreditRecovery } from './ai-credit-outbox-store';
+import { aiCreditBackoffMs, drainAiCreditOutbox, planAiCreditRequeue, type AiCreditOutboxRow, type AiCreditOutboxStore } from './ai-credit-outbox';
+import { lookupAiAccount, missingAiAccountView, previewAiCreditRecovery, requeueFailedAiCredits } from './ai-credit-outbox-store';
 
 const NOW = Date.parse('2026-10-21T00:00:00Z');
 function row(overrides: Partial<AiCreditOutboxRow> = {}): AiCreditOutboxRow {
@@ -153,6 +153,65 @@ describe('AI credit outbox delivery', () => {
         const f = fixture(); f.store.accountFor.mockRejectedValue(new Error('postgres://secret JWT'));
         await f.run(); expect(f.store.finish.mock.calls[0]![1].reason).toBe('delivery_unavailable');
         expect(JSON.stringify([f.log.mock.calls, f.store.finish.mock.calls])).not.toMatch(/postgres:|JWT|outbox-test-secret/);
+    });
+});
+
+describe('round 3 D6/D5: outbox log lines and operator requeue', () => {
+    it('logs one JSON line per finished row, including a grant that expired waiting for an account', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const expired = row({ id: 'r2', attempts: 7 }); expired.payload.expiresAt = new Date(NOW).toISOString();
+        const f = fixture([row(), expired]); f.store.accountFor.mockResolvedValueOnce(null);
+        await f.run();
+        expect(info.mock.calls.map(call => JSON.parse(String(call[0])))).toEqual([
+            { event: 'ai-outbox', eventKey: row().eventKey, status: 'retry', attempts: 1, reason: 'no_ai_account' },
+            { event: 'ai-outbox', eventKey: row().eventKey, status: 'failed', attempts: 7, reason: 'expired' }]);
+        expect(JSON.stringify(info.mock.calls)).not.toMatch(/outbox-test-secret|works-public-id/);
+        info.mockRestore();
+    });
+    const candidate = (over: Partial<Parameters<typeof planAiCreditRequeue>[0]> = {}) =>
+        ({ ...row(), attempts: 10, lastError: 'attempts_exhausted', revoked: false, ...over });
+    it.each([
+        ['attempts_exhausted', {}, 'eligible'],
+        ['no account', { lastError: 'no_ai_account' }, 'eligible'],
+        ['gateway 503', { lastError: 'http_503' }, 'eligible'],
+        ['permanent 409', { lastError: 'event_conflict' }, 'not_retryable'],
+        ['permanent 400', { lastError: 'http_400' }, 'not_retryable'],
+        ['revoked root', { revoked: true }, 'revoked'],
+        ['restore', { kind: 'ai_restore' }, 'invalid_payload'],
+    ] as const)('decides %s', (_name, over, decision) => expect(planAiCreditRequeue(candidate(over), NOW)).toBe(decision));
+    it('never replays a grant past its immutable expiry, or one marked for review', () => {
+        const expired = candidate({ lastError: 'expired' }); expired.payload = { ...expired.payload, expiresAt: new Date(NOW).toISOString() };
+        expect(planAiCreditRequeue(expired, NOW)).toBe('still_expired');
+        const review = candidate(); review.payload = { ...review.payload, delivery: { status: 'failed', reviewRequired: true } };
+        expect(planAiCreditRequeue(review, NOW)).toBe('not_retryable');
+    });
+    it('is a dry run unless applied, and resets only eligible rows under the delivery fence', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const failed = { ...candidate(), payload: { ...row().payload, delivery: { status: 'failed', nextAttemptAt: null } } };
+        const execute = vi.fn().mockResolvedValueOnce([failed, { ...failed, id: 'r2', lastError: 'event_conflict' }]);
+        const dry = await requeueFailedAiCredits({ execute } as never, { eventKeys: [failed.eventKey], apply: false, now: NOW });
+        expect(dry).toMatchObject({ dryRun: true, selected: 2, eligible: 1, requeued: 0,
+            decisions: [{ eventKey: failed.eventKey, decision: 'eligible' }, { eventKey: failed.eventKey, lastError: 'event_conflict', decision: 'not_retryable' }] });
+        expect(execute).toHaveBeenCalledTimes(1);
+        execute.mockResolvedValueOnce([failed]).mockResolvedValueOnce([{ id: 'row' }]);
+        expect(await requeueFailedAiCredits({ execute } as never, { userId: '11111111-1111-4111-8111-111111111111', apply: true, now: NOW }))
+            .toMatchObject({ dryRun: false, requeued: 1, decisions: [{ decision: 'requeued' }] });
+        const update = new PgDialect().sqlToQuery(execute.mock.calls[2]![0]);
+        expect(update.sql).toMatch(/set attempts = 0, last_error = null/);
+        expect(update.sql).toMatch(/attempts = \$\d+ and delivered_at is null\s+and payload->'delivery' = /);
+        expect(update.params).toEqual(expect.arrayContaining([JSON.stringify({ status: 'retry', nextAttemptAt: NOW, requeuedAt: NOW,
+            requeuedFrom: 'attempts_exhausted' }), 'row', 10, JSON.stringify(failed.payload.delivery)]));
+        execute.mockResolvedValueOnce([failed]).mockResolvedValueOnce([]);
+        expect((await requeueFailedAiCredits({ execute } as never, { eventKeys: ['x'], apply: true, now: NOW })).decisions[0]!.decision).toBe('lost_race');
+        expect(info.mock.calls.map(call => JSON.parse(String(call[0])).decision)).toEqual(['eligible', 'not_retryable', 'requeued', 'lost_race']);
+        info.mockRestore();
+    });
+    it('refuses an empty, unbounded or malformed selection before any query', async () => {
+        const execute = vi.fn();
+        for (const input of [{}, { eventKeys: [] }, { eventKeys: Array.from({ length: 201 }, (_, i) => `k${i}`) }, { userId: 'not-a-uuid' }, { eventKeys: [''] }]) {
+            await expect(requeueFailedAiCredits({ execute } as never, { ...input, apply: false, now: NOW })).rejects.toThrow(TypeError);
+        }
+        expect(execute).not.toHaveBeenCalled();
     });
 });
 

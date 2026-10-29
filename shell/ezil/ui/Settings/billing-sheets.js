@@ -1,7 +1,7 @@
 // Versioned billing mutations share one modal lifetime with embedded checkout.
 import { openUpgradeSheet } from './upgrade-sheet.js';
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, dateLabel, dateTimeLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl } from './billing-format.js';
+import { dollars, dateLabel, dateTimeLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, planBullets, upgradeAiCreditsFromGrant } from './billing-format.js';
 
 const COMPUTE = 'compute_monthly_v2';
 const STANDARD = 'standard_monthly_v2';
@@ -104,6 +104,8 @@ export function openComputeUpgradeSheet (options) {
         void request('billing.previewUpgrade', { toSku: target }, data => {
             body.replaceChildren();
             if ( v3 ) offerDetails(sheet, offer);
+            const fromOffer = v3 ? options.summary.catalog.offers.find(o => o.sku === 'standard_monthly_v3') : null;
+            const credits = v3 ? upgradeAiCreditsFromGrant(data.grantStdSeconds, fromOffer, offer) : 0;
             const table = node('table', null);
             table.className = 'ezil-billing-sheet-lines';
             table.setAttribute('aria-label', 'Upgrade price breakdown');
@@ -116,18 +118,20 @@ export function openComputeUpgradeSheet (options) {
             node('p', `Due now ${money(data.amountDueCents)}`).className = 'ezil-billing-sheet-total';
             node('p', 'USD. Any applicable tax appears on the invoice.').className = 'ezil-upgrade-caption';
             if ( ! v3 ) node('p', `Adds ${stdHoursLabel(data.grantStdSeconds, { round: 'down' })} standard-hours for the rest of this period (until ${dateLabel(data.periodEnd)}). Your usage so far carries over.`);
-            node('p', v3 ? 'Your upgrade takes effect after payment. Your AWS computer is prepared then.' : 'Your plan changes once payment is confirmed.');
+            if ( v3 ) whatHappensNext(sheet, credits, data.periodEnd);
+            else node('p', 'Your plan changes once payment is confirmed.');
             const actions = node('div', null);
             actions.className = 'ezil-billing-sheet-actions';
             button(`Pay ${money(data.amountDueCents)} and upgrade`, 'confirm', () => {
                 void request('billing.confirmUpgrade', { toSku: target, prorationDate: data.prorationDate }, confirmation => {
-                    if ( confirmation.status === 'applied' ) result([`You're on ${name}`]);
+                    if ( confirmation.status === 'applied' && v3 ) upgraded(sheet, options, credits);
+                    else if ( confirmation.status === 'applied' ) result([`You're on ${name}`]);
                     else if ( confirmation.status === 'requires_action' ) result([
                         'Confirm the payment with your bank to finish.',
                         'Your plan changes once payment is confirmed.',
                     ], { invoice: confirmation.hostedInvoiceUrl, pending: true });
                     else if ( confirmation.status === 'payment_failed' ) result([
-                        "The payment didn't go through.",
+                        v3 ? "Your payment didn't go through. Try again or use a different payment method. Your plan is unchanged." : "The payment didn't go through.",
                         confirmation.expiresAt
                             ? `Your upgrade is held until ${dateTimeLabel(confirmation.expiresAt)}. Pay the invoice or update your payment method before then.`
                             : 'Pay the invoice or update your payment method to finish your upgrade.',
@@ -239,32 +243,83 @@ export function openOverageSheet (options) {
     return sheet.handle;
 }
 
-/** PublicOfferV3 only: price, included usage and catalog benefits. */
-function offerDetails (sheet, offer, parent = sheet.body) {
-    sheet.node('p', `${money(offer.priceCents)}/month`, parent).className = 'ezil-billing-sheet-total';
-    sheet.node('p', 'Usage included · Prices before tax.', parent);
-    const bullets = sheet.node('ul', null, parent);
-    for ( const bullet of offer.bullets ) sheet.node('li', bullet, bullets);
+/** PublicOfferV3 only: price and the round-3 bullets (configurations → storage → AI credits → computer time). */
+function offerDetails (sheet, offer, parent = sheet.body, { price = true } = {}) {
+    if ( price ) sheet.node('p', offer.priceCents ? `${money(offer.priceCents)}/month` : '$0', parent).className = 'ezil-billing-sheet-total';
+    const { lead, bullets } = planBullets(offer);
+    if ( lead ) sheet.node('p', lead, parent).className = 'ezil-billing-choice-lead';
+    const list = sheet.node('ul', null, parent);
+    for ( const bullet of bullets ) sheet.node('li', bullet, list);
+    sheet.node('p', 'Prices before tax.', parent).className = 'ezil-upgrade-caption';
 }
 
+/** Upgrade (plan §6.4, M8): what happens today, to the computer, and at renewal. */
+function whatHappensNext (sheet, credits, renewsAt) {
+    const box = sheet.node('section');
+    box.className = 'ezil-billing-next';
+    box.setAttribute('aria-label', 'What happens next');
+    sheet.node('h3', 'What happens next', box);
+    const steps = sheet.node('dl', null, box);
+    for ( const [term, detail] of [
+        ['Today', credits > 0 ? `Premium starts and ${credits.toLocaleString('en-US')} AI credits are added.` : 'Premium starts.'],
+        ['Your computer', 'Switch configuration whenever you like.'],
+        ['Renews', `${dateLabel(renewsAt, true)}, with the full monthly credits.`],
+    ] ) {
+        const row = sheet.node('div', null, steps);
+        sheet.node('dt', term, row);
+        sheet.node('dd', detail, row);
+    }
+}
+
+/** Success leads straight into the unlocked configuration (plan §6.4, M9). */
+function upgraded (sheet, options, credits) {
+    sheet.body.replaceChildren();
+    sheet.node('p', "You're on Premium").className = 'ezil-billing-sheet-total';
+    if ( credits > 0 ) sheet.node('p', `${credits.toLocaleString('en-US')} AI credits added.`);
+    const actions = sheet.node('div');
+    actions.className = 'ezil-billing-sheet-actions';
+    const finish = () => { try { options.onDone?.(); } finally { sheet.close(); } };
+    sheet.button('Switch to 4 vCPU · 16 GB', 'switch-config', () => {
+        try { options.onSwitch?.('cmp-4'); } finally { finish(); }
+    }, actions).focus();
+    sheet.button('Maybe later', 'maybe-later', finish, actions).className = 'ezil-billing-sheet-secondary';
+}
+
+/**
+ * "Choose your plan" (plan §6.4, M6/M7): Free / Standard / Premium, each with
+ * one value line, the price, then the button — "Current plan" (disabled) on
+ * the plan you have, "Upgrade" on the others.
+ */
 export function openPlanPickerSheet (options) {
     if ( options.summary.version !== 3 ) throw new Error('unavailable');
     const sheet = billingSheet(options, 'checkout', 'Choose your plan');
     if ( sheet.existing ) return sheet.existing;
     sheet.dialog.dataset.sheet = 'choose';
-    const offers = options.summary.catalog.offers.filter(offer => ['standard_monthly_v3', 'premium_monthly_v3'].includes(offer.sku));
+    const order = ['free_v3', 'standard_monthly_v3', 'premium_monthly_v3'];
+    const offers = options.summary.catalog.offers.filter(offer => order.includes(offer.sku))
+        .sort((a, b) => order.indexOf(a.sku) - order.indexOf(b.sku));
+    const grid = sheet.node('div');
+    grid.className = 'ezil-billing-choices';
     for ( const offer of offers ) {
-        const card = sheet.node('section');
-        card.className = `ezil-billing-choice${offer.highlighted ? ' is-highlighted' : ''}`;
+        const card = sheet.node('section', null, grid);
+        card.className = 'ezil-billing-choice';
+        card.dataset.plan = offer.sku;
         sheet.node('h3', offer.name, card);
-        if ( offer.badge ) sheet.node('p', offer.badge, card).className = 'ezil-settings-pill';
         sheet.node('p', offer.tagline, card);
-        offerDetails(sheet, offer, card);
-        sheet.button(`Choose ${offer.name}`, 'checkout', () => {
-            if ( ! options.summary.actions.checkout ) return;
-            sheet.close();
-            (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer });
-        }, card).dataset.sku = offer.sku;
+        sheet.node('p', offer.priceCents ? `${money(offer.priceCents)}/month` : '$0', card).className = 'ezil-billing-sheet-total';
+        if ( offer.sku === options.summary.plan.sku ) {
+            const current = sheet.node('button', 'Current plan', card);
+            current.type = 'button';
+            current.disabled = true;
+            current.dataset.role = 'current-plan';
+        } else if ( offer.sku !== 'free_v3' ) {
+            sheet.button('Upgrade', 'checkout', () => {
+                if ( ! options.summary.actions.checkout ) return;
+                sheet.close();
+                (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer });
+            }, card).dataset.sku = offer.sku;
+        }
+        offerDetails(sheet, offer, card, { price: false });
     }
     return sheet.handle;
 }

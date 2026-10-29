@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     context: vi.fn(), get: vi.fn(), defaultComputer: vi.fn(), provider: vi.fn(), payload: vi.fn(), redirect: vi.fn(),
 }));
+// The page reads `env` at import for the per-user shell feature flags (round-3 feedback port); keep the test env-free.
+vi.mock('@/env', () => ({ env: {} }));
 vi.mock('next/headers', () => ({ headers: async () => new Headers() }));
 vi.mock('next/navigation', () => ({ redirect: mocks.redirect }));
 vi.mock('@/server/api/trpc', () => ({ createTRPCContext: mocks.context }));
