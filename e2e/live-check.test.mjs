@@ -225,6 +225,9 @@ test('relay retry still rejects a mismatched runtime or an expiry that has elaps
   }
 });
 
+// Public values the programmatic sign-in needs (see sign-in.mjs).
+const supabase = { NEXT_PUBLIC_SUPABASE_URL: 'https://db.example.test', NEXT_PUBLIC_SUPABASE_ANON_KEY: 'public-anon-key' };
+
 test('CLI setup failure exits 1 and writes redacted JSON without loading a browser', () => {
   const out = mkdtempSync(join(tmpdir(), 'ezil-live-unit-'));
   try {
@@ -232,7 +235,7 @@ test('CLI setup failure exits 1 and writes redacted JSON without loading a brows
       encoding: 'utf8', timeout: 5000,
       env: { EZIL_E2E_APP: 'invalid-origin?token=private-token', EZIL_E2E_EMAIL: 'private@example.test',
         EZIL_E2E_PASSWORD: 'private-password', VERCEL_AUTOMATION_BYPASS_SECRET: 'private-bypass',
-        PLAYWRIGHT_REQUIRE_DIR: out, EZIL_LIVE_OUT: out },
+        PLAYWRIGHT_REQUIRE_DIR: out, EZIL_LIVE_OUT: out, ...supabase },
     });
     assert.equal(child.status, 1);
     assert.equal(child.stderr, '');
@@ -252,10 +255,10 @@ const otherId = '11111111-2222-3333-4444-555555555555';
 
 async function fakeLiveRun(t, { selectedId = isolatedId, coldId = isolatedId, failWarm = false,
   failStop = false, alreadyStopped = false, relayRace = false, env: overrides = {},
-  onWarm = () => {}, onScreenshot = () => {}, onStop = () => {} } = {}) {
+  onWarm = () => {}, onScreenshot = () => {}, onStop = () => {}, onSignIn = () => {} } = {}) {
   const out = mkdtempSync(join(tmpdir(), 'ezil-live-fake-'));
   t.after(() => rmSync(out, { recursive: true, force: true }));
-  const events = [], requests = [], emitted = [];
+  const events = [], requests = [], emitted = [], visited = [];
   let selected = selectedId, visits = 0, output, warmNonce, relayRenewals = 0;
   const codeLocator = {
     isVisible: async () => true, click: async () => {}, fill: async () => {}, press: async () => {},
@@ -269,6 +272,7 @@ async function fakeLiveRun(t, { selectedId = isolatedId, coldId = isolatedId, fa
   };
   const page = {
     goto: async url => {
+      visited.push(new URL(url).pathname);
       if (url.endsWith('/os')) {
         selected = ++visits === 1 ? selectedId : coldId;
         events.push('session-ready');
@@ -327,17 +331,37 @@ async function fakeLiveRun(t, { selectedId = isolatedId, coldId = isolatedId, fa
     },
   };
   const report = await runLiveCheck({
-    env: { EZIL_E2E_EMAIL: 'test@example.test', EZIL_E2E_PASSWORD: 'private-password', PLAYWRIGHT_REQUIRE_DIR: out,
+    env: { EZIL_E2E_EMAIL: 'test@example.test', EZIL_E2E_PASSWORD: 'private-password', PLAYWRIGHT_REQUIRE_DIR: out, ...supabase,
       EZIL_E2E_COMPUTER_ID: isolatedId, EZIL_E2E_REQUIRE_TARGET: '1', EZIL_LIVE_OUT: out, ...overrides },
-    loadDependencies: async () => ({ deployment, signIn: async () => {},
+    loadDependencies: async () => ({ deployment, signIn: async (_page, options) => onSignIn(options),
       chromium: { launch: async () => browser }, verifySelectedComputer, stopIsolatedComputer }),
     emit: value => emitted.push(value),
   });
   assert.deepEqual(JSON.parse(readFileSync(join(out, 'live-check.json'), 'utf8')), report);
   assert.deepEqual(emitted.at(-1), report);
   assert.doesNotMatch(JSON.stringify(emitted), /private|aaaaaaaa|11111111/);
-  return { report, events, requests };
+  return { report, events, requests, visited };
 }
+
+test('live check signs in programmatically on the target origin, never through /login', async t => {
+  let options;
+  const { report, visited } = await fakeLiveRun(t, { env: { EZIL_LIVE_SKIP_COLD: '1' }, onSignIn: value => { options = value; } });
+  assert.equal(report.result, 'PASS');
+  assert.equal(options.app, 'https://live.example.test');
+  assert.equal(options.destination, '/computers');
+  assert.equal(options.env.NEXT_PUBLIC_SUPABASE_URL, supabase.NEXT_PUBLIC_SUPABASE_URL);
+  assert.equal(visited.some(path => path.startsWith('/login')), false);
+});
+
+test('live check setup fails without the public Supabase sign-in inputs', async t => {
+  for (const name of Object.keys(supabase)) {
+    let signedIn = false;
+    const { report } = await fakeLiveRun(t, { env: { [name]: '' }, onSignIn: () => { signedIn = true; } });
+    assert.equal(report.result, 'FAIL');
+    assert.deepEqual(report.checks.map(check => [check.check, check.ok]).slice(0, 1), [['setup', false]]);
+    assert.equal(signedIn, false);
+  }
+});
 
 test('live check retries a relay race using a fresh GET and the original computer for both renewals', async t => {
   const { report, requests } = await fakeLiveRun(t, { relayRace: true, env: { EZIL_LIVE_SKIP_COLD: '1' } });

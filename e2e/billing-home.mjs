@@ -82,7 +82,7 @@ try {
                     if (pathname === '/') {
                         assert.equal((await page.locator('[data-testid="home-hero"] h1').innerText()).trim(), 'Open EZiL OS and get to work.');
                         await assertHref(page, '[data-testid="cta-start-free"]', '/login');
-                        await assertHref(page, '[data-testid="cta-sign-in"]', '/login?method=email');
+                        await assertHref(page, '[data-testid="cta-sign-in"]', '/login');
                     } else {
                         // /pricing is plans-first: no hero, the plans title is the page's h1
                         // and the plans are in view on load without any scrolling.

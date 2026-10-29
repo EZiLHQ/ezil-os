@@ -42,7 +42,6 @@ const osPage = read('../os/page.tsx');
 const computersLayout = read('../computers/layout.tsx');
 const computerLayout = read('../computer/layout.tsx');
 const loginPage = read('./page.tsx');
-const loginForm = read('./login-form.tsx');
 const rootPage = read('../page.tsx');
 const trpcSource = read('../../server/api/trpc.ts');
 const confirmRoute = read('../auth/confirm/route.ts');
@@ -92,24 +91,20 @@ describe('/login never redirects, so nothing can loop through it', () => {
 });
 
 describe('the sign-in page says how to get an account', () => {
-    it('Google creates the account on first sign-in', () => {
-        expect(code(loginPage)).toMatch(/Sign in or get started with Google\./);
-        expect(loginForm).toMatch(/Continue with Google/);
-    });
-
-    it('the email form says it is for existing accounts, since it cannot create one', () => {
-        expect(code(loginForm)).toMatch(/Email and password work for existing accounts\. New accounts start with Continue with Google\./);
+    it('EZiL ID signs in, and creates the account on first sign-in', () => {
+        expect(code(loginPage)).toMatch(/Sign in with your EZiL ID\./);
+        expect(code(loginPage)).toMatch(/Continue with EZiL ID/);
+        // Behaviour (one action, nothing else) is rendered in `./page.test.ts`.
+        expect(code(loginPage)).not.toMatch(/Google|LoginForm|method=email/);
     });
 
     it('there is no invite-only wording and no "not on the list" panel left', () => {
-        for (const source of [loginPage, loginForm]) {
-            expect(source).not.toMatch(/invite-only|not on the list|ask a maintainer/i);
-        }
+        expect(loginPage).not.toMatch(/invite-only|not on the list|ask a maintainer/i);
     });
 
-    it('opening sign-up adds no sign-up call: accounts come from Supabase OAuth', () => {
+    it('opening sign-up adds no sign-up call: accounts come from EZiL ID', () => {
         // Pinned in full by `./entry-contract.test.ts`.
-        expect(code(loginForm)).not.toMatch(/auth\.signUp\(/);
+        expect(code(loginPage)).not.toMatch(/auth\.signUp\(/);
     });
 });
 
@@ -147,6 +142,13 @@ describe('the invited-user landing keeps the document-load contract', () => {
 
     it('and it strips the tokens out of the address bar once they are spent', () => {
         expect(code(invitedPage)).toMatch(/history\.replaceState\(/);
+    });
+
+    it('it no longer asks for a password: EZiL ID is the only sign-in', () => {
+        const body = code(invitedPage);
+        expect(body).not.toMatch(/type="password"|updateUser\(|set-password|<form/);
+        // Positive control: it still establishes the invite session.
+        expect(body).toMatch(/auth\.setSession\(/);
     });
 });
 
