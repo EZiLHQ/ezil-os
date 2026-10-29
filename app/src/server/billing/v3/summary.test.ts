@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
-import { buildSummaryV3, usedSecondsInWindow } from './summary';
+import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
 
 const now = new Date('2026-10-19T12:00:00Z');
 const start = new Date('2026-10-10T00:00:00Z'), end = new Date('2026-11-10T00:00:00Z');
@@ -291,9 +291,63 @@ describe('round 5 contract pin (W0): enrollment, storage and heal fields default
             expect(summary.ai.waiting).toBeNull();
             expect(summary.actions.ezilId).toBeNull();
             expect(summary.computer.machineChoice.length).toBeGreaterThan(0);
-            for (const option of summary.computer.machineChoice) expect(option.diskGiB).toBeNull();
+            // Round 5 D3 (L3): what a NEW disk gets under this plan (plan-max), the same on every configuration.
+            for (const option of summary.computer.machineChoice) expect(option.diskGiB).toBe(sku ? CATALOG_V3[sku].storageGiB : null);
             expect(summary.computer.disk?.growsOnSwitch).toBe(false);
             expect(summary.catalog.offers.map(offer => offer.storageGiB)).toEqual([null, 50, 100]);
         }
+    });
+});
+
+describe('round 5 D3: the shown disk is the computer\'s REAL volume; machine options carry the plan disk', () => {
+    const GiB = 1024 ** 3;
+    it.each([null, 'cmp-4', 'cmp-8'] as const)('Premium at %s: a computer created today shows its 100 GiB volume, an older one its 50 GiB volume', preference => {
+        const today = { ...input('premium_monthly_v3'), sizePreference: preference, volumeGiB: 100 };
+        expect(buildSummaryV3(today).computer.disk).toEqual({ provisionedGiB: 100, usedBytes: null, growsOnSwitch: false });
+        expect(buildSummaryV3(today).storage).toEqual({ usedBytes: '0', capBytes: String(100 * GiB), state: 'unavailable' });
+        const older = { ...today, volumeGiB: 50, storage: [{ computerId: 'c', bytes: BigInt(43) * BigInt(GiB), measuredAt: now }] };
+        expect(buildSummaryV3(older).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * GiB), growsOnSwitch: false });
+        expect(buildSummaryV3(older).storage).toEqual({ usedBytes: String(43 * GiB), capBytes: String(50 * GiB), state: 'low' });
+    });
+    it.each([undefined, null, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 16385])('an unreadable or implausible volume (%s) falls back to 50, never the plan figure', volumeGiB => {
+        for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
+            expect(buildSummaryV3({ ...input(sku), volumeGiB }).computer.disk?.provisionedGiB).toBe(50);
+        }
+    });
+    it('Free keeps no GB figure even when a volume size is passed', () => {
+        expect(buildSummaryV3({ ...input(), volumeGiB: 100 }).computer.disk).toEqual({ provisionedGiB: null, usedBytes: null, growsOnSwitch: false });
+    });
+    it('machineChoice diskGiB is the plan disk (Standard 50, Premium 100 on every size, Free null); offers carry storageGiB', () => {
+        const disks = (sku?: SellableSkuV3) => buildSummaryV3(input(sku)).computer.machineChoice.map(option => [option.size, option.diskGiB]);
+        expect(disks()).toEqual([['free-cf', null]]);
+        expect(disks('standard_monthly_v3')).toEqual([['std-2', 50]]);
+        expect(disks('premium_monthly_v3')).toEqual([['std-2', 100], ['cmp-4', 100], ['cmp-8', 100]]);
+        expect(buildSummaryV3(input('premium_monthly_v3')).catalog.offers.map(offer => [offer.sku, offer.storageGiB]))
+            .toEqual([['free_v3', null], ['standard_monthly_v3', 50], ['premium_monthly_v3', 100]]);
+    });
+    it('copy guard: no "unlimited" anywhere; configuration tiles carry no per-configuration disk claim', () => {
+        for (const sku of [undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const) {
+            const summary = buildSummaryV3({ ...input(sku), volumeGiB: 100 });
+            expect(JSON.stringify(summary)).not.toMatch(/unlimited/i);
+            // One plan disk for every tile of a plan: no tile claims a bigger disk than another.
+            expect(new Set(summary.computer.machineChoice.map(option => option.diskGiB)).size).toBe(1);
+            for (const option of summary.computer.machineChoice) {
+                expect(Object.values(option).every(value => typeof value !== 'string' || /^(free-cf|std-2|cmp-4|cmp-8|x86_64)$/.test(value))).toBe(true);
+            }
+        }
+    });
+});
+
+describe('round 5 D3: used space in GiB, the same unit as the cap', () => {
+    const GiB = BigInt(1024) ** BigInt(3);
+    it('divides by 1024^3 (a full 50 GiB disk reads 50, not 53.7), one decimal', () => {
+        expect(usedGiBOf(BigInt(50) * GiB)).toBe(50);
+        expect(usedGiBOf(String(BigInt(50) * GiB))).toBe(50);
+        expect(usedGiBOf(BigInt(43) * GiB + GiB / BigInt(2))).toBe(43.5);
+        expect(usedGiBOf(BigInt(1_000_000_000))).toBe(0.9);
+        expect(usedGiBOf(BigInt(0))).toBe(0);
+    });
+    it('null, negative or malformed input is null (no invented figure)', () => {
+        for (const value of [null, undefined, '', 'abc', '-5', BigInt(-1)]) expect(usedGiBOf(value as never)).toBeNull();
     });
 });

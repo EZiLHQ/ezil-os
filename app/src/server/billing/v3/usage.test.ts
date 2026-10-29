@@ -108,10 +108,24 @@ describe('round 3 hours at the current configuration (D3/D8)', () => {
 describe('round 3 storage in usage (D10)', () => {
     it('reports the provisioned AWS disk, and no cap at all on Free', () => {
         expect(buildUsageV3(input()).storage).toEqual({ state: 'unavailable', capBytes: String(50 * 1024 ** 3), samples: [],
-            disk: { provisionedGiB: 50, usedBytes: null } });
+            disk: { provisionedGiB: 50, usedBytes: null, usedGiB: null, growsOnSwitch: false } });
         const free = input(); free.subs = []; free.grants = [];
         expect(buildUsageV3(free).storage).toMatchObject({ state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null } });
         free.storage = [{ computerId: 'c', bytes: BigInt(7), measuredAt: now }];
         expect(buildUsageV3(free).storage).toMatchObject({ state: 'sampled', capBytes: null, disk: { provisionedGiB: null, usedBytes: '7' } });
+    });
+});
+
+describe('round 5 D3: usage shows the REAL volume and used space in GiB', () => {
+    const GiB = 1024 ** 3;
+    it('the volume size passed in is the disk (100 GiB Premium today, 50 GiB older); unreadable falls back to 50', () => {
+        const args = input();
+        args.storage = [{ computerId: 'c', bytes: BigInt(43) * BigInt(GiB), measuredAt: now }];
+        expect(buildUsageV3({ ...args, volumeGiB: 100 }).storage).toMatchObject({ capBytes: String(100 * GiB),
+            disk: { provisionedGiB: 100, usedBytes: String(43 * GiB), usedGiB: 43, growsOnSwitch: false } });
+        expect(buildUsageV3({ ...args, volumeGiB: 50 }).storage).toMatchObject({ capBytes: String(50 * GiB), disk: { provisionedGiB: 50 } });
+        for (const volumeGiB of [null, undefined, 0, Number.NaN]) {
+            expect(buildUsageV3({ ...args, volumeGiB }).storage).toMatchObject({ capBytes: String(50 * GiB), disk: { provisionedGiB: 50 } });
+        }
     });
 });

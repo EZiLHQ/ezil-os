@@ -100,27 +100,106 @@ async function aiReceipts(deps: BillingDeps, userId: string) {
 }
 
 type PlacementProvider = 'aws-ec2' | 'cloudflare' | null;
+/** Round 5 D3: one aws-ec2 computer's data volume, for its real size. */
+export interface AwsVolumeRef { computerId: string; region: string; volumeId: string }
+/** Round 4 provider (standing) plus, round 5 D3, the user's aws-ec2 data volumes (real disk size). */
+export interface UserPlacement { provider: PlacementProvider; awsVolumes: AwsVolumeRef[] }
+type DbReader = { execute(query: SQL): Promise<unknown> };
 
 /**
  * Round 4: where the user's files are, for the computer's standing. Any aws-ec2 placement among the user's
- * LIVE computers counts (a user may have two). Read-only, through the placement module's own reader (only
- * placement.ts names the placement table); null with placement reads off, without the placement table
- * (billing-only databases) or on any read error: the summary never fails on it.
+ * LIVE computers counts (a user may have two). Read-only, through the placement module's own readers (only
+ * placement.ts names the placement table); provider null with placement reads off, without the placement
+ * table (billing-only databases) or on any read error: the summary never fails on it.
+ * Round 5 D3: each aws-ec2 placement's {region, volumeId}, from the placement module's full read
+ * (owner-checked). That read is separate: when it fails the provider stands and only the volume is missing.
  */
-export async function userPlacementProvider(db: { execute(query: SQL): Promise<unknown> }, userId: string): Promise<PlacementProvider> {
+export async function userPlacement(db: DbReader, userId: string): Promise<UserPlacement> {
     try {
-        const [{ isPlacementReadEnabled }, { readPlacementProvider }, { computers }] = await Promise.all([
+        const [{ isPlacementReadEnabled }, { readPlacement, readPlacementProvider }, { computers }] = await Promise.all([
             import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema')]);
-        if (!isPlacementReadEnabled()) return null;
+        if (!isPlacementReadEnabled()) return { provider: null, awsVolumes: [] };
         const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computers.id}::text AS id FROM ${computers}
             WHERE ${computers.userId} = ${userId}::uuid AND ${computers.deletedAt} IS NULL`);
         const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
-        const providers = await Promise.all(rows.map(row => typeof row.id === 'string' ? readPlacementProvider(db, row.id) : null));
-        return providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(provider => provider !== null) ? 'cloudflare' : null;
+        const ids = rows.map(row => row.id).filter((id): id is string => typeof id === 'string');
+        const providers = await Promise.all(ids.map(id => readPlacementProvider(db, id)));
+        const provider = providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(p => p !== null) ? 'cloudflare' : null;
+        const awsVolumes: AwsVolumeRef[] = [];
+        for (const [index, id] of ids.entries()) {
+            if (providers[index] !== 'aws-ec2') continue;
+            try {
+                const { record } = await readPlacement(db, id, userId);
+                if (record?.provider === 'aws-ec2' && record.region && record.volumeId)
+                    awsVolumes.push({ computerId: record.computerId, region: record.region, volumeId: record.volumeId });
+            } catch {
+                console.warn('[billing.summary] volume placement unavailable');
+            }
+        }
+        return { provider, awsVolumes };
     } catch {
         console.warn('[billing.summary] placement unavailable');
-        return null;
+        return { provider: null, awsVolumes: [] };
     }
+}
+
+/** Round 4 reader kept for its callers: the provider only. */
+export async function userPlacementProvider(db: DbReader, userId: string): Promise<PlacementProvider> {
+    return (await userPlacement(db, userId)).provider;
+}
+
+/** Round 5 D3: a cached volume size lasts at most 5 minutes (a volume only changes size through a grow, Phase B). */
+const VOLUME_SIZE_TTL_MS = 5 * 60_000;
+/** Bounded: one entry per AWS computer read recently on this instance; the oldest goes first. */
+const VOLUME_SIZE_MAX_ENTRIES = 512;
+/** The summary never waits on EC2 for longer than this; slower reads fall back to the 50 GiB figure. */
+const VOLUME_SIZE_TIMEOUT_MS = 2_000;
+
+type VolumeDescribe = (region: string, volumeId: string) => Promise<{ sizeGiB?: number } | null>;
+
+/**
+ * Round 5 D3: the data volume's real size in GiB (EC2 DescribeVolumes), cached per volume for at most
+ * 5 minutes in a bounded map. Only successful reads are cached; an error, a missing size, an unknown
+ * volume or a read slower than the timeout is null (the caller shows the fallback, never a guess).
+ */
+export function createVolumeSizeReader(describe: VolumeDescribe, options: { now?: () => number; ttlMs?: number;
+    maxEntries?: number; timeoutMs?: number } = {}): (volume: AwsVolumeRef) => Promise<number | null> {
+    const now = options.now ?? Date.now, ttlMs = Math.min(options.ttlMs ?? VOLUME_SIZE_TTL_MS, VOLUME_SIZE_TTL_MS);
+    const maxEntries = options.maxEntries ?? VOLUME_SIZE_MAX_ENTRIES, timeoutMs = options.timeoutMs ?? VOLUME_SIZE_TIMEOUT_MS;
+    const cache = new Map<string, { sizeGiB: number; at: number }>();
+    return async ({ region, volumeId }) => {
+        const key = `${region}:${volumeId}`;
+        const hit = cache.get(key);
+        if (hit && now() - hit.at <= ttlMs) return hit.sizeGiB;
+        cache.delete(key);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const view = await Promise.race([describe(region, volumeId),
+                new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); })]);
+            const sizeGiB = view?.sizeGiB;
+            if (typeof sizeGiB !== 'number' || !Number.isInteger(sizeGiB) || sizeGiB < 1) return null;
+            while (cache.size >= maxEntries) cache.delete(cache.keys().next().value!);
+            cache.set(key, { sizeGiB, at: now() });
+            return sizeGiB;
+        } catch {
+            return null;
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+}
+
+/** The app's own EC2 reader (the same collaborators the compute provider uses); nothing with AWS off. */
+const defaultVolumeSize = createVolumeSizeReader(async (region, volumeId) => {
+    const { sharedAwsSdkCollaborators } = await import('@/server/lib/compute/aws-clients');
+    return await sharedAwsSdkCollaborators(process.env).describer?.describeVolume(region, volumeId) ?? null;
+});
+
+/** Round 5 D3: the smallest readable size among `volumes` (never overclaim); null when none is readable. */
+async function readVolumeGiB(volumes: readonly AwsVolumeRef[], read: (volume: AwsVolumeRef) => Promise<number | null>): Promise<number | null> {
+    const sizes = (await Promise.all(volumes.map(volume => read(volume).catch(() => null))))
+        .filter((size): size is number => typeof size === 'number');
+    return sizes.length ? Math.min(...sizes) : null;
 }
 
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
@@ -132,9 +211,30 @@ async function telemetryOperator(email: string | null | undefined): Promise<bool
 
 export function createBillingRouter(getDeps: () => BillingDeps,
     options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean>;
-        placementProvider?: (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<PlacementProvider> } = {}) {
+        /** Round 4 (provider only); superseded by `placement`, kept for callers that inject it. */
+        placementProvider?: (db: DbReader, userId: string) => Promise<PlacementProvider>;
+        /** Round 5 D3: provider plus the user's aws-ec2 volumes. */
+        placement?: (db: DbReader, userId: string) => Promise<UserPlacement>;
+        /** Round 5 D3: a volume's real size in GiB, null when unreadable. */
+        volumeGiB?: (volume: AwsVolumeRef) => Promise<number | null> } = {}) {
     const isOperator = options.isOperator ?? telemetryOperator;
-    const placementOf = options.placementProvider ?? userPlacementProvider;
+    const legacyPlacement = options.placementProvider;
+    const placementOf = options.placement ?? (legacyPlacement
+        ? async (db: DbReader, userId: string): Promise<UserPlacement> => ({ provider: await legacyPlacement(db, userId), awsVolumes: [] })
+        : userPlacement);
+    const volumeSize = options.volumeGiB ?? defaultVolumeSize;
+    /** Never throws: an unreadable placement is no provider and no volume (fallback disk). */
+    const placementAndVolume = async (db: DbReader, userId: string, computerId?: string) => {
+        let placement: UserPlacement;
+        try {
+            placement = await placementOf(db, userId);
+        } catch {
+            console.warn('[billing.summary] placement unavailable');
+            placement = { provider: null, awsVolumes: [] };
+        }
+        const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize) };
+    };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
             const deps = getDeps();
@@ -147,17 +247,18 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, userCreatedAt, now });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, storage, consent, overageInvoices, sizePreference] = await Promise.all([
+            const [epochs, grants, storage, consent, overageInvoices, sizePreference, placement] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
                 deps.store.overageInvoicesFor(ctx.user.id),
                 deps.store.sizePreference(ctx.user.id),
+                placementAndVolume(ctx.db, ctx.user.id, input?.computerId),
             ]);
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference,
-                hasCustomer: false, computerId: input?.computerId });
+                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
@@ -171,7 +272,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placementProvider] = await Promise.all([
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -181,7 +282,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.stripeCustomerFor(ctx.user.id),
                 deps.store.overageInvoicesFor(ctx.user.id),
                 readStripePacks(deps.stripe),
-                placementOf(ctx.db, ctx.user.id),
+                placementAndVolume(ctx.db, ctx.user.id),
             ]);
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
@@ -199,7 +300,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
-                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider,
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
+                volumeGiB: placement.volumeGiB,
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;

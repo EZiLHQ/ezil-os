@@ -4,9 +4,13 @@ import { epochSeconds, isoSeconds } from '../v2/time';
 import { SIZES, type SizeCode } from '../v2/contract';
 import { planFromSubscriptions } from './catalog';
 import { hoursLeftAtWeight } from './contract';
-import { fairUseAllowance, storageDisk, usedSecondsInWindow } from './summary';
+import { fairUseAllowance, storageDisk, usedGiBOf, usedSecondsInWindow } from './summary';
 
-type Input = Parameters<typeof buildSummaryV2>[0] & { computerId?: string };
+type Input = Parameters<typeof buildSummaryV2>[0] & {
+    computerId?: string;
+    /** Round 5 D3: the computer's real data-volume size in GiB; null/omitted = unreadable (fallback 50). */
+    volumeGiB?: number | null;
+};
 
 /** Read-only meter observations, not provider readiness or a live storage inventory. */
 export function buildUsageV3(input: Input) {
@@ -42,7 +46,8 @@ export function buildUsageV3(input: Input) {
         if (!samples.has(sample.computerId) || samples.get(sample.computerId)!.measuredAt < sample.measuredAt)
             samples.set(sample.computerId, sample);
     }
-    const disk = storageDisk(plan, preferred, input.storage, input.config.largeStorageEnabled); // The plan's disk, not a stray epoch's.
+    // The computer's real volume (round 5 D3); the preferred size only decides AWS vs Free, not the figure.
+    const disk = storageDisk(plan, preferred, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
     return {
         enabled: true as const, version: 1 as const, asOf: isoSeconds(now),
         session: { computerId: epoch?.computerId ?? input.computerId ?? null, state,
@@ -55,9 +60,11 @@ export function buildUsageV3(input: Input) {
             currentSize, currentWeight, remainingHoursAtCurrent: hoursLeftAtWeight(remaining, currentWeight),
             equivalents: choices.map(size => ({ size, weight: SIZES[size].weight, hours: hoursLeftAtWeight(remaining, SIZES[size].weight) })) },
         storage: { state: samples.size ? 'sampled' as const : 'unavailable' as const,
-            // Round 3 D10: the provisioned AWS data volume; null on Free (no invented cap).
+            // Round 3 D10 / round 5 D3: the computer's real AWS data volume; null on Free (no invented cap).
             capBytes: disk.capBytes?.toString() ?? null,
-            disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null },
+            // usedGiB: the used bytes in the cap's unit (GiB); a switch keeps the disk until a grow path exists.
+            disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null,
+                usedGiB: usedGiBOf(disk.usedBytes), growsOnSwitch: false },
             samples: [...samples.values()].map(sample => ({ computerId: sample.computerId,
                 bytes: sample.bytes.toString(), measuredAt: sample.measuredAt.toISOString() })) },
         egress: { state: 'unavailable' as const, usedBytes: null },
