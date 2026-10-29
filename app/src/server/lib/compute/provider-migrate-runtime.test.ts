@@ -55,6 +55,15 @@ describe('real migration admission and provisioning seam', () => {
         expect(f.db.placements).toEqual([]);
         await f.deps.provision(f.get()); expect(f.start).toHaveBeenCalledOnce(); expect(f.store.mintRestoreToken).toHaveBeenCalledOnce();
     });
+    it.each([['premium_monthly_v3', 'std-2', 100], ['premium_monthly_v3', 'cmp-4', 100], ['premium_monthly_v3', 'cmp-8', 100],
+        ['standard_monthly_v3', 'std-2', 50], ['standard_monthly_v3', 'cmp-8', 50]] as const)(
+        'round 5 D3 plan-max: a Cloudflare to AWS migration for %s (entitled %s) provisions a %i GiB data volume', async (plan, size, gib) => {
+            const f = fixture({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '10' }, plan, size);
+            await f.deps.provision(f.get());
+            const [, work] = f.start.mock.calls[0]! as unknown as [string, { input: string }];
+            const intent = JSON.parse((JSON.parse(work.input) as { document: string }).document) as { operation: string; dataVolumeGiB: number };
+            expect(intent).toMatchObject({ operation: 'provision', dataVolumeGiB: gib });
+        });
     it.each([{ EZIL_AWS_COMPUTERS_ENABLED: '0' }, { EZIL_AWS_KILL_SWITCH: '1' }, { AWS_MAX_RUNNING: '0' },
         { EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0' }, { AWS_REGIONS: 'us-east-1' }])('refusal %j creates no intent/token/instance', async patch => {
         const f = fixture(patch); await expect(f.deps.provision(f.get())).rejects.toThrow();

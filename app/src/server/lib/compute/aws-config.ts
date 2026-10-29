@@ -11,6 +11,7 @@
  */
 
 import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
+import { CATALOG_V3, type PlanSkuV3 } from '@/server/billing/v3/contract';
 
 export type Env = Record<string, string | undefined>;
 
@@ -143,8 +144,26 @@ export const AWS_TIERS = {
 } as const satisfies Record<string, readonly string[]>;
 export type AwsTier = keyof typeof AWS_TIERS;
 
-/** Data-volume size at provision (infra DEFAULT_DATA_TIERS_GIB: free 20, premium 50); must fall inside the deployment's range. */
+/**
+ * Data-volume size per tier when the plan has no storage of its own (legacy v1/v2 plans, a lazy tier
+ * source without a plan id, the legacy free AWS path). New paid volumes use `dataGiBForNewVolume`.
+ * Every value must fall inside the deployment's storage range (dataMinGiB..dataMaxGiB, 20..100 today),
+ * or the lifecycle intent is refused (aws-intent.ts).
+ */
 export const AWS_TIER_DATA_GIB: Readonly<Record<AwsTier, number>> = { free: 20, plus: 50, compute4: 50, compute8: 50 };
+
+/**
+ * Round 5 D3 (plan-max): a NEW data volume is sized for the largest configuration the plan allows,
+ * because a switch keeps the volume and no grow path exists yet. v3 plans carry their own storage
+ * (`CATALOG_V3[sku].storageGiB`: Standard 50, Premium 100); anything else keeps the tier table.
+ * The tier gates first: an unpaid record resolves to `free` and keeps the legacy 20 GiB.
+ */
+export function dataGiBForNewVolume(tier: AwsTier, planId: string | null | undefined): number {
+    if (tier === 'free') return AWS_TIER_DATA_GIB.free;
+    const planStorage = planId && Object.prototype.hasOwnProperty.call(CATALOG_V3, planId)
+        ? CATALOG_V3[planId as PlanSkuV3].storageGiB : null;
+    return planStorage ?? AWS_TIER_DATA_GIB[tier];
+}
 
 export const INSTANCE_VCPU: Readonly<Record<string, number>> = Object.freeze({
     't3a.medium': 2,
