@@ -2420,61 +2420,77 @@ describe('HF2 operator correction rows', () => {
             expect(plan(foreign)).toEqual({ outcome: 'review:restore_mismatch', grants: [], outbox: [] });
         }
     });
-    it('reverses compute alone when every root is operator-revoked, and its replays are applied with zero writes', async () => {
+    const ledger = (f: Awaited<ReturnType<typeof canary>>) => [...f.store.grants.values()].filter(g => g.meter === 'compute_std_seconds')
+        .map(g => `${g.kind}:${g.sourceType}:${g.sourceId}:${g.amount}`);
+    it('refuses dispute and refund with zero writes when every root is operator-revoked and no child binds the cause', async () => {
         const f = await canary('root first', { correction: false });
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('review:restore_mismatch');
         f.stripe.charge.refunded = true;
-        const before = [...f.store.writes];
-        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
-        expect(f.store.writes.slice(before.length)).toEqual(['refund:re_local:compute_std_seconds:revoke']);
-        const after = [...f.store.writes];
-        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
-        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('applied');
-        expect(f.store.writes).toEqual(after);
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+        expect(f.store.writes).toEqual(before);
+        expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`]);
+        expect([...f.store.outbox.keys()].filter(key => key.startsWith(`${f.ROOT}:revoke:`))).toEqual([]);
     });
-    it('suspends compute alone when every root is operator-revoked, and its replay is applied with zero writes', async () => {
+    it('refuses replays of an unbound dispute and refund, and a restore, with zero writes', async () => {
         const f = await canary('root first', { correction: false });
         const before = [...f.store.writes];
-        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
-        expect(f.store.writes.slice(before.length)).toEqual(['dispute:dp_local:compute_std_seconds:suspend']);
-        const after = [...f.store.writes];
-        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
-        expect(f.store.writes).toEqual(after);
+        for (const replay of [dispute(), dispute()]) expect(await processStripeEvent(replay, f.deps)).toBe('review:restore_mismatch');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        f.stripe.charge.refunded = true;
+        for (const replay of [refund(), refund(), event('refund.updated', { id: 're_local', charge: 'ch_local' })]) {
+            expect(await processStripeEvent(replay, f.deps)).toBe('review:restore_mismatch');
+        }
+        expect(f.store.writes).toEqual(before);
+        expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`]);
+    });
+    it('refuses an unbound plan in the planner itself with zero writes, for every action', async () => {
+        const f = await canary('root first', { correction: false });
+        for (const action of ['revoke', 'suspend', 'restore'] as const) {
+            expect(planAiReversal({ action, causeId: action === 'revoke' ? 're_local' : 'dp_local', chargeId: 'ch_local',
+                customerId: 'cus_local', userId: 'user_local', originals: [f.compute], receipts: [f.root] },
+            { originals: [f.compute], corrections: [], receipts: [...f.store.outbox.values()] }))
+                .toEqual({ outcome: action === 'restore' ? 'review:restore_refused_terminal' : 'review:restore_mismatch', grants: [], outbox: [] });
+        }
     });
     it.each([
-        ['without an operator revoke', { revoke: false }, BigInt(-144000)],
-        ['with a partial amount under an operator revoke', {}, BigInt(-100000)],
-    ] as const)('refuses an unbound local refund row %s with zero writes', async (_, options, amount) => {
+        ['without an operator revoke', { revoke: false }, BigInt(-144000), 'review:local_reversal_mismatch'],
+        ['with a partial amount under an operator revoke', {}, BigInt(-100000), 'review:restore_mismatch'],
+        ['with the full amount under an operator revoke', {}, BigInt(-144000), 'review:restore_mismatch'],
+    ] as const)('refuses an unbound local refund row %s with zero writes', async (_, options, amount, outcome) => {
         const f = await canary('root first', { correction: false, ...options });
         await f.store.insertGrant({ ...f.compute, kind: 'revoke', amount, sourceType: 'refund', sourceId: 're_local' });
         f.stripe.charge.refunded = true;
         const before = [...f.store.writes];
-        expect(await processStripeEvent(refund(), f.deps)).toBe('review:local_reversal_mismatch');
+        expect(await processStripeEvent(refund(), f.deps)).toBe(outcome);
         expect(f.store.writes).toEqual(before);
     });
-    it('refuses a full unbound refund row once an earlier dispute already took the compute, with zero writes', async () => {
-        const f = await canary('root first', { correction: false, revoke: false });
-        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
-        await f.store.enqueueOutbox(f.revoke);
-        await f.store.insertGrant({ ...f.compute, kind: 'revoke', amount: BigInt(-144000), sourceType: 'refund', sourceId: 're_local' });
-        f.stripe.charge.refunded = true;
-        const before = [...f.store.writes];
-        expect(await processStripeEvent(refund(), f.deps)).toBe('review:local_reversal_mismatch');
-        expect(f.store.writes).toEqual(before);
-    });
-    it('replays a zero refund row after an earlier dispute took the compute under an operator revoke', async () => {
+    it('refuses a refund after an operator revoke even when an earlier dispute was bound on the root, with zero writes', async () => {
         const f = await canary('root first', { correction: false, revoke: false });
         expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
         await f.store.enqueueOutbox(f.revoke);
         f.stripe.charge.refunded = true;
         const before = [...f.store.writes];
-        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
-        expect(f.store.writes.slice(before.length)).toEqual(['refund:re_local:compute_std_seconds:revoke']);
-        expect(f.store.grants.get('refund:re_local:compute_std_seconds:revoke')!.amount).toBe(BigInt(0));
-        const after = [...f.store.writes];
-        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
-        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('applied');
-        expect(f.store.writes).toEqual(after);
+        expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('review:restore_mismatch');
+        expect(f.store.writes).toEqual(before);
+        expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`, 'suspend:dispute:dp_local:-144000']);
     });
+    it.each(['root first', 'correction first'] as const)(
+        'a dispute then a refund never double-debit compute when a correction child binds the cause (%s)', async order => {
+            const f = await canary(order);
+            expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+            f.stripe.charge.refunded = true;
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(ledger(f)).toEqual([`plan_period:invoice:${f.compute.sourceId}:144000`, 'suspend:dispute:dp_local:-144000',
+                'revoke:refund:re_local:0']);
+            expect([...f.store.grants.values()].filter(g => g.meter === 'compute_std_seconds')
+                .reduce((total, g) => total + g.amount, BigInt(0))).toBe(BigInt(0));
+            expect([...f.store.outbox.keys()].filter(key => key.includes(':revoke:'))).toEqual([
+                `${f.CORR}:revoke:dispute:dp_local`, `${f.CORR}:revoke:refund:re_local`]);
+        },
+    );
     it('reverses a correction whose credits equal the parent', async () => {
         const f = await canary('correction first', { defect: r => { r.correction.payload.credits = 4000; } });
         f.stripe.charge.refunded = true;

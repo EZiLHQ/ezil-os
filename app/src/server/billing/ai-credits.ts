@@ -173,8 +173,7 @@ const deliveredRestore = (r: AiReversalReceipt) => r.deliveredAt != null
 /** Count each local ledger row once, even when several root receipts refer to it.
  * Only exact original-grant evidence can affect this purchase's remaining amount.
  */
-function localReversalDeltas(input: AiReversalInput, corrections: GrantRow[], receipts: AiReversalReceipt[], grants: GrantInsert[],
-    unbound = false): boolean {
+function localReversalDeltas(input: AiReversalInput, corrections: GrantRow[], receipts: AiReversalReceipt[], grants: GrantInsert[]): boolean {
     const facts = originalFacts(input.originals);
     const linked = new Map<string, { originalId: string; row: GrantRow }>();
     for (const receipt of receipts) {
@@ -216,8 +215,7 @@ function localReversalDeltas(input: AiReversalInput, corrections: GrantRow[], re
         if (remaining < BigInt(0) || remaining > original.amount) return false;
         const existing = corrections.find(g => localKey(g) === localKey(grant));
         if (existing) {
-            // With every root operator-revoked no receipt binds this cause: only its own exact delta replays.
-            if (!linked.has(localKey(existing)) && !(unbound && sameLocalGrant(existing, { ...grant, amount: -remaining }))) return false;
+            if (!linked.has(localKey(existing))) return false;
             grant.amount = existing.amount; // A replay retains its committed delta, regardless of later events.
         } else if (input.action === 'restore') {
             const suspend = linked.get(localKey({ ...grant, kind: 'suspend' }))?.row;
@@ -256,7 +254,11 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
     // The existing ledger key has one row per meter/cause. Never partially apply an ambiguous purchase.
     if (new Set(grants.map(localKey)).size !== grants.length) return refuse('review:restore_mismatch');
     const outbox: OutboxInsert[] = [];
-    let unbound = input.action !== 'restore';
+    const operatorRevoked = (root: OutboxInsert) => snapshot.receipts.some(r => r.payload.entitlementId === root.payload.entitlementId
+        && bareRevoke(root, r));
+    // A local reversal needs an AI receipt reversed in the same plan to bind its cause; an unbound plan stays in review.
+    // A restore of an operator-revoked root keeps its own terminal refusal below.
+    if (input.action !== 'restore' && input.receipts.every(operatorRevoked)) return refuse('review:restore_mismatch');
     const matchesSource = (p: Record<string, unknown>) => snapshot.originals.some(g => g.sourceType === 'payment_intent'
         ? p.paymentIntentId === g.sourceId && p.entitlementId === `ezil-os:v1:topup:${p.packSku}:${g.sourceId}`
             && p.expiresAt === g.periodEnd?.toISOString()
@@ -284,8 +286,7 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
         const family = snapshot.receipts.filter(r => r.payload.entitlementId === p.entitlementId);
         if (family.some(r => !receiptTermsMatch(root, r) && !bareRevoke(root, r))) return refuse('review:restore_mismatch');
         // An operator's cause-less revoke already removed this root; a second revoke ID is not known safe downstream.
-        const revoked = family.some(r => bareRevoke(root, r));
-        unbound &&= revoked;
+        const revoked = operatorRevoked(root);
         const accounts = accountsOf(root);
         if (accounts.length > 1) return refuse('review:restore_mismatch');
         const account = accounts[0];
@@ -339,7 +340,7 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
         if (!previous && !revoked) outbox.push(item);
     }
     if (new Set(input.receipts.map(r => r.payload.entitlementId)).size !== input.receipts.length) return refuse('review:restore_mismatch');
-    if (!localReversalDeltas(input, snapshot.corrections, snapshot.receipts, grants, unbound)) {
+    if (!localReversalDeltas(input, snapshot.corrections, snapshot.receipts, grants)) {
         return refuse(input.action === 'restore' ? 'review:restore_mismatch' : 'review:local_reversal_mismatch');
     }
     for (const item of outbox) item.payload.localDeltas = input.originals.map((original, i) => ({
