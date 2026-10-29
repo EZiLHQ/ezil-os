@@ -456,6 +456,7 @@ test('image baseline lookup selects successful deployments on the target branch 
   const outputs = {};
   const valid = {id:10, updated_at:'2026-10-20T02:00:00Z', run_attempt:2, path:'.github/workflows/preview.yml',
     head_branch:'main', head_sha:sha, conclusion:'success', event:'push'};
+  const probed = [];
   const github = {rest:{actions:{listWorkflowRuns:async args => {
     assert.equal(args.branch, 'main');
     assert.equal(args.status, 'success');
@@ -465,11 +466,17 @@ test('image baseline lookup selects successful deployments on the target branch 
       {...valid,id:12,run_number:12,head_branch:'preview'}, {...valid,id:13,run_number:13,event:'pull_request'},
       {...valid,id:14,run_number:14,path:'.github/workflows/image.yml'}, valid,
     ]}};
+  }, listWorkflowRunArtifacts:async args => {
+    probed.push(args.run_id);
+    assert.deepEqual(args, {owner:'test', repo:'os', run_id:args.run_id, name:`live-evidence-main-${args.run_id}-2`, per_page:100});
+    return {data:{artifacts:[{name:`live-evidence-main-${args.run_id}-2`, expired:false}]}};
   }}}};
   const execute = new (Object.getPrototypeOf(async function(){}).constructor)('github', 'context', 'core', script);
   await execute(github, {ref:'refs/heads/main', repo:{owner:'test',repo:'os'}, runId:15},
     {setOutput:(key,value) => { outputs[key] = value; }, warning:assert.fail});
   assert.deepEqual(outputs, {run:'10', sha, artifact:'live-evidence-main-10-2'});
+  // The newest qualifying run had a receipt, so no older run was consulted.
+  assert.deepEqual(probed, [10]);
   let warnings = 0;
   await execute({rest:{actions:{listWorkflowRuns:async () => { throw new Error('unavailable'); }}}},
     {ref:'refs/heads/main'}, {setOutput:assert.fail, warning:() => warnings++});
@@ -517,6 +524,137 @@ test('failed image push remains drift on an app-only successor; untrusted or abs
     assert.equal(result.status, 0, result.output);
     assert.match(fs.readFileSync(output, 'utf8'), new RegExp(`^changed=${changed}$`, 'm'));
   }
+});
+
+test('image change detection baselines on the newest deployment receipt, never a run that deployed nothing', async t => {
+  // Chain the shipped steps: baseline lookup -> artifact download -> change detection
+  // over a real repository, with the workflow's own IMAGE_INPUTS list.
+  const changes = previewWorkflow.jobs.find(j => j.name === 'changes');
+  const step = id => changes.steps.find(s => s.text.includes(`id: ${id}\n`)).text;
+  const lookup = new (Object.getPrototypeOf(async function(){}).constructor)('github', 'context', 'core',
+    step('deployed').match(/script: \|\n([\s\S]*)$/)[1]);
+  assert.match(step('deployed_evidence'), /if: steps\.deployed\.outputs\.run != ''/);
+  assert.match(step('deployed_evidence'), /\nrun-id: \$\{\{ steps\.deployed\.outputs\.run \}\}\nname: \$\{\{ steps\.deployed\.outputs\.artifact \}\}\npath: deployed-evidence$/);
+  const detect = step('image_changes').match(/run: \|\n([\s\S]*)$/)[1];
+  // The fake artifacts below carry the names the two deploy jobs upload.
+  for (const name of ['preview', 'production']) {
+    const upload = previewWorkflow.jobs.find(j => j.name === name).steps.find(s => s.line === '- name: Upload live evidence');
+    assert.match(upload.text, /\nname: live-evidence-\$\{\{ github\.ref_name \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}\n/, name);
+  }
+  const imageInputs = workflowText.match(/^ {2}IMAGE_INPUTS: \|-\n((?: {4}\S.*\n)+)/m)[1].split('\n').map(line => line.trim()).filter(Boolean);
+  assert.ok(imageInputs.includes('worker/Dockerfile') && imageInputs.includes('worker/scripts') && !imageInputs.some(p => /^(?:app|worker\/src)\b/.test(p)));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-image-baseline-'));
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  const repo = path.join(dir, 'repo');
+  const gitEnv = {PATH:process.env.PATH, HOME:dir, GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null',
+    GIT_AUTHOR_NAME:'ci', GIT_AUTHOR_EMAIL:'ci@example.invalid', GIT_COMMITTER_NAME:'ci', GIT_COMMITTER_EMAIL:'ci@example.invalid'};
+  // S0 is a deployed image source; D, A, B are app-only; I changes the Dockerfile;
+  // J is Worker-only; K changes another image input.
+  const created = runWorkflowScript('bash', ['-euo', 'pipefail', '-c', `
+    git -c init.defaultBranch=main init -q "$0" && cd "$0" && mkdir -p app worker/src worker/scripts
+    commit() { git add -A && git commit -q -m "$1" && git rev-parse HEAD; }
+    echo 'FROM scratch' > worker/Dockerfile; echo 'exit 0' > worker/scripts/start.sh
+    echo 0 > app/page.txt; echo 0 > worker/src/index.ts; commit S0
+    echo 1 > app/page.txt; commit D
+    echo 2 > app/page.txt; commit A
+    echo 3 > app/page.txt; commit B
+    echo 'FROM scratch AS desktop' > worker/Dockerfile; commit I
+    echo 1 > worker/src/index.ts; commit J
+    echo 'exit 1' > worker/scripts/start.sh; commit K
+  `, repo], {env:gitEnv});
+  assert.equal(created.status, 0, created.output);
+  const [S0, D, A, B, I, J, K] = created.output.split('\n').filter(line => /^[a-f0-9]{40}$/.test(line));
+  assert.ok(K, created.output);
+
+  const run = (id, event, head_sha, minute, extra = {}) => ({id, event, head_sha, run_attempt:1, conclusion:'success',
+    path:'.github/workflows/preview.yml', updated_at:`2026-10-29T10:${String(minute).padStart(2, '0')}:00Z`, ...extra});
+  // A run that only detected changes or built images uploads these, never live evidence.
+  const buildOnly = (branch, id, head) => [{name:`live-changes-${branch}-${id}-1`}, {name:`os-images-${head}`}];
+  const deployedRun = (branch, id, receipt, attempt = 1) =>
+    [{name:`live-changes-${branch}-${id}-${attempt}`}, {name:`live-evidence-${branch}-${id}-${attempt}`, receipt}];
+  const receipt = (branch, source, deployment) => ({source, deployment, branch, tested:true});
+
+  async function detectImageChange({ref, sha, runs, artifacts, failArtifacts = false}) {
+    const branch = ref.replace('refs/heads/', '');
+    const outputs = {}; let warnings = 0;
+    const github = {rest:{actions:{
+      listWorkflowRuns:async args => {
+        assert.deepEqual(args, {owner:'test', repo:'os', workflow_id:'preview.yml', branch, status:'success', per_page:100});
+        return {data:{workflow_runs:runs.map(r => ({head_branch:branch, ...r}))}};
+      },
+      // Every artifact of the run comes back, so only an exact name can select a receipt.
+      listWorkflowRunArtifacts:async ({run_id}) => {
+        if (failArtifacts) throw new Error('rate limited');
+        return {data:{artifacts:(artifacts[run_id] ?? []).map(({name, expired = false}) => ({name, expired}))}};
+      },
+    }}};
+    await lookup(github, {ref, repo:{owner:'test', repo:'os'}, runId:99},
+      {setOutput:(key, value) => { outputs[key] = value; }, warning:() => warnings++});
+    // actions/download-artifact fails (continue-on-error) unless that run holds that live artifact.
+    fs.rmSync(path.join(repo, 'deployed-evidence'), {recursive:true, force:true});
+    let downloaded = false;
+    if (outputs.run) {
+      const artifact = (artifacts[outputs.run] ?? []).find(a => a.name === outputs.artifact && !a.expired);
+      if (artifact) {
+        downloaded = true;
+        fs.mkdirSync(path.join(repo, 'deployed-evidence/live-evidence'), {recursive:true});
+        if (artifact.receipt) fs.writeFileSync(path.join(repo, 'deployed-evidence/live-evidence/image-source.json'), JSON.stringify(artifact.receipt));
+      }
+    }
+    const output = path.join(dir, 'github-output'); fs.writeFileSync(output, '');
+    const result = runWorkflowScript('bash', ['-e', '-c', detect], {cwd:repo, env:{...gitEnv,
+      DEPLOYED_SHA:outputs.sha ?? '', EVIDENCE_DOWNLOADED:String(downloaded), IMAGE_INPUTS:imageInputs.join('\n'),
+      GITHUB_SHA:sha, GITHUB_REF:ref, GITHUB_REF_NAME:branch, GITHUB_OUTPUT:output}});
+    assert.equal(result.status, 0, result.output);
+    const out = Object.fromEntries(fs.readFileSync(output, 'utf8').trim().split('\n').filter(Boolean).map(line => line.split('=')));
+    return {changed:out.changed, source:out.source, run:outputs.run, warnings};
+  }
+
+  const main = 'refs/heads/main', preview = 'refs/heads/preview';
+  // (a) A main push after push-only runs: they built images but deployed nothing.
+  const pushOnly = {
+    runs:[run(21, 'push', A, 30), run(20, 'workflow_dispatch', D, 20)],
+    artifacts:{21:buildOnly('main', 21, A), 20:deployedRun('main', 20, receipt('main', S0, D))},
+  };
+  // (b) A dispatch after a dispatch deploy that rolled out image I, with a newer
+  // unconfirmed dispatch (deploy_production=false) and a push in between.
+  const dispatched = {
+    runs:[run(32, 'workflow_dispatch', J, 40), run(31, 'push', J, 35), run(30, 'workflow_dispatch', I, 30)],
+    artifacts:{32:buildOnly('main', 32, J), 31:buildOnly('main', 31, J), 30:deployedRun('main', 30, receipt('main', I, I))},
+  };
+  // (c) A preview push after a staging deployment.
+  const staged = {runs:[run(41, 'push', D, 20)], artifacts:{41:deployedRun('preview', 41, receipt('preview', S0, D))}};
+  for (const [label, scenario, ref, sha, expected] of [
+    ['(a) app-only main push after a push-only run', pushOnly, main, B, {changed:'false', source:S0, run:'20'}],
+    ['(a) image-changing main push after a push-only run', pushOnly, main, I, {changed:'true', source:S0, run:'20'}],
+    // An image built by a push but never deployed is still drift for its app-only successor.
+    ['(a) app-only push after an undeployed image build', {runs:[run(22, 'push', I, 40), ...pushOnly.runs],
+      artifacts:{...pushOnly.artifacts, 22:buildOnly('main', 22, I)}}, main, J, {changed:'true', source:S0, run:'20'}],
+    // A pre-cutover main push that deployed holds a receipt: the artifact decides, not the event.
+    ['(a) legacy main push deployment', {runs:[run(21, 'push', A, 30), run(20, 'push', D, 20)], artifacts:pushOnly.artifacts},
+      main, B, {changed:'false', source:S0, run:'20'}],
+    ['(b) Worker-only dispatch after a dispatch deploy', dispatched, main, J, {changed:'false', source:I, run:'30'}],
+    ['(b) image-changing dispatch after a dispatch deploy', dispatched, main, K, {changed:'true', source:I, run:'30'}],
+    ['(b) rerun dispatch deploy uses its own attempt', {runs:[run(60, 'workflow_dispatch', D, 20, {run_attempt:2})],
+      artifacts:{60:[{name:'live-evidence-main-60-1'}, ...deployedRun('main', 60, receipt('main', S0, D), 2)]}},
+      main, B, {changed:'false', source:S0, run:'60'}],
+    ['(c) app-only preview push', staged, preview, B, {changed:'false', source:S0, run:'41'}],
+    ['(c) image-changing preview push', staged, preview, I, {changed:'true', source:S0, run:'41'}],
+    // Negative controls: no receipt, an expired newest receipt, or an API failure rebuild.
+    ['no deployment receipt anywhere', {runs:[run(21, 'push', A, 30)], artifacts:{21:buildOnly('main', 21, A)}},
+      main, B, {changed:'true'}],
+    ['expired newest receipt never falls back to an older deployment', {
+      runs:[run(71, 'workflow_dispatch', I, 30), run(70, 'workflow_dispatch', D, 20)],
+      artifacts:{71:[{name:'live-evidence-main-71-1', expired:true, receipt:receipt('main', I, I)}],
+                 70:deployedRun('main', 70, receipt('main', S0, D))}}, main, B, {changed:'true'}],
+  ]) {
+    const {warnings, ...result} = await detectImageChange({ref, sha, ...scenario});
+    assert.equal(warnings, 0, label);
+    assert.deepEqual(Object.fromEntries(Object.entries(result).filter(([, v]) => v !== undefined)), expected, label);
+  }
+  const unavailable = await detectImageChange({ref:main, sha:B, ...pushOnly, failArtifacts:true});
+  assert.deepEqual(unavailable, {changed:'true', source:undefined, run:undefined, warnings:1});
 });
 
 test('successful deployment receipts preserve reused image source instead of the app-only commit', () => {

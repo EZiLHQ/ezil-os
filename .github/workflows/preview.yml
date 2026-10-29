@@ -73,19 +73,31 @@ jobs:
           script: |
             // A failed image push must remain drift on the following app-only push.
             // Use the image receipt from the last successful deployment, never event.before.
+            // Only the deploy jobs upload live-evidence; main pushes and unconfirmed
+            // dispatches succeed without deploying, so the artifact itself decides.
             try {
               const branch = context.ref.replace('refs/heads/', '');
               const {data} = await github.rest.actions.listWorkflowRuns({
                 ...context.repo, workflow_id: 'preview.yml', branch, status: 'success', per_page: 100,
               });
-              const run = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
+              const runs = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
                 && run.head_branch === branch && run.conclusion === 'success'
                 && ['push', 'workflow_dispatch'].includes(run.event)
-                && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))[0];
-              if (!run) return;
-              core.setOutput('run', String(run.id));
-              core.setOutput('sha', run.head_sha);
-              core.setOutput('artifact', `live-evidence-${branch}-${run.id}-${run.run_attempt}`);
+                && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+              for (const run of runs) {
+                const artifact = `live-evidence-${branch}-${run.id}-${run.run_attempt}`;
+                const {data: {artifacts}} = await github.rest.actions.listWorkflowRunArtifacts({
+                  ...context.repo, run_id: run.id, name: artifact, per_page: 100,
+                });
+                const evidence = artifacts.find(found => found.name === artifact);
+                if (!evidence) continue;
+                // The newest deployment decides; an expired receipt rebuilds, never an older one.
+                if (evidence.expired) return;
+                core.setOutput('run', String(run.id));
+                core.setOutput('sha', run.head_sha);
+                core.setOutput('artifact', artifact);
+                return;
+              }
             } catch {
               core.warning('Deployment evidence unavailable; rebuilding images');
             }

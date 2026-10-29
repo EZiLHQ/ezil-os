@@ -138,6 +138,23 @@ assert "run.path === '.github/workflows/preview.yml'" in lookup['with']['script'
 assert 'run.head_branch === branch' in lookup['with']['script']
 assert "['push', 'workflow_dispatch'].includes(run.event)" in lookup['with']['script']
 assert 'Date.parse(b.updated_at) - Date.parse(a.updated_at)' in lookup['with']['script']
+# A successful run is a baseline only if a deploy job uploaded its live evidence:
+# main pushes and unconfirmed dispatches succeed without one. The newest such
+# artifact decides; an expired one rebuilds instead of falling back further.
+assert 'const artifact = `live-evidence-${branch}-${run.id}-${run.run_attempt}`;' in lookup['with']['script']
+assert 'github.rest.actions.listWorkflowRunArtifacts({' in lookup['with']['script']
+assert 'run_id: run.id, name: artifact' in lookup['with']['script']
+assert 'artifacts.find(found => found.name === artifact)' in lookup['with']['script']
+assert 'if (!evidence) continue;' in lookup['with']['script']
+assert 'if (evidence.expired) return;' in lookup['with']['script']
+assert "core.setOutput('artifact', artifact);" in lookup['with']['script']
+assert 'inputs.' not in lookup['with']['script'] and '.event ===' not in lookup['with']['script']
+# Only the deploy jobs may produce that receipt; change detection and image builds never do.
+receipt_jobs = {name for name, job in preview['jobs'].items() for step in job.get('steps', [])
+                if step.get('uses', '').startswith('actions/upload-artifact@')
+                and step['with']['name'].startswith('live-evidence-')}
+assert receipt_jobs == {'preview', 'production'}, receipt_jobs
+assert 'live-evidence' not in (root / '.github/workflows/image.yml').read_text()
 evidence = next(step for step in changes['steps'] if step.get('id') == 'deployed_evidence')
 assert evidence['continue-on-error'] is True
 assert evidence['with']['run-id'] == '${{ steps.deployed.outputs.run }}'
@@ -335,6 +352,8 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     upload = by_name['Upload live evidence']
     assert upload['if'] == 'always()' and upload['uses'].startswith('actions/upload-artifact@')
     assert 'live-evidence' in upload['with']['path'].splitlines()
+    # The change-detection baseline looks up exactly this name; keep them in step.
+    assert upload['with']['name'] == 'live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}'
     assert position(check) < position(upload) < position(release)
     assert 'hosted-continuity-evidence/container-rollout.json' in upload['with']['path'].splitlines()
     receipt = by_name['Record successfully deployed image source']
