@@ -66,16 +66,15 @@ export function webUrl (value) {
 
 export const BANNED_COPY = ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour'];
 
-/** Format the canonical microcredit string without passing it through Number. */
+/**
+ * Credits are whole numbers on every user surface (founder 2026-10-29): the
+ * canonical microcredit string is floored without passing it through Number,
+ * and a plain balance is floored too. Never a fraction, never dollars.
+ */
 export function creditsLabel (micro, balance = null) {
-    if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) {
-        const value = BigInt(micro);
-        const fraction = String(value % 1000000n).padStart(6, '0').replace(/0+$/, '');
-        return `${(value / 1000000n).toLocaleString('en-US')}${fraction ? `.${fraction}` : ''}`;
-    }
+    if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) return (BigInt(micro) / 1000000n).toLocaleString('en-US');
     return typeof balance === 'number' && Number.isFinite(balance) && balance >= 0 && balance <= Number.MAX_SAFE_INTEGER
-        && Number(balance.toFixed(6)) === balance
-        ? balance.toLocaleString('en-US', { maximumFractionDigits: 6 }) : 'Not reported';
+        ? Math.floor(balance).toLocaleString('en-US') : 'Not reported';
 }
 
 // ── Round 3 (plan §6.3/§6.4, contract v3 D1/D3/D4) ───────────────────────────
@@ -119,9 +118,11 @@ export function planBullets (offer) {
         credits && `${credits} AI credits to start`,
         hours && `${hours} hours of computer time each month`,
     ]) };
+    // Round 5 D3: the plan's disk for a new computer (`offer.storageGiB`); 50 GB when an older server omits it.
+    const disk = known(offer.storageGiB) ? offer.storageGiB : PAID_DISK_GB;
     if ( offer.sku === 'standard_monthly_v3' ) return { lead: 'Everything in Free, plus:', bullets: keep([
         `Your own AWS computer${size}`,
-        `${PAID_DISK_GB} GB disk for your projects`,
+        `${disk} GB disk for your projects`,
         credits && `${credits} AI credits every month`,
         hours && `${hours} hours of computer time each month`,
     ]) };
@@ -132,7 +133,7 @@ export function planBullets (offer) {
     const most = Math.max(offer.memoryGiB ?? 0, ...choices.map(code => memory[code] ?? 0));
     return { lead: 'Everything in Standard, plus:', bullets: keep([
         listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `Your own AWS computer${size}`,
-        `${PAID_DISK_GB} GB disk for your projects`,
+        `${disk} GB disk for your projects`,
         credits && `${credits} AI credits every month`,
         hours && `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
     ]) };

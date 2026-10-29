@@ -148,7 +148,7 @@ await check('Billing: every meter means "left" (time, AI credits, storage)', () 
         assert.match(bar.getAttribute('aria-label') ?? '', /left/i, 'each bar is labelled as what is left');
         assert.equal(bar.getAttribute('aria-valuemin'), '0'); assert.equal(bar.getAttribute('aria-valuemax'), '100');
     }
-    assert.match(clean(el.querySelector('[data-role="meter-time"]')), /25 h left/);
+    assert.match(clean(el.querySelector('[data-role="meter-time"]')), /10 h left/);
     assert.match(clean(el.querySelector('[data-role="meter-ai"]')), /812 of 1,000 left/);
     assert.match(clean(el.querySelector('[data-role="meter-storage"]')), /38 GB left/);
     assert.doesNotMatch(summaryV3Html(s, usageDto()), /progressbar/i, 'Billing never renders progressbar (ui-copy.qa)');

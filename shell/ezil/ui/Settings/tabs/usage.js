@@ -29,8 +29,13 @@ const bytes = value => {
 const row = (label, value) => `<div class="usage-row"><dt>${esc(label)}</dt><dd>${value}</dd></div>`;
 const duration = value => `<span${count(value) ? ` title="${esc(value)} seconds"` : ''}>${esc(seconds(value))}</span>`;
 const ratio = (value, cap) => count(value) && count(cap) && cap > 0 ? Math.min(100, value / cap * 100) : null;
-const threshold = percent => percent === null ? 'unavailable' : percent >= 100 ? 'danger' : percent >= 80 ? 'warn' : 'ok';
 // Billing's existing /os deep links own plan changes and the AI credits flow.
+/** The EZiL ID link (`actions.ezilId`): an http(s) URL or a same-site path, opened in this tab. */
+const ezilIdHref = value => {
+    if (typeof value !== 'string' || !value) return null;
+    if (value.startsWith('/') && !value.startsWith('//')) return value;
+    try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) ? url.href : null; } catch { return null; }
+};
 const billingLink = (label, action, primary = false, query = '') => `<a class="ezil-settings-btn${primary ? ' ezil-settings-btn-primary' : ''}" data-action="${action}" href="/os?settings=billing${query}">${esc(label)}</a>`;
 const bar = (id, percent, text) => percent === null ? '' : `<div class="usage-capacity" role="progressbar" aria-labelledby="usage-${id}-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${esc(text)}"><span${percent > 0 ? ' class="usage-fill"' : ''} style="width:${percent}%"></span></div>`;
 const meter = (id, label, value, percent, text, note, state, action = '') => `<section class="usage-section usage-${state}" data-usage="${id}" data-state="${state}" aria-labelledby="usage-${id}-label">
@@ -43,10 +48,14 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const usage = data?.enabled === true ? data : null;
     const period = usage?.period ?? {}, current = usage?.session ?? {}, plan = summary?.plan, actions = summary?.actions ?? {};
     const resetsAt = validDate(period.resetsAt) ? period.resetsAt : summary?.fairUse?.resetsAt;
-    const timePercent = ratio(period.usedStandardSeconds, period.allowanceStandardSeconds);
-    const timeState = timePercent === null ? 'unavailable' : !summary ? 'ok'
-        : summary.fairUse?.status === 'paused' || timePercent >= 100 ? 'danger'
-        : summary.fairUse?.status === 'near' ? 'warn' : threshold(timePercent);
+    // Round 5 (D6): every bar is what is LEFT. Time: the server's remaining over this period's allowance.
+    const remainingSeconds = count(period.remainingStandardSeconds) ? period.remainingStandardSeconds
+        : count(period.usedStandardSeconds) && count(period.allowanceStandardSeconds) ? Math.max(0, period.allowanceStandardSeconds - period.usedStandardSeconds) : null;
+    const timeLeft = ratio(remainingSeconds, period.allowanceStandardSeconds);
+    const timePercent = timeLeft === null ? null : Math.floor(timeLeft);
+    const timeState = timePercent === null ? 'unavailable'
+        : summary?.fairUse?.status === 'paused' || remainingSeconds === 0 ? 'danger'
+        : summary?.fairUse?.status === 'near' ? 'warn' : 'ok';
     const paused = summary?.fairUse?.status === 'paused' || timeState === 'danger';
     const primary = plan?.status === 'past_due'
         ? actions.portal === true ? billingLink('Fix payment', 'usage-payment', true) : ''
@@ -70,23 +79,38 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
         : esc(lines?.equivalents ?? '');
     const ai = summary?.ai, grant = ai?.grant;
+    // Round 5 D1: an account without EZiL ID has its credits parked; the server says so, never "Unavailable".
+    const enrollment = ai ? ai.enrollment ?? 'enrolled' : null;
+    const waiting = ai?.waiting && Number.isSafeInteger(ai.waiting.credits) && ai.waiting.credits > 0 ? ai.waiting.credits : null;
+    const ezilHref = ezilIdHref(actions.ezilId);
     const included = ai?.included && Number.isSafeInteger(ai.included.remaining) && Number.isSafeInteger(ai.included.granted) && ai.included.granted > 0 ? ai.included : null;
+    // Whole credits only (founder 2026-10-29): the label floors, and so does the number behind the bar.
     const balanceLabel = creditsLabel(ai?.balanceMicro, ai?.balance);
-    const balance = included ? included.remaining : balanceLabel === 'Not reported' ? null : typeof ai?.balanceMicro === 'string' && /^\d{1,100}$/.test(ai.balanceMicro) ? Number(ai.balanceMicro) / 1000000 : ai.balance;
-    const aiPercent = ratio(balance, included ? included.granted : grant?.amount);
-    const aiState = balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
-        : ai?.state === 'low' || (aiPercent !== null && aiPercent <= 20) ? 'warn' : 'ok';
-    const grantLabel = included ? creditsLabel(null, included.granted) : count(grant?.amount) && grant.amount > 0 ? creditsLabel(null, grant.amount) : null;
+    const balance = included ? included.remaining : balanceLabel === 'Not reported' ? null : Number(balanceLabel.replace(/,/g, ''));
+    const denominator = included ? included.granted : count(grant?.amount) && grant.amount > 0 ? grant.amount : null;
+    const aboveGrant = !included && balance !== null && denominator !== null && balance > denominator;
+    const aiPercent = aboveGrant ? 100 : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
+    const aiState = enrollment && enrollment !== 'enrolled' ? 'pending' : balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
+        : ai?.state === 'low' ? 'warn' : 'ok';
+    const grantLabel = denominator !== null ? creditsLabel(null, denominator) : null;
     // "Your plan adds N every month" only when this period's grant is not split out: right after an upgrade it was false.
     const grantNote = included ? `Resets ${timestamp(included.periodEnd)}` : grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
         : grant.per === 'once' ? `Includes ${grantLabel} one-time trial credits` : '' : '';
+    const split = aboveGrant ? `${esc(grantLabel)} from your plan + ${esc(creditsLabel(null, balance - denominator))} extra` : '';
     const extras = [
         ai?.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining > 0 ? `+ ${esc(creditsLabel(null, ai.purchased.remaining))} purchased · expire ${timestamp(ai.purchased.expiresAt)}` : '',
         ai?.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining > 0 ? `${esc(creditsLabel(null, ai.starter.remaining))} starter credits left` : '',
         ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
     ].filter(Boolean);
-    const aiNote = [aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : grantNote, ...extras].filter(Boolean).join('<br>');
-    const aiValue = balance === null ? 'Unavailable' : `${esc(included ? creditsLabel(null, included.remaining) : balanceLabel)}${grantLabel ? ` of ${esc(grantLabel)}` : ''} left`;
+    const aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
+        : enrollment === 'activating' ? (waiting ? `${esc(creditsLabel(null, waiting))} credits are added when this finishes.` : '')
+        : [aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : split || grantNote, ...(split && aiState !== 'ok' ? [split] : []), ...extras].filter(Boolean).join('<br>');
+    const aiValue = enrollment === 'needs_ezil_id' ? waiting ? `${esc(creditsLabel(null, waiting))} credits waiting` : 'Not active yet'
+        : enrollment === 'activating' ? 'Setting up your AI credits…'
+        : balance === null ? 'Unavailable' : aboveGrant ? `${esc(balanceLabel)} left`
+        : `${esc(included ? creditsLabel(null, included.remaining) : balanceLabel)}${grantLabel ? ` of ${esc(grantLabel)}` : ''} left`;
+    const aiAction = enrollment === 'needs_ezil_id' ? ezilHref ? `<a class="ezil-settings-btn" data-action="ezil-id" href="${esc(ezilHref)}">Sign in with EZiL ID</a>` : ''
+        : enrollment === 'enrolled' && actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '';
     // Round 3 (D4): the provisioned disk; a used figure only when measured; Free shows no invented number.
     const storage = usage?.storage, samples = storage?.state === 'sampled' && Array.isArray(storage.samples) ? storage.samples : [];
     const disk = storage?.disk && typeof storage.disk === 'object' ? storage.disk : null;
@@ -94,18 +118,24 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const sizes = samples.map(sample => byteCount(sample.bytes));
     const total = sizes.length && sizes.every(count) ? sizes.reduce((sum, size) => sum + size, 0) : null;
     const usedBytes = byteCount(disk?.usedBytes) ?? (count(total) ? total : null);
-    const capBytes = byteCount(storage ? storage.capBytes : summary?.storage?.capBytes);
-    const storagePercent = ratio(usedBytes, capBytes), storageState = threshold(storagePercent);
+    // Round 5 (D6): the bar is the REAL disk left, only when both the disk and a used figure are known.
+    // The catalog's storage cap (a 2 GB display constant) is never shown as a disk.
+    const capBytes = diskGB ? diskGB * 1e9 : null;
+    const leftBytes = usedBytes !== null && capBytes !== null ? Math.max(0, capBytes - usedBytes) : null;
+    const storageLeft = ratio(leftBytes, capBytes);
+    const storagePercent = storageLeft === null ? null : Math.floor(storageLeft);
+    const storageState = storagePercent === null ? 'unavailable' : storagePercent === 0 ? 'danger' : storagePercent <= 10 ? 'warn' : 'ok';
     const measuredAt = samples.map(sample => sample.measuredAt).filter(validDate).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
-    const storageValue = usedBytes !== null && capBytes !== null ? `${esc(bytes(usedBytes))} of ${esc(diskGB ? `${diskGB} GB` : bytes(capBytes))}`
-        : diskGB ? `${diskGB} GB disk` : storage && storage.capBytes === null ? 'Saved with your computer' : 'Not measured yet';
+    const freePlan = summary?.plan?.sku === 'free_v3';
+    const storageValue = leftBytes !== null ? `${esc(bytes(leftBytes))} left`
+        : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : 'Not measured yet';
     const storageNote = storageState === 'danger' ? '■ Full. Delete files you no longer need.'
         : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
-        : diskGB ? `For your projects · the same on every configuration${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
-        : usedBytes !== null ? `Last measured ${timestamp(measuredAt)}` : storage && storage.capBytes === null ? 'Your files are saved with your computer.' : '';
+        : diskGB ? `${usedBytes !== null ? `${esc(bytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
+        : freePlan || (storage && storage.capBytes === null) ? 'Your files are saved between sessions.' : '';
     const sessionLine = !['recording', 'stale', 'ended'].includes(current.state) ? 'No session recorded yet.'
         : current.state === 'ended' ? `Last session: ${duration(current.elapsedSeconds)} · ended ${timestamp(current.endedAt)}`
-        : current.state === 'stale' || stale ? `This session: ${duration(current.elapsedSeconds)} so far · Update delayed`
+        : current.state === 'stale' || stale ? 'Measuring this session…'
         : `This session: ${duration(current.elapsedSeconds)} · running${validDate(summary?.computer?.activeDeadline) ? ` · ends ${timestamp(summary.computer.activeDeadline, true)}` : ''}`;
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
@@ -116,10 +146,9 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     <div class="usage-meters">
         ${meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
             `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
-        ${meter('ai', 'AI credits', aiValue, aiPercent, `${included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${!included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState,
-            actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '')}
+        ${meter('ai', 'AI credits', aiValue, aiPercent, `${aboveGrant ? balanceLabel : included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${aboveGrant ? ` ${split}.` : !included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState, aiAction)}
         ${meter('storage', 'Storage', storageValue, storagePercent,
-            `${bytes(usedBytes)} used of ${bytes(capBytes)}.`, storageNote, storageState)}
+            `${bytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState)}
     </div>
     <p class="usage-session-line" data-usage="session">${sessionLine}</p>
     <div class="usage-details">
@@ -127,7 +156,7 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
             ${weights.map(option => `<p class="usage-note">${esc(option.vcpu)} vCPU counts ${esc(option.weight)} h for each hour it runs.</p>`).join('')}
             ${weights.length ? '<p class="usage-note">Bigger configurations use your monthly time sooner, so the hours left depend on the configuration you run.</p>' : ''}
             <p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p></details>
-        <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Your computer's disk for your projects. It stays the same when you switch configuration. A used figure appears once it is measured.</p></details>
+        <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Storage is the disk on your computer; some space is used by the system. A used figure appears once it is measured.</p></details>
         <details data-usage-detail="session"><summary>Session details</summary><dl>${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}</dl></details>
     </div>`;
 }
@@ -188,7 +217,7 @@ async function load(state, manual = false) {
     }
     status.removeAttr('role').removeClass('usage-warning').text(state.usage ? 'Refreshing…' : 'Loading usage…');
     body.attr('aria-busy', 'true');
-    if (state.usage?.session.state === 'recording') body.find('.usage-session-line').html(`This session: ${duration(state.usage.session.elapsedSeconds)} so far · Update delayed`);
+    if (state.usage?.session.state === 'recording') body.find('.usage-session-line').text('Measuring this session…');
     // billing.summary has side effects (Stripe renewal preview, Gateway balance read, free-credit enqueue):
     // read it on open, on manual Refresh, or when older than five minutes. The 30 s poll reads usage only.
     const summaryDue = manual || state.summaryAt === undefined || Date.now() - state.summaryAt > SUMMARY_MAX_AGE_MS;
