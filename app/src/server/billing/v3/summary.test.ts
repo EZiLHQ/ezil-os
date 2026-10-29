@@ -237,10 +237,10 @@ describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () =>
         const args = input(sku); args.sizePreference = preference;
         const summary = buildSummaryV3(args);
         expect(summary.storage).toEqual({ usedBytes: '0', capBytes: GiB50, state: 'unavailable' });
-        expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null });
+        expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null, growsOnSwitch: false });
         args.storage = [{ computerId: 'c', bytes: BigInt(43) * BigInt(1024) ** BigInt(3), measuredAt: now }];
         expect(buildSummaryV3(args).storage).toEqual({ usedBytes: String(43 * 1024 ** 3), capBytes: GiB50, state: 'low' });
-        expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3) });
+        expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3), growsOnSwitch: false });
     });
     it('Free shows no invented cap, even with the large-storage flag or a sample', () => {
         const args = input(); args.config.largeStorageEnabled = true;
@@ -280,5 +280,20 @@ describe('round 4: standing fields (additive)', () => {
         args.subs = [{ ...args.subs[0]!, cancelAtPeriodEnd: true }];
         expect(buildSummaryV3(args)).toMatchObject({ plan: { status: 'cancels', planEndsAt: '2026-11-10T00:00:00Z', cancelsAt: '2026-11-10T00:00:00Z' },
             computer: { standing: 'plan_ending' } });
+    });
+});
+
+describe('round 5 contract pin (W0): enrollment, storage and heal fields default with no behaviour change', () => {
+    it.each([undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const)('%s: enrolled, nothing waiting, no EZiL ID link, no per-configuration disk', sku => {
+        for (const ai of [undefined, { receipts: [], gatewayGrants: [], balanceMicro: '0' }]) {
+            const summary = buildSummaryV3({ ...input(sku), ai });
+            expect(summary.ai.enrollment).toBe('enrolled');
+            expect(summary.ai.waiting).toBeNull();
+            expect(summary.actions.ezilId).toBeNull();
+            expect(summary.computer.machineChoice.length).toBeGreaterThan(0);
+            for (const option of summary.computer.machineChoice) expect(option.diskGiB).toBeNull();
+            expect(summary.computer.disk?.growsOnSwitch).toBe(false);
+            expect(summary.catalog.offers.map(offer => offer.storageGiB)).toEqual([null, 50, 100]);
+        }
     });
 });

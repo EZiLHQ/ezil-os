@@ -18,6 +18,7 @@ export function publicOffers(): PublicOfferV3[] {
         vcpu: offer.vcpu, memoryGiB: offer.memoryGiB, sessionMaxSeconds: offer.sessionMaxSeconds,
         opening: offer.opening, fairUseHours: offer.fairUseSeconds / 3600, highlighted: offer.highlighted,
         badge: offer.badge, machineChoice: [...offer.machineChoice], aiCredits: { ...offer.aiCredits }, bullets: [...offer.bullets],
+        storageGiB: offer.storageGiB,
     }));
 }
 
