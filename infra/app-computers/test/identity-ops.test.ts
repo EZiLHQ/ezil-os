@@ -338,7 +338,8 @@ test('I6 kill switch: exact statements and an operator path no bounded principal
 test('I6 ops: DLM volumes only, 12-hourly retain 14; budget 50/80/100; egress alarm; exact topic publishers; env guard', () => {
     const ops = stacks().ops, of = (type: string) => Object.values(ops.Resources).filter(r => r.Type === type).map(r => r.Properties);
     const [policy] = of('AWS::DLM::LifecyclePolicy');
-    assert.equal(policy.ExecutionRoleArn, `arn:aws:iam::${A}:role/service-role/AWSDataLifecycleManagerDefaultRole`);
+    // create-default-role puts the role at path "/" (the live service-role/ ARN failed sts:AssumeRole).
+    assert.equal(policy.ExecutionRoleArn, `arn:aws:iam::${A}:role/AWSDataLifecycleManagerDefaultRole`);
     assert.equal(policy.PolicyDetails.PolicyType, 'EBS_SNAPSHOT_MANAGEMENT');
     assert.deepEqual(policy.PolicyDetails.ResourceTypes, ['VOLUME']);
     assert.deepEqual(policy.PolicyDetails.TargetTags, [{ Key: 'ezil:backup', Value: 'pilot' }]);

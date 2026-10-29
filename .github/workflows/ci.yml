@@ -1,5 +1,6 @@
 # CI: Ubuntu checks for the web app, Worker, SDK and cloud images.
-# Deployment and live acceptance run on preview/main pushes in preview.yml.
+# Deployment and live acceptance run in preview.yml: staging on preview pushes,
+# legacy production only from a confirmed manual dispatch on main.
 name: CI
 
 on:

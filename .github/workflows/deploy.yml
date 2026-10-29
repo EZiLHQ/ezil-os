@@ -12,5 +12,5 @@ jobs:
     steps:
       - name: Explain the release flow
         run: |
-          echo '::error::This legacy deploy entry point is disabled; push/merge to main runs preview.yml#production. For a manual rerun, dispatch preview.yml on main.'
+          echo '::error::This legacy deploy entry point is disabled; push/merge to main never deploys production. To deploy or roll back the legacy Vercel/Worker production, dispatch preview.yml on main with deploy_production set.'
           exit 1

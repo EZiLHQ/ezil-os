@@ -1,4 +1,7 @@
-# Pushes deploy the selected environment before running its live check.
+# Preview pushes deploy staging before running its live check. Production is
+# moving to AWS: a push to main builds and tests images but never deploys. The
+# legacy Vercel/Worker production deploy (and its rollback) runs only from a
+# manual dispatch on main with deploy_production set; version tags only verify.
 # Configure staging/production environment secrets and OS_WORKER_URL separately.
 # Vercel rootDirectory=app; this workflow owns deployments and preview aliasing.
 name: Deploy and live check
@@ -8,6 +11,11 @@ on:
     branches: [preview, main]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      deploy_production:
+        description: 'On main only - deploy the legacy Vercel and Worker production (rollback path)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,19 +73,31 @@ jobs:
           script: |
             // A failed image push must remain drift on the following app-only push.
             // Use the image receipt from the last successful deployment, never event.before.
+            // Only the deploy jobs upload live-evidence; main pushes and unconfirmed
+            // dispatches succeed without deploying, so the artifact itself decides.
             try {
               const branch = context.ref.replace('refs/heads/', '');
               const {data} = await github.rest.actions.listWorkflowRuns({
                 ...context.repo, workflow_id: 'preview.yml', branch, status: 'success', per_page: 100,
               });
-              const run = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
+              const runs = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
                 && run.head_branch === branch && run.conclusion === 'success'
                 && ['push', 'workflow_dispatch'].includes(run.event)
-                && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))[0];
-              if (!run) return;
-              core.setOutput('run', String(run.id));
-              core.setOutput('sha', run.head_sha);
-              core.setOutput('artifact', `live-evidence-${branch}-${run.id}-${run.run_attempt}`);
+                && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+              for (const run of runs) {
+                const artifact = `live-evidence-${branch}-${run.id}-${run.run_attempt}`;
+                const {data: {artifacts}} = await github.rest.actions.listWorkflowRunArtifacts({
+                  ...context.repo, run_id: run.id, name: artifact, per_page: 100,
+                });
+                const evidence = artifacts.find(found => found.name === artifact);
+                if (!evidence) continue;
+                // The newest deployment decides; an expired receipt rebuilds, never an older one.
+                if (evidence.expired) return;
+                core.setOutput('run', String(run.id));
+                core.setOutput('sha', run.head_sha);
+                core.setOutput('artifact', artifact);
+                return;
+              }
             } catch {
               core.warning('Deployment evidence unavailable; rebuilding images');
             }
@@ -407,9 +427,10 @@ jobs:
   production:
     name: Deploy and verify production
     needs: [changes, images]
-    # A skipped image build must not skip deployments for app/Worker-only pushes.
+    # A skipped image build must not skip deployments for app/Worker-only runs.
+    # Main deploys only from a confirmed manual dispatch, never from a push or merge.
     if: >-
-      ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
+      ${{ !cancelled() && ((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_production == true) || startsWith(github.ref, 'refs/tags/v')) &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest

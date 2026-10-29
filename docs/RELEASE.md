@@ -1,15 +1,17 @@
 # OS production releases
 
-Successful push CI for the current `main` commit starts
-[Cloud preview and main deploy](../.github/workflows/preview.yml).
-Manual **Deploy**, **Deploy App**, and `v*` tags call that same workflow and
-require successful push CI for exactly the current main SHA. Deploy App is
-now a full gated release; its former frontend-only and verify-only bypasses
-are retired. Vercel Git previews remain enabled; automatic main Git deployment
-must remain disabled in `app/vercel.json`.
+Production is moving to AWS. A push or merge to `main` runs
+[Cloud preview and main deploy](../.github/workflows/preview.yml) to build and
+test images only; it never deploys production. The legacy Vercel/Worker
+production deploy, with its rollback, runs only when an operator dispatches that
+workflow on `main` with `deploy_production` set.
+Manual **Deploy** and **Deploy App** no longer deploy anything: they fail and
+direct operators to that dispatch. `v*` tags run the same workflow to verify
+production in place without redeploying. Vercel Git previews remain enabled;
+automatic main Git deployment must remain disabled in `app/vercel.json`.
 
 All OS jobs use GitHub-hosted runners, including exact-artifact Mac E2E on
-`macos-15`. Native/macOS rollout is outside the automatic main cloud release. On version tags, the independent
+`macos-15`. Native/macOS rollout is outside the cloud release. On version tags, the independent
 release workflow still builds signed native artifacts as drafts. Deploy waits
 for successful cloud verification and the signed macOS installer, attaches
 the version image alias to the tested digest, then publishes that draft.
@@ -23,7 +25,9 @@ the version image alias to the tested digest, then publishes that draft.
 3. The reusable Image workflow builds/reuses pinned Neko continuity, base, branding and desktop images
    for the admitted full source SHA, then runs all three existing real-container
    suites against the exact desktop digest; any skip fails the job.
-4. Production requires both staging and images to succeed. Under the common
+4. Production runs only from a dispatch on `main` with `deploy_production` set;
+   a push or merge to `main` stops after the images. It requires the image job
+   to succeed, or to be skipped because no image input changed. Under the common
    production lock, capture previous identities and reject unvalidated schema
    changes, then deploy Worker and Vercel from that source.
 5. Test both the returned Vercel URL and `https://os.ezil.org` (and check that the

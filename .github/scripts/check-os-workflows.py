@@ -74,7 +74,8 @@ browser_paths = {
 assert family_paths == browser_paths, family_paths ^ browser_paths
 assert 'shell/ezil/boot-test.mjs' in next(step['run'] for step in shell_steps if step.get('name') == 'Shell unit suites')
 
-# Push/dispatch deployment uses only the jobs designated by the shared contract.
+# Deployment uses only the jobs designated by the shared contract. A push to main
+# never deploys production: only a dispatch on main with deploy_production does.
 # YAML 1.1 interprets "on" as True.
 preview = workflows['preview']
 preview_text = (root / '.github/workflows/preview.yml').read_text()
@@ -83,13 +84,19 @@ assert not re.search(r'\bvercel\s+(?:alias\s+set|promote)\b', preview_text)
 triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
+assert set(triggers['workflow_dispatch']) == {'inputs'}
+assert set(triggers['workflow_dispatch']['inputs']) == {'deploy_production'}
+confirm = triggers['workflow_dispatch']['inputs']['deploy_production']
+assert confirm['type'] == 'boolean' and confirm['default'] is False and 'required' not in confirm
+# Only the production job gate reads it, as a boolean (github.event.inputs is a string).
+assert preview_text.count('inputs.deploy_production') == 1 and 'github.event.inputs' not in preview_text
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
 assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production'}
 assert not (root / '.github/workflows/live.yml').exists()
 assert 'live.yml' not in (root / '.github/workflows/ci.yml').read_text()
 
-# Legacy entry points retain their designated job but direct operators to main.
+# Legacy entry points retain their designated job but direct operators to the main dispatch.
 for name in ('deploy', 'deploy-app'):
     fallback = workflows[name]
     assert set(fallback.get('on', fallback.get(True))) == {'workflow_dispatch'}, name
@@ -101,7 +108,8 @@ for name in ('deploy', 'deploy-app'):
     assert len(job['steps']) == 1, name
     step = job['steps'][0]
     assert set(step) <= {'name', 'run'}, name
-    assert 'push/merge to main runs preview.yml#production' in step['run'], name
+    assert 'push/merge to main never deploys production' in step['run'], name
+    assert 'dispatch preview.yml on main with deploy_production set' in step['run'], name
     assert step['run'].strip().endswith('exit 1'), name
 
 # Keep the CI scan unconditional; deployment assertions must precede any work.
@@ -130,6 +138,23 @@ assert "run.path === '.github/workflows/preview.yml'" in lookup['with']['script'
 assert 'run.head_branch === branch' in lookup['with']['script']
 assert "['push', 'workflow_dispatch'].includes(run.event)" in lookup['with']['script']
 assert 'Date.parse(b.updated_at) - Date.parse(a.updated_at)' in lookup['with']['script']
+# A successful run is a baseline only if a deploy job uploaded its live evidence:
+# main pushes and unconfirmed dispatches succeed without one. The newest such
+# artifact decides; an expired one rebuilds instead of falling back further.
+assert 'const artifact = `live-evidence-${branch}-${run.id}-${run.run_attempt}`;' in lookup['with']['script']
+assert 'github.rest.actions.listWorkflowRunArtifacts({' in lookup['with']['script']
+assert 'run_id: run.id, name: artifact' in lookup['with']['script']
+assert 'artifacts.find(found => found.name === artifact)' in lookup['with']['script']
+assert 'if (!evidence) continue;' in lookup['with']['script']
+assert 'if (evidence.expired) return;' in lookup['with']['script']
+assert "core.setOutput('artifact', artifact);" in lookup['with']['script']
+assert 'inputs.' not in lookup['with']['script'] and '.event ===' not in lookup['with']['script']
+# Only the deploy jobs may produce that receipt; change detection and image builds never do.
+receipt_jobs = {name for name, job in preview['jobs'].items() for step in job.get('steps', [])
+                if step.get('uses', '').startswith('actions/upload-artifact@')
+                and step['with']['name'].startswith('live-evidence-')}
+assert receipt_jobs == {'preview', 'production'}, receipt_jobs
+assert 'live-evidence' not in (root / '.github/workflows/image.yml').read_text()
 evidence = next(step for step in changes['steps'] if step.get('id') == 'deployed_evidence')
 assert evidence['continue-on-error'] is True
 assert evidence['with']['run-id'] == '${{ steps.deployed.outputs.run }}'
@@ -197,8 +222,11 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert job['environment'] == environment
     assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (42 if job_name == 'preview' else 71)
     assert job['needs'] == ['changes', 'images']
+    # Production on main needs the event and the confirmation, so a push or a
+    # merge to main can never satisfy it; tags only verify (asserted below).
     ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
-                     "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))")
+                     "((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && "
+                     "inputs.deploy_production == true) || startsWith(github.ref, 'refs/tags/v'))")
     assert ' '.join(job['if'].split()) == (
         "${{ !cancelled() && " + ref_condition + " && "
         "needs.changes.result == 'success' && "
@@ -324,6 +352,8 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     upload = by_name['Upload live evidence']
     assert upload['if'] == 'always()' and upload['uses'].startswith('actions/upload-artifact@')
     assert 'live-evidence' in upload['with']['path'].splitlines()
+    # The change-detection baseline looks up exactly this name; keep them in step.
+    assert upload['with']['name'] == 'live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}'
     assert position(check) < position(upload) < position(release)
     assert 'hosted-continuity-evidence/container-rollout.json' in upload['with']['path'].splitlines()
     receipt = by_name['Record successfully deployed image source']
