@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as cloudflare from '../cloudflare-guacamole-provider';
@@ -307,6 +309,52 @@ describe('actual placement versus paid entitlement', () => {
     });
 });
 const ON_ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1' };
+
+describe('hotfix 3: a stored switch failure is reconciled against the placement (System plan row)', () => {
+    // 2026-10-29: std-2 → cmp-4 failed in its stop phase at epoch 7 (no wake recorded); a heal released the
+    // host and the user's own open came up RUNNING at epoch 8 on m6i.xlarge = the switch's target.
+    const stopFailed = { v: 1, transitionId: '44444444-4444-4444-8444-444444444444', requestId: 'request-0001', kind: 'switch', computerId, userId: OWNER,
+        current: 'std-2', target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed', fromGeneration: 3, fromLeaseEpoch: 7,
+        requestedAt: '2026-10-29T09:36:00.000Z', stoppingAt: '2026-10-29T09:36:00.000Z', wakingAt: null, endedAt: '2026-10-29T09:40:00.000Z' };
+    const dialect = new PgDialect();
+    /** The fake placement db plus the computer row's advisory transition record (`readComputerMeta`). */
+    function awsDb(placement: { lease_epoch: number; instance_type: string; state?: string }, transition: unknown = stopFailed) {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, owner_user_id: OWNER, region: 'ap-south-1',
+            generation: 4, state: 'RUNNING', ...placement })] });
+        return { execute: async (query: SQL) => dialect.sqlToQuery(query).sql.includes('/* transition:read */')
+            ? { rows: [{ transition, opening: null }] } : db.execute(query) };
+    }
+    async function system(db: ReturnType<typeof awsDb>, size: 'cmp-4' | 'cmp-8') {
+        const billing = await import('@/server/billing/v2/compute-access');
+        const migrations = await import('./provider-migrate-orchestrator');
+        vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => ({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size }) });
+        vi.spyOn(migrations, 'migrationStatusFor').mockResolvedValue(null);
+        return readSystemInfo(db, computer, { ...READS, ...ON_ENV });
+    }
+    it('recovered (next epoch RUNNING on the target): ready on the placement size, no transition', async () => {
+        const info = await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.xlarge' }), 'cmp-4');
+        expect(info?.machine).toMatchObject({ instanceType: 'm6i.xlarge', vcpu: 4 });
+        expect(info?.plan).toMatchObject({ status: 'ready', reason: null, current: 'cmp-4', selected: 'cmp-4', transition: null });
+    });
+    it('recovered with a different next-start choice: the pending selection is still reported', async () => {
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.xlarge' }), 'cmp-8'))?.plan)
+            .toMatchObject({ status: 'ready', current: 'cmp-4', selected: 'cmp-8', vcpu: 8, transition: null });
+    });
+    it('a real failure (still the switch\'s epoch on the old size) stays failed with the pre-switch size', async () => {
+        expect((await system(awsDb({ lease_epoch: 7, instance_type: 'm6i.large' }), 'cmp-4'))?.plan).toMatchObject({ status: 'failed',
+            reason: 'stop_placement_unconfirmed', current: 'std-2', transition: { phase: 'failed', current: 'std-2', target: 'cmp-4', revertAvailable: true } });
+        expect((await system(awsDb({ lease_epoch: 7, instance_type: 'm6i.large', state: 'STOPPED' }), 'cmp-4'))?.plan).toMatchObject({ status: 'failed' });
+    });
+    it('superseded (no wake recorded; the next epoch is the user\'s own open on another size): ready, no transition', async () => {
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null });
+    });
+    it('its own wake landed on another size: failed size_not_applied', async () => {
+        const woke = { ...stopFailed, reason: 'wake_timeout', wakingAt: '2026-10-29T09:37:00.000Z' };
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }, woke), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'failed', reason: 'size_not_applied', transition: { reason: 'size_not_applied', revertAvailable: true } });
+    });
+});
 
 it('wires computer-scoped migration status into the production System data path', async () => {
     const billing = await import('@/server/billing/v2/compute-access');

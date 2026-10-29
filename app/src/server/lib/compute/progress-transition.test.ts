@@ -1,12 +1,17 @@
 /** Round 3: switch/restart transitions and the server-stamped opening (contract v3 OpeningProgressV3). */
-import { describe, expect, it } from 'vitest';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OPENING_MILESTONES_V3 } from '@/server/billing/v3/contract';
 import { SWITCH_DEMAND_WINDOW_MS } from './ready-pool';
+import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { Placement } from './placement';
 import {
-    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, reconcileTransition, resolveTransition, transitionView,
+    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, readComputerProgress, reconcileTransition, resolveTransition, transitionView,
     TRANSITION_MAX_AGE_MS, TRANSITION_STOP_GRACE_MS, TRANSITION_STOP_TIMEOUT_MS, TRANSITION_WAKE_TIMEOUT_MS, type ComputerTransition, type OpeningRecord,
 } from './progress';
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('No live billing DB in tests'); } }));
 
 const C = 'abcdefab-abcd-4abc-8abc-abcdefabcdef';
 const U = '11111111-1111-4111-8111-111111111111';
@@ -231,3 +236,27 @@ describe('describeProgress: OpeningProgressV3 fields, capacity wait, expected se
     });
 });
 function nonceIn(s: number) { return new Date(T0.getTime() + s * 1000); }
+
+describe('readComputerProgress: the progress DTO carries the reconciled transition', () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+    const dialect = new PgDialect();
+    const stopFailed = transition({ target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed', endedAt: at(200).toISOString() });
+    async function progressOf(row: { lease_epoch: number; instance_type: string; state?: string }, stored: ComputerTransition) {
+        const billing = await import('@/server/billing/v2/compute-access');
+        vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => null });
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: C, owner_user_id: U, region: 'ap-south-1', generation: 4, state: 'RUNNING', ...row })] });
+        const wrapped = { execute: async (query: SQL) => dialect.sqlToQuery(query).sql.includes('/* transition:read */')
+            ? { rows: [{ transition: stored, opening: null }] } : db.execute(query) };
+        return readComputerProgress(wrapped, { computerId: C, userId: U }, env, at(1800));
+    }
+    it('recovered: done with no revert; superseded: none; a real failure: failed with its revert', async () => {
+        expect((await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed))?.transition)
+            .toMatchObject({ phase: 'done', reason: null, revertAvailable: false, current: 'std-2', target: 'cmp-4' });
+        expect((await progressOf({ lease_epoch: 8, instance_type: 'm6i.large' }, stopFailed))?.transition).toBeNull();
+        expect((await progressOf({ lease_epoch: 7, instance_type: 'm6i.large' }, stopFailed))?.transition)
+            .toMatchObject({ phase: 'failed', reason: 'stop_placement_unconfirmed', revertAvailable: true });
+    });
+    it('a recovered failure never relabels the RUNNING computer as a switch opening', async () => {
+        expect(await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed)).toMatchObject({ stage: 'running', operation: 'none', path: null, openingStartedAt: null });
+    });
+});
