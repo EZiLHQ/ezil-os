@@ -32,8 +32,9 @@ export const SNAPSHOT_INTERVAL_HOURS = 12, SNAPSHOT_RETAIN_COUNT = 14;
 /** The AWS-managed DLM role (created once by `aws dlm create-default-role`).
  * It is outside the boundary on purpose: DLM must delete the snapshots it
  * rotated, which every bounded principal is denied. It can touch only
- * snapshots created by its own policies. */
-export const dlmRoleArn = (accountId: string) => `arn:aws:iam::${accountId}:role/service-role/AWSDataLifecycleManagerDefaultRole`;
+ * snapshots created by its own policies. That command creates it at path "/";
+ * a service-role/ ARN names no role and DLM fails with sts:AssumeRole. */
+export const dlmRoleArn = (accountId: string) => `arn:aws:iam::${accountId}:role/AWSDataLifecycleManagerDefaultRole`;
 
 /** Founder-owned operator objects live here, outside every bounded path. */
 export const OPERATOR_PATH = '/ezil/operators/';
