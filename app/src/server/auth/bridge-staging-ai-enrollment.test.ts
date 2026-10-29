@@ -95,6 +95,19 @@ describe('Auth0 bridge staging enrollment boundary', () => {
         }
     });
 
+    // Review fix (r5 L1): the email confirm must never run for an account whose stored subject belongs
+    // to another EZiL ID identity, so the conflict fixture here is unconfirmed (the confirm branch is live).
+    it.each([['null', null], ['missing', undefined]] as const)
+    ('never confirms the email of a conflicting account (email_confirmed_at %s)', async (_name, confirmedAt) => {
+        stub.listUsers.mockResolvedValue({ data: { users: [{
+            ...user, email_confirmed_at: confirmedAt, app_metadata: { auth0_sub: 'auth0|another' },
+        }] }, error: null });
+        await expect(bridgeAuth0Identity(identity)).rejects.toMatchObject({ code: 'account_conflict' });
+        for (const fn of [stub.createUser, stub.updateUserById, stub.enroll, stub.generateLink, stub.verifyOtp]) {
+            expect(fn).not.toHaveBeenCalled();
+        }
+    });
+
     it.each(['listUsers', 'createUser', 'updateUserById'] as const)('does not enroll after %s fails', async method => {
         if (method === 'updateUserById') stub.listUsers.mockResolvedValue({ data: { users: [{ ...user, app_metadata: {} }] }, error: null });
         stub[method].mockResolvedValue({ data: null, error: { message: 'provider fixture failure' } });

@@ -21,10 +21,11 @@ const iso = (date: Date) => isoSeconds(epochSeconds(date));
 
 /**
  * Round 5 D1: whole credits granted to an account that is not enrolled yet: stored grant receipts the
- * Gateway has not acknowledged and that have not expired. null when nothing waits or receipts are unreadable.
+ * Gateway has not acknowledged, that have not expired and whose delivery has not failed terminally.
+ * null when nothing waits or receipts are unreadable.
  */
 function waitingCredits(receipts: readonly AiCreditReceipt[] | null, now: Date): { credits: number } | null {
-    const credits = (receipts ?? []).reduce((sum, receipt) => receipt.deliveredAt === null
+    const credits = (receipts ?? []).reduce((sum, receipt) => receipt.deliveredAt === null && !receipt.failed
         && Date.parse(receipt.expiresAt) > now.getTime() ? sum + receipt.credits : sum, 0);
     return credits > 0 ? { credits } : null;
 }

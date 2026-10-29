@@ -25,7 +25,7 @@ export type AiEnrollRefusal = typeof AI_ENROLL_SQL_REFUSALS[number] | 'unknown_r
 export type AiEnrollCode = AiEnrollRefusal | typeof AI_ENROLL_UNAVAILABLE[number];
 export type AiEnrollSource = 'auth0' | 'outbox';
 export type AiEnrollResult = { ok: true } | { ok: false; code: AiEnrollCode };
-type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'enqueue' | 'done';
+type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'kick' | 'enqueue' | 'done';
 
 const SQL_REFUSALS: ReadonlySet<string> = new Set(AI_ENROLL_SQL_REFUSALS);
 export const isAiEnrollRefusal = (code: AiEnrollCode): code is AiEnrollRefusal => SQL_REFUSALS.has(code) || code === 'unknown_refusal';
@@ -47,9 +47,10 @@ class EnrollFailure extends Error {
 type SocketAddress = { host: string[]; port: number[]; path?: string };
 
 /**
- * Enrolls the OS user as an AI Gateway member (no grant, no kick). `sub` must be the user's Auth0
- * subject: freshly verified at sign-in, or the stored `app_metadata.auth0_sub` (round 5 D1; the SQL
- * function re-checks it against the auth user). Never throws; logs one coded `ai-enroll` line.
+ * Enrolls the OS user as an AI Gateway member, then kicks this user's outbox rows that wait on the
+ * AI account (no Free receipt). `sub` must be the user's Auth0 subject: freshly verified at sign-in,
+ * or the stored `app_metadata.auth0_sub` (round 5 D1; the SQL function re-checks it against the auth
+ * user). Never throws; logs one coded `ai-enroll` line.
  */
 export function enrollAiMember(authUserId: string, sub: string, source: AiEnrollSource): Promise<AiEnrollResult> {
     return runEnrollment(authUserId, sub, source, false);
@@ -57,8 +58,8 @@ export function enrollAiMember(authUserId: string, sub: string, source: AiEnroll
 
 /**
  * Sign-in enrollment, called only after linking an identity whose Auth0 ID token has been verified:
- * enrolls, then (same owned client, app privileges) enqueues the Free receipt and kicks this user's
- * outbox rows that wait on the AI account so they deliver on the next sweep.
+ * enrolls, kicks this user's outbox rows that wait on the AI account so they deliver on the next
+ * sweep, then (same owned client, app privileges) enqueues the Free receipt.
  */
 export function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub: string): Promise<AiEnrollResult> {
     return runEnrollment(authUserId, verifiedAuth0Sub, 'auth0', true);
@@ -172,12 +173,21 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
                 const error = enrollment?.ok === false && typeof enrollment.error === 'string' ? enrollment.error : '';
                 throw new EnrollFailure(SQL_REFUSALS.has(error) ? error as AiEnrollRefusal : 'unknown_refusal');
             }
+            // COMMIT reset the local role. Use the original app privileges on
+            // this same owned client from here on.
+            // Round 5 D1 kick: wake this user's rows waiting on the AI account (every source, so a
+            // drain enrollment wakes sibling rows parked as needs_ezil_id). Its own transaction, before
+            // and independent of the Free receipt, so a receipt failure never rolls it back. Best
+            // effort: a failure leaves those rows on their schedule and never fails the enrollment
+            // (the deadline still applies: it rejects the race on its own).
+            stage = 'kick';
+            const now = new Date();
+            await transaction(() => query(AI_CREDIT_KICK_SQL, [authUserId, String(now.getTime()), AI_CREDIT_PROTOCOL]))
+                .catch(() => {});
             if (!afterSignIn) return;
 
-            // COMMIT reset the local role. Use the original app privileges on
-            // this same owned client; enqueue failure preserves the enrollment.
+            // Enqueue failure preserves the enrollment and the kick.
             stage = 'enqueue';
-            const now = new Date();
             const entitlement = aiCreditEntitlement({
                 userId: authUserId, sku: 'free_v3', subscriptionId: null,
                 periodStart: now, periodEnd: null, invoiceId: null,
@@ -188,7 +198,6 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
                 await query(`insert into public.ezil_billing_outbox (event_key, user_id, kind, payload)
                     values ($1, $2::uuid, $3, $4::jsonb) on conflict do nothing`,
                 [item.eventKey, item.userId, item.kind, JSON.stringify(item.payload)]);
-                await query(AI_CREDIT_KICK_SQL, [authUserId, String(now.getTime()), AI_CREDIT_PROTOCOL]);
             });
         }
 

@@ -26,7 +26,7 @@ export type AiEnrollForResult = 'enrolled' | 'needs_ezil_id' | `refused:${string
 /** At most this many enrollment attempts per drain pass (each user at most once). */
 export const AI_ENROLL_MAX_PER_PASS = 3;
 /**
- * Worst-case enrollFor time: the bounded admin user read (2 s) + the owned-client work (5 s,
+ * Worst-case enrollFor time: the admin read and any email confirm (one shared 2 s window) + the owned-client work (5 s,
  * staging-ai-enrollment.ts WORK_MS) + close (1 s) + 1 s margin. The drain enrolls only while this
  * plus one Gateway request (10 s + 1 s) still fits before the deadline, i.e. with >= 20 s left.
  */
@@ -34,8 +34,11 @@ export const AI_ENROLL_BUDGET_MS = 9_000;
 export const AI_ENROLL_ADMIN_READ_MS = 2_000;
 /** needs_ezil_id rows wait a day (not hourly); a successful EZiL ID sign-in kicks them at once. */
 export const AI_NEEDS_EZIL_ID_PARK_MS = 24 * 3_600_000;
-/** A user's stored AI grant receipt: the frozen wire terms and whether the Gateway acknowledged it. */
-export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null }
+/**
+ * A user's stored AI grant receipt: the frozen wire terms and whether the Gateway acknowledged it.
+ * `failed` (round 5 D1): delivery ended terminally (never "waiting"; an operator requeue clears it).
+ */
+export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null; failed?: true }
 export interface AiCreditOutboxStore {
     claim(now: number): Promise<AiCreditOutboxRow | null>;
     accountFor(row: AiCreditOutboxRow): Promise<string | null>;
@@ -148,6 +151,9 @@ export async function drainAiCreditOutbox(deps: {
                     enroll = await enrollOnce(row.userId);
                     if (enroll === 'enrolled') account = await store.accountFor(row);
                 }
+                // A sign-in can link, enroll and kick while this row is processing (the kick skips
+                // processing rows): re-read the account before parking it for a day (lost wakeup).
+                if (!account && enroll === 'needs_ezil_id') account = await store.accountFor(row);
                 if (!account) {
                     result = { status: 'retry', reason: 'no_ai_account',
                         ...(enroll && enroll !== 'deferred' ? { blockedBy: enroll } : {}),

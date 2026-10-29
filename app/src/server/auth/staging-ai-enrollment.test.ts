@@ -18,7 +18,7 @@ vi.mock('./supabase-admin', () => ({ createAdminClient: () => ({ auth: { admin: 
 } } }) }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { verifyOtp: stub.verifyOtp } }) }));
 
-import { AI_ENROLL_SQL_REFUSALS, enrollAiMember, enrollStagingAiMember } from './staging-ai-enrollment';
+import { AI_ENROLL_SQL_REFUSALS, AI_ENROLL_UNAVAILABLE, enrollAiMember, enrollStagingAiMember, isAiEnrollRefusal } from './staging-ai-enrollment';
 import { bridgeAuth0Identity } from './bridge';
 
 const userId = '3f2f95a1-5420-4a63-94f9-79b85a1ceeb4';
@@ -26,7 +26,7 @@ const sub = 'auth0|verified-subject';
 const firstGrant = new Date('2026-10-26T00:00:00.000Z');
 const narrowRole = 'ezil_os_ai_enroller';
 const fixtureUrl = 'postgres://fixture:fixture@db.example.test:5432/fixture?sslmode=require';
-type Stage = 'acquire' | 'role' | 'probe' | 'enroll' | 'outbox' | 'kick' | 'enroll_commit' | 'outbox_commit';
+type Stage = 'acquire' | 'role' | 'probe' | 'enroll' | 'outbox' | 'kick' | 'enroll_commit' | 'kick_commit' | 'outbox_commit';
 type ClientOptions = {
     max: number; max_pipeline: number; prepare: boolean; fetch_types: boolean; connect_timeout: number;
     socket: (address: { host: string[]; port: number[]; path?: string }) => Promise<FakeSocket>;
@@ -94,7 +94,7 @@ class FakeClient {
         if (statement.startsWith('select ezil_works.enroll_ai_member')) return 'enroll';
         if (statement.startsWith('insert into')) return 'outbox';
         if (statement.startsWith('update public.ezil_billing_outbox')) return 'kick';
-        if (statement === 'commit') return this.transaction === 1 ? 'enroll_commit' : 'outbox_commit';
+        if (statement === 'commit') return this.transaction === 1 ? 'enroll_commit' : this.pendingKick ? 'kick_commit' : 'outbox_commit';
     }
     unsafe = vi.fn(async (statement: string, parameters: string[] = []) => {
         this.queries.push({ statement, parameters, role: this.role, at: performance.now() });
@@ -239,7 +239,8 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(all[enroll].role).toBe(narrowRole);
         expect(all[insert].role).toBe('postgres');
         expect(clients[0].role).toBe('postgres');
-        expect(all.filter(query => query.statement === 'commit')).toHaveLength(2);
+        // Enrollment, the account-wait kick and the Free receipt each commit on their own.
+        expect(all.filter(query => query.statement === 'commit')).toHaveLength(3);
     });
 
     it('parameterizes the exact linked UUID and verified Auth0 subject', async () => {
@@ -285,7 +286,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
                 action: 'grant', credits: 100, expiresAt: '2027-10-26T00:00:00.000Z',
             },
         }]);
-        expect(effects.map(effect => effect.kind)).toEqual(['enrollment', 'receipt', 'kick']);
+        expect(effects.map(effect => effect.kind)).toEqual(['enrollment', 'kick', 'receipt']);
     });
 
     it('preserves the first Free receipt on repeated/concurrent existing-member sign-ins', async () => {
@@ -312,8 +313,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
 
     it.each([
         ['role', 'role', 'set_role_failed'], ['probe', 'probe', 'probe_failed'], ['enroll', 'enroll', 'unknown_refusal'],
-        ['enroll_commit', 'enroll', 'unknown_refusal'], ['outbox', 'enqueue', 'enqueue_failed'],
-        ['kick', 'enqueue', 'enqueue_failed'], ['outbox_commit', 'enqueue', 'enqueue_failed'],
+        ['enroll_commit', 'enroll', 'unknown_refusal'],
     ] as const)('rolls back local role/pending receipt on %s failure and logs one coded line (stage %s, code %s)', async (stage, logged, code) => {
         failStage = stage;
         await expect(enrollStagingAiMember(userId, sub)).resolves.toEqual({ ok: false, code });
@@ -321,8 +321,33 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(clients[0].role).toBe('postgres');
         expect(receipts.size).toBe(0);
         expect(kicks).toEqual([]);
-        expect(clients[0].enrolled).toBe(logged === 'enqueue');
+        expect(clients[0].enrolled).toBe(false);
         expect(warn.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: logged, code })]]);
+    });
+
+    // Review fix (r5 L1): the kick commits on its own, before and independent of the Free receipt, so a
+    // receipt failure after a committed enrollment never strands rows parked on the account.
+    it.each(['outbox', 'outbox_commit'] as const)('keeps the committed kick when the Free receipt fails at %s', async stage => {
+        failStage = stage;
+        await expect(enrollStagingAiMember(userId, sub)).resolves.toEqual({ ok: false, code: 'enqueue_failed' });
+        expect(queries().at(-1)?.statement).toBe('rollback');
+        expect(clients[0].enrolled).toBe(true);
+        expect(kicks).toEqual([[userId, String(firstGrant.getTime()), 'ezil-ai-credits-v1']]);
+        expect(receipts.size).toBe(0);
+        expect(clients[0].role).toBe('postgres');
+        expect(warn.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'enqueue', code: 'enqueue_failed' })]]);
+    });
+
+    it.each(['kick', 'kick_commit'] as const)('treats a %s failure as best effort: still enrolled, Free receipt still queued', async stage => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        failStage = stage;
+        await expect(enrollStagingAiMember(userId, sub)).resolves.toEqual({ ok: true });
+        expect(clients[0].enrolled).toBe(true);
+        expect(kicks).toEqual([]);
+        expect([...receipts.keys()]).toEqual([`ezil-os:v1:free-once:${userId}:grant`]);
+        expect(clients[0].role).toBe('postgres');
+        expect(warn).not.toHaveBeenCalled();
+        expect(info.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null })]]);
     });
 
     it('retries the same entitlement after an outbox rollback without changing existing membership', async () => {
@@ -361,7 +386,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(effects).toEqual([]);
     });
 
-    it.each(['acquire', 'role', 'probe', 'enroll', 'outbox', 'enroll_commit', 'outbox_commit'] as const)
+    it.each(['acquire', 'role', 'probe', 'enroll', 'kick', 'outbox', 'enroll_commit', 'kick_commit', 'outbox_commit'] as const)
     ('closes before returning at the deadline and sends no late SQL after a stalled %s', async stage => {
         holdStage = stage;
         const signingIn = mockSignIn()();
@@ -517,13 +542,15 @@ describe('round 5 D1: coded enrollment split (enrollAiMember)', () => {
         expect(warn.mock.calls).toEqual([line('outbox', 'config', 'disabled')]);
     });
 
-    it('enrolls only: one owned client, no Free receipt, no kick, one success line', async () => {
+    it('drain enrollment: one owned client, no Free receipt, kicks the user\'s other account waits, one success line', async () => {
         await expect(enrollAiMember(userId, sub, 'outbox')).resolves.toEqual({ ok: true });
         expect(clients).toHaveLength(1);
         expect(clients[0].enrolled).toBe(true);
         expect(receipts.size).toBe(0);
-        expect(kicks).toEqual([]);
-        expect(queries().some(query => /^(insert|update)\b/.test(query.statement.trim()))).toBe(false);
+        // Review fix (r5 L1): a drain enrollment also wakes sibling rows parked as needs_ezil_id.
+        expect(kicks).toEqual([[userId, String(firstGrant.getTime()), 'ezil-ai-credits-v1']]);
+        expect(queries().some(query => /^insert\b/.test(query.statement.trim()))).toBe(false);
+        expect(effects.map(effect => effect.kind)).toEqual(['enrollment', 'kick']);
         expect(info.mock.calls).toEqual([line('outbox', 'done', null)]);
         expect(warn).not.toHaveBeenCalled();
         expect(clients[0].closed).toBe(true);
@@ -541,6 +568,17 @@ describe('round 5 D1: coded enrollment split (enrollAiMember)', () => {
         expect(kick.statement).toMatch(/delivered_at is null/);
         expect(kick.statement).not.toMatch(/attempts/);
         expect(info.mock.calls).toEqual([line('auth0', 'done', null)]);
+    });
+
+    it.each([...AI_ENROLL_SQL_REFUSALS, 'unknown_refusal'] as const)('isAiEnrollRefusal(%s) is true', code => {
+        expect(isAiEnrollRefusal(code)).toBe(true);
+    });
+    it.each([...AI_ENROLL_UNAVAILABLE])('isAiEnrollRefusal(%s) is false: an OS-side failure, not the member', code => {
+        expect(isAiEnrollRefusal(code)).toBe(false);
+    });
+    it('pins all fourteen codes', () => {
+        expect(AI_ENROLL_SQL_REFUSALS.length + 1 + AI_ENROLL_UNAVAILABLE.length).toBe(14);
+        expect([...AI_ENROLL_UNAVAILABLE]).toEqual(['set_role_failed', 'probe_failed', 'timeout', 'connect_failed', 'enqueue_failed', 'disabled']);
     });
 
     it.each([...AI_ENROLL_SQL_REFUSALS])('never kicks or enqueues after refusal %s', async code => {

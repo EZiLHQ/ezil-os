@@ -330,6 +330,14 @@ describe('round 5 D1: AI enrollment, waiting credits and the EZiL ID action', ()
         expect(summary.actions).toMatchObject({ topup: false, ezilId: null });
         expect(buildSummaryV3({ ...input(), ai: { ...ai, receipts: null }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: null } }).ai.waiting).toBeNull();
     });
+    // Review fix (r5 L1): a terminally failed grant (invalid_payload, attempts_exhausted, review) will not
+    // arrive on sign-in, so it is not "waiting".
+    it('does not count terminally failed undelivered grants as waiting', () => {
+        const failed = { entitlementId: 'ezil-os:v1:premium_monthly_v3:sub:2026-10-12T00:00:00.000Z', credits: 1000,
+            expiresAt: future, deliveredAt: null, failed: true };
+        const summary = buildSummaryV3({ ...input(), ai: { ...ai, receipts: [...receipts, failed] }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: link } });
+        expect(summary.ai.waiting).toEqual({ credits: 300 });
+    });
     it('checkout off keeps top-up off in every state', () => {
         const args = input(); args.config.checkoutEnabled = false;
         expect(buildSummaryV3({ ...args, enrollment: { state: 'enrolled', ezilIdUrl: null } }).actions.topup).toBe(false);

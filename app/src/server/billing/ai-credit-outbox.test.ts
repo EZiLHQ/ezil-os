@@ -406,6 +406,21 @@ describe('round 5 D1: drain-side enrollment for rows waiting on the AI account',
         expect(f.enrollFor).not.toHaveBeenCalled();
         expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + 60_000 });
     });
+    // Review fix (r5 L1, lost wakeup): a sign-in can link, enroll and kick while this row is processing
+    // (the kick skips processing rows), so the drain re-reads the account before parking it for a day.
+    it('re-resolves the account before a needs_ezil_id park and delivers when a concurrent sign-in enrolled the user', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const f = enrolling([userRow('u1', { attempts: 71, dependencyWaits: 70 })], {});
+        let enrolledConcurrently = false;
+        f.store.accountFor.mockImplementation(async () => enrolledConcurrently ? 'works-public-id' : null);
+        f.enrollFor.mockImplementation(async () => { enrolledConcurrently = true; return 'needs_ezil_id'; });
+        expect(await f.run()).toMatchObject({ claimed: 1, done: 1, retry: 0, skipped: 0 });
+        expect(f.store.accountFor).toHaveBeenCalledTimes(2);
+        expect(f.store.pinAccount).toHaveBeenCalledWith(expect.anything(), 'works-public-id');
+        expect(f.fetcher).toHaveBeenCalledOnce();
+        expect(lines(info)[0]).toMatchObject({ status: 'done', enroll: 'needs_ezil_id' });
+        info.mockRestore();
+    });
     it('a re-resolve miss after enrolled stays an hourly-capped wait', async () => {
         const f = enrolling([userRow('u1')], {});
         f.enrollFor.mockResolvedValue('enrolled');
