@@ -123,8 +123,9 @@ export function describePlanPlacement(info: SystemInfo, entitlement: import('./t
 export function describeFreePlan(info: SystemInfo, entitlement: import('./tier').EntitlementRecord | null): SystemInfo['plan'] | undefined {
     if (entitlement?.source !== 'billing_v2' || entitlement.planId !== 'free_v3' || entitlement.provider === 'aws') return;
     const free = CATALOG_V3.free_v3;
-    if (info.provider !== 'aws-ec2') return { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: free.vcpu, memoryGB: free.memoryGiB,
-        region: null, status: 'ready', reason: null, outcome: null, current: free.size, selected: null, transition: null };
+    // Free's own configuration. With the placement unread (`unknown`) the standing is not claimed.
+    if (info.provider !== 'aws-ec2') return { name: 'Free', provider: 'cloudflare', ...(info.provider === 'unknown' ? {} : { standing: 'free' as const }),
+        vcpu: free.vcpu, memoryGB: free.memoryGiB, region: null, status: 'ready', reason: null, outcome: null, current: free.size, selected: null, transition: null };
     const current = meteredSizeForInstanceType(info.machine.instanceType);
     // An unrecorded type falls back to the only configuration the hold opens (std-2); `current` stays null.
     const size = SIZES[current ?? 'std-2'];

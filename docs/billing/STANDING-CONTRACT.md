@@ -113,6 +113,7 @@ Free, `standing`. `region` may be `null`.
 | Case | plan |
 |---|---|
 | Free on Cloudflare, or not placed yet | `{ name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: 2, memoryGB: 6, region: null, status: 'ready', current: 'free-cf' }` |
+| Free with placement reads off or unreadable (`info.provider: 'unknown'`) | as above without `standing` (Free's own configuration; where the files are is not claimed) |
 | Free with an aws-ec2 placement | `{ name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu, memoryGB, region: 'ap-south-1', status: 'ready', current: 'std-2' \| 'cmp-4' \| 'cmp-8' \| null }` (from the recorded type) |
 | Paid | as before, plus `name` and `provider: 'aws'` |
 

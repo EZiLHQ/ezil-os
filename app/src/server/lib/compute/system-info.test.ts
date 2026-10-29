@@ -327,6 +327,9 @@ describe('round 4: a Free plan is reported, never "not available"', () => {
         const expected = { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: 2, memoryGB: 6, region: null, status: 'ready', current: 'free-cf' };
         expect(describeFreePlan(cf, free)).toMatchObject(expected);
         expect(describeFreePlan(describePlacement({ provider: 'cloudflare', store: 'r2', record: null }), free)).toMatchObject(expected);
+        const unread = describeFreePlan({ ...cf, provider: 'unknown', providerSource: 'reads_off' }, free);
+        expect(unread).toMatchObject({ name: 'Free', provider: 'cloudflare', vcpu: 2, memoryGB: 6 });
+        expect(unread).not.toHaveProperty('standing');
     });
     it('Free with the AWS computer still placed reports that configuration as files_on_aws', () => {
         expect(describeFreePlan(aws, free)).toEqual({ name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu: 2, memoryGB: 8, region: 'ap-south-1',
