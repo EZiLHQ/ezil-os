@@ -39,6 +39,7 @@ import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const OS = process.env.EZIL_SHELL_OUT_DIR || path.resolve(here, '../../../../app/public/os');
@@ -478,6 +479,12 @@ await settle(4);
 restartBtn = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
 push('🔴 …and flips to ENABLED the moment the route is published — no code change, live feature-detection',
     restartBtn && ! restartBtn.disabled, `disabled=${restartBtn?.disabled}`);
+{
+    // Round 5 (D6): BANNED_COPY is clean on the rendered Troubleshoot pane, not only its constants.
+    const text = (q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? '').replace(/\s+/g, ' ');
+    const banned = scanCopy(text);
+    push('D6: the rendered Troubleshoot pane passes scanCopy', text.length > 200 && banned.length === 0, banned.join(', ') || `${text.length} chars`);
+}
 
 // Click it: confirm, then a stubbed 500 (this harness's `fetch` stub has no
 // `/api/shell/restart` case, so it falls through to the generic 500 at the

@@ -122,6 +122,19 @@ await check('Billing: sections in the D6 order — header, banner, plan, usage, 
         assert.ok(nodes[i - 1].compareDocumentPosition(nodes[i]) & window.Node.DOCUMENT_POSITION_FOLLOWING, `${roles[i - 1]} comes before ${roles[i]}`);
     }
 });
+await check('Billing: the usage card names its reset date once, in the card header', () => {
+    for ( const name of ['free', 'standard', 'premium', 'premium-low'] ) {
+        for ( const usage of [null, false, usageDto()] ) {
+            const card = fragment(summaryV3Html(billingState(name), usage)).querySelector('[data-role="billing-usage"]');
+            const hits = clean(card).match(/resets/gi) ?? [];
+            assert.equal(hits.length, 1, `${name}/${usage === null ? 'loading' : usage === false ? 'unavailable' : 'measured'}: ${clean(card)}`);
+            assert.match(clean(card.querySelector('.ezil-billing-section-head')), /Resets Nov 1, 2026/);
+        }
+    }
+    // A credit period that ends on another day still says when.
+    const s = billingState('premium'); s.ai.included.periodEnd = '2026-11-15T00:00:00Z';
+    assert.match(clean(fragment(summaryV3Html(s, usageDto())).querySelector('[data-role="meter-ai"]')), /Resets Nov 15/);
+});
 await check('Billing: an incomplete subscription asks to finish payment, not to update a card for a plan that never started', () => {
     const el = fragment(summaryV3Html(billingState('incomplete')));
     assert.ok(el.querySelector('[data-role="upgrade-pending"]'), 'the incomplete banner');
@@ -579,6 +592,27 @@ await check('System: Running on and Configuration stay; identifiers, slot, image
     assert.deepEqual(scanCopy(clean(pane)), [], 'System pane copy');
     system.onDeactivate();
     host.remove();
+});
+await check('System: keyboard focus on the Details summary survives a repaint', async () => {
+    const { default: system } = await import(moduleUrl(systemSrc));
+    const host = window.document.createElement('div');
+    window.document.body.append(host);
+    host.innerHTML = system.html();
+    const $win = { off () { return this; }, on () { return this; } };
+    system.init($win, { computer: me });
+    const before = host.querySelector('details[data-role="sys-details"] > summary');
+    before.focus();
+    assert.equal(window.document.activeElement, before);
+    system.onActivate($win, { computer: me }); // repaints now, and again when getScreen/getSystemInfo answer
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const after = host.querySelector('details[data-role="sys-details"] > summary');
+    assert.notEqual(after, before, 'the pane repainted');
+    assert.equal(window.document.activeElement, after, 'focus is back on Details');
+    system.onDeactivate();
+    host.remove();
+});
+await check('Feedback: the dialog copy passes scanCopy', () => {
+    for ( const file of ['../feedback/feedback.js', '../feedback/redact-editor.js'] ) assert.deepEqual(scanCopy(read(file)), [], file);
 });
 await check('Feedback: the dialog is dark with an accent primary, through tokens only', () => {
     const css = read('../feedback/feedback.css').replace(/\/\*[\s\S]*?\*\//g, '');
