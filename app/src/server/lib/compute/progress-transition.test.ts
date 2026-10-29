@@ -241,12 +241,27 @@ describe('readComputerProgress: the progress DTO carries the reconciled transiti
     afterEach(() => { vi.restoreAllMocks(); });
     const dialect = new PgDialect();
     const stopFailed = transition({ target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed', endedAt: at(200).toISOString() });
-    async function progressOf(row: { lease_epoch: number; instance_type: string; state?: string }, stored: ComputerTransition) {
+    // Opening writes are recorded: describeProgress hides the opening while RUNNING, so only the write shows its path.
+    let openingWrites: OpeningRecord[] = [];
+    async function progressOf(row: { lease_epoch: number; instance_type: string; state?: string }, stored: ComputerTransition,
+        extra: { opening?: OpeningRecord; poolLeasedAt?: Date } = {}) {
         const billing = await import('@/server/billing/v2/compute-access');
         vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => null });
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: C, owner_user_id: U, region: 'ap-south-1', generation: 4, state: 'RUNNING', ...row })] });
-        const wrapped = { execute: async (query: SQL) => dialect.sqlToQuery(query).sql.includes('/* transition:read */')
-            ? { rows: [{ transition: stored, opening: null }] } : db.execute(query) };
+        openingWrites = [];
+        const wrapped = { execute: async (query: SQL) => {
+            const { sql: text, params } = dialect.sqlToQuery(query);
+            if (text.includes('/* transition:read */')) return { rows: [{ transition: stored, opening: extra.opening ?? null }] };
+            if (text.includes('/* transition:opening */')) {
+                // The new record is the first JSON bind (SET); a later one is the compare-and-swap's previous record.
+                const next = params.find(v => typeof v === 'string' && v.includes('"path"'));
+                if (typeof next === 'string') openingWrites.push(JSON.parse(next) as OpeningRecord);
+                return { rows: [{ id: C }] };
+            }
+            if (text.includes('/* pool:opening */')) return { rows: extra.poolLeasedAt
+                ? [{ leased_at: extra.poolLeasedAt, claim_published_at: extra.poolLeasedAt, session_ready_at: extra.poolLeasedAt }] : [] };
+            return db.execute(query);
+        } };
         return readComputerProgress(wrapped, { computerId: C, userId: U }, env, at(1800));
     }
     it('recovered: done with no revert; superseded: none; a real failure: failed with its revert', async () => {
@@ -258,5 +273,18 @@ describe('readComputerProgress: the progress DTO carries the reconciled transiti
     });
     it('a recovered failure never relabels the RUNNING computer as a switch opening', async () => {
         expect(await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed)).toMatchObject({ stage: 'running', operation: 'none', path: null, openingStartedAt: null });
+        // No opening was stored: none is created (a reconciled `done` would stamp a switch opening from the 09:36 request).
+        expect(openingWrites).toEqual([]);
+        // A stored warm opening of the recovered epoch keeps its path.
+        const leasedAt = at(1700);
+        const warm: OpeningRecord = { v: 1, generation: 4, leaseEpoch: 8, startedAt: leasedAt.toISOString(), path: 'warm',
+            milestones: Object.fromEntries(OPENING_MILESTONES_V3.map(key => [key, leasedAt.toISOString()])) };
+        const stale: OpeningRecord = { ...warm, milestones: { requested: leasedAt.toISOString() } };
+        expect(await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed, { opening: stale, poolLeasedAt: leasedAt }))
+            .toMatchObject({ stage: 'running', transition: { phase: 'done' } });
+        expect(openingWrites.length).toBe(1);
+        expect(openingWrites[0]).toMatchObject({ leaseEpoch: 8, path: 'warm', startedAt: leasedAt.toISOString() });
+        await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed, { opening: warm, poolLeasedAt: leasedAt });
+        expect(openingWrites.every(o => o.path === 'warm')).toBe(true);
     });
 });
