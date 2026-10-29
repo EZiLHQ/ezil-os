@@ -2,30 +2,26 @@
 //
 // Run: cd shell && node ezil/ui/app-spinner-test.mjs
 //
-// Two things this pins, and why each is worth a file of its own:
+// Round 5 (decision D5): when an app opens the user sees ONE calm surface —
+// the app icon, an "Opening {App}" title, ONE bar, ONE status line (the
+// loading-stage sentence `computer-progress.js` `progressView` produced) and a
+// muted elapsed/expected line. Nothing else unless the server says something
+// needs them. This file pins:
 //
-//   1. 🔴 THE STATIC GUARD. `AppSpinner` exists specifically because Preview
-//      and Code have no machine to boot, and the desktop window is only
-//      allowed to show it for the first `PHASE_LIST_AFTER_MS` of a boot. Both
-//      of those properties depend on this component being unable to invent
-//      its own progress — see `app-spinner.js`'s own header. A component that
-//      imports `boot-progress.js` or starts a `setInterval` on its own clock
-//      would satisfy every DOM assertion below while quietly reopening the
-//      exact hole `boot-phases.ts`'s honesty constraint exists to close.
-//      Reverting the "no timers" property (e.g. adding a `setInterval` that
-//      advances a percentage outside the shared observer) makes this guard fail without touching a
-//      single other assertion in this file — that is the point of pinning it
-//      separately from the behavioural checks.
-//
-//   2. The behavioural checks: it renders the SAME `BootUiState` every other
-//      boot surface in this codebase renders, using the SAME copy tables
-//      (`BOOT_FAILURE_COPY` / `BOOT_NOT_CONFIGURED_COPY`), so a caller that
-//      swaps `BootProgress` for this component changes only how much detail
-//      is shown, never what is claimed.
-//
-// jsdom, not a browser: this proves the DOM this component builds and what it
-// does with a `render()` call, not that a ring visibly spins (that is CSS,
-// asserted only by its presence as a class name here).
+//   1. 🔴 THE STATIC GUARD. The component owns no timer: the caller's existing
+//      250 ms paint and the shared observer drive every update. A component that
+//      starts its own `setInterval` could advance a bar while nothing is asking.
+//   2. The DOM: no step list, ticks, ring, <progress>, reassurance, bytes line,
+//      "Estimated", guidance/next/updated line, and never a dev paragraph on the
+//      visible surface (dev details live only in a closed, flagged <details>).
+//   3. The bar binding: fill = max(previous, 0.88·(1 − e^(−2.2·t/T)), stage floor),
+//      real transfer percent when measured, 100 only on the real ready signal,
+//      MONOTONIC across a re-open, a null poll and a changed server timestamp,
+//      with the elapsed clock anchored on this client's first sight of the open.
+//   4. The states: opening, long (warn meta, no button), attention (needs_operator /
+//      hold / ten-minute budget: one action by the existing predicate), failed, done.
+//   5. Every L-A case: an active AWS timeout stays progress, 600 s shows Try again,
+//      needs_operator shows Try again at once, no observation keeps the old failure.
 
 import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
@@ -42,162 +38,173 @@ const push = (name, pass, detail = '') => checks.push({ name, pass, detail });
 const source = fs.readFileSync(path.join(here, 'app-spinner.js'), 'utf8');
 push('🔴 app-spinner.js contains no setTimeout', ! source.includes('setTimeout'));
 push('🔴 app-spinner.js contains no setInterval', ! source.includes('setInterval'));
+push('🔴 app-spinner.js does not import the retired phase panel', ! /from '\.\/boot-progress\.js'/.test(source));
 
-// ── 2. Behavioural checks ────────────────────────────────────────────────
+// ── 2. Unobserved behaviour (Cloudflare / native / no computer) ───────────
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true });
 globalThis.document = dom.window.document;
 globalThis.HTMLElement = dom.window.HTMLElement;
+const originalNow = Date.now;
+let now = 0; Date.now = () => now;
 
-const { AppSpinner } = await import('./app-spinner.js');
+const { AppSpinner, openingFill } = await import('./app-spinner.js');
+const $ = (s, sel) => s.el.querySelector(sel);
+const titleOf = s => $(s, '.ezil-app-spinner-label')?.textContent;
+const statusOf = s => $(s, '.ezil-app-spinner-sub');
+const barEl = s => $(s, '.ezil-opening-bar');
+const barOf = s => Number(barEl(s)?.dataset.percent);
+const metaOf = s => $(s, '.ezil-opening-meta');
+const stateOf = s => s.el.dataset.state;
+/** The surface the user can read: everything except a closed <details>. */
+const visibleText = s => { const c = s.el.cloneNode(true); for (const d of c.querySelectorAll('details:not([open])')) d.remove(); return c.textContent; };
+const FORBIDDEN_DOM = 'ol, li, progress, [data-phase], .ezil-app-spinner-ring, .ezil-boot-phase, .ezil-boot-check, .ezil-opening-name';
+const NOISE = /\d+%|min left|Estimated|✓|Next session|Last recorded update|Applies after/;
 
 {
     const retries = [];
-    const spinner = AppSpinner({ label: 'Opening Browser…', onRetry: () => retries.push(Date.now()) });
+    const spinner = AppSpinner({ label: 'Opening Browser…', onRetry: () => retries.push(1) });
     dom.window.document.body.appendChild(spinner.el);
 
     push('root carries the honesty-neutral class, not `.ezil-boot`',
-        spinner.el.classList.contains('ezil-app-spinner')
-        && ! spinner.el.classList.contains('ezil-boot'),
-        spinner.el.className);
-    push('no phase list anywhere in the markup',
-        spinner.el.querySelectorAll('[data-phase], .ezil-boot-phase').length === 0);
-    push('label is set before the first render()',
-        spinner.el.querySelector('.ezil-app-spinner-label')?.textContent === 'Opening Browser…');
-    push('actions start hidden — nothing to retry before a state has rendered',
-        spinner.el.querySelector('.ezil-boot-actions')?.hidden === true);
+        spinner.el.classList.contains('ezil-app-spinner') && ! spinner.el.classList.contains('ezil-boot'), spinner.el.className);
+    push('ONE surface: one title, one bar, one status line, one meta line; no list, ring, <progress> or app-name line',
+        spinner.el.querySelectorAll('h1').length === 1 && spinner.el.querySelectorAll('.ezil-opening-bar').length === 1
+        && spinner.el.querySelectorAll('.ezil-app-spinner-sub').length === 1 && spinner.el.querySelectorAll('.ezil-opening-meta').length === 1
+        && spinner.el.querySelectorAll(FORBIDDEN_DOM).length === 0);
+    push('the root is not a live region (the elapsed tick is never announced); the status line is',
+        ! spinner.el.hasAttribute('aria-live') && statusOf(spinner).getAttribute('aria-live') === 'polite'
+        && metaOf(spinner).getAttribute('aria-hidden') === 'true');
+    push('title is the "Opening {App}" label before the first render()', titleOf(spinner) === 'Opening Browser…');
+    push('icon falls back to the app initial', $(spinner, '.ezil-opening-icon')?.textContent === 'B');
+    push('actions start hidden — nothing to retry before a state has rendered', $(spinner, '.ezil-boot-actions')?.hidden === true);
 
     spinner.render({ kind: 'progress', currentPhase: 'waking', confirmed: false, isRunningLong: false });
-    push('progress: one thin indeterminate bar, no ring (round 3)',
-        spinner.el.querySelector('.ezil-opening-bar')?.hidden === false
-        && spinner.el.querySelector('.ezil-opening-bar')?.dataset.indeterminate === 'true'
-        && !spinner.el.querySelector('.ezil-app-spinner-ring'));
-    push('progress: app icon and app name from the label',
-        spinner.el.querySelector('.ezil-opening-name')?.textContent === 'Browser'
-        && spinner.el.querySelector('.ezil-opening-icon')?.textContent === 'B');
-    push('progress: the label is the app-specific one, not machine copy',
-        spinner.el.querySelector('.ezil-app-spinner-label')?.textContent === 'Opening Browser…');
-    push('progress: no Retry offered mid-boot',
-        spinner.el.querySelector('.ezil-boot-actions')?.hidden === true);
-    push('progress: data-kind reflects the state',
-        spinner.el.getAttribute('data-kind') === 'progress');
+    push('unobserved progress: data-state opening, one indeterminate bar (no basis for a position)',
+        stateOf(spinner) === 'opening' && barEl(spinner).hidden === false && barEl(spinner).dataset.indeterminate === 'true'
+        && ! barEl(spinner).hasAttribute('aria-valuenow'));
+    push('unobserved progress: the title stays "Opening Browser…" and there is no second line', titleOf(spinner) === 'Opening Browser…' && statusOf(spinner).hidden);
+    push('unobserved progress: no Retry mid-boot', $(spinner, '.ezil-boot-actions').hidden === true);
+    push('unobserved progress: data-kind reflects the state', spinner.el.getAttribute('data-kind') === 'progress');
+    push('unobserved progress: meta hidden in the first 3 s', metaOf(spinner).hidden === true);
+    now = 5_000; spinner.render({ kind: 'progress' });
+    push('unobserved progress: muted elapsed + expectation from TYPICAL_BOOT_MS', metaOf(spinner).textContent === '0:05 · usually under a minute', metaOf(spinner).textContent);
+    now = 36_000; spinner.render({ kind: 'progress' });
+    push('unobserved long (≥ LONG_BOOT_MS): warn meta, no button', stateOf(spinner) === 'long'
+        && metaOf(spinner).textContent === 'Taking longer than usual · 0:36' && $(spinner, '.ezil-boot-actions').hidden, metaOf(spinner).textContent);
+    spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
+    push('unobserved: the real url_received signal makes the bar determinate at the opening-app floor, never 100',
+        barEl(spinner).dataset.indeterminate === undefined && barOf(spinner) >= 85 && barOf(spinner) < 100, String(barOf(spinner)));
+    now = 0;
 
     spinner.render({ kind: 'not_configured' });
-    push('not_configured: the bar hides',
-        spinner.el.querySelector('.ezil-opening-bar')?.hidden === true);
+    push('not_configured: the bar hides', barEl(spinner).hidden === true);
     push('not_configured: renders the SAME copy every other surface uses',
-        spinner.el.querySelector('.ezil-app-spinner-label')?.textContent === 'EZiL OS desktop'
-        && spinner.el.querySelector('.ezil-app-spinner-sub')?.textContent
-            === "This computer's desktop provider is not configured.");
-    push('not_configured: no Retry — the next attempt would fail identically',
-        spinner.el.querySelector('.ezil-boot-actions')?.hidden === true);
+        titleOf(spinner) === 'EZiL OS desktop' && statusOf(spinner).textContent === "This computer's desktop provider is not configured.");
+    push('not_configured: no Retry — the next attempt would fail identically', $(spinner, '.ezil-boot-actions').hidden === true);
 
     spinner.render({ kind: 'failed', reason: 'timeout' });
-    push('failed: renders BOOT_FAILURE_COPY for the specific reason, not a generic message',
-        spinner.el.querySelector('.ezil-app-spinner-label')?.textContent === 'This is taking too long');
-    push('failed: Retry is offered',
-        spinner.el.querySelector('.ezil-boot-actions')?.hidden === false);
-
-    dom.window.$ ??= undefined; // no jQuery dependency — plain DOM events only
-    spinner.el.querySelector('.ezil-boot-retry')?.dispatchEvent(
-        new dom.window.Event('click', { bubbles: true, cancelable: true }));
+    push('failed: BOOT_FAILURE_COPY for the specific reason', titleOf(spinner) === 'This is taking too long');
+    push('failed: data-state failed, the bar hidden, Retry offered',
+        stateOf(spinner) === 'failed' && barEl(spinner).hidden && $(spinner, '.ezil-boot-actions').hidden === false && $(spinner, '.ezil-boot-retry').hidden === false);
+    $(spinner, '.ezil-boot-retry').dispatchEvent(new dom.window.Event('click', { bubbles: true, cancelable: true }));
     push('failed: clicking Retry calls onRetry exactly once', retries.length === 1, `${retries.length} calls`);
-
     spinner.render({ kind: 'failed', reason: 'unknown' });
-    push('failed (unrecognised reason still falls back honestly): falls back to the generic copy',
-        spinner.el.querySelector('.ezil-app-spinner-label')?.textContent === 'Something went wrong');
+    push('failed (unrecognised reason): generic copy', titleOf(spinner) === 'Something went wrong');
 
-    // 'ready' / 'ready_unverified' are no-ops here — the caller is about to
-    // swap the iframe in, or already has. Must not throw.
     let threw = false;
-    try {
-        spinner.render({ kind: 'ready' });
-        spinner.render({ kind: 'ready_unverified' });
-    } catch {
-        threw = true;
-    }
-    push('ready / ready_unverified render without throwing', ! threw);
+    try { spinner.render({ kind: 'ready' }); } catch { threw = true; }
+    push('ready: data-state done and the bar at 100 (the real ready signal)', ! threw && stateOf(spinner) === 'done' && barOf(spinner) === 100
+        && barEl(spinner).getAttribute('aria-valuenow') === '100');
+    try { spinner.render({ kind: 'ready_unverified' }); } catch { threw = true; }
+    push('ready_unverified renders without throwing', ! threw);
 }
-
+{
+    const s = AppSpinner({ label: 'Opening Linux Desktop…', className: 'ezil-boot', icon: 'data:image/svg+xml;utf8,<svg/>' });
+    push('className: the desktop window\'s one surface also answers the legacy `.ezil-boot` hooks',
+        s.el.classList.contains('ezil-app-spinner') && s.el.classList.contains('ezil-boot')
+        && !! $(s, 'h1.ezil-boot-title') && !! $(s, '.ezil-boot-sub'));
+    push('icon: a data: URL renders as an image', $(s, '.ezil-opening-icon img')?.getAttribute('src')?.startsWith('data:image/svg+xml'));
+}
 {
     let retried = false;
     const spinner = AppSpinner({ label: 'Opening Code…', onRetry: () => { retried = true; },
         failureCopy: { title: 'Code is unavailable', body: 'Local editor <guidance>' } });
     spinner.render({ kind: 'failed', reason: 'unknown' });
     push('app-specific failure copy renders as text without changing failed state',
-        spinner.el.dataset.kind === 'failed'
-        && spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Code is unavailable'
-        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === 'Local editor <guidance>'
-        && !spinner.el.querySelector('guidance'));
-    spinner.el.querySelector('.ezil-boot-retry').click();
+        spinner.el.dataset.kind === 'failed' && titleOf(spinner) === 'Code is unavailable'
+        && statusOf(spinner).textContent === 'Local editor <guidance>' && ! $(spinner, 'guidance'));
+    $(spinner, '.ezil-boot-retry').click();
     push('app-specific copy preserves explicit retry', retried);
     spinner.render({ kind: 'progress' });
-    push('retry progress restores app label and hides failure guidance',
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Opening Code…'
-        && spinner.el.querySelector('.ezil-app-spinner-sub').hidden);
+    push('retry progress restores the app title and hides failure guidance', titleOf(spinner) === 'Opening Code…' && statusOf(spinner).hidden);
 }
-
-// A replacement is distinct from a migration, including malformed observations.
 for (const flag of [undefined, null, false, 'true', 'false', 1, 0, {}, [], true]) {
     const spinner = AppSpinner({ label: 'Opening Preview…', isLaunching: () => flag });
     spinner.render({ kind: 'progress' });
     push(`launch copy requires boolean true (${JSON.stringify(flag)})`,
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent
-            === (flag === true ? 'Starting a fresh computer…' : 'Opening Preview…')
-        && spinner.el.querySelector('.ezil-app-spinner-sub').hidden === (flag !== true)
-        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent
-            === (flag === true ? 'This start can take a few minutes.' : ''));
+        titleOf(spinner) === (flag === true ? 'Starting a fresh computer…' : 'Opening Preview…')
+        && statusOf(spinner).hidden === (flag !== true)
+        && statusOf(spinner).textContent === (flag === true ? 'This start can take a few minutes.' : ''));
 }
 {
     let launching = true, migrating = true;
     const spinner = AppSpinner({ label: 'Opening Code…', isLaunching: () => launching, isMigrating: () => migrating });
     spinner.render({ kind: 'progress' });
     push('migration wins when both flags are true, with unchanged copy',
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Moving your computer to AWS (India)'
-        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === 'This first start takes a few minutes. Your files come with you.');
+        titleOf(spinner) === 'Moving your computer to AWS (India)' && statusOf(spinner).textContent === 'This first start takes a few minutes. Your files come with you.');
     migrating = false;
     spinner.render({ kind: 'progress' });
     push('a remaining launch shows neutral copy without Retry',
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Starting a fresh computer…'
-        && spinner.el.querySelector('.ezil-opening-bar').hidden === false
-        && spinner.el.querySelector('.ezil-boot-actions').hidden === true);
+        titleOf(spinner) === 'Starting a fresh computer…' && barEl(spinner).hidden === false && $(spinner, '.ezil-boot-actions').hidden === true);
     spinner.render({ kind: 'failed', reason: 'timeout' });
-    push('launch flag does not override timeout or Retry',
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'This is taking too long'
-        && spinner.el.querySelector('.ezil-boot-actions').hidden === false);
+    push('launch flag does not override timeout or Retry', titleOf(spinner) === 'This is taking too long' && $(spinner, '.ezil-boot-actions').hidden === false);
     spinner.render({ kind: 'not_configured' });
-    push('launch flag does not override unconfigured copy',
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'EZiL OS desktop');
+    push('launch flag does not override unconfigured copy', titleOf(spinner) === 'EZiL OS desktop');
     launching = false;
     spinner.render({ kind: 'progress' });
-    push('clearing observations restores the app label and hides the body',
-        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Opening Code…'
-        && spinner.el.querySelector('.ezil-app-spinner-sub').hidden === true
-        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === '');
+    push('clearing observations restores the app title and hides the line', titleOf(spinner) === 'Opening Code…' && statusOf(spinner).hidden === true);
 }
 
-const originalFetch = globalThis.fetch, originalSet = globalThis.setTimeout, originalClear = globalThis.clearTimeout, originalNow = Date.now;
-let now = 0; Date.now = () => now;
+// ── 3. The bar formula (pure) ────────────────────────────────────────────
+{
+    const curve = (t, T) => 0.88 * (1 - Math.exp(-2.2 * t / T));
+    push('formula: the time curve at t = T is ~78% and never reaches 88%',
+        Math.abs(openingFill({ t: 240, T: 240 }) - curve(240, 240)) < 1e-9 && openingFill({ t: 1e9, T: 240 }) <= 0.88);
+    push('formula: a stage floor lifts an early bar', openingFill({ t: 1, T: 240, floor: 0.6 }) === 0.6);
+    push('formula: never below the previous value', openingFill({ t: 0, T: 240, prev: 0.42 }) === 0.42);
+    push('formula: a measured transfer shows the real fraction (cap 0.99), not the clock',
+        openingFill({ t: 1000, T: 240, real: 0.26 }) === 0.26 && openingFill({ t: 0, T: 240, real: 1 }) === 0.99);
+    push('formula: reduced motion quantises to whole 5% steps', [10, 50, 120, 400].every(t => Math.round(openingFill({ t, T: 240, reducedMotion: true }) * 100) % 5 === 0));
+}
+
+// ── 4. Observed behaviour (fake fetch, fake timers, fake clock) ──────────
+const originalFetch = globalThis.fetch, originalSet = globalThis.setTimeout, originalClear = globalThis.clearTimeout;
 const timers = new Map(); let timerId = 0;
 globalThis.setTimeout = (fn, ms) => { timers.set(++timerId, { fn, ms }); return timerId; };
 globalThis.clearTimeout = id => timers.delete(id);
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+const T0 = '1970-01-01T00:00:00.000Z';
 const migration = { version: 2, computerId: 'qa-computer', operation: 'migration', stage: 'provisioning', recordedStage: 'provisioning',
     active: true, durable: true, resumePolicy: 'saved_workspace_only', bytes: { transferred: 312_000_000, total: 1_200_000_000 },
     percent: 26, etaSeconds: 121, typicalSeconds: 390, transferStartedAt: '2026-10-26T10:00:00Z', transferUpdatedAt: '2026-10-26T10:01:00Z' };
-let payload = migration;
-globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+let payload = migration, failFetch = false;
+globalThis.fetch = async () => {
+    if (failFetch) throw new Error('network');
+    return { ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) };
+};
 async function observe(data, check, options = {}) {
     payload = data;
-    const spinner = AppSpinner({ computerId: 'qa-computer', ...options });
+    const spinner = AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…', ...options });
     document.body.appendChild(spinner.el);
     try { spinner.render({ kind: 'progress' }); await tick(); await check(spinner); }
-    finally { spinner.dispose(); spinner.el.remove(); }
+    finally { spinner.dispose(); spinner.el.remove(); failFetch = false; }
 }
 const poll = async () => { const [id, timer] = [...timers].find(([, value]) => value.ms === 5000); timers.delete(id); timer.fn(); await tick(); };
-const barOf = spinner => Number(spinner.el.querySelector('.ezil-opening-bar').getAttribute('aria-valuenow'));
-// Round 3 (plan §6.5): one status line, one bar, a muted elapsed time. No list, ticks, percentages or countdowns.
-const NOISE = /\d+%|min left|Almost there|Estimated|✓/;
+const opening = { version: 2, computerId: 'qa-computer', operation: 'opening', stage: 'starting', recordedStage: 'starting', active: true, durable: false,
+    path: 'warm', openingStartedAt: T0, expectedSeconds: 240, milestones: [{ key: 'requested', at: T0 }],
+    bytes: { transferred: null, total: null }, percent: null, etaSeconds: null };
 try {
+    // Migration: one status line per step (bytes join it while moving), one bar below 100.
     const labels = ['Saving your files', 'Getting your AWS computer', 'Moving your files', 'Starting your desktop'];
     for (const [stage, transferred, current] of [
         ['requested', null, 0], ['fenced', null, 0], ['exported', 0, 1], ['provisioning', 0, 1],
@@ -205,123 +212,155 @@ try {
         ['mounting', 312_000_000, 3], ['starting', 312_000_000, 3], ['running', 312_000_000, 3],
     ]) {
         await observe({ ...migration, stage, bytes: { ...migration.bytes, transferred } }, spinner => {
-            push(`${stage} (${transferred} bytes): one status line, no step list`,
-                spinner.el.querySelector('.ezil-app-spinner-label').textContent === labels[current]
-                && !spinner.el.querySelector('ol, li') && !NOISE.test(spinner.el.textContent));
+            const want = current === 2 ? `${labels[2]} · 312 MB of 1.2 GB` : labels[current];
+            push(`${stage} (${transferred} bytes): the title stays "Opening Browser…", ONE status line "${want}"`,
+                titleOf(spinner) === 'Opening Browser…' && statusOf(spinner).textContent === want && ! NOISE.test(visibleText(spinner))
+                && spinner.el.querySelectorAll(FORBIDDEN_DOM).length === 0, statusOf(spinner).textContent);
             push(`${stage} (${transferred} bytes): one determinate bar below 100`,
-                spinner.el.querySelectorAll('.ezil-opening-bar').length === 1
-                && !spinner.el.querySelector('.ezil-opening-bar').hidden && barOf(spinner) < 100);
-            push(`${stage}: bytes only while moving`, spinner.el.textContent.includes('312 MB of 1.2 GB') === (current === 2));
+                ! barEl(spinner).hidden && barEl(spinner).dataset.indeterminate === undefined && barOf(spinner) > 0 && barOf(spinner) < 100, String(barOf(spinner)));
         });
     }
     await observe(migration, async spinner => {
-        const bar = spinner.el.querySelector('.ezil-opening-bar');
-        push('measured transfer uses decimal MB and GB', spinner.el.textContent.includes('312 MB of 1.2 GB'));
-        push('the bar exposes an accessible range and the status line as its name',
+        const bar = barEl(spinner);
+        push('measured transfer: the bar shows the REAL percent', barOf(spinner) === 26, String(barOf(spinner)));
+        push('the bar exposes an accessible range named by the title',
             bar.getAttribute('role') === 'progressbar' && bar.getAttribute('aria-valuemin') === '0'
-            && bar.getAttribute('aria-valuemax') === '100' && bar.getAttribute('aria-label') === 'Moving your files');
-        const before = barOf(spinner);
+            && bar.getAttribute('aria-valuemax') === '100' && bar.getAttribute('aria-label') === 'Opening Browser…'
+            && bar.getAttribute('aria-valuenow') === '26');
         payload = { ...migration, bytes: { transferred: 600_000_000, total: 1_200_000_000 }, percent: 50, etaSeconds: 59 };
         await poll();
-        push('a later observation updates bytes and moves the bar forward without changing stage',
-            spinner.el.textContent.includes('600 MB of 1.2 GB') && barOf(spinner) > before
-            && spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Moving your files');
+        push('a later measurement moves the bar to the new real percent', barOf(spinner) === 50 && statusOf(spinner).textContent === 'Moving your files · 600 MB of 1.2 GB');
         payload = { ...migration, bytes: { transferred: 100_000_000, total: 1_200_000_000 }, percent: 8 };
-        const high = barOf(spinner);
         await poll();
-        push('a lower reading never moves the bar backwards', barOf(spinner) === high);
+        push('a lower reading never moves the bar backwards', barOf(spinner) === 50);
     });
     for (const percent of [0, 100, null]) {
         await observe({ ...migration, stage: 'restored', bytes: { transferred: percent === 100 ? 1_200_000_000 : 0, total: 1_200_000_000 }, percent }, spinner => {
-            push(`percentage ${percent}: transfer cannot finish the bar before ready`, barOf(spinner) < 100 && barOf(spinner) >= 25);
+            push(`transfer ${percent}%: never 100 before ready`, barOf(spinner) < 100 && barOf(spinner) >= 0, String(barOf(spinner)));
         });
     }
-    for (const [override, title] of [
-        [{ operationsPaused: true, needsOperator: true }, 'Computer startup is temporarily paused'],
-        [{ paused: true }, 'Computer startup is temporarily paused'],
-        [{ stage: 'operations_paused' }, 'Computer startup is temporarily paused'],
-        [{ needsOperator: true }, 'Your computer needs attention'], [{ stage: 'queued' }, 'Waiting to start'],
-        [{ stage: 'failed_reopened' }, 'Migration did not finish'], [{ stage: 'failed_needs_operator' }, 'Your computer needs attention'],
+    // Holds: the server says something needs the user. No bar for a hold that is not a failure.
+    for (const [override, title, state] of [
+        [{ operationsPaused: true, needsOperator: true }, 'Computer startup is temporarily paused', 'attention'],
+        [{ paused: true }, 'Computer startup is temporarily paused', 'attention'],
+        [{ stage: 'operations_paused' }, 'Computer startup is temporarily paused', 'attention'],
+        [{ stage: 'queued' }, 'Waiting to start', 'attention'],
+        [{ stage: 'failed_reopened' }, 'Migration did not finish', 'failed'],
     ]) {
         await observe({ ...migration, ...override }, spinner => {
-            push(`${JSON.stringify(override)}: existing message overrides migration with no bar or transfer`,
-                spinner.el.querySelector('.ezil-app-spinner-label').textContent === title
-                && spinner.el.querySelector('.ezil-opening-bar').hidden
-                && !spinner.el.querySelector('ol') && !spinner.el.textContent.includes('312 MB'));
-            if (override.stage !== 'queued') push(`${JSON.stringify(override)}: no active migration promise`,
-                !spinner.el.textContent.includes('your files keep moving'));
+            push(`${JSON.stringify(override)}: the hold copy, data-state ${state}, no bar or transfer`,
+                titleOf(spinner) === title && stateOf(spinner) === state && barEl(spinner).hidden
+                && ! spinner.el.querySelector('ol') && ! spinner.el.textContent.includes('312 MB'), `${titleOf(spinner)} ${stateOf(spinner)}`);
         });
     }
-    const opening = { ...migration, operation: 'opening', stage: 'starting', typicalSeconds: null, bytes: { transferred: null, total: null }, percent: null, etaSeconds: null };
+    // Opening: title + the HF3 stage sentence + the bar binding.
     await observe(opening, async spinner => {
-        push('AWS opening: STARTING reads "Starting your computer" (the order is no longer inverted)',
-            spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Starting your computer');
-        push('AWS opening: no step list, countdown or percentage', !spinner.el.querySelector('ol') && !NOISE.test(spinner.el.textContent));
-        push('AWS opening: muted elapsed time', spinner.el.querySelector('.ezil-opening-meta').textContent === '0:00');
-        const first = barOf(spinner);
-        now = 120000; payload = { ...opening, stage: 'mounting' }; await poll();
-        push('AWS opening: MOUNTING follows STARTING and the bar advances',
-            spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Attaching your files'
-            && barOf(spinner) > first && spinner.el.querySelector('.ezil-opening-meta').textContent === '2:00');
-        const mid = barOf(spinner);
-        now = 130000; payload = { ...opening, stage: 'starting' }; await poll();
-        push('AWS opening: a stage read out of order never regresses the bar', barOf(spinner) >= mid);
+        push('opening: title "Opening Browser…", status = the stage sentence, data-state opening',
+            titleOf(spinner) === 'Opening Browser…' && statusOf(spinner).textContent === 'A machine is ready and starting up.'
+            && stateOf(spinner) === 'opening', `${titleOf(spinner)} / ${statusOf(spinner).textContent}`);
+        push('opening: the getting-computer floor (5%) at t = 0', barOf(spinner) === 5, String(barOf(spinner)));
+        push('opening: meta hidden in the first 3 s', metaOf(spinner).hidden);
+        now = 72_000; await poll();
+        const want = Math.round(100 * 0.88 * (1 - Math.exp(-2.2 * 72 / 240)));
+        push('opening: at 72 s the bar is the time curve against T = 240 s', barOf(spinner) === want, `${barOf(spinner)} vs ${want}`);
+        push('opening: muted "1:12 · usually about 4 min"', metaOf(spinner).textContent === '1:12 · usually about 4 min', metaOf(spinner).textContent);
+        now = 73_000; spinner.render({ kind: 'progress' });
+        push('the bar advances on the caller\'s paint tick, not only on a poll', barOf(spinner) > want, String(barOf(spinner)));
+        push('aria-valuenow is throttled (not rewritten every tick)', barEl(spinner).getAttribute('aria-valuenow') === String(want));
+        payload = { ...opening, milestones: [{ key: 'requested', at: T0 }, { key: 'host_claimed', at: T0 }, { key: 'files_attached', at: T0 }, { key: 'desktop_starting', at: T0 }] };
+        now = 74_000; await poll();
+        push('desktop_starting lifts the bar to the starting floor (60%)', barOf(spinner) >= 60 && statusOf(spinner).textContent === 'The desktop is starting. Browser opens next.', String(barOf(spinner)));
         spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
-        push('url_received lifts the bar but not to 100', barOf(spinner) >= 88 && barOf(spinner) < 100);
+        push('url_received lifts it to the opening-app floor, not to 100', barOf(spinner) >= 85 && barOf(spinner) < 100);
         spinner.stamp('first_frame'); spinner.render({ kind: 'progress' });
         push('first_frame (the ready event) is the only 100%', barOf(spinner) === 100);
     });
     now = 0;
-    // Two tabs with the same server opening start show the same bar and time.
-    {
-        const shared = { ...opening, openingStartedAt: '1970-01-01T00:00:00.000Z', expectedSeconds: 200, milestones: [{ key: 'requested', at: '1970-01-01T00:00:00.000Z' }] };
-        const results = [];
-        for (const firstSeen of [5000, 95000]) {
-            now = firstSeen;
-            await observe(shared, async spinner => {
-                now = 100000; await poll();
-                results.push([barOf(spinner), spinner.el.querySelector('.ezil-opening-meta').textContent]);
-            });
-        }
-        push('two tabs (different first observations, one server start) agree', JSON.stringify(results[0]) === JSON.stringify(results[1])
-            && results[0][1] === '1:40', JSON.stringify(results));
-        now = 0;
+    for (const [n, floor] of [[2, 5], [3, 35], [4, 60], [5, 85]]) {
+        const keys = ['requested', 'host_claimed', 'files_attached', 'desktop_starting', 'desktop_ready'];
+        await observe({ ...opening, stage: 'provisioning', milestones: keys.slice(0, n).map(key => ({ key, at: T0 })) }, spinner => {
+            push(`stage floor after ${keys[n - 1]}: ${floor}%`, barOf(spinner) === floor, String(barOf(spinner)));
+        });
     }
-    // Long: past the server's expected seconds, the meta line says so; the status line stays.
-    await observe({ ...opening, openingStartedAt: '1970-01-01T00:00:00.000Z', expectedSeconds: 90 }, async spinner => {
-        now = 91000; await poll();
-        push('long: "Taking a little longer than usual" with the elapsed time, no Try again',
-            spinner.el.querySelector('.ezil-opening-meta').textContent === 'Taking a little longer than usual · 1:31'
-            && spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Starting your computer'
-            && spinner.el.querySelector('.ezil-boot-actions').hidden && barOf(spinner) <= 90);
+    // Never 100 before the ready signal, however long it takes.
+    await observe({ ...opening, stage: 'running', milestones: [{ key: 'desktop_ready', at: T0 }] }, async spinner => {
+        const seen = [];
+        for (const t of [0, 240_000, 600_000, 3_600_000, 36_000_000]) { now = t; await poll(); seen.push(barOf(spinner)); }
+        push('🔴 the bar never reaches 100 before ready (0 s … 10 h)', seen.every(v => v < 100), seen.join());
+        spinner.render({ kind: 'ready' });
+        push('ready: 100 and data-state done', barOf(spinner) === 100 && stateOf(spinner) === 'done');
     });
     now = 0;
-    // Reduced motion: whole 10% steps, flagged for the CSS (no transition, no shimmer).
+    // 🔴 MONOTONIC across a re-open, a changed server timestamp and a null poll; elapsed never resets.
+    await observe(opening, async spinner => {
+        now = 85_000; await poll();
+        const before = barOf(spinner);
+        push('before the re-open: 1:25', metaOf(spinner).textContent === '1:25 · usually about 4 min', metaOf(spinner).textContent);
+        // The desktop window's re-open: a fresh attempt stamps null and paints progress again.
+        now = 86_000; spinner.stamp(null); spinner.render({ kind: 'progress' });
+        push('🔴 re-open: the elapsed clock keeps counting (no 1:25 → 0:01 reset)', metaOf(spinner).textContent === '1:26 · usually about 4 min', metaOf(spinner).textContent);
+        push('🔴 re-open: the bar never goes back', barOf(spinner) >= before, `${barOf(spinner)} < ${before}`);
+        // The server's opening start changes (the live HYPOTHESIS for the reset) and the stage reads earlier.
+        payload = { ...opening, stage: 'provisioning', openingStartedAt: '1970-01-01T00:01:26.000Z', milestones: [{ key: 'requested', at: '1970-01-01T00:01:26.000Z' }] };
+        now = 88_000; await poll();
+        push('🔴 a changed server openingStartedAt does not reset the elapsed time', metaOf(spinner).textContent === '1:28 · usually about 4 min', metaOf(spinner).textContent);
+        push('🔴 ... nor the bar', barOf(spinner) >= before);
+        const status = statusOf(spinner).textContent, high = barOf(spinner);
+        failFetch = true; now = 95_000; await poll();
+        push('null poll: the live observation is gone (verdicts read the live value)', spinner.hasComputerProgress() === false && spinner.el.dataset.progress === 'unavailable');
+        push('🔴 null poll: the surface keeps the held status, a determinate bar and the clock',
+            statusOf(spinner).textContent === status && barEl(spinner).dataset.indeterminate === undefined && barOf(spinner) >= high
+            && metaOf(spinner).textContent === '1:35 · usually about 4 min', `${statusOf(spinner).textContent} ${barOf(spinner)} ${metaOf(spinner).textContent}`);
+        spinner.render({ kind: 'progress' }, { reopening: true });
+        push('null poll during a re-open still shows the held stage (one surface, no swap)', statusOf(spinner).textContent === status);
+    });
+    now = 0;
+    // Long: t ≥ T turns the meta warn; the status line keeps following the server; no button.
+    await observe({ ...opening, expectedSeconds: 90 }, async spinner => {
+        now = 91_000; await poll();
+        push('long: data-state long, "Taking longer than usual · 1:31", no Try again, bar below 100',
+            stateOf(spinner) === 'long' && metaOf(spinner).textContent === 'Taking longer than usual · 1:31'
+            && statusOf(spinner).textContent === 'A machine is ready and starting up.'
+            && $(spinner, '.ezil-boot-actions').hidden && barOf(spinner) < 100, `${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+    });
+    now = 0;
+    // Reduced motion: whole 5% steps, flagged for the CSS (no transition, no sheen).
     globalThis.window = dom.window;
     dom.window.matchMedia = query => ({ matches: query === '(prefers-reduced-motion: reduce)' });
-    await observe({ ...opening, openingStartedAt: '1970-01-01T00:00:00.000Z', expectedSeconds: 240 }, async spinner => {
+    await observe(opening, async spinner => {
         const steps = [];
         for (const t of [7000, 33000, 61000, 97000]) { now = t; await poll(); steps.push(barOf(spinner)); }
-        push('reduced motion: the bar advances in whole steps', steps.every(v => v % 10 === 0)
-            && spinner.el.querySelector('.ezil-opening').dataset.reducedMotion === 'true', steps.join());
+        push('reduced motion: the bar advances in whole 5% steps, flagged on the root', steps.every(v => v % 5 === 0)
+            && spinner.el.dataset.reducedMotion === 'true', steps.join());
     });
     delete dom.window.matchMedia; delete globalThis.window; now = 0;
-    // Attention: "Your computer needs attention" + Try again only when retryable + Send feedback (flag on).
+    // Attention: needs_operator, amber frozen fill, ONE action by the existing predicate.
     globalThis.window = dom.window;
     for (const feedback of [false, true]) {
         window.__EZIL_BOOT__ = { desktopState: { endpoints: feedback ? { feedback: '/api/shell/feedback' } : {} } };
         for (const [recordedStage, retryable] of [['unconfirmed', true], ['failed_needs_operator', false]]) {
-            await observe({ ...opening, stage: 'needs_operator', recordedStage, active: false }, spinner => {
+            let viewed = 0;
+            await observe(opening, async spinner => {
+                now = 60_000; spinner.render({ kind: 'progress' });
+                const high = barOf(spinner);
+                payload = { ...opening, stage: 'needs_operator', recordedStage, active: false };
+                await poll();
                 spinner.render({ kind: 'failed', reason: 'unknown' });
-                push(`attention (${recordedStage}, feedback ${feedback}): copy, Try again only when retryable, feedback only when on`,
-                    spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Your computer needs attention'
-                    && spinner.el.querySelector('.ezil-boot-retry').hidden === !retryable
-                    && spinner.el.querySelector('.ezil-opening-feedback').hidden === !feedback
-                    && spinner.el.querySelector('.ezil-opening-feedback').textContent === 'Send feedback');
-            });
+                const status = $(spinner, '.ezil-opening-view-status');
+                push(`attention (${recordedStage}, feedback ${feedback}): copy, amber frozen fill, one action`,
+                    titleOf(spinner) === 'Your computer needs attention' && stateOf(spinner) === 'attention'
+                    && ! barEl(spinner).hidden && barOf(spinner) === high
+                    && $(spinner, '.ezil-boot-retry').hidden === ! retryable && status.hidden === retryable
+                    && $(spinner, '.ezil-opening-feedback').hidden === ! feedback, `${stateOf(spinner)} ${barOf(spinner)}/${high}`);
+                now = 90_000; spinner.render({ kind: 'failed', reason: 'unknown' });
+                push(`attention (${recordedStage}): the fill stays frozen`, barOf(spinner) === high);
+                if (! retryable) { status.click(); push('manualAttention: "View computer status" calls onViewStatus', viewed === 1 && status.textContent === 'View computer status'); }
+            }, { onViewStatus: () => { viewed++; } });
+            now = 0;
         }
     }
     delete globalThis.window;
+    // L-A: an active AWS operation keeps progress through the client timeout; ten minutes shows Try again.
     for (const operation of ['opening', 'migration']) {
         await observe({ ...opening, operation, startedAt: '1970-01-01T00:00:00Z' }, async spinner => {
             for (const elapsed of [300000, 480000, 599000, 600000]) {
@@ -329,87 +368,63 @@ try {
                 await poll();
                 spinner.render({ kind: 'failed', reason: 'timeout' });
                 push(`${operation} at ${elapsed}ms: an active operation stays in progress`, spinner.el.dataset.kind === 'progress'
-                    && !spinner.el.querySelector('.ezil-opening-bar').hidden
-                    && !spinner.el.textContent.includes('This is taking too long'));
-                push(`${operation} at ${elapsed}ms: retry appears only at the ten-minute ceiling`,
-                    spinner.el.querySelector('.ezil-boot-retry').hidden === (elapsed < 600000));
-                push(`${operation} at ${elapsed}ms: an overdue bar holds below 90%`, barOf(spinner) <= 90 && barOf(spinner) > 0);
+                    && ! barEl(spinner).hidden && ! spinner.el.textContent.includes('This is taking too long'));
+                push(`${operation} at ${elapsed}ms: retry appears only at the ten-minute ceiling`, $(spinner, '.ezil-boot-retry').hidden === (elapsed < 600000));
+                push(`${operation} at ${elapsed}ms: never 100 before ready`, barOf(spinner) < 100 && barOf(spinner) > 0);
             }
-            push(`${operation}: ten minutes shows calm guidance and secondary retry styling`,
-                spinner.el.querySelector('.ezil-app-spinner-sub').textContent === "This is taking longer than usual. We're still working on it — you can keep this open or come back later."
-                && spinner.el.classList.contains('ezil-app-spinner-running-long'));
+            push(`${operation}: ten minutes shows calm guidance (attention, one action)`,
+                statusOf(spinner).textContent === "This is taking longer than usual. We're still working on it — you can keep this open or come back later."
+                && stateOf(spinner) === 'attention' && spinner.el.classList.contains('ezil-app-spinner-running-long'));
             spinner.render({ kind: 'failed', reason: 'unknown' });
             push(`${operation}: a genuine failure is not suppressed by active progress`, spinner.el.dataset.kind === 'failed'
-                && spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Something went wrong'
-                && !spinner.el.querySelector('.ezil-boot-actions').hidden);
+                && titleOf(spinner) === 'Something went wrong' && ! $(spinner, '.ezil-boot-actions').hidden);
         });
         now = 0;
     }
+    // 🔴 devDetails: never on the visible surface; only in a closed <details>, and only when the flag is boolean true.
     for (const devDetails of [undefined, false, 'true', true]) {
         globalThis.window = dom.window;
         window.__EZIL_BOOT__ = { user: { id: 'qa-user' }, features: { devDetails } };
         await observe({ ...opening, updatedAt: '2026-10-27T00:00:00Z', selectedNextOpenHardware: { effective: 'next_open', vcpu: 2, memoryGiB: 8 } }, spinner => {
-            const sub = spinner.el.querySelector('.ezil-app-spinner-sub').textContent;
-            push(`boot devDetails ${devDetails}: only the update line is a diagnostic, and it requires boolean true`,
-                spinner.el.textContent.includes('Last recorded update:') === (devDetails === true), sub);
-            // HF3: the opening surface never shows the next-start hardware; the body is the loading stage.
-            push(`boot devDetails ${devDetails}: the body is the loading stage, never "Next session"`,
-                !/Next session|GiB memory|Applies after/.test(spinner.el.textContent)
-                && sub.startsWith('A machine is ready and starting up.'), sub);
+            const details = $(spinner, 'details.ezil-opening-details');
+            push(`devDetails ${devDetails}: no dev paragraph on the visible surface`, ! NOISE.test(visibleText(spinner)), visibleText(spinner));
+            push(`devDetails ${devDetails}: the update line exists only inside a CLOSED <details>, only for boolean true`,
+                devDetails === true
+                    ? details && details.hidden === false && details.open === false && details.textContent.includes('Last recorded update:')
+                    : (! details || details.hidden === true) && ! spinner.el.textContent.includes('Last recorded update'));
+            push(`devDetails ${devDetails}: the status line is the loading stage, never "Next session"`,
+                statusOf(spinner).textContent === 'A machine is ready and starting up.' && ! /Next session|GiB memory/.test(spinner.el.textContent));
         });
         delete globalThis.window;
     }
-    // HF3: one loading-stage sentence per server milestone; "Almost there" only at desktop_ready.
+    // HF3 sentences, one per server milestone; "Almost there" only at desktop_ready.
     {
-        const T = '1970-01-01T00:00:00.000Z';
         const keys = ['requested', 'host_claimed', 'files_attached', 'desktop_starting', 'desktop_ready'];
         const sentences = ['Finding a machine for your computer.', 'A machine is ready and starting up.', 'Your files are attached. The desktop is starting.',
             'The desktop is starting. Browser opens next.', 'Almost there — waiting for Browser to connect.'];
-        for ( let n = 1; n <= 5; n++ ) {
-            await observe({ ...opening, stage: 'provisioning', path: 'warm', openingStartedAt: T, expectedSeconds: 240,
-                milestones: keys.slice(0, n).map(key => ({ key, at: T })) }, spinner => {
-                const sub = spinner.el.querySelector('.ezil-app-spinner-sub');
-                push(`milestone ${keys[n - 1]}: the body is "${sentences[n - 1]}"`, !sub.hidden && sub.textContent === sentences[n - 1], sub.textContent);
-                push(`milestone ${keys[n - 1]}: "Almost there" only at desktop_ready`, /Almost there/.test(spinner.el.textContent) === (n === 5));
-                push(`milestone ${keys[n - 1]}: no percentages, countdowns or ticks`, !/\d+%|min left|Estimated|✓/.test(spinner.el.textContent));
-            }, { label: 'Opening Browser…' });
+        for (let n = 1; n <= 5; n++) {
+            await observe({ ...opening, stage: 'provisioning', milestones: keys.slice(0, n).map(key => ({ key, at: T0 })) }, spinner => {
+                push(`milestone ${keys[n - 1]}: the status line is "${sentences[n - 1]}"`, ! statusOf(spinner).hidden && statusOf(spinner).textContent === sentences[n - 1], statusOf(spinner).textContent);
+                push(`milestone ${keys[n - 1]}: no percentages, countdowns or ticks`, ! NOISE.test(visibleText(spinner)));
+            });
         }
-        await observe({ ...opening, stage: 'provisioning', path: 'cold', openingStartedAt: T, expectedSeconds: 400, milestones: [{ key: 'requested', at: T }] }, spinner => {
-            push('cold path at requested: "Preparing a new machine"', spinner.el.querySelector('.ezil-app-spinner-sub').textContent === 'Preparing a new machine — this can take a few minutes.');
-        });
-        // Ten minutes in, runningLong still replaces the body; the long meta line is unchanged.
-        await observe({ ...opening, stage: 'leased', startedAt: T, openingStartedAt: T, expectedSeconds: 240, milestones: [{ key: 'requested', at: T }, { key: 'host_claimed', at: T }] }, async spinner => {
-            now = 600000; await poll();
-            push('running long: the long copy replaces the stage sentence', spinner.el.querySelector('.ezil-app-spinner-sub').textContent
-                === "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
-            push('running long: the meta line is the elapsed time', spinner.el.querySelector('.ezil-opening-meta').textContent === '10:00');
-        });
-        now = 0;
     }
-    // F1b: while this window's open is in flight and the server still says stopped (no opening yet), the surface
-    // reads "Starting your computer" with an indeterminate bar, never "Computer stopped — Use the normal computer controls…".
+    // F1b: open in flight while the server still says stopped.
     const stoppedNow = { ...opening, operation: 'none', stage: 'stopped', recordedStage: 'stopped', active: false, openingStartedAt: null, milestones: [] };
     for (const stage of ['stopped', 'purge_eligible']) {
         await observe({ ...stoppedNow, stage }, async spinner => {
-            const label = () => spinner.el.querySelector('.ezil-app-spinner-label').textContent;
-            const bar = spinner.el.querySelector('.ezil-opening-bar');
             push(`${stage} + open in flight: "Starting your computer", indeterminate bar, no stopped copy`,
-                label() === 'Starting your computer' && !bar.hidden && bar.dataset.indeterminate === 'true'
-                && !/stopped|normal computer controls|No active startup/i.test(spinner.el.textContent), spinner.el.textContent);
+                statusOf(spinner).textContent === 'Starting your computer' && ! barEl(spinner).hidden && barEl(spinner).dataset.indeterminate === 'true'
+                && ! /stopped|normal computer controls|No active startup/i.test(spinner.el.textContent), spinner.el.textContent);
             push(`${stage} + open in flight: the observation keeps the server stage for the window's wait`,
                 spinner.computerProgress()?.stage === stage && spinner.computerProgress()?.activeAws === false);
-            push(`${stage} + open in flight: no Try again or feedback while starting`, spinner.el.querySelector('.ezil-boot-actions').hidden);
-            payload = { ...opening, stage: 'leased', openingStartedAt: '1970-01-01T00:00:00.000Z', expectedSeconds: 240,
-                milestones: [{ key: 'requested', at: '1970-01-01T00:00:00.000Z' }] };
+            push(`${stage} + open in flight: no Try again or feedback while starting`, $(spinner, '.ezil-boot-actions').hidden);
+            payload = { ...opening, stage: 'leased' };
             now = 30000; await poll();
-            push(`${stage}: the server's opening takes over with its determinate bar`,
-                label() === 'Starting your computer' && bar.dataset.indeterminate === undefined && barOf(spinner) > 0);
-            spinner.render({ kind: 'failed', reason: 'timeout' });
-            push(`${stage}: a failed open shows its failure copy`, label() !== 'Computer stopped');
+            push(`${stage}: the server's opening takes over with its determinate bar`, barEl(spinner).dataset.indeterminate === undefined && barOf(spinner) > 0);
         });
         now = 0;
     }
-    // Without a request (Settings, transition watchers) the observer keeps the stopped copy.
     {
         const element = document.createElement('div'); document.body.appendChild(element);
         const seen = [];
@@ -426,9 +441,7 @@ try {
     dom.window.close();
 }
 
-// ── 3. Round 4: Send feedback names the RAW server code ──────────────────
-// The founder's 10-28 report read "Error code: unknown" for `billing_size_not_allowed`:
-// both surfaces passed the classified reason. The dialog module is replaced by a recorder.
+// ── 5. Send feedback names the RAW server code ──────────────────────────
 {
     const fbDom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true });
     globalThis.document = fbDom.window.document;
@@ -441,24 +454,16 @@ try {
     } });
     try {
         const { computeBootUiState } = await import('../boot-phases.js');
-        const { BootProgress } = await import('./boot-progress.js');
         const settle = async () => { for (let i = 0; i < 50 && globalThis.__feedbackCalls.length === 0; i++) await new Promise(r => setTimeout(r, 5)); };
-        const cases = [
-            ['AppSpinner', 'billing_files_on_aws', 'billing_files_on_aws'],
-            ['AppSpinner', 'billing_size_not_allowed', 'billing_size_not_allowed'],
-            ['BootProgress', 'billing_payment_issue', 'billing_payment_issue'],
-            // A state built without a code (older callers) still names its reason.
-            ['BootProgress', undefined, 'unknown'],
-        ];
-        for (const [name, errorCode, expected] of cases) {
+        for (const [errorCode, expected] of [['billing_files_on_aws', 'billing_files_on_aws'], ['billing_size_not_allowed', 'billing_size_not_allowed'], [undefined, 'unknown']]) {
             globalThis.__feedbackCalls = [];
-            const surface = name === 'AppSpinner' ? AppSpinner({ label: 'Opening Code…' }) : BootProgress({ onRetry () {} });
+            const surface = AppSpinner({ label: 'Opening Code…' });
             document.body.appendChild(surface.el);
             surface.render(errorCode ? computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode }) : { kind: 'failed', reason: 'unknown' });
             surface.el.querySelector('.ezil-opening-feedback').click();
             await settle();
             const call = globalThis.__feedbackCalls[0];
-            push(`${name}: ${errorCode ?? 'no code'} → feedback prefill code ${expected}`,
+            push(`AppSpinner: ${errorCode ?? 'no code'} → feedback prefill code ${expected}`,
                 globalThis.__feedbackCalls.length === 1 && call?.source === 'opening' && call?.errorCode === expected, JSON.stringify(call));
             surface.el.remove();
         }
