@@ -59,9 +59,9 @@ describe('v3 public plans', () => {
         }
     });
 
-    it('explains sessions, fair use, persistence and billing changes in five FAQs', () => {
+    it('explains sessions, fair use, persistence, billing changes and storage in six FAQs', () => {
         const faq = getPricingContent().faq.items;
-        expect(faq).toHaveLength(5);
+        expect(faq).toHaveLength(6);
         expect(faq[0].answer).toContain('Free sessions last up to 1 hour. Standard and Premium: No session time limit. Fair use still applies to every plan.');
         expect(faq[0].answer).toContain('computer stops');
         for (const offer of Object.values(CATALOG_V3)) expect(faq[1].answer).toContain(`about ${offer.fairUseSeconds / 3600} ${offer.tier === 'premium' ? 'standard-hours' : 'hours'} a month on ${offer.name}`);
@@ -75,6 +75,23 @@ describe('v3 public plans', () => {
         expect(cards(render()).join('')).not.toMatch(/standard-hour|500|40 hours a month|5 hours a month/);
         expect(cards(render())[0]).toContain('2 vCPU · 6 GB');
         expect(cards(render())[2]).toContain('Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)');
+    });
+
+    it('round 5 (D6): a storage FAQ with each plan\'s disk, from the catalog', () => {
+        const storage = getPricingContent().faq.items[5];
+        expect(storage.question).toBe('How much storage do I get?');
+        expect(storage.answer).toContain(`Standard comes with a ${CATALOG_V3.standard_monthly_v3.storageGiB} GB disk`);
+        expect(storage.answer).toContain(`Premium with a ${CATALOG_V3.premium_monthly_v3.storageGiB} GB disk`);
+        expect(storage.answer).toContain('On Free, your files are saved between sessions.');
+        expect(storage.answer).toContain('Some space is used by the system.');
+        expect(CATALOG_V3.free_v3.storageGiB).toBeNull();
+        expect(render()).toContain('How much storage do I get?');
+    });
+
+    it('round 5 (D6): no "coming soon" AI feature on the marketing page', () => {
+        expect(JSON.stringify(marketingContent)).not.toMatch(/coming soon/i);
+        expect(render()).not.toMatch(/coming soon/i);
+        expect(render(true)).not.toMatch(/coming soon/i);
     });
 
     it('respects the pricing gate with fake config, including the unavailable state', () => {
