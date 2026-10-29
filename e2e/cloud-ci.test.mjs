@@ -685,6 +685,8 @@ test('a push or merge to main never deploys production; only a confirmed main di
   // [ref, event, inputs, staging deploys, production job runs]
   for (const [ref, event_name, inputs, staging, prod] of [
     ['refs/heads/main', 'push', {}, false, false],
+    // Pushes carry no inputs; the event check still refuses one if they ever did.
+    ['refs/heads/main', 'push', { deploy_production: true }, false, false],
     ['refs/heads/main', 'workflow_dispatch', {}, false, false],
     ['refs/heads/main', 'workflow_dispatch', { deploy_production: false }, false, false],
     ['refs/heads/main', 'workflow_dispatch', { deploy_production: true }, false, true],
