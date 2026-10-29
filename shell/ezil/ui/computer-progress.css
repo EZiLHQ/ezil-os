@@ -1,46 +1,224 @@
-/* The one opening surface (`computer-progress.js` `OpeningSurface`), shared by
- * `.ezil-app-spinner` and `.ezil-boot`: icon, app name, one status line, one thin
- * bar, a muted elapsed time. The selectors carry the parent class so they win over
- * the older `.ezil-boot-*` rules in `ezil-shell.css`, which loads after this file. */
-.ezil-app-spinner > .ezil-opening, .ezil-boot > .ezil-opening {
-    display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 320px; text-align: center;
+/* The one opening surface (round 5, D5): `app-spinner.js`. App icon, an "Opening {App}"
+ * title, ONE bar, ONE status line, a muted elapsed/expected line, and an action only when
+ * the server or a failure needs the user. Dark is the default; light is the explicit
+ * `[data-theme="light"]` set (the shell itself is dark). Colours come only from the tokens
+ * below; the accent is the user's `--ezil-accent` (Settings → Appearance). The root also
+ * answers `.ezil-boot` in the Desktop window (legacy hooks), so every selector is rooted on
+ * `.ezil-app-spinner`. */
+.ezil-app-spinner {
+    --open-bg: var(--color-charcoal, #161616);
+    --open-fg: #f5f5f4;
+    --open-muted: #9ca3a3;
+    --open-faint: #7f8686;
+    --open-tile: rgb(255 255 255 / 0.06);
+    --open-track: rgb(255 255 255 / 0.08);
+    --open-line: rgb(255 255 255 / 0.16);
+    --open-sheen: rgb(255 255 255 / 0.35);
+    --open-accent: var(--ezil-accent, #00adb5);
+    --open-accent-fg: var(--ezil-accent-contrast, #ffffff);
+    --open-warn: #e0a54a;
+    --open-danger: #e5675f;
+    --open-focus: #f5f5f4;
+
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    align-items: safe center;
+    justify-content: center;
+    box-sizing: border-box;
+    padding: 24px 16px;
+    background-color: var(--open-bg);
+    color: var(--open-fg);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    text-align: center;
+    -webkit-user-select: none;
+    user-select: none;
+    /* `.window-body` sets `overflow: auto`; the surface scrolls itself, never sideways. */
+    overflow: auto;
+    overflow-x: hidden;
 }
-.ezil-opening .ezil-opening-icon {
-    display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin-bottom: 12px;
-    border-radius: 12px; background: #1d2121; color: #f5f5f4; font-size: 20px; font-weight: 600; overflow: hidden;
+:root[data-theme='light'] .ezil-app-spinner {
+    --open-bg: #f6f7f7;
+    --open-fg: #161616;
+    --open-muted: #5f6666;
+    --open-faint: #6b7272;
+    --open-tile: rgb(0 0 0 / 0.05);
+    --open-track: rgb(0 0 0 / 0.08);
+    --open-line: rgb(0 0 0 / 0.16);
+    --open-sheen: rgb(255 255 255 / 0.45);
+    --open-warn: #a86a00;
+    --open-danger: #b42318;
+    --open-focus: #161616;
 }
-.ezil-opening .ezil-opening-icon img { width: 100%; height: 100%; object-fit: contain; }
-.ezil-opening .ezil-opening-name { margin: 0 0 4px; font-size: 15px; font-weight: 600; line-height: 1.3; color: #f5f5f4; }
-.ezil-app-spinner > .ezil-opening .ezil-opening-status, .ezil-boot > .ezil-opening .ezil-opening-status {
-    margin: 0 0 14px; font-size: 13px; font-weight: 400; line-height: 1.45; color: #c4caca;
+/* `hidden` is how every caller retires the surface; `display: flex` above would beat the UA rule. */
+.ezil-app-spinner[hidden] { display: none; }
+
+.ezil-app-spinner > .ezil-opening {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    max-width: 360px;
+    min-width: 0;
+    /* A warm reopen that is ready within ~150 ms never shows the card at all. */
+    animation: ezil-open-enter 180ms ease-out 150ms both;
 }
-.ezil-app-spinner[data-kind='failed'] .ezil-opening-status, .ezil-boot[data-kind='failed'] .ezil-opening-status,
-.ezil-app-spinner[data-kind='not_configured'] .ezil-opening-status, .ezil-boot[data-kind='not_configured'] .ezil-opening-status {
-    font-size: 15px; font-weight: 600; color: #f5f5f4;
+@keyframes ezil-open-enter { from { opacity: 0; } to { opacity: 1; } }
+
+.ezil-app-spinner .ezil-opening-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    background: var(--open-tile);
+    color: var(--open-fg);
+    font-size: 20px;
+    font-weight: 600;
+    overflow: hidden;
 }
-.ezil-opening .ezil-opening-bar { position: relative; width: 220px; max-width: 100%; height: 4px; border-radius: 2px; background: #2a2e2e; overflow: hidden; }
-.ezil-opening .ezil-opening-bar[hidden], .ezil-opening .ezil-opening-meta[hidden], .ezil-opening .ezil-opening-name[hidden],
-.ezil-opening .ezil-opening-sub[hidden], .ezil-opening .ezil-opening-feedback[hidden], .ezil-opening .ezil-boot-retry[hidden] { display: none; }
-.ezil-opening .ezil-opening-fill { height: 100%; width: 0; border-radius: 2px; background: var(--ezil-accent, #00adb5); transition: width 0.9s ease-out; }
-.ezil-opening .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill {
-    width: 30%; animation: ezil-opening-shimmer 1.6s ease-in-out infinite;
+.ezil-app-spinner .ezil-opening-icon img { width: 100%; height: 100%; object-fit: contain; }
+
+.ezil-app-spinner .ezil-opening-title {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--open-fg);
+    overflow-wrap: anywhere;
 }
-@keyframes ezil-opening-shimmer { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
-.ezil-opening .ezil-opening-meta { margin: 8px 0 0; font-size: 12px; line-height: 1.4; color: #7f8686; font-variant-numeric: tabular-nums; }
-.ezil-app-spinner > .ezil-opening .ezil-opening-sub, .ezil-boot > .ezil-opening .ezil-opening-sub { margin: 10px 0 0; font-size: 13px; line-height: 1.5; color: #9ca3a3; }
-.ezil-opening .ezil-boot-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 16px; }
-.ezil-opening .ezil-boot-actions[hidden] { display: none; }
-.ezil-opening .ezil-opening-feedback {
-    appearance: none; padding: 9px 14px; border: 1px solid #3a3f3f; border-radius: 6px; background: transparent;
-    color: #f5f5f4; font: inherit; font-size: 13px; cursor: pointer;
+
+/* ONE bar: thin, determinate, monotonic (the width only ever grows; JS guarantees it). */
+.ezil-app-spinner .ezil-opening-bar {
+    position: relative;
+    width: min(260px, 72%);
+    height: 4px;
+    margin-top: 4px;
+    border-radius: 999px;
+    background: var(--open-track);
+    overflow: hidden;
 }
-.ezil-opening .ezil-opening-feedback:focus-visible { outline: 2px solid #f5f5f4; outline-offset: 2px; }
-.ezil-app-spinner-running-long .ezil-boot-retry { padding: 6px 12px; background: transparent; color: inherit; border: 1px solid #555; font-size: 12px; }
-/* Reduced motion: the bar steps (10% at a time, from JS) with no transition and no shimmer. */
+.ezil-app-spinner .ezil-opening-fill {
+    position: relative;
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--open-accent);
+    overflow: hidden;
+    transition: width 600ms cubic-bezier(.2, .7, .2, 1), background-color 200ms ease;
+}
+/* The sheen says "alive", never "further along": it moves inside the filled part only. */
+.ezil-app-spinner .ezil-opening-fill::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, var(--open-sheen), transparent);
+    transform: translateX(-100%);
+    animation: ezil-open-sheen 1.8s ease-in-out infinite;
+}
+@keyframes ezil-open-sheen { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+/* No basis for a position yet (no observation, no real signal): a sweep, not a percentage. */
+.ezil-app-spinner .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill {
+    width: 30%;
+    transition: none;
+    animation: ezil-open-sweep 1.6s ease-in-out infinite;
+}
+.ezil-app-spinner .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill::after { content: none; }
+@keyframes ezil-open-sweep { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+
+.ezil-app-spinner .ezil-opening-status {
+    margin: 0;
+    max-width: 320px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--open-muted);
+    overflow-wrap: anywhere;
+}
+.ezil-app-spinner .ezil-opening-meta {
+    margin: -4px 0 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--open-faint);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── States (`data-state` on the root) ── */
+.ezil-app-spinner[data-state='long'] .ezil-opening-meta { color: var(--open-warn); }
+.ezil-app-spinner[data-state='long'] .ezil-opening-fill::after { animation-duration: 2.8s; }
+.ezil-app-spinner[data-state='attention'] .ezil-opening-fill { background: var(--open-warn); }
+.ezil-app-spinner[data-state='failed'] .ezil-opening-fill { background: var(--open-danger); }
+.ezil-app-spinner[data-state='failed'] .ezil-opening-icon { box-shadow: 0 0 0 2px var(--open-danger); }
+.ezil-app-spinner[data-state='attention'] .ezil-opening-icon { box-shadow: 0 0 0 2px var(--open-warn); }
+.ezil-app-spinner:is([data-state='attention'], [data-state='failed'], [data-state='done']) .ezil-opening-fill::after { content: none; animation: none; }
+/* Done: the bar completes, the card fades; the root keeps its background so the frame
+ * the caller reveals underneath never flashes white. */
+.ezil-app-spinner[data-state='done'] > .ezil-opening { animation: ezil-open-exit 160ms ease 360ms both; }
+@keyframes ezil-open-exit { from { opacity: 1; } to { opacity: 0; } }
+
+/* ── One action, only when needed. 44 px hit targets. ── */
+.ezil-app-spinner .ezil-boot-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+.ezil-app-spinner .ezil-opening-action {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 18px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--open-accent);
+    color: var(--open-accent-fg);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+}
+.ezil-app-spinner .ezil-opening-action.is-secondary {
+    background: transparent;
+    color: var(--open-fg);
+    box-shadow: inset 0 0 0 1px var(--open-line);
+}
+.ezil-app-spinner .ezil-opening-action:hover { filter: brightness(1.08); }
+.ezil-app-spinner .ezil-opening-action:focus-visible { outline: 2px solid var(--open-focus); outline-offset: 2px; }
+
+/* Dev details: closed by default, only when the deployment flags them. */
+.ezil-app-spinner .ezil-opening-details { font-size: 11px; line-height: 1.4; color: var(--open-faint); }
+.ezil-app-spinner .ezil-opening-details summary {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 8px;
+    cursor: pointer;
+}
+.ezil-app-spinner .ezil-opening-details summary:focus-visible { outline: 2px solid var(--open-focus); outline-offset: 2px; }
+.ezil-app-spinner .ezil-opening-details-text { margin: 0; }
+
+/* Every part retires with `hidden`; this wins over the display rules above. */
+.ezil-app-spinner .ezil-opening [hidden] { display: none; }
+
+/* Reduced motion: whole 5% steps from JS, a static fill, no sheen, no fades. */
 @media (prefers-reduced-motion: reduce) {
-    .ezil-opening .ezil-opening-fill { transition: none; }
-    .ezil-opening .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+    .ezil-app-spinner > .ezil-opening { animation: none; }
+    .ezil-app-spinner .ezil-opening-fill { transition: none; }
+    .ezil-app-spinner .ezil-opening-fill::after { content: none; animation: none; }
+    .ezil-app-spinner .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+    .ezil-app-spinner[data-state='done'] > .ezil-opening { animation: none; }
 }
-.ezil-opening[data-reduced-motion='true'] .ezil-opening-fill { transition: none; }
-.ezil-opening[data-reduced-motion='true'] .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+.ezil-app-spinner[data-reduced-motion='true'] > .ezil-opening { animation: none; }
+.ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-fill { transition: none; }
+.ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-fill::after { content: none; animation: none; }
+.ezil-app-spinner[data-reduced-motion='true'] .ezil-opening-bar[data-indeterminate='true'] .ezil-opening-fill { animation: none; width: 100%; opacity: .35; }
+.ezil-app-spinner[data-reduced-motion='true'][data-state='done'] > .ezil-opening { animation: none; }

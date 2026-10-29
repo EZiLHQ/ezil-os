@@ -57,7 +57,7 @@ export function bindNativeBrowser (el, ctx) {
                 setup_failed: 'Embedded Touch ID could not be configured.' }[result.reason] || 'Embedded Touch ID is unavailable.');
     }).catch(() => {});
     const trace = ctx.trace ?? { step () {}, end () {} };
-    const progress = AppSpinner({ label: 'Opening Browser…', onRetry: () => { if (active) void start(active); },
+    const progress = AppSpinner({ label: `Opening ${ctx?.appName || 'Browser'}…`, appName: ctx?.appName || 'Browser', icon: ctx?.icon, onRetry: () => { if (active) void start(active); },
         failureCopy: { title: 'Browser is unavailable', body: 'The local browser could not start. Try again. If this continues, relaunch EZiL OS.' } });
     viewport.appendChild(progress.el);
     const alive = tab => !disposed && tabs.includes(tab);

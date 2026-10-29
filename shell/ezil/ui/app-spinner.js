@@ -238,6 +238,9 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws
             && (observation.elapsed >= 600 || state.observedBudgetSpent === true);
         root.setAttribute('data-kind', activeTimeout ? 'progress' : state.kind);
+        // The caller's estimate and its one real signal, as data for diagnostics; never drawn.
+        if (state.kind === 'progress') { root.dataset.phase = state.currentPhase ?? ''; root.dataset.confirmed = String(state.confirmed === true); }
+        else delete root.dataset.phase;
         root.classList.toggle('ezil-app-spinner-running-long', !!runningLong);
         const progressing = state.kind === 'progress' || activeTimeout;
 
