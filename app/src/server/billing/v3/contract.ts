@@ -212,6 +212,26 @@ export type AdmitStartV3 = (input: {
 
 export type PlanStatusV3 = 'free' | 'active' | 'cancels' | 'past_due' | 'incomplete' | 'upgrade_pending';
 
+/**
+ * Round 4 (plan §12 D16-D19; docs/billing/STANDING-CONTRACT.md). Derived on every read, never stored:
+ * - `paid`: a current paid period, no unresolved subscription payment issue.
+ * - `grace` (D17): the payment didn't go through; the paid computer stays usable until `plan.graceEndsAt`
+ *   (first unresolved issue + 7 days, or Stripe's final action, whichever is first).
+ * - `plan_ending` (D18): cancel at period end; paid until `plan.planEndsAt`.
+ * - `files_on_aws` (D16): on Free while the computer is still the AWS computer. It opens at std-2 under Free
+ *   limits; nothing has been moved.
+ * - `free`: on Free with the files on Cloudflare.
+ */
+export type ComputeStandingV3 = 'paid' | 'grace' | 'plan_ending' | 'files_on_aws' | 'free';
+
+/** Reserved for Phase B (the AWS → Cloudflare move, D20/D21). Always null in round 4. */
+export interface ComputerMoveV3 {
+    direction: 'to_cloudflare' | 'to_aws';
+    stage: string;
+    bytesDone: string;
+    bytesTotal: string | null;
+}
+
 export interface BillingSummaryV3 {
     enabled: true;
     version: 3;
@@ -225,6 +245,10 @@ export interface BillingSummaryV3 {
         scheduledChange: { toSku: SellableSkuV3; effectiveAt: string } | null;
         pendingUpgrade: { toSku: SellableSkuV3; expiresAt: string; hostedInvoiceUrl: string | null } | null;
         paymentIssue: 'payment_failed' | 'requires_action' | null;
+        /** Round 4 (additive): set only in `grace`, when the paid computer stops being usable without a payment. */
+        graceEndsAt?: string | null;
+        /** Round 4 (additive): a cancel at period end, the paid period's end ("Premium ends on <date>"). */
+        planEndsAt?: string | null;
     };
     computer: {
         /** The size the next session opens with (the chosen size on Premium). */
@@ -243,6 +267,14 @@ export interface BillingSummaryV3 {
          * (same on every configuration; null on Free/Cloudflare); `usedBytes` only when measured.
          */
         disk?: { provisionedGiB: number | null; usedBytes: string | null };
+        /** Round 4 (additive): what the computer can do under the plan now (see `ComputeStandingV3`). */
+        standing?: ComputeStandingV3;
+        /** Round 4 (additive): where the files are, from the user's placement (any live aws-ec2 row → 'aws'). */
+        filesOn?: 'aws' | 'cloudflare';
+        /** Round 4 (additive): `files_on_aws` only, when Free began; null when not recorded (an immediate cancel). */
+        heldSince?: string | null;
+        /** Round 4 (additive): always null until Phase B moves files (D20/D21). */
+        move?: ComputerMoveV3 | null;
     };
     /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
     ai: {

@@ -18,11 +18,12 @@ import type { SubscriptionRow } from '../meters';
 import type { PaymentIssueRow } from '../ports';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { planFromSubscriptions } from './catalog';
+import type { ComputeStandingV3 } from './contract';
 
 export const PAYMENT_GRACE_DAYS = 7 as const;
 export const PAYMENT_GRACE_SECONDS = PAYMENT_GRACE_DAYS * 86_400;
 
-export type ComputeStandingV3 = 'paid' | 'grace' | 'plan_ending' | 'files_on_aws' | 'free';
+export type { ComputeStandingV3 };
 
 export interface StandingV3 {
     standing: ComputeStandingV3;

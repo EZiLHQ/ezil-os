@@ -1,4 +1,5 @@
 import { TRPCError } from '@trpc/server';
+import { sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
@@ -98,6 +99,30 @@ async function aiReceipts(deps: BillingDeps, userId: string) {
     }
 }
 
+type PlacementProvider = 'aws-ec2' | 'cloudflare' | null;
+
+/**
+ * Round 4: where the user's files are, for the computer's standing. Any aws-ec2 placement among the user's
+ * LIVE computers counts (a user may have two). Read-only; null with placement reads off, without the
+ * placement table (billing-only databases) or on any read error: the summary never fails on it.
+ */
+export async function userPlacementProvider(db: { execute(query: SQL): Promise<unknown> }, userId: string): Promise<PlacementProvider> {
+    try {
+        const { isPlacementReadEnabled } = await import('@/server/lib/compute/aws-config');
+        if (!isPlacementReadEnabled()) return null;
+        const rows = (result: unknown) => (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
+        const [table] = rows(await db.execute(sql`/* billing:placement-table */ SELECT to_regclass('public.ezil_computer_placements') IS NOT NULL AS present`));
+        if (table?.present !== true) return null;
+        const providers = rows(await db.execute(sql`/* billing:placement-provider */ SELECT p.provider FROM public.ezil_computer_placements p
+            JOIN public.ezil_computers c ON c.id = p.computer_id
+            WHERE p.owner_user_id = ${userId}::uuid AND c.user_id = ${userId}::uuid AND c.deleted_at IS NULL`)).map(row => row.provider);
+        return providers.includes('aws-ec2') ? 'aws-ec2' : providers.length ? 'cloudflare' : null;
+    } catch {
+        console.warn('[billing.summary] placement unavailable');
+        return null;
+    }
+}
+
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 /** The operator gate reuses the `/admin/telemetry` allow-list (`TELEMETRY_ADMIN_EMAILS`, fail-closed); no new env. */
 async function telemetryOperator(email: string | null | undefined): Promise<boolean> {
@@ -106,8 +131,10 @@ async function telemetryOperator(email: string | null | undefined): Promise<bool
 }
 
 export function createBillingRouter(getDeps: () => BillingDeps,
-    options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean> } = {}) {
+    options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean>;
+        placementProvider?: (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<PlacementProvider> } = {}) {
     const isOperator = options.isOperator ?? telemetryOperator;
+    const placementOf = options.placementProvider ?? userPlacementProvider;
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
             const deps = getDeps();
@@ -144,7 +171,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs] = await Promise.all([
+            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placementProvider] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -154,6 +181,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.stripeCustomerFor(ctx.user.id),
                 deps.store.overageInvoicesFor(ctx.user.id),
                 readStripePacks(deps.stripe),
+                placementOf(ctx.db, ctx.user.id),
             ]);
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
@@ -171,7 +199,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
-                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro },
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider,
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
