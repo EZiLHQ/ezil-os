@@ -6,8 +6,8 @@
  * byte. That file is what the os-staging schema tool applies
  * (`app/scripts/billing-staging-schema.mjs`, `EXPLICIT_FILES`); it is a
  * `snapshot` source in `.github/production-migrations.json`, never a grammar
- * `migration`, and the tool refuses it for `aws-production`
- * (`docs/feedback-migration.md`).
+ * `migration`; on `aws-production` the tool applies it with the full ordered
+ * list but never baselines it (`docs/feedback-migration.md`).
  */
 
 export const FEEDBACK_REPORTS_SQL = `CREATE TABLE public.ezil_feedback_reports (id uuid NOT NULL, user_id uuid NOT NULL, computer_id uuid NULL, created_at timestamptz NOT NULL, category text NOT NULL, description text NOT NULL, diagnostics jsonb NULL, client_request_id uuid NOT NULL, shell_version text NULL, status text NOT NULL, redaction_count integer NOT NULL, has_screenshot boolean NOT NULL, deploy_sha text NULL);

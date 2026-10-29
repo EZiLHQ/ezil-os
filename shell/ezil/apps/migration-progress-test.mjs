@@ -13,13 +13,15 @@ async function until(fn) {
     assert.fail('migration UI did not settle');
 }
 
-// Round 3: one status line while opening (no body); hold states keep one sentence.
+// Hotfix 3: an AWS opening shows ONE loading-stage sentence keyed by the server's reached milestone
+// (receipts-hf3 reached1-opening.png); moving and ordinary Cloudflare opens keep one status line
+// (no body); hold states keep one sentence.
 const copies = {
     attention: ['Your computer needs attention', 'Check the computer’s current status before trying again.'],
     unavailable: ['Opening', ''],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
     moving: ['Getting your AWS computer', ''],
-    launching: ['Starting your computer', ''],
+    launching: ['Starting your computer', 'A machine is ready and starting up.'],
     both: ['Getting your AWS computer', ''],
 };
 
@@ -111,7 +113,12 @@ for (const app of ['code', 'desktop', 'preview']) {
             const h = await open(t, app, mode);
             await wait(40); // Past the desktop phase reveal timer: observed copy must remain visible.
             assert.equal(h.spinner.hidden, false);
-            assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').hidden, true, 'one status line');
+            const sub = h.spinner.querySelector('.ezil-app-spinner-sub');
+            if (mode === 'moving') assert.equal(sub.hidden, true, 'one status line while moving');
+            else {
+                assert.equal(sub.hidden, false, 'opening shows its loading-stage sentence');
+                assert.equal(sub.textContent, copies.launching[1]);
+            }
             assert.equal(h.spinner.querySelector('.ezil-opening-bar').hidden, false);
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
             h.setNow(300_000); // Longer than the old AWS timeout.
@@ -119,6 +126,7 @@ for (const app of ['code', 'desktop', 'preview']) {
             assert.equal(h.spinner.dataset.kind, 'progress');
             h.setMode('waking');
             await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Attaching your files');
+            assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, 'Your files are attached. The desktop is starting.');
             assert.equal(h.spinner.querySelector('ol'), null, 'no step list');
             assert.doesNotMatch(h.spinner.textContent, /\d+%|min left/, 'no percentage text or countdown');
             if (app === 'desktop') {

@@ -346,9 +346,9 @@ describe('billing router', () => {
         if (origin === null) f.ctx.headers.delete('origin');
         else f.ctx.headers.set('origin', origin);
         await checkoutControl(f);
-        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ cancelUrl: 'https://os.ezil.org/os' }));
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ cancelUrl: 'https://os.ezil.work/os' }));
         await f.caller.portal();
-        expect(f.stripe.createPortalSession).toHaveBeenCalledWith({ customerId: 'cus_fixture', returnUrl: 'https://os.ezil.org/os' });
+        expect(f.stripe.createPortalSession).toHaveBeenCalledWith({ customerId: 'cus_fixture', returnUrl: 'https://os.ezil.work/os' });
     });
 
     it('requires a linked customer for the portal', async () => {

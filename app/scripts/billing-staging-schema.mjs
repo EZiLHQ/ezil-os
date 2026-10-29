@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Hand-run staging only. Intentionally independent of the production runner.
+// Hand-run schema applier for the self-hosted staging/preview and the empty self-hosted
+// production database (aws-production). Intentionally independent of the hosted production runner.
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -19,6 +20,8 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0007_paid_session_deadlines.sql',
     'docs/aws-computers/sql/0001_compute_placement.sql.txt',
     'docs/aws-computers/sql/0002_ready_pool.sql.txt',
+    // Applied out of band by rebase_release.py on staging (baseline it there); logged here for production.
+    'docs/aws-computers/sql/0002_image_rebase.sql.txt',
     'docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt',
     'app/drizzle/0008_pool_dispatch.sql',
     'app/drizzle/0009_capacity_demands.sql',
@@ -167,10 +170,12 @@ export function run(args = process.argv.slice(2), {
         const connection = databaseUrl ? validateDatabaseUrl(databaseUrl, target) : null;
         if (!connection && (mode !== 'plan' || target.startsWith('aws-'))) refuse('BILLING_STAGING_DATABASE_URL is required.');
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
-        // P9: pool v2 is staging-only, even though this runner also supports production.
-        if (target === 'aws-production' &&
-            (mode === 'apply' || requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql'].includes(basename(name))))) {
-            refuse('Pool hosts v2, capacity demand, migration restore progress and feedback are staging-only; production apply/baseline is forbidden.');
+        // Production applies the full ordered list under the same guards as preview: localhost:5432 host
+        // pin, pg_control system-id pin, SHA-256 re-check, one logged transaction per file (release plan
+        // §4.1-4.2). These files must really run there, never be recorded as already present.
+        if (target === 'aws-production' && mode === 'baseline' &&
+            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql'].includes(basename(name)))) {
+            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress and feedback must be applied on production, never baselined.');
         }
         const files = ordered.map((file) => ({ file, sha256: sha256(readFileSync(resolve(ROOT, file))) }));
         const selected = new Set(requested.map((name) => {
@@ -203,7 +208,7 @@ export function run(args = process.argv.slice(2), {
             let result;
             try {
                 result = spawnSyncImpl('psql', ['-X', '--no-password', '-v', 'ON_ERROR_STOP=1', '-q', '-A', '-t', ...(target.startsWith('aws-') && !parameters.includes('SELECT system_identifier FROM pg_control_system();') ?
-                        ['-c', `DO $pin$ BEGIN IF (SELECT system_identifier::text FROM pg_control_system()) IS DISTINCT FROM ${literal(expectSystemId)} THEN RAISE EXCEPTION 'Preview system identifier mismatch'; END IF; END; $pin$;`] : []), ...parameters], {
+                        ['-c', `DO $pin$ BEGIN IF (SELECT system_identifier::text FROM pg_control_system()) IS DISTINCT FROM ${literal(expectSystemId)} THEN RAISE EXCEPTION 'System identifier mismatch'; END IF; END; $pin$;`] : []), ...parameters], {
                     cwd: ROOT, env: childEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
                 });
             } catch { refuse('psql could not start; diagnostics suppressed to protect credentials.'); }
@@ -214,7 +219,7 @@ export function run(args = process.argv.slice(2), {
         // connection, so repeat the pin inside that same session before its SQL.
         if (target.startsWith('aws-')) {
             const actual = psql(['-c', 'SELECT system_identifier FROM pg_control_system();']).trim();
-            if (!/^[0-9]+$/.test(actual) || actual !== expectSystemId) refuse('Preview system identifier mismatch; no schema operation performed.');
+            if (!/^[0-9]+$/.test(actual) || actual !== expectSystemId) refuse('System identifier mismatch; no schema operation performed.');
         }
         psql(['--single-transaction', '-c', `CREATE TABLE IF NOT EXISTS ${TABLE} (file text primary key, sha256 text not null, applied_at timestamptz not null default now(), mode text not null);`]);
         let logged;

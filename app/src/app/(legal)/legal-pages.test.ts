@@ -8,9 +8,9 @@ import { describe, expect, it } from 'vitest';
 import { CATALOG_V3 } from '@/server/billing/v3/contract';
 
 import LegalLayout from './layout';
-import PrivacyPage from './privacy/page';
+import PrivacyPage, { metadata as privacyMetadata } from './privacy/page';
 import RefundsPage, { metadata as refundsMetadata } from './refunds/page';
-import TermsPage from './terms/page';
+import TermsPage, { metadata as termsMetadata } from './terms/page';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const legacyOperator = /Private\s+Limited|Bengaluru/i;
@@ -70,8 +70,13 @@ describe('hosted legal identity and navigation', () => {
 
     it('provides the refunds route and canonical metadata', () => {
         expect(existsSync(path.join(here, 'refunds/page.tsx'))).toBe(true);
-        expect(refundsMetadata.alternates?.canonical).toBe('https://os.ezil.org/refunds');
+        expect(refundsMetadata.alternates?.canonical).toBe('https://os.ezil.work/refunds');
         expect(renderToStaticMarkup(createElement(RefundsPage))).toContain('<h1>Refund Policy</h1>');
+    });
+
+    it('points every canonical URL at the production app, not the os.ezil.org landing site', () => {
+        expect(termsMetadata.alternates?.canonical).toBe('https://os.ezil.work/terms');
+        expect(privacyMetadata.alternates?.canonical).toBe('https://os.ezil.work/privacy');
     });
 
     it('links Terms, Privacy, and Refunds from the shared footer', () => {

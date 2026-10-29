@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { billingReturnOrigin, OWNED_APP_ORIGINS } from './return-origin';
 
 const headers = (origin: string | null): Pick<Headers, 'get'> => ({ get: name => name === 'origin' ? origin : null });
-const fallback = 'https://os.ezil.org';
+const fallback = 'https://os.ezil.work';
 
 afterEach(() => vi.unstubAllEnvs());
 

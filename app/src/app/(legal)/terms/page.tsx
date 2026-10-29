@@ -6,7 +6,7 @@ import { LegalDocument, OperatorContact, type LegalSection } from '../legal-docu
 export const metadata: Metadata = {
     title: 'Terms and Conditions | EZiL OS',
     description: 'Terms for the hosted EZiL OS service at os.ezil.org: accounts, acceptable use, your content, service limits, and your rights.',
-    alternates: { canonical: 'https://os.ezil.org/terms' },
+    alternates: { canonical: 'https://os.ezil.work/terms' },
 };
 
 const sections: readonly LegalSection[] = [

@@ -53,7 +53,8 @@ export const OWNED_APP_ORIGINS = [
     'https://os.ezil.work',
     'https://os-staging.ezil.work',
 ] as const;
-const CANONICAL_ORIGIN = 'https://os.ezil.org';
+/** The production app. `os.ezil.org` is the landing site and redirects here. */
+export const CANONICAL_ORIGIN = 'https://os.ezil.work';
 
 /** `publicOrigin`, but only an owned origin (or local dev outside production); otherwise the canonical one. */
 export function ownedPublicOrigin(headers: HeaderReader, fallback: string): string {

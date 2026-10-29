@@ -325,15 +325,21 @@ test('aws-production accepts only the DB container namespace and needs a system-
     const { validateDatabaseUrl } = await import('./billing-staging-schema.mjs');
     assert.doesNotThrow(() => validateDatabaseUrl('postgres://postgres:p@127.0.0.1:5432/postgres', 'aws-production'));
     assert.doesNotThrow(() => validateDatabaseUrl('postgres://postgres:p@localhost/postgres', 'aws-production'));
-    for (const bad of ['postgres://postgres:p@db.ezil.work:5432/postgres', 'postgres://postgres:p@10.63.20.10:5432/postgres',
-        'postgres://postgres:p@127.0.0.1:15432/postgres', 'postgres://postgres:p@db.btgqfmnzycdecmeyqubx.supabase.co:5432/postgres']) {
+    for (const bad of ['postgres://postgres:p@db.ezil.work:5432/postgres', 'postgres://postgres:p@db.ezil.work/postgres',
+        'postgres://postgres:p@10.63.20.10:5432/postgres', 'postgres://postgres:p@10.63.20.252:5432/postgres',
+        'postgres://postgres:p@127.0.0.1:15432/postgres', 'postgres://postgres:p@localhost:5433/postgres',
+        'postgres://postgres:p@127.0.0.1:5432/postgres?host=db.ezil.work',
+        'postgres://postgres:p@db.btgqfmnzycdecmeyqubx.supabase.co:5432/postgres']) {
         assert.throws(() => validateDatabaseUrl(bad, 'aws-production'), bad);
     }
 });
 
-test('pool v2 is registered after its prerequisite and preserves service-only RLS', () => {
+test('pool v2 is registered after its prerequisites and preserves service-only RLS', () => {
     const file = 'docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt';
-    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('docs/aws-computers/sql/0002_ready_pool.sql.txt') + 1);
+    const rebase = 'docs/aws-computers/sql/0002_image_rebase.sql.txt';
+    // Release plan §4.2: ready pool, then image rebase (now logged), then pool v2.
+    assert.equal(EXPLICIT_FILES.indexOf(rebase), EXPLICIT_FILES.indexOf('docs/aws-computers/sql/0002_ready_pool.sql.txt') + 1);
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf(rebase) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /REVOKE ALL ON TABLE public.ezil_compute_pool_hosts FROM public, anon, authenticated/);
     assert.match(sql, /ALTER TABLE public.ezil_compute_pool_hosts ENABLE ROW LEVEL SECURITY/);
@@ -342,20 +348,118 @@ test('pool v2 is registered after its prerequisite and preserves service-only RL
     assert.equal((sql.match(/CREATE INDEX IF NOT EXISTS/g) || []).length, 3);
 });
 
-test('pool v2 production apply and baseline refuse before any connection while other baselines still work', () => {
-    for (const mode of [['apply', '--yes'], ['baseline', '0003_pool_hosts_v2.sql.txt', '--yes'],
+const productionId = '7568749223372036999';
+const productionUrl = `postgres://postgres:${password}@localhost:5432/postgres`;
+const productionArgs = ['--target', 'aws-production', '--expect-system-id', productionId];
+const neverBaselined = ['docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', 'app/drizzle/0008_pool_dispatch.sql',
+    'app/drizzle/0009_capacity_demands.sql', 'app/drizzle/0010_migration_restore_progress.sql', 'app/drizzle/0011_feedback.sql'];
+function productionHarness(logged = [], actual = productionId) {
+    const h = harness(logged, { BILLING_STAGING_DATABASE_URL: productionUrl, PGHOSTADDR: '10.63.20.252', PGSERVICE: 'other' });
+    const original = h.options.spawnSyncImpl;
+    h.options.spawnSyncImpl = (...args) => {
+        const result = original(...args);
+        if (args[1].includes('SELECT system_identifier FROM pg_control_system();')) result.stdout = `${actual}\n`;
+        return result;
+    };
+    return h;
+}
+
+test('pool v2 production baseline refuses before any connection while plan and other baselines still work', () => {
+    for (const mode of [['baseline', '0003_pool_hosts_v2.sql.txt', '--yes'],
         ['baseline', './docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', '--yes']]) {
-        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
-        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        const h = productionHarness();
+        assert.equal(run([...mode, ...productionArgs], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
-    const plan = previewHarness();
-    plan.options.env.BILLING_STAGING_DATABASE_URL = 'postgres://postgres@localhost:5432/postgres';
-    assert.equal(run(['plan', '--target', 'aws-production', '--expect-system-id', previewId], plan.options), 0);
-    const h = previewHarness();
-    h.options.env.BILLING_STAGING_DATABASE_URL = 'postgres://postgres@localhost:5432/postgres';
-    assert.equal(run(['baseline', files[0].file, '--yes', '--target', 'aws-production', '--expect-system-id', previewId], h.options), 0);
+    assert.equal(run(['plan', ...productionArgs], productionHarness().options), 0);
+    const h = productionHarness();
+    assert.equal(run(['baseline', files[0].file, '--yes', ...productionArgs], h.options), 0);
+    assert.match(h.calls.at(-1).args.at(-1), /'baseline'\);$/);
+});
+
+test('production apply runs every reviewed file in plan order, image rebase included, each pinned and logged', () => {
+    const h = productionHarness();
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    assert.equal(h.calls[0].args.at(-1), 'SELECT system_identifier FROM pg_control_system();');
+    const migrations = h.calls.slice(3);
+    assert.deepEqual(migrations.map(({ args }) => EXPLICIT_FILES.find(file => args[args.indexOf('-f') + 1].endsWith(`/${file}`))), [...EXPLICIT_FILES]);
+    assert.ok(EXPLICIT_FILES.includes('docs/aws-computers/sql/0002_image_rebase.sql.txt'));
+    for (const { args, settings } of h.calls.slice(1)) {
+        const guardIndex = args.findIndex(arg => arg.startsWith('DO $pin$'));
+        assert.ok(guardIndex > 0 && args[guardIndex].includes(productionId));
+        assert.equal(settings.env.PGHOST, 'localhost');
+        assert.equal(settings.env.PGPORT, '5432');
+        assert.equal(settings.env.PGSSLMODE, 'disable');
+        assert.equal(settings.env.PGHOSTADDR, undefined);
+        assert.equal(settings.env.PGSERVICE, undefined);
+        assert.equal(args.join(' ').includes(password), false);
+    }
+    migrations.forEach(({ args }, index) => {
+        assert.ok(args.includes('--single-transaction'));
+        assert.ok(args.findIndex(arg => arg.startsWith('DO $pin$')) < args.indexOf('-f'));
+        assert.ok(args.indexOf('-f') < args.lastIndexOf('-c'));
+        assert.ok(args.at(-1).includes(files[index].file) && args.at(-1).includes(files[index].sha256));
+        assert.match(args.at(-1), /INSERT INTO public\.ezil_staging_schema_log .*'apply'\);$/);
+    });
+    assert.equal(h.output.filter(line => line.endsWith(': applied')).length, EXPLICIT_FILES.length);
+    assert.equal(h.output.join('\n').includes(password), false);
+});
+
+test('production apply resumes after logged files and stops on the first failure', () => {
+    const h = productionHarness([row(0), row(1)]);
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    assert.equal(h.calls.length, 3 + files.length - 2);
+    assert.ok(h.calls[3].args[h.calls[3].args.indexOf('-f') + 1].endsWith(files[2].file));
+    const failing = productionHarness();
+    const successful = failing.options.spawnSyncImpl;
+    failing.options.spawnSyncImpl = (...args) => {
+        const result = successful(...args);
+        return failing.calls.length === 4 ? { status: 1, stdout: password, stderr: productionUrl } : result; // the first migration
+    };
+    assert.equal(run(['apply', '--yes', ...productionArgs], failing.options), 1);
+    assert.equal(failing.calls.length, 4);
+    assert.match(failing.output.join('\n'), /stopped without retry/);
+    assert.equal(failing.output.join('\n').includes(': applied'), false);
+    assert.equal(failing.output.join('\n').includes(password), false);
+});
+
+test('production apply refuses before any write on a wrong system id, host, URL or pin argument', () => {
+    for (const actual of ['7568749223372036998', '', 'garbage']) {
+        const h = productionHarness([], actual);
+        assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 1);
+        assert.equal(h.calls.length, 1);
+        assert.match(h.output.join('\n'), /identifier mismatch/);
+    }
+    for (const url of [undefined, 'postgres://postgres@db.ezil.work:5432/postgres', 'postgres://postgres@10.63.20.252:5432/postgres',
+        'postgres://postgres@127.0.0.1:15432/postgres']) {
+        const h = productionHarness();
+        h.options.env.BILLING_STAGING_DATABASE_URL = url;
+        assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 1);
+        assert.equal(h.calls.length, 0);
+    }
+    for (const args of [['apply', '--yes', '--target', 'aws-production'], ['apply', '--target', 'aws-production', '--expect-system-id', productionId],
+        ['apply', '--yes', '--target', 'aws-production', '--expect-system-id', "1'; DROP TABLE x; --"]]) {
+        const h = productionHarness();
+        assert.equal(run(args, h.options), 1);
+        assert.equal(h.calls.length, 0);
+    }
+});
+
+test('production refuses to baseline any file that must be applied, alone or mixed with allowed files', () => {
+    for (const file of neverBaselined) {
+        for (const name of [file.split('/').at(-1), file, `./${file}`]) {
+            for (const requested of [[name], [files[0].file, name]]) {
+                const h = productionHarness();
+                assert.equal(run(['baseline', ...requested, '--yes', ...productionArgs], h.options), 1);
+                assert.equal(h.calls.length, 0);
+                assert.match(h.output.join('\n'), /never baselined/);
+            }
+        }
+        // Preview keeps its baseline path for files applied out of band.
+        const preview = previewHarness();
+        assert.equal(run(['baseline', file, '--yes', ...previewArgs], preview.options), 0);
+    }
 });
 
 test('restore progress follows 0009 and is registered as a production snapshot only', () => {
@@ -368,13 +472,13 @@ test('restore progress follows 0009 and is registered as a production snapshot o
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('restore progress production apply and baseline refuse before connecting', () => {
-    for (const mode of [['apply', '--yes'], ['baseline', '0010_migration_restore_progress.sql', '--yes'],
+test('restore progress production baseline refuses before connecting', () => {
+    for (const mode of [['baseline', '0010_migration_restore_progress.sql', '--yes'],
         ['baseline', './app/drizzle/0010_migration_restore_progress.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
 });
 
@@ -395,12 +499,12 @@ test('feedback follows 0010 and is registered as a production snapshot only', ()
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('feedback production apply and baseline refuse before connecting', () => {
-    for (const mode of [['apply', '--yes'], ['baseline', '0011_feedback.sql', '--yes'],
+test('feedback production baseline refuses before connecting', () => {
+    for (const mode of [['baseline', '0011_feedback.sql', '--yes'],
         ['baseline', './app/drizzle/0011_feedback.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
 });

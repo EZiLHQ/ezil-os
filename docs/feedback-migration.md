@@ -15,8 +15,9 @@ How it is wired:
 - `.github/production-migrations.json` registers it in `sources` as `kind: "snapshot"`
   (so `production-migrations.mjs validate` accepts the `.sql` file), **not** in
   `migrations`: nothing applies it to production through the release gate.
-- The staging tool refuses it for `--target aws-production` (apply and baseline), like
-  0003 pool v2 / 0008 / 0009 / 0010.
+- On `--target aws-production` the tool applies it with the full ordered list (it is inert
+  until `EZIL_OS_FEEDBACK` is set) and refuses to baseline it, like 0003 pool v2 / 0008 /
+  0009 / 0010.
 
 ## Apply on os-staging (release owner)
 

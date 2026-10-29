@@ -61,6 +61,10 @@ performed while authoring. See `README.md` for the separate app release flow.
    node app/scripts/billing-staging-schema.mjs apply --yes --target aws-preview --expect-system-id VERIFIED_DIGITS
    # Baseline only after separately verifying that this file's schema exists:
    node app/scripts/billing-staging-schema.mjs baseline app/drizzle/0006_compute_migrations.sql --yes --target aws-preview --expect-system-id VERIFIED_DIGITS
+   # Once on os-staging: 0002_image_rebase is now in the list but was applied out of band by
+   # rebase_release.py. Its SQL is not re-runnable, so after verifying public.ezil_computer_image_jobs
+   # exists, baseline it before the next apply (production applies it instead):
+   node app/scripts/billing-staging-schema.mjs baseline docs/aws-computers/sql/0002_image_rebase.sql.txt --yes --target aws-preview --expect-system-id VERIFIED_DIGITS
    ```
 
    The initial system-ID query precedes log creation and all mode operations.

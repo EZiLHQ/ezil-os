@@ -6,7 +6,7 @@ import { LegalDocument, OperatorContact, type LegalSection } from '../legal-docu
 export const metadata: Metadata = {
     title: 'Refund Policy | EZiL OS',
     description: 'Refunds for monthly Standard and Premium charges within 14 days when less than 10% of monthly fair use is used, and how to contact EZiL LLC about a payment.',
-    alternates: { canonical: 'https://os.ezil.org/refunds' },
+    alternates: { canonical: 'https://os.ezil.work/refunds' },
 };
 
 const sections: readonly LegalSection[] = [
