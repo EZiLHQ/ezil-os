@@ -13,15 +13,20 @@ async function until(fn) {
     assert.fail('migration UI did not settle');
 }
 
-// Round 3: one status line while opening (no body); hold states keep one sentence.
+// Round 5 (D5): ONE surface. While opening, the title is "Opening {App}…" and the ONE status line
+// is the loading-stage sentence (the retired round-3 rule "no body line while opening" is gone);
+// a hold puts the server's title and its one sentence in their place.
 const copies = {
     attention: ['Your computer needs attention', 'Check the computer’s current status before trying again.'],
     unavailable: ['Opening', ''],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
-    moving: ['Getting your AWS computer', ''],
-    launching: ['Starting your computer', ''],
-    both: ['Getting your AWS computer', ''],
+    moving: ['Getting your AWS computer'],
+    launching: ['A machine is ready and starting up.'],
+    both: ['Getting your AWS computer'],
 };
+const TITLES = { code: 'Opening Code…', desktop: 'Opening Browser…', preview: 'Opening Preview…' };
+const label = spinner => spinner.querySelector('.ezil-app-spinner-label').textContent;
+const line = spinner => spinner.querySelector('.ezil-app-spinner-sub');
 
 async function open(t, app, initialMode = 'moving') {
     const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', {
@@ -71,7 +76,9 @@ async function open(t, app, initialMode = 'moving') {
     await registry.launch(app, { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState });
     const win = await until(() => w.document.querySelector(`.window[data-app="${app}"]`));
     const spinner = win.querySelector('.ezil-app-spinner');
-    await until(() => initialMode === 'unavailable' ? spinner.querySelector('.ezil-app-spinner-label').textContent.startsWith('Opening ') && spinner.dataset.progress === 'unavailable' : spinner.querySelector('.ezil-app-spinner-label').textContent === copies[initialMode][0]);
+    await until(() => initialMode === 'unavailable' ? label(spinner).startsWith('Opening ') && spinner.dataset.progress === 'unavailable'
+        : ['attention', 'paused'].includes(initialMode) ? label(spinner) === copies[initialMode][0]
+        : label(spinner) === TITLES[app] && line(spinner).textContent === copies[initialMode][0]);
     return { w, win, spinner, asks, setMode: m => { mode = m; }, setNow: ms => { now = ms; } };
 }
 
@@ -109,22 +116,25 @@ for (const app of ['code', 'desktop', 'preview']) {
     for (const mode of ['moving', 'launching']) {
         test(`${app}: built loader shows ${mode} copy, then ordinary progress and a ready frame beyond the old deadline`, async t => {
             const h = await open(t, app, mode);
-            await wait(40); // Past the desktop phase reveal timer: observed copy must remain visible.
+            await wait(40); // Past the old desktop phase reveal timer: the one surface stays.
             assert.equal(h.spinner.hidden, false);
-            assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').hidden, true, 'one status line');
+            assert.equal(label(h.spinner), TITLES[app], 'the title names the app');
+            assert.equal(line(h.spinner).hidden, false, 'ONE status line: the loading stage');
+            assert.equal(line(h.spinner).textContent, copies[mode][0]);
             assert.equal(h.spinner.querySelector('.ezil-opening-bar').hidden, false);
+            assert.equal(h.spinner.querySelector('.ezil-opening-bar').dataset.indeterminate, undefined, 'an observed opening has a determinate bar');
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
             h.setNow(300_000); // Longer than the old AWS timeout.
             await wait(20);
             assert.equal(h.spinner.dataset.kind, 'progress');
             h.setMode('waking');
-            await until(() => h.spinner.querySelector('.ezil-app-spinner-label').textContent === 'Attaching your files');
+            await until(() => line(h.spinner).textContent === 'Your files are attached. The desktop is starting.');
+            assert.equal(label(h.spinner), TITLES[app]);
             assert.equal(h.spinner.querySelector('ol'), null, 'no step list');
-            assert.doesNotMatch(h.spinner.textContent, /\d+%|min left/, 'no percentage text or countdown');
-            if (app === 'desktop') {
-                assert.equal(h.spinner.hidden, false);
-                assert.equal(h.win.querySelector('.ezil-boot').hidden, true);
-            }
+            assert.doesNotMatch(h.spinner.textContent, /\d+%|min left|Next session|Last recorded update/, 'no percentage text, countdown or dev line');
+            // One surface: in the Desktop window the legacy `.ezil-boot` hook IS the spinner.
+            const loaders = [...new Set(h.win.querySelectorAll('.ezil-app-spinner, .ezil-boot'))];
+            assert.deepEqual(loaders, [h.spinner]);
             h.setNow(mode === 'moving' ? 480_000 : 400_000); // Migration restarts at commit; replacement retains its original deadline.
             h.setMode('ready');
             await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://'));
@@ -134,12 +144,13 @@ for (const app of ['code', 'desktop', 'preview']) {
         test(`${app}: ${mode} timeout keeps active progress until the calm ten-minute retry`, async t => {
             const h = await open(t, app, mode);
             h.setNow(480_000);
-            await until(() => h.spinner.querySelector('.ezil-opening-meta').textContent.startsWith('Taking a little longer than usual'));
+            await until(() => h.spinner.querySelector('.ezil-opening-meta').textContent.startsWith('Taking longer than usual · '));
+            assert.equal(h.spinner.dataset.state, 'long');
             assert.equal(h.spinner.dataset.kind, 'progress');
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
             assert.doesNotMatch(h.spinner.textContent, /This is taking too long/);
-            const bar = Number(h.spinner.querySelector('.ezil-opening-bar').getAttribute('aria-valuenow'));
-            assert.ok(bar > 0 && bar <= 90, `an overdue bar holds below 90% until ready (${bar})`);
+            const bar = Number(h.spinner.querySelector('.ezil-opening-bar').dataset.percent);
+            assert.ok(bar > 0 && bar < 100, `an overdue bar never reaches 100 before ready (${bar})`);
             h.setNow(599_000);
             await wait(30);
             assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
@@ -160,8 +171,8 @@ for (const app of ['code', 'desktop', 'preview']) {
         const h = await open(t, app, 'both');
         await wait(40);
         assert.equal(h.spinner.hidden, false);
-        assert.equal(h.spinner.querySelector('.ezil-app-spinner-label').textContent, copies.moving[0]);
-        assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, copies.moving[1]);
+        assert.equal(label(h.spinner), TITLES[app]);
+        assert.equal(line(h.spinner).textContent, copies.moving[0]);
         h.setMode('ready');
         await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://'));
     });
