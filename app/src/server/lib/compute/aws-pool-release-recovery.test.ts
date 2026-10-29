@@ -572,3 +572,38 @@ describe('the real retried-observe failed release heals once its host has aged o
         expect(s.usage[0]!.stopped_at).toEqual(new Date('2026-10-28T17:36:42.863Z'));
     });
 });
+
+describe('round 5 D2: releaseHealOf classifies the rows this recovery really writes', () => {
+    it('failed release → RECOVERING replay → STOPPED/pool_released: pending, pending, then no heal', async () => {
+        const { releaseHealOf } = await import('./release-heal');
+        const s = setup();
+        expect(releaseHealOf(await s.current())).toBe('pending');
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
+        expect(releaseHealOf(await s.current())).toBe('pending');
+        s.finish(); await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED });
+        expect(releaseHealOf(await s.current())).toBeNull();
+    });
+    it('a transient read failure stays pending; a refused identity or a spent recovery is failed', async () => {
+        const { releaseHealOf } = await import('./release-heal');
+        const transient = setup(); transient.deps.describer!.describeVolume = async () => { throw new Error('lost'); };
+        await transient.tick();
+        expect(await transient.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('describe_unavailable') });
+        expect(releaseHealOf(await transient.current())).toBe('pending');
+        const refused = setup(); refused.host.state = 'running'; await refused.tick();
+        expect(await refused.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('instance_identity') });
+        expect(releaseHealOf(await refused.current())).toBe('failed');
+        const spent = setup(); await spent.tick(); spent.finish('FAILED'); await spent.tick(); await spent.tick();
+        expect(await spent.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('recovery_retry_awaits_new_deployment') });
+        expect(releaseHealOf(await spent.current())).toBe('failed');
+    });
+    it('a refused replay start keeps RECOVERING: still pending', async () => {
+        const { releaseHealOf } = await import('./release-heal');
+        const s = setup();
+        s.deps.starter!.start = async () => { throw Object.assign(new Error('denied'), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 400 } }); };
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'RECOVERING', lastError: expect.stringContaining('start_refused') });
+        expect(releaseHealOf(await s.current())).toBe('pending');
+    });
+});
