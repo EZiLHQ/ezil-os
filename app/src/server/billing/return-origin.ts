@@ -1,4 +1,4 @@
-import { OWNED_APP_ORIGINS } from '@/utils/forwarded';
+import { CANONICAL_ORIGIN, OWNED_APP_ORIGINS } from '@/utils/forwarded';
 
 export { OWNED_APP_ORIGINS };
 
@@ -10,5 +10,5 @@ export function billingReturnOrigin(headers?: Pick<Headers, 'get'>): string {
         const local = /^http:\/\/(?:localhost|127\.0\.0\.1):([0-9]{1,5})$/.exec(origin);
         if (local && local[0] === origin && Number(local[1]) <= 65535) return origin;
     }
-    return 'https://os.ezil.org';
+    return CANONICAL_ORIGIN;
 }

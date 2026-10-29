@@ -32,8 +32,8 @@ window.listSupportedLanguages = () => Object.keys(translations).map(lang => tran
 
 const variables = {
     docs: 'https://ezil.org/docs',
-    terms: 'https://os.ezil.org/terms',
-    privacy: 'https://os.ezil.org/privacy',
+    terms: 'https://os.ezil.work/terms',
+    privacy: 'https://os.ezil.work/privacy',
 };
 
 function ReplacePlaceholders (str, arg_variables = {}) {
