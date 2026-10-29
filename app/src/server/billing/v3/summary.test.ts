@@ -250,3 +250,29 @@ describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () =>
             computer: { disk: { provisionedGiB: null, usedBytes: '5' } } });
     });
 });
+
+describe('round 4: standing fields (additive)', () => {
+    it('paid by default, with the placement deciding filesOn and move always null', () => {
+        expect(buildSummaryV3(input('standard_monthly_v3')).computer).toMatchObject({ standing: 'paid', filesOn: 'cloudflare', heldSince: null, move: null });
+        expect(buildSummaryV3({ ...input('standard_monthly_v3'), placementProvider: 'aws-ec2' }).computer).toMatchObject({ standing: 'paid', filesOn: 'aws' });
+        expect(buildSummaryV3(input()).computer).toMatchObject({ standing: 'free', filesOn: 'cloudflare' });
+        expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2' }).computer).toMatchObject({ standing: 'files_on_aws', filesOn: 'aws' });
+        expect(buildSummaryV3(input()).plan).toMatchObject({ graceEndsAt: null, planEndsAt: null });
+    });
+    it('grace keeps the paid allowance when the unpaid renewal has no receipt, and a refund reversal still pauses', () => {
+        const args = { ...input('premium_monthly_v3'), grants: [], placementProvider: 'aws-ec2' as const,
+            subs: [{ sku: 'premium_monthly_v3' as const, stripeSubscriptionId: 'sub', status: 'past_due', currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }],
+            paymentIssues: [{ stripeInvoiceId: 'in', userId: 'u', subscriptionId: 'sub', invoiceKind: 'subscription' as const, issue: 'payment_failed' as const,
+                hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-10-15T00:00:00Z'), resolvedAt: null, updatedAt: now }] };
+        expect(buildSummaryV3(args)).toMatchObject({ plan: { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: '2026-10-22T00:00:00Z' },
+            computer: { standing: 'grace' }, fairUse: { status: 'ok' } });
+        expect(buildSummaryV3({ ...args, grants: [{ ...input('premium_monthly_v3').grants[0]!, amount: BigInt(0) }] }).fairUse.status).toBe('paused');
+        expect(buildSummaryV3({ ...args, now: new Date('2026-10-22T00:00:00Z') }).computer).toMatchObject({ standing: 'files_on_aws', heldSince: '2026-10-22T00:00:00Z' });
+    });
+    it('cancel at period end reads plan_ending with planEndsAt', () => {
+        const args = input('premium_monthly_v3');
+        args.subs = [{ ...args.subs[0]!, cancelAtPeriodEnd: true }];
+        expect(buildSummaryV3(args)).toMatchObject({ plan: { status: 'cancels', planEndsAt: '2026-11-10T00:00:00Z', cancelsAt: '2026-11-10T00:00:00Z' },
+            computer: { standing: 'plan_ending' } });
+    });
+});

@@ -520,7 +520,101 @@ describe('v3 compute enforcement', () => {
         input.epochs = [{ ...epoch('2026-10-18T11:00:00Z', '2026-10-18T12:00:00Z'), endedAt: null }];
         expect(await gate()).toEqual({ allowed: false, reason: 'concurrent_limit' });
         input.epochs = [];
+        // Round 4 D17: a fresh subscription issue is grace (paid computer usable); 7 days on it is Free, and a
+        // Free start with no placement type (a canary) is still refused.
         input.paymentIssues = [issue()];
-        expect(await gate()).toEqual({ allowed: false, reason: 'payment_issue' });
+        expect(await gate()).toEqual({ allowed: true });
+        input.paymentIssues = [issue({ stripeEventCreated: new Date(NOW.getTime() - 7 * 86_400_000) })];
+        expect(await gate()).toEqual({ allowed: false, reason: 'size_not_allowed' });
+    });
+});
+
+describe('round 4: grace (D17), dropped plans (D18) and the Free hold on AWS (D16)', () => {
+    const DAY = 86_400_000;
+    const ago = (ms: number) => new Date(NOW.getTime() - ms);
+    // A failed renewal: the period has moved on, its invoice is unpaid, so the period has no receipt yet.
+    const renewal = (over: Partial<SubscriptionRow> = {}) => subscription({ sku: 'standard_monthly_v3', status: 'past_due',
+        currentPeriodStart: ago(2 * DAY), currentPeriodEnd: new Date(NOW.getTime() + 28 * DAY), ...over });
+    const canceled = () => [subscription({ sku: 'premium_monthly_v3', status: 'canceled', stripeSubscriptionId: 'sub_p' }),
+        subscription({ sku: 'standard_monthly_v3', status: 'canceled' })];
+    const shadow = () => readBillingConfig({ BILLING_TAB_ENABLED: '1' });
+
+    it('v3 past_due inside grace opens AWS at the paid size through the full gate, and the Billing summary still says so', async () => {
+        const { deps } = fixture({ config: enforced(), subs: [renewal()], paymentIssues: [issue({ stripeEventCreated: ago(2 * DAY) })] });
+        expect(await gate(deps)).toEqual({ allowed: true });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'standard_monthly_v3', planActive: true, delinquent: true, paymentIssue: false,
+            provider: 'aws', entitledSize: 'std-2', allowanceStdSeconds: 40 * 3600 });
+        expect(state.summary.version === 3 && state.summary.plan).toMatchObject({ status: 'past_due', paymentIssue: 'payment_failed' });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ status: 'active', provider: 'aws', size: 'std-2', paymentIssue: false });
+        // Premium in grace keeps its chosen configuration; a refund reversal for the period still wins (D19).
+        const premium = fixture({ config: enforced(), subs: [renewal({ sku: 'premium_monthly_v3' })], sizePreference: 'cmp-8',
+            paymentIssues: [issue({ stripeEventCreated: ago(DAY) })] });
+        expect(await gate(premium.deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: true });
+        premium.input.grants = [grant({ periodStart: ago(2 * DAY), periodEnd: new Date(NOW.getTime() + 28 * DAY), amount: BigInt(0) })];
+        expect(await gate(premium.deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+
+    it.each([
+        ['day 6 (6 d 23 h 59 m)', 7 * DAY - 60_000, true],
+        ['day 7 (exactly 7 d)', 7 * DAY, false],
+    ] as const)('grace on %s', async (_label, age, inGrace) => {
+        const { deps } = fixture({ config: shadow(), subs: [renewal({ currentPeriodStart: ago(8 * DAY) })],
+            paymentIssues: [issue({ stripeEventCreated: ago(age) })] });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject(inGrace ? { planSku: 'standard_monthly_v3', provider: 'aws', paymentIssue: false }
+            : { planSku: 'free_v3', provider: 'cloudflare', paymentIssue: false, planActive: true, entitledSize: 'free-cf', window: MONTH, sessionMaxSeconds: 3600 });
+        const decision = await gate(deps);
+        expect(decision).toMatchObject({ allowed: true, shadow: inGrace ? { admit: true, size: 'std-2' } : { admit: true, size: 'std-2', maxRunSeconds: 3600, hold: true } });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject(inGrace
+            ? { status: 'active', provider: 'aws' } : { status: 'active', provider: 'cloudflare', planId: 'free_v3' });
+    });
+
+    it.each(['unpaid', 'incomplete'])('%s drops to Free at once (no grace)', async status => {
+        const { deps } = fixture({ config: enforced(), subs: [renewal({ status })], paymentIssues: [issue()] });
+        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: 'free_v3', provider: 'cloudflare', paymentIssue: false });
+        expect(await gate(deps, { instanceType: 'm6i.xlarge' })).toEqual({ allowed: false, reason: 'files_on_aws' });
+        expect(await gate(deps, { kind: 'cloudflare', instanceType: null })).toEqual({ allowed: true });
+    });
+
+    it('D16: an immediate cancel holds the AWS computer at std-2 under Free limits; cmp-4/cmp-8 and a typeless canary are refused', async () => {
+        const admit = vi.spyOn(admissionV3, 'admitStart');
+        const { deps } = fixture({ config: enforced(), subs: canceled(), epochs: [epoch('2026-10-02T00:00:00Z', '2026-10-02T01:00:00Z')] });
+        expect(await gate(deps)).toEqual({ allowed: true });
+        expect(admit).toHaveLastReturnedWith({ admit: true, size: 'std-2', maxRunSeconds: 3600, fromPool: false, poolPriority: 0, hold: true,
+            deadline: isoSeconds(epochSeconds(NOW) + 3600) });
+        expect(admit).toHaveBeenLastCalledWith(expect.objectContaining({ sku: 'free_v3', size: 'std-2', hold: true, usedSeconds: 4 * 3600 }));
+        expect(await gate(deps, { instanceType: 'm6i.xlarge' })).toEqual({ allowed: false, reason: 'files_on_aws' });
+        expect(await gate(deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: false, reason: 'files_on_aws' });
+        expect(await gate(deps, { instanceType: null })).toEqual({ allowed: false, reason: 'size_not_allowed' });
+        expect(await gate(deps, { kind: 'cloudflare', instanceType: null })).toEqual({ allowed: true });
+        // Free fair use still applies to the hold.
+        // Legacy Free (no creation date): 8 h; two one-hour cmp-8 sessions are 8 standard-hours.
+        const spent = fixture({ config: enforced(), subs: canceled(), epochs: [epoch('2026-10-02T00:00:00Z', '2026-10-02T01:00:00Z'),
+            epoch('2026-10-03T00:00:00Z', '2026-10-03T01:00:00Z')] });
+        expect(await gate(spent.deps)).toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+
+    it('ready-epoch trap: decideStart at readiness keeps the hold (deadline = ready + Free remaining, not ready)', async () => {
+        const { deps } = fixture({ config: enforced(), subs: canceled(),
+            // 4 h + 3 h 50 m of the legacy Free 8 h: 600 seconds left.
+            epochs: [epoch('2026-10-02T00:00:00Z', '2026-10-02T01:00:00Z'), epoch('2026-10-03T00:00:00Z', '2026-10-03T00:57:30Z')] });
+        const result = await open(deps, { size: 'std-2' });
+        expect(result).toMatchObject({ status: 'opened', deadlineAt: isoSeconds(epochSeconds(READY) + 600), decision: { admit: true, hold: true, size: 'std-2' } });
+        const fresh = fixture({ config: enforced(), subs: canceled() });
+        expect(await open(fresh.deps, { size: 'std-2' })).toMatchObject({ status: 'opened', deadlineAt: isoSeconds(epochSeconds(READY) + 3600),
+            decision: { hold: true } });
+        // A larger AWS type at readiness is not held: it is recorded due at once.
+        const big = fixture({ config: enforced(), subs: canceled() });
+        expect(await open(big.deps, { size: 'cmp-8' })).toMatchObject({ deadlineAt: isoSeconds(epochSeconds(READY)), decision: { admit: false } });
+    });
+
+    it('cancel at period end keeps the paid computer until the end (plan_ending), then holds it', async () => {
+        const { deps, input } = fixture({ config: enforced(), subs: [subscription({ sku: 'premium_monthly_v3', cancelAtPeriodEnd: true })],
+            grants: [grant({ amount: BigInt(1_800_000) })], sizePreference: 'cmp-8' });
+        expect(await gate(deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: true });
+        input.subs = [subscription({ sku: 'premium_monthly_v3', cancelAtPeriodEnd: true, currentPeriodEnd: NOW })];
+        expect(await gate(deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: false, reason: 'files_on_aws' });
+        expect(await gate(deps, { instanceType: 'm6i.large' })).toEqual({ allowed: true });
     });
 });

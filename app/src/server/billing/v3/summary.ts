@@ -11,6 +11,7 @@ import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
 import { CATALOG_V3_VERSION, type BillingSummaryV3, type SellableSkuV3 } from './contract';
+import { deriveStanding } from './standing';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
 import { aiMicroBalanceState, type AiGatewayGrant } from '../ai-balance';
 import type { AiCreditReceipt } from '../ai-credit-outbox';
@@ -29,13 +30,16 @@ export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineA
 }
 
 /** Paid receipts and reversals keep the same subscription/period isolation as v2. */
-export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[]): number {
+export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[], options: { grace?: boolean } = {}): number {
     if (plan.sku === 'legacy') throw new TypeError('Legacy allowances use v2 rating');
     if (plan.sku === 'free_v3') return plan.legacyFree ? plan.offer.legacyFairUseSeconds! : plan.offer.fairUseSeconds;
     const start = new Date(plan.window.start), end = new Date(plan.window.end);
-    const amount = grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
-        && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start)
-        .reduce((sum, grant) => sum + grant.amount, BigInt(0));
+    const rows = grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
+        && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start);
+    // Round 4 D17: an unpaid renewal has no receipt yet. In grace the paid computer stays usable on the plan's
+    // fair use; any receipt or reversal (a refund, D19) for the period still wins.
+    if (options.grace && rows.length === 0) return plan.offer.fairUseSeconds;
+    const amount = rows.reduce((sum, grant) => sum + grant.amount, BigInt(0));
     return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
 }
 
@@ -146,8 +150,12 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     stripeAvailable?: boolean;
     /** Round 3: the Gateway balance and stored receipts; omitted = balance filled by the caller (v1 shape). */
     ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null };
+    /** Round 4: any aws-ec2 placement among the user's live computers; null/omitted = none or unreadable. */
+    placementProvider?: 'aws-ec2' | 'cloudflare' | null;
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
+    const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        placementProvider: input.placementProvider ?? null, now: input.now });
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
     const changes = input.planChanges.filter(change => change.subscriptionId === plan.subscriptionId);
     const upgrade = changes.find(change => change.kind === 'upgrade' && sellable(change.toSku)
@@ -162,7 +170,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         && issue.resolvedAt === null && issue.issue !== 'voided' && issue.invoiceKind === 'subscription');
     const paymentIssue = issues.some(issue => issue.issue === 'requires_action') ? 'requires_action'
         : issues.length || plan.status === 'past_due' || plan.status === 'incomplete' ? 'payment_failed' : null;
-    const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants);
+    const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants, { grace: standing.standing === 'grace' });
     const bounds = { sessionMaxSeconds: plan.sessionMaxSeconds, allowanceStdSeconds: allowance };
     const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now, bounds);
     const size = legacy ? SIZES[legacy.compute.selectedSize] : plan.sku === 'legacy' ? SIZES[plan.offer.defaultSize]
@@ -192,12 +200,13 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             : plan.offer.family === 'compute' ? 'Compute (legacy)' : 'Standard (legacy)' : plan.offer.name,
         status: pendingUpgrade && plan.planActive ? 'upgrade_pending' : plan.status,
         renewal: plan.renewsAt !== null ? input.renewal ?? null : null, cancelsAt: plan.cancelsAt,
-        scheduledChange, pendingUpgrade, paymentIssue },
+        scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt },
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: plan.sessionMaxSeconds,
             opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline,
             machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
                 size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const })),
-            disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null } },
+            disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null },
+            standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },

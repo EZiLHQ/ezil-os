@@ -21,7 +21,7 @@ vi.mock('@/server/billing/deps', () => ({
     getBillingDeps: () => { throw new Error('Tests must inject billing ports'); },
 }));
 
-import { createBillingRouter } from './billing';
+import { createBillingRouter, userPlacementProvider } from './billing';
 
 const now = new Date('2026-10-11T12:00:00Z');
 const sku = 'standard_monthly_v3';
@@ -1196,5 +1196,71 @@ describe('round 3 D5: operator-only AI requeue', () => {
             await expect(f.caller.requeueAiCredits(input as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         }
         expect(f.requeueFailed).not.toHaveBeenCalled();
+    });
+});
+
+describe('round 4: the computer standing in the summary', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    const withPlacement = (provider: 'aws-ec2' | 'cloudflare' | null) => {
+        const f = fixture();
+        const placementProvider = vi.fn(async () => provider);
+        return { ...f, placementProvider, caller: createBillingRouter(() => f.deps, { placementProvider }).createCaller(f.ctx) };
+    };
+
+    it('an immediate cancel with the computer still on AWS reads files_on_aws, with no move', async () => {
+        const f = withPlacement('aws-ec2');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled',
+            currentPeriodEnd: new Date('2026-11-20T00:00:00Z') })]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'free_v3', graceEndsAt: null, planEndsAt: null },
+            computer: { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null } });
+        expect(f.placementProvider).toHaveBeenCalledWith(f.ctx.db, userId);
+    });
+
+    it('a failed renewal reads grace with its end date; a cancel at period end reads plan_ending', async () => {
+        const f = withPlacement('aws-ec2');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v3', status: 'past_due',
+            currentPeriodStart: new Date('2026-10-10T00:00:00Z'), currentPeriodEnd: new Date('2026-11-10T00:00:00Z') })]);
+        f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in_f', userId, subscriptionId: 'sub_fixture', invoiceKind: 'subscription',
+            issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-10-10T06:00:00Z'), resolvedAt: null, updatedAt: now }]);
+        await expect(f.caller.summary()).resolves.toMatchObject({
+            plan: { sku: 'standard_monthly_v3', status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: '2026-10-17T06:00:00Z' },
+            // The unpaid renewal has no receipt yet: grace keeps the plan's fair use, never "paused".
+            computer: { standing: 'grace', filesOn: 'aws' }, fairUse: { status: 'ok' } });
+        f.store.openPaymentIssues.mockResolvedValue([]);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', cancelAtPeriodEnd: true })]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { planEndsAt: '2026-10-20T00:00:00Z' }, computer: { standing: 'plan_ending' } });
+    });
+
+    it('Free on Cloudflare (or an unreadable placement) reads free', async () => {
+        for (const provider of ['cloudflare', null] as const) {
+            await expect(withPlacement(provider).caller.summary()).resolves.toMatchObject({ computer: { standing: 'free', filesOn: 'cloudflare', move: null } });
+        }
+    });
+
+    it('userPlacementProvider: off without placement reads, null without the table or on error, aws-ec2 wins across computers', async () => {
+        const [c1, c2] = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+        const execute = vi.fn(async (): Promise<unknown> => []);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
+        expect(execute).not.toHaveBeenCalled();
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        // No live computers.
+        execute.mockResolvedValueOnce([]);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
+        // Live computers, no placement table.
+        execute.mockResolvedValueOnce([{ id: c1 }]).mockResolvedValueOnce([{ present: false }]);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
+        // Two computers: Cloudflare and aws-ec2 → aws-ec2 (rows or { rows } results).
+        execute.mockResolvedValueOnce({ rows: [{ id: c1 }, { id: c2 }] })
+            .mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([{ present: true }])
+            .mockResolvedValueOnce([{ provider: 'cloudflare' }]).mockResolvedValueOnce([{ provider: 'aws-ec2' }]);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBe('aws-ec2');
+        execute.mockResolvedValueOnce([{ id: c1 }]).mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([{ provider: 'cloudflare' }]);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBe('cloudflare');
+        execute.mockResolvedValueOnce([{ id: c1 }]).mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([]);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        execute.mockRejectedValueOnce(new Error('relation missing'));
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
+        expect(warn).toHaveBeenCalledWith('[billing.summary] placement unavailable');
     });
 });
