@@ -46,3 +46,42 @@ it('production host deps forward cancellation to the observer before its first d
     expect(f.deps.db.execute).not.toHaveBeenCalled();
     expect(f.deps.db.transaction).not.toHaveBeenCalled();
 });
+it('D4: the production pass log keeps its memo across cron requests (one line, then silent, then a 15-minute heartbeat)', () => {
+    const f = poolFixture(); mocks.sdk.mockReturnValue({ starter: { start: vi.fn() } });
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-29T12:00:00Z'));
+    try {
+        const env = { ...f.deps.env, AWS_REGIONS: 'ap-south-1' };
+        const c = createPoolReplenishDeps(f.deps.db, env, store).classes[0]!;
+        const entries = [{ c, record: { target: 1, recent: 0, base: 1, spares: 1, provisioned: 0, retired: 0, retirements: [], slowHosts: [] } }];
+        // Each cron GET builds fresh deps; the memo must outlive them.
+        createPoolReplenishDeps(f.deps.db, env, store).log(entries, false);
+        createPoolReplenishDeps(f.deps.db, env, store).log(entries, false);
+        expect(info).toHaveBeenCalledOnce();
+        const [line, ...rest] = info.mock.calls[0]!;
+        expect(rest).toEqual([]); expect(typeof line).toBe('string'); expect(line).not.toContain('\n');
+        expect(JSON.parse(line as string)).toMatchObject({ event: 'pool-replenish', classes: [{ type: c.instanceType, spares: 1 }] });
+        vi.setSystemTime(new Date('2026-10-29T12:15:00Z'));
+        createPoolReplenishDeps(f.deps.db, env, store).log(entries, false);
+        expect(info).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(info.mock.calls[1]![0] as string)).toMatchObject({ heartbeat: true });
+    } finally { vi.useRealTimers(); info.mockRestore(); }
+});
+it('D4: the production pass log passes `failed` through, so a failed pass with an unchanged signature still emits', () => {
+    const f = poolFixture(); mocks.sdk.mockReturnValue({ starter: { start: vi.fn() } });
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-29T13:00:00Z'));
+    try {
+        const env = { ...f.deps.env, AWS_REGIONS: 'ap-south-1' };
+        const c = createPoolReplenishDeps(f.deps.db, env, store).classes[0]!;
+        // target 3 is a signature no earlier test emitted, so this first line is a change (the memo is module-level).
+        const entries = [{ c, record: { target: 3, recent: 0, base: 1, spares: 1, provisioned: 0, retired: 0, retirements: [], slowHosts: [] } }];
+        createPoolReplenishDeps(f.deps.db, env, store).log(entries, false);
+        const before = info.mock.calls.length;
+        expect(before).toBe(1);
+        vi.setSystemTime(new Date('2026-10-29T13:01:00Z'));
+        createPoolReplenishDeps(f.deps.db, env, store).log(entries, true);
+        expect(info.mock.calls.length).toBe(before + 1);
+        expect(JSON.parse(info.mock.calls[before]![0] as string)).toMatchObject({ event: 'pool-replenish', failed: true });
+    } finally { vi.useRealTimers(); info.mockRestore(); }
+});
