@@ -154,11 +154,8 @@ the Gateway: these steps never touch it, its volumes or the SG's other rules.
   still the sslip.io name (read-only probe, 2026-10-29). The build bakes
   `NEXT_PUBLIC_SUPABASE_URL=https://db.ezil.work` and both `deploy.sh` and
   `render-env.py` enforce it, so the DB owner must serve that hostname first.
-- App code: `https://os-prod.ezil.work` is not in `OWNED_APP_ORIGINS`
-  (`app/src/utils/forwarded.ts`); until it is, Auth0 sign-in on the smoke
-  hostname redirects to the canonical origin.
-- Schema `apply --target aws-production` must be allowed by the reviewed
-  `app/scripts/billing-staging-schema.mjs` change; run it (SSM port forward to
+- Schema: `app/scripts/billing-staging-schema.mjs` now allows
+  `apply --target aws-production`; unless already done, run it (SSM port forward to
   `i-09012068d96166828`, `--expect-system-id 7698288507300208674`) before install.
 - Backups (wal-g archiving, fresh snapshots) are the DB owner's maintenance
   window and come before the schema.

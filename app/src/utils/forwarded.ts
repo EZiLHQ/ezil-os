@@ -51,6 +51,7 @@ export function publicOrigin(headers: HeaderReader, fallback: string): string {
 export const OWNED_APP_ORIGINS = [
     'https://os.ezil.org',
     'https://os.ezil.work',
+    'https://os-prod.ezil.work',
     'https://os-staging.ezil.work',
 ] as const;
 /** The production app. `os.ezil.org` is the landing site and redirects here. */

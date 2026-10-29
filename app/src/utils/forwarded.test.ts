@@ -64,7 +64,12 @@ describe('ownedPublicOrigin', () => {
         const h = new Headers({ host: 'localhost:3000', 'x-forwarded-host': 'os-staging.ezil.work', 'x-forwarded-proto': 'https' });
         expect(ownedPublicOrigin(h, 'https://localhost:3000/')).toBe('https://os-staging.ezil.work');
     });
-    it.each(['evil.example', 'x.vercel.app', 'evil-app.ezil.org', 'os-staging.ezil.work.evil.example'])('replaces a spoofed host %s with the canonical origin', async host => {
+    it('keeps the AWS production host os-prod.ezil.work', async () => {
+        const { ownedPublicOrigin } = await import('./forwarded');
+        const h = new Headers({ host: 'localhost:3000', 'x-forwarded-host': 'os-prod.ezil.work', 'x-forwarded-proto': 'https' });
+        expect(ownedPublicOrigin(h, 'https://localhost:3000/')).toBe('https://os-prod.ezil.work');
+    });
+    it.each(['evil.example', 'x.vercel.app', 'evil-app.ezil.org', 'os-staging.ezil.work.evil.example', 'os-prod.ezil.work.evil.example'])('replaces a spoofed host %s with the canonical origin', async host => {
         const { ownedPublicOrigin } = await import('./forwarded');
         const h = new Headers({ 'x-forwarded-host': host, 'x-forwarded-proto': 'https' });
         expect(ownedPublicOrigin(h, 'https://localhost:3000/')).toBe('https://os.ezil.work');
