@@ -154,35 +154,67 @@ const VOLUME_SIZE_TTL_MS = 5 * 60_000;
 const VOLUME_SIZE_MAX_ENTRIES = 512;
 /** The summary never waits on EC2 for longer than this; slower reads fall back to the 50 GiB figure. */
 const VOLUME_SIZE_TIMEOUT_MS = 2_000;
+/**
+ * An unreadable volume (error, throttle, unknown, timeout) is held as unreadable this long, so a throttled
+ * EC2 is not re-asked on every summary: DescribeVolumes shares its rate limit with the admission-lock
+ * attachment check (aws-ec2.ts), whose failure sends a warm pool adopt down the cold path.
+ */
+const VOLUME_SIZE_NEGATIVE_TTL_MS = 30_000;
 
 type VolumeDescribe = (region: string, volumeId: string) => Promise<{ sizeGiB?: number } | null>;
 
 /**
- * Round 5 D3: the data volume's real size in GiB (EC2 DescribeVolumes), cached per volume for at most
- * 5 minutes in a bounded map. Only successful reads are cached; an error, a missing size, an unknown
- * volume or a read slower than the timeout is null (the caller shows the fallback, never a guess).
+ * Round 5 D3: the data volume's real size in GiB (EC2 DescribeVolumes), cached per volume in a bounded map:
+ * a size for at most 5 minutes, an unreadable answer (error, missing size, unknown volume, timeout) as null
+ * for 30 s. Concurrent reads of one volume share one call, and a call that outlives the timeout still fills
+ * the cache when it lands. The caller shows the fallback for null, never a guess.
  */
 export function createVolumeSizeReader(describe: VolumeDescribe, options: { now?: () => number; ttlMs?: number;
-    maxEntries?: number; timeoutMs?: number } = {}): (volume: AwsVolumeRef) => Promise<number | null> {
+    negativeTtlMs?: number; maxEntries?: number; timeoutMs?: number } = {}): (volume: AwsVolumeRef) => Promise<number | null> {
     const now = options.now ?? Date.now, ttlMs = Math.min(options.ttlMs ?? VOLUME_SIZE_TTL_MS, VOLUME_SIZE_TTL_MS);
+    const negativeTtlMs = Math.min(options.negativeTtlMs ?? VOLUME_SIZE_NEGATIVE_TTL_MS, ttlMs);
     const maxEntries = options.maxEntries ?? VOLUME_SIZE_MAX_ENTRIES, timeoutMs = options.timeoutMs ?? VOLUME_SIZE_TIMEOUT_MS;
-    const cache = new Map<string, { sizeGiB: number; at: number }>();
+    const cache = new Map<string, { sizeGiB: number | null; at: number }>();
+    /** One in-flight call per volume; a call stuck past the negative TTL is replaced (bounded with the cache). */
+    const pending = new Map<string, { promise: Promise<number | null>; at: number }>();
+    const store = (key: string, sizeGiB: number | null) => {
+        cache.delete(key);
+        while (cache.size >= maxEntries) cache.delete(cache.keys().next().value!);
+        cache.set(key, { sizeGiB, at: now() });
+    };
     return async ({ region, volumeId }) => {
         const key = `${region}:${volumeId}`;
         const hit = cache.get(key);
-        if (hit && now() - hit.at <= ttlMs) return hit.sizeGiB;
-        cache.delete(key);
+        if (hit && now() - hit.at <= (hit.sizeGiB === null ? negativeTtlMs : ttlMs)) return hit.sizeGiB;
+        let inflight = pending.get(key);
+        if (!inflight || now() - inflight.at > negativeTtlMs) {
+            const call = { at: now() } as { promise: Promise<number | null>; at: number };
+            call.promise = (async () => {
+                try {
+                    const sizeGiB = (await describe(region, volumeId))?.sizeGiB;
+                    return typeof sizeGiB === 'number' && Number.isInteger(sizeGiB) && sizeGiB >= 1 ? sizeGiB : null;
+                } catch {
+                    return null;
+                }
+            })().then(sizeGiB => {
+                if (pending.get(key) === call) pending.delete(key);
+                store(key, sizeGiB);
+                return sizeGiB;
+            });
+            while (!pending.has(key) && pending.size >= maxEntries) pending.delete(pending.keys().next().value!);
+            pending.set(key, call);
+            inflight = call;
+        }
+        const call = inflight;
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
-            const view = await Promise.race([describe(region, volumeId),
-                new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); })]);
-            const sizeGiB = view?.sizeGiB;
-            if (typeof sizeGiB !== 'number' || !Number.isInteger(sizeGiB) || sizeGiB < 1) return null;
-            while (cache.size >= maxEntries) cache.delete(cache.keys().next().value!);
-            cache.set(key, { sizeGiB, at: now() });
-            return sizeGiB;
-        } catch {
-            return null;
+            return await Promise.race([call.promise, new Promise<null>(resolve => {
+                timer = setTimeout(() => {
+                    // Still in flight: unreadable for now; the late answer overwrites this when it lands.
+                    if (pending.get(key) === call) store(key, null);
+                    resolve(null);
+                }, timeoutMs);
+            })]);
         } finally {
             clearTimeout(timer);
         }

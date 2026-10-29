@@ -20,6 +20,13 @@ vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
 vi.mock('@/server/billing/deps', () => ({
     getBillingDeps: () => { throw new Error('Tests must inject billing ports'); },
 }));
+// Round 5 D3: the router's DEFAULT volume reader goes through the app's EC2 collaborators. The describer is a
+// fake; by default it knows no volume (null), which is the AWS-off answer, so every other case keeps the fallback.
+const awsDescribeVolume = vi.hoisted(() => vi.fn<(region: string, volumeId: string) => Promise<{ sizeGiB?: number } | null>>(async () => null));
+vi.mock('@/server/lib/compute/aws-clients', async importOriginal => ({
+    ...await importOriginal<typeof import('@/server/lib/compute/aws-clients')>(),
+    sharedAwsSdkCollaborators: () => ({ describer: { describeVolume: awsDescribeVolume } }),
+}));
 
 import { createBillingRouter, createVolumeSizeReader, userPlacement, userPlacementProvider, type UserPlacement } from './billing';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -1291,7 +1298,8 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
             expect(summary).toMatchObject({ computer: { disk: { provisionedGiB: gib, growsOnSwitch: false }, standing: 'paid', filesOn: 'aws' },
                 storage: { capBytes: String(gib * GiB) } });
             if (!summary.enabled) throw new Error('summary disabled');
-            expect(summary.computer.machineChoice.map(option => option.diskGiB)).toEqual([100, 100, 100]);
+            // D3 + W0 pin: the tiles carry no disk figure; the real volume is the computer's disk.
+            expect(summary.computer.machineChoice.map(option => option.diskGiB)).toEqual([null, null, null]);
             await expect(f.caller.usage()).resolves.toMatchObject({ storage: { capBytes: String(gib * GiB), disk: { provisionedGiB: gib } } });
             expect(f.volumeGiB).toHaveBeenCalledWith({ computerId: C1, region: 'ap-south-1', volumeId });
             expect(f.placement).toHaveBeenCalledWith(f.ctx.db, userId);
@@ -1319,6 +1327,30 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         f.store.computerOwner = vi.fn(async () => userId) as never;
         await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
         await expect(f.caller.usage({ computerId: C2 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 50 } } });
+        // z.string().uuid() accepts upper case; the placement ids are lower case.
+        await expect(f.caller.usage({ computerId: C1.toUpperCase() })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
+    });
+
+    it('without an injected reader, the router reads the volume through the app\'s EC2 describer (region, volumeId)', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3' })]);
+        // Unique ids: the default reader's cache is module-wide.
+        const VOL_DEFAULT = 'vol-0dddddddddddddddd', VOL_DEFAULT_OLD = 'vol-0eeeeeeeeeeeeeeee';
+        const sizes: Record<string, number> = { [VOL_DEFAULT]: 100, [VOL_DEFAULT_OLD]: 50 };
+        awsDescribeVolume.mockImplementation(async (region, volumeId) => region === 'ap-south-1' && sizes[volumeId] ? { sizeGiB: sizes[volumeId] } : null);
+        try {
+            for (const [volumeId, gib] of [[VOL_DEFAULT, 100], [VOL_DEFAULT_OLD, 50]] as const) {
+                const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: 'aws-ec2',
+                    awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId }] }));
+                const caller = createBillingRouter(() => f.deps, { placement }).createCaller(f.ctx);
+                await expect(caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: gib } }, storage: { capBytes: String(gib * GiB) } });
+                await expect(caller.usage()).resolves.toMatchObject({ storage: { disk: { provisionedGiB: gib } } });
+                expect(awsDescribeVolume).toHaveBeenCalledWith('ap-south-1', volumeId);
+            }
+        } finally {
+            awsDescribeVolume.mockReset();
+            awsDescribeVolume.mockResolvedValue(null);
+        }
     });
 
     it('the legacy placementProvider option still works (provider only, fallback disk)', async () => {
@@ -1397,11 +1429,53 @@ describe('round 5 D3: the volume size reader (describeVolume, cached)', () => {
         await r.read({ ...volume, volumeId: `vol-0${'1'.repeat(16)}` });
         expect(r.describe).toHaveBeenCalledTimes(5);
     });
-    it.each([['an AWS error', new Error('Throttling')], ['a missing size', 'missing' as const], ['a hung call (timeout)', 'hang' as const]])('%s is null and not cached', async (_name, size) => {
-        const r = setup(size);
-        await expect(r.read(volume)).resolves.toBeNull();
-        await expect(r.read(volume)).resolves.toBeNull();
-        expect(r.describe).toHaveBeenCalledTimes(2);
+    it('a caller ttlMs above 5 minutes is clamped to 5 minutes', async () => {
+        let clock = 0;
+        const describe = vi.fn(async () => ({ sizeGiB: 100 }));
+        const read = createVolumeSizeReader(describe, { now: () => clock, ttlMs: 60 * 60_000 });
+        await read(volume);
+        clock = 300_001;
+        await read(volume);
+        expect(describe).toHaveBeenCalledTimes(2);
+    });
+    it.each([['an AWS error', new Error('Throttling')], ['a missing size', 'missing' as const], ['a hung call (timeout)', 'hang' as const]])(
+        '%s is null, held for 30 s (a throttled EC2 is not re-hit on every call), then read again', async (_name, size) => {
+            const r = setup(size);
+            await expect(r.read(volume)).resolves.toBeNull();
+            r.at(30_000);
+            await expect(r.read(volume)).resolves.toBeNull();
+            expect(r.describe).toHaveBeenCalledTimes(1);
+            r.at(30_001);
+            await expect(r.read(volume)).resolves.toBeNull();
+            expect(r.describe).toHaveBeenCalledTimes(2);
+        });
+    it('a caller negativeTtlMs is clamped to the positive TTL', async () => {
+        let clock = 0;
+        const describe = vi.fn(async () => { throw new Error('Throttling'); });
+        const read = createVolumeSizeReader(describe, { now: () => clock, ttlMs: 1_000, negativeTtlMs: 60_000 });
+        await read(volume);
+        clock = 1_001;
+        await read(volume);
+        expect(describe).toHaveBeenCalledTimes(2);
+    });
+    it('concurrent reads of one volume share one DescribeVolumes call', async () => {
+        let release!: (view: { sizeGiB: number }) => void;
+        const describe = vi.fn(() => new Promise<{ sizeGiB: number }>(resolve => { release = resolve; }));
+        const read = createVolumeSizeReader(describe, { timeoutMs: 1_000 });
+        const reads = Array.from({ length: 5 }, () => read(volume));
+        release({ sizeGiB: 100 });
+        await expect(Promise.all(reads)).resolves.toEqual([100, 100, 100, 100, 100]);
+        expect(describe).toHaveBeenCalledTimes(1);
+    });
+    it('a read that finishes after the timeout still fills the cache (the next summary shows the real size)', async () => {
+        let release!: (view: { sizeGiB: number }) => void;
+        const describe = vi.fn(() => new Promise<{ sizeGiB: number }>(resolve => { release = resolve; }));
+        const read = createVolumeSizeReader(describe, { timeoutMs: 10 });
+        await expect(read(volume)).resolves.toBeNull();
+        release({ sizeGiB: 100 });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await expect(read(volume)).resolves.toBe(100);
+        expect(describe).toHaveBeenCalledTimes(1);
     });
     it('a volume EC2 does not know (null) or AWS off is null', async () => {
         const read = createVolumeSizeReader(async () => null, { timeoutMs: 20 });

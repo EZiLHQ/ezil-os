@@ -47,7 +47,11 @@ export function buildUsageV3(input: Input) {
             samples.set(sample.computerId, sample);
     }
     // The computer's real volume (round 5 D3); the preferred size only decides AWS vs Free, not the figure.
-    const disk = storageDisk(plan, preferred, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
+    // Usage for one computer meters that computer's used space against that computer's volume (the router
+    // scopes the volume the same way); without a computer, every computer's latest sample, as before.
+    const scopedId = input.computerId?.toLowerCase();
+    const scopedStorage = scopedId ? input.storage.filter(sample => sample.computerId.toLowerCase() === scopedId) : input.storage;
+    const disk = storageDisk(plan, preferred, scopedStorage, input.config.largeStorageEnabled, input.volumeGiB);
     return {
         enabled: true as const, version: 1 as const, asOf: isoSeconds(now),
         session: { computerId: epoch?.computerId ?? input.computerId ?? null, state,

@@ -4,7 +4,6 @@ import { checkoutAvailable } from '../config';
 import { storageState } from '../meters';
 import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
-import { awsTierForSize, dataGiBForNewVolume } from '../../lib/compute/aws-config';
 import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
@@ -146,16 +145,6 @@ export function usedGiBOf(usedBytes: bigint | string | null | undefined): number
 }
 
 /**
- * Round 5 D3: what a NEW disk gets for `size` under this plan (plan-max, the same rule the provision
- * sites use). null on Free/Cloudflare and on legacy plans (no figure is claimed for them).
- */
-export function newDiskGiB(plan: ResolvedPlanV3, size: SizeCode): number | null {
-    if (plan.sku === 'legacy') return null;
-    const tier = awsTierForSize(size);
-    return tier ? dataGiBForNewVolume(tier, plan.sku) : null;
-}
-
-/**
  * The real disk (round 3 D10, round 5 D3). AWS plans have one data volume per computer and a switch
  * keeps it, so the cap is that volume's REAL size (`volumeGiB`, read by the caller from EC2), never a
  * per-configuration table; unreadable falls back to `DISK_FALLBACK_GIB`. Free/Cloudflare has no
@@ -248,7 +237,9 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline,
             machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
                 size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const,
-                diskGiB: newDiskGiB(plan, code) })),
+                // D3 + the W0 pin: no per-configuration disk figure until a grow path exists (a switch keeps
+                // the computer's volume); the plan disk is on the plan card (offer storageGiB) only.
+                diskGiB: null })),
             disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null, growsOnSwitch: false },
             standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
