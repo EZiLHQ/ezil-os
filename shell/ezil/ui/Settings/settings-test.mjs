@@ -884,6 +884,37 @@ push('Open desktop relaunches the desktop for c-d',
     q('.window[data-app="desktop"][data-ezil-computer-id="c-d"]') !== null);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5g. FEEDBACK LIVES IN SETTINGS, NOT ON THE HOME SCREEN (founder, 2026-10-29).
+//     With the endpoint published, Settings gains a Feedback tab whose button
+//     opens the existing form. jsdom has no top layer: the dialog doubles
+//     below exercise lifecycle, not pixels (as `feedback-test.mjs` does).
+// ═══════════════════════════════════════════════════════════════════════════
+window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event('close')); };
+window.__EZIL_BOOT__ = { user: { id: '11111111-2222-4333-8444-555555555555' }, desktopState: { endpoints: { feedback: '/api/shell/feedback' } } };
+await reopenSettings();
+const feedbackTabIds = qa('.window[data-app="settings"] .ezil-settings-tab').map(t => t.getAttribute('data-tab'));
+push('with feedback enabled, Settings lists Feedback between About and Troubleshoot',
+    JSON.stringify(feedbackTabIds.slice(-3)) === JSON.stringify(['about', 'feedback', 'troubleshoot']), JSON.stringify(feedbackTabIds));
+clickTab('feedback');
+await settle(2);
+const sendFeedback = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="feedback"].active [data-action="send-feedback"]');
+push('Settings → Feedback shows a labelled "Send feedback" button', sendFeedback?.textContent.trim() === 'Send feedback');
+const callsBeforeFeedback = calls.length;
+click(sendFeedback);
+await settle(2);
+push('🔴 the button opens the existing feedback form, and opening it sends nothing',
+    q('dialog.ezil-feedback-dialog h2')?.textContent === 'Send feedback' && calls.length === callsBeforeFeedback);
+click(q('dialog.ezil-feedback-dialog [data-action="cancel"]'));
+await settle(2);
+push('closing the form returns focus to the Settings button',
+    ! q('dialog.ezil-feedback-dialog') && doc.activeElement === sendFeedback);
+delete window.__EZIL_BOOT__;
+await reopenSettings();
+push('feedback disabled: no Feedback tab',
+    ! q('.window[data-app="settings"] .ezil-settings-tab[data-tab="feedback"]'));
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════
 const offOrigin = calls.filter(c => /^https?:\/\//.test(c.url) && ! (new URL(c.url).hostname === 'ezil.local'));

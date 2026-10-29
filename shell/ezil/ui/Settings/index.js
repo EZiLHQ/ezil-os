@@ -63,6 +63,7 @@ import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';
 import TabSystem from './tabs/system.js';
 import TabAbout from './tabs/about.js';
+import TabFeedback from './tabs/feedback.js';
 import TabTroubleshoot from './tabs/troubleshoot.js';
 
 const PHASE = 'ezil-os:settings';
@@ -73,9 +74,10 @@ const PHASE = 'ezil-os:settings';
  * restart a stuck desktop's container without losing the workspace, reachable
  * from the same two paths Settings itself is (the pinned taskbar icon, and
  * the control-drawer button `drawer-action.js` injects into a full-bleed
- * window) — see `tabs/troubleshoot.js`'s header.
+ * window) — see `tabs/troubleshoot.js`'s header. `feedback` (2026-10-29) is
+ * the home-screen chip's replacement, shown only when feedback is enabled.
  */
-const TABS = [TabAccount, TabUsage, TabBilling, TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot];
+const TABS = [TabAccount, TabUsage, TabBilling, TabComputers, TabSystem, TabAppearance, TabAbout, TabFeedback, TabTroubleshoot];
 
 /**
  * The tab Settings opens on. Account sits at the top of the sidebar (where

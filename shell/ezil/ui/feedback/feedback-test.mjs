@@ -620,6 +620,32 @@ try {
         assert.equal(pane.querySelector('[data-role="feedback-reports"]'), null);
         pane.remove();
     });
+    await check('Settings → Feedback: a labelled button opens the existing form, returns focus, and is gated on the endpoint', async () => {
+        window.__EZIL_BOOT__.desktopState.endpoints.feedback = '/api/shell/feedback';
+        const { default: tab } = await import('../Settings/tabs/feedback.js');
+        assert.equal(tab.id, 'feedback');
+        assert.equal(tab.label, 'Feedback');
+        assert.equal(tab.available(), true);
+        const pane = document.createElement('div');
+        pane.innerHTML = tab.html();
+        document.body.append(pane);
+        const count = calls.length;
+        tab.init($(pane));
+        const entry = pane.querySelector('[data-action="send-feedback"]');
+        assert.equal(entry.tagName, 'BUTTON');
+        assert.equal(entry.type, 'button');
+        assert.equal(entry.textContent, 'Send feedback');
+        entry.click();
+        assert.equal(current().querySelector('h2').textContent, 'Send feedback');
+        assert.equal(calls.length, count, 'opening the form sends nothing');
+        close(); assert.equal(document.activeElement, entry, 'closing the form returns focus to the Settings button');
+        delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
+        assert.equal(tab.available(), false, 'no endpoint: no Feedback tab');
+        entry.click();
+        assert.equal(current(), null);
+        assert.equal(calls.length, count);
+        pane.remove();
+    });
     console.log(`\n${checks} feedback checks passed. jsdom does not validate browser layout or real capture.`);
 } finally {
     trace.end();
