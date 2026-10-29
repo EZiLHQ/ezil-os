@@ -1238,17 +1238,25 @@ describe('round 4: the computer standing in the summary', () => {
     });
 
     it('userPlacementProvider: off without placement reads, null without the table or on error, aws-ec2 wins across computers', async () => {
-        const execute = vi.fn(async (): Promise<unknown> => [{ present: true }]);
+        const [c1, c2] = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+        const execute = vi.fn(async (): Promise<unknown> => []);
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
         expect(execute).not.toHaveBeenCalled();
         vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
-        execute.mockResolvedValueOnce([{ present: false }]);
+        // No live computers.
+        execute.mockResolvedValueOnce([]);
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
-        execute.mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([{ provider: 'cloudflare' }, { provider: 'aws-ec2' }]);
+        // Live computers, no placement table.
+        execute.mockResolvedValueOnce([{ id: c1 }]).mockResolvedValueOnce([{ present: false }]);
+        await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
+        // Two computers: Cloudflare and aws-ec2 → aws-ec2 (rows or { rows } results).
+        execute.mockResolvedValueOnce({ rows: [{ id: c1 }, { id: c2 }] })
+            .mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([{ present: true }])
+            .mockResolvedValueOnce([{ provider: 'cloudflare' }]).mockResolvedValueOnce([{ provider: 'aws-ec2' }]);
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBe('aws-ec2');
-        execute.mockResolvedValueOnce({ rows: [{ present: true }] }).mockResolvedValueOnce({ rows: [{ provider: 'cloudflare' }] });
+        execute.mockResolvedValueOnce([{ id: c1 }]).mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([{ provider: 'cloudflare' }]);
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBe('cloudflare');
-        execute.mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([]);
+        execute.mockResolvedValueOnce([{ id: c1 }]).mockResolvedValueOnce([{ present: true }]).mockResolvedValueOnce([]);
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         execute.mockRejectedValueOnce(new Error('relation missing'));

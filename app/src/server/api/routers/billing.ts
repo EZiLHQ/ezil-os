@@ -103,20 +103,20 @@ type PlacementProvider = 'aws-ec2' | 'cloudflare' | null;
 
 /**
  * Round 4: where the user's files are, for the computer's standing. Any aws-ec2 placement among the user's
- * LIVE computers counts (a user may have two). Read-only; null with placement reads off, without the
- * placement table (billing-only databases) or on any read error: the summary never fails on it.
+ * LIVE computers counts (a user may have two). Read-only, through the placement module's own reader (only
+ * placement.ts names the placement table); null with placement reads off, without the placement table
+ * (billing-only databases) or on any read error: the summary never fails on it.
  */
 export async function userPlacementProvider(db: { execute(query: SQL): Promise<unknown> }, userId: string): Promise<PlacementProvider> {
     try {
-        const { isPlacementReadEnabled } = await import('@/server/lib/compute/aws-config');
+        const [{ isPlacementReadEnabled }, { readPlacementProvider }, { computers }] = await Promise.all([
+            import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema')]);
         if (!isPlacementReadEnabled()) return null;
-        const rows = (result: unknown) => (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
-        const [table] = rows(await db.execute(sql`/* billing:placement-table */ SELECT to_regclass('public.ezil_computer_placements') IS NOT NULL AS present`));
-        if (table?.present !== true) return null;
-        const providers = rows(await db.execute(sql`/* billing:placement-provider */ SELECT p.provider FROM public.ezil_computer_placements p
-            JOIN public.ezil_computers c ON c.id = p.computer_id
-            WHERE p.owner_user_id = ${userId}::uuid AND c.user_id = ${userId}::uuid AND c.deleted_at IS NULL`)).map(row => row.provider);
-        return providers.includes('aws-ec2') ? 'aws-ec2' : providers.length ? 'cloudflare' : null;
+        const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computers.id}::text AS id FROM ${computers}
+            WHERE ${computers.userId} = ${userId}::uuid AND ${computers.deletedAt} IS NULL`);
+        const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
+        const providers = await Promise.all(rows.map(row => typeof row.id === 'string' ? readPlacementProvider(db, row.id) : null));
+        return providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(provider => provider !== null) ? 'cloudflare' : null;
     } catch {
         console.warn('[billing.summary] placement unavailable');
         return null;
