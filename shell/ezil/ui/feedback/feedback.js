@@ -175,7 +175,26 @@ function fullbleed_visible () {
     });
 }
 
-/** Mount the top-right Feedback chip (idempotent). */
+/**
+ * Send what was submitted but never confirmed (an offline send, or one cut off
+ * by a reload) and keep watching `online` (idempotent). Boot calls this when the
+ * shell mounts; it is the outbox half of what the chip used to do there.
+ */
+export function resume_feedback_outbox () {
+    if ( ! feedback_enabled() ) return;
+    listen_online();
+    // A page restored from the back/forward cache does not run shell boot.
+    window.addEventListener('pageshow', flush_after_restore);
+    if ( read_outbox().length ) void flush_feedback_outbox();
+}
+
+function flush_after_restore (event) { if ( event.persisted ) void flush_feedback_outbox(); }
+
+/**
+ * Mount the top-right Feedback chip (idempotent). Boot no longer mounts it
+ * (2026-10-29): the founder moved Feedback off the home screen into Settings →
+ * Feedback (`../Settings/tabs/feedback.js`).
+ */
 export function mount_feedback_chip () {
     if ( ! feedback_enabled() || ! document.body ) return;
     let chip = document.querySelector('button.ezil-feedback-chip');
@@ -206,8 +225,7 @@ export function mount_feedback_chip () {
     window.addEventListener('pagehide', suspend_feedback_chip);
     sync();
     // A report submitted while offline (or before the tab closed) goes now.
-    listen_online();
-    if ( read_outbox().length ) void flush_feedback_outbox();
+    resume_feedback_outbox();
 }
 
 function read_blob (blob, signal) {

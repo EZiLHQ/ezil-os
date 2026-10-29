@@ -1758,6 +1758,35 @@ const HEARTBEAT_MS = 60_000; // must match shell/ezil/activity-heartbeat.js's HE
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Scenario 19 — FEEDBACK IS NOT ON THE HOME SCREEN (founder, 2026-10-29). With
+// the feedback endpoint published, the desktop paints no Feedback chip (the
+// entry is Settings → Feedback), yet a report an earlier session submitted but
+// never confirmed is still re-sent, once, when the shell mounts.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const ACCOUNT = '33333333-3333-4333-8333-333333333333';
+    const queued = { v: 1, clientRequestId: '44444444-4444-4444-8444-444444444444', category: 'bug',
+        description: 'Queued before a reload', computerId: null, diagnostics: null, screenshot: null };
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url === '/api/shell/feedback' && init.method === 'POST') {
+            return { __status: 201, id: '22222222-2222-4222-8222-222222222222', screenshotAccepted: false };
+        }
+        return { ok: true, guacamoleRunning: false };
+    }, { ...PAYLOAD, user: { id: ACCOUNT, email: 'someone@ezil.work' },
+        desktopState: { ...PAYLOAD.desktopState, endpoints: { ...PAYLOAD.desktopState.endpoints, feedback: '/api/shell/feedback' } } });
+    // Same tick as the bundle's self-boot, so it is there before `build()` reaches the outbox.
+    const key = `ezil:feedback:outbox:v1:${ACCOUNT}`;
+    window.localStorage.setItem(key, JSON.stringify([{ clientRequestId: queued.clientRequestId, body: JSON.stringify(queued) }]));
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    await until(() => window.localStorage.getItem(key) === null);
+    push('🔴 feedback enabled: no Feedback chip on the home screen', $$(window, '.ezil-feedback-chip').length === 0);
+    const posts = seen.filter(r => r.url === '/api/shell/feedback');
+    push('a report queued by an earlier session is re-sent once when the shell mounts',
+        posts.length === 1 && posts[0].method === 'POST' && window.localStorage.getItem(key) === null,
+        JSON.stringify(seen.map(r => `${r.method} ${r.url}`)));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 const failed = checks.filter(c => !c.pass);
 for (const c of checks) {
     console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.name}${c.detail ? `  [${c.detail}]` : ''}`);
