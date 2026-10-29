@@ -103,6 +103,43 @@ Timers match Vercel UTC schedules: telemetry 03:17 daily, reap 04:08 daily,
 billing sweep every minute. Persistent timers catch up once after downtime.
 Each curl has a 50-second limit; cancellation does not cancel server-side work.
 
+## Reading the web logs
+
+Run these on the host through SSM (Session Manager or `AWS-RunShellScript`) as root.
+
+**Live log** (the current container, since its last recreate):
+```bash
+docker logs --timestamps --since 2h ezil-os-staging-web-1 2>&1 | less
+docker logs --timestamps ezil-os-staging-web-1 2>&1 | grep '"event":"pool-replenish"'
+```
+Compose keeps json-file logs of 50 MB x 5 files per container. Every
+`--force-recreate` deletes them: install, plus the release-gate close and open
+re-renders.
+
+**Snapshots** (earlier containers):
+- `install-host.sh` writes the outgoing web container's log to
+  `/var/log/ezil-os-staging/web-<UTC yyyymmddThhmmssZ>.log.gz` just before it
+  recreates the container. The file is root-only (mode 0600).
+- The lead's gate re-render does the same before each of its recreates.
+- Snapshots older than 7 days are pruned at the next snapshot.
+- A failed snapshot prints `Web log snapshot skipped` and never blocks the install.
+- Each snapshot covers one container's lifetime, so read them in order with the
+  live log to follow a whole day:
+```bash
+ls -l /var/log/ezil-os-staging/
+zcat /var/log/ezil-os-staging/web-20261029T080003Z.log.gz | grep '"event":"pool-host-readiness"'
+zcat /var/log/ezil-os-staging/web-*.log.gz | grep 'ai-outbox'   # files sort by time
+```
+
+**Pool lines** are single-line JSON. Steady state is quiet:
+- `pool-replenish`: one line per minute pass only when something changed. That
+  means a dispatch, a retirement, slow hosts, a failed pass, or a per-class
+  target/spares change. Otherwise at most one `"heartbeat":true` line every
+  15 minutes.
+- `pool-host-readiness`: only a host's first `enrolled` and first `ready`.
+  Five-minute heartbeat refreshes are silent. Every `*_rejected` line is kept,
+  as a warning.
+
 ## Known gap, rollback and teardown
 
 This checkout has **no `/api/health` or version route**. Smoke deliberately fails

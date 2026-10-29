@@ -1,6 +1,7 @@
-import { expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AwsClientError } from './aws-errors';
-import { runPoolReplenish, withPoolReplenishLock, type PoolReplenishDeps } from './aws-pool-replenish';
+import { newPoolPassLogMemo, poolPassLine, runPoolReplenish, withPoolReplenishLock, type PoolPassEntry, type PoolPassRecord, type PoolReplenishDeps } from './aws-pool-replenish';
+import type { PoolClass } from './ready-pool';
 import { poolFixture, demandFixture, HOST, OTHER, NOW } from './aws-pool-test-support';
 import { fixtureDeployment } from './aws-intent.test-support';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -27,7 +28,7 @@ it('reads P8 demand/planner under the lock, dispatches through the existing star
     expect(deps.withLock).toHaveBeenCalledOnce();
     expect(deps.data.readPoolDemand).toHaveBeenCalledWith(deps.db, deps.classes[0], NOW);
     expect(deps.data.planPool).toHaveBeenCalledWith(deps.classes[0], expect.anything(), NOW);
-    expect(deps.log).toHaveBeenCalledWith(records![0]);
+    expect(deps.log).toHaveBeenCalledExactlyOnceWith([{ c: deps.classes[0], record: records![0] }], false);
     const calls = vi.mocked(deps.starter.start).mock.calls;
     expect(calls).toHaveLength(2);
     for (const [region, w] of calls) {
@@ -108,7 +109,7 @@ it.each(['started', 'refused', 'unknown'] as const)('records each retirement dis
     const record = (await runPoolReplenish(deps))![0];
     expect(record.retirements).toEqual([{ poolHostId: HOST, jobId: expect.any(String), outcome }]);
     expect(record.retired).toBe(outcome === 'started' ? 1 : 0);
-    expect(deps.log).toHaveBeenCalledWith(record);
+    expect(deps.log).toHaveBeenCalledExactlyOnceWith([{ c: deps.classes[0], record }], false);
 });
 it('records the read-only readiness diagnostic from the locked pass before failing old boots', async () => {
     const { deps, plan } = fixture(); plan.provision = 0; plan.fail = [HOST];
@@ -123,7 +124,7 @@ it('records the read-only readiness diagnostic from the locked pass before faili
         return slowHosts;
     });
     expect((await runPoolReplenish(deps))![0].slowHosts).toEqual(slowHosts);
-    expect(deps.log).toHaveBeenCalledWith(expect.objectContaining({ slowHosts }));
+    expect(deps.log).toHaveBeenCalledExactlyOnceWith([{ c: deps.classes[0], record: expect.objectContaining({ slowHosts }) }], false);
 });
 it('commits reservations and work before starting lifecycle authority callbacks', async () => {
     const { deps, plan } = fixture(); plan.provision = 1;
@@ -135,7 +136,8 @@ it('commits reservations and work before starting lifecycle authority callbacks'
 it('does not start work after a reservation failure and still logs the pass', async () => {
     const { deps } = fixture(); deps.store.prepare = vi.fn(async () => { throw new Error('store failure'); });
     await expect(runPoolReplenish(deps)).rejects.toThrow('store failure');
-    expect(deps.starter.start).not.toHaveBeenCalled(); expect(deps.log).toHaveBeenCalledOnce();
+    expect(deps.starter.start).not.toHaveBeenCalled();
+    expect(deps.log).toHaveBeenCalledExactlyOnceWith([{ c: deps.classes[0], record: expect.objectContaining({ provisioned: 0 }) }], true);
 });
 it.each([-1, .5, NaN])('refuses invalid provision counts %s', async count => {
     const { deps, plan } = fixture(); plan.provision = count;
@@ -152,6 +154,8 @@ it('performs no work during an overlapping pass', async () => {
         transaction: async fn => fn({ execute: lockAnswer(false) }) }, run);
     await expect(runPoolReplenish(deps)).rejects.toMatchObject({ status: 204 });
     expect(deps.data.readPoolDemand).not.toHaveBeenCalled();
+    expect(deps.log).not.toHaveBeenCalled(); // D4: a skipped (lock-busy) pass is not a failed pass
+
 });
 it('takes the admission lock FIRST, then holds the pool advisory lock until dispatch ends', async () => {
     let done = false;
@@ -164,4 +168,66 @@ it('takes the admission lock FIRST, then holds the pool advisory lock until disp
     expect(order).toHaveLength(2);
     expect(order[0]).toContain('placement:lock-admission');
     expect(order[1]).toContain('pg_try_advisory_xact_lock(1163554896, 0)');
+});
+
+// D4 (round 5): one compact single-line JSON per pass, only when something changed, plus a 15-minute heartbeat.
+const CLASS_L: PoolClass = { region: 'ap-south-1', zoneId: 'aps1-az1', instanceType: 'm6i.large' };
+const CLASS_XL: PoolClass = { region: 'ap-south-1', zoneId: 'aps1-az1', instanceType: 'm6i.xlarge' };
+const idle = (spares = 1, target = 1): PoolPassRecord => ({ target, recent: 0, base: 1, spares, provisioned: 0, retired: 0, retirements: [], slowHosts: [] });
+const pass = (...records: PoolPassRecord[]): PoolPassEntry[] => records.map((record, i) => ({ c: i === 0 ? CLASS_L : CLASS_XL, record }));
+const at = (minutes: number) => new Date(NOW.getTime() + minutes * 60_000);
+describe('poolPassLine (D4 pool-replenish log)', () => {
+    it('emits one single-line JSON with every class on the first pass', () => {
+        const memo = newPoolPassLogMemo();
+        const line = poolPassLine(pass(idle(1, 1), idle(0, 0)), memo, NOW);
+        expect(line).not.toBeNull(); expect(line).not.toContain('\n');
+        expect(JSON.parse(line!)).toEqual({ event: 'pool-replenish', classes: [
+            { region: 'ap-south-1', type: 'm6i.large', target: 1, spares: 1, provisioned: 0, retired: 0, retirements: [], slowHosts: [] },
+            { region: 'ap-south-1', type: 'm6i.xlarge', target: 0, spares: 0, provisioned: 0, retired: 0, retirements: [], slowHosts: [] }] });
+    });
+    it('stays silent for unchanged idle passes and heartbeats once per 15 minutes', () => {
+        const memo = newPoolPassLogMemo();
+        expect(poolPassLine(pass(idle(), idle(0, 0)), memo, NOW)).not.toBeNull();
+        for (let m = 1; m < 15; m++) expect(poolPassLine(pass(idle(), idle(0, 0)), memo, at(m)), `minute ${m}`).toBeNull();
+        const beat = poolPassLine(pass(idle(), idle(0, 0)), memo, at(15));
+        expect(JSON.parse(beat!)).toMatchObject({ event: 'pool-replenish', heartbeat: true });
+        expect(poolPassLine(pass(idle(), idle(0, 0)), memo, at(16))).toBeNull();
+        expect(poolPassLine(pass(idle(), idle(0, 0)), memo, at(29))).toBeNull();
+        expect(poolPassLine(pass(idle(), idle(0, 0)), memo, at(30))).not.toBeNull();
+    });
+    it.each<[string, (r: PoolPassRecord) => void]>([
+        ['provisioned', r => { r.provisioned = 1; }],
+        ['retired', r => { r.retired = 1; }],
+        ['retirements', r => { r.retirements = [{ poolHostId: HOST, jobId: 'job', outcome: 'refused' }]; }],
+        ['slowHosts', r => { r.slowHosts = [{ poolHostId: HOST, instanceId: null, createdAt: NOW.toISOString(), enrolledAt: null, health: 'unknown' }]; }],
+        ['target', r => { r.target = 2; }],
+        ['spares', r => { r.spares = 2; }],
+    ])('emits a changed pass (%s) without the heartbeat flag', (_name, change) => {
+        const memo = newPoolPassLogMemo();
+        poolPassLine(pass(idle()), memo, NOW);
+        const record = idle(); change(record);
+        const line = poolPassLine(pass(record), memo, at(1));
+        expect(line).not.toBeNull(); expect(JSON.parse(line!).heartbeat).toBeUndefined();
+    });
+    it('re-arms the signature: a new steady state is logged once, then silent', () => {
+        const memo = newPoolPassLogMemo();
+        poolPassLine(pass(idle(1)), memo, NOW);
+        expect(poolPassLine(pass(idle(2)), memo, at(1))).not.toBeNull();
+        expect(poolPassLine(pass(idle(2)), memo, at(2))).toBeNull();
+    });
+    it('a failed pass always emits, flagged', () => {
+        const memo = newPoolPassLogMemo();
+        poolPassLine(pass(idle()), memo, NOW);
+        expect(JSON.parse(poolPassLine(pass(idle()), memo, at(1), { failed: true })!)).toMatchObject({ event: 'pool-replenish', failed: true });
+    });
+});
+it('logs each pass exactly once, pairing every record with its own class', async () => {
+    const { deps, demand } = fixture(); deps.classes.push({ ...CLASS_XL, zoneId: deps.classes[0]!.zoneId });
+    deps.data.readPoolDemand = vi.fn(async (_db, c) => ({ ...demand, spares: c.instanceType === 'm6i.xlarge' ? 7 : 3 }));
+    const records = await runPoolReplenish(deps);
+    expect(deps.log).toHaveBeenCalledOnce();
+    const [entries, failed] = vi.mocked(deps.log).mock.calls[0]!;
+    expect(failed).toBe(false);
+    expect(entries.map(e => e.record)).toEqual(records);
+    for (const e of entries) expect(e.record.spares).toBe(e.c.instanceType === 'm6i.xlarge' ? 7 : 3);
 });

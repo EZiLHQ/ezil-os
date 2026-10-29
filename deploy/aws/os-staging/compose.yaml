@@ -15,9 +15,11 @@ services:
     # --bridge=none. The app binds loopback only; Caddy is the public edge.
     network_mode: host
     command: ["node", "node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", "3000"]
+    # D4: 50 MB x 5 rotated json-file logs (weeks at the post-D4 rate). --force-recreate still deletes
+    # them, so install-host.sh snapshots the outgoing web log to /var/log/ezil-os-staging first.
     logging: &logging
       driver: json-file
-      options: {max-size: '10m', max-file: '3'}
+      options: {max-size: '50m', max-file: '5'}
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped

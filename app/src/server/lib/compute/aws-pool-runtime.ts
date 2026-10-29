@@ -14,7 +14,7 @@ import { createPoolDemandDeps, reservePoolDemand } from './aws-pool-demand';
 import { withPoolReplenishLock, type PoolDispatchStore, type PoolReplenishDeps } from './aws-pool-replenish';
 
 import { createPoolDispatchStore } from './aws-pool-dispatch';
-import { runPoolReplenish } from './aws-pool-replenish';
+import { newPoolPassLogMemo, poolPassLine, runPoolReplenish, type PoolPassEntry } from './aws-pool-replenish';
 import type { PoolDeps } from './aws-receipts';
 /**
  * vCPU above the region cap, counted the ONE way pool opens and the round-3 switch preflight
@@ -86,6 +86,13 @@ export function createPoolHostDeps(db: PlacementDb, env: Env): PoolClaimDeps {
     return deps;
 }
 
+/** Process-wide (module-level) memo: every cron GET builds fresh deps, so the memo must outlive them (D4). */
+const poolPassLogMemo = newPoolPassLogMemo();
+function logPoolPass(entries: PoolPassEntry[], failed: boolean): void {
+    const line = poolPassLine(entries, poolPassLogMemo, new Date(), { failed });
+    if (line) console.info(line);
+}
+
 /** Production cron and post-lease replenishment share durable dispatch. */
 export function createPoolReplenishDeps(db: PlacementDb, env: Env, store?: PoolDispatchStore): PoolReplenishDeps {
     poolGuard('cron_enabled', isAwsComputersEnabled(env), 503);
@@ -98,5 +105,5 @@ export function createPoolReplenishDeps(db: PlacementDb, env: Env, store?: PoolD
     return { db, data, store: store ?? createPoolDispatchStore(db, env, sdk), starter: sdk.starter, deployments: configs.deployments,
         classes: regions.flatMap(region => poolModule.POOL_TYPES.filter(type => configs.deployments[region]!.instanceTypes.includes(type))
             .map(instanceType => ({ region, zoneId: configs.deployments[region]!.zoneId, instanceType, deployment: configs.deployments[region]! }))),
-        now: () => new Date(), withLock: run => withPoolReplenishLock(db, run), log: record => console.info('pool-replenish', record) };
+        now: () => new Date(), withLock: run => withPoolReplenishLock(db, run), log: logPoolPass };
 }
