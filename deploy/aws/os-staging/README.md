@@ -120,7 +120,9 @@ re-renders.
 - `install-host.sh` writes the outgoing web container's log to
   `/var/log/ezil-os-staging/web-<UTC yyyymmddThhmmssZ>.log.gz` just before it
   recreates the container. The file is root-only (mode 0600).
-- The lead's gate re-render does the same before each of its recreates.
+- The lead's release-gate re-renders (`deploy-app.sh`) do the same before each of
+  their recreates, once `deploy-app.r5.patch` is applied. Until then, the gate
+  windows are not snapshotted.
 - Snapshots older than 7 days are pruned at the next snapshot.
 - A failed snapshot prints `Web log snapshot skipped` and never blocks the install.
 - Each snapshot covers one container's lifetime, so read them in order with the
