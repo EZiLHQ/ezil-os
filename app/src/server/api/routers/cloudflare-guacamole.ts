@@ -79,7 +79,7 @@ import { prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } 
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { resetCapacityAttempt } from '@/server/lib/compute/aws-pool-demand';
-import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer, stopCooldownAnswer } from './compute-dispatch';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -511,6 +511,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             };
             if (routed.kind === 'aws-ec2') {
+                // Hotfix r5: a hosted-app poll never restarts a computer that just stopped.
+                const held = await stopCooldownAnswer(ctx.db, computer);
+                if (held) return held;
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
@@ -711,6 +714,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
             if (routed.kind === 'aws-ec2') {
+                // Hotfix r5: a hosted-app poll never restarts a computer that just stopped.
+                const held = await stopCooldownAnswer(ctx.db, computer);
+                if (held) return held;
                 // WARM-118: after the ownership and billing gates, the (never-throwing) credential sync overlaps the
                 // first ensure. Both settle before any preview or relay preparation; an ensure rejection is rethrown
                 // only once the sync has drained, so nothing is left running. Cloudflare keeps its order below.
