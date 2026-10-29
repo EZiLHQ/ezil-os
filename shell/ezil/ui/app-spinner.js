@@ -78,7 +78,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             observer?.stop(); observation = null; progressChecked = false;
         }
         if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
-        failureCode = state.kind === 'failed' ? state.reason : observation?.stage === 'needs_operator' ? 'needs_operator' : undefined;
+        // Round 4: the raw server code (e.g. `billing_files_on_aws`), not the classified reason.
+        failureCode = state.kind === 'failed' ? state.errorCode ?? state.reason : observation?.stage === 'needs_operator' ? 'needs_operator' : undefined;
         const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
         // `observedBudgetSpent`: the desktop window's own ten-minute clock ran out first.
         const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws

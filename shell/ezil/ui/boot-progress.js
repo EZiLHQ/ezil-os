@@ -129,7 +129,8 @@ export function BootProgress ({ onRetry, appName, icon } = {}) {
      */
     function render (state, aws = null, extra = {}) {
         root.setAttribute('data-kind', state.kind);
-        failureCode = state.kind === 'failed' ? state.reason : undefined;
+        // Round 4: the raw server code (e.g. `billing_files_on_aws`), not the classified reason.
+        failureCode = state.kind === 'failed' ? state.errorCode ?? state.reason : undefined;
 
         if ( state.kind === 'progress' ) {
             root.dataset.phase = state.currentPhase ?? '';

@@ -31,6 +31,7 @@ import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { registerHooks } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -392,6 +393,49 @@ try {
     globalThis.fetch = originalFetch; globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear;
     Date.now = originalNow; delete globalThis.window;
     dom.window.close();
+}
+
+// ── 3. Round 4: Send feedback names the RAW server code ──────────────────
+// The founder's 10-28 report read "Error code: unknown" for `billing_size_not_allowed`:
+// both surfaces passed the classified reason. The dialog module is replaced by a recorder.
+{
+    const fbDom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true });
+    globalThis.document = fbDom.window.document;
+    globalThis.HTMLElement = fbDom.window.HTMLElement;
+    globalThis.__feedbackCalls = [];
+    const dialogUrl = new URL('./feedback/feedback.js', import.meta.url).href;
+    const hooks = registerHooks({ load (url, context, next) {
+        return url === dialogUrl ? { format: 'module', shortCircuit: true,
+            source: 'export const open_feedback_dialog = opts => { globalThis.__feedbackCalls.push(opts); };' } : next(url, context);
+    } });
+    try {
+        const { computeBootUiState } = await import('../boot-phases.js');
+        const { BootProgress } = await import('./boot-progress.js');
+        const settle = async () => { for (let i = 0; i < 50 && globalThis.__feedbackCalls.length === 0; i++) await new Promise(r => setTimeout(r, 5)); };
+        const cases = [
+            ['AppSpinner', 'billing_files_on_aws', 'billing_files_on_aws'],
+            ['AppSpinner', 'billing_size_not_allowed', 'billing_size_not_allowed'],
+            ['BootProgress', 'billing_payment_issue', 'billing_payment_issue'],
+            // A state built without a code (older callers) still names its reason.
+            ['BootProgress', undefined, 'unknown'],
+        ];
+        for (const [name, errorCode, expected] of cases) {
+            globalThis.__feedbackCalls = [];
+            const surface = name === 'AppSpinner' ? AppSpinner({ label: 'Opening Code…' }) : BootProgress({ onRetry () {} });
+            document.body.appendChild(surface.el);
+            surface.render(errorCode ? computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode }) : { kind: 'failed', reason: 'unknown' });
+            surface.el.querySelector('.ezil-opening-feedback').click();
+            await settle();
+            const call = globalThis.__feedbackCalls[0];
+            push(`${name}: ${errorCode ?? 'no code'} → feedback prefill code ${expected}`,
+                globalThis.__feedbackCalls.length === 1 && call?.source === 'opening' && call?.errorCode === expected, JSON.stringify(call));
+            surface.el.remove();
+        }
+    } finally {
+        hooks.deregister();
+        delete globalThis.__feedbackCalls;
+        fbDom.window.close();
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
