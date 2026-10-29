@@ -4,7 +4,6 @@ import { checkoutAvailable } from '../config';
 import { storageState } from '../meters';
 import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
-import { AWS_TIER_DATA_GIB, AWS_TIERS, type AwsTier } from '../../lib/compute/aws-config';
 import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
@@ -128,12 +127,42 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
 const GIB = BigInt(1024) ** BigInt(3);
 
 /**
- * Round 3 D10: the real disk. AWS plans have one data volume per computer (`AWS_TIER_DATA_GIB`,
- * 50 GiB on every paid size today) and the cap is that volume; Free/Cloudflare has no provisioned
- * figure, so no cap is invented. Only legacy v1/v2 plans keep the v1 constant.
+ * Round 5 D3: the disk shown when the computer's volume cannot be read (no AWS placement yet, AWS off,
+ * a read error or timeout): the smallest paid new-volume size, so the figure never overclaims.
+ */
+export const DISK_FALLBACK_GIB = 50;
+
+/** A volume size the summary may show: a whole, positive EBS size (the intent schema's bound); anything else is unreadable. */
+function readableVolumeGiB(volumeGiB: number | null | undefined): number | null {
+    return typeof volumeGiB === 'number' && Number.isInteger(volumeGiB) && volumeGiB >= 1 && volumeGiB <= 16384 ? volumeGiB : null;
+}
+
+/**
+ * Round 5 D3: used space in GiB (bytes / 1024^3, one decimal), the unit of the GiB cap, so a full
+ * 50 GiB disk reads 50 rather than 53.7 decimal GB. null when there is no valid measurement.
+ */
+export function usedGiBOf(usedBytes: bigint | string | null | undefined): number | null {
+    let bytes: bigint;
+    try {
+        if (usedBytes === null || usedBytes === undefined || usedBytes === '') return null;
+        bytes = typeof usedBytes === 'bigint' ? usedBytes : BigInt(usedBytes);
+    } catch {
+        return null;
+    }
+    if (bytes < BigInt(0)) return null;
+    // Tenths of a GiB in integer math first: exact for any size, then one rounding step.
+    const tenths = (bytes * BigInt(10) * BigInt(2) + GIB) / (GIB * BigInt(2));
+    return Number(tenths) / 10;
+}
+
+/**
+ * The real disk (round 3 D10, round 5 D3). AWS plans have one data volume per computer and a switch
+ * keeps it, so the cap is that volume's REAL size (`volumeGiB`, read by the caller from EC2), never a
+ * per-configuration table; unreadable falls back to `DISK_FALLBACK_GIB`. Free/Cloudflare has no
+ * provisioned figure, so no cap is invented. Only legacy v1/v2 plans keep the v1 constant.
  */
 export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
-    largeStorageEnabled: boolean): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
+    largeStorageEnabled: boolean, volumeGiB?: number | null): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
     const newest = new Map<string, typeof storage[number]>();
     for (const sample of storage) {
         if (!newest.has(sample.computerId) || newest.get(sample.computerId)!.measuredAt < sample.measuredAt) newest.set(sample.computerId, sample);
@@ -147,9 +176,7 @@ export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: reado
         const cap = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', largeStorageEnabled);
         return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(cap) };
     }
-    const tier = SIZES[size].provider === 'aws'
-        ? (Object.keys(AWS_TIERS) as AwsTier[]).find(t => t !== 'free' && AWS_TIERS[t][0] === SIZES[size].machine) : undefined;
-    const provisionedGiB = tier ? AWS_TIER_DATA_GIB[tier] : null;
+    const provisionedGiB = SIZES[size].provider === 'aws' ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
     const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
     return { provisionedGiB, usedBytes, capBytes, state: capBytes === null || usedBytes === null ? 'unavailable' : meter(capBytes) };
 }
@@ -169,6 +196,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
      * sign-in is off). Omitted = `enrolled`, no link (the W0 default).
      */
     enrollment?: { state: BillingSummaryV3['ai']['enrollment']; ezilIdUrl: string | null };
+    /** Round 5 D3: the computer's real data-volume size in GiB (EC2 describeVolume); null/omitted = unreadable (fallback 50). */
+    volumeGiB?: number | null;
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
@@ -212,7 +241,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         plan.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
     )) : null;
-    const disk = storageDisk(plan, size.code, input.storage, input.config.largeStorageEnabled);
+    const disk = storageDisk(plan, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
@@ -226,6 +255,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline,
             machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
                 size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const,
+                // D3 + the W0 pin: no per-configuration disk figure until a grow path exists (a switch keeps
+                // the computer's volume); the plan disk is on the plan card (offer storageGiB) only.
                 diskGiB: null })),
             disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null, growsOnSwitch: false },
             standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null },

@@ -152,6 +152,17 @@ function setup(o: { rows?: Record<string, unknown>[]; host?: PoolHostRow | null;
 }
 
 describe('POOL-OPEN warm lifecycle', () => {
+    it.each([
+        ['premium_monthly_v3', 100], ['standard_monthly_v3', 50], ['standard_monthly_v2', 50],
+    ] as const)('round 5 D3 plan-max: a fresh pool adopt (no volume yet) for %s creates a %i GiB volume; a reopen creates none', async (planId, gib) => {
+        const entitlement: EntitlementRecord = { ...paid, planId };
+        const fresh = setup({ entitlement });
+        await fresh.ensure();
+        expect(fresh.starts[0].intent).toMatchObject({ operation: 'adopt', dataVolumeId: null, dataVolumeGiB: gib });
+        const reopen = setup({ rows: [stopped()], entitlement });
+        await reopen.ensure();
+        expect(reopen.starts[0].intent).toMatchObject({ operation: 'adopt', dataVolumeId: VOLUME, dataVolumeGiB: null });
+    });
     it.each([false, true])('lease/adopt/claim/ready bills only at claim completion, reopen=%s', async reopen => {
         const s = setup({ rows: reopen ? [stopped()] : [] });
         expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });

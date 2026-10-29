@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { SizeCode } from '@/server/billing/v2/contract';
-import { AWS_TIERS, AWS_TIER_DATA_GIB, INSTANCE_VCPU, awsCanaryConfig, awsDirectSince, awsTierForSize, instanceTypeForTier, instanceVcpu, sizeForInstanceType, meteredSizeForInstanceType } from './aws-config';
+import type { AwsTier } from './aws-config';
+import { AWS_TIERS, AWS_TIER_DATA_GIB, INSTANCE_VCPU, awsCanaryConfig, dataGiBForNewVolume, awsDirectSince, awsTierForSize, instanceTypeForTier, instanceVcpu, sizeForInstanceType, meteredSizeForInstanceType } from './aws-config';
 import { KNOWN_INSTANCE_TYPES } from './aws-intent';
+import { fixtureDeployment } from './aws-intent.test-support';
+import { CATALOG_V3 } from '@/server/billing/v3/contract';
 
 describe('direct AWS creation cutoff', () => {
     it.each([undefined, '', ' ', '2026-10-14', '2026-10-14T00:00:00', 'yesterday', '2026-13-40T00:00:00Z'])('fails closed for SINCE %j', since => {
@@ -75,5 +78,30 @@ describe('metered AWS sizes', () => {
     ('does not meter %j while capacity still counts 8 vCPU', type => {
         expect(meteredSizeForInstanceType(type)).toBeNull();
         expect(instanceVcpu(type)).toBe(8);
+    });
+});
+
+describe('round 5 D3: a new data volume is sized for the largest configuration the plan allows (plan-max)', () => {
+    const PAID: readonly AwsTier[] = ['plus', 'compute4', 'compute8'];
+    it.each(PAID)('tier %s: Standard 50, Premium 100, legacy/unknown plans keep the tier table (50)', tier => {
+        expect(dataGiBForNewVolume(tier, 'standard_monthly_v3')).toBe(50);
+        expect(dataGiBForNewVolume(tier, 'premium_monthly_v3')).toBe(100);
+        for (const planId of ['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1', 'free_v3', '', null, undefined, 'toString', '__proto__'])
+            expect(dataGiBForNewVolume(tier, planId)).toBe(AWS_TIER_DATA_GIB[tier]);
+    });
+    it('the free tier keeps the legacy 20 GiB, whatever plan id comes with it (an unpaid Premium never gets 100)', () => {
+        for (const planId of ['premium_monthly_v3', 'standard_monthly_v3', null]) expect(dataGiBForNewVolume('free', planId)).toBe(20);
+    });
+    it('what the plan card markets is what a new volume gets, and every size fits the lifecycle range (dataMaxGiB 100)', () => {
+        const { storage } = fixtureDeployment('ap-south-1', ['m6i.large']);
+        expect(storage.dataMaxGiB).toBe(100);
+        for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) for (const tier of PAID) {
+            expect(dataGiBForNewVolume(tier, sku)).toBe(CATALOG_V3[sku].storageGiB);
+        }
+        for (const tier of [...PAID, 'free'] as const) for (const planId of [...Object.keys(CATALOG_V3), null]) {
+            const gib = dataGiBForNewVolume(tier, planId);
+            expect(gib).toBeGreaterThanOrEqual(storage.dataMinGiB);
+            expect(gib).toBeLessThanOrEqual(storage.dataMaxGiB);
+        }
     });
 });

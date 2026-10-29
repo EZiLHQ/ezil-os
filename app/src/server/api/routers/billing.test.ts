@@ -22,8 +22,17 @@ vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
 vi.mock('@/server/billing/deps', () => ({
     getBillingDeps: () => { throw new Error('Tests must inject billing ports'); },
 }));
+// Round 5 D3: the router's DEFAULT volume reader goes through the app's EC2 collaborators. The describer is a
+// fake; by default it knows no volume (null), which is the AWS-off answer, so every other case keeps the fallback.
+const awsDescribeVolume = vi.hoisted(() => vi.fn<(region: string, volumeId: string) => Promise<{ sizeGiB?: number } | null>>(async () => null));
+vi.mock('@/server/lib/compute/aws-clients', async importOriginal => ({
+    ...await importOriginal<typeof import('@/server/lib/compute/aws-clients')>(),
+    sharedAwsSdkCollaborators: () => ({ describer: { describeVolume: awsDescribeVolume } }),
+}));
 
-import { createBillingRouter, userPlacementProvider } from './billing';
+import { createBillingRouter, createVolumeSizeReader, userPlacement, userPlacementProvider, type UserPlacement } from './billing';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 
 const now = new Date('2026-10-11T12:00:00Z');
 const sku = 'standard_monthly_v3';
@@ -1344,5 +1353,218 @@ describe('round 5 D1: summary enrollment state and top-up gating', () => {
     it('createTopupCheckout proceeds for an enrolled member', async () => {
         const f = enrolling('works-member');
         await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 })).resolves.toMatchObject({ sessionId: session.id });
+    });
+});
+
+describe('round 5 D3: the summary and usage show the computer\'s REAL volume', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    const [C1, C2] = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+    const VOL_TODAY = 'vol-0aaaaaaaaaaaaaaaa', VOL_OLD = 'vol-0bbbbbbbbbbbbbbbb';
+    const GiB = 1024 ** 3;
+    const withVolumes = (awsVolumes: UserPlacement['awsVolumes'], sizes: Record<string, number | null | Error>) => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3' })]);
+        const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: awsVolumes.length ? 'aws-ec2' : null, awsVolumes }));
+        const volumeGiB = vi.fn(async ({ volumeId }: { region: string; volumeId: string }) => {
+            const size = sizes[volumeId];
+            if (size instanceof Error) throw size;
+            return size ?? null;
+        });
+        return { ...f, placement, volumeGiB, caller: createBillingRouter(() => f.deps, { placement, volumeGiB }).createCaller(f.ctx) };
+    };
+
+    it('a Premium computer created today (100 GiB volume) shows 100; an older one (50 GiB) shows 50; summary and usage agree', async () => {
+        for (const [volumeId, gib] of [[VOL_TODAY, 100], [VOL_OLD, 50]] as const) {
+            const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId }], { [VOL_TODAY]: 100, [VOL_OLD]: 50 });
+            const summary = await f.caller.summary();
+            expect(summary).toMatchObject({ computer: { disk: { provisionedGiB: gib, growsOnSwitch: false }, standing: 'paid', filesOn: 'aws' },
+                storage: { capBytes: String(gib * GiB) } });
+            if (!summary.enabled) throw new Error('summary disabled');
+            // D3 + W0 pin: the tiles carry no disk figure; the real volume is the computer's disk.
+            expect(summary.computer.machineChoice.map(option => option.diskGiB)).toEqual([null, null, null]);
+            await expect(f.caller.usage()).resolves.toMatchObject({ storage: { capBytes: String(gib * GiB), disk: { provisionedGiB: gib } } });
+            expect(f.volumeGiB).toHaveBeenCalledWith({ computerId: C1, region: 'ap-south-1', volumeId });
+            expect(f.placement).toHaveBeenCalledWith(f.ctx.db, userId);
+        }
+    });
+
+    it('an unreadable volume (error, missing, no AWS placement) shows 50 and never fails the summary or usage', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        for (const f of [withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }], { [VOL_TODAY]: new Error('AccessDenied') }),
+            withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }], { [VOL_TODAY]: null }),
+            withVolumes([], {})]) {
+            await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } }, storage: { capBytes: String(50 * GiB) } });
+            await expect(f.caller.usage()).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 50 } } });
+        }
+        const failing = withVolumes([], {});
+        failing.placement.mockRejectedValue(new Error('db down'));
+        await expect(failing.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 }, filesOn: 'cloudflare' } });
+        expect(warn).toHaveBeenCalled();
+    });
+
+    it('two AWS volumes: the smallest readable size (never overclaim); usage for one computer reads that computer\'s volume', async () => {
+        const volumes = [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }, { computerId: C2, region: 'ap-south-1', volumeId: VOL_OLD }];
+        const f = withVolumes(volumes, { [VOL_TODAY]: 100, [VOL_OLD]: 50 });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } } });
+        f.store.computerOwner = vi.fn(async () => userId) as never;
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
+        await expect(f.caller.usage({ computerId: C2 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 50 } } });
+        // One volume unreadable (error/timeout) beside a readable 100: that computer may be 50, so the summary shows 50.
+        const partly = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }, { computerId: C2, region: 'ap-south-1', volumeId: VOL_OLD }],
+            { [VOL_TODAY]: 100, [VOL_OLD]: new Error('Throttling') });
+        await expect(partly.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } } });
+        // z.string().uuid() accepts upper case; the placement ids are lower case.
+        await expect(f.caller.usage({ computerId: C1.toUpperCase() })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
+    });
+
+    it('without an injected reader, the router reads the volume through the app\'s EC2 describer (region, volumeId)', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3' })]);
+        // Unique ids: the default reader's cache is module-wide.
+        const VOL_DEFAULT = 'vol-0dddddddddddddddd', VOL_DEFAULT_OLD = 'vol-0eeeeeeeeeeeeeeee';
+        const sizes: Record<string, number> = { [VOL_DEFAULT]: 100, [VOL_DEFAULT_OLD]: 50 };
+        awsDescribeVolume.mockImplementation(async (region, volumeId) => region === 'ap-south-1' && sizes[volumeId] ? { sizeGiB: sizes[volumeId] } : null);
+        try {
+            for (const [volumeId, gib] of [[VOL_DEFAULT, 100], [VOL_DEFAULT_OLD, 50]] as const) {
+                const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: 'aws-ec2',
+                    awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId }] }));
+                const caller = createBillingRouter(() => f.deps, { placement }).createCaller(f.ctx);
+                await expect(caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: gib } }, storage: { capBytes: String(gib * GiB) } });
+                await expect(caller.usage()).resolves.toMatchObject({ storage: { disk: { provisionedGiB: gib } } });
+                expect(awsDescribeVolume).toHaveBeenCalledWith('ap-south-1', volumeId);
+            }
+        } finally {
+            awsDescribeVolume.mockReset();
+            awsDescribeVolume.mockResolvedValue(null);
+        }
+    });
+
+    it('the legacy placementProvider option still works (provider only, fallback disk)', async () => {
+        const f = fixture();
+        const placementProvider = vi.fn(async () => 'aws-ec2' as const);
+        const caller = createBillingRouter(() => f.deps, { placementProvider }).createCaller(f.ctx);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v3' })]);
+        await expect(caller.summary()).resolves.toMatchObject({ computer: { filesOn: 'aws', disk: { provisionedGiB: 50 } } });
+    });
+
+    it('userPlacement: aws-ec2 placements expose {computerId, region, volumeId}; a failed rich read keeps the provider', async () => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const dialect = new PgDialect();
+        const rows: Record<string, Record<string, unknown>> = {
+            [C1]: placementRow({ computer_id: C1, owner_user_id: userId, provider: 'aws-ec2', region: 'ap-south-1', volume_id: VOL_TODAY }),
+            [C2]: placementRow({ computer_id: C2, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' }),
+        };
+        let richFails = false;
+        const execute = vi.fn(async (query: Parameters<typeof dialect.sqlToQuery>[0]) => {
+            const { sql: text, params } = dialect.sqlToQuery(query);
+            if (text.includes('billing:live-computers')) return [{ id: C1 }, { id: C2 }];
+            if (text.includes('placement:provider-table')) return [{ present: true }];
+            if (text.includes('placement:provider */')) return [{ provider: rows[String(params[0])]!.provider }];
+            if (text.includes('placement:read')) { if (richFails) throw new Error('column missing'); return [rows[String(params[0])]!]; }
+            if (text.includes('placement:image-reservation')) return [];
+            throw new Error(`unexpected query ${text}`);
+        });
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2',
+            awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }] });
+        await expect(userPlacementProvider({ execute: execute as never }, userId)).resolves.toBe('aws-ec2');
+        // Only the aws-ec2 computer gets the rich read.
+        expect(execute.mock.calls.filter(([q]) => dialect.sqlToQuery(q).sql.includes('placement:read')).map(([q]) => dialect.sqlToQuery(q).params[0])).toEqual([C1, C1]);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        richFails = true;
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
+        expect(warn).toHaveBeenCalledWith('[billing.summary] volume placement unavailable');
+        // A placement without a volume yet (provisioning) has nothing to read.
+        richFails = false; rows[C1] = { ...rows[C1], volume_id: null };
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
+        // Placement reads off: nothing is read at all.
+        vi.unstubAllEnvs(); execute.mockClear();
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: null, awsVolumes: [] });
+        expect(execute).not.toHaveBeenCalled();
+    });
+});
+
+describe('round 5 D3: the volume size reader (describeVolume, cached)', () => {
+    const volume = { computerId: 'c', region: 'ap-south-1', volumeId: 'vol-0aaaaaaaaaaaaaaaa' };
+    const setup = (sizeGiB: number | 'missing' | Error | 'hang' = 100) => {
+        let clock = 0;
+        const describe = vi.fn(async () => {
+            if (sizeGiB === 'hang') return new Promise<never>(() => {});
+            if (sizeGiB instanceof Error) throw sizeGiB;
+            return sizeGiB === 'missing' ? {} : { sizeGiB };
+        });
+        const read = createVolumeSizeReader(describe, { now: () => clock, timeoutMs: 20, maxEntries: 3 });
+        return { describe, read, at: (ms: number) => { clock = ms; } };
+    };
+    it('reads sizeGiB once per volume within 5 minutes, then again after', async () => {
+        const r = setup();
+        await expect(r.read(volume)).resolves.toBe(100);
+        r.at(299_000);
+        await expect(r.read(volume)).resolves.toBe(100);
+        expect(r.describe).toHaveBeenCalledTimes(1);
+        expect(r.describe).toHaveBeenCalledWith('ap-south-1', volume.volumeId);
+        r.at(300_001);
+        await expect(r.read(volume)).resolves.toBe(100);
+        expect(r.describe).toHaveBeenCalledTimes(2);
+    });
+    it('is bounded: the oldest entry is evicted past maxEntries', async () => {
+        const r = setup();
+        for (const id of ['1', '2', '3', '4']) await r.read({ ...volume, volumeId: `vol-0${id.repeat(16)}` });
+        expect(r.describe).toHaveBeenCalledTimes(4);
+        await r.read({ ...volume, volumeId: `vol-0${'4'.repeat(16)}` });
+        expect(r.describe).toHaveBeenCalledTimes(4);
+        await r.read({ ...volume, volumeId: `vol-0${'1'.repeat(16)}` });
+        expect(r.describe).toHaveBeenCalledTimes(5);
+    });
+    it('a caller ttlMs above 5 minutes is clamped to 5 minutes', async () => {
+        let clock = 0;
+        const describe = vi.fn(async () => ({ sizeGiB: 100 }));
+        const read = createVolumeSizeReader(describe, { now: () => clock, ttlMs: 60 * 60_000 });
+        await read(volume);
+        clock = 300_001;
+        await read(volume);
+        expect(describe).toHaveBeenCalledTimes(2);
+    });
+    it.each([['an AWS error', new Error('Throttling')], ['a missing size', 'missing' as const], ['a hung call (timeout)', 'hang' as const]])(
+        '%s is null, held for 30 s (a throttled EC2 is not re-hit on every call), then read again', async (_name, size) => {
+            const r = setup(size);
+            await expect(r.read(volume)).resolves.toBeNull();
+            r.at(30_000);
+            await expect(r.read(volume)).resolves.toBeNull();
+            expect(r.describe).toHaveBeenCalledTimes(1);
+            r.at(30_001);
+            await expect(r.read(volume)).resolves.toBeNull();
+            expect(r.describe).toHaveBeenCalledTimes(2);
+        });
+    it('a caller negativeTtlMs is clamped to the positive TTL', async () => {
+        let clock = 0;
+        const describe = vi.fn(async () => { throw new Error('Throttling'); });
+        const read = createVolumeSizeReader(describe, { now: () => clock, ttlMs: 1_000, negativeTtlMs: 60_000 });
+        await read(volume);
+        clock = 1_001;
+        await read(volume);
+        expect(describe).toHaveBeenCalledTimes(2);
+    });
+    it('concurrent reads of one volume share one DescribeVolumes call', async () => {
+        let release!: (view: { sizeGiB: number }) => void;
+        const describe = vi.fn(() => new Promise<{ sizeGiB: number }>(resolve => { release = resolve; }));
+        const read = createVolumeSizeReader(describe, { timeoutMs: 1_000 });
+        const reads = Array.from({ length: 5 }, () => read(volume));
+        release({ sizeGiB: 100 });
+        await expect(Promise.all(reads)).resolves.toEqual([100, 100, 100, 100, 100]);
+        expect(describe).toHaveBeenCalledTimes(1);
+    });
+    it('a read that finishes after the timeout still fills the cache (the next summary shows the real size)', async () => {
+        let release!: (view: { sizeGiB: number }) => void;
+        const describe = vi.fn(() => new Promise<{ sizeGiB: number }>(resolve => { release = resolve; }));
+        const read = createVolumeSizeReader(describe, { timeoutMs: 10 });
+        await expect(read(volume)).resolves.toBeNull();
+        release({ sizeGiB: 100 });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await expect(read(volume)).resolves.toBe(100);
+        expect(describe).toHaveBeenCalledTimes(1);
+    });
+    it('a volume EC2 does not know (null) or AWS off is null', async () => {
+        const read = createVolumeSizeReader(async () => null, { timeoutMs: 20 });
+        await expect(read(volume)).resolves.toBeNull();
     });
 });

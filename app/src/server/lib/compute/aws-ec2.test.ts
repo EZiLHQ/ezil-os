@@ -165,6 +165,29 @@ describe('ensure: a new computer', () => {
         expect(calls[0]!.intent).toMatchObject({ operation: 'provision', instanceType: 'm6i.2xlarge', dataVolumeGiB: 50 });
     });
 
+    it.each([
+        ['premium_monthly_v3', 'std-2', 'm6i.large', 100],
+        ['premium_monthly_v3', 'cmp-4', 'm6i.xlarge', 100],
+        ['premium_monthly_v3', 'cmp-8', 'm6i.2xlarge', 100],
+        ['standard_monthly_v3', 'std-2', 'm6i.large', 50],
+    ] as const)('round 5 D3 plan-max: a %s computer provisioned at %s (%s) gets a %i GiB data volume', async (planId, size, type, gib) => {
+        const entitlement: EntitlementRecord = { source: 'billing_v2', status: 'active', planId, size, provider: 'aws', paymentIssue: false };
+        const { provider, placements, calls } = setup({}, { entitlement, tierFor: undefined, e: env({
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '4',
+            [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', [...TYPES, 'm6i.xlarge', 'm6i.2xlarge']) }),
+        }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'computer_starting' });
+        expect(placements[0]).toMatchObject({ instance_type: type, region: 'ap-south-1' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'provision', instanceType: type, dataVolumeGiB: gib });
+    });
+
+    it('round 5 D3: a past-due Premium record is the free tier and keeps the legacy 20 GiB (never the plan disk)', async () => {
+        const entitlement: EntitlementRecord = { source: 'billing_v2', status: 'past_due', planId: 'premium_monthly_v3', size: 'cmp-8', provider: 'aws', paymentIssue: true };
+        const { provider, calls } = setup({}, { entitlement, tierFor: undefined });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(calls[0]!.intent).toMatchObject({ operation: 'provision', instanceType: 't3a.medium', dataVolumeGiB: 20 });
+    });
+
     it.each(['start', 'replace'] as const)('waking in %s mode replaces at the entitled cmp-8 size', async operation => {
         const { provider, calls } = setup({ placements: [stopped()] }, {
             entitlement: { source: 'billing_v2', status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws' },

@@ -40,7 +40,7 @@ export { buildEnrollmentUserData as buildAwsProvisionUserData } from './aws-enro
 
 import { runAdmission, type AdmissionRefusal, type AdmissionRequest } from './admission';
 import {
-    AWS_TIER_DATA_GIB,
+    dataGiBForNewVolume,
     instanceTypeForTier,
     isAwsComputersEnabled,
     readAwsAdmissionConfig,
@@ -489,7 +489,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 }
                 const work = deps.pool.buildWork({ ...cold.intent, operation: 'adopt', poolHostId: host.poolHostId,
                     providerInstanceId: host.instanceId, dataVolumeId: p.volumeId,
-                    dataVolumeGiB: p.volumeId === null ? AWS_TIER_DATA_GIB[tier] : null,
+                    dataVolumeGiB: p.volumeId === null ? dataGiBForNewVolume(tier, deps.entitlement?.planId) : null,
                     userData: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
                 });
                 workRef.set(work);
@@ -591,7 +591,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 work = buildLifecycleWork({
                                     schemaVersion: 1, jobId: newId(), computerId, revision: 1, operation: 'provision', targetGeneration: 1, fenceToken,
                                     providerInstanceId: null, dataVolumeId: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
-                                    deployment, instanceType: instanceTypeForTier(tier), dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: 1, userData,
+                                    deployment, instanceType: instanceTypeForTier(tier), dataVolumeGiB: dataGiBForNewVolume(tier, deps.entitlement?.planId), leaseEpoch: 1, userData,
                                 });
                                 return {
                                     zoneId: deployment.zoneId, fsUuid, fenceToken,
