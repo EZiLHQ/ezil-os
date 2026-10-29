@@ -1,19 +1,23 @@
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { gunzipSync } from 'node:zlib';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 // D4 (round 5): the web container log must survive weeks of traffic and every deploy recreate.
 const STAGING = path.resolve(__dirname, '..', '..', '..', '..', '..', 'deploy', 'aws', 'os-staging');
 const read = (file: string) => readFileSync(path.join(STAGING, file), 'utf8');
-// js-yaml is resolved from the app's installed tree (a lockfile dependency of the ESLint toolchain).
-const yaml = createRequire(import.meta.url)('js-yaml') as { load(text: string): unknown };
-type Service = { logging?: { driver?: string; options?: Record<string, unknown> } };
 
 describe('os-staging compose logging (D4)', () => {
-    const compose = yaml.load(read('compose.yaml')) as { services: Record<string, Service> };
-    it.each(['web', 'caddy'])('%s keeps json-file logs at 50 MB x 5 files', service => {
-        expect(compose.services[service]?.logging).toEqual({ driver: 'json-file', options: { 'max-size': '50m', 'max-file': '5' } });
+    // Narrow, dependency-free check of the exact block (no YAML library: none is a declared app dependency).
+    const compose = read('compose.yaml');
+    it('web defines the shared json-file anchor at 50 MB x 5 files', () => {
+        expect(compose).toMatch(/^ {2}web:\n(?: {4}.*\n|\s*\n)*? {4}logging: &logging\n {6}driver: json-file\n {6}options: \{max-size: '50m', max-file: '5'\}\n/m);
+        expect(compose.match(/&logging\b/g)).toHaveLength(1);
+    });
+    it('caddy reuses the same anchor', () => {
+        expect(compose).toMatch(/^ {2}caddy:\n(?: {4}.*\n|\s*\n)*? {4}logging: \*logging\n/m);
     });
 });
 
@@ -22,6 +26,11 @@ describe('os-staging install keeps the outgoing web log (D4)', () => {
     const lines = installer.split('\n');
     const recreate = lines.findIndex(l => /docker compose .*up -d --force-recreate/.test(l));
     const snapshotCall = lines.findIndex(l => l.trim() === 'snapshot_web_log');
+    it('install-host.sh passes bash -n', () => {
+        const result = spawnSync('bash', ['-n', path.join(STAGING, 'install-host.sh')], { encoding: 'utf8' });
+        expect(result.stderr).toBe('');
+        expect(result.status).toBe(0);
+    });
     it('snapshots the running web container before the force-recreate', () => {
         expect(recreate).toBeGreaterThan(0);
         expect(snapshotCall).toBeGreaterThan(0);
@@ -34,5 +43,86 @@ describe('os-staging install keeps the outgoing web log (D4)', () => {
         expect(body).toMatch(/docker logs --timestamps "\$container" 2>&1 \| gzip/);
         expect(body).toMatch(/web-\$\(date -u \+%Y%m%dT%H%M%SZ\)\.log\.gz/);
         expect(body).toMatch(/-mmin \+10080 -delete/);
+    });
+});
+
+/**
+ * Runs the REAL snapshot_web_log function from install-host.sh under the installer's own `set -euo pipefail`
+ * and `umask 077`, with a fake `docker` on PATH. Only the log directory path is rewritten to a temp directory.
+ * The function must never block the install: `AFTER` must print and bash must exit 0 in every case.
+ */
+describe('install-host.sh snapshot_web_log behaviour (D4)', () => {
+    const LOG_DIR = '/var/log/ezil-os-staging';
+    const installer = read('install-host.sh');
+    const start = installer.indexOf('snapshot_web_log() {');
+    const fn = installer.slice(start, installer.indexOf('\n}\n', start) + 3);
+    let root: string, bin: string, logs: string;
+    beforeEach(() => {
+        root = mkdtempSync(path.join(tmpdir(), 'ezil-d4-snapshot-'));
+        bin = path.join(root, 'bin'); mkdirSync(bin);
+        logs = path.join(root, 'logs');
+    });
+    afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+    const docker = (body: string) => {
+        const fake = path.join(bin, 'docker');
+        writeFileSync(fake, `#!/usr/bin/env bash\n${body}\n`); chmodSync(fake, 0o755);
+    };
+    const run = (dir = logs) => spawnSync('bash', ['-c', `set -euo pipefail\numask 077\n${fn.split(LOG_DIR).join(dir)}snapshot_web_log\necho AFTER\n`],
+        { encoding: 'utf8', timeout: 60_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+    const snapshots = () => existsSync(logs) ? readdirSync(logs).filter(n => /^web-.*\.log\.gz$/.test(n)).sort() : [];
+    const expectContinued = (result: ReturnType<typeof run>) => {
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toContain('AFTER');
+    };
+
+    it('writes a private gzip snapshot of stdout+stderr with timestamps, atomically', () => {
+        docker('case $1 in container) exit 0;; logs) [[ $2 == --timestamps && $3 == ezil-os-staging-web-1 ]] || exit 9;'
+            + ' echo "2026-10-29T12:00:00Z out"; echo "2026-10-29T12:00:01Z err" >&2;; esac');
+        expectContinued(run());
+        const [snap, ...more] = snapshots();
+        expect(more).toEqual([]);
+        expect(snap).toMatch(/^web-\d{8}T\d{6}Z\.log\.gz$/);
+        expect(gunzipSync(readFileSync(path.join(logs, snap!))).toString()).toBe('2026-10-29T12:00:00Z out\n2026-10-29T12:00:01Z err\n');
+        expect(statSync(path.join(logs, snap!)).mode & 0o777).toBe(0o600);
+        expect(statSync(logs).mode & 0o777).toBe(0o700);
+        expect(readdirSync(logs).filter(n => n.endsWith('.partial'))).toEqual([]);
+    });
+    it('first install (no web container) continues without a snapshot', () => {
+        docker('exit 1');
+        expectContinued(run());
+        expect(snapshots()).toEqual([]);
+    });
+    it('a docker logs failure never blocks the install and leaves no file (no truncated snapshot kept)', () => {
+        docker('case $1 in container) exit 0;; logs) echo partial; exit 3;; esac');
+        const result = run();
+        expectContinued(result);
+        expect(result.stderr).toContain('Web log snapshot skipped');
+        expect(readdirSync(logs)).toEqual([]);
+    });
+    it('a log path that is a regular file never blocks the install', () => {
+        docker('case $1 in container) exit 0;; logs) echo line;; esac');
+        writeFileSync(logs, 'not a directory');
+        expectContinued(run());
+    });
+    it('a log directory that cannot be created (prune finds nothing) never blocks the install', () => {
+        docker('case $1 in container) exit 0;; logs) echo line;; esac');
+        writeFileSync(logs, 'not a directory');
+        expectContinued(run(path.join(logs, 'sub')));
+    });
+    it('prunes only web snapshots older than 7 days', () => {
+        docker('case $1 in container) exit 0;; logs) echo line;; esac');
+        mkdirSync(logs, { mode: 0o700 });
+        const old = 'web-20261020T000000Z.log.gz', recent = 'web-20261027T000000Z.log.gz', other = 'keep-me.txt';
+        for (const name of [old, recent, other]) writeFileSync(path.join(logs, name), 'x');
+        const days = (n: number) => (Date.now() - n * 86_400_000) / 1000;
+        utimesSync(path.join(logs, old), days(8), days(8));
+        utimesSync(path.join(logs, other), days(8), days(8));
+        utimesSync(path.join(logs, recent), days(6), days(6));
+        expectContinued(run());
+        const names = readdirSync(logs);
+        expect(names).not.toContain(old);
+        expect(names).toContain(recent);
+        expect(names).toContain(other);
+        expect(snapshots()).toHaveLength(2);
     });
 });

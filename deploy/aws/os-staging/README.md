@@ -135,12 +135,15 @@ zcat /var/log/ezil-os-staging/web-*.log.gz | grep 'ai-outbox'   # files sort by 
 
 **Pool lines** are single-line JSON. Steady state is quiet:
 - `pool-replenish`: one line per minute pass only when something changed. That
-  means a dispatch, a retirement, slow hosts, a failed pass, or a per-class
+  means a dispatch, a retirement, slow hosts, a failed pass (`"failed":true`),
+  the first good pass after a failed one (the recovery line), or a per-class
   target/spares change. Otherwise at most one `"heartbeat":true` line every
   15 minutes.
-- `pool-host-readiness`: only a host's first `enrolled` and first `ready`.
-  Five-minute heartbeat refreshes are silent. Every `*_rejected` line is kept,
-  as a warning.
+- `pool-host-readiness`: an `enrolled` line for each enroll while the host row
+  is still `booting` (normally once; a host that re-enrolls before it is ready
+  logs again), and one `ready` line for the host's first ready. Once a host is
+  ready, its five-minute heartbeat refreshes and re-enrolls are silent. Every
+  `*_rejected` line is kept, as a warning.
 
 ## Known gap, rollback and teardown
 

@@ -87,8 +87,8 @@ export async function handlePoolHost(req: Request, deps: PoolHostDeps, action: '
             poolGuard('row_unclaimed', ['booting', 'ready'].includes(row.state) && row.leasedComputerId === null);
             return row;
         });
-        // D4: heartbeat refreshes are silent. Log the first enrollment (row still booting) and the first ready
-        // (ready_at is COALESCEd, so it equals this report's clock only the first time).
+        // D4: heartbeat refreshes are silent. Log each enroll while the row is still booting (normally once) and
+        // the first ready (ready_at is COALESCEd, so it equals this report's clock only the first time).
         const first = action === 'enroll' ? committed.state === 'booting' : committed.readyAt?.getTime() === now.getTime();
         if (first) console.info(JSON.stringify({ event: 'pool-host-readiness', result: action === 'enroll' ? 'enrolled' : 'ready', ...context,
             state: committed.state, enrolledAt: committed.enrolledAt?.toISOString() ?? null,

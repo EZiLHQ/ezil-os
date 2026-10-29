@@ -220,6 +220,35 @@ describe('poolPassLine (D4 pool-replenish log)', () => {
         poolPassLine(pass(idle()), memo, NOW);
         expect(JSON.parse(poolPassLine(pass(idle()), memo, at(1), { failed: true })!)).toMatchObject({ event: 'pool-replenish', failed: true });
     });
+    it('logs recovery: the first good pass after a failed one emits (same signature), then silence resumes', () => {
+        const memo = newPoolPassLogMemo();
+        poolPassLine(pass(idle()), memo, NOW);
+        poolPassLine(pass(idle()), memo, at(1), { failed: true });
+        const recovered = poolPassLine(pass(idle()), memo, at(2));
+        expect(recovered).not.toBeNull();
+        expect(JSON.parse(recovered!)).not.toHaveProperty('failed');
+        expect(JSON.parse(recovered!)).not.toHaveProperty('heartbeat');
+        expect(poolPassLine(pass(idle()), memo, at(3))).toBeNull();
+    });
+    it('class order is not a change: the signature is sorted (the planner reorders classes)', () => {
+        const memo = newPoolPassLogMemo();
+        const a = { c: CLASS_L, record: idle(1, 1) }, b = { c: CLASS_XL, record: idle(0, 0) };
+        expect(poolPassLine([a, b], memo, NOW)).not.toBeNull();
+        expect(poolPassLine([b, a], memo, at(1))).toBeNull();
+    });
+    it('the signature carries the region: swapping targets between two regions of one type is a change', () => {
+        const memo = newPoolPassLogMemo();
+        const mum: PoolClass = { ...CLASS_L, region: 'ap-south-1' }, use: PoolClass = { ...CLASS_L, region: 'us-east-1', zoneId: 'use1-az1' };
+        expect(poolPassLine([{ c: mum, record: idle(1, 2) }, { c: use, record: idle(1, 1) }], memo, NOW)).not.toBeNull();
+        expect(poolPassLine([{ c: mum, record: idle(1, 1) }, { c: use, record: idle(1, 2) }], memo, at(1))).not.toBeNull();
+    });
+});
+it('a dispatch-phase failure after the lock commits is logged once as failed, then rethrown', async () => {
+    const { deps, plan } = fixture(); plan.provision = 1;
+    deps.store.outcome = vi.fn(async () => { throw new Error('outcome failure'); });
+    await expect(runPoolReplenish(deps)).rejects.toThrow('outcome failure');
+    expect(deps.starter.start).toHaveBeenCalledOnce();
+    expect(deps.log).toHaveBeenCalledExactlyOnceWith([{ c: deps.classes[0], record: expect.objectContaining({ target: 4 }) }], true);
 });
 it('logs each pass exactly once, pairing every record with its own class', async () => {
     const { deps, demand } = fixture(); deps.classes.push({ ...CLASS_XL, zoneId: deps.classes[0]!.zoneId });

@@ -182,24 +182,28 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
     return prepared.records;
 }
 
-/** D4 (round 5) log memo: the last emitted per-class target/spares signature and when any line was emitted. */
-export interface PoolPassLogMemo { signature: string | null; emittedAt: number | null }
+/**
+ * D4 (round 5) log memo: the last emitted per-class target/spares signature, when any line was emitted,
+ * and whether that line was a failed pass (so the first good pass after it is logged as the recovery).
+ */
+export interface PoolPassLogMemo { signature: string | null; emittedAt: number | null; failed: boolean }
 export const POOL_LOG_HEARTBEAT_MS = 15 * 60_000;
-export function newPoolPassLogMemo(): PoolPassLogMemo { return { signature: null, emittedAt: null }; }
+export function newPoolPassLogMemo(): PoolPassLogMemo { return { signature: null, emittedAt: null, failed: false }; }
 /**
  * The ONE compact pool-replenish line for a pass, or null when nothing changed. A pass is a change when it
- * dispatched (provisioned+retired>0), reserved retirements, saw slow hosts, failed, or its per-class
- * target/spares signature differs from the last emitted line. An unchanged pass emits at most one
- * `heartbeat` line per 15 minutes. Updates `memo` only when it returns a line.
+ * dispatched (provisioned+retired>0), reserved retirements, saw slow hosts, failed, is the first good pass
+ * after a failed one, or its per-class target/spares signature differs from the last emitted line. An
+ * unchanged pass emits at most one `heartbeat` line per 15 minutes. Updates `memo` only when it returns a line.
  */
 export function poolPassLine(entries: PoolPassEntry[], memo: PoolPassLogMemo, now: Date, opts: { failed?: boolean } = {}): string | null {
+    const failed = !!opts.failed;
     const classes = entries.map(({ c, record: r }) => ({ region: c.region, type: c.instanceType, target: r.target, spares: r.spares,
         provisioned: r.provisioned, retired: r.retired, retirements: r.retirements, slowHosts: r.slowHosts }));
     const signature = classes.map(k => `${k.region}:${k.type}:${k.target}:${k.spares}`).sort().join(',');
-    const changed = !!opts.failed || signature !== memo.signature
+    const changed = failed || memo.failed || signature !== memo.signature
         || classes.some(k => k.provisioned + k.retired > 0 || k.retirements.length > 0 || k.slowHosts.length > 0);
     const heartbeatDue = memo.emittedAt === null || now.getTime() - memo.emittedAt >= POOL_LOG_HEARTBEAT_MS;
     if (!changed && !heartbeatDue) return null;
-    memo.signature = signature; memo.emittedAt = now.getTime();
-    return JSON.stringify({ event: 'pool-replenish', ...(opts.failed ? { failed: true } : {}), ...(changed ? {} : { heartbeat: true }), classes });
+    memo.signature = signature; memo.emittedAt = now.getTime(); memo.failed = failed;
+    return JSON.stringify({ event: 'pool-replenish', ...(failed ? { failed: true } : {}), ...(changed ? {} : { heartbeat: true }), classes });
 }
