@@ -77,11 +77,12 @@ function billingState (name) {
     s.actions.topup = true; s.catalog.packs = packs;
     switch ( name ) {
     case 'premium-low': s.ai.state = 'low'; s.ai.included.remaining = 40; break;
+    case 'premium-exhausted': s.ai.state = 'exhausted'; s.ai.included.remaining = 0; break;
     case 'grace': Object.assign(s.plan, { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: '2026-11-05T00:00:00Z' }); s.computer.standing = 'grace'; break;
     case 'past_due': Object.assign(s.plan, { status: 'past_due', paymentIssue: 'payment_failed' }); break;
     case 'cancels': Object.assign(s.plan, { status: 'cancels', cancelsAt: END, planEndsAt: END }); s.computer.standing = 'plan_ending'; break;
     case 'upgrade_pending': Object.assign(s.plan, { status: 'upgrade_pending', pendingUpgrade: { toSku: 'premium_monthly_v3', expiresAt: '2026-10-20T00:00:00Z', hostedInvoiceUrl: 'https://invoice.example.test/p' } }); break;
-    case 'incomplete': Object.assign(s.plan, { status: 'incomplete', pendingUpgrade: { toSku: 'premium_monthly_v3', expiresAt: '2026-10-20T00:00:00Z', hostedInvoiceUrl: 'https://invoice.example.test/p' } }); break;
+    case 'incomplete': Object.assign(s.plan, { status: 'incomplete', paymentIssue: 'payment_failed', pendingUpgrade: { toSku: 'premium_monthly_v3', expiresAt: '2026-10-20T00:00:00Z', hostedInvoiceUrl: 'https://invoice.example.test/p' } }); break;
     case 'paused-standard': case 'paused-premium': s.fairUse.status = 'paused'; break;
     case 'files_on_aws': Object.assign(s.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); break;
     case 'needs_ezil_id': Object.assign(s.ai, { enrollment: 'needs_ezil_id', waiting: { credits: 100 }, balance: null, balanceMicro: null, state: 'unavailable' }); s.actions.ezilId = EZIL_ID; break;
@@ -94,7 +95,7 @@ const usageDto = (remaining = 36000, allowance = 144000) => ({ enabled: true, ve
     period: { unit: 'standard_seconds', allowanceStandardSeconds: allowance, remainingStandardSeconds: remaining, usedStandardSeconds: allowance - remaining,
         currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: Math.floor(remaining / 3600), equivalents: [] } });
 const STATES = {
-    free: 'Upgrade to Standard', standard: 'Upgrade to Premium', premium: null, 'premium-low': 'Add AI credits',
+    free: 'Upgrade to Standard', standard: 'Upgrade to Premium', premium: null, 'premium-low': 'Add AI credits', 'premium-exhausted': 'Add AI credits',
     grace: 'Update payment method', past_due: 'Update payment method', cancels: 'Resume plan', upgrade_pending: 'Finish payment', incomplete: 'Finish payment',
     'paused-standard': 'Upgrade to Premium', 'paused-premium': null, files_on_aws: 'Upgrade to Standard', needs_ezil_id: 'Upgrade to Standard', activating: 'Upgrade to Standard',
 };
@@ -110,6 +111,34 @@ await check('Billing: at most ONE primary button in every page state, and it is 
             if ( header ) assert.ok(! header.classList.contains('ezil-settings-btn-primary'), `${name}: Manage payment is secondary`);
         }
     }
+});
+await check('Billing: sections in the D6 order — header, banner, plan, usage, plans, top-up, invoices, footer', () => {
+    const roles = ['.ezil-billing-header', '[data-role="payment-banner"]', '[data-role="plan-card"]', '[data-role="billing-usage"]', '[data-role="plans"]', '[data-role="ai-topup"]', '[data-role="invoices"]', '.ezil-billing-v3-footer'];
+    const s = billingState('past_due');
+    const el = fragment(summaryV3Html(s, usageDto()));
+    const nodes = roles.map(sel => el.querySelector(sel));
+    nodes.forEach((node, i) => assert.ok(node, `${roles[i]} rendered`));
+    for ( let i = 1; i < nodes.length; i++ ) {
+        assert.ok(nodes[i - 1].compareDocumentPosition(nodes[i]) & window.Node.DOCUMENT_POSITION_FOLLOWING, `${roles[i - 1]} comes before ${roles[i]}`);
+    }
+});
+await check('Billing: an incomplete subscription asks to finish payment, not to update a card for a plan that never started', () => {
+    const el = fragment(summaryV3Html(billingState('incomplete')));
+    assert.ok(el.querySelector('[data-role="upgrade-pending"]'), 'the incomplete banner');
+    assert.equal(el.querySelector('[data-role="payment-banner"]'), null);
+    assert.doesNotMatch(clean(el), /Update your payment method to keep/);
+});
+await check('Billing: the Computer time row warns at the server\'s "near" state', () => {
+    const s = billingState('standard'); s.fairUse.status = 'near';
+    const row = fragment(summaryV3Html(s, usageDto())).querySelector('[data-role="meter-time"]');
+    assert.ok(row.classList.contains('is-warn'), row.className);
+    s.fairUse.status = 'ok';
+    assert.ok(fragment(summaryV3Html(s, usageDto())).querySelector('[data-role="meter-time"]').classList.contains('is-ok'));
+});
+await check('Billing: the time row says it is checking while usage loads, never "Not measured yet"', () => {
+    const row = clean(fragment(summaryV3Html(billingState('standard'), null)).querySelector('[data-role="meter-time"]'));
+    assert.doesNotMatch(row, /Not measured yet/);
+    assert.match(row, /Checking…/);
 });
 await check('Billing: the operator AI internals card is gone from every state', () => {
     for ( const name of Object.keys(STATES) ) {
@@ -143,23 +172,31 @@ await check('Billing: every meter means "left" (time, AI credits, storage)', () 
     const meter = role => el.querySelector(`[data-role="${role}"] [role="meter"]`);
     assert.equal(meter('meter-time')?.getAttribute('aria-valuenow'), '25', 'time bar is the share LEFT');
     assert.equal(meter('meter-ai')?.getAttribute('aria-valuenow'), '81', 'AI bar is the share of the plan grant LEFT');
-    assert.equal(meter('meter-storage')?.getAttribute('aria-valuenow'), '76', 'storage bar is the disk LEFT');
+    assert.equal(meter('meter-storage')?.getAttribute('aria-valuenow'), '77', 'storage bar is the disk LEFT (50 GiB disk, 12e9 bytes used)');
     for ( const bar of el.querySelectorAll('[role="meter"]') ) {
         assert.match(bar.getAttribute('aria-label') ?? '', /left/i, 'each bar is labelled as what is left');
         assert.equal(bar.getAttribute('aria-valuemin'), '0'); assert.equal(bar.getAttribute('aria-valuemax'), '100');
     }
     assert.match(clean(el.querySelector('[data-role="meter-time"]')), /10 h left/);
     assert.match(clean(el.querySelector('[data-role="meter-ai"]')), /812 of 1,000 left/);
-    assert.match(clean(el.querySelector('[data-role="meter-storage"]')), /38 GB left/);
+    assert.match(clean(el.querySelector('[data-role="meter-storage"]')), /38\.8 GB left/);
+    assert.match(clean(el.querySelector('[data-role="meter-storage"]')), /11\.2 GB used of your 50 GB disk/);
     assert.doesNotMatch(summaryV3Html(s, usageDto()), /progressbar/i, 'Billing never renders progressbar (ui-copy.qa)');
 });
-await check('Billing: a balance above the plan grant fills the bar and splits "from your plan + extra"', () => {
-    const s = billingState('free'); s.ai.balance = 1264; s.ai.included = null;
+await check('Billing: a balance above the plan grant fills the bar and splits "from your plan + extra" from the server breakdown', () => {
+    // ADV-1: 20 starter credits left of the 100 granted, 500 purchased. The plan part is 20, never 100.
+    const s = billingState('free'); Object.assign(s.ai, { balance: 520, included: null, starter: { remaining: 20 }, purchased: { remaining: 500, expiresAt: '2027-04-01T00:00:00Z' } });
     const row = fragment(summaryV3Html(s)).querySelector('[data-role="meter-ai"]');
     assert.equal(row.querySelector('[role="meter"]')?.getAttribute('aria-valuenow'), '100');
-    assert.match(clean(row), /1,264 left/);
-    assert.match(clean(row), /100 from your plan \+ 1,164 extra/);
-    assert.doesNotMatch(clean(row), /1,264 of 100/);
+    assert.match(clean(row), /520 left/);
+    assert.match(clean(row), /20 from your plan \+ 500 extra/);
+    assert.doesNotMatch(clean(row), /100 from your plan|420 extra|520 of 100/);
+    // No breakdown: the total only, never an invented split.
+    const t = billingState('free'); Object.assign(t.ai, { balance: 1264, included: null });
+    const plain = fragment(summaryV3Html(t)).querySelector('[data-role="meter-ai"]');
+    assert.equal(plain.querySelector('[role="meter"]')?.getAttribute('aria-valuenow'), '100');
+    assert.match(clean(plain), /1,264 left/);
+    assert.doesNotMatch(clean(plain), /from your plan|extra|1,264 of 100/);
 });
 await check('Billing: needs_ezil_id shows waiting credits, the EZiL ID link and no top-up; activating says so', () => {
     const el = fragment(summaryV3Html(billingState('needs_ezil_id')));
@@ -244,12 +281,12 @@ await check('Usage: the computer-time bar is the share LEFT', () => {
     const el = fragment(usageHtml(uSample, uSummary()));
     assert.equal(el.querySelector('[data-usage="compute"] [role="progressbar"]')?.getAttribute('aria-valuenow'), '40');
 });
-await check('Usage: whole-number credits; a balance above the grant is "from your plan + extra", never "x of 100"', () => {
+await check('Usage: whole-number credits; a balance above the grant is "N left" with a full bar, never "x of 100"', () => {
     const s = billingState('free'); s.ai.balance = 1041.67; s.ai.balanceMicro = '1041670000'; s.ai.included = null;
     const row = fragment(usageHtml(uSample, s)).querySelector('[data-usage="ai"]');
     assert.doesNotMatch(clean(row), /1,041\.67|\d\.\d|1,041 of 100/);
     assert.match(clean(row), /1,041 left/);
-    assert.match(clean(row), /100 from your plan \+ 941 extra/);
+    assert.doesNotMatch(clean(row), /941 extra/, 'no invented split without a breakdown');
     assert.equal(row.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow'), '100');
 });
 await check('Usage: low credits come from the server state only', () => {
@@ -274,11 +311,38 @@ await check('Usage: storage is the real disk, never "the same on every configura
     assert.match(text, /50 GB disk/);
     assert.doesNotMatch(text, /same on every configuration|2 GB/);
 });
+await check('Usage: the same split rule as Billing — from the server breakdown, never balance minus grant', () => {
+    const s = billingState('free'); Object.assign(s.ai, { balance: 520, balanceMicro: null, included: null, starter: { remaining: 20 }, purchased: { remaining: 500, expiresAt: '2027-04-01T00:00:00Z' } });
+    const row = clean(fragment(usageHtml(uSample, s)).querySelector('[data-usage="ai"]'));
+    assert.match(row, /520 left/);
+    assert.match(row, /20 from your plan \+ 500 extra/);
+    assert.doesNotMatch(row, /100 from your plan|420 extra/);
+});
+await check('Usage: needs_ezil_id draws no AI bar (nothing to measure yet)', () => {
+    const s = billingState('needs_ezil_id'); s.ai.grant = { amount: 100, per: 'once' }; s.ai.balance = 0;
+    const row = fragment(usageHtml(uSample, s)).querySelector('[data-usage="ai"]');
+    assert.equal(row.querySelector('[role="progressbar"]'), null);
+    assert.match(clean(row), /100 credits waiting/);
+});
 await check('Usage: no banned copy', () => {
     for ( const name of ['free', 'standard', 'premium', 'needs_ezil_id'] ) {
         const text = clean(fragment(usageHtml(uSample, billingState(name))));
         assert.deepEqual(scanCopy(text), [], name); assert.doesNotMatch(text, honestyBans, name);
     }
+});
+
+await check('Billing and Usage: storage is measured in the disk\'s own GiB, so a 50 GB disk with 50e9 bytes used is not full', () => {
+    // ADV-2: the server's cap is provisionedGiB × 2^30.
+    const s = billingState('standard'); s.computer.disk = { provisionedGiB: 50, usedBytes: '50000000000', growsOnSwitch: false };
+    const row = clean(fragment(summaryV3Html(s)).querySelector('[data-role="meter-storage"]'));
+    assert.match(row, /3\.4 GB left/);
+    assert.match(row, /46\.6 GB used of your 50 GB disk/);
+    assert.doesNotMatch(row, /^Storage 0 GB left|Full/);
+    const u = fragment(usageHtml({ ...uSample, storage: { state: 'unavailable', capBytes: '53687091200', samples: [], disk: { provisionedGiB: 50, usedBytes: '50000000000' } } }, uSummary()));
+    const section = u.querySelector('[data-usage="storage"]');
+    assert.notEqual(section.dataset.state, 'danger');
+    assert.doesNotMatch(clean(section), /0 bytes left|Full/);
+    assert.match(clean(section), /3\.4 GB left/);
 });
 
 // ── Computer: source module with its imports stubbed (computers-test Part A) ──
@@ -327,6 +391,9 @@ await check('Computer: tiles sell — title, one benefit line, the weight note, 
     assert.equal(premium.querySelectorAll('[data-role="config-current"]').length, 1);
     const free = render({ data: plan('free'), prog: null, streaming: true });
     assert.match(clean(tile(free, 'std-2')), /Included in Standard/);
+    assert.ok(clean(tile(free, 'free-cf').querySelector('[data-role="config-benefit"]') ?? { textContent: '' }).length > 10, 'free-cf has a benefit line');
+    // Free has no disk of its own: the intro never promises one.
+    assert.doesNotMatch(clean(free.querySelector('[data-role="config-grid"]')?.parentElement ?? free), /stay on your disk/);
 });
 await check('Computer: the header names the computer, where it runs, its configuration and its real disk', () => {
     const el = render({ data: plan('premium'), prog: running('m6i.xlarge') });
@@ -433,10 +500,15 @@ await check('Confirm: a dark sheet-frame dialog with an accent primary; Esc and 
         onConfirm: () => new Promise(resolve => { release = resolve; }) });
     dialog = window.document.querySelector('[data-sheet="confirm-switch"]');
     const primary = dialog.querySelector('[data-action="confirm"]');
+    assert.equal(window.document.activeElement?.dataset.action, 'cancel', 'initial focus is the safe choice, not the restart');
     primary.click();
     assert.equal(primary.disabled, true);
     assert.equal(primary.textContent, 'Starting switch…');
     primary.click();
+    window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    assert.ok(window.document.querySelector('[data-sheet="confirm-switch"]'), 'Esc does not dismiss while the request is in flight');
+    dialog.querySelector('[data-action="close-sheet"]').click();
+    assert.ok(window.document.querySelector('[data-sheet="confirm-switch"]'), '× does not dismiss while the request is in flight');
     release();
     assert.equal(await accepted, true);
     assert.equal(window.document.querySelector('[role="dialog"]'), null);
@@ -446,6 +518,11 @@ await check('Confirm: the sheet styles use tokens only (accent primary, dark sur
     assert.match(css, /\.ezil-confirm-sheet\s*\{/);
     const rule = css.match(/\.ezil-confirm-sheet\s*\{([^}]*)\}/)[1];
     assert.doesNotMatch(rule, /#[0-9a-f]{3,6}\b/i);
+    // The secondary (Cancel) overrides the sheet's accent button fill; only the primary is accent.
+    const secondary = css.match(/\.ezil-confirm-actions \.ezil-settings-btn\s*\{([^}]*)\}/)?.[1] ?? '';
+    assert.match(secondary, /background:\s*(transparent|var\(--surface)/, 'Cancel has a non-accent background');
+    assert.doesNotMatch(secondary, /var\(--accent\)/);
+    assert.match(secondary, /min-height:\s*44px/, '44 px hit target on every pointer');
 });
 
 // ── Troubleshoot, System, Feedback ──────────────────────────────────────────
@@ -462,6 +539,12 @@ await check('Troubleshoot: the Restart copy is one sentence, identical in both p
     }
     assert.doesNotMatch(src, /About 20 seconds/);
     assert.deepEqual(scanCopy(RESTART), []);
+});
+await check('Troubleshoot: both Restart confirmations are the sheet frame, never the legacy UIAlert', () => {
+    const src = read('tabs/troubleshoot.js');
+    assert.ok(! /UIAlert/.test(src), 'no UIAlert in troubleshoot.js');
+    assert.ok(/openConfirmSheet\(\{[^}]*sheet: 'confirm-restart'/.test(src), 'Restart desktop confirms through openConfirmSheet');
+    assert.ok(/openConfirmSheet\(\{[^}]*sheet: 'confirm-restart-computer'/.test(src), 'Restart computer confirms through openConfirmSheet');
 });
 globalThis.__dSystemSession = { currentComputer: () => me, payload: () => null, getScreen: async () => ({ ok: false }), getSystemInfo: async () => ({ ok: false, code: 'UPSTREAM' }) };
 const systemSrc = read('tabs/system.js')
@@ -491,6 +574,7 @@ await check('System: Running on and Configuration stay; identifiers, slot, image
         const row = pane.querySelector(`[data-role="${role}"]`);
         assert.ok(row && ! details.contains(row), `${role} stays visible`);
     }
+    assert.deepEqual(scanCopy(clean(pane)), [], 'System pane copy');
     system.onDeactivate();
     host.remove();
 });

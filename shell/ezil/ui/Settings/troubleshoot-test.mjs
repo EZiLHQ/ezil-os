@@ -11,6 +11,7 @@ const moduleUrl = src => `data:text/javascript;base64,${Buffer.from(src).toStrin
 const src = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'utf8')
     .replace("import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../native-runtime.js';", 'const isNative = () => false, selectRuntimeAdapter = () => null, sanitizeNativeEvents = () => [];')
     .replace("import UIAlert from '../../../../src/UI/UIAlert.js';", "const UIAlert = async () => 'confirm';")
+    .replace("import { openConfirmSheet } from '../sheet-frame.js';", 'const openConfirmSheet = async () => false;')
     .replace("import log from '../../../log.js';", 'const log = { ringBuffer: () => [] };')
     .replace("import session from '../../../session.js';", 'const session = { restartEndpoint: () => null, currentComputer: () => null };')
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }) };')

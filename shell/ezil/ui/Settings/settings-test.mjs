@@ -118,6 +118,8 @@ window.fetch = async (url, opts = {}) => {
     }
     if ( u === '/api/shell/stop' || u.endsWith('/api/shell/stop') ) {
         rec.body = JSON.parse(opts.body ?? '{}');
+        // D6: the chip flips to Stopping… the moment the user confirms — before the server answers.
+        rec.chipAtCall = window.document.querySelector('.window[data-app="settings"] [data-role="computer-chip"]')?.textContent.trim();
         progressState = 'STOPPED';
         return json({ ok: true });
     }
@@ -484,8 +486,12 @@ const restartEvents = [];
 window.addEventListener('ezil:desktop-restarted', e => restartEvents.push(e.detail));
 click(restartBtn);
 await settle(2);
-const restartConfirmBtn = Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart');
-push('restarting asks for confirmation first', !! restartConfirmBtn);
+// Round 5 (D6): the confirmation is the sheet frame (openConfirmSheet), not the legacy UIAlert.
+const restartSheet = q('[role="dialog"][data-sheet="confirm-restart"]');
+const restartConfirmBtn = restartSheet?.querySelector('[data-action="confirm"]');
+push('restarting asks for confirmation first, in the sheet frame',
+    !! restartConfirmBtn && restartConfirmBtn.textContent.trim() === 'Restart' && !! restartSheet.closest('.ezil-upgrade-backdrop')
+    && q('.window-alert-message') === null, restartSheet?.textContent);
 click(restartConfirmBtn);
 await settle(6);
 push('🔴 a failed restart is reported as failed, never as a claimed success',
@@ -506,7 +512,7 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
     };
     click(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]'));
     await settle(2);
-    click(Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart'));
+    click(q('[role="dialog"][data-sheet="confirm-restart"] [data-action="confirm"]'));
     await settle(6);
     push('a pending AWS restart shows Restarting and sends no completion event',
         restartRequests === 1 && restartEvents.length === 0
@@ -549,10 +555,14 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
     const restartComputer = async () => {
         click(ts()?.querySelector('[data-action="restart-computer"]'));
         await settle(2);
-        click(Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart computer' && b.closest('.window')?.querySelector('.window-alert-message')));
+        const sheet = q('[role="dialog"][data-sheet="confirm-restart-computer"]');
+        restartSheets.push(!! sheet && q('.window-alert-message') === null && sheet.querySelector('[data-action="confirm"]')?.textContent.trim() === 'Restart computer');
+        click(sheet?.querySelector('[data-action="confirm"]'));
         await settle(6);
     };
+    const restartSheets = [];
     await restartComputer();
+    push('Restart computer confirms in the sheet frame (not the legacy alert)', restartSheets.length === 1 && restartSheets[0]);
     push('Restart computer confirms, then POSTs scope "computer" with a request id',
         bodies.length === 1 && bodies[0].scope === 'computer' && /^[A-Za-z0-9_-]{8,64}$/.test(bodies[0].requestId ?? '') && !! bodies[0].computerId,
         JSON.stringify(bodies));
@@ -841,6 +851,7 @@ click(stopConfirm);
 await settle(30, 40);
 const stopCall = calls.find(c => c.url.endsWith('/api/shell/stop'));
 push('POST /api/shell/stop went out for c-d', stopCall?.method === 'POST' && stopCall?.body?.computerId === 'c-d', JSON.stringify(stopCall?.body));
+push('🔴 the chip read "Stopping…" while the stop request was in flight', stopCall?.chipAtCall === 'Stopping…', stopCall?.chipAtCall);
 push('🔴 THE GUARANTEE: desktop, preview AND code were closed BEFORE the stop request',
     stopCall?.domAtCall.desktopWindows === 0 && stopCall?.domAtCall.previewWindows === 0 && stopCall?.domAtCall.codeWindows === 0,
     `desktop=${stopCall?.domAtCall.desktopWindows} preview=${stopCall?.domAtCall.previewWindows} code=${stopCall?.domAtCall.codeWindows}`);
