@@ -353,13 +353,23 @@ describe('paid sessions have no time cap', () => {
         expect(f.stop).not.toHaveBeenCalled();
         expect(f.isStillRunning).not.toHaveBeenCalled();
     });
-    it('stops a paid session with a subscription payment issue before fair use', async () => {
+    // Round 4 (D17): a fresh subscription payment issue opens a 7-day grace, so the paid session keeps running.
+    it('keeps a paid session running during the payment grace', async () => {
         const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
         f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in', userId: ref.userId, subscriptionId: 'sub',
             invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: T, updatedAt: T, resolvedAt: null }]);
         await f.run(10);
-        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
-        expect(f.epochs[0].endedAt).toBe(iso(10));
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0].endedAt).toBeNull();
+    });
+    it('cuts a paid session to the Free limits once the payment grace has ended', async () => {
+        const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
+        const eightDaysAgo = new Date(T.getTime() - 8 * 86_400_000);
+        f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in', userId: ref.userId, subscriptionId: 'sub',
+            invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: eightDaysAgo, updatedAt: eightDaysAgo, resolvedAt: null }]);
+        await f.run(3601);
+        expect(f.stop).toHaveBeenCalledTimes(1);
+        expect(f.epochs[0].endedAt).not.toBeNull();
     });
     it('runs reconciliation after existing migration work with the original launch budget', async () => {
         const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');

@@ -744,8 +744,8 @@ export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
         body: "You've reached fair use for now. Your files are kept. Settings → Billing shows when it resets.",
     },
     files_on_aws: {
-        title: 'Your files are still on your AWS (India) computer.',
-        body: 'Open it on the Free plan with Free limits, or upgrade to restore full use.',
+        title: 'Your files are on a bigger AWS (India) computer.',
+        body: "That size can't open on the Free plan. Your files are kept. Upgrade to open it again.",
     },
     unknown: {
         title: 'Something went wrong',

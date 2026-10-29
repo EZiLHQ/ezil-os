@@ -45,7 +45,7 @@ describe.each([['app', app], ['shell', shell]] as const)('%s billing refusal cop
         ['billing_fair_use_paused', 'fair_use_paused', 'Computer time is paused', 'Your files are kept.'],
         ['billing_allowance_exhausted', 'fair_use_paused', 'Computer time is paused', 'Your files are kept.'],
         ['billing_overage_cap_reached', 'fair_use_paused', 'Computer time is paused', 'Your files are kept.'],
-        ['billing_files_on_aws', 'files_on_aws', 'Your files are still on your AWS (India) computer.', 'Open it on the Free plan with Free limits, or upgrade to restore full use.'],
+        ['billing_files_on_aws', 'files_on_aws', 'Your files are on a bigger AWS (India) computer.', "That size can't open on the Free plan. Your files are kept. Upgrade to open it again."],
         ['billing_user_hours_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your files are kept.'],
         ['billing_aws_monthly_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your files are kept.'],
         ['billing_concurrent_limit', 'unknown', 'Something went wrong', "We couldn't start your computer."],

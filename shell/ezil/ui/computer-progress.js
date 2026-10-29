@@ -285,7 +285,7 @@ export function OpeningSurface ({ appName = '', icon, onRetry, feedbackCode, sta
     el_retry.addEventListener('click', e => { swallow(e); if (typeof onRetry === 'function') onRetry(); });
     el_feedback.addEventListener('click', e => {
         swallow(e);
-        // L3's dialog. LEAD: it ignores `errorCode` until it accepts a prefill.
+        // L3's dialog; it prefills the error code (round 4).
         void import('./feedback/feedback.js').then(m => m.open_feedback_dialog?.({ source: 'opening', errorCode: feedbackCode?.() }))
             .catch(() => {});
     });
