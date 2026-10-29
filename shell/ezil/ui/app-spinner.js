@@ -1,18 +1,34 @@
-// EZiL app loading surface. Physical app readiness remains owned by the caller.
-// Hosted computers also show protected, read-only computer.progress observations.
-// Paused/operator/queued states override recorded migration intent; none animate.
-// The separate observer owns polling, never allocation; this file owns no clock:
-// the elapsed time and bar advance only when the caller paints.
-// Without an authoritative observation, do not infer a transfer from launch flags.
-// Native/local callers retain the original BootUiState and retry behavior.
-// Round 3: renders through the one opening surface (`OpeningSurface`).
+// EZiL app opening surface (round 5, decision D5). Physical app readiness stays owned by the caller.
+//
+// ONE calm surface while an app opens: the app icon, an "Opening {App}" title, ONE bar, ONE status
+// line (the loading-stage sentence `computer-progress.js` `progressView` produced) and a muted
+// elapsed/expected line. Nothing else unless the server says something needs the user (a hold,
+// needs_operator, the ten-minute budget) or the open failed. No step list, no ticks, no ring, no
+// reassurance/bytes/"Estimated" lines and never a dev paragraph: dev details live only in a
+// closed <details>, and only when `features.devDetails` is boolean true.
+//
+// THE BAR (one source of truth per open):
+//   fill = max(previous, 0.88·(1 − e^(−2.2·t/T)), stage floor)
+//   t  = seconds since THIS client first saw this open (kept across re-opens, null polls and a
+//        changed server timestamp: the live 1:25 → 0:01 reset cannot happen)
+//   T  = the observation's expected seconds; without an observation there is no basis for a
+//        position and the bar is an indeterminate sweep until a real signal arrives
+//   floors: getting your computer 0.05, attaching 0.35, starting 0.60, opening the app 0.85
+//   a measured transfer shows its real percent (cap 99); 100 only on the real ready signal.
+//
+// This file owns no clock: it reads `Date.now()` when the caller paints (the 250 ms tick) and when
+// the shared observer reports. `computerProgress()`/`hasComputerProgress()` always return the LIVE
+// observation, so every wait/fail verdict the callers take is unchanged; only the display holds
+// the last observation of this open through a gap.
 
 import {
     BOOT_FAILURE_COPY,
     BOOT_NOT_CONFIGURED_COPY,
+    LONG_BOOT_MS,
+    TYPICAL_BOOT_MS,
 } from '../boot-phases.js';
 
-import { observeComputerProgress, OpeningSurface, OPENING_COPY, OPENING_MILESTONES, formatElapsed, openingAt, prefersReducedMotion } from './computer-progress.js';
+import { observeComputerProgress, OPENING_COPY, OPENING_MILESTONES, formatElapsed, prefersReducedMotion } from './computer-progress.js';
 import { isNative } from '../native-runtime.js';
 
 import { LAUNCH_COPY } from '../launch-copy.js';
@@ -23,53 +39,190 @@ const MIGRATION_COPY = {
     body: 'This first start takes a few minutes. Your files come with you.',
 };
 
+/** Copy owned by this surface. */
+export const OPEN_COPY = {
+    long: 'Taking longer than usual',
+    stillStarting: 'Your computer is still starting',
+    retry: 'Try again',
+    viewStatus: 'View computer status',
+    details: 'Details',
+};
+
+const CURVE_MAX = 0.88;
+const CURVE_RATE = 2.2;
+/** Stage floors by server milestone index (requested … desktop_ready, then the client's url_received). */
+const OPENING_FLOOR = [0.05, 0.05, 0.35, 0.6, 0.85, 0.85];
+/** Migration steps: saving, getting the AWS computer, moving (the real percent governs), starting. */
+const MIGRATION_FLOOR = [0.05, 0.05, 0.05, 0.6];
+/** `progressView` maps a measured transfer into this segment of its own migration bar. */
+const TRANSFER_SEGMENT = [0.25, 0.85];
+const URL_RECEIVED = OPENING_MILESTONES.indexOf('url_received');
+const FIRST_FRAME = OPENING_MILESTONES.indexOf('first_frame');
+/** Server holds that are not failures: the server says wait; no bar. */
+const HOLDS = ['operations_paused', 'queued'];
+/** aria-valuenow is rewritten at most this often (and on a stage or state change). */
+const ARIA_EVERY_MS = 5000;
+/** The meta line appears after this long: a warm open finishes before it is ever read. */
+const META_AFTER_S = 3;
+
+/**
+ * The bar position, 0..1. Pure.
+ * @param {{t?: number, T?: number, floor?: number, prev?: number, real?: number|null, reducedMotion?: boolean}} input
+ */
+export function openingFill ({ t = 0, T = 240, floor = 0, prev = 0, real = null, reducedMotion = false } = {}) {
+    const curve = real === null && T > 0 ? CURVE_MAX * (1 - Math.exp(-CURVE_RATE * Math.max(0, t) / T)) : 0;
+    let value = Math.min(0.99, Math.max(curve, floor, real ?? 0));
+    if (reducedMotion) value = Math.floor(value * 20 + 1e-9) / 20;
+    return Math.max(prev, value);
+}
+
+const expectText = T => T < 60 ? 'usually under a minute' : `usually about ${Math.max(1, Math.round(T / 60))} min`;
+const ICON_URL = /^(?:data:image\/(?:svg\+xml|png|gif|webp|jpeg)[;,]|https:\/\/|\/(?!\/))/;
+const feedbackAvailable = () => typeof globalThis.window?.__EZIL_BOOT__?.desktopState?.endpoints?.feedback === 'string';
 /** "Opening Code…" → "Code". */
 const appNameOf = label => String(label ?? '').replace(/^Opening\s+/, '').replace(/…$/, '').trim();
 
+/** Settings → Computer, through the shell's own registry. */
+function viewComputerStatus () {
+    try {
+        const registry = globalThis.ezil?.registry;
+        const payload = globalThis.window?.__EZIL_BOOT__;
+        const ctx = { payload, computer: payload?.computer, desktopState: payload?.desktopState };
+        void Promise.resolve(registry?.launch?.('settings', { ...(registry.launchContext?.(ctx) ?? ctx), initialTab: 'computers' })).catch(() => {});
+    } catch { /* The surface never throws from a click. */ }
+}
+
 /**
- * Build the spinner once. Returns a controller the caller drives — same
- * `{ el, render }` shape as `BootProgress`, so either can sit in a window
- * body and be driven by the same `paint()` loop.
+ * Build the surface once. Returns a controller the caller drives with the same
+ * `{ el, render, stamp, dispose }` shape every app window already uses.
  *
  * @param {object} opts
- * @param {string} [opts.label] The status line while `state.kind === 'progress'`
- *   and no observation exists: "Opening Browser…", "Opening Code…".
- * @param {string} [opts.appName] Shown under the icon; defaults to the label's app.
+ * @param {string} [opts.computerId] Observe this computer's `computer.progress` (hosted only).
+ * @param {() => void} [opts.onProgressChange]
+ * @param {string} [opts.label] The title while opening: "Opening Browser…", "Opening Code…".
+ * @param {string} [opts.appName] Defaults to the label's app.
  * @param {string} [opts.icon] The app's icon (a data: or same-origin URL).
- * @param {() => void} [opts.onRetry] Called by the failure state's Retry button.
+ * @param {string} [opts.className] Extra root class (the desktop window keeps the `.ezil-boot` hooks).
+ * @param {() => void} [opts.onRetry] Called by Try again.
+ * @param {() => void} [opts.onViewStatus] Called by "View computer status" (default: Settings → Computer).
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
- * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific
- *   failure guidance. Changes wording only, never readiness or retry behavior.
+ * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific failure guidance.
  */
-export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, onRetry, failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
+export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, className, onRetry, onViewStatus,
+    failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
-    root.setAttribute('role', 'status');
-    root.setAttribute('aria-live', 'polite');
+    if (typeof className === 'string' && className) root.classList.add(...className.split(/\s+/).filter(Boolean));
+    root.dataset.state = 'opening';
+    root.innerHTML = `
+        <div class="ezil-opening ezil-app-spinner-panel">
+            <div class="ezil-opening-icon" aria-hidden="true"></div>
+            <h1 class="ezil-opening-title ezil-boot-title ezil-app-spinner-label"></h1>
+            <div class="ezil-opening-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="ezil-opening-fill"></div></div>
+            <p class="ezil-opening-status ezil-boot-sub ezil-app-spinner-sub" aria-live="polite" hidden></p>
+            <p class="ezil-opening-meta" aria-hidden="true" hidden></p>
+            <div class="ezil-boot-actions" hidden>
+                <button type="button" class="ezil-opening-action ezil-boot-retry" hidden></button>
+                <button type="button" class="ezil-opening-action ezil-opening-view-status" hidden></button>
+                <button type="button" class="ezil-opening-action is-secondary ezil-opening-feedback" hidden></button>
+            </div>
+            <details class="ezil-opening-details" hidden><summary></summary><p class="ezil-opening-details-text"></p></details>
+        </div>`;
+    const el = sel => root.querySelector(sel);
+    const el_icon = el('.ezil-opening-icon'), el_title = el('.ezil-opening-title'), el_bar = el('.ezil-opening-bar');
+    const el_fill = el('.ezil-opening-fill'), el_status = el('.ezil-opening-status'), el_meta = el('.ezil-opening-meta');
+    const el_actions = el('.ezil-boot-actions'), el_retry = el('.ezil-boot-retry'), el_view = el('.ezil-opening-view-status');
+    const el_feedback = el('.ezil-opening-feedback'), el_details = el('.ezil-opening-details'), el_details_text = el('.ezil-opening-details-text');
 
-    const name = appName ?? appNameOf(label);
+    const name = String(appName ?? appNameOf(label) ?? '').trim();
+    if (typeof icon === 'string' && ICON_URL.test(icon)) {
+        const img = document.createElement('img'); img.alt = ''; img.src = icon; el_icon.appendChild(img);
+    } else el_icon.textContent = (name || 'E').slice(0, 1).toUpperCase();
+    el_retry.textContent = OPEN_COPY.retry;
+    el_view.textContent = OPEN_COPY.viewStatus;
+    el_feedback.textContent = OPENING_COPY.feedback;
+    el('.ezil-opening-details summary').textContent = OPEN_COPY.details;
+
     let failureCode;
-    const surface = OpeningSurface({ appName: name, icon, onRetry, feedbackCode: () => failureCode,
-        statusClass: 'ezil-app-spinner-label', subClass: 'ezil-app-spinner-sub' });
-    surface.el.classList.add('ezil-app-spinner-panel');
-    root.appendChild(surface.el);
+    const swallow = e => { e.preventDefault(); e.stopPropagation(); };
+    el_retry.addEventListener('click', e => { swallow(e); if (typeof onRetry === 'function') onRetry(); });
+    el_view.addEventListener('click', e => { swallow(e); (typeof onViewStatus === 'function' ? onViewStatus : viewComputerStatus)(); });
+    el_feedback.addEventListener('click', e => {
+        swallow(e);
+        // L3's dialog; it prefills the RAW server code (round 4).
+        void import('./feedback/feedback.js').then(m => m.open_feedback_dialog?.({ source: 'opening', errorCode: failureCode }))
+            .catch(() => {});
+    });
 
     let observation = null, latestState = null, latestExtra = {}, progressChecked = false, client = 0;
+    /**
+     * This open, from the client's first sight of it to ready / failure. `t0` anchors the elapsed
+     * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display.
+     */
+    let open = null;
+    let aria = { at: -Infinity, key: null };
+
     // Rendered as `progress` = this window's open is in flight: a not-yet-recorded opening never reads "stopped".
     const observer = computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name,
         openRequested: () => latestState?.kind === 'progress', onChange: value => {
-        observation = value; progressChecked = true;
-        if (latestState) render(latestState, latestExtra);
-        onProgressChange?.();
-    } }) : null;
+            observation = value; progressChecked = true;
+            if (latestState) render(latestState, latestExtra);
+            onProgressChange?.();
+        } }) : null;
     root.dataset.progress = observer ? 'pending' : 'none';
-    surface.paint({ status: label, percent: null });
+    el_title.textContent = label;
+
+    /**
+     * Write the DOM. textContent only; nothing is rebuilt.
+     * @param {{state: string, title: string, status?: string, meta?: string, bar: null | 'indeterminate' | number,
+     *   retry?: boolean, view?: boolean, feedback?: boolean, details?: string|null}} m
+     */
+    function paint (m) {
+        const now = Date.now();
+        const changed = root.dataset.state !== m.state || el_status.textContent !== (m.status ?? '');
+        root.dataset.state = m.state;
+        root.dataset.reducedMotion = String(prefersReducedMotion());
+        el_title.textContent = m.title;
+        el_status.textContent = m.status ?? ''; el_status.hidden = !m.status;
+        el_meta.textContent = m.meta ?? ''; el_meta.hidden = !m.meta;
+        el_bar.hidden = m.bar === null;
+        el_bar.setAttribute('aria-label', m.title);
+        if (m.bar === 'indeterminate') {
+            el_bar.dataset.indeterminate = 'true'; delete el_bar.dataset.percent;
+            el_bar.removeAttribute('aria-valuenow'); el_bar.removeAttribute('aria-valuetext');
+            el_fill.style.width = '';
+        } else if (typeof m.bar === 'number') {
+            const percent = Math.max(0, Math.min(100, Math.round(m.bar * 100)));
+            delete el_bar.dataset.indeterminate;
+            el_bar.dataset.percent = String(percent);
+            // The fill follows every paint (the 250 ms tick); the CSS transition smooths it.
+            el_fill.style.width = `${percent}%`;
+            const key = `${m.state}|${m.status ?? ''}`;
+            if (changed || aria.key !== key || now - aria.at >= ARIA_EVERY_MS || percent === 100 || !el_bar.hasAttribute('aria-valuenow')) {
+                el_bar.setAttribute('aria-valuenow', String(percent));
+                el_bar.setAttribute('aria-valuetext', m.state === 'long' ? `${m.status || m.title}, ${OPEN_COPY.long.toLowerCase()}` : (m.status || m.title));
+                aria = { at: now, key };
+            }
+        }
+        el_retry.hidden = !m.retry;
+        el_view.hidden = !m.view;
+        el_feedback.hidden = !(m.feedback && feedbackAvailable());
+        el_actions.hidden = el_retry.hidden && el_view.hidden && el_feedback.hidden;
+        el_details_text.textContent = m.details ?? '';
+        el_details.hidden = !m.details;
+        if (!m.details) el_details.open = false;
+    }
+
+    const elapsedOf = () => open ? Math.max(0, (Date.now() - open.t0) / 1000) : 0;
+    const metaFor = (t, T, long) => long ? `${OPEN_COPY.long} · ${formatElapsed(t)}` : t >= META_AFTER_S ? `${formatElapsed(t)} · ${expectText(T)}` : '';
+    const reduced = () => prefersReducedMotion();
+    const frozen = () => open && open.high > 0 ? open.high : null;
 
     /**
      * @param {import('../boot-phases.js').BootUiState} state
-     * @param {{elapsedMs?: number}} [extra] The caller's own boot clock, for the
-     *   elapsed time when no server observation exists.
+     * @param {{elapsedMs?: number, reopening?: boolean}} [extra] `reopening`: the desktop window is
+     *   re-asking because the AWS observation said the computer is still opening.
      */
     function render (state, extra = {}) {
         latestState = state; latestExtra = extra ?? {};
@@ -86,54 +239,100 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             && (observation.elapsed >= 600 || state.observedBudgetSpent === true);
         root.setAttribute('data-kind', activeTimeout ? 'progress' : state.kind);
         root.classList.toggle('ezil-app-spinner-running-long', !!runningLong);
-        const showObservation = pending && observation && (state.kind === 'progress' || activeTimeout
-            || ['operations_paused', 'needs_operator', 'queued', 'failed_reopened'].includes(observation.stage));
+        const progressing = state.kind === 'progress' || activeTimeout;
+
+        // The open: started by the first progress paint after a concluded one, never by a re-open.
+        if (progressing && !runningLong && (!open || open.ended)) {
+            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false };
+            client = 0;
+        }
+        if (open && observation && progressing) { open.view = observation; open.T = observation.expected ?? open.T; }
+        const view = observation ?? (progressing && open && !open.ended ? open.view : null);
+        const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
+
+        const showObservation = pending && view && (progressing
+            || ['operations_paused', 'needs_operator', 'queued', 'failed_reopened'].includes(view.stage));
         if (showObservation) {
-            const at = openingAt(observation, Date.now(), { reducedMotion: prefersReducedMotion(), client });
-            const attention = observation.stage === 'needs_operator';
-            const retry = !!(runningLong || observation.stage === 'failed_reopened'
-                || (state.kind === 'failed' && attention && !observation.manualAttention));
-            const meta = !at ? '' : at.long && !runningLong ? `${OPENING_COPY.long} · ${at.elapsedText}` : at.elapsedText;
-            const dev = observation.updated ? `Last recorded update: ${observation.updated}` : '';
-            surface.paint({
-                status: observation.title,
-                body: runningLong ? OPENING_COPY.runningLong : [observation.body, observation.bytes, dev].filter(Boolean).join(' · '),
-                percent: at ? at.percent : observation.indeterminate ? 'indeterminate' : null, key: observation.openingKey, meta, long: at?.long,
-                retry, feedback: attention || retry,
+            const stage = view.stage;
+            const attention = stage === 'needs_operator';
+            const hold = HOLDS.includes(stage);
+            const reopened = stage === 'failed_reopened';
+            // The existing predicate: one action, never from a client clock alone.
+            const retry = !!(runningLong || reopened || (state.kind === 'failed' && attention && !view.manualAttention));
+            const viewStatus = !retry && ((attention && view.manualAttention) || stage === 'operations_paused');
+            if (runningLong || attention || hold || reopened) {
+                if (open) open.ended = runningLong || state.kind === 'failed' ? true : open.ended;
+                paint({
+                    state: reopened ? 'failed' : 'attention',
+                    title: runningLong ? label : view.title,
+                    status: runningLong ? OPENING_COPY.runningLong : view.body,
+                    bar: attention || runningLong ? frozen() : null,
+                    retry, view: viewStatus, feedback: attention || retry, details,
+                });
+                return;
+            }
+            const t = elapsedOf();
+            const T = view.expected ?? open?.T ?? 240;
+            const long = t >= T;
+            let bar = 'indeterminate';
+            if (view.bar || open?.high > 0 || client >= URL_RECEIVED) {
+                const opening = !view.bar || view.bar.floors.length === OPENING_MILESTONES.length;
+                const reached = Math.max(0, view.bar?.reached ?? 0);
+                const index = Math.max(reached, opening ? Math.min(client, URL_RECEIVED) : 0);
+                const floor = opening ? OPENING_FLOOR[Math.min(index, OPENING_FLOOR.length - 1)] : MIGRATION_FLOOR[Math.min(reached, MIGRATION_FLOOR.length - 1)];
+                const mf = view.bar?.migrationFraction;
+                const real = Number.isFinite(mf) ? (mf - TRANSFER_SEGMENT[0]) / (TRANSFER_SEGMENT[1] - TRANSFER_SEGMENT[0]) : null;
+                open.high = client >= FIRST_FRAME ? 1 : openingFill({ t, T, floor, prev: open.high, real, reducedMotion: reduced() });
+                bar = open.high;
+            }
+            const status = view.body || [view.title, view.bytes].filter(Boolean).join(' · ');
+            paint({ state: long ? 'long' : 'opening', title: label, status, meta: metaFor(t, T, long), bar, details });
+            return;
+        }
+
+        if ( progressing ) {
+            // Optional AWS/migration metadata must not replace physical app startup.
+            const copy = observer ? null : isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
+            const t = elapsedOf();
+            const long = t >= LONG_BOOT_MS / 1000;
+            // No observation: no basis for a position until a real signal (the desktop process is
+            // up, or the open answered with a URL). Then the stage floor, never a timer, sets it.
+            let bar = 'indeterminate';
+            const signal = client >= URL_RECEIVED ? OPENING_FLOOR[URL_RECEIVED] : state.confirmed === true ? OPENING_FLOOR[3] : 0;
+            if (client >= FIRST_FRAME) bar = open.high = 1;
+            else if (signal > 0 || open.high > 0) bar = open.high = Math.max(open.high, Math.min(0.99, signal));
+            paint({
+                state: long ? 'long' : 'opening',
+                title: copy ? copy.title : label,
+                status: copy ? copy.body : extra?.reopening ? OPEN_COPY.stillStarting : '',
+                meta: metaFor(t, TYPICAL_BOOT_MS / 1000, long), bar,
             });
             return;
         }
 
-        if ( state.kind === 'progress' ) {
-            // Optional AWS/migration metadata must not replace physical app startup.
-            const copy = observer ? null : isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
-            const elapsed = Number.isFinite(extra?.elapsedMs) ? extra.elapsedMs / 1000 : null;
-            surface.paint({ status: copy ? copy.title : label, body: copy ? copy.body : '', percent: 'indeterminate',
-                meta: elapsed === null ? '' : formatElapsed(elapsed) });
-            return;
-        }
-
         if ( state.kind === 'not_configured' ) {
-            // Nothing to retry: no provider is configured, so the next
-            // attempt fails identically. Same rule as `BootProgress`.
-            surface.paint({ status: BOOT_NOT_CONFIGURED_COPY.title, body: BOOT_NOT_CONFIGURED_COPY.body, percent: null });
+            // Nothing to retry: no provider is configured, so the next attempt fails identically.
+            if (open) open.ended = true;
+            paint({ state: 'attention', title: BOOT_NOT_CONFIGURED_COPY.title, status: BOOT_NOT_CONFIGURED_COPY.body, bar: null });
             return;
         }
 
         if ( state.kind === 'failed' ) {
+            if (open) open.ended = true;
             const copy = failureCopy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
-            surface.paint({ status: copy.title, body: copy.body, percent: null, retry: true, feedback: true });
+            paint({ state: 'failed', title: copy.title, status: copy.body, bar: null, retry: true, feedback: true });
             return;
         }
 
-        // 'ready' and 'ready_unverified' — the caller is about to swap the
-        // iframe in over this panel, or has already retired it. Nothing to
-        // draw: the unverified strip is `DisplayNotice`'s, and only the desktop
-        // window uses it.
+        // 'ready' and 'ready_unverified': the real ready signal. The bar completes and the surface
+        // fades; the caller reveals the frame under it (the last frame stays, so no white flash).
+        if (open) open.ended = true;
+        paint({ state: 'done', title: el_title.textContent || label, status: el_status.textContent, bar: 1 });
     }
 
-    /** The caller's client milestones: `url_received`, then `first_frame` (the bar's 100%); null starts a new attempt. */
+    /** The caller's client milestones: `url_received`, then `first_frame` (the bar's 100%); null marks a fresh attempt. */
     function stamp (key) {
+        // A fresh attempt inside the same open (a re-open) keeps the elapsed clock and the bar.
         if (key === null) { client = 0; return; }
         const i = OPENING_MILESTONES.indexOf(key);
         if (i > client) { client = i; if (latestState) render(latestState, latestExtra); }

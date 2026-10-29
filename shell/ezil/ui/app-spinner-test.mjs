@@ -264,11 +264,11 @@ try {
         const want = Math.round(100 * 0.88 * (1 - Math.exp(-2.2 * 72 / 240)));
         push('opening: at 72 s the bar is the time curve against T = 240 s', barOf(spinner) === want, `${barOf(spinner)} vs ${want}`);
         push('opening: muted "1:12 · usually about 4 min"', metaOf(spinner).textContent === '1:12 · usually about 4 min', metaOf(spinner).textContent);
-        now = 73_000; spinner.render({ kind: 'progress' });
+        now = 76_000; spinner.render({ kind: 'progress' });
         push('the bar advances on the caller\'s paint tick, not only on a poll', barOf(spinner) > want, String(barOf(spinner)));
         push('aria-valuenow is throttled (not rewritten every tick)', barEl(spinner).getAttribute('aria-valuenow') === String(want));
         payload = { ...opening, milestones: [{ key: 'requested', at: T0 }, { key: 'host_claimed', at: T0 }, { key: 'files_attached', at: T0 }, { key: 'desktop_starting', at: T0 }] };
-        now = 74_000; await poll();
+        now = 78_000; await poll();
         push('desktop_starting lifts the bar to the starting floor (60%)', barOf(spinner) >= 60 && statusOf(spinner).textContent === 'The desktop is starting. Browser opens next.', String(barOf(spinner)));
         spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
         push('url_received lifts it to the opening-app floor, not to 100', barOf(spinner) >= 85 && barOf(spinner) < 100);
