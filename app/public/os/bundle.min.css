@@ -1245,6 +1245,7 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-sys-details{margin-top:16px}
 .ezil-sys-details summary{min-height:32px;display:flex;align-items:center;cursor:pointer;font-weight:600;color:var(--text)}
 :root[data-theme=light] .ezil-settings-window{--bg:#f6f7f7;--surface:#ffffff;--surface-2:#f2f4f6;--border:rgba(0, 0, 0, 0.1);--text:#161616;--muted:#5f6666;--warn:#a86a00;--danger:#b42318}
+.ezil-settings-window a.ezil-settings-btn{display:inline-flex;align-items:center;text-decoration:none}
 .ezil-settings-usage{container-type:inline-size;min-width:0;padding-bottom:12px}
 .ezil-settings-usage .usage-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}
 .ezil-settings-usage .usage-heading h3{margin:0}

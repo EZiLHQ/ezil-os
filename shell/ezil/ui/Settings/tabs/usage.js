@@ -26,6 +26,8 @@ const bytes = value => {
     const divisor = value < 1000000000 ? 1000000 : 1000000000;
     return `${(value / divisor).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${divisor === 1000000 ? 'MB' : 'GB'}`;
 };
+// D6: a delayed reading keeps the last recorded runtime (never "0 s") and says it is still measuring.
+const measuringLine = elapsed => count(elapsed) && elapsed >= 60 ? `This session: ${duration(elapsed)} so far · Measuring this session…` : 'Measuring this session…';
 const row = (label, value) => `<div class="usage-row"><dt>${esc(label)}</dt><dd>${value}</dd></div>`;
 const duration = value => `<span${count(value) ? ` title="${esc(value)} seconds"` : ''}>${esc(seconds(value))}</span>`;
 const ratio = (value, cap) => count(value) && count(cap) && cap > 0 ? Math.min(100, value / cap * 100) : null;
@@ -135,7 +137,7 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         : freePlan || (storage && storage.capBytes === null) ? 'Your files are saved between sessions.' : '';
     const sessionLine = !['recording', 'stale', 'ended'].includes(current.state) ? 'No session recorded yet.'
         : current.state === 'ended' ? `Last session: ${duration(current.elapsedSeconds)} · ended ${timestamp(current.endedAt)}`
-        : current.state === 'stale' || stale ? 'Measuring this session…'
+        : current.state === 'stale' || stale ? measuringLine(current.elapsedSeconds)
         : `This session: ${duration(current.elapsedSeconds)} · running${validDate(summary?.computer?.activeDeadline) ? ` · ends ${timestamp(summary.computer.activeDeadline, true)}` : ''}`;
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
@@ -217,7 +219,7 @@ async function load(state, manual = false) {
     }
     status.removeAttr('role').removeClass('usage-warning').text(state.usage ? 'Refreshing…' : 'Loading usage…');
     body.attr('aria-busy', 'true');
-    if (state.usage?.session.state === 'recording') body.find('.usage-session-line').text('Measuring this session…');
+    if (state.usage?.session.state === 'recording') body.find('.usage-session-line').html(measuringLine(state.usage.session.elapsedSeconds));
     // billing.summary has side effects (Stripe renewal preview, Gateway balance read, free-credit enqueue):
     // read it on open, on manual Refresh, or when older than five minutes. The 30 s poll reads usage only.
     const summaryDue = manual || state.summaryAt === undefined || Date.now() - state.summaryAt > SUMMARY_MAX_AGE_MS;

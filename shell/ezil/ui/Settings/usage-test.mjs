@@ -355,7 +355,7 @@ try {
     assert.match(win.text(), /About 16 hours left at 2 vCPU/);
     assert.equal(win.find('details[data-usage-detail="session"]').get(0), details);
     assert.equal(document.activeElement, details.querySelector('summary'));
-    assert.match(win.find('.usage-session-line').text(), /Measuring this session…/);
+    assert.match(win.find('.usage-session-line').text(), /^This session: 1 h 30 min so far · Measuring this session…$/, 'the recorded runtime stays while it measures');
     s.resolve({ ok: true, data: summary }); await tick();
     assert.doesNotMatch(win.find('.usage-session-line').text(), /running/);
     u.resolve({ ok: true, data: sample }); await tick();

@@ -1044,3 +1044,5 @@
     --warn: #a86a00;
     --danger: #b42318;
 }
+/* A link styled as a button (Sign in with EZiL ID, Upgrade) reads as a button, not underlined text. */
+.ezil-settings-window a.ezil-settings-btn { display: inline-flex; align-items: center; text-decoration: none; }
