@@ -130,7 +130,7 @@ describe('computeBootUiState — never fabricates progress', () => {
                 elapsedMs: 0,
                 errorCode: 'desktop_unreachable',
             }),
-        ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
+        ).toEqual({ kind: 'failed', reason: 'desktop_unreachable', errorCode: 'desktop_unreachable' });
     });
 
     it('while pending, never marks a phase confirmed from elapsed time alone', () => {
@@ -180,25 +180,30 @@ describe('computeBootUiState — never fabricates progress', () => {
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'connection_refused' })).toEqual({
             kind: 'failed',
             reason: 'worker_unreachable',
+            errorCode: 'connection_refused',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'fetch_failed' })).toEqual({
             kind: 'failed',
             reason: 'worker_unreachable',
+            errorCode: 'fetch_failed',
         });
         expect(
             computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_runtime_blocked' }),
-        ).toEqual({ kind: 'failed', reason: 'sandbox_crashed' });
+        ).toEqual({ kind: 'failed', reason: 'sandbox_crashed', errorCode: 'sandbox_runtime_blocked' });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_start_failed' })).toEqual({
             kind: 'failed',
             reason: 'sandbox_crashed',
+            errorCode: 'sandbox_start_failed',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'timeout' })).toEqual({
             kind: 'failed',
             reason: 'timeout',
+            errorCode: 'timeout',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'worker_http_error' })).toEqual({
             kind: 'failed',
             reason: 'unknown',
+            errorCode: 'worker_http_error',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0 })).toEqual({
             kind: 'failed',
@@ -220,6 +225,7 @@ describe('computeBootUiState — never fabricates progress', () => {
             expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode })).toEqual({
                 kind: 'failed',
                 reason: 'unknown',
+                errorCode,
             });
         }
     });
@@ -235,8 +241,12 @@ describe('computeBootUiState — never fabricates progress', () => {
             'capacity_unavailable',
             'desktop_unreachable',
             'display_not_streaming',
+            'fair_use_paused',
+            'files_on_aws',
             'global_hours_cap',
             'operations_paused',
+            'payment_issue',
+            'plan_required',
             'sandbox_crashed',
             'timeout',
             'unknown',
@@ -418,6 +428,20 @@ describe('the port is a module-format conversion and nothing more', () => {
         'desktop_unreachable',
         'timeout',
         'unknown',
+        // Round 4: every billing refusal, the one retryable billing code and an unlisted one.
+        'billing_payment_issue',
+        'billing_no_plan',
+        'billing_size_not_allowed',
+        'billing_fair_use_paused',
+        'billing_files_on_aws',
+        'billing_concurrent_limit',
+        'billing_upgrade_pending',
+        'billing_allowance_exhausted',
+        'billing_overage_cap_reached',
+        'billing_user_hours_cap',
+        'billing_aws_monthly_cap',
+        'billing_unavailable',
+        'billing_some_future_reason' as never,
     ] as const;
     // The handoff observation. `undefined` is in the sweep on purpose: "nobody
     // looked" is a distinct input from "looked and saw nothing", and the two

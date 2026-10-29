@@ -405,15 +405,21 @@ export function refusalCopy (reason, target, data = summary, current = null) {
  * pending click). Pure, so the states are unit-tested without a DOM.
  */
 export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false }) {
-    const free = data?.plan?.sku === 'free_v3';
+    // Round 4 (STANDING-CONTRACT): the standing decides what opens; an unknown or missing one keeps the
+    // plan-only model. The plan block may still describe a past_due paid subscription after grace.
+    const standing = standingOf(data);
+    // D16: on Free, but the files are still on the AWS computer. It opens under Free limits; nothing has moved.
+    const held = standing === 'files_on_aws';
+    const dropped = held || standing === 'free';
+    const free = data?.plan?.sku === 'free_v3' || dropped;
     const t = transitionOf(prog);
     const flying = IN_FLIGHT.has(t?.phase) ? t : null;
     const lifecycle = typeof prog?.lifecycleState === 'string' ? prog.lifecycleState : null;
-    const running = free ? streaming : lifecycle === 'RUNNING';
-    const stopped = ! free && lifecycle === 'STOPPED';
+    const running = free && ! held ? streaming : lifecycle === 'RUNNING';
+    const stopped = (! free || held) && lifecycle === 'STOPPED';
     const hardware = sizeForInstanceType(prog?.hardware?.instanceType);
     const preference = data?.computer?.size ?? null;
-    const current = free ? 'free-cf' : flying?.current ?? hardware ?? preference;
+    const current = held ? flying?.current ?? hardware ?? 'std-2' : free ? 'free-cf' : flying?.current ?? hardware ?? preference;
     const choice = new Set((data?.computer?.machineChoice ?? []).map(m => m.size));
     const switching = pending ? { current: pending.current, target: pending.target, phase: 'requested', acknowledged: false }
         : flying && flying.kind !== 'restart' ? { current: flying.current, target: flying.target, phase: flying.phase, acknowledged: true } : null;
@@ -426,10 +432,11 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     else if ( prog?.operation === 'opening' ) chip = { state: 'starting', text: 'Starting…' };
     else if ( prog?.operation === 'stopping' ) chip = { state: 'stopping', text: 'Stopping…' };
     else if ( stopped ) chip = { state: 'stopped', text: 'Stopped' };
-    const sizes = free ? ['free-cf', ...AWS_SIZES] : AWS_SIZES;
+    // Held on AWS: no Cloudflare card (the files are not there) and every AWS configuration is locked.
+    const sizes = free && ! held ? ['free-cf', ...AWS_SIZES] : AWS_SIZES;
     const cards = data ? sizes.map(size => {
         const info = sizeInfo(size, data);
-        let state = size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
+        let state = held || (dropped && size !== 'free-cf') ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
         if ( switching && size === switching.target ) state = 'switching';
         else if ( nextStart === size ) state = 'next';
         return { size, vcpu: info.vcpu, memoryGiB: info.memoryGiB, weight: info.weight, state,
@@ -438,8 +445,90 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const disk = data?.computer?.disk ?? null;
     const done = ! switching && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
-    return { computer, data, free, provider: data ? free ? 'Cloudflare' : 'AWS · India' : null, chip, current, nextStart, switching,
+    const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
+    return { computer, data, free, standing, held, move,
+        provider: data ? held ? 'AWS (India) · files kept' : free ? 'Cloudflare' : 'AWS · India' : null, chip, current, nextStart, switching,
         running, stopped, cards, done, failed, disk, busy: !! (switching || flying || prog?.operation === 'opening' || prog?.operation === 'stopping') };
+}
+
+const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
+/** The server's standing for the computer (`billing.summary` v3 `computer.standing`), or null. */
+export function standingOf (data) {
+    const value = data?.computer?.standing;
+    return STANDINGS.has(value) ? value : null;
+}
+
+/** "27 Nov 2026" from an ISO instant (UTC), or null. Same format as Billing's `dateLabel(iso, true)`. */
+function dayLabel (iso) {
+    const time = Date.parse(iso ?? '');
+    return Number.isFinite(time) ? new Date(time).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) : null;
+}
+
+/** Round 4 copy. Billing (`billing.js`) carries the same function; billing-test pins the two equal. */
+export function standingCopy (standing, data) {
+    const plan = data?.plan ?? {};
+    if ( standing === 'grace' ) {
+        const by = dayLabel(plan.graceEndsAt);
+        return `Your payment didn't go through — update it${by ? ` by ${by}` : ''} to keep your ${data?.computer?.filesOn === 'cloudflare' ? 'plan' : 'AWS computer'}.`;
+    }
+    if ( standing === 'plan_ending' ) {
+        const on = dayLabel(plan.planEndsAt ?? plan.cancelsAt);
+        const name = plan.name || 'Your plan';
+        const ends = on ? `${name} ends on ${on}.` : `${name} ends at the end of this period.`;
+        return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
+            : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
+    }
+    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.';
+    return '';
+}
+
+const MOVE_STEPS = ['Saving your files', 'Copying your files to your Free computer', 'Checking your files', 'Starting your desktop'];
+const MOVE_STEP_OF = { requested: 0, fenced: 0, saving: 0, exporting: 1, copying: 1, exported: 2, restoring: 2, restored: 2, checking: 2, flipping: 3, starting: 3 };
+
+/** A reverse move (AWS → Cloudflare, Phase B) from server fields only: done, failed or a step index. */
+export function moveView (move) {
+    if ( ! move || move.direction !== 'to_cloudflare' ) return null;
+    const stage = String(move.stage ?? '');
+    if ( stage === 'committed' || stage === 'done' ) return { kind: 'done' };
+    if ( stage.startsWith('failed') ) return { kind: 'failed', code: /^[a-z0-9_:-]{1,64}$/i.test(String(move.reason ?? '')) ? move.reason : `move_${stage}` };
+    const index = MOVE_STEP_OF[stage] ?? 0;
+    const done = /^\d+$/.test(String(move.bytesDone ?? '')) ? Number(move.bytesDone) : null;
+    const total = /^\d+$/.test(String(move.bytesTotal ?? '')) ? Number(move.bytesTotal) : null;
+    const bytes = index === 1 && done !== null && total ? `${(done / 1e6).toLocaleString('en-US', { maximumFractionDigits: 0 })} MB of ${(total / 1e9).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB copied` : '';
+    const fraction = index === 1 && done !== null && total ? Math.min(1, done / total) : 0;
+    return { kind: 'progress', index, steps: MOVE_STEPS, bytes, percent: Math.round(Math.min(0.95, (index + fraction) / MOVE_STEPS.length) * 100) };
+}
+
+function moveHtml (model) {
+    const view = moveView(model.move);
+    if ( ! view ) return '';
+    if ( view.kind === 'done' ) {
+        return `<div class="ezil-computer-switch is-done" data-role="move-done" role="status"><p>Your files are on your Free computer.</p>
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop</button></div>`;
+    }
+    if ( view.kind === 'failed' ) {
+        return `<div class="ezil-computer-switch is-failed" data-role="move-failed" role="alert">
+            <p>We couldn't move your files. They're still on your AWS computer and nothing was deleted.</p><div class="ezil-settings-row-actions">
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="move-retry">Try again</button>
+            ${feedback_enabled() ? `<button type="button" class="ezil-settings-btn" data-action="move-feedback" data-code="${html_encode(view.code)}">Send feedback</button>` : ''}</div></div>`;
+    }
+    return `<div class="ezil-computer-switch" data-role="move-progress" role="status" aria-live="polite">
+        <p><strong>Moving your files to your Free computer</strong></p>
+        ${view.bytes ? `<p data-role="move-bytes">${html_encode(view.bytes)}</p>` : ''}
+        <div class="ezil-computer-bar" role="progressbar" aria-label="Move progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.percent}"><span style="width:${view.percent}%"></span></div>
+        <ol class="ezil-computer-steps">${view.steps.map((step, i) => `<li data-step="${i + 1}" data-state="${i < view.index ? 'done' : i === view.index ? 'active' : 'todo'}">${html_encode(step)}</li>`).join('')}</ol></div>`;
+}
+
+/** Round 4 standing banners (D16-D18): grace, plan ending, files held on AWS. */
+function standingHtml (model) {
+    const copy = standingCopy(model.standing, model.data);
+    if ( model.standing === 'grace' ) {
+        return `<div class="ezil-computer-switch is-failed" data-role="payment-grace" role="status"><p>${html_encode(copy)}</p>
+            <a class="ezil-settings-btn ezil-settings-btn-primary" data-action="fix-payment" href="/os?settings=billing">Fix payment</a></div>`;
+    }
+    if ( model.standing === 'plan_ending' ) return `<div class="ezil-computer-switch" data-role="plan-ending" role="status"><p>${html_encode(copy)}</p></div>`;
+    if ( model.held ) return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(copy)}</p></div>`;
+    return '';
 }
 
 /**
@@ -559,7 +648,7 @@ export function computerHtml (model, prog = progress, older = []) {
     const summaryLine = size ? [`${size.vcpu} vCPU`, `${size.memoryGiB} GB memory`, ...(Number.isFinite(disk) ? [`${disk} GB disk`] : [])].join(' · ') : '';
     const choices = (data?.computer?.machineChoice ?? []).map(m => m.vcpu);
     const premiumOnly = AWS_SIZES.filter(code => ! (data?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
-    const planLine = ! data ? '' : premiumOnly.length && ! model.free
+    const planLine = ! data ? '' : model.held ? 'Upgrade to restore full use.' : premiumOnly.length && ! model.free
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
@@ -574,6 +663,8 @@ export function computerHtml (model, prog = progress, older = []) {
             <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>
             ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
         ${statusHtml(model, prog)}
+        ${model.switching ? '' : moveHtml(model)}
+        ${standingHtml(model)}
         ${notice ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
         ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
             <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
@@ -1045,6 +1136,14 @@ function bind ($win, ctx) {
     });
     $list.on('click', '[data-action="switch-feedback"]', function () {
         if ( feedback_enabled() ) open_feedback_dialog({ source: 'settings-computer' });
+    });
+    // Phase B (dormant while computer.move is null): the move restarts on the next open (D20).
+    $list.on('click', '[data-action="move-retry"]', () => {
+        const computer = mainComputer();
+        if ( computer ) void switchTo(computer, ctx, $win);
+    });
+    $list.on('click', '[data-action="move-feedback"]', function () {
+        if ( feedback_enabled() ) open_feedback_dialog({ source: 'settings-computer', errorCode: this.dataset.code });
     });
 
     $list.on('click', '[data-action="switch"]', function () {

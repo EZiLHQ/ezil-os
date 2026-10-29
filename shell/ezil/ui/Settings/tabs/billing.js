@@ -52,7 +52,38 @@ function sizesLine (summary, codes, memory = true) {
     return `${cpus.slice(0, -1).join(', ')} or ${cpus.at(-1)} vCPU${memory ? ` · up to ${Math.max(...sizes.map(size => size.memoryGiB))} GiB` : ''}`;
 }
 
-function paymentHtml ({ plan, actions, version }) {
+const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
+/** Round 4: the server's standing (`computer.standing`, STANDING-CONTRACT), or null when not reported. */
+function standingOf (summary) {
+    const value = summary?.computer?.standing;
+    return STANDINGS.has(value) ? value : null;
+}
+
+/** Round 4 copy (D16-D18). Same function as `computers.js` `standingCopy`; billing-test pins the two equal. */
+export function standingCopy (standing, data) {
+    const plan = data?.plan ?? {};
+    const day = iso => Number.isFinite(Date.parse(iso ?? '')) ? dateLabel(iso, true) : null;
+    if ( standing === 'grace' ) {
+        const by = day(plan.graceEndsAt);
+        return `Your payment didn't go through — update it${by ? ` by ${by}` : ''} to keep your ${data?.computer?.filesOn === 'cloudflare' ? 'plan' : 'AWS computer'}.`;
+    }
+    if ( standing === 'plan_ending' ) {
+        const on = day(plan.planEndsAt ?? plan.cancelsAt);
+        const name = plan.name || 'Your plan';
+        const ends = on ? `${name} ends on ${on}.` : `${name} ends at the end of this period.`;
+        return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
+            : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
+    }
+    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.';
+    return '';
+}
+
+function paymentHtml (summary) {
+    const { plan, actions, version } = summary;
+    // Round 4 (D17): in grace the paid computer stays usable until the date; the banner says so.
+    if ( version === 3 && standingOf(summary) === 'grace' && plan.paymentIssue !== 'requires_action' ) {
+        return `<aside class="ezil-billing-card ezil-billing-payment is-danger" role="status" data-role="payment-grace">${paragraph(standingCopy('grace', summary))}${actions.portal ? actionHtml('portal', 'Fix payment') : ''}</aside>`;
+    }
     if ( ! plan.paymentIssue ) return '';
     const banners = {
         payment_failed: [`Your last payment didn't go through. Update your payment method to keep ${version === 3 ? plan.name : 'your plan'}.`, actions.portal ? actionHtml('portal', version === 3 ? 'Update payment' : 'Update payment method') : ''],
@@ -294,14 +325,16 @@ export function summaryV3Html (summary, usage = null) {
     const price = plan.sku === 'free_v3' ? '$0' : plan.renewal && ! ['cancels', 'past_due'].includes(plan.status)
         ? `${dollars(plan.renewal.amountCents, { compact: true })}/month · renews ${dateLabel(plan.renewal.at, true)}` : '';
     const choices = computer.machineChoice.length > 1;
+    const standing = standingOf(summary);
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div>
         <div class="ezil-billing-actions">${actions.portal ? actionHtml('portal', 'Manage payment') : ''}${actionHtml('invoices', 'Invoices')}</div></header>
         ${paymentHtml(summary)}
         <section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3" aria-label="Current plan">
             <div class="ezil-billing-plan-heading"><h4>${encode(plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(plan.status)}">${encode(status)}</span></div>
             ${price ? paragraph(price, 'ezil-billing-status') : ''}
-            ${plan.status === 'cancels' ? `<aside role="status" data-role="cancels-banner">${paragraph(`${plan.name} ends on ${dateLabel(plan.cancelsAt)}. Your files are kept.`)}</aside>` : ''}
-            ${plan.status === 'past_due' && ! plan.paymentIssue ? `<aside role="status" data-role="payment-banner">${encode(`Your last payment didn't go through. Update your payment method to keep ${plan.name}.`)}</aside>` : ''}
+            ${standing === 'plan_ending' ? `<aside role="status" data-role="plan-ending">${paragraph(standingCopy('plan_ending', summary))}</aside>`
+                : plan.status === 'cancels' ? `<aside role="status" data-role="cancels-banner">${paragraph(`${plan.name} ends on ${dateLabel(plan.cancelsAt)}. Your files are kept.`)}</aside>` : ''}
+            ${standing === 'files_on_aws' ? `<aside role="status" data-role="files-held">${paragraph(standingCopy('files_on_aws', summary))}</aside>` : ''}
             ${plan.scheduledChange ? paragraph(`Changes to ${offerFor(summary, plan.scheduledChange.toSku)?.name ?? 'Standard'} on ${dateLabel(plan.scheduledChange.effectiveAt)}.`) : ''}
             ${plan.pendingUpgrade ? paragraph(`Premium starts once payment is confirmed. This upgrade expires ${dateLabel(plan.pendingUpgrade.expiresAt)}.`) : ''}
             <div class="ezil-billing-actions" data-role="plan-actions">${planActionsV3(summary)}</div>
@@ -309,7 +342,8 @@ export function summaryV3Html (summary, usage = null) {
         <section class="ezil-billing-card" data-role="your-computer"><h4>Your computer</h4>
             ${paragraph(choices ? `Next start: ${computer.vcpu} vCPU · ${computer.memoryGiB} GB` : `${computer.vcpu} vCPU · ${computer.memoryGiB} GB`)}
             ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`)}
-            ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
+            ${standing === 'files_on_aws' ? paragraph('Your files are kept on your AWS (India) computer. It opens with Free limits.')
+                : plan.sku !== 'free_v3' && standing !== 'free' ? paragraph('Your own computer on AWS (India)') : ''}
             ${choices ? `<div class="ezil-billing-actions">${actionHtml('computer-tab', 'Change configuration')}</div>` : ''}
         </section>
         <div class="ezil-billing-v3-meters" data-role="billing-meters">${aiCreditsV3Html(summary)}<div data-role="time-slot">${timeV3Html(summary, usage)}</div>${storageV3Html(summary)}</div>

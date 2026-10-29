@@ -311,9 +311,16 @@ export function open_feedback_dialog (_opts) {
     if ( draft ) {
         description.value = draft.description;
         for ( const radio of form.elements.category ) radio.checked = radio.value === draft.category;
-    } else if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
+    }
+    if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
         // Opened from the opening screen's "Send feedback": name the error code so the report can be routed.
-        description.value = `Error code: ${_opts.errorCode}\n\n`;
+        // Round 4: also with a saved draft (appended once, within the 4,000-character limit).
+        const line = `Error code: ${_opts.errorCode}`;
+        const text = description.value;
+        if ( ! text.trim() ) description.value = `${line}\n\n`;
+        else if ( ! text.split('\n').some(row => row.trim() === line) && text.trimEnd().length + line.length + 2 <= 4000 ) {
+            description.value = `${text.trimEnd()}\n\n${line}`;
+        }
     }
 
     function save_draft () {

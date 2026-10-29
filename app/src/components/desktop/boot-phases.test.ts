@@ -88,10 +88,20 @@ function computeBootUiStateSource(file: string): string {
  * The change converts a false FAILURE into PROGRESS, which is strictly more
  * honest, and adds no path to `ready` that did not exist before.
  */
+/**
+ * ── HASH CHANGE OF 2026-10-29 (round 4), AND WHY IT WAS LEGITIMATE ─────────
+ * Previous: `boot-phases.ts` 0a8865a6…aa80, `boot-phases.shell.js` 57d43a01…97bf.
+ *
+ * Only the `error` branch changed: a failure now also carries the raw server
+ * `errorCode` beside the classified `reason`, so "Send feedback" names
+ * `billing_files_on_aws` instead of "unknown". It returns `failed` exactly as
+ * before, with the same `reason`; no other branch was touched, so none of the
+ * five attacks is reopened and no new path to `ready` exists.
+ */
 describe('🔴 computeBootUiState is byte-identical to the reviewed text', () => {
     it.each([
-        ['./boot-phases.ts', '0a8865a62753b33922a3c58df7eeb4a65412664fb33e29acb3c15d6f33e3aa80'],
-        ['./boot-phases.shell.js', '57d43a012f1faad401bf536193d93fdfd43beea5ea97d75a29c8dc18dd9c97bf'],
+        ['./boot-phases.ts', '795f6d5b3108f81d573cf1b68df165961f39c5335766cf67815ef26353e6dcc0'],
+        ['./boot-phases.shell.js', 'fc54f6c8d8e370867a7cb9ada9f3fa5a31e82d0bf49e6dd79ec96afee88e4c12'],
     ])('%s', (file, sha) => {
         expect(createHash('sha256').update(computeBootUiStateSource(file)).digest('hex')).toBe(sha);
     });
@@ -258,7 +268,7 @@ describe('computeBootUiState — never fabricates progress', () => {
                 elapsedMs: 0,
                 errorCode: 'desktop_unreachable',
             }),
-        ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
+        ).toEqual({ kind: 'failed', reason: 'desktop_unreachable', errorCode: 'desktop_unreachable' });
     });
 
     it('while pending, never marks a phase confirmed from elapsed time alone', () => {
@@ -308,25 +318,30 @@ describe('computeBootUiState — never fabricates progress', () => {
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'connection_refused' })).toEqual({
             kind: 'failed',
             reason: 'worker_unreachable',
+            errorCode: 'connection_refused',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'fetch_failed' })).toEqual({
             kind: 'failed',
             reason: 'worker_unreachable',
+            errorCode: 'fetch_failed',
         });
         expect(
             computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_runtime_blocked' }),
-        ).toEqual({ kind: 'failed', reason: 'sandbox_crashed' });
+        ).toEqual({ kind: 'failed', reason: 'sandbox_crashed', errorCode: 'sandbox_runtime_blocked' });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_start_failed' })).toEqual({
             kind: 'failed',
             reason: 'sandbox_crashed',
+            errorCode: 'sandbox_start_failed',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'timeout' })).toEqual({
             kind: 'failed',
             reason: 'timeout',
+            errorCode: 'timeout',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'worker_http_error' })).toEqual({
             kind: 'failed',
             reason: 'unknown',
+            errorCode: 'worker_http_error',
         });
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0 })).toEqual({
             kind: 'failed',
@@ -348,6 +363,7 @@ describe('computeBootUiState — never fabricates progress', () => {
             expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode })).toEqual({
                 kind: 'failed',
                 reason: 'unknown',
+                errorCode,
             });
         }
     });
@@ -362,6 +378,7 @@ describe('computeBootUiState — never fabricates progress', () => {
         expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_starting' })).toEqual({
             kind: 'failed',
             reason: 'timeout',
+            errorCode: 'sandbox_starting',
         });
     });
 
@@ -376,8 +393,12 @@ describe('computeBootUiState — never fabricates progress', () => {
             'capacity_unavailable',
             'desktop_unreachable',
             'display_not_streaming',
+            'fair_use_paused',
+            'files_on_aws',
             'global_hours_cap',
             'operations_paused',
+            'payment_issue',
+            'plan_required',
             'sandbox_crashed',
             'timeout',
             'unknown',

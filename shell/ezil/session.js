@@ -481,7 +481,9 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
             }
 
             // A genuine failure. One silent re-ask if a second attempt could
-            // plausibly answer differently, then hand it to the user.
+            // plausibly answer differently, then hand it to the user. Round 4: a
+            // `billing_*` refusal never qualifies (`isRetryableBootErrorCode`);
+            // only `billing_unavailable` does.
             if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
                  && isRetryableBootErrorCode(res.errorCode) ) {
                 retried = true;

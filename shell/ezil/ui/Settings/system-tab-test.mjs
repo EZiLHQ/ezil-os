@@ -191,7 +191,7 @@ test('late responses from the old computer cannot replace the current computer d
     oldScreen.resolve({ ok: true, width: 800, height: 600 });
     await settle();
     assert.equal(host.innerHTML, current);
-    assert.doesNotMatch(host.innerHTML, /old-image|AWS EC2/);
+    assert.doesNotMatch(host.innerHTML, /old-image|ezil-sys-v">AWS/);
 });
 
 test('a failed read retries and refreshes slowly after recovery', async () => {
@@ -225,4 +225,16 @@ test('stream vitals render only from the desktop frame, and only as text', async
     assert.match(host.innerHTML, /Relayed through TURN over UDP/, 'route fields survive cleaning');
     post(frame, { localCandidateType: 'host', remoteCandidateType: 'srflx' });
     assert.match(host.innerHTML, /Direct \(host → srflx\)/);
+});
+
+test('Round 4: a Free user with files on the AWS computer sees truthful Running on and Configuration rows', async () => {
+    answer = () => ({ ok: true, info: { provider: 'aws-ec2', providerSource: 'placement', lifecycleState: 'STOPPED', usage: null,
+        machine: { vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large', region: 'ap-south-1', source: 'configured' },
+        image: { id: 'running-image', source: 'running' }, plan: { standing: 'files_on_aws' } } });
+    await activate();
+    // `host` is a plain innerHTML holder here; read the row's value cell by its data-role.
+    const rowText = role => host.innerHTML.match(new RegExp(`data-role="${role}">\\s*<div class="ezil-sys-k">[^<]*</div>\\s*<div class="ezil-sys-v">([^<]*)</div>`))?.[1];
+    assert.equal(rowText('sys-running-on'), 'AWS (India) · 2 vCPU / 8 GiB · stopped');
+    assert.equal(rowText('sys-configuration'), 'Plan: Free · files kept on this computer');
+    assert.doesNotMatch(host.innerHTML, /Not reported<|Plan entitlement is not available|ap-south-1|Mumbai/);
 });

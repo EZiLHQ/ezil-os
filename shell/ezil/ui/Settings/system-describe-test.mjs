@@ -1,6 +1,7 @@
 // system-describe-test.mjs — EZiL-authored. Pure wording tests for Settings → System.
 // Run: node shell/ezil/ui/Settings/system-describe-test.mjs   (exit 0 pass, 1 fail)
-import { describeRunningOn, describePlan, describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
+import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
+import { describeRunningOn, describePlan, standingOf, describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
 
 const results = [];
 const push = (name, ok, detail) => results.push({ name, ok: !! ok, detail });
@@ -10,7 +11,7 @@ const cf = { provider: 'cloudflare', providerSource: 'placement', machine: { vcp
 const unassigned = { provider: 'unassigned', providerSource: 'no_placement', machine: { vcpu: null, memoryMiB: null, instanceType: null, region: null, source: 'unknown' }, lifecycleState: null, usage: null };
 
 // Provider
-push('AWS placement names AWS and its region', describeProvider(aws).value === 'AWS EC2 (us-east-1)', describeProvider(aws));
+push('AWS placement names AWS and its region', describeProvider(aws).value === 'AWS (us-east-1)', describeProvider(aws));
 push('Cloudflare placement names Cloudflare Containers', describeProvider(cf).value === 'Cloudflare Containers');
 push('🔴 no placement is "Not assigned yet", never Cloudflare', describeProvider(unassigned).value === 'Not assigned yet');
 push('🔴 unreadable info is Unknown, never Cloudflare', describeProvider(null, 'UPSTREAM').value === 'Unknown');
@@ -23,7 +24,7 @@ push('🔴 reads off: the hint separates configured routing from verification',
     && ! /Every computer/.test(describeProvider(readsOff).hint));
 push('🔴 reads off: no Cloudflare size is presented', describeMachine(readsOff).value === '—', describeMachine(readsOff));
 
-push('actual Cloudflare line never fabricates Mumbai', describeRunningOn(cf).value === 'Cloudflare Containers (2 vCPU / 6 GiB)');
+push('actual Cloudflare line never fabricates a city', describeRunningOn(cf).value === 'Cloudflare Containers · 2 vCPU / 6 GiB', describeRunningOn(cf));
 push('plan line separates entitlement and preparation', describePlan({ ...cf, plan: { vcpu: 2, memoryGB: 8, status: 'preparing' } }).value === '2 vCPU / 8 GB on AWS (India) — being prepared');
 // Round 3 (SWITCH-CONTRACT §4): a size mismatch alone is "ready" with a separate next-start hint;
 // "being prepared" only while a transition is in flight; never "Running on X" next to an unrelated "plan Y — being prepared".
@@ -99,6 +100,33 @@ push('worker http', describeScreenError('UPSTREAM', 'worker_http_502') === 'the 
 push('🔴 unknown upstream text is NOT echoed; only the code', describeScreenError('UPSTREAM', '<html>secret internal 10.0.0.5 trace</html>') === 'upstream');
 push('🔴 a known token\'s detail is not echoed', ! /generation mismatch/.test(describeScreenError('UPSTREAM', 'aws_origin_unavailable: generation mismatch')));
 push('no code, no message → unavailable', describeScreenError(undefined, undefined) === 'unavailable');
+
+// Round 4 (D16): a Free user whose files are still on the AWS computer. "AWS (India)", never the
+// region code or a city; "Plan: Free" only from an explicit server field, never from a missing plan.
+{
+    const held = { provider: 'aws-ec2', providerSource: 'placement', machine: { vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large', region: 'ap-south-1', source: 'configured' }, lifecycleState: 'STOPPED', usage: null };
+    const running = describeRunningOn(held);
+    push('Round 4: Running on reads "AWS (India) · 2 vCPU / 8 GiB · stopped"', running.value === 'AWS (India) · 2 vCPU / 8 GiB · stopped', running);
+    const shapes = [
+        ['plan.standing', { ...held, plan: { standing: 'files_on_aws' } }],
+        ['info.standing', { ...held, standing: 'files_on_aws' }],
+        ['a Free plan on provider aws', { ...held, plan: { name: 'Free', provider: 'aws' } }],
+        // The exact server shape (STANDING-CONTRACT §4).
+        ['the contract shape', { ...held, plan: { name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu: 2, memoryGB: 8, region: 'ap-south-1', status: 'ready', reason: null, outcome: null, current: 'std-2', selected: null, transition: null } }],
+    ];
+    for ( const [name, info] of shapes ) {
+        const plan = describePlan(info);
+        push(`Round 4: files_on_aws via ${name} → "Plan: Free · files kept on this computer"`, plan.value === 'Plan: Free · files kept on this computer'
+            && ! /Not reported|not available/.test(plan.value + plan.hint), plan);
+    }
+    const freeCf = describePlan({ ...cf, plan: { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: 2, memoryGB: 6, region: null, status: 'ready', reason: null, outcome: null, current: 'free-cf', selected: null, transition: null } });
+    push('Round 4: Free on Cloudflare names the plan and its computer', freeCf.value === 'Plan: Free · 2 vCPU / 6 GB on Cloudflare', freeCf);
+    push('Round 4: 🔴 no plan field is still "Not reported", never a guessed Free', describePlan(held).value === 'Not reported');
+    push('Round 4: an unknown standing value is ignored', standingOf({ standing: 'moved' }) === null && describePlan({ ...held, standing: 'moved' }).value === 'Not reported');
+    push('Round 4: a paid standing keeps the paid plan line', describePlan({ ...held, plan: { standing: 'paid', vcpu: 2, memoryGB: 8, status: 'ready', current: 'std-2', selected: 'std-2' } }).value === '2 vCPU / 8 GB on AWS (India)');
+    const copy = [running, ...shapes.map(([, info]) => describePlan(info)), freeCf, describeProvider(held)].map(d => `${d.value} ${d.hint}`).join(' ');
+    push('Round 4: copy guard, no region code and no city', scanCopy(copy).length === 0 && ! /ap-south-1|mumbai|moved/i.test(copy), copy);
+}
 
 let failed = 0;
 for ( const r of results ) {

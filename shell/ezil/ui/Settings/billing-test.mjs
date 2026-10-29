@@ -123,7 +123,7 @@ window.fetch = async (url, options = {}) => {
 };
 const bundled = await build({
     stdin: {
-        contents: "import './shell/ezil/boot.js'; import * as billing from './shell/ezil/ui/Settings/tabs/billing.js'; import * as format from './shell/ezil/ui/Settings/billing-format.js'; window.billing = billing; window.billingFormat = format;",
+        contents: "import './shell/ezil/boot.js'; import * as billing from './shell/ezil/ui/Settings/tabs/billing.js'; import * as format from './shell/ezil/ui/Settings/billing-format.js'; import * as computersTab from './shell/ezil/ui/Settings/tabs/computers.js'; window.billing = billing; window.billingFormat = format; window.computersTab = computersTab;",
         resolveDir: path.resolve(here, '../../../..'),
     },
     bundle: true, write: false, format: 'iife', target: 'es2022',
@@ -919,6 +919,52 @@ try {
     click(q('[data-action="portal"]')); await settle(); assert.equal(opened.length, previousOpened);
     mutation = () => reply({ url: 'https://billing.example.test/v3' }); click(q('[data-action="portal"]')); await settle();
     assert.equal(opened.at(-1)[0], 'https://billing.example.test/v3');
+    // Round 4 (D16-D18): the standing banners. Dates are UTC; the dead past_due-without-issue branch is gone.
+    {
+        const GRACE = '2026-11-05T00:00:00Z', ENDS = '2026-11-26T00:00:00Z';
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: GRACE });
+        Object.assign(summary.computer, { standing: 'grace', filesOn: 'aws', heldSince: null, move: null }); await refresh();
+        contains('[data-role="payment-grace"]', "Your payment didn't go through — update it by Nov 5, 2026 to keep your AWS computer.");
+        contains('[data-role="payment-grace"] [data-action="portal"]', 'Fix payment');
+        has('[data-role="payment-banner"]', false);
+        assert.equal(qa('[data-role="payment-grace"], [data-role="payment-banner"]').length, 1, 'one payment banner');
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
+        Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
+        contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');
+        has('[data-role="cancels-banner"]', false);
+        contains('[data-role="plan-actions"] [data-action="resume"]', 'Keep Premium');
+        summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
+        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.');
+        contains('[data-role="your-computer"]', 'Your files are kept on your AWS (India) computer. It opens with Free limits.');
+        contains('[data-role="plan-actions"]', 'Upgrade');
+        // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
+        summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
+        Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
+        has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
+        assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
+        // Unknown or missing standing: the round-3 Billing tab exactly.
+        for ( const standing of [undefined, 'moved'] ) {
+            summary = summaryV3('free'); summary.computer.standing = standing; await refresh();
+            for ( const role of ['payment-grace', 'plan-ending', 'files-held'] ) has(`[data-role="${role}"]`, false);
+        }
+        // The dead branch: past_due without a payment issue never painted its own banner (summary.ts always sets one).
+        summary = summaryV3(); Object.assign(summary.plan, { status: 'past_due', paymentIssue: null }); await refresh();
+        has('[data-role="payment-banner"]', false);
+        // Billing and Settings → Computer say the same thing (two copies of one function, pinned here).
+        const shapes = [
+            ['grace', { plan: { graceEndsAt: GRACE }, computer: { filesOn: 'aws' } }], ['grace', { plan: {}, computer: { filesOn: 'cloudflare' } }],
+            ['plan_ending', { plan: { name: 'Standard', planEndsAt: ENDS }, computer: { filesOn: 'aws' } }],
+            ['plan_ending', { plan: { name: 'Premium', cancelsAt: ENDS }, computer: { filesOn: 'cloudflare' } }], ['plan_ending', { plan: {}, computer: {} }],
+            ['files_on_aws', { plan: {}, computer: {} }], ['paid', { plan: {}, computer: {} }], ['free', { plan: {}, computer: {} }],
+        ];
+        for ( const [standing, data] of shapes ) {
+            const copy = window.billing.standingCopy(standing, data);
+            assert.equal(window.computersTab.standingCopy(standing, data), copy, `${standing} copy agrees across tabs`);
+            assert.doesNotMatch(copy, banned); assert.doesNotMatch(copy, honestyBans); assert.doesNotMatch(copy, /ap-south-1|mumbai/i);
+        }
+        pass('Round 4 standing banners: grace, plan ending, files held on AWS; unknown standing unchanged; copy pinned across tabs');
+    }
     summary = summaryV3(); history = [invoice()]; getHistory = () => failure('private invoice failure'); await refresh();
     contains('[data-role="invoice-rows"]', "Couldn't load invoices.");
     getHistory = () => reply(history); click(q('[data-role="invoice-rows"] [data-action="retry"]')); await settle();

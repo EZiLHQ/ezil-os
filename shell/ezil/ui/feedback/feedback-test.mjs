@@ -417,6 +417,27 @@ try {
         Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: user });
         open(); setDescription(''); close();
     });
+    await check('Round 4: the opening screen\'s error code is prefilled, appended once to a saved draft, and kept within 4,000 characters', async () => {
+        const openWith = errorCode => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode }); };
+        openWith('billing_files_on_aws');
+        assert.equal(form().elements.description.value, 'Error code: billing_files_on_aws\n\n', 'no draft: the code leads the report');
+        setDescription(''); close();
+        open(); setDescription('Code would not open after I cancelled'); close();
+        openWith('billing_files_on_aws');
+        assert.equal(form().elements.description.value, 'Code would not open after I cancelled\n\nError code: billing_files_on_aws',
+            'a saved draft keeps its text and gains the code');
+        setDescription(form().elements.description.value); close();
+        openWith('billing_files_on_aws');
+        assert.equal((form().elements.description.value.match(/Error code: billing_files_on_aws/g) ?? []).length, 1, 'appended once');
+        close();
+        openWith('not a code!');
+        assert.doesNotMatch(form().elements.description.value, /not a code/, 'an invalid code is never written');
+        const full = 'x'.repeat(3995);
+        setDescription(full); close();
+        openWith('billing_payment_issue');
+        assert.equal(form().elements.description.value, full, 'a draft at the limit is not pushed past 4,000 characters');
+        setDescription(''); close();
+    });
     await check('teardown and navigation close the form, abort pending captures and leave Back unhandled', async () => {
         const count = calls.length;
         for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) {
