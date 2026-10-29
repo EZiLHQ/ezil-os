@@ -5,6 +5,14 @@ export const pricingMetadata = {
     description: 'Start free. Choose longer sessions and a bigger computer when you need them.',
 } as const;
 
+/** A home-page feature tile: a description, or a short badge (none ships today). */
+type MarketingFeature = { readonly title: string; readonly description?: string; readonly badge?: string };
+const features: readonly MarketingFeature[] = [
+    { title: 'A real desktop', description: 'Your files and installed tools stay with your computer between sessions.' },
+    { title: 'Browser and VS Code built in', description: 'Build and preview without installing anything.' },
+    { title: 'EZiL AI in Code and Chat', description: 'Every plan comes with AI credits to use in Code and Chat.' },
+];
+
 export const marketingContent = {
     skipLink: 'Skip to content',
     brand: 'EZiL OS',
@@ -14,11 +22,7 @@ export const marketingContent = {
     signInLink: { label: 'Sign in', href: '/login?method=email' },
     desktop: { browser: 'Browser', editor: 'VS Code' },
     featuresLabel: 'Your workspace',
-    features: [
-        { title: 'A real desktop', description: 'Your files and installed tools stay with your computer between sessions.' },
-        { title: 'Browser and VS Code built in', description: 'Build and preview without installing anything.' },
-        { title: 'EZiL AI in Code and Chat', description: 'Every plan comes with AI credits to use in Code and Chat.' },
-    ],
+    features,
     closing: 'Start building for free',
     seller: 'Sold by EZiL LLC',
     footerLabel: 'Legal and support',
