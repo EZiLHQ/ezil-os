@@ -1028,7 +1028,8 @@ try {
     summary = summaryV3(); summary.ai.balance = 4000; await refresh();
     contains('#ai-credits h4', 'AI credits');
     assert.equal(q('#ai-credits .ezil-billing-meter-value').textContent, '4,000 left');
-    contains('#ai-credits', '200 from your plan + 3,800 extra');
+    // ADV-1: no breakdown from the server, so no invented "plan + extra" split.
+    assert.doesNotMatch(q('#ai-credits').textContent, /from your plan|3,800 extra/);
     assert.equal(q('#ai-credits [role="meter"]').getAttribute('aria-valuenow'), '100');
     has('#ai-credits button', false); has('[data-role="ai-topup"]', false);
     summary.catalog.packs = packs; await refresh(); has('[data-role="ai-topup"]', false);

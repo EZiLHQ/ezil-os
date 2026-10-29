@@ -674,7 +674,7 @@ export function computerHtml (model, prog = progress, older = []) {
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
-    const used = typeof model.disk?.usedBytes === 'string' && /^\d+$/.test(model.disk.usedBytes) ? Number(model.disk.usedBytes) / 1e9 : null;
+    const used = typeof model.disk?.usedBytes === 'string' && /^\d+$/.test(model.disk.usedBytes) ? Number(model.disk.usedBytes) / 2 ** 30 : null; // the disk's own unit (GiB), like its size
     const stoppable = model.running && ! model.busy;
     return `<section class="ezil-computer" data-role="your-computer" data-id="${html_encode(computer.id)}">
         <header class="ezil-computer-header" data-role="computer-header">
@@ -692,7 +692,7 @@ export function computerHtml (model, prog = progress, older = []) {
         ${standingHtml(model)}
         ${notice ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
         ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
-            <p class="ezil-settings-muted">Pick a size for your computer. Your files stay on your disk when you switch.</p>
+            <p class="ezil-settings-muted">${model.free ? 'Pick a size for your computer. More sizes come with Standard and Premium.' : 'Pick a size for your computer. Your files stay on your disk when you switch.'}</p>
             <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
             <p class="ezil-settings-muted" data-role="plan-line">${html_encode(planLine)} <a href="/os?settings=billing&amp;upgrade=pro" data-action="compare-plans">Compare plans</a></p></section>` : ''}
         ${data ? `<section class="ezil-computer-section" data-role="computer-storage" aria-labelledby="ezil-storage-heading"><h4 id="ezil-storage-heading">Storage</h4>

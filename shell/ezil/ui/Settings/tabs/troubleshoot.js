@@ -68,7 +68,7 @@ import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../n
 // It is included because the console ring alone would tell half the story:
 // exactly one module writes to `log.js` today, while ~30 call sites across
 // this shell report through `telemetry.capture()`.
-import UIAlert from '../../../../src/UI/UIAlert.js';
+import { openConfirmSheet } from '../sheet-frame.js';
 import log from '../../../log.js';
 import session from '../../../session.js';
 import trpc from '../trpc.js';
@@ -83,13 +83,6 @@ const TROUBLESHOOT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentC
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
     + '<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>'
     + '<circle cx="12" cy="12" r="4"/></svg>';
-
-/** Same construction/reasoning as `tabs/computers.js`'s `ALERT_WARNING_ICON`
- * — neither `UIAlert` icon key this fork kept resolves without one. */
-const ALERT_WARNING_ICON = 'data:image/svg+xml,' + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#e0a030" stroke-width="2">'
-    + '<path d="M12 3 2 20h20L12 3Z" stroke-linejoin="round"/><path d="M12 10v4M12 17h.01" stroke-linecap="round"/></svg>',
-);
 
 const DESKTOP_SELECTOR = '.window[data-app="desktop"]';
 
@@ -354,20 +347,26 @@ function render ($win) {
     `);
 }
 
-async function confirmRestart () {
-    const value = await UIAlert({
-        message: '<strong>Restart this desktop?</strong>'
-            + '<p>The desktop will shut down and start again inside the same container. Anything '
-            + 'unsaved in an open application inside it will be lost. Your workspace in storage, and the '
-            + 'computer itself, are not touched.</p>',
-        type: 'warning',
-        body_icon: ALERT_WARNING_ICON,
-        buttons: [
-            { label: 'Restart', value: 'confirm', type: 'danger' },
-            { label: 'Cancel', value: 'cancel', type: 'secondary' },
+/** The window body the confirm sheet belongs to (it closes with the window). */
+const sheetContainer = $win => $win?.find?.('.window-body')?.get?.(0) ?? $win?.get?.(0) ?? document.body;
+
+/**
+ * Round 5 (D6): Restart confirms through the same dark sheet frame as Switch and
+ * Stop (`openConfirmSheet`), never the legacy alert dialog. `begin` runs from the
+ * sheet's primary, so the pane shows Restarting… the moment the user confirms;
+ * the restart itself runs after the sheet closes. Resolves true only when
+ * `begin` took the restart.
+ */
+async function confirmRestart ($win, begin) {
+    let took = false;
+    await openConfirmSheet({ container: sheetContainer($win), sheet: 'confirm-restart', title: 'Restart this desktop?',
+        lines: [
+            'The desktop and its apps restart. Anything unsaved in an open app is lost; save your work first.',
+            'Your files stay, and your computer is not touched.',
+            RESTART_DESKTOP_TIME,
         ],
-    });
-    return value === 'confirm';
+        confirmLabel: 'Restart', busyLabel: 'Restarting…', onConfirm: () => { took = begin(); } });
+    return took;
 }
 
 async function handleRestart ($win) {
@@ -375,11 +374,13 @@ async function handleRestart ($win) {
     const computerId = openDesktopComputerId();
     if ( ! computerId ) return;
 
-    const confirmed = await confirmRestart();
-    if ( ! confirmed || status === 'restarting' ) return;
-
-    status = 'restarting';
-    render($win);
+    const confirmed = await confirmRestart($win, () => {
+        if ( status === 'restarting' || computerStatus === 'restarting' ) return false;
+        status = 'restarting';
+        render($win);
+        return true;
+    });
+    if ( ! confirmed ) return;
 
     const res = await session.restartDesktop(computerId);
 
@@ -406,19 +407,16 @@ async function handleRestart ($win) {
     render($win);
 }
 
-async function confirmRestartComputer () {
-    const value = await UIAlert({
-        message: '<strong>Restart your computer?</strong>'
-            + '<p>Your computer stops and starts again on the same configuration. Open apps close and '
-            + 'anything unsaved in them is lost. Your files stay. This takes 1–4 minutes.</p>',
-        type: 'warning',
-        body_icon: ALERT_WARNING_ICON,
-        buttons: [
-            { label: 'Restart computer', value: 'confirm', type: 'danger' },
-            { label: 'Cancel', value: 'cancel', type: 'secondary' },
+async function confirmRestartComputer ($win, begin) {
+    let took = false;
+    await openConfirmSheet({ container: sheetContainer($win), sheet: 'confirm-restart-computer', title: 'Restart your computer?',
+        lines: [
+            'Your computer stops and starts again on the same configuration. Open apps close; save your work first.',
+            'Your files stay.',
+            'This usually takes 1-4 minutes.',
         ],
-    });
-    return value === 'confirm';
+        confirmLabel: 'Restart computer', busyLabel: 'Restarting…', onConfirm: () => { took = begin(); } });
+    return took;
 }
 
 function restartRequestId (computerId) {
@@ -462,11 +460,15 @@ async function handleRestartComputer ($win) {
     const computerId = session.currentComputer()?.id ?? openDesktopComputerId();
     const url = session.restartEndpoint();
     if ( ! computerId || ! url ) return;
-    if ( ! await confirmRestartComputer() || computerStatus === 'restarting' ) return;
-    computerStatus = 'restarting';
-    computerReason = '';
-    computerTransition = null;
-    render($win);
+    const confirmed = await confirmRestartComputer($win, () => {
+        if ( computerStatus === 'restarting' || status === 'restarting' ) return false;
+        computerStatus = 'restarting';
+        computerReason = '';
+        computerTransition = null;
+        render($win);
+        return true;
+    });
+    if ( ! confirmed ) return;
     let answer = null;
     try {
         const res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },

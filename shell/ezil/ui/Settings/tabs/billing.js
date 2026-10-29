@@ -262,10 +262,11 @@ function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', note
  * Never "standard-hour" or "compute hours" (scanCopy).
  */
 export function timeV3Html ({ computer, fairUse }, usage = null) {
+    // `usage` null: billing.usage has not answered yet; false: it answered without a reading.
     const period = usage?.period ?? null;
     const lines = hoursLeftLines(period, computer.machineChoice);
     const hours = lines ? period.remainingHoursAtCurrent : null;
-    const value = hours === null ? 'Not measured yet' : hours === 0 && period.remainingStandardSeconds > 0 ? 'Less than 1 h left' : `${whole(hours)} h left`;
+    const value = hours === null ? usage === null ? 'Checking…' : 'Not measured yet' : hours === 0 && period.remainingStandardSeconds > 0 ? 'Less than 1 h left' : `${whole(hours)} h left`;
     const percent = lines && safeCount(period.remainingStandardSeconds) && safeCount(period.allowanceStandardSeconds) && period.allowanceStandardSeconds > 0
         ? percentOf(period.remainingStandardSeconds, period.allowanceStandardSeconds) : null;
     const tone = fairUse.status === 'paused' ? 'danger' : fairUse.status === 'near' ? 'warn' : 'ok';
@@ -302,13 +303,9 @@ function aiMeterV3 (summary) {
     const awaitingPayment = plan?.paymentIssue != null && included !== null && included.granted === 0 && pending !== null;
     const tone = ai.state === 'exhausted' ? 'danger' : ai.state === 'low' ? 'warn' : 'ok';
     const state = { low: '! Running low', exhausted: '■ No credits left' }[ai.state] ?? '';
-    const extras = [
-        ai.purchased && safeCount(ai.purchased.remaining) && ai.purchased.remaining > 0 ? `+ ${whole(ai.purchased.remaining)} purchased · expire ${dateLabel(ai.purchased.expiresAt, true)}` : '',
-        ai.starter && safeCount(ai.starter.remaining) && ai.starter.remaining > 0 ? `${whole(ai.starter.remaining)} starter credits left` : '',
-        pending && ! awaitingPayment ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
-    ];
-    const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.` : `${whole(grant.amount)} credits to start.` : '';
-    let value, percent = null, split = '';
+    const purchased = ai.purchased && safeCount(ai.purchased.remaining) ? ai.purchased : null;
+    const starter = ai.starter && safeCount(ai.starter.remaining) ? ai.starter : null;
+    let value, percent = null, split = null;
     if ( awaitingPayment ) value = `0 of ${whole(pending.credits)} this period`;
     else if ( included && included.granted > 0 ) { value = `${whole(included.remaining)} of ${whole(included.granted)} left`; percent = percentOf(included.remaining, included.granted); }
     else if ( typeof ai.balance === 'number' && Number.isFinite(ai.balance) && ai.balance >= 0 ) {
@@ -316,27 +313,42 @@ function aiMeterV3 (summary) {
         if ( grant && balance <= grant.amount ) { value = `${whole(balance)} of ${whole(grant.amount)} left`; percent = percentOf(balance, grant.amount); }
         else {
             value = `${whole(balance)} left`;
-            if ( grant ) { percent = 100; split = `${whole(grant.amount)} from your plan + ${whole(balance - grant.amount)} extra`; }
+            if ( grant ) percent = 100;
+            // ADV-1: the split comes only from the server's breakdown, and only when it adds up to
+            // the balance. Never balance minus grant (that assumes the grant is unspent).
+            if ( grant && purchased && purchased.remaining > 0 && (starter?.remaining ?? 0) + purchased.remaining === balance ) split = { plan: starter?.remaining ?? 0, extra: purchased.remaining };
         }
     } else value = '—';
+    const extras = [
+        purchased && purchased.remaining > 0 ? split ? `Extra credits expire ${dateLabel(purchased.expiresAt, true)}` : `+ ${whole(purchased.remaining)} purchased · expire ${dateLabel(purchased.expiresAt, true)}` : '',
+        starter && starter.remaining > 0 && ! split ? `${whole(starter.remaining)} starter credits left` : '',
+        pending && ! awaitingPayment ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
+    ];
+    const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.` : `${whole(grant.amount)} credits to start.` : '';
+    split = split ? `${whole(split.plan)} from your plan + ${whole(split.extra)} extra` : '';
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
         ...extras, included ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote, 'Used by EZiL AI in Code and Chat.',
     ] });
 }
 
+const GIB = 2 ** 30;
+/** Disk bytes in the disk's own unit (GiB, shown as "GB" like the disk size itself). */
+const diskText = bytes => bytes >= GIB ? `${(bytes / GIB).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB`
+    : `${Math.floor(bytes / 2 ** 20).toLocaleString('en-US')} MB`;
 /** Storage (D3): the computer's REAL disk; a used figure and a bar only once something measures it. */
 function storageMeterV3 ({ computer }) {
     const disk = computer.disk;
     const gb = Number.isFinite(disk?.provisionedGiB) && disk.provisionedGiB > 0 ? disk.provisionedGiB : null;
-    const used = typeof disk?.usedBytes === 'string' && /^\d+$/.test(disk.usedBytes) ? Number(disk.usedBytes) / 1e9 : null;
-    const gbText = value => value.toLocaleString('en-US', { maximumFractionDigits: 1 });
+    const usedBytes = typeof disk?.usedBytes === 'string' && /^\d+$/.test(disk.usedBytes) ? Number(disk.usedBytes) : null;
     if ( gb === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Files saved', notes: ['Your files are saved between sessions.'] });
-    if ( used === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`, notes: [`${gb} GB disk for your projects`] });
-    const left = Math.max(0, gb - used);
-    const percent = percentOf(left, gb);
-    return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gbText(left)} GB left`, percent,
-        tone: percent === 0 ? 'danger' : percent <= 20 ? 'warn' : 'ok', notes: [`${gbText(used)} GB used of your ${gb} GB disk`] });
+    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`, notes: [`${gb} GB disk for your projects`] });
+    // ADV-2: the disk is provisionedGiB × 2^30 bytes (the server's cap), so used and left use the same unit.
+    const capBytes = gb * GIB;
+    const leftBytes = Math.max(0, capBytes - usedBytes);
+    const percent = percentOf(leftBytes, capBytes);
+    return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${diskText(leftBytes)} left`, percent,
+        tone: percent === 0 ? 'danger' : percent <= 20 ? 'warn' : 'ok', notes: [`${diskText(usedBytes)} used of your ${gb} GB disk`] });
 }
 
 /** The one state banner, or null. It carries the page's only primary in its state. */
@@ -348,6 +360,14 @@ function bannerV3 (summary) {
     if ( plan.paymentIssue === 'requires_action' ) {
         return banner('payment-banner', 'warn', 'Your bank needs you to confirm a payment.', '',
             '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-invoice" data-kind="subscription">Confirm payment</button>');
+    }
+    // ADV-3: the server reports every incomplete subscription as payment_failed (summary.ts); the plan
+    // never started, so the ask is to finish that payment, not to keep a plan.
+    if ( plan.status === 'incomplete' && standing !== 'grace' ) {
+        const to = offerFor(summary, plan.pendingUpgrade?.toSku ?? plan.sku)?.name ?? plan.name;
+        const expires = plan.pendingUpgrade?.expiresAt ? ` This link expires ${dateLabel(plan.pendingUpgrade.expiresAt)}.` : '';
+        return banner('upgrade-pending', 'warn', `${to} starts once payment is confirmed.${expires}`, '',
+            '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-invoice" data-kind="subscription">Finish payment</button>');
     }
     if ( standing === 'grace' || plan.paymentIssue === 'payment_failed' ) {
         return banner(standing === 'grace' ? 'payment-grace' : 'payment-banner', 'danger', "Your last payment didn't go through",
@@ -444,9 +464,12 @@ function offerCardV3 (summary, offer) {
         const time = code === 'free-cf' ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}`
             : `about ${whole(offer.fairUseHours / size.weight)} hours a month`;
         const now = current && code === computer.size ? ' <span class="ezil-billing-now">Now</span>' : '';
-        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong> <span>${encode(`· ${time}`)}</span>${now}</li>`;
+        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now} <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span></li>`;
     }).join('');
-    const storage = Number.isSafeInteger(offer.storageGiB) && offer.storageGiB > 0 ? `${offer.storageGiB} GB disk` : 'Files saved between sessions';
+    // The current card never contradicts "Your computer": a disk made smaller than today's plan disk says so.
+    const realDisk = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
+    const storage = Number.isSafeInteger(offer.storageGiB) && offer.storageGiB > 0
+        ? `${offer.storageGiB} GB disk${current && realDisk !== null && realDisk !== offer.storageGiB ? ` · yours has ${realDisk} GB` : ''}` : 'Files saved between sessions';
     const credits = offer.aiCredits?.amount ? `${whole(offer.aiCredits.amount)} AI credits ${offer.aiCredits.per === 'once' ? 'to start' : 'every month'}` : '';
     let cta = '';
     if ( current ) cta = '<span class="ezil-billing-current" data-role="current-plan">Current plan</span>';
@@ -629,8 +652,8 @@ async function loadUsage ($win, state, request) {
     const computerId = currentComputer()?.id;
     const result = await trpc.query('billing.usage', computerId ? { computerId } : undefined).catch(() => ({ ok: false }));
     if ( request !== state.request || state.closed || ! state.summary || ! $win.get(0).isConnected ) return;
-    const usage = result?.ok && result.data?.enabled === true && result.data.period ? result.data : null;
-    if ( usage ) $win.find('[data-role="meter-time"]').replaceWith(timeV3Html(state.summary, usage));
+    const usage = result?.ok && result.data?.enabled === true && result.data.period ? result.data : false;
+    $win.find('[data-role="meter-time"]').replaceWith(timeV3Html(state.summary, usage));
 }
 
 function actionError ($win, copy) { $win.find('[data-role="billing-action-error"]').text(copy); }

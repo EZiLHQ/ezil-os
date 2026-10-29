@@ -20,12 +20,10 @@ const timestamp = (value, clock = false) => {
     return `<time datetime="${esc(value)}" title="${esc(new Date(value).toISOString())}">${esc(new Intl.DateTimeFormat(undefined, options).format(new Date(value)))}</time>`;
 };
 const byteCount = value => typeof value === 'string' && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
-const bytes = value => {
-    if (!count(value)) return 'Unavailable';
-    if (value < 1000000) return `${value.toLocaleString()} bytes`;
-    const divisor = value < 1000000000 ? 1000000 : 1000000000;
-    return `${(value / divisor).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${divisor === 1000000 ? 'MB' : 'GB'}`;
-};
+const GIB = 2 ** 30;
+/** Disk bytes in the disk's own unit (GiB, shown as "GB" like the disk size itself). */
+const diskBytes = value => !count(value) ? 'Unavailable' : value >= GIB ? `${(value / GIB).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB`
+    : value >= 2 ** 20 ? `${Math.floor(value / 2 ** 20).toLocaleString('en-US')} MB` : `${value.toLocaleString('en-US')} bytes`;
 // D6: a delayed reading keeps the last recorded runtime (never "0 s") and says it is still measuring.
 const measuringLine = elapsed => count(elapsed) && elapsed >= 60 ? `This session: ${duration(elapsed)} so far · Measuring this session…` : 'Measuring this session…';
 const row = (label, value) => `<div class="usage-row"><dt>${esc(label)}</dt><dd>${value}</dd></div>`;
@@ -91,17 +89,23 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const balance = included ? included.remaining : balanceLabel === 'Not reported' ? null : Number(balanceLabel.replace(/,/g, ''));
     const denominator = included ? included.granted : count(grant?.amount) && grant.amount > 0 ? grant.amount : null;
     const aboveGrant = !included && balance !== null && denominator !== null && balance > denominator;
-    const aiPercent = aboveGrant ? 100 : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
+    // ADV-6: nothing to measure until the account is enrolled — no bar beside "N credits waiting".
+    const aiPercent = enrollment !== 'enrolled' ? null : aboveGrant ? 100 : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
     const aiState = enrollment && enrollment !== 'enrolled' ? 'pending' : balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
         : ai?.state === 'low' ? 'warn' : 'ok';
     const grantLabel = denominator !== null ? creditsLabel(null, denominator) : null;
     // "Your plan adds N every month" only when this period's grant is not split out: right after an upgrade it was false.
     const grantNote = included ? `Resets ${timestamp(included.periodEnd)}` : grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
         : grant.per === 'once' ? `Includes ${grantLabel} one-time trial credits` : '' : '';
-    const split = aboveGrant ? `${esc(grantLabel)} from your plan + ${esc(creditsLabel(null, balance - denominator))} extra` : '';
+    // ADV-1 (same rule as Billing): split only from the server's breakdown, and only when it adds up
+    // to the balance — never balance minus grant, which assumes the grant is unspent.
+    const purchased = ai?.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining >= 0 ? ai.purchased.remaining : null;
+    const starter = ai?.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining >= 0 ? ai.starter.remaining : null;
+    const splitParts = aboveGrant && purchased > 0 && (starter ?? 0) + purchased === balance ? { plan: starter ?? 0, extra: purchased } : null;
+    const split = splitParts ? `${esc(creditsLabel(null, splitParts.plan))} from your plan + ${esc(creditsLabel(null, splitParts.extra))} extra` : '';
     const extras = [
-        ai?.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining > 0 ? `+ ${esc(creditsLabel(null, ai.purchased.remaining))} purchased · expire ${timestamp(ai.purchased.expiresAt)}` : '',
-        ai?.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining > 0 ? `${esc(creditsLabel(null, ai.starter.remaining))} starter credits left` : '',
+        purchased > 0 ? splitParts ? `Extra credits expire ${timestamp(ai.purchased.expiresAt)}` : `+ ${esc(creditsLabel(null, purchased))} purchased · expire ${timestamp(ai.purchased.expiresAt)}` : '',
+        starter > 0 && !splitParts ? `${esc(creditsLabel(null, starter))} starter credits left` : '',
         ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
     ].filter(Boolean);
     const aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
@@ -122,18 +126,19 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const usedBytes = byteCount(disk?.usedBytes) ?? (count(total) ? total : null);
     // Round 5 (D6): the bar is the REAL disk left, only when both the disk and a used figure are known.
     // The catalog's storage cap (a 2 GB display constant) is never shown as a disk.
-    const capBytes = diskGB ? diskGB * 1e9 : null;
+    // ADV-2: the disk is provisionedGiB × 2^30 bytes (the server's cap); used and left use that unit too.
+    const capBytes = diskGB ? diskGB * GIB : null;
     const leftBytes = usedBytes !== null && capBytes !== null ? Math.max(0, capBytes - usedBytes) : null;
     const storageLeft = ratio(leftBytes, capBytes);
     const storagePercent = storageLeft === null ? null : Math.floor(storageLeft);
     const storageState = storagePercent === null ? 'unavailable' : storagePercent === 0 ? 'danger' : storagePercent <= 20 ? 'warn' : 'ok';
     const measuredAt = samples.map(sample => sample.measuredAt).filter(validDate).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
     const freePlan = summary?.plan?.sku === 'free_v3';
-    const storageValue = leftBytes !== null ? `${esc(bytes(leftBytes))} left`
+    const storageValue = leftBytes !== null ? `${esc(diskBytes(leftBytes))} left`
         : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : 'Not measured yet';
     const storageNote = storageState === 'danger' ? '■ Full. Delete files you no longer need.'
         : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
-        : diskGB ? `${usedBytes !== null ? `${esc(bytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
+        : diskGB ? `${usedBytes !== null ? `${esc(diskBytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
         : freePlan || (storage && storage.capBytes === null) ? 'Your files are saved between sessions.' : '';
     const sessionLine = !['recording', 'stale', 'ended'].includes(current.state) ? 'No session recorded yet.'
         : current.state === 'ended' ? `Last session: ${duration(current.elapsedSeconds)} · ended ${timestamp(current.endedAt)}`
@@ -148,9 +153,9 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     <div class="usage-meters">
         ${meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
             `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
-        ${meter('ai', 'AI credits', aiValue, aiPercent, `${aboveGrant ? balanceLabel : included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${aboveGrant ? ` ${split}.` : !included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState, aiAction)}
+        ${meter('ai', 'AI credits', aiValue, aiPercent, `${aboveGrant ? balanceLabel : included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${aboveGrant ? split ? ` ${split}.` : '' : !included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState, aiAction)}
         ${meter('storage', 'Storage', storageValue, storagePercent,
-            `${bytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState)}
+            `${diskBytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState)}
     </div>
     <p class="usage-session-line" data-usage="session">${sessionLine}</p>
     <div class="usage-details">

@@ -211,7 +211,9 @@
     background: var(--accent);
 }
 .ezil-confirm-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 24px; }
-.ezil-confirm-actions .ezil-settings-btn { min-height: 36px; padding: 8px 16px; font-size: 13px; }
+/* Cancel is a quiet secondary: it overrides the sheet's accent button fill, so the primary is the only accent. */
+.ezil-confirm-actions .ezil-settings-btn { min-height: 44px; padding: 8px 16px; font-size: 13px; background: transparent; border-color: var(--border); color: var(--text); }
+.ezil-confirm-actions .ezil-settings-btn:hover:not(:disabled) { background: var(--surface-2); }
 .ezil-confirm-actions .ezil-settings-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .ezil-upgrade-backdrop.is-compact .ezil-confirm-sheet { padding: 48px 16px 20px; }
 @media (any-pointer: coarse) {

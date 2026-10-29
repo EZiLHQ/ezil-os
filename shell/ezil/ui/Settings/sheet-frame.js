@@ -1,7 +1,7 @@
 // Shared, document-owned modal lifetime for checkout and billing changes.
 const sheets = new WeakMap();
 
-export function openSheetFrame ({ container, title, role = 'billing-sheet', sheet, onClose, dispose, canDismissBackdrop = () => true, onCompact, closeLabel = 'Close billing sheet' }) {
+export function openSheetFrame ({ container, title, role = 'billing-sheet', sheet, onClose, dispose, canDismissBackdrop = () => true, canDismiss = () => true, onCompact, closeLabel = 'Close billing sheet' }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -149,7 +149,8 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
         if ( event.key === 'Escape' ) {
             event.preventDefault();
             event.stopImmediatePropagation();
-            close();
+            // A user dismissal (Esc, ×) is refused while the owner says so (a request in flight).
+            if ( canDismiss() ) close();
         } else if ( event.key === 'Tab' ) {
             const elements = focusable();
             if ( event.shiftKey && doc.activeElement === elements[0] ) { event.preventDefault(); focusLast(); }
@@ -214,7 +215,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     });
     dialog.querySelector('[data-action="close-sheet"]').addEventListener('click', () => {
         sync();
-        if ( ! portals.length ) close();
+        if ( ! portals.length && canDismiss() ) close();
     });
     refreshCompact();
     sync();
@@ -226,8 +227,9 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
  * Round 5 (D6): the confirmation for Switch and Stop, replacing the legacy
  * UIAlert. The same dark, document-owned frame as the billing sheets: a title,
  * a short "what happens" list, Cancel and ONE accent primary. Esc, Cancel, ×
- * and the backdrop decline. The primary runs `onConfirm` with itself disabled
- * (and `busyLabel` shown) until it settles, then the sheet closes.
+ * and the backdrop decline; none of them dismisses while `onConfirm` runs. The
+ * primary runs `onConfirm` with itself disabled (and `busyLabel` shown) until
+ * it settles, then the sheet closes. Used for Switch, Stop and both Restarts.
  *
  * @returns {Promise<boolean>} true once confirmed (after `onConfirm`), false when declined.
  */
@@ -236,7 +238,7 @@ export function openConfirmSheet ({ container, sheet = 'confirm', title, lines =
         let confirmed = false;
         let busy = false;
         const frame = openSheetFrame({ container, title, role: 'confirm-sheet', sheet, closeLabel: 'Close',
-            canDismissBackdrop: () => ! busy, onClose: () => { if ( ! confirmed ) resolve(false); } });
+            canDismissBackdrop: () => ! busy, canDismiss: () => ! busy, onClose: () => { if ( ! confirmed ) resolve(false); } });
         if ( frame.existing ) { resolve(false); return; }
         const { doc, content, dialog } = frame;
         dialog.classList.add('ezil-confirm-sheet');
@@ -276,6 +278,7 @@ export function openConfirmSheet ({ container, sheet = 'confirm', title, lines =
                 resolve(true);
             }
         });
-        primary.focus();
+        // The safe choice takes focus: Enter right after opening never restarts or stops anything.
+        cancel.focus();
     });
 }

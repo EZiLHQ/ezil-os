@@ -248,6 +248,8 @@ await check('Billing: "Your computer" row shows the configuration, the REAL disk
     assert.match(clean(row), /2 vCPU · 8 GB memory · 50 GB disk/);
     assert.match(clean(row.querySelector('[data-action="computer-tab"]')), /Change configuration ›/);
     assert.match(clean(el.querySelector('[data-role="meter-storage"]')), /50 GB disk for your projects/);
+    // The current Premium card (100 GB plan disk) says this computer's disk is 50 GB, never just "100 GB".
+    assert.match(clean(el.querySelector('[data-role="plan-offer"][data-current]')), /100 GB disk · yours has 50 GB/);
     assert.doesNotMatch(clean(el.querySelector('[data-role="meter-storage"]')), /100 GB|same disk on every/i);
     const free = fragment(summaryV3Html(billingState('free')));
     assert.doesNotMatch(clean(free.querySelector('[data-role="meter-storage"]')), /\d+ GB/);
