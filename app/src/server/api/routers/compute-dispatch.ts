@@ -231,7 +231,9 @@ function stopFailureReason(outcome: string | undefined): string {
  * - round 5 D2: a failed pool release the platform is healing (status `releaseHeal: 'pending'`;
  *   each status look applies the receipt, which runs `reconcilePoolReleaseRecovery`, aws-receipts.ts:249)
  *   is still this stop: polling continues through UNCONFIRMED/RECOVERING to STOPPED/pool_released.
- *   A heal that fails → `release_heal_failed`; still healing at the deadline → `stop_healing` (not yet);
+ *   A heal that fails → `release_heal_failed`; still healing at the deadline → `stop_healing` (not yet).
+ *   A Stop that finds the heal already under way (`placement_unconfirmed`/`placement_recovering`) takes one
+ *   status look and, while it is pending, waits the same way;
  * - any other answer (refused, moved to another state) is returned as a failure unchanged.
  */
 export async function confirmAwsStop(
@@ -245,8 +247,15 @@ export async function confirmAwsStop(
     const deadline = now() + (opts.budgetMs ?? AWS_SHELL_STOP_BUDGET_MS);
     const first = await provider.stop(ctx, computer, 'user');
     if (first.ok) return { ok: true, terminated: false, outcome: 'not_running' };
-    if (!['stopping', 'placement_draining', 'placement_stopping'].includes(first.outcome ?? '')) return first;
     let healing = false;
+    if (first.outcome === 'placement_unconfirmed' || first.outcome === 'placement_recovering') {
+        // A Stop pressed (or retried) while a release heal is already under way: one look (it applies the receipt
+        // and runs the recovery), then wait through the heal like any other stop. No heal: the refusal, unchanged.
+        const look = (await provider.status(ctx, computer)) as AwsComputeStatus & { releaseHeal?: ReleaseHeal };
+        if (look.placementState === 'STOPPED') return { ok: true, terminated: true, outcome: 'destroyed' };
+        if (look.releaseHeal !== 'pending') return first;
+        healing = true;
+    } else if (!['stopping', 'placement_draining', 'placement_stopping'].includes(first.outcome ?? '')) return first;
     while (now() < deadline) {
         await sleep(Math.max(0, Math.min(opts.pollMs ?? AWS_SHELL_STOP_POLL_MS, deadline - now())));
         const status = (await provider.status(ctx, computer)) as AwsComputeStatus & { releaseHeal?: ReleaseHeal };

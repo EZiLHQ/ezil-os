@@ -59,13 +59,20 @@ describe('releaseHealOf: what the placement alone says about a pool-release heal
             expect(releaseHealOf(failedRelease({ lastError: recovery({ intent, error }) }))).toBe('pending');
         }
     });
-    it('failed: UNCONFIRMED with any other recovery error, a malformed context, or no job left to recover', () => {
+    it('pending: UNCONFIRMED with an intent-less recovery error (nothing replayed; the next pass re-evaluates the original job)', () => {
+        // A host still stopping (instance_identity) or a volume still detaching (volume_attachment) at the first pass.
+        for (const error of ['instance_identity', 'volume_attachment', 'termination_not_proven', 'execution_not_failed', 'placement_identity']) {
+            expect(releaseHealOf(failedRelease({ lastError: recovery({ error }) }))).toBe('pending');
+        }
+    });
+    it('failed: UNCONFIRMED after the replay ran (saved intent, non-transient error), a malformed context, or no job left to recover', () => {
         for (const error of ['recovery_retry_awaits_new_deployment', 'termination_not_proven', 'instance_identity', 'volume_identity',
-            'execution_not_failed', 'execution_authority', 'replay_identity', 'starter_missing']) {
-            expect(releaseHealOf(failedRelease({ lastError: recovery({ error }) }))).toBe('failed');
+            'execution_not_failed', 'execution_authority', 'replay_identity', 'starter_missing', 'receipt_identity']) {
+            expect(releaseHealOf(failedRelease({ lastError: recovery({ intent, sourceJobId: JOB, stoppedAt: null, error }) }))).toBe('failed');
         }
         expect(releaseHealOf(failedRelease({ lastError: 'pool_release_recovery:{not json' }))).toBe('failed');
         expect(releaseHealOf(failedRelease({ lastError: recovery({ error: 'execution_unavailable' }), lifecycleJobId: null }))).toBe('failed');
+        expect(releaseHealOf(failedRelease({ lastError: recovery({ error: 'instance_identity' }), lifecycleDigest: null }))).toBe('failed');
     });
 });
 
@@ -73,7 +80,8 @@ describe('releaseHeal: only the failed release of THIS switch, while it is stopp
     it('same generation and lease epoch, phase requested or stopping', () => {
         expect(releaseHeal(transition(), failedRelease())).toBe('pending');
         expect(releaseHeal(transition({ phase: 'requested', stoppingAt: null }), failedRelease())).toBe('pending');
-        expect(releaseHeal(transition(), failedRelease({ lastError: recovery({ error: 'termination_not_proven' }) }))).toBe('failed');
+        expect(releaseHeal(transition(), failedRelease({ lastError: recovery({ error: 'instance_identity' }) }))).toBe('pending');
+        expect(releaseHeal(transition(), failedRelease({ lastError: recovery({ intent, error: 'recovery_retry_awaits_new_deployment' }) }))).toBe('failed');
     });
     it('another epoch or generation, a waking or ended transition, or no placement: not this heal', () => {
         expect(releaseHeal(transition(), failedRelease({ leaseEpoch: 10 }))).toBeNull();

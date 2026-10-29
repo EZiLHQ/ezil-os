@@ -79,7 +79,9 @@ const RELEASE_SCRIPTS: Record<ReleaseScript, Record<string, Record<string, unkno
     },
     release_heal_fail: {
         DRAINING: { state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed', lifecycle_job_id: JOB, lifecycle_digest: 'd'.repeat(64) },
-        UNCONFIRMED: { last_error: POOL_RELEASE_RECOVERY_PREFIX + JSON.stringify({ error: 'termination_not_proven' }) },
+        // The replay ran and failed on this lifecycle version: aws-pool-release-recovery.ts keeps the saved intent (terminal).
+        UNCONFIRMED: { lifecycle_job_id: REPLAY_JOB, last_error: POOL_RELEASE_RECOVERY_PREFIX + JSON.stringify({ intent: { operation: 'release', jobId: REPLAY_JOB },
+            sourceJobId: JOB, stoppedAt: null, error: 'recovery_retry_awaits_new_deployment' }) },
     },
     // The recovery never advances past UNCONFIRMED (e.g. the terminated host is still shutting-down).
     release_stuck: {
@@ -87,7 +89,19 @@ const RELEASE_SCRIPTS: Record<ReleaseScript, Record<string, Record<string, unkno
     },
 };
 
-function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'capacity' | 'stuck' | 'unconfirmed' | 'warm'; stop?: 'ok' | 'never' | ReleaseScript } = {}) {
+/** Per-look scripts for heals whose row shapes repeat a state (UNCONFIRMED → UNCONFIRMED), applied one per status look. */
+type ReleaseSteps = 'release_flake_moving';
+const RELEASE_STEPS: Record<ReleaseSteps, Record<string, unknown>[]> = {
+    release_flake_moving: [
+        RELEASE_SCRIPTS.release_flake.DRAINING!,
+        // The first recovery pass finds the host still stopping: `fail('instance_identity')`, no intent, job and digest kept.
+        { last_error: POOL_RELEASE_RECOVERY_PREFIX + JSON.stringify({ error: 'instance_identity' }) },
+        RELEASE_SCRIPTS.release_flake.UNCONFIRMED!,
+        RELEASE_SCRIPTS.release_flake.RECOVERING!,
+    ],
+};
+
+function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'capacity' | 'stuck' | 'unconfirmed' | 'warm'; stop?: 'ok' | 'never' | ReleaseScript | ReleaseSteps } = {}) {
     const prepared = new Set<number>();
     const fake = createFakePlacementDb({ placements: [placementRow({
         computer_id: C, owner_user_id: U, state: 'RUNNING', generation: 3, lease_epoch: 7, region: 'ap-south-1', zone_id: 'aps1-az1',
@@ -110,9 +124,12 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
         async status() {
             calls.status++;
             const released = script.stop && script.stop in RELEASE_SCRIPTS ? RELEASE_SCRIPTS[script.stop as ReleaseScript] : null;
-            const next: Record<string, string> = script.stop === 'never' || released ? {} : { DRAINING: 'STOPPING', STOPPING: 'STOPPED' };
+            const steps = script.stop && script.stop in RELEASE_STEPS ? RELEASE_STEPS[script.stop as ReleaseSteps] : null;
+            const next: Record<string, string> = script.stop === 'never' || released || steps ? {} : { DRAINING: 'STOPPING', STOPPING: 'STOPPED' };
             Object.assign(next, { LEASED: 'STARTING', STARTING: 'MOUNTING', MOUNTING: 'RUNNING' });
-            if (released?.[p().state as string]) Object.assign(p(), released[p().state as string]);
+            const step = steps && ['DRAINING', 'UNCONFIRMED', 'RECOVERING'].includes(String(p().state)) ? steps.shift() : undefined;
+            if (step) Object.assign(p(), step);
+            else if (released?.[p().state as string]) Object.assign(p(), released[p().state as string]);
             else if (next[p().state as string]) p().state = next[p().state as string];
             // Like aws-ec2 `status`: the placement-only heal state, present only when there is one.
             const record = (await readPlacement(fake.db, C, U)).record;
@@ -321,6 +338,17 @@ describe('round 5 D2: a release that fails and heals during a switch (release_fl
         expect(s.stored()).toMatchObject({ phase: 'done', reason: null });
         expect(h.preference).toBe('cmp-4');
         expect(s.store.setSizePreference).toHaveBeenCalledTimes(1); // the switch's own write; never a revert
+    });
+    it('the first recovery pass finds the host still moving (intent-less instance_identity): still healing, then done on the target', async () => {
+        const s = harness({}, { stop: 'release_flake_moving' });
+        await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        await s.run();
+        expect(s.observed.reasons).toEqual(['stop_healing', 'stop_healing', 'stop_healing', null]);
+        expect(s.observed.preferences).toEqual(['cmp-4', 'cmp-4', 'cmp-4', 'cmp-4']);
+        expect(s.calls).toMatchObject({ stop: 1, leases: 1, leasedSizes: ['cmp-4'] });
+        expect(s.stored()).toMatchObject({ phase: 'done', reason: null });
+        expect(h.preference).toBe('cmp-4');
+        expect(s.store.setSizePreference).toHaveBeenCalledTimes(1); // never reverted mid-heal
     });
     it('a restart inherits it: heal, then the same size again', async () => {
         const s = harness({}, { stop: 'release_flake' });

@@ -585,15 +585,15 @@ describe('round 5 D2: releaseHealOf classifies the rows this recovery really wri
         expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED });
         expect(releaseHealOf(await s.current())).toBeNull();
     });
-    it('a transient read failure stays pending; a refused identity or a spent recovery is failed', async () => {
+    it('a transient read failure or a first-pass identity miss stays pending; a spent recovery (replay ran) is failed', async () => {
         const { releaseHealOf } = await import('./release-heal');
         const transient = setup(); transient.deps.describer!.describeVolume = async () => { throw new Error('lost'); };
         await transient.tick();
         expect(await transient.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('describe_unavailable') });
         expect(releaseHealOf(await transient.current())).toBe('pending');
-        const refused = setup(); refused.host.state = 'running'; await refused.tick();
-        expect(await refused.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('instance_identity') });
-        expect(releaseHealOf(await refused.current())).toBe('failed');
+        const moving = setup(); moving.host.state = 'running'; await moving.tick();
+        expect(await moving.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('instance_identity') });
+        expect(releaseHealOf(await moving.current())).toBe('pending');
         const spent = setup(); await spent.tick(); spent.finish('FAILED'); await spent.tick(); await spent.tick();
         expect(await spent.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('recovery_retry_awaits_new_deployment') });
         expect(releaseHealOf(await spent.current())).toBe('failed');
@@ -608,15 +608,14 @@ describe('round 5 D2: releaseHealOf classifies the rows this recovery really wri
     });
 });
 
-// LEAD DECISION OPEN (round 5 D2): the brief classifies every non-transient prefixed UNCONFIRMED error as `failed`, but an
-// error written WITHOUT a saved replay intent is re-evaluated on the next pass (the original job is still the placement's),
-// so it can still heal. This pins today's behaviour so a classifier change is a visible, deliberate edit.
-describe('round 5 D2 characterisation: an intent-less recovery error is retried on the next pass', () => {
-    it('a host still running at the first pass (instance_identity → releaseHealOf failed) recovers once it has stopped', async () => {
+// Round 5 D2 (review fix): an error written WITHOUT a saved replay intent is re-evaluated on the next pass (the original
+// job is still the placement's), so it can still heal: releaseHealOf keeps it pending (bounded by the 230 s stop bound).
+describe('round 5 D2: an intent-less recovery error is retried on the next pass, so the heal stays pending', () => {
+    it('a host still running at the first pass (instance_identity → releaseHealOf pending) recovers once it has stopped', async () => {
         const { releaseHealOf } = await import('./release-heal');
         const s = setup(); s.host.state = 'running'; await s.tick();
         expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('instance_identity') });
-        expect(releaseHealOf(await s.current())).toBe('failed');
+        expect(releaseHealOf(await s.current())).toBe('pending');
         s.host.state = 'stopped'; await s.tick();
         expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
     });

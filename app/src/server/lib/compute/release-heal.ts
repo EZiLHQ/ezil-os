@@ -35,8 +35,14 @@ function recoveryContext(lastError: string): { intent?: unknown; error?: unknown
  * once the recovery recorded a non-retryable error, null when the row is not a release heal.
  * - pending: UNCONFIRMED `failed:*` with job and digest (what the recovery accepts);
  *   RECOVERING with a replay intent (`isPoolReleaseRecovering`; its kept errors are retryable);
- *   UNCONFIRMED with the prefix, job and digest, and a transient error.
- * - failed: UNCONFIRMED with the prefix and any other error (one recovery per lifecycle version).
+ *   UNCONFIRMED with the prefix, job and digest, and a transient error;
+ *   UNCONFIRMED with the prefix, job and digest and NO saved replay intent: the recovery's first
+ *   evaluation found the resources still moving (e.g. instance_identity while the host is still
+ *   stopping, volume_attachment while the volume detaches). Nothing was replayed, so the next pass
+ *   re-evaluates the original job (aws-pool-release-recovery.ts `fail` keeps job and digest; the
+ *   one-recovery guard needs a saved intent). A deterministic one ends at the caller's 230 s bound.
+ * - failed: UNCONFIRMED with the prefix, a saved replay intent and a non-transient error (the replay
+ *   ran; one recovery per lifecycle version), a malformed context, or no job left to recover.
  */
 export function releaseHealOf(p: HealFields | null | undefined): ReleaseHeal {
     if (!p || p.provider !== 'aws-ec2' || (p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING')) return null;
@@ -46,7 +52,9 @@ export function releaseHealOf(p: HealFields | null | undefined): ReleaseHeal {
     if (!error.startsWith(POOL_RELEASE_RECOVERY_PREFIX)) return null;
     const context = recoveryContext(error);
     if (p.state === 'RECOVERING') return context?.intent ? 'pending' : null;
-    return job && typeof context?.error === 'string' && TRANSIENT_RECOVERY_ERRORS.includes(context.error) ? 'pending' : 'failed';
+    if (!job || !context) return 'failed';
+    if (!context.intent) return 'pending';
+    return typeof context.error === 'string' && TRANSIENT_RECOVERY_ERRORS.includes(context.error) ? 'pending' : 'failed';
 }
 
 /**

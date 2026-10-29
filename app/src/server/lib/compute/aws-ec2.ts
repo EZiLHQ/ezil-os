@@ -800,8 +800,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             p = settled.placement;
             const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p)
                 || await isStalledPoolAdoptPending(deps, p) ? 'starting' : isEnrollmentHostRetire(p) ? 'stopping' : AWS_STATE_FOR[p.state];
-            // Round 5 D2: a failed pool release being healed (release-heal.ts); present only when there is one.
-            const releaseHeal = releaseHealOf(p);
+            // Round 5 D2: a failed pool release being healed (release-heal.ts); present only when there is one. Only a
+            // pool-mode deployment heals one (reconcilePoolReleaseRecovery), so elsewhere the stop fails fast as before.
+            const healer = cfg.deployments[p.region ?? ''];
+            const releaseHeal = healer && isPoolMode(healer) ? releaseHealOf(p) : null;
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}),
                 ...(releaseHeal ? { releaseHeal } : {}) };
         },

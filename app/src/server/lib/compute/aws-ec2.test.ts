@@ -805,23 +805,42 @@ describe('round 5 D2: status reports a failed pool release being healed (release
     const JOB = '33333333-3333-4333-8333-333333333333';
     const failed = (over: Record<string, unknown> = {}) => stopped({ state: 'UNCONFIRMED', lease_epoch: 4, last_error: 'failed:LifecycleUnconfirmed',
         lifecycle_job_id: JOB, lifecycle_digest: 'd'.repeat(64), ...over });
-    it('UNCONFIRMED failed:* with its job: releaseHeal pending, the placement state unchanged', async () => {
+    /** Pool mode (aws-receipts.ts isPoolMode: ap-south-1 + mum), the only mode reconcilePoolReleaseRecovery heals in. */
+    const MUM = { ...DEPLOYMENTS['ap-south-1'], namespace: 'mum', stateMachineVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-mum-lifecycle:1' };
+    const mum = () => env({ [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': MUM }) });
+    /** An execution reader whose describe is lost: the recovery's pass records the transient execution_unavailable. */
+    const lostReader = () => ({ describe: vi.fn(async () => { throw new Error('lost'); }), history: vi.fn(async () => []) });
+    it('pool mode, UNCONFIRMED failed:* with its job: the status look runs the recovery (receipt pass) and reports releaseHeal pending', async () => {
+        const executions = lostReader();
+        const s = setup({ placements: [failed()] }, { e: mum(), executions });
+        expect(await s.provider.status(ctx, me)).toMatchObject({ ok: false, error: 'placement_unconfirmed', placementState: 'UNCONFIRMED', releaseHeal: 'pending' });
+        // status → reconcileOwn → applyLifecycleReceipt → reconcilePoolReleaseRecovery: the original release job was read.
+        expect(executions.describe).toHaveBeenCalledWith('ap-south-1', expect.stringContaining(JOB));
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: JOB,
+            last_error: 'pool_release_recovery:' + JSON.stringify({ error: 'execution_unavailable' }) });
+    });
+    it('pool mode, a recovery whose replay ran and recorded a non-retryable error: releaseHeal failed', async () => {
+        const s = setup({ placements: [failed({ last_error: 'pool_release_recovery:' + JSON.stringify({ intent: { operation: 'release' },
+            sourceJobId: JOB, stoppedAt: null, error: 'recovery_retry_awaits_new_deployment' }) })] }, { e: mum() });
+        expect(await s.provider.status(ctx, me)).toMatchObject({ placementState: 'UNCONFIRMED', releaseHeal: 'failed' });
+    });
+    it('pool mode: the field is the row the recovery pass left (a RECOVERING replay whose document is invalid ends failed)', async () => {
+        // A valid replay staying RECOVERING (pending) is driven end to end in aws-pool-release-recovery.test.ts.
+        const s = setup({ placements: [failed({ state: 'RECOVERING',
+            last_error: 'pool_release_recovery:' + JSON.stringify({ intent: { operation: 'release' }, sourceJobId: JOB, stoppedAt: null, error: null }) })] },
+        { e: mum(), executions: lostReader() });
+        expect(await s.provider.status(ctx, me)).toMatchObject({ placementState: 'UNCONFIRMED', releaseHeal: 'failed' });
+        expect(String(s.placements[0]!.last_error)).toContain('"error":"replay_invalid"');
+    });
+    it('not pool mode (pilot): nothing heals a failed release there, so the field is absent and a stop fails fast as before', async () => {
         const { provider } = setup({ placements: [failed()] });
-        expect(await provider.status(ctx, me)).toMatchObject({ ok: false, error: 'placement_unconfirmed', placementState: 'UNCONFIRMED', releaseHeal: 'pending' });
-    });
-    it('a recovery that recorded a non-retryable error: releaseHeal failed', async () => {
-        const { provider } = setup({ placements: [failed({ last_error: 'pool_release_recovery:{"error":"termination_not_proven"}' })] });
-        expect(await provider.status(ctx, me)).toMatchObject({ placementState: 'UNCONFIRMED', releaseHeal: 'failed' });
-    });
-    it('a RECOVERING release replay: releaseHeal pending (state starting, as before)', async () => {
-        const { provider } = setup({ placements: [failed({ state: 'RECOVERING',
-            last_error: 'pool_release_recovery:' + JSON.stringify({ intent: { operation: 'release' }, sourceJobId: JOB, stoppedAt: null, error: null }) })] });
-        expect(await provider.status(ctx, me)).toMatchObject({ state: 'starting', placementState: 'RECOVERING', releaseHeal: 'pending' });
+        expect(await provider.status(ctx, me)).toMatchObject({ ok: false, error: 'placement_unconfirmed', placementState: 'UNCONFIRMED' });
+        expect(await provider.status(ctx, me)).not.toHaveProperty('releaseHeal');
     });
     it('no heal: the field is absent (existing answers unchanged)', async () => {
-        const { provider } = setup({ placements: [stopped({ state: 'STOPPED', lease_epoch: 4 })] });
+        const { provider } = setup({ placements: [stopped({ state: 'STOPPED', lease_epoch: 4 })] }, { e: mum() });
         expect(await provider.status(ctx, me)).not.toHaveProperty('releaseHeal');
-        const other = setup({ placements: [failed({ lifecycle_job_id: null, lifecycle_digest: null })] });
+        const other = setup({ placements: [failed({ lifecycle_job_id: null, lifecycle_digest: null })] }, { e: mum() });
         expect(await other.provider.status(ctx, me)).not.toHaveProperty('releaseHeal');
     });
 });

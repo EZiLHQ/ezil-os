@@ -185,6 +185,8 @@ describe('round 5 D2: a failed pool release being healed keeps the switch in fli
     const replaying = (over: Partial<Placement> = {}) => failedRelease({ state: 'RECOVERING', lifecycleJobId: REPLAY_JOB,
         lastError: `pool_release_recovery:${JSON.stringify({ intent: { operation: 'release', jobId: REPLAY_JOB }, sourceJobId: JOB, stoppedAt: null, error: null })}`, ...over });
     const recoveryError = (error: string) => `pool_release_recovery:${JSON.stringify({ error })}`;
+    /** The replay ran and failed (saved intent kept): one recovery per lifecycle version, so terminal. */
+    const spentRecovery = (error: string) => `pool_release_recovery:${JSON.stringify({ intent: { operation: 'release', jobId: REPLAY_JOB }, sourceJobId: JOB, stoppedAt: null, error })}`;
     const limit = (TRANSITION_STOP_TIMEOUT_MS + TRANSITION_STOP_GRACE_MS) / 1000;
 
     it('the reasons are the pinned contract codes (SWITCH_HEAL_REASONS_V3)', () => {
@@ -200,9 +202,20 @@ describe('round 5 D2: a failed pool release being healed keeps the switch in fli
         expect(resolveTransition(transition(), failedRelease(), at(limit + 1))).toEqual({ phase: 'failed', reason: 'release_heal_timeout' });
         expect(resolveTransition(transition(), replaying(), at(limit + 1))).toEqual({ phase: 'failed', reason: 'release_heal_timeout' });
     });
-    it('a heal that fails is release_heal_failed at once (non-retryable)', () => {
+    it('the 230 s bound is measured from stoppingAt (a switch that waited in requested first is not cut short)', () => {
+        const late = transition({ stoppingAt: at(60).toISOString() });
+        expect(resolveTransition(late, failedRelease(), at(limit + 30))).toEqual({ phase: 'stopping', reason: 'stop_healing' });
+        expect(resolveTransition(late, failedRelease(), at(60 + limit + 1))).toEqual({ phase: 'failed', reason: 'release_heal_timeout' });
+    });
+    it('a heal that fails after its replay ran is release_heal_failed at once (non-retryable)', () => {
         for (const error of ['recovery_retry_awaits_new_deployment', 'termination_not_proven', 'instance_identity', 'execution_not_failed']) {
-            expect(resolveTransition(transition(), failedRelease({ lastError: recoveryError(error) }), at(40))).toEqual({ phase: 'failed', reason: 'release_heal_failed' });
+            expect(resolveTransition(transition(), failedRelease({ lastError: spentRecovery(error) }), at(40))).toEqual({ phase: 'failed', reason: 'release_heal_failed' });
+        }
+    });
+    it('an intent-less recovery error (resources still moving at the first pass) is still healing, up to the bound', () => {
+        for (const error of ['instance_identity', 'volume_attachment', 'termination_not_proven']) {
+            expect(resolveTransition(transition(), failedRelease({ lastError: recoveryError(error) }), at(40))).toEqual({ phase: 'stopping', reason: 'stop_healing' });
+            expect(resolveTransition(transition(), failedRelease({ lastError: recoveryError(error) }), at(limit + 1))).toEqual({ phase: 'failed', reason: 'release_heal_timeout' });
         }
     });
     it('not this switch\'s release: the existing UNCONFIRMED/RECOVERING failures are unchanged', () => {
@@ -233,14 +246,15 @@ describe('round 5 D2: a failed pool release being healed keeps the switch in fli
         }
     });
     it('describeProgress: a heal that failed or timed out holds for the operator as before', () => {
-        const failed = failedRelease({ lastError: recoveryError('termination_not_proven') });
+        const failed = failedRelease({ lastError: spentRecovery('termination_not_proven') });
         expect(describeProgress(C, failed, null, env, at(30), null, { transition: transitionView(transition(), resolveTransition(transition(), failed, at(30))) }))
             .toMatchObject({ stage: 'needs_operator', needsOperator: true, active: false, transition: { phase: 'failed', reason: 'release_heal_failed' } });
         expect(describeProgress(C, failedRelease(), null, env, at(limit + 1), null,
             { transition: transitionView(transition(), resolveTransition(transition(), failedRelease(), at(limit + 1))) }))
             .toMatchObject({ stage: 'needs_operator', needsOperator: true, transition: { phase: 'failed', reason: 'release_heal_timeout' } });
         // No transition: an UNCONFIRMED failed:* row alone is ambiguous (any failed job writes it) and still holds.
-        expect(describeProgress(C, failedRelease(), null, env, at(30))).toMatchObject({ stage: 'needs_operator', needsOperator: true });
+        expect(describeProgress(C, failedRelease(), null, env, at(30))).toMatchObject({ stage: 'needs_operator', needsOperator: true,
+            operation: 'none', recordedStage: 'unconfirmed' });
     });
     it('describeProgress: a plain Stop whose release is being replayed (RECOVERING with its intent) reads as stopping', () => {
         expect(describeProgress(C, replaying(), null, env, at(30))).toMatchObject({ stage: 'stopping', operation: 'stopping', needsOperator: false,
@@ -271,6 +285,25 @@ describe('round 5 D2: a failed pool release being healed keeps the switch in fli
             expect(resolved, time).toEqual(expected);
             const view = TRANSITION_IN_FLIGHT_PHASES.includes(resolved.phase) ? transitionView(t, resolved) : null;
             expect(describeProgress(C, p, null, env, T(time), null, { transition: view }), time).toMatchObject({ stage, needsOperator: false });
+        }
+    });
+    it('incident variant: the first recovery pass sees the host still moving (intent-less instance_identity), the next heals; never failed', () => {
+        const T = (iso: string) => new Date(`2026-10-29T${iso}Z`);
+        const t = transition({ current: 'std-2', target: 'cmp-4', fromGeneration: 4, fromLeaseEpoch: 11,
+            requestedAt: T('09:36:08.000').toISOString(), stoppingAt: T('09:36:08.050').toISOString() });
+        const base = { generation: 4, leaseEpoch: 11, instanceType: 'm6i.large', updatedAt: T('09:36:33.000') };
+        const steps: [string, Placement, { phase: string; reason: string | null }][] = [
+            ['09:36:33.500', failedRelease(base), { phase: 'stopping', reason: 'stop_healing' }],
+            // aws-pool-release-recovery.ts `fail('instance_identity')`: no saved intent, job and digest kept.
+            ['09:36:38.600', failedRelease({ ...base, lastError: recoveryError('instance_identity') }), { phase: 'stopping', reason: 'stop_healing' }],
+            ['09:36:43.700', replaying(base), { phase: 'stopping', reason: 'stop_healing' }],
+            ['09:36:49.000', placement({ ...base, state: 'STOPPED', lastError: 'pool_released' }), { phase: 'waking', reason: null }],
+        ];
+        for (const [time, p, expected] of steps) {
+            const resolved = resolveTransition(t, p, T(time));
+            expect(resolved, time).toEqual(expected);
+            expect(describeProgress(C, p, null, env, T(time), null, { transition: transitionView(t, resolved) }), time)
+                .toMatchObject({ stage: 'switching', needsOperator: false });
         }
     });
 });

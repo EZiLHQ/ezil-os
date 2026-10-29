@@ -713,6 +713,24 @@ describe('Codex 4277613545: the shell stop of an AWS computer answers only a CON
                 .toEqual({ ok: false, terminated: false, outcome: 'stop_healing' });
             expect(looks).toHaveLength(4);
         });
+        it.each([['placement_unconfirmed', 'UNCONFIRMED'], ['placement_recovering', 'RECOVERING']])(
+            'a Stop pressed while the heal is already under way (%s) waits through it too', async (outcome, state) => {
+                const { provider, looks, clock } = healing([[state, 'pending'], [state, 'pending'], ['STOPPED']], { ok: false, terminated: false, outcome });
+                expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, { ...clock, budgetMs: 200_000, pollMs: 5_000 }))
+                    .toEqual({ ok: true, terminated: true, outcome: 'destroyed' });
+                expect(looks).toEqual([`${state}:pending`, `${state}:pending`, 'STOPPED']);
+            });
+        it('a Stop pressed mid-heal whose budget runs out answers stop_healing; a row with no heal (or a failed one) keeps the refusal, one look', async () => {
+            const stuck = healing([], { ok: false, terminated: false, outcome: 'placement_unconfirmed' });
+            expect(await confirmAwsStop(stuck.provider, { correlationId: 'c' }, computer, { ...stuck.clock, budgetMs: 20_000, pollMs: 5_000 }))
+                .toEqual({ ok: false, terminated: false, outcome: 'stop_healing' });
+            for (const look of [['UNCONFIRMED'], ['UNCONFIRMED', 'failed'], ['RECOVERING']] as [string, ('pending' | 'failed')?][]) {
+                const first = { ok: false, terminated: false, outcome: `placement_${look[0].toLowerCase()}` };
+                const h = healing([look], first);
+                expect(await confirmAwsStop(h.provider, { correlationId: 'c' }, computer, h.clock)).toEqual(first);
+                expect(h.looks).toHaveLength(1);
+            }
+        });
         it('UNCONFIRMED or RECOVERING with no heal is the unchanged failure', async () => {
             const a = healing([['UNCONFIRMED']]);
             expect(await confirmAwsStop(a.provider, { correlationId: 'c' }, computer, a.clock))
