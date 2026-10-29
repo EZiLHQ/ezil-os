@@ -39,11 +39,17 @@ or live check restores the previous Worker version and Vercel deployment and,
 when the image changed, restores the captured container image and waits for its
 rollout. Recovery uses `previous-release.json`, uploaded before mutation; SQL is
 never reversed. Recovery failures remain visible and fail the run. Live-check
-and recovery evidence is uploaded on every run. PR CI runs on
+and recovery evidence is uploaded by every staging and production deployment
+run. PR CI runs on
 Ubuntu; `preview.yml` also supports manual dispatch on `preview` or `main`,
 and the macOS workflows remain available manually. Container images build
-only when their inputs change; other pushes leave the container rollout
-disabled. `preview.yml` keeps the shared `IMAGE_INPUTS` list, checked against
+only when their inputs differ from the image source in the branch's newest
+deployment receipt: the `live-evidence` artifact of a successful staging deploy
+on `preview`, or of a production dispatch on `main`. Otherwise the container
+rollout stays disabled. Main pushes and dispatches without `deploy_production`
+deploy nothing and leave no receipt, so after an image-input change every main
+push rebuilds and tests the images until a production dispatch deploys them.
+An expired newest receipt also rebuilds. `preview.yml` keeps the shared `IMAGE_INPUTS` list, checked against
 `image-plan.mjs` and every local `worker/Dockerfile` COPY/ADD source. Manual
 dispatch on branches and new branches rebuild images conservatively.
 
