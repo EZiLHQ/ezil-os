@@ -32,9 +32,21 @@ export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void
             });
             if (error) throw new Auth0Error('session_failed');
         }
+        // Round 5 D1: the caller verified this email at Auth0, so confirm the Supabase copy
+        // (GoTrue omits email_confirmed_at when unset). Otherwise enrollment refuses with
+        // email_unconfirmed. Best effort: a failure never blocks the sign-in.
+        if (!user.email_confirmed_at) {
+            try {
+                const { error } = await admin.updateUserById(user.id, { email_confirm: true });
+                if (error) console.warn('[auth0] email confirmation unavailable');
+            } catch {
+                console.warn('[auth0] email confirmation unavailable');
+            }
+        }
     }
     // The guarded SQL updates JWT app metadata before GoTrue mints the session.
-    // Enrollment is best effort; it never replaces the link or OTP checks below.
+    // Enrollment is best effort (coded `ai-enroll` log); it never replaces the link or OTP
+    // checks below. On success it also wakes this user's outbox rows waiting on the account.
     await enrollStagingAiMember(user.id, identity.sub);
     const { data, error } = await admin.generateLink({ type: 'magiclink', email });
     if (error || !data?.properties?.hashed_token || data.user?.id !== user.id

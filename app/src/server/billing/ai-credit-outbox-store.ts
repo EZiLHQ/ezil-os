@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { AI_CREDIT_PROTOCOL } from './ai-credits';
-import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, isAiDeliveryDependency, planAiCreditRequeue,
-    plannedAiCreditEvent, type AiCreditOutboxRow, type AiCreditOutboxStore, type AiCreditRequeueCandidate,
-    type AiCreditRequeueInput, type AiCreditRequeueResult } from './ai-credit-outbox';
+import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, AI_ENROLL_ADMIN_READ_MS, isAiAccountDependency, isAiDeliveryDependency,
+    planAiCreditRequeue, plannedAiCreditEvent, type AiCreditOutboxRow, type AiCreditOutboxStore, type AiCreditRequeueCandidate,
+    type AiCreditRequeueInput, type AiCreditRequeueResult, type AiEnrollForResult } from './ai-credit-outbox';
 
 type Database = typeof import('@/server/db').db;
 
@@ -19,17 +19,84 @@ export function missingAiAccountView(error: unknown): boolean {
     return false;
 }
 
-export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: string): Promise<string | null> {
+/**
+ * The Works AI member public id. A missing schema/view reads as "no account" for delivery; with
+ * `strict` it is rethrown so callers that must not confuse "no Works view here" with "not a member"
+ * (round 5 D1 enrollment state) can tell them apart.
+ */
+export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: string, options: { strict?: boolean } = {}): Promise<string | null> {
     try {
         const rows = await db.execute<{ public_id: string | null }>(
             sql`select public_id from ezil_works.ai_members where auth_user_id = ${userId}::uuid limit 1`,
         );
         return rows[0]?.public_id || null;
     } catch (error) {
-        if (missingAiAccountView(error)) return null;
+        if (!options.strict && missingAiAccountView(error)) return null;
         throw error;
     }
 }
+
+/**
+ * Round 5 D1 drain-side enrollment (the store's `enrollFor`). Reads the OS user through the existing
+ * Supabase admin API and enrolls with the STORED `app_metadata.auth0_sub`; the SQL function
+ * re-verifies it against the auth user (D1 trust model: app_metadata is service-role-writable only).
+ * - off staging (no ai-staging funding origin / DB URL): `unavailable:disabled`, no admin read;
+ * - no stored subject: `needs_ezil_id`, no DB client;
+ * - a stored subject with an unconfirmed Supabase email: confirmed through the admin API first (as the
+ *   bridge does at sign-in). The bridge stores a subject only after Auth0 verified this email (auth0.ts
+ *   requires email_verified), and a pre-round-5 link could leave the copy unconfirmed, which the SQL
+ *   refuses (email_unconfirmed) forever. A failed confirm is `unavailable:<code>`, never a refusal;
+ * - otherwise `enrollAiMember(userId, sub, 'outbox')` mapped to enrolled | refused:<code> | unavailable:<code>.
+ * The admin read and the confirm share one 2 s window (AI_ENROLL_BUDGET_MS is unchanged). Never throws;
+ * fixed codes only. Server-only modules load lazily so the drain and its tests never import them eagerly.
+ */
+export async function enrollWithStoredSubject(userId: string): Promise<AiEnrollForResult> {
+    const [{ createAdminClient }, enrollment] = await Promise.all([
+        import('@/server/auth/supabase-admin'), import('@/server/auth/staging-ai-enrollment')]);
+    if (!enrollment.aiEnrollmentConfigured()) return 'unavailable:disabled';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let sub: string;
+    try {
+        const adminWindow = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), AI_ENROLL_ADMIN_READ_MS); });
+        const admin = createAdminClient().auth.admin;
+        const response = await Promise.race([admin.getUserById(userId), adminWindow]);
+        if (response === 'timeout') return 'unavailable:timeout';
+        if (response.error) return response.error.status === 404 ? 'refused:user_not_found' : 'unavailable:connect_failed';
+        const user: { app_metadata?: Record<string, unknown> | null; email_confirmed_at?: string | null } | null = response.data.user;
+        if (!user) return 'refused:user_not_found';
+        const stored = user.app_metadata?.auth0_sub;
+        if (typeof stored !== 'string' || stored.length === 0) return 'needs_ezil_id';
+        sub = stored;
+        if (!user.email_confirmed_at) {
+            const confirmed = await Promise.race([admin.updateUserById(userId, { email_confirm: true }), adminWindow]);
+            if (confirmed === 'timeout') return 'unavailable:timeout';
+            if (confirmed.error) return 'unavailable:connect_failed';
+        }
+    } catch {
+        return 'unavailable:connect_failed';
+    } finally {
+        clearTimeout(timer);
+    }
+    const result = await enrollment.enrollAiMember(userId, sub, 'outbox');
+    if (result.ok) return 'enrolled';
+    return enrollment.isAiEnrollRefusal(result.code) ? `refused:${result.code}` : `unavailable:${result.code}`;
+}
+
+/**
+ * Round 5 D1 "kick": after a successful enrollment (EZiL ID sign-in or the drain), in its own
+ * transaction, wake that user's undelivered rows
+ * that wait on the AI account ($1 user uuid, $2 now in epoch ms, $3 the protocol). Only `retry` rows
+ * whose last error is an account dependency move; `processing` rows (held by a worker) are never
+ * touched, and `attempts` and every other delivery field stay as they are, so the claim/finish fences
+ * (attempts + the delivery JSON) keep working. Under READ COMMITTED a row that a concurrent claim just
+ * turned into `processing` fails the re-checked status and is skipped. Run with app privileges.
+ */
+export const AI_CREDIT_KICK_SQL = `update public.ezil_billing_outbox
+    set payload = jsonb_set(payload, '{delivery,nextAttemptAt}', to_jsonb($2::bigint))
+    where user_id = $1::uuid and delivered_at is null
+        and payload->>'protocol' = $3
+        and payload->'delivery'->>'status' = 'retry'
+        and last_error in ('no_ai_account', 'account_not_found')`;
 
 /** Delivery metadata lives under payload.delivery; the six wire fields are immutable.
  * One atomic claim commits before HTTP. A 30 s lease recovers crashed workers;
@@ -128,6 +195,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
                     ...(dependencyWaits > 0 ? { dependencyWaits } : {}),
                     ...(result.outcome ? { outcome: result.outcome } : {}),
                     ...(result.reviewRequired ? { reviewRequired: true } : {}),
+                    ...(result.blockedBy ? { blockedBy: result.blockedBy } : {}),
                 })}::text)::jsonb), last_error = ${result.reason},
                     delivered_at = ${result.status === 'done' ? new Date(now).toISOString() : null}::timestamptz
                 where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
@@ -135,17 +203,20 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
             `);
         },
         requeueFailed: input => requeueFailedAiCredits(db, input),
+        enrollFor: enrollWithStoredSubject,
         async receiptsFor(userId) {
-            const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown }>(sql`
+            const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown; failed: unknown }>(sql`
                 select payload->>'entitlementId' as "entitlementId", payload->'credits' as credits,
-                    payload->>'expiresAt' as "expiresAt", delivered_at as "deliveredAt"
+                    payload->>'expiresAt' as "expiresAt", delivered_at as "deliveredAt",
+                    payload->'delivery'->>'status' = 'failed' as failed
                 from ezil_billing_outbox where user_id = ${userId}::uuid and kind = 'ai_grant'
                     and payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
                 order by created_at desc, id limit 200`);
             return rows.flatMap(row => typeof row.entitlementId === 'string' && typeof row.credits === 'number'
                 && Number.isSafeInteger(row.credits) && typeof row.expiresAt === 'string' && Number.isFinite(Date.parse(row.expiresAt))
                 ? [{ entitlementId: row.entitlementId, credits: row.credits, expiresAt: new Date(row.expiresAt).toISOString(),
-                    deliveredAt: row.deliveredAt == null ? null : new Date(row.deliveredAt as string | Date).toISOString() }] : []);
+                    deliveredAt: row.deliveredAt == null ? null : new Date(row.deliveredAt as string | Date).toISOString(),
+                    ...(row.failed === true ? { failed: true as const } : {}) }] : []);
         },
     };
 }

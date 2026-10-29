@@ -3,20 +3,74 @@ import 'server-only';
 import { Socket } from 'node:net';
 import postgres from 'postgres';
 
-import { aiCreditEntitlement, aiCreditOutboxItem } from '@/server/billing/ai-credits';
+import { AI_CREDIT_PROTOCOL, aiCreditEntitlement, aiCreditOutboxItem } from '@/server/billing/ai-credits';
+import { AI_CREDIT_KICK_SQL } from '@/server/billing/ai-credit-outbox-store';
 import { readBillingConfig } from '@/server/billing/config';
 
 const WORK_MS = 5_000;
 const CLOSE_MS = 1_000;
 const CONNECT_MS = 2_000;
 
+/**
+ * The fixed refusal vocabulary of `ezil_works.enroll_ai_member(uuid,text)`: gw-ui
+ * scripts/os-staging/sql/20_enroll_members.sql (41cc53c, lines 62-97) returns `{ok:false, error}`
+ * with exactly these codes. Any other result maps to `unknown_refusal`.
+ */
+export const AI_ENROLL_SQL_REFUSALS = [
+    'user_not_found', 'email_unconfirmed', 'subject_mismatch', 'user_banned', 'user_deleted', 'anonymous_user', 'public_id_collision',
+] as const;
+/** OS-side failure codes: install/transport problems, not the member's eligibility. */
+export const AI_ENROLL_UNAVAILABLE = ['set_role_failed', 'probe_failed', 'timeout', 'connect_failed', 'enqueue_failed', 'disabled'] as const;
+export type AiEnrollRefusal = typeof AI_ENROLL_SQL_REFUSALS[number] | 'unknown_refusal';
+export type AiEnrollCode = AiEnrollRefusal | typeof AI_ENROLL_UNAVAILABLE[number];
+export type AiEnrollSource = 'auth0' | 'outbox';
+export type AiEnrollResult = { ok: true } | { ok: false; code: AiEnrollCode };
+type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'kick' | 'enqueue' | 'done';
+
+const SQL_REFUSALS: ReadonlySet<string> = new Set(AI_ENROLL_SQL_REFUSALS);
+export const isAiEnrollRefusal = (code: AiEnrollCode): code is AiEnrollRefusal => SQL_REFUSALS.has(code) || code === 'unknown_refusal';
+
+/** The staging-only gate (no client is opened otherwise): the exact ai-staging funding origin and the existing DB URL. */
+export function aiEnrollmentConfigured(): boolean {
+    try {
+        const { fundingUrl } = readBillingConfig();
+        return Boolean(fundingUrl && new URL(fundingUrl).origin === 'https://ai-staging.ezil.work' && process.env.SUPABASE_DATABASE_URL);
+    } catch {
+        return false;
+    }
+}
+
+class EnrollFailure extends Error {
+    constructor(readonly code: AiEnrollCode) { super(code); }
+}
+
 type SocketAddress = { host: string[]; port: number[]; path?: string };
 
-/** Called only after linking an identity whose Auth0 ID token has been verified. */
-export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub: string): Promise<void> {
+/**
+ * Enrolls the OS user as an AI Gateway member, then kicks this user's outbox rows that wait on the
+ * AI account (no Free receipt). `sub` must be the user's Auth0 subject: freshly verified at sign-in,
+ * or the stored `app_metadata.auth0_sub` (round 5 D1; the SQL function re-checks it against the auth
+ * user). Never throws; logs one coded `ai-enroll` line.
+ */
+export function enrollAiMember(authUserId: string, sub: string, source: AiEnrollSource): Promise<AiEnrollResult> {
+    return runEnrollment(authUserId, sub, source, false);
+}
+
+/**
+ * Sign-in enrollment, called only after linking an identity whose Auth0 ID token has been verified:
+ * enrolls, kicks this user's outbox rows that wait on the AI account so they deliver on the next
+ * sweep, then (same owned client, app privileges) enqueues the Free receipt.
+ */
+export function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub: string): Promise<AiEnrollResult> {
+    return runEnrollment(authUserId, verifiedAuth0Sub, 'auth0', true);
+}
+
+async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSource, afterSignIn: boolean): Promise<AiEnrollResult> {
     let client: postgres.Sql | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let stopped = false;
+    let timedOut = false;
+    let stage: Stage = 'config';
     const sockets = new Set<Socket>();
     const deadline = performance.now() + WORK_MS;
     const unavailable = () => new Error('staging_enrollment_unavailable');
@@ -53,11 +107,11 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
         });
     }
 
+    let result: AiEnrollResult;
     try {
-        const { fundingUrl } = readBillingConfig();
-        if (!fundingUrl || new URL(fundingUrl).origin !== 'https://ai-staging.ezil.work') return;
-        const databaseUrl = process.env.SUPABASE_DATABASE_URL;
-        if (!databaseUrl) return;
+        if (!aiEnrollmentConfigured()) throw new EnrollFailure('disabled');
+        const databaseUrl = process.env.SUPABASE_DATABASE_URL!;
+        stage = 'connect';
 
         // One invocation, one client, no shared acquisition queue. The socket
         // option is supported by postgres.js but absent from its bundled types.
@@ -88,9 +142,11 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
                 throw error;
             }
         }
-        async function enrollAndEnqueue() {
+        async function enroll() {
             const enrollment = await transaction(async () => {
+                stage = 'role';
                 await query('set local role ezil_os_ai_enroller');
+                stage = 'probe';
                 const callers = await query<{ allowed: boolean }[]>(`
                     select exists (
                         select 1 from pg_catalog.pg_roles r
@@ -103,22 +159,38 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
                             and a.grantee = r.oid and a.privilege_type = 'EXECUTE'
                     ) as allowed
                 `);
-                if (callers[0]?.allowed !== true) return null;
+                if (callers[0]?.allowed !== true) throw new EnrollFailure('probe_failed');
+                stage = 'enroll';
                 // G4 owns confirmation, exact subject binding, bans/deletion/
                 // anonymous checks and unchanged member role/public ID/suspension.
-                const rows = await query<{ enrollment: { ok: boolean } | null }[]>(
+                const rows = await query<{ enrollment: { ok?: unknown; error?: unknown } | null }[]>(
                     'select ezil_works.enroll_ai_member($1::uuid, $2::text) as enrollment',
-                    [authUserId, verifiedAuth0Sub],
+                    [authUserId, sub],
                 );
                 return rows[0]?.enrollment;
             });
-            if (enrollment?.ok !== true) throw unavailable();
-
+            if (enrollment?.ok !== true) {
+                const error = enrollment?.ok === false && typeof enrollment.error === 'string' ? enrollment.error : '';
+                throw new EnrollFailure(SQL_REFUSALS.has(error) ? error as AiEnrollRefusal : 'unknown_refusal');
+            }
             // COMMIT reset the local role. Use the original app privileges on
-            // this same owned client; enqueue failure preserves the enrollment.
+            // this same owned client from here on.
+            // Round 5 D1 kick: wake this user's rows waiting on the AI account (every source, so a
+            // drain enrollment wakes sibling rows parked as needs_ezil_id). Its own transaction, before
+            // and independent of the Free receipt, so a receipt failure never rolls it back. Best
+            // effort: a failure leaves those rows on their schedule and never fails the enrollment
+            // (the deadline still applies: it rejects the race on its own).
+            stage = 'kick';
+            const now = new Date();
+            await transaction(() => query(AI_CREDIT_KICK_SQL, [authUserId, String(now.getTime()), AI_CREDIT_PROTOCOL]))
+                .catch(() => {});
+            if (!afterSignIn) return;
+
+            // Enqueue failure preserves the enrollment and the kick.
+            stage = 'enqueue';
             const entitlement = aiCreditEntitlement({
                 userId: authUserId, sku: 'free_v3', subscriptionId: null,
-                periodStart: new Date(), periodEnd: null, invoiceId: null,
+                periodStart: now, periodEnd: null, invoiceId: null,
             });
             const item = aiCreditOutboxItem(authUserId, entitlement, 'grant', null);
             await transaction(async () => {
@@ -132,14 +204,16 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
         const expired = new Promise<never>((_, reject) => {
             deadlineTimer = setTimeout(() => {
                 stopped = true;
+                timedOut = true;
                 destroySockets();
                 reject(unavailable());
             }, Math.max(0, deadline - performance.now()));
         });
-        await Promise.race([enrollAndEnqueue(), expired]);
-    } catch {
-        // Never log database/provider detail, identity values or credentials.
-        console.warn('[auth0] staging AI enrollment unavailable');
+        await Promise.race([enroll(), expired]);
+        stage = 'done';
+        result = { ok: true };
+    } catch (error) {
+        result = { ok: false, code: failureCode(error, stage, timedOut) };
     } finally {
         stopped = true;
         clearTimeout(deadlineTimer);
@@ -159,5 +233,24 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
                 ]);
             } finally { clearTimeout(closeTimer); }
         }
+    }
+    // One line per attempt. Fixed codes only: never ids, the subject, DB/provider text or credentials.
+    const line = JSON.stringify({ event: 'ai-enroll', source, stage, code: result.ok ? null : result.code });
+    if (result.ok) console.info(line);
+    else console.warn(line);
+    return result;
+}
+
+function failureCode(error: unknown, stage: Stage, timedOut: boolean): AiEnrollCode {
+    if (timedOut) return 'timeout';
+    if (error instanceof EnrollFailure) return error.code;
+    switch (stage) {
+        case 'config': return 'disabled';
+        case 'connect': return 'connect_failed';
+        case 'role': return 'set_role_failed';
+        case 'probe': return 'probe_failed';
+        case 'enqueue': return 'enqueue_failed';
+        // A thrown function call or enroll COMMIT: the member state is unknown, not an install problem.
+        default: return 'unknown_refusal';
     }
 }

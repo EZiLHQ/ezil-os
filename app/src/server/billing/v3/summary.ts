@@ -18,6 +18,17 @@ import type { AiCreditReceipt } from '../ai-credit-outbox';
 import { creditNumber } from '../ai-read';
 
 const iso = (date: Date) => isoSeconds(epochSeconds(date));
+
+/**
+ * Round 5 D1: whole credits granted to an account that is not enrolled yet: stored grant receipts the
+ * Gateway has not acknowledged, that have not expired and whose delivery has not failed terminally.
+ * null when nothing waits or receipts are unreadable.
+ */
+function waitingCredits(receipts: readonly AiCreditReceipt[] | null, now: Date): { credits: number } | null {
+    const credits = (receipts ?? []).reduce((sum, receipt) => receipt.deliveredAt === null && !receipt.failed
+        && Date.parse(receipt.expiresAt) > now.getTime() ? sum + receipt.credits : sum, 0);
+    return credits > 0 ? { credits } : null;
+}
 const sellable = (sku: string | null): sku is SellableSkuV3 => sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3';
 
 /** Standard seconds, using v2's validated epoch weights and session bounds. */
@@ -152,6 +163,12 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null };
     /** Round 4: any aws-ec2 placement among the user's live computers; null/omitted = none or unreadable. */
     placementProvider?: 'aws-ec2' | 'cloudflare' | null;
+    /**
+     * Round 5 D1: whether the account can receive AI credits (from the Works member lookup and the
+     * stored EZiL ID subject, never the Gateway) and the EZiL ID sign-in link (null when EZiL ID
+     * sign-in is off). Omitted = `enrolled`, no link (the W0 default).
+     */
+    enrollment?: { state: BillingSummaryV3['ai']['enrollment']; ezilIdUrl: string | null };
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
@@ -197,6 +214,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     )) : null;
     const disk = storageDisk(plan, size.code, input.storage, input.config.largeStorageEnabled);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
+    const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
         enabled: true, version: 3,
         plan: { sku: plan.sku, name: plan.sku === 'legacy' ? plan.offer.family === 'pro_legacy' ? 'Pro (legacy)'
@@ -213,16 +231,18 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
-            enrollment: 'enrolled', waiting: null,
+            enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
         storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
-        actions: { checkout: enabled && plan.family === 'free', topup: enabled,
+        // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
+        actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
             upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
-            portal: enabled && input.hasCustomer, ezilId: null },
+            portal: enabled && input.hasCustomer,
+            ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         catalog: { version: CATALOG_V3_VERSION, offers: publicOffers(),
             packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
                 sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),

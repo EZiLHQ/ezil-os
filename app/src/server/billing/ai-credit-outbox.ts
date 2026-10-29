@@ -14,14 +14,41 @@ export interface AiCreditOutboxRow {
 export interface AiCreditDelivery {
     status: 'done' | 'failed' | 'retry'; reason: string | null; nextAttemptAt?: number;
     outcome?: AiRestoreOutcome; reviewRequired?: boolean;
+    /** Round 5 D1: why a `no_ai_account` wait is still blocked (the drain's enrollment result); stored as delivery.blockedBy. */
+    blockedBy?: AiEnrollForResult;
 }
-/** A user's stored AI grant receipt: the frozen wire terms and whether the Gateway acknowledged it. */
-export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null }
+/**
+ * Round 5 D1 drain-side enrollment result (fixed codes only):
+ * `enrolled`; `needs_ezil_id` (no EZiL ID linked: parked 24 h, woken by the sign-in kick);
+ * `refused:<SQL refusal | email_unconfirmed | user_not_found>`; `unavailable:<OS-side code>`.
+ */
+export type AiEnrollForResult = 'enrolled' | 'needs_ezil_id' | `refused:${string}` | `unavailable:${string}`;
+/** At most this many enrollment attempts per drain pass (each user at most once). */
+export const AI_ENROLL_MAX_PER_PASS = 3;
+/**
+ * Worst-case enrollFor time: the admin read and any email confirm (one shared 2 s window) + the owned-client work (5 s,
+ * staging-ai-enrollment.ts WORK_MS) + close (1 s) + 1 s margin. The drain enrolls only while this
+ * plus one Gateway request (10 s + 1 s) still fits before the deadline, i.e. with >= 20 s left.
+ */
+export const AI_ENROLL_BUDGET_MS = 9_000;
+export const AI_ENROLL_ADMIN_READ_MS = 2_000;
+/** needs_ezil_id rows wait a day (not hourly); a successful EZiL ID sign-in kicks them at once. */
+export const AI_NEEDS_EZIL_ID_PARK_MS = 24 * 3_600_000;
+/**
+ * A user's stored AI grant receipt: the frozen wire terms and whether the Gateway acknowledged it.
+ * `failed` (round 5 D1): delivery ended terminally (never "waiting"; an operator requeue clears it).
+ */
+export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null; failed?: true }
 export interface AiCreditOutboxStore {
     claim(now: number): Promise<AiCreditOutboxRow | null>;
     accountFor(row: AiCreditOutboxRow): Promise<string | null>;
     pinAccount(row: AiCreditOutboxRow, accountPublicId: string): Promise<boolean>;
     finish(row: AiCreditOutboxRow, result: AiCreditDelivery, now: number): Promise<void>;
+    /**
+     * Round 5 D1 (optional): try to enroll the user as an AI member with the stored EZiL ID subject.
+     * Must not throw (the drain maps a throw to `unavailable:connect_failed`).
+     */
+    enrollFor?(userId: string): Promise<AiEnrollForResult>;
     /** Newest first, at most 200 grant receipts of one user (read-only; splits the balance by bucket). */
     receiptsFor?(userId: string): Promise<AiCreditReceipt[]>;
     /** Operator-only (D5): dry run unless `apply`; see `planAiCreditRequeue`. */
@@ -88,12 +115,26 @@ export async function drainAiCreditOutbox(deps: {
     if (!store) return counts;
     const clock = deps.clock ?? Date.now;
     const hasTime = () => deadlineMs - clock() >= AI_GATEWAY_TIMEOUT_MS + 1_000;
+    // Round 5 D1: one enrollment attempt per user per pass, at most AI_ENROLL_MAX_PER_PASS per pass.
+    const enrolledThisPass = new Map<string, AiEnrollForResult>();
+    const enrollOnce = async (userId: string): Promise<AiEnrollForResult | 'deferred'> => {
+        const known = enrolledThisPass.get(userId);
+        if (known) return known;
+        if (enrolledThisPass.size >= AI_ENROLL_MAX_PER_PASS
+            || deadlineMs - clock() < AI_GATEWAY_TIMEOUT_MS + 1_000 + AI_ENROLL_BUDGET_MS) return 'deferred';
+        let result: AiEnrollForResult;
+        try { result = await store.enrollFor!(userId); }
+        catch { result = 'unavailable:connect_failed'; }
+        enrolledThisPass.set(userId, result);
+        return result;
+    };
     for (let i = 0; i < Math.min(200, Math.max(0, Math.floor(limit))); i++) {
         if (!hasTime()) break;
         const row = await store.claim(clock());
         if (!row) break;
         counts.claimed++;
         let result: AiCreditDelivery;
+        let enroll: AiEnrollForResult | 'deferred' | undefined;
         const event = plannedAiCreditEvent(row);
         if (row.exhausted) result = { status: 'failed', reason: 'attempts_exhausted' };
         else if (!event) result = { status: 'failed', reason: 'invalid_payload', ...(row.kind === 'ai_restore' ? { reviewRequired: true } : {}) };
@@ -103,9 +144,20 @@ export async function drainAiCreditOutbox(deps: {
         else if (event.action === 'grant' && Date.parse(event.expiresAt) <= clock()) result = { status: 'failed', reason: 'expired' };
         else {
             try {
-                const account = typeof row.payload.accountPublicId === 'string' ? row.payload.accountPublicId : await store.accountFor(row);
+                let account = typeof row.payload.accountPublicId === 'string' ? row.payload.accountPublicId : await store.accountFor(row);
+                // Round 5 D1: a grant waiting on the account tries enrollment (stored EZiL ID subject) and,
+                // once enrolled, continues to pin/send in this pass. The reason stays no_ai_account.
+                if (!account && event.action === 'grant' && store.enrollFor) {
+                    enroll = await enrollOnce(row.userId);
+                    if (enroll === 'enrolled') account = await store.accountFor(row);
+                }
+                // A sign-in can link, enroll and kick while this row is processing (the kick skips
+                // processing rows): re-read the account before parking it for a day (lost wakeup).
+                if (!account && enroll === 'needs_ezil_id') account = await store.accountFor(row);
                 if (!account) {
-                    result = { status: 'retry', reason: 'no_ai_account' };
+                    result = { status: 'retry', reason: 'no_ai_account',
+                        ...(enroll && enroll !== 'deferred' ? { blockedBy: enroll } : {}),
+                        ...(enroll === 'needs_ezil_id' ? { nextAttemptAt: clock() + AI_NEEDS_EZIL_ID_PARK_MS } : {}) };
                     counts.skipped++;
                 } else if (!hasTime() || !await store.pinAccount(row, account) || !hasTime()) {
                     result = { status: 'retry', reason: 'deadline_or_lease' };
@@ -128,12 +180,12 @@ export async function drainAiCreditOutbox(deps: {
             if (!isAiDeliveryDependency(result.reason) && row.attempts - (row.dependencyWaits ?? 0) >= AI_CREDIT_MAX_ATTEMPTS) {
                 result = { status: 'failed', reason: 'attempts_exhausted' };
             }
-            else result.nextAttemptAt = clock() + aiCreditBackoffMs(row.attempts);
+            else result.nextAttemptAt ??= clock() + aiCreditBackoffMs(row.attempts);
         }
         await store.finish(row, result, clock());
         // One structured line per finished delivery (ids and fixed codes only, never payload values).
         console.info(JSON.stringify({ event: 'ai-outbox', eventKey: row.eventKey, status: result.status,
-            attempts: row.attempts, reason: result.reason }));
+            attempts: row.attempts, reason: result.reason, ...(enroll ? { enroll } : {}) }));
         counts[result.status]++;
     }
     return counts;

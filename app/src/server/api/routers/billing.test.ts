@@ -15,6 +15,8 @@ import { upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
+const auth0 = vi.hoisted(() => ({ enabled: vi.fn(() => true) }));
+vi.mock('@/server/auth/auth0', () => ({ auth0Enabled: auth0.enabled }));
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
 vi.mock('@/server/billing/deps', () => ({
@@ -169,7 +171,8 @@ function fixture() {
         headers: new Headers({ origin: 'https://os.ezil.work' }),
         user: { id: userId, email: 'fixture@example.org', aud: 'authenticated', app_metadata: {}, user_metadata: {}, created_at: now.toISOString() },
     };
-    const router = createBillingRouter(() => deps);
+    // Round 5 D1: the fixture user is a Gateway member unless a test says otherwise.
+    const router = createBillingRouter(() => deps, { aiMember: async () => 'works-member-fixture' });
     return { deps, store, stripe, ctx, router, changes, caller: router.createCaller(ctx) };
 }
 
@@ -1262,5 +1265,84 @@ describe('round 4: the computer standing in the summary', () => {
         execute.mockRejectedValueOnce(new Error('relation missing'));
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
         expect(warn).toHaveBeenCalledWith('[billing.summary] placement unavailable');
+    });
+});
+
+describe('round 5 D1: summary enrollment state and top-up gating', () => {
+    const link = '/auth/auth0/login?returnUrl=/os';
+    function enrolling(member: string | null | Error, sub?: unknown) {
+        const f = fixture();
+        f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        const aiMember = vi.fn(async () => { if (member instanceof Error) throw member; return member; });
+        const ctx = { ...f.ctx, user: { ...f.ctx.user!, app_metadata: sub === undefined ? {} : { auth0_sub: sub } } };
+        const caller = createBillingRouter(() => f.deps, { aiMember }).createCaller(ctx);
+        return { ...f, ctx, aiMember, caller };
+    }
+    afterEach(() => { auth0.enabled.mockReset(); auth0.enabled.mockReturnValue(true); });
+
+    it('needs_ezil_id: no Gateway member and no stored EZiL ID; CTA link, no top-up', async () => {
+        const f = enrolling(null);
+        const summary = await f.caller.summary();
+        expect(f.aiMember).toHaveBeenCalledWith(f.ctx.db, userId);
+        expect(summary).toMatchObject({ ai: { enrollment: 'needs_ezil_id' }, actions: { topup: false, ezilId: link } });
+    });
+    it('needs_ezil_id with EZiL ID sign-in off has no link', async () => {
+        auth0.enabled.mockReturnValue(false);
+        expect(await enrolling(null, '').caller.summary()).toMatchObject({ ai: { enrollment: 'needs_ezil_id' }, actions: { topup: false, ezilId: null } });
+    });
+    it('activating: a stored EZiL ID subject without a member yet', async () => {
+        expect(await enrolling(null, 'auth0|stored').caller.summary()).toMatchObject({
+            ai: { enrollment: 'activating' }, actions: { topup: false, ezilId: null } });
+    });
+    it('enrolled: a Works member (even without a stored subject, e.g. operator-seeded)', async () => {
+        expect(await enrolling('works-member').caller.summary()).toMatchObject({
+            ai: { enrollment: 'enrolled', waiting: null }, actions: { topup: true, ezilId: null } });
+    });
+    it('sums waiting credits from undelivered, unexpired stored receipts', async () => {
+        const f = enrolling(null);
+        const receiptsFor = vi.fn(async () => [
+            { entitlementId: `ezil-os:v1:free-once:${userId}`, credits: 100, expiresAt: '2027-10-01T00:00:00.000Z', deliveredAt: null },
+            { entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-10-01T00:00:00.000Z', credits: 200, expiresAt: '2027-10-01T00:00:00.000Z', deliveredAt: '2026-10-02T00:00:00.000Z' },
+        ]);
+        f.deps.aiCredits = { claim: vi.fn(), accountFor: vi.fn(), pinAccount: vi.fn(), finish: vi.fn(), receiptsFor };
+        expect((await f.caller.summary() as { ai: { waiting: unknown } }).ai.waiting).toEqual({ credits: 100 });
+    });
+    it('a member lookup failure keeps the enrolled default with a fixed warning (no false CTA, top-up unchanged)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const f = enrolling(new Error('postgres://private:secret@host'));
+        expect(await f.caller.summary()).toMatchObject({ ai: { enrollment: 'enrolled' }, actions: { topup: true, ezilId: null } });
+        expect(warn).toHaveBeenCalledWith('[billing.ai] enrollment state unavailable');
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('secret');
+        warn.mockRestore();
+    });
+    it('a database without the Works member view keeps the enrolled default silently (enrollment does not apply there)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const f = enrolling(Object.assign(new Error('relation "ezil_works.ai_members" does not exist'), { code: '42P01' }));
+        expect(await f.caller.summary()).toMatchObject({ ai: { enrollment: 'enrolled' }, actions: { topup: true, ezilId: null } });
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 })).resolves.toMatchObject({ sessionId: session.id });
+        expect(warn).not.toHaveBeenCalledWith('[billing.ai] enrollment state unavailable');
+        warn.mockRestore();
+    });
+    it('the default member lookup is strict: a missing view is not read as "no member"', async () => {
+        const f = fixture();
+        const execute = vi.fn(async () => { throw Object.assign(new Error('missing'), { code: '42P01' }); });
+        const caller = createBillingRouter(() => f.deps).createCaller({ ...f.ctx, db: { execute } as unknown as typeof f.ctx.db });
+        expect(await caller.summary()).toMatchObject({ ai: { enrollment: 'enrolled' }, actions: { topup: true } });
+        expect(execute).toHaveBeenCalled();
+    });
+    it.each([['needs_ezil_id', undefined], ['activating', 'auth0|stored']] as const)
+    ('createTopupCheckout refuses %s before any Stripe call', async (_state, sub) => {
+        const f = enrolling(null, sub);
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 }))
+            .rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture' }))
+            .rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+        expect(f.stripe.listProducts).not.toHaveBeenCalled();
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+    it('createTopupCheckout proceeds for an enrolled member', async () => {
+        const f = enrolling('works-member');
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 })).resolves.toMatchObject({ sessionId: session.id });
     });
 });
