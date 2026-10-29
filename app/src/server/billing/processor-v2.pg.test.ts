@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import * as schema from '@/server/db/schema';
-import { computers } from '@/server/db/schema';
+import { authUsers, computers } from '@/server/db/schema';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem } from './ai-credits';
 import { readBillingConfig } from './config';
 import type { BillingStore, StripeApi, StripeCharge, StripeInvoice, StripeInvoicePaymentState, StripeSubscription } from './ports';
 import { processStripeEvent } from './processor';
@@ -502,4 +504,70 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('v2 processor and summar
         expect(await store.latestConsent(a.userId, a.subscriptionId)).toEqual(previousConsent);
         expect(await summary(a)).toEqual(before);
     });
+
+});
+
+/** HF2 (round 4 S-D): the store's reversal transaction is a savepoint inside this rollback-only test transaction. */
+describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('HF2 refund over operator correction rows with Postgres', () => {
+    let client: ReturnType<typeof postgres>, base: Database, db: Database, store: BillingStore, owner: Tenant;
+    let finishTest: () => void, transactionDone: Promise<void>;
+    const rollbackTest = Symbol('rollback hf2 test');
+    beforeAll(() => {
+        client = postgres(process.env.BILLING_TEST_DATABASE_URL!, { max: 1, prepare: false });
+        base = drizzle(client, { schema });
+    });
+    beforeEach(async () => {
+        const finished = new Promise<void>(resolve => { finishTest = resolve; });
+        let ready!: () => void, failed!: (error: unknown) => void;
+        const started = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; });
+        transactionDone = base.transaction(async tx => {
+            db = tx as unknown as Database; store = createBillingStore(db); owner = tenant();
+            await db.insert(authUsers).values({ id: owner.userId });
+            await store.linkCustomer(owner.userId, owner.customerId);
+            ready(); await finished; throw rollbackTest;
+        }).catch(error => { if (error !== rollbackTest) { failed(error); throw error; } });
+        await started;
+    });
+    afterEach(async () => { finishTest?.(); await transactionDone; });
+    afterAll(async () => { await client?.end(); });
+
+    it.each(['root first', 'correction first'] as const)(
+        'a full refund reverses compute and only the correction, in either insertion order (%s)', async order => {
+            const stripe = fakeStripe();
+            const invoiceId = `in_${randomUUID()}`;
+            await store.insertGrant({ userId: owner.userId, meter: 'compute_std_seconds', kind: 'plan_period', amount: BigInt(144000),
+                subscriptionId: owner.subscriptionId, periodStart: START, periodEnd: END, sourceType: 'invoice', sourceId: invoiceId });
+            const root = aiCreditOutboxItem(owner.userId, aiCreditEntitlement({ userId: owner.userId, sku: 'standard_monthly_v3',
+                subscriptionId: owner.subscriptionId, periodStart: START, periodEnd: END, invoiceId }), 'grant', invoiceId);
+            Object.assign(root.payload, { credits: 4000, accountPublicId: 'canary-payer' });
+            const ROOT = String(root.payload.entitlementId), CORR = `${ROOT}:correction-20261028`;
+            const note = { operatorNote: 'r3-20261028 legacy amount correction' };
+            const revoke = aiCreditRevokeItem(root);
+            Object.assign(revoke.payload, { invoiceId: null, ...note });
+            const correction = aiCreditOutboxItem(owner.userId, { entitlementId: CORR, credits: 200,
+                expiresAt: String(root.payload.expiresAt) }, 'grant', invoiceId);
+            Object.assign(correction.payload, { accountPublicId: 'canary-payer', ...note });
+            for (const item of order === 'root first' ? [root, revoke, correction] : [correction, revoke, root]) await store.enqueueOutbox(item);
+            // The receipt read has no ORDER BY; each case pins the order the planner actually receives.
+            expect((await store.aiCreditGrantsByInvoice!(owner.userId, invoiceId)).map(r => r.payload.entitlementId))
+                .toEqual(order === 'root first' ? [ROOT, CORR] : [CORR, ROOT]);
+            const charge: StripeCharge = { id: `ch_${randomUUID()}`, customer: owner.customerId, invoiceId, paymentIntentId: null,
+                amount: 2000, amountRefunded: 2000, refunded: true };
+            stripe.charges.set(charge.id, charge);
+            const refundId = `re_${randomUUID()}`;
+            const deps = { store, stripe: stripe.api, now: () => NOW };
+            const outbox = () => db.select().from(schema.billingOutbox).where(eq(schema.billingOutbox.userId, owner.userId));
+            const before = await outbox();
+            expect(await processStripeEvent(event('refund.created', { id: refundId, charge: charge.id }), deps)).toBe('applied');
+            expect(await store.grantsBySource('refund', refundId)).toEqual([expect.objectContaining({ userId: owner.userId,
+                meter: 'compute_std_seconds', kind: 'revoke', amount: BigInt(-144000), subscriptionId: owner.subscriptionId })]);
+            const after = await outbox();
+            expect(after.filter(row => !before.some(prior => prior.id === row.id))).toEqual([expect.objectContaining({
+                eventKey: `${CORR}:revoke:refund:${refundId}`, kind: 'ai_revoke',
+                payload: expect.objectContaining({ entitlementId: CORR, credits: 200, invoiceId, accountPublicId: 'canary-payer' }) })]);
+            expect(await processStripeEvent(event('refund.updated', { id: refundId, charge: charge.id }), deps)).toBe('applied');
+            expect(await outbox()).toEqual(after);
+            expect(await store.grantsBySource('refund', refundId)).toHaveLength(1);
+        },
+    );
 });
