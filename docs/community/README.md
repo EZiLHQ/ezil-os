@@ -87,7 +87,7 @@ Every other issue below has no prerequisite in this backlog.
 | [TEL-01](issues/TEL-01.md) | The telemetry drain outage has no drill | `worker`, `docs`, `size/M` | none |
 | [COV-01](issues/COV-01.md) | Coverage reporting — revive the branch | `ci`, `good first issue`, `size/M` | none |
 | [KBD-01](issues/KBD-01.md) | Reconcile `wip/mobile-keyboard` | `shell`, `worker`, `size/M` | none |
-| [AUTH-01](issues/AUTH-01.md) | Forgot-password UI and re-auth before `updateUser` | `app`, `help wanted`, `size/M` | none |
+| [AUTH-01](issues/AUTH-01.md) | `/auth/invited` shows invite errors in its own words | `app`, `help wanted`, `size/S` | none |
 | [NEKO-01](issues/NEKO-01.md) | `EZIL_NEKO_IMAGE` means two different shapes | `worker`, `local`, `good first issue`, `size/S` | none |
 | [DB-01](issues/DB-01.md) | A `db:apply-0002` script matching `db:apply-0001` | `app`, `good first issue`, `size/S` | none |
 | [TAURI-01](issues/TAURI-01.md) | Native installers via a Tauri wrapper | `local`, `blocked`, `size/XL` | none (blocked) |

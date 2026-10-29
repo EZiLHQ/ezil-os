@@ -174,9 +174,12 @@ describe('/ redirects into /os, so its one known client-side sender must be a re
  * does not permit a client or password auth.signUp call.
  *
  * Invited accounts use `bun tools/invite.ts add <email>`, which writes the
- * `ezil_os_access` row and then asks Supabase to send an invite; an invited
- * person sets their password on `/auth/invited`. `signUpWithPassword` and the
- * form's `'sign-up'` mode were deleted for this (row A2).
+ * `ezil_os_access` row and then asks Supabase to send an invite. The invite
+ * link's session takes the person from `/auth/invited` straight into `/os`;
+ * no password is set there, and next time they continue with EZiL ID using
+ * the same address (`server/auth/bridge.ts` links the account by email).
+ * `signUpWithPassword` and the form's `'sign-up'` mode were deleted for this
+ * (row A2).
  *
  * The sweep below reads every source file under `app/src` rather than the
  * three files this row touched, because the failure it guards is somebody
@@ -251,7 +254,10 @@ describe('there is no password self-signup in the app', () => {
  *
  * Like the sign-up sweep above, it reads every component under `app/src`
  * rather than a fixed list, because the failure it guards is a NEW surface
- * bringing a second way in back.
+ * bringing a second way in back. Client helpers and hooks are plain `.ts`,
+ * which a component only has to import, so every `.ts` file is read for the
+ * Supabase sign-in calls as well; the files allowed to keep one are named
+ * below with the reason.
  */
 const OTHER_SIGN_IN = [
     /Continue with Google|Sign in with Google|get started with Google/i,
@@ -260,6 +266,23 @@ const OTHER_SIGN_IN = [
     /\bresetPasswordForEmail\b|updateUser\(\s*\{\s*password/,
     /\/login\?method=email/,
 ];
+
+/** A Supabase sign-in call, looked for in every `.ts` file. */
+const SIGN_IN_CALL = /\bsignInWith(?:OAuth|Password|Otp)\b/;
+
+/**
+ * The `.ts` files that may keep one, each with a marker it must still carry,
+ * so an entry cannot quietly turn into a pass for something else.
+ */
+const KEPT_SIGN_IN_CALLS: Record<string, string> = {
+    // The server actions kept unreferenced on purpose (see the note at the top
+    // of actions.ts), pinned by the document-load contract above.
+    'app/login/actions.ts': "'use server'",
+    // The local development CLI (`bun run dev:setup` / `dev:verify`), never
+    // part of a page: it checks the setup-owned accounts on local Supabase.
+    'dev/local-supabase.ts': 'passwordVerifier.auth.signInWithPassword(',
+    'dev/verify-local-web.ts': 'client.auth.signInWithPassword(',
+};
 
 describe('there is no sign-in UI other than EZiL ID', () => {
     it('the patterns recognise what they are looking for', () => {
@@ -287,6 +310,38 @@ describe('there is no sign-in UI other than EZiL ID', () => {
         expect(scanned.length).toBeGreaterThan(20);
         expect(scanned).toEqual(expect.arrayContaining(['app/login/page.tsx', 'app/auth/invited/page.tsx', 'app/(marketing)/pricing/pricing-content.ts']));
         expect(offenders).toEqual([]);
+    });
+
+    it('the sign-in call pattern recognises each Supabase method', () => {
+        for (const sample of ['await supabase.auth.signInWithOAuth({ provider })', 'auth.signInWithPassword(credentials)',
+            'await supabase.auth.signInWithOtp({ email })']) {
+            expect(sample).toMatch(SIGN_IN_CALL);
+        }
+    });
+
+    it('🔴 no .ts helper or hook under app/src calls a Supabase sign-in method', () => {
+        const offenders: string[] = [];
+        const scanned: string[] = [];
+        for (const file of sourceFilesUnder(APP_SRC)) {
+            if (!file.endsWith('.ts')) continue;
+            const name = path.relative(APP_SRC, file).split(path.sep).join('/');
+            scanned.push(name);
+            if (name in KEPT_SIGN_IN_CALLS) continue;
+            if (SIGN_IN_CALL.test(code(readFileSync(file, 'utf8')))) offenders.push(name);
+        }
+        // Positive control: the walk reached the browser client and every
+        // kept file, so an exception names a file that is really there.
+        expect(scanned.length).toBeGreaterThan(40);
+        expect(scanned).toEqual(expect.arrayContaining(['utils/supabase/client.ts', ...Object.keys(KEPT_SIGN_IN_CALLS)]));
+        expect(offenders).toEqual([]);
+    });
+
+    it('each kept sign-in call is still the one it was kept for', () => {
+        for (const [name, marker] of Object.entries(KEPT_SIGN_IN_CALLS)) {
+            const source = readFileSync(path.join(APP_SRC, name), 'utf8');
+            expect(source, name).toContain(marker);
+            expect(code(source), name).toMatch(SIGN_IN_CALL);
+        }
     });
 
     it('the deleted Google and email/password form stays deleted', () => {
