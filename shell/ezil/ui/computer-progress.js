@@ -266,7 +266,7 @@ const ICON_URL = /^(?:data:image\/(?:svg\+xml|png|gif|webp|jpeg)[;,]|https:\/\/|
  * The one opening surface. Builds its DOM once; `paint(model)` only updates it.
  *
  *   model.status   the one status line (or a failure title)
- *   model.body     one sentence, only for failures and hold states
+ *   model.body     one sentence: the loading stage while opening, or a failure / hold explanation
  *   model.percent  0..100 for a determinate bar, 'indeterminate', or null (no bar)
  *   model.key      the opening the percent belongs to; the bar never regresses within one
  *   model.meta     muted line: the elapsed time, or the long-wait note
