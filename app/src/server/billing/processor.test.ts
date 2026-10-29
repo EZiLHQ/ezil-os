@@ -2396,6 +2396,9 @@ describe('HF2 operator correction rows', () => {
         ['bare revoke foreign invoice', (r: Rows) => { r.revoke.payload.invoiceId = 'in_other'; }],
         ['bare revoke foreign account', (r: Rows) => { r.revoke.payload.accountPublicId = 'other-payer'; }],
         ['bare revoke owner', (r: Rows) => { r.revoke.userId = 'other-user'; }],
+        ['bare revoke kind', (r: Rows) => { r.revoke.kind = 'ai_grant'; }],
+        ['bare revoke action', (r: Rows) => { r.revoke.payload.action = 'grant'; }],
+        ['bare revoke event id', (r: Rows) => { r.revoke.payload.eventId = `${r.ROOT}:revoke:operator`; }],
     ] as const)('refuses a %s with zero writes, compute included', async (_, defect) => {
         for (const order of ['root first', 'correction first'] as const) {
             const f = await canary(order, { defect });
