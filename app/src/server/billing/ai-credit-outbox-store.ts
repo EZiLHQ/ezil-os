@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { AI_CREDIT_PROTOCOL } from './ai-credits';
-import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, isAiDeliveryDependency, planAiCreditRequeue,
-    plannedAiCreditEvent, type AiCreditOutboxRow, type AiCreditOutboxStore, type AiCreditRequeueCandidate,
-    type AiCreditRequeueInput, type AiCreditRequeueResult } from './ai-credit-outbox';
+import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, AI_ENROLL_ADMIN_READ_MS, isAiAccountDependency, isAiDeliveryDependency,
+    planAiCreditRequeue, plannedAiCreditEvent, type AiCreditOutboxRow, type AiCreditOutboxStore, type AiCreditRequeueCandidate,
+    type AiCreditRequeueInput, type AiCreditRequeueResult, type AiEnrollForResult } from './ai-credit-outbox';
 
 type Database = typeof import('@/server/db').db;
 
@@ -29,6 +29,43 @@ export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: str
         if (missingAiAccountView(error)) return null;
         throw error;
     }
+}
+
+/**
+ * Round 5 D1 drain-side enrollment (the store's `enrollFor`). Reads the OS user through the existing
+ * Supabase admin API and enrolls with the STORED `app_metadata.auth0_sub`; the SQL function
+ * re-verifies it against the auth user (D1 trust model: app_metadata is service-role-writable only).
+ * - off staging (no ai-staging funding origin / DB URL): `unavailable:disabled`, no admin read;
+ * - no stored subject: `needs_ezil_id`, no DB client; unconfirmed email: `refused:email_unconfirmed`;
+ * - otherwise `enrollAiMember(userId, sub, 'outbox')` mapped to enrolled | refused:<code> | unavailable:<code>.
+ * The admin read is bounded (2 s). Never throws; fixed codes only. Server-only modules load lazily
+ * so the drain and its tests never import them eagerly.
+ */
+export async function enrollWithStoredSubject(userId: string): Promise<AiEnrollForResult> {
+    const [{ createAdminClient }, enrollment] = await Promise.all([
+        import('@/server/auth/supabase-admin'), import('@/server/auth/staging-ai-enrollment')]);
+    if (!enrollment.aiEnrollmentConfigured()) return 'unavailable:disabled';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let user: { app_metadata?: Record<string, unknown> | null; email_confirmed_at?: string | null } | null;
+    try {
+        const read = createAdminClient().auth.admin.getUserById(userId);
+        const timedOut = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), AI_ENROLL_ADMIN_READ_MS); });
+        const response = await Promise.race([read, timedOut]);
+        if (response === 'timeout') return 'unavailable:timeout';
+        if (response.error) return response.error.status === 404 ? 'refused:user_not_found' : 'unavailable:connect_failed';
+        user = response.data.user;
+    } catch {
+        return 'unavailable:connect_failed';
+    } finally {
+        clearTimeout(timer);
+    }
+    if (!user) return 'refused:user_not_found';
+    const sub = user.app_metadata?.auth0_sub;
+    if (typeof sub !== 'string' || sub.length === 0) return 'needs_ezil_id';
+    if (!user.email_confirmed_at) return 'refused:email_unconfirmed';
+    const result = await enrollment.enrollAiMember(userId, sub, 'outbox');
+    if (result.ok) return 'enrolled';
+    return enrollment.isAiEnrollRefusal(result.code) ? `refused:${result.code}` : `unavailable:${result.code}`;
 }
 
 /**
@@ -143,6 +180,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
                     ...(dependencyWaits > 0 ? { dependencyWaits } : {}),
                     ...(result.outcome ? { outcome: result.outcome } : {}),
                     ...(result.reviewRequired ? { reviewRequired: true } : {}),
+                    ...(result.blockedBy ? { blockedBy: result.blockedBy } : {}),
                 })}::text)::jsonb), last_error = ${result.reason},
                     delivered_at = ${result.status === 'done' ? new Date(now).toISOString() : null}::timestamptz
                 where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
@@ -150,6 +188,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
             `);
         },
         requeueFailed: input => requeueFailedAiCredits(db, input),
+        enrollFor: enrollWithStoredSubject,
         async receiptsFor(userId) {
             const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown }>(sql`
                 select payload->>'entitlementId' as "entitlementId", payload->'credits' as credits,
