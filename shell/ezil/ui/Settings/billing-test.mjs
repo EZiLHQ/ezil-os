@@ -928,6 +928,14 @@ try {
         contains('[data-role="payment-grace"] [data-action="portal"]', 'Fix payment');
         has('[data-role="payment-banner"]', false);
         assert.equal(qa('[data-role="payment-grace"], [data-role="payment-banner"]').length, 1, 'one payment banner');
+        // In grace the new period's plan credits wait for the payment: never "0 of 0 left" + "more from <renewal>".
+        Object.assign(summary.ai, { included: { granted: 0, remaining: 0, periodEnd: END }, pendingFromRenewal: { credits: 1000, at: END }, starter: { remaining: 100 } }); await refresh();
+        contains('[data-role="meter-ai"]', '0 of 1,000 this period · added once your payment goes through');
+        contains('[data-role="meter-ai"]', '100 starter credits left');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /0 of 0|more from/);
+        Object.assign(summary.ai, { included: { granted: 1000, remaining: 640, periodEnd: END } }); await refresh();
+        contains('[data-role="meter-ai"]', '640 of 1,000 left this period');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/);
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
         Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');

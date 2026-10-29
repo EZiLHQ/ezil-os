@@ -221,19 +221,25 @@ function nudgeHtml (summary) {
 const whole = value => Number(value).toLocaleString('en-US');
 
 /** AI credits row (plan §6.3): this period's plan credits, then purchased, starter and renewal on their own lines. */
-function aiCreditsV3Html ({ ai, actions, catalog }) {
+function aiCreditsV3Html ({ ai, actions, catalog, plan }) {
     const state = STATES.has(ai.state) ? ai.state : 'unavailable';
     const packs = actions.topup === true ? catalog.packs ?? [] : [];
     const included = ai.included && Number.isSafeInteger(ai.included.remaining) ? ai.included : null;
-    const main = included
+    const pending = ai.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+    // Round 4 D17: during the payment grace this period's plan credits are granted only once the
+    // invoice is paid — never "0 of 0 left" with "more from <renewal>" (ACCEPT-R4A S-C finding).
+    const awaitingPayment = plan?.paymentIssue != null && included !== null && included.granted === 0 && pending !== null;
+    const main = awaitingPayment
+        ? `<strong>0</strong> <span>${encode(`of ${whole(pending.credits)} this period · added once your payment goes through`)}</span>`
+        : included
         ? `<strong>${encode(whole(included.remaining))}</strong> <span>${encode(`of ${whole(included.granted)} left this period · resets ${dateLabel(included.periodEnd)}`)}</span>`
         : ai.balance == null ? 'Not available' : `<strong>${encode(creditsLabel(null, ai.balance))}</strong> <span>credits left</span>`;
     const purchased = ai.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining > 0
         ? paragraph(`+ ${whole(ai.purchased.remaining)} purchased · expire ${dateLabel(ai.purchased.expiresAt, true)}`, 'ezil-billing-credit-line') : '';
     const starter = ai.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining > 0
         ? paragraph(`${whole(ai.starter.remaining)} starter credits left`, 'ezil-billing-credit-line') : '';
-    const renewal = ai.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0
-        ? paragraph(`${whole(ai.pendingFromRenewal.credits)} more from ${dateLabel(ai.pendingFromRenewal.at)}`, 'ezil-billing-credit-line') : '';
+    const renewal = pending && ! awaitingPayment
+        ? paragraph(`${whole(pending.credits)} more from ${dateLabel(pending.at)}`, 'ezil-billing-credit-line') : '';
     return `<section id="ai-credits" class="ezil-billing-card ezil-billing-ai-credits is-${state}" data-role="meter-ai" aria-labelledby="ai-credits-heading">
         <h4 id="ai-credits-heading" tabindex="-1">AI credits</h4>
         <p class="ezil-billing-credit-balance">${main}</p>${purchased}${starter}${renewal}
