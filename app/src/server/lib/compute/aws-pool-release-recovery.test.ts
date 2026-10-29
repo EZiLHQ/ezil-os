@@ -607,3 +607,17 @@ describe('round 5 D2: releaseHealOf classifies the rows this recovery really wri
         expect(releaseHealOf(await s.current())).toBe('pending');
     });
 });
+
+// LEAD DECISION OPEN (round 5 D2): the brief classifies every non-transient prefixed UNCONFIRMED error as `failed`, but an
+// error written WITHOUT a saved replay intent is re-evaluated on the next pass (the original job is still the placement's),
+// so it can still heal. This pins today's behaviour so a classifier change is a visible, deliberate edit.
+describe('round 5 D2 characterisation: an intent-less recovery error is retried on the next pass', () => {
+    it('a host still running at the first pass (instance_identity → releaseHealOf failed) recovers once it has stopped', async () => {
+        const { releaseHealOf } = await import('./release-heal');
+        const s = setup(); s.host.state = 'running'; await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('instance_identity') });
+        expect(releaseHealOf(await s.current())).toBe('failed');
+        s.host.state = 'stopped'; await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
+    });
+});
