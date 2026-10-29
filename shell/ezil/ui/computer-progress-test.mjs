@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { progressView, observeComputerProgress, openingAt, openingFraction, formatElapsed, watchComputerTransition, OPENING_MILESTONES } from './computer-progress.js';
 import { AppSpinner } from './app-spinner.js';
+import { scanCopy } from '../../../e2e/billing-e2e-lib.mjs';
 const base={version:2,computerId:'qa-computer',stage:'provisioning',recordedStage:'exported',operation:'migration',active:true,durable:true,resumePolicy:'saved_workspace_only',updatedAt:'2026-10-26T10:00:00Z',bytes:{transferred:null,total:null},percent:null,etaSeconds:null,transferStartedAt:null,transferUpdatedAt:null,typicalSeconds:null,selectedNextOpenHardware:{size:'xlarge',vcpu:4,memoryGiB:16,effective:'next_open'}};
 // Round 3 (plan §6.5): one status line, one bar, no step list, countdown or percentage text.
 const BANNED=/\d+%|min left|Almost there|Estimated|countdown|faster|instant|unlimited|priority|gpu|heavy use|gpt|claude|gemini|llama|memory is kept|memory survives|processes keep running|ai included|includes ai|compute hours|standard-hour|Mumbai/i;
@@ -8,11 +9,12 @@ let view=progressView(base,'qa-computer');
 assert.equal(view.title,'Getting your AWS computer');
 assert.equal(view.body,'','one status line while moving');
 assert.equal('steps' in view||'countdown' in view||'meter' in view,false,'no step list, countdown or meter');
-assert.equal(view.next,'');assert.equal(view.updated,null);
+assert.equal(view.updated,null);
+// HF3: the next-start hardware is never rendered on the opening surface (Settings → Computer shows it).
 for(const devDetails of [undefined,false,'true',1,true]) {
  const value=progressView(base,'qa-computer',{features:{devDetails}});
- assert.equal(!!value.next,devDetails===true);assert.equal(!!value.updated,devDetails===true);
- if(devDetails===true)assert.match(value.next,/4 vCPU · 16 GiB/);
+ assert.equal('next' in value,false);assert.equal(!!value.updated,devDetails===true);
+ assert.doesNotMatch(JSON.stringify(value),/Next session|GiB memory|Applies after/);
 }
 assert.equal(view.bytes,'');
 assert.doesNotMatch(JSON.stringify({...view,updated:null}),BANNED);
@@ -62,12 +64,17 @@ assert.equal(progressView({...base,stage:'<script>'},'qa-computer'),null);
 
 // ── Opening: the real order is LEASED → STARTING → MOUNTING → RUNNING ────────
 const opening={...base,operation:'opening',stage:'mounting',durable:false};
+// HF3: the body is ONE loading-stage sentence keyed by the server's reached milestone.
+const STAGE_BODY=['Finding a machine for your computer.','A machine is ready and starting up.','Your files are attached. The desktop is starting.',
+ 'The desktop is starting. Code opens next.','Almost there — waiting for Code to connect.'];
 for(const [stage,reached,title] of [['provisioning',0,'Starting your computer'],['leased',1,'Starting your computer'],['claimed',1,'Starting your computer'],
  ['starting',1,'Starting your computer'],['mounting',2,'Attaching your files'],['running',4,'Starting Code'],['ready',4,'Starting Code']]) {
  const value=progressView({...opening,stage},'qa-computer',{appName:'Code'});
  assert.equal(value.reached,reached,stage);assert.equal(value.title,title,stage);
- assert.equal(value.body,'',stage);assert.equal(value.bytes,'',stage);
+ assert.equal(value.body,STAGE_BODY[reached],stage);assert.equal(value.bytes,'',stage);
  assert.doesNotMatch(value.title,BANNED);
+ assert.doesNotMatch(value.body.replace(/^Almost there — /,''),BANNED,stage);
+ assert.equal(/Almost there/.test(value.body),reached>=4&&value.serverReady,`${stage}: "Almost there" only at desktop_ready`);
 }
 assert.ok(progressView({...opening,stage:'starting'},'qa-computer').reached<progressView({...opening,stage:'mounting'},'qa-computer').reached,'STARTING comes before MOUNTING');
 assert.equal(progressView({...opening,stage:'running'},'qa-computer').title,'Starting your desktop','no app name: the desktop');
@@ -95,6 +102,57 @@ for(const [stage,title] of [['leased','Getting a 4 vCPU machine'],['mounting','A
  assert.equal(progressView({...opening,stage,path:'switch',transition:tr('switch','waking')},'qa-computer',{appName:'Code'}).title,title,stage);
 }
 assert.equal(progressView({...opening,stage:'running',active:false},'qa-computer').activeAws,false,'ready is not opening');
+// HF3 body per milestone: server milestones 0..4, cold vs warm at 0, no app name, never the client clock.
+{const T0=Date.parse(T);
+ for(const [n,stage,warm,cold,anon] of [
+  [1,'provisioning','Finding a machine for your computer.','Preparing a new machine — this can take a few minutes.','Finding a machine for your computer.'],
+  [2,'provisioning','A machine is ready and starting up.','A machine is ready and starting up.','A machine is ready and starting up.'],
+  [3,'provisioning','Your files are attached. The desktop is starting.','Your files are attached. The desktop is starting.','Your files are attached. The desktop is starting.'],
+  [4,'leased','The desktop is starting. Code opens next.','The desktop is starting. Code opens next.','The desktop is starting. Your apps open next.'],
+  [5,'leased','Almost there — waiting for Code to connect.','Almost there — waiting for Code to connect.','Almost there — waiting for your desktop to connect.'],
+ ]) {
+  const data=path=>({...opening,stage,path,openingStartedAt:T,expectedSeconds:240,milestones:ms(n)});
+  assert.equal(progressView(data('warm'),'qa-computer',{appName:'Code'}).body,warm,`warm ${n}`);
+  assert.equal(progressView(data('cold'),'qa-computer',{appName:'Code'}).body,cold,`cold ${n}`);
+  assert.equal(progressView(data('warm'),'qa-computer').body,anon,`no app ${n}`);
+  // Hours on the clock never move the sentence: only a reached milestone does.
+  assert.equal(progressView(data('warm'),'qa-computer',{appName:'Code',now:T0+3_600_000,firstObservedAt:T0}).body,warm,`clock ${n}`);
+  for(const path of ['warm','cold']) {
+   const v=progressView(data(path),'qa-computer',{appName:'Code'});
+   assert.equal(/Almost there/.test(v.body),n-1>=4,`no "Almost there" before reached 4 (reached ${n-1}, ${path})`);
+   assert.equal(scanCopy(`${v.title} ${v.body}`).length,0,`copy guard ${n}`);
+  }
+ }
+ // Capacity wait is reached 0; switch and restart name their own phase.
+ const body=(stage,transition,extra={})=>progressView({...opening,stage,transition,active:true,...extra},'qa-computer',{appName:'Code'});
+ assert.equal(body('waiting_capacity',null).body,'Finding a machine for your computer.');
+ assert.equal(body('waiting_capacity',null,{path:'cold'}).body,'Preparing a new machine — this can take a few minutes.');
+ assert.equal(body('switching',tr('switch','stopping')).body,'Your files stay with your computer.');
+ assert.equal(body('switching',tr('switch','requested')).body,'Your files stay with your computer.');
+ {const v=body('switching',tr('switch','waking'),{milestones:ms(3)});
+  assert.equal(v.title,'Getting a 4 vCPU machine');assert.equal(v.body,'Starting your computer on the new configuration.','the body stays with its title');}
+ assert.equal(body('leased',tr('switch','waking'),{path:'switch'}).body,'Starting your computer on the new configuration.');
+ assert.equal(body('mounting',tr('switch','waking'),{path:'switch'}).body,'Your files are attached. The desktop is starting.');
+ assert.equal(body('restarting',tr('restart','waking')).body,'Starting your computer again.');
+ assert.equal(body('restarting',tr('restart','stopping')).body,'Your files stay with your computer.');
+ // A stop the driver is healing: phase stays 'stopping', the reason says why.
+ {const v=body('switching',{...tr('switch','stopping'),reason:'stop_healing'});
+  assert.equal(v.title,'Recovering your computer before the switch');
+  assert.equal(v.body,'A release did not confirm; the computer is being checked. Your files are safe.');
+  assert.equal(v.transition.reason,'stop_healing');assert.equal(v.activeAws,true);assert.notEqual(v.bar,null);}
+ assert.equal(body('restarting',{...tr('restart','stopping'),reason:'stop_healing'}).title,'Recovering your computer before the restart');
+ assert.equal(body('switching',{...tr('switch','stopping'),reason:'stop_timeout'}).title,'Saving and closing your session','only stop_healing recovers');
+ // Migration keeps one status line (bytes come separately); hold states keep their sentence, never "Almost there".
+ for(const stage of ['requested','exported','restored','committed','running'])assert.equal(progressView({...moving,stage},'qa-computer').body,'',stage);
+ for(const stage of ['operations_paused','needs_operator','queued','failed_reopened','stopped','retired','purge_eligible']) {
+  const v=progressView({...opening,stage,milestones:ms(5)},'qa-computer',{appName:'Code'});
+  assert.equal(v.body,stage==='needs_operator'?'Check the computer’s current status before trying again.':{operations_paused:'Check this view later for an update.',queued:'Waiting for the saved request to begin.',
+   failed_reopened:'The original computer was reopened. Check its current status before trying again.',stopped:'Use the normal computer controls to start a session.',
+   retired:'Waiting for the current transition status.',purge_eligible:'No active startup is recorded.'}[stage],stage);
+  assert.doesNotMatch(v.body,/Almost there/,stage);
+ }
+ for(const v of [body('switching',tr('switch','stopping')),body('restarting',tr('restart','waking')),body('waiting_capacity',null)])
+  assert.equal(scanCopy(`${v.title} ${v.body}`).length,0,v.body);}
 // F1b: this tab asked to open, the server has no opening yet. Never "Computer stopped"; only the copy changes.
 {const stopped={...base,operation:'none',stage:'stopped',recordedStage:'stopped',active:false,durable:false,openingStartedAt:null,path:null,milestones:[],expectedSeconds:null};
  for(const stage of ['stopped','purge_eligible']) {

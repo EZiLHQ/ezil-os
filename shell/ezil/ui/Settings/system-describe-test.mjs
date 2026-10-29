@@ -41,7 +41,28 @@ push('plan line separates entitlement and preparation', describePlan({ ...cf, pl
     const restart = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'being_prepared', current: 'std-2', transition: { ...t, kind: 'restart', target: 'std-2' } } });
     push('being_prepared by a restart says so', restart.value === 'Restarting your computer');
     const failed = describePlan({ ...aws, plan: { vcpu: 8, memoryGB: 32, status: 'failed', reason: 'capacity_unavailable', current: 'std-2', transition: { ...t, phase: 'failed', revertAvailable: true } } });
-    push('failed switch: back on the previous size, files safe', failed.value === "Switch didn't finish — back on 2 vCPU / 8 GB" && /files are safe/.test(failed.hint), JSON.stringify(failed));
+    push('failed switch: names the target and the size the computer is on, files safe',
+        failed.value === "Switch to 8 vCPU / 32 GB didn't finish" && failed.hint === 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.', JSON.stringify(failed));
+    // HF3: the placement's size (p.current) wins over the transition's pre-switch size.
+    const ft = { ...t, current: 'std-2', target: 'cmp-4', phase: 'failed', revertAvailable: true };
+    const placed = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', reason: 'size_not_applied', current: 'cmp-8', transition: ft } });
+    push('failed switch: names p.current, not the transition\'s pre-switch size',
+        placed.value === "Switch to 4 vCPU / 16 GB didn't finish" && placed.hint.startsWith('Your computer is on 8 vCPU / 32 GB.') && ! /back on|2 vCPU/.test(placed.value + placed.hint), JSON.stringify(placed));
+    const fallback = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', reason: 'wake_timeout', current: null, transition: ft } });
+    push('failed switch: without p.current, falls back to the transition\'s size', fallback.hint === 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.', JSON.stringify(fallback));
+    const unknown = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', current: 'mystery', transition: { ...ft, current: 'mystery', target: 'mystery' } } });
+    push('failed switch: unknown sizes are not guessed', unknown.value === "Switch didn't finish" && unknown.hint === 'Your files are safe. Try again from Settings → Computer.', JSON.stringify(unknown));
+    const restartFailed = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'failed', current: 'std-2', transition: { ...ft, kind: 'restart', target: 'std-2' } } });
+    push('failed restart is not called a switch', restartFailed.value === "Restart didn't finish" && /on 2 vCPU \/ 8 GB/.test(restartFailed.hint), JSON.stringify(restartFailed));
+    const noTransition = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', reason: 'migration_failed', current: 'std-2', transition: null } });
+    push('failed without a transition keeps the preparation line', noTransition.value === '4 vCPU / 16 GB on AWS (India) — preparation failed' && noTransition.hint === 'migration_failed', JSON.stringify(noTransition));
+    // Contract: a recovered switch is plan ready (current = running size) with no transition; a pending choice is "Next start".
+    const recovered = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'ready', current: 'cmp-4', selected: 'cmp-4', transition: null } });
+    push('recovered switch: ready on the running size, no failure', recovered.value === '4 vCPU / 16 GB on AWS (India)' && recovered.hint === '', JSON.stringify(recovered));
+    const pendingNext = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null } });
+    push('ready with selected ≠ current still says "Next start"', pendingNext.value === '2 vCPU / 8 GB on AWS (India)' && pendingNext.hint === 'Next start: 4 vCPU / 16 GB.', JSON.stringify(pendingNext));
+    const copy = [failed, placed, fallback, unknown, restartFailed, recovered, pendingNext].map(d => `${d.value} ${d.hint}`).join(' ');
+    push('HF3 failed copy passes the copy guard', scanCopy(copy).length === 0 && ! /back on/i.test(copy), copy);
 }
 push('paused plan explains operations', describePlan({ plan: { vcpu: 2, memoryGB: 8, status: 'blocked', reason: 'AWS paused by operations' } }).hint === 'AWS paused by operations');
 

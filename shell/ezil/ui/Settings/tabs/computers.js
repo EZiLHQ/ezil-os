@@ -310,7 +310,7 @@ const SWITCH_KEY = 'ezil-os:switch.';
 export const AWS_CAP_COPY = "You've used this month's AWS computer time. It resets on the 1st — or contact us.";
 const CAP_REASONS = new Set(['billing_user_hours_cap', 'billing_aws_monthly_cap', 'user_hours_cap', 'aws_monthly_cap']);
 /** Failure reasons another attempt can fix; billing, retirement or a missing placement cannot. */
-const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|wake_timeout|unconfirmed|size_not_applied|placement_unavailable|computer_starting)/;
+const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|release_heal_|wake_timeout|unconfirmed|size_not_applied|placement_unavailable|computer_starting)/;
 
 let summary = null;   // billing.summary (v3) or null when it cannot be read
 let progress = null;  // computer.progress of the main computer
@@ -540,7 +540,7 @@ export function switchSteps (switching, prog, data = summary) {
     const keys = new Set((prog?.milestones ?? []).map(m => m?.key));
     const cold = Number(prog?.expectedSeconds) >= 300;
     const vcpu = sizeInfo(switching.target, data)?.vcpu;
-    const getting = `Getting a ${vcpu} vCPU machine`;
+    const getting = `Getting ${/^(8|11|18)$/.test(String(vcpu)) ? 'an' : 'a'} ${vcpu} vCPU machine`;
     const index = ! switching.acknowledged || switching.phase === 'requested' || switching.phase === 'stopping' ? 0
         : keys.has('files_attached') || keys.has('desktop_starting') ? 3 : keys.has('host_claimed') ? 2 : 1;
     const detail = index === 1 ? cold ? 'preparing a new machine — can take a few minutes' : keys.has('host_claimed') ? 'ready machine found' : ''
@@ -597,11 +597,13 @@ function statusHtml (model, prog) {
         const t = model.failed;
         const cap = CAP_REASONS.has(t.reason);
         const retry = ! cap && RETRYABLE.test(String(t.reason ?? ''));
-        const copy = cap ? AWS_CAP_COPY : `We couldn't switch. Your computer is back on ${sizeLabel(t.current, model.data)} and your files are safe.`;
+        // HF3: the size it actually runs (the placement), else the pre-switch size; never offer a switch to that same size.
+        const on = model.current ?? t.current;
+        const copy = cap ? AWS_CAP_COPY : `We couldn't switch to ${sizeLabel(t.target, model.data)}. Your computer is on ${sizeLabel(on, model.data)} and your files are safe.`;
         return `<div class="ezil-computer-switch is-failed" data-role="switch-failed" role="alert">
             <p>${html_encode(copy)}</p><div class="ezil-settings-row-actions">
             ${retry ? `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="switch-retry" data-size="${html_encode(t.target)}">Try again</button>` : ''}
-            ${t.revertAvailable ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
+            ${t.revertAvailable && on !== t.current ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
             ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="switch-feedback">Send feedback</button>' : ''}</div></div>`;
     }
     if ( model.nextStart ) {
