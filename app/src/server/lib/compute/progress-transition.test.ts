@@ -284,7 +284,8 @@ describe('readComputerProgress: the progress DTO carries the reconciled transiti
             .toMatchObject({ stage: 'running', transition: { phase: 'done' } });
         expect(openingWrites.length).toBe(1);
         expect(openingWrites[0]).toMatchObject({ leaseEpoch: 8, path: 'warm', startedAt: leasedAt.toISOString() });
+        // A complete stored warm opening is not rewritten at all.
         await progressOf({ lease_epoch: 8, instance_type: 'm6i.xlarge' }, stopFailed, { opening: warm, poolLeasedAt: leasedAt });
-        expect(openingWrites.every(o => o.path === 'warm')).toBe(true);
+        expect(openingWrites).toEqual([]);
     });
 });
