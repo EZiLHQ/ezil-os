@@ -14,7 +14,7 @@ import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
-import { buildSummaryV3 } from '@/server/billing/v3/summary';
+import { buildSummaryV3, DISK_FALLBACK_GIB } from '@/server/billing/v3/summary';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -227,11 +227,14 @@ const defaultVolumeSize = createVolumeSizeReader(async (region, volumeId) => {
     return await sharedAwsSdkCollaborators(process.env).describer?.describeVolume(region, volumeId) ?? null;
 });
 
-/** Round 5 D3: the smallest readable size among `volumes` (never overclaim); null when none is readable. */
+/**
+ * Round 5 D3: the smallest size among `volumes` (never overclaim). An unreadable volume beside a readable one
+ * counts as the fallback (it may be a 50 GiB volume); null when none is readable (the summary's fallback).
+ */
 async function readVolumeGiB(volumes: readonly AwsVolumeRef[], read: (volume: AwsVolumeRef) => Promise<number | null>): Promise<number | null> {
-    const sizes = (await Promise.all(volumes.map(volume => read(volume).catch(() => null))))
-        .filter((size): size is number => typeof size === 'number');
-    return sizes.length ? Math.min(...sizes) : null;
+    const sizes = await Promise.all(volumes.map(volume => read(volume).catch(() => null)));
+    if (!sizes.some(size => typeof size === 'number')) return null;
+    return Math.min(...sizes.map(size => typeof size === 'number' ? size : DISK_FALLBACK_GIB));
 }
 
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */

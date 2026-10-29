@@ -1327,6 +1327,10 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         f.store.computerOwner = vi.fn(async () => userId) as never;
         await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
         await expect(f.caller.usage({ computerId: C2 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 50 } } });
+        // One volume unreadable (error/timeout) beside a readable 100: that computer may be 50, so the summary shows 50.
+        const partly = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }, { computerId: C2, region: 'ap-south-1', volumeId: VOL_OLD }],
+            { [VOL_TODAY]: 100, [VOL_OLD]: new Error('Throttling') });
+        await expect(partly.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } } });
         // z.string().uuid() accepts upper case; the placement ids are lower case.
         await expect(f.caller.usage({ computerId: C1.toUpperCase() })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
     });
