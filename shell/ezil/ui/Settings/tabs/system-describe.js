@@ -177,8 +177,8 @@ export function describeRunningOn (info, reason) {
 const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
 
 /**
- * Round 4: the server's standing for this computer (STANDING-CONTRACT), read only from
- * explicit fields — `info.plan.standing` or `info.standing`. Null when not reported.
+ * Round 4: the server's standing for this computer (docs/billing/STANDING-CONTRACT.md §4), read
+ * only from explicit fields — `info.plan.standing` (or `info.standing`). Null when not reported.
  */
 export function standingOf (info) {
     const value = info && (info.plan && info.plan.standing !== undefined ? info.plan.standing : info.standing);
@@ -201,9 +201,9 @@ export function describePlan (info) {
     // Round 4: Free is told only from an explicit server field (a standing, sku or status), never
     // from a missing plan. Files on the AWS computer are kept there; nothing is said to have moved.
     const standing = standingOf(info);
-    const free = standing === 'files_on_aws' || standing === 'free' || (p && (p.sku === 'free_v3' || p.status === 'free'));
+    const free = standing === 'files_on_aws' || standing === 'free' || (p && (p.name === 'Free' || p.sku === 'free_v3'));
     if ( free ) {
-        const onAws = standing === 'files_on_aws' || (p && p.filesOn === 'aws') || (info && info.filesOn === 'aws');
+        const onAws = standing === 'files_on_aws' || (p && (p.provider === 'aws' || p.filesOn === 'aws'));
         if ( onAws ) return { value: 'Plan: Free · files kept on this computer', hint: 'It opens with Free limits. Upgrade to restore full use.' };
         const size = p && Number.isFinite(p.vcpu) && Number.isFinite(p.memoryGB) ? ` · ${p.vcpu} vCPU / ${p.memoryGB} GB on Cloudflare` : '';
         return { value: `Plan: Free${size}`, hint: '' };

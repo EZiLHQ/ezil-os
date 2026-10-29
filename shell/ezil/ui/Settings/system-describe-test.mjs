@@ -110,14 +110,16 @@ push('no code, no message → unavailable', describeScreenError(undefined, undef
     const shapes = [
         ['plan.standing', { ...held, plan: { standing: 'files_on_aws' } }],
         ['info.standing', { ...held, standing: 'files_on_aws' }],
-        ['a Free plan with filesOn aws', { ...held, plan: { sku: 'free_v3', filesOn: 'aws' } }],
+        ['a Free plan on provider aws', { ...held, plan: { name: 'Free', provider: 'aws' } }],
+        // The exact server shape (STANDING-CONTRACT §4).
+        ['the contract shape', { ...held, plan: { name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu: 2, memoryGB: 8, region: 'ap-south-1', status: 'ready', reason: null, outcome: null, current: 'std-2', selected: null, transition: null } }],
     ];
     for ( const [name, info] of shapes ) {
         const plan = describePlan(info);
         push(`Round 4: files_on_aws via ${name} → "Plan: Free · files kept on this computer"`, plan.value === 'Plan: Free · files kept on this computer'
             && ! /Not reported|not available/.test(plan.value + plan.hint), plan);
     }
-    const freeCf = describePlan({ ...cf, plan: { sku: 'free_v3', status: 'free', standing: 'free', vcpu: 2, memoryGB: 6 } });
+    const freeCf = describePlan({ ...cf, plan: { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: 2, memoryGB: 6, region: null, status: 'ready', reason: null, outcome: null, current: 'free-cf', selected: null, transition: null } });
     push('Round 4: Free on Cloudflare names the plan and its computer', freeCf.value === 'Plan: Free · 2 vCPU / 6 GB on Cloudflare', freeCf);
     push('Round 4: 🔴 no plan field is still "Not reported", never a guessed Free', describePlan(held).value === 'Not reported');
     push('Round 4: an unknown standing value is ignored', standingOf({ standing: 'moved' }) === null && describePlan({ ...held, standing: 'moved' }).value === 'Not reported');
