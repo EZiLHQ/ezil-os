@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PRO_PLAN } from './catalog';
 import * as catalog from './catalog';
-import { planAiReversal, type AiReversalStore, type AiReversalReceipt, type AiTopupReceiptStore } from './ai-credits';
+import { aiCreditOutboxItem, aiCreditRevokeItem, planAiReversal, type AiReversalStore, type AiReversalReceipt, type AiTopupReceiptStore } from './ai-credits';
 import { drainAiCreditOutbox, type AiCreditOutboxRow } from './ai-credit-outbox';
 import type {
     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
@@ -2316,6 +2316,141 @@ describe('W0.3 dispute restore receipts', () => {
         const before = [...f.store.writes];
         expect(await processStripeEvent(d('dp_' + 'x'.repeat(200)), f.deps)).toBe('review:invalid_ai_event_id');
         expect(f.store.writes).toEqual(before);
+    });
+});
+
+describe('HF2 operator correction rows', () => {
+    type Rows = { root: AiReversalReceipt; revoke: OutboxInsert; correction: OutboxInsert; ROOT: string; CORR: string };
+    /** Canary shape: paid root, operator bare revoke (invoice cleared), same-invoice 200-credit correction. */
+    async function canary(order: 'root first' | 'correction first' = 'root first',
+        options: { revoke?: boolean; correction?: boolean; defect?: (rows: Rows) => OutboxInsert[] | void } = {}) {
+        const f = fixture();
+        f.stripe.charge.refunded = false;
+        f.stripe.subscription.sku = 'standard_monthly_v3';
+        f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3' }];
+        f.stripe.charge.invoiceId = f.stripe.invoice.id;
+        expect(await processStripeEvent(paidV2(), f.deps)).toBe('applied');
+        const root = [...f.store.outbox.values()][0]!;
+        Object.assign(root.payload, { credits: 4000, accountPublicId: 'canary-payer' });
+        const ROOT = String(root.payload.entitlementId), CORR = `${ROOT}:correction-20261028`;
+        const note = { operatorNote: 'r3-20261028 legacy amount correction' };
+        const revoke = aiCreditRevokeItem(root);
+        Object.assign(revoke.payload, { invoiceId: null, ...note });
+        const correction = aiCreditOutboxItem('user_local', { entitlementId: CORR, credits: 200,
+            expiresAt: String(root.payload.expiresAt) }, 'grant', String(root.payload.invoiceId));
+        Object.assign(correction.payload, { accountPublicId: 'canary-payer', ...note });
+        const extra = options.defect?.({ root, revoke, correction, ROOT, CORR }) ?? [];
+        if (options.revoke !== false) await f.store.enqueueOutbox(revoke);
+        if (options.correction !== false) await f.store.enqueueOutbox(correction);
+        for (const item of extra) await f.store.enqueueOutbox(item);
+        if (order === 'correction first') { f.store.outbox.delete(root.eventKey); f.store.outbox.set(root.eventKey, root); }
+        const compute = [...f.store.grants.values()].find(g => g.kind === 'plan_period')!;
+        return { ...f, root, revoke, correction, ROOT, CORR, compute };
+    }
+    const rekey = (item: OutboxInsert, entitlementId: string) => {
+        item.eventKey = `${entitlementId}:grant`;
+        Object.assign(item.payload, { entitlementId, eventId: item.eventKey });
+    };
+
+    it.each(['root first', 'correction first'] as const)(
+        'a full refund reverses compute and the correction only, never the operator-revoked parent (%s)', async order => {
+            const f = await canary(order);
+            expect(f.compute.amount).toBe(BigInt(144000));
+            const before = [...f.store.writes];
+            f.stripe.charge.refunded = true;
+            expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+            expect(f.store.writes.slice(before.length)).toEqual(['refund:re_local:compute_std_seconds:revoke', `${f.CORR}:revoke:refund:re_local`]);
+            expect(f.store.grants.get('refund:re_local:compute_std_seconds:revoke')).toMatchObject({ amount: BigInt(-144000),
+                meter: 'compute_std_seconds', kind: 'revoke', sourceType: 'refund', sourceId: 're_local', subscriptionId: f.compute.subscriptionId });
+            expect(f.store.outbox.get(`${f.CORR}:revoke:refund:re_local`)).toMatchObject({ kind: 'ai_revoke', userId: 'user_local',
+                payload: { action: 'revoke', entitlementId: f.CORR, credits: 200, expiresAt: f.root.payload.expiresAt,
+                    invoiceId: f.root.payload.invoiceId, accountPublicId: 'canary-payer',
+                    reversal: { causeType: 'refund', causeId: 're_local' },
+                    localDeltas: [{ originalGrantId: f.compute.id, meter: 'compute_std_seconds', amount: '-144000' }] } });
+            expect([...f.store.outbox.keys()].filter(key => key.startsWith(`${f.ROOT}:revoke:`))).toEqual([]);
+        },
+    );
+    it.each(['root first', 'correction first'] as const)('replays of the same refund write nothing (%s)', async order => {
+        const f = await canary(order);
+        f.stripe.charge.refunded = true;
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        const after = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(event('refund.updated', { id: 're_local', charge: 'ch_local' }), f.deps)).toBe('applied');
+        expect(f.store.writes).toEqual(after);
+    });
+    it.each([
+        ['correction expiry', (r: Rows) => { r.correction.payload.expiresAt = '2026-12-01T00:00:00.000Z'; }],
+        ['correction credits above the parent', (r: Rows) => { r.correction.payload.credits = 4001; }],
+        ['correction foreign account', (r: Rows) => { r.correction.payload.accountPublicId = 'other-payer'; }],
+        ['correction payment intent', (r: Rows) => { r.correction.payload.paymentIntentId = 'pi_other'; }],
+        ['orphan correction', (r: Rows) => rekey(r.correction, `${r.ROOT.replace(':sub_local:', ':sub_other:')}:correction-20261028`)],
+        ['malformed correction suffix', (r: Rows) => rekey(r.correction, `${r.ROOT}:correction-2026102`)],
+        ['chained correction', (r: Rows) => {
+            const chained = structuredClone(r.correction);
+            rekey(chained, `${r.CORR}:correction-20261029`);
+            return [chained];
+        }],
+        ['bare revoke credits', (r: Rows) => { r.revoke.payload.credits = 3999; }],
+        ['bare revoke expiry', (r: Rows) => { r.revoke.payload.expiresAt = '2026-12-01T00:00:00.000Z'; }],
+        ['bare revoke foreign invoice', (r: Rows) => { r.revoke.payload.invoiceId = 'in_other'; }],
+        ['bare revoke foreign account', (r: Rows) => { r.revoke.payload.accountPublicId = 'other-payer'; }],
+        ['bare revoke owner', (r: Rows) => { r.revoke.userId = 'other-user'; }],
+    ] as const)('refuses a %s with zero writes, compute included', async (_, defect) => {
+        for (const order of ['root first', 'correction first'] as const) {
+            const f = await canary(order, { defect });
+            const before = [...f.store.writes];
+            f.stripe.charge.refunded = true;
+            expect(await processStripeEvent(refund(), f.deps)).toBe('review:restore_mismatch');
+            expect(f.store.writes).toEqual(before);
+        }
+    });
+    it('refuses a correction whose invoice differs from its parent when the planner is handed it', async () => {
+        const f = await canary();
+        const plan = (correction: OutboxInsert) => planAiReversal({ action: 'revoke', causeId: 're_local', chargeId: 'ch_local',
+            customerId: 'cus_local', userId: 'user_local', originals: [f.compute], receipts: [f.root, correction] },
+        { originals: [f.compute], corrections: [], receipts: [...f.store.outbox.values()].map(r => r.eventKey === correction.eventKey ? correction : r) });
+        expect(plan(f.correction)).toMatchObject({ outcome: 'applied', outbox: [{ eventKey: `${f.CORR}:revoke:refund:re_local` }] });
+        for (const invoiceId of ['in_other', null]) {
+            const foreign = structuredClone(f.correction);
+            foreign.payload.invoiceId = invoiceId;
+            expect(plan(foreign)).toEqual({ outcome: 'review:restore_mismatch', grants: [], outbox: [] });
+        }
+    });
+    it('reverses compute alone when every root is operator-revoked, and its replay writes nothing', async () => {
+        const f = await canary('root first', { correction: false });
+        f.stripe.charge.refunded = true;
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+        expect(f.store.writes.slice(before.length)).toEqual(['refund:re_local:compute_std_seconds:revoke']);
+        const after = [...f.store.writes];
+        await processStripeEvent(refund(), f.deps);
+        expect(f.store.writes).toEqual(after);
+    });
+    it('suspends the correction alone on a dispute; a win then stays terminal with zero writes', async () => {
+        const f = await canary('correction first');
+        const before = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(f.store.writes.slice(before.length)).toEqual(['dispute:dp_local:compute_std_seconds:suspend', `${f.CORR}:revoke:dispute:dp_local`]);
+        expect(f.store.grants.get('dispute:dp_local:compute_std_seconds:suspend')!.amount).toBe(BigInt(-144000));
+        expect(f.store.outbox.get(`${f.CORR}:revoke:dispute:dp_local`)).toMatchObject({ kind: 'ai_revoke',
+            payload: { entitlementId: f.CORR, credits: 200, accountPublicId: 'canary-payer', overlappingDisputes: false } });
+        const after = [...f.store.writes];
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+        expect(f.store.writes).toEqual(after);
+        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
+    });
+    it('suspends and restores a correction child under its own root when no operator revoke exists', async () => {
+        const f = await canary('root first', { revoke: false });
+        expect(await processStripeEvent(dispute(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
+        for (const root of [f.ROOT, f.CORR]) {
+            expect(f.store.outbox.get(`${root}:revoke:dispute:dp_local`)).toMatchObject({ kind: 'ai_revoke' });
+            expect(f.store.outbox.get(`${root}:restore:dp_local`)).toMatchObject({ kind: 'ai_restore',
+                payload: { entitlementId: root, credits: root === f.CORR ? 200 : 4000, accountPublicId: 'canary-payer' } });
+        }
+        expect([...f.store.grants.values()].map(g => g.amount)).toEqual([BigInt(144000), BigInt(-144000), BigInt(144000)]);
     });
 });
 

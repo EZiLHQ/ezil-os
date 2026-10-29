@@ -274,8 +274,7 @@ export function planAiReversal(input: AiReversalInput, snapshot: {
         // A correction child is reversible only under its own sourced parent on identical, no larger terms.
         const parentId = CORRECTION_ENTITLEMENT.exec(p.entitlementId)?.[1];
         const parent = parentId === undefined ? undefined : input.receipts.find(r => r.payload.entitlementId === parentId);
-        if (!matchesSource(p) && !(parent && matchesSource(parent.payload) && parent.userId === root.userId
-            && parent.payload.protocol === p.protocol && parent.payload.invoiceId === p.invoiceId
+        if (!matchesSource(p) && !(parent && matchesSource(parent.payload) && parent.payload.invoiceId === p.invoiceId
             && parent.payload.expiresAt === p.expiresAt && parent.payload.paymentIntentId === p.paymentIntentId
             && Number(p.credits) <= Number(parent.payload.credits)
             && isDeepStrictEqual(accountsOf(parent), accountsOf(root)))) return refuse('review:restore_mismatch');
