@@ -248,7 +248,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  * request cannot fail this way. See `applyDisplayEvidence`.
  *
  * @typedef {'worker_unreachable' | 'sandbox_crashed' | 'desktop_unreachable'
- *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap' | 'unknown'} BootFailureReason
+ *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap'
+ *   | 'payment_issue' | 'plan_required' | 'fair_use_paused' | 'files_on_aws' | 'unknown'} BootFailureReason
  */
 
 /**
@@ -273,7 +274,9 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  */
 
 /**
- * @typedef {{ kind: 'failed', reason: BootFailureReason }} BootFailureState
+ * Round 4: `errorCode` is the raw server code (e.g. `billing_files_on_aws`) for the feedback
+ * prefill; absent when nothing failed with a code.
+ * @typedef {{ kind: 'failed', reason: BootFailureReason, errorCode?: string }} BootFailureState
  * @typedef {BootProgressState | BootReadyState | BootNotConfiguredState
  *   | BootFailureState | BootUnverifiedState} BootUiState
  */
@@ -301,7 +304,17 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  *   | 'sandbox_runtime_blocked' | 'sandbox_start_failed' | 'sandbox_starting'
  *   | 'worker_http_error' | 'desktop_unreachable' | 'timeout'
  *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'capacity_attempt_expired' | 'region_capacity'
- *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'unknown'} BootErrorCode
+ *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | BillingBootErrorCode | 'unknown'} BootErrorCode
+ */
+
+/**
+ * Round 4: the billing gate's refusals, returned as values (`billing_<reason>`) by the
+ * preview routers. Every one is deterministic except `billing_unavailable`.
+ *
+ * @typedef {'billing_payment_issue' | 'billing_no_plan' | 'billing_size_not_allowed'
+ *   | 'billing_fair_use_paused' | 'billing_files_on_aws' | 'billing_concurrent_limit'
+ *   | 'billing_upgrade_pending' | 'billing_allowance_exhausted' | 'billing_overage_cap_reached'
+ *   | 'billing_user_hours_cap' | 'billing_aws_monthly_cap' | 'billing_unavailable'} BillingBootErrorCode
  */
 
 /**
@@ -351,6 +364,9 @@ const AWS_REFUSAL_ERROR_CODES = [
  */
 export function isRetryableBootErrorCode(code) {
     if (!code) return true;
+    // Round 4: a billing refusal answers the same until the plan or payment changes. Only
+    // `billing_unavailable` (the billing state could not be read) may answer differently.
+    if (typeof code === 'string' && code.startsWith('billing_')) return code === 'billing_unavailable';
     return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code) && !AWS_REFUSAL_ERROR_CODES.includes(code);
 }
 
@@ -407,6 +423,22 @@ function classifyFailure(errorCode) {
             return 'sandbox_crashed';
         case 'desktop_unreachable':
             return 'desktop_unreachable';
+        // Round 4: billing gate refusals. Each has its own copy; `billing_unavailable`
+        // takes the generic copy and stays retryable.
+        case 'billing_payment_issue':
+            return 'payment_issue';
+        case 'billing_no_plan':
+        case 'billing_size_not_allowed':
+            return 'plan_required';
+        case 'billing_fair_use_paused':
+        case 'billing_allowance_exhausted':
+        case 'billing_overage_cap_reached':
+            return 'fair_use_paused';
+        case 'billing_files_on_aws':
+            return 'files_on_aws';
+        case 'billing_user_hours_cap':
+        case 'billing_aws_monthly_cap':
+            return 'user_hours_cap';
         // `sandbox_starting` is the server saying "still waking, ask again" —
         // it is normally consumed as PROGRESS by the caller's wake loop and
         // never reaches here at all. It only lands in this switch when that
@@ -509,7 +541,10 @@ export function computeBootUiState(input) {
         };
     }
     if (input.requestStatus === 'error') {
-        return { kind: 'failed', reason: classifyFailure(input.errorCode) };
+        // The raw code travels with the classified reason, so "Send feedback" names what the server said.
+        return typeof input.errorCode === 'string' && input.errorCode
+            ? { kind: 'failed', reason: classifyFailure(input.errorCode), errorCode: input.errorCode }
+            : { kind: 'failed', reason: classifyFailure(input.errorCode) };
     }
 
     // pending
@@ -671,6 +706,23 @@ export const BOOT_FAILURE_COPY = {
     timeout: {
         title: 'This is taking too long',
         body: "Starting your computer is taking longer than it should. It may still come up in the background — try again.",
+    },
+    // Round 4 (D16-D18): billing refusals. Never retried automatically.
+    payment_issue: {
+        title: "Your payment didn't go through",
+        body: 'Update your payment method in Settings → Billing to keep using your computer.',
+    },
+    plan_required: {
+        title: 'This configuration needs a paid plan.',
+        body: 'Your files are kept. Choose a plan in Settings → Billing.',
+    },
+    fair_use_paused: {
+        title: 'Computer time is paused',
+        body: "You've reached fair use for now. Your files are kept. Settings → Billing shows when it resets.",
+    },
+    files_on_aws: {
+        title: 'Your files are still on your AWS (India) computer.',
+        body: 'Open it on the Free plan with Free limits, or upgrade to restore full use.',
     },
     unknown: {
         title: 'Something went wrong',
