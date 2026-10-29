@@ -11,7 +11,7 @@ export const marketingContent = {
     navigationLabel: 'Main navigation',
     plansLink: { label: 'Plans', href: '#plans' },
     startLink: { label: 'Start free', href: '/login' },
-    signInLink: { label: 'Sign in', href: '/login?method=email' },
+    signInLink: { label: 'Sign in', href: '/login' },
     desktop: { browser: 'Browser', editor: 'VS Code' },
     featuresLabel: 'Your workspace',
     features: [

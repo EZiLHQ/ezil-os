@@ -2,11 +2,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('server-only', () => ({}));
-beforeEach(() => { vi.stubEnv('AUTH0_CLIENT_ID', ''); vi.stubEnv('AUTH0_SECRET_ID', ''); });
+// EZiL ID is configured by default here; the "not configured" case unsets it.
+beforeEach(() => { vi.stubEnv('AUTH0_CLIENT_ID', 'client'); vi.stubEnv('AUTH0_SECRET_ID', 'private-test-secret'); });
 afterEach(() => vi.unstubAllEnvs());
-
-// Rendering login must not need a session, database, or OAuth request.
-vi.mock('./actions', () => ({ signInWithGoogle: vi.fn(), signInWithPassword: vi.fn() }));
 
 import LoginPage from './page';
 
@@ -14,66 +12,83 @@ async function render(params: Record<string, string | string[]> = {}) {
     return renderToStaticMarkup(await LoginPage({ searchParams: Promise.resolve(params) }));
 }
 
-describe('lock screen entry', () => {
-    it('offers one Google action and a collapsed, labelled password disclosure', async () => {
+const UNAVAILABLE = 'Sign-in is unavailable right now.';
+
+/** Every other way in that this page used to offer, or that a regression could bring back. */
+function expectNoOtherSignIn(html: string) {
+    // Visible text only: the EZiL ID link keeps the `ezil-lock-google` class name.
+    const text = html.replace(/<[^>]*>/g, ' ');
+    expect(text).toContain('Sign in with your EZiL ID.');
+    expect(text).not.toMatch(/Google/i);
+    expect(text).not.toMatch(/password|sign up|magic link|forgot/i);
+    expect(html).not.toContain('<input');
+    expect(html).not.toContain('<form');
+    expect(html).not.toContain('<button');
+    expect(html).not.toContain('email-sign-in');
+    expect(html).not.toContain('/auth/callback');
+}
+
+describe('EZiL ID is the only sign-in', () => {
+    it('renders exactly one action, the EZiL ID document link', async () => {
         const html = await render();
-        expect(html).toContain('Sign in or get started with Google.');
-        expect(html.match(/>Continue with Google<\/button>/g)).toHaveLength(1);
-        expect(html).toContain('aria-expanded="false" aria-controls="email-sign-in"');
-        expect(html).toContain('id="email-sign-in" hidden=""');
-        expect(html).toContain('<label for="email"');
-        expect(html).toContain('<label for="password"');
+        expect(html).toContain('Sign in with your EZiL ID.');
+        expect(html.match(/<a class="ezil-lock-google" href="\/auth\/auth0\/login\?returnUrl=[^"]*">Continue with EZiL ID<\/a>/g)).toHaveLength(1);
+        // The only links besides it are the logo and the legal footer.
+        const hrefs = [...html.matchAll(/href="([^"]*)"/g)].map(match => match[1]);
+        expect(hrefs.filter(href => !['/', '/terms', '/privacy', '/pricing'].includes(href))).toEqual([expect.stringMatching(/^\/auth\/auth0\/login\?/)]);
+        expectNoOtherSignIn(html);
         expect(html).not.toContain('role="alert"');
+        expect(html).not.toContain('private-test-secret');
     });
 
-    it('opens the email form for a direct link and preserves a safe destination', async () => {
-        const html = await render({ method: 'email', returnUrl: '/os?computer=example' });
-        expect(html).toContain('aria-expanded="true"');
-        expect(html).not.toContain('id="email-sign-in" hidden');
-        expect(html).toContain('name="returnUrl" value="/os?computer=example"');
-        expect(html).toContain('autoComplete="current-password"');
-        expect(html).toContain('Email and password work for existing accounts.');
-    });
-
-    it('keeps credentials out of the URL even before JavaScript loads', async () => {
+    it('ignores the old ?method=email link instead of opening a password form', async () => {
         const html = await render({ method: 'email' });
-        const passwordForm = html.match(/<form\b[^>]*id="email-sign-in"[^>]*>/)?.[0];
-        expect(passwordForm).toContain('method="post"');
+        expect(html).toContain('>Continue with EZiL ID</a>');
+        expectNoOtherSignIn(html);
     });
 
-    it('rejects a foreign return URL before handing it to the form', async () => {
-        const html = await render({ returnUrl: 'https://untrusted.example/' });
-        expect(html).not.toContain('untrusted.example');
-        expect(html).toContain('name="returnUrl" value="/computers"');
+    it('carries a safe destination through EZiL ID', async () => {
+        const html = await render({ returnUrl: '/os?computer=one' });
+        expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done"');
+    });
+
+    it.each(['https://untrusted.example/', '//evil.example'])('rejects the foreign return URL %j before it reaches the link', async returnUrl => {
+        const html = await render({ returnUrl });
+        expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fcomputers"');
+        expect(html).not.toMatch(/untrusted\.example|evil\.example/);
     });
 
     it.each(['auth_callback_failed', '<script>provider failure</script>', ['private detail', 'other detail']])(
         'shows a generic, accessible callback failure for %j', async error => {
             const html = await render({ error });
-            expect(html).toContain('role="alert"');
+            expect(html.match(/role="alert"/g)).toHaveLength(1);
             expect(html).toContain('Please try again.');
             for (const value of [error].flat()) expect(html).not.toContain(value);
+            // The button stays: a failed attempt is retried the same way.
+            expect(html).toContain('>Continue with EZiL ID</a>');
         },
     );
 });
 
-describe('EZiL ID entry', () => {
-    it('offers the Auth0 document link only when both settings are present', async () => {
-        expect(await render()).not.toContain('Continue with EZiL ID');
-        vi.stubEnv('AUTH0_CLIENT_ID', 'client');
-        expect(await render()).not.toContain('Continue with EZiL ID');
-        vi.stubEnv('AUTH0_SECRET_ID', 'private-test-secret');
-        const html = await render({ returnUrl: '/os?computer=one' });
-        expect(html).toContain('Continue with EZiL ID');
-        expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done"');
-        expect(html).toContain('Continue with Google');
-        expect(html).toContain('id="email-sign-in"');
-        expect(html).not.toContain('private-test-secret');
+describe('without the EZiL ID settings', () => {
+    it.each([
+        ['neither setting', {}],
+        ['only the client id', { AUTH0_CLIENT_ID: 'client' }],
+        ['only the secret', { AUTH0_SECRET_ID: 'secret' }],
+    ])('with %s it says sign-in is unavailable and offers nothing else', async (_name, env: Record<string, string>) => {
+        vi.stubEnv('AUTH0_CLIENT_ID', env.AUTH0_CLIENT_ID ?? '');
+        vi.stubEnv('AUTH0_SECRET_ID', env.AUTH0_SECRET_ID ?? '');
+        const html = await render({ error: 'auth_callback_failed', method: 'email' });
+        expect(html.match(/role="alert"/g)).toHaveLength(1);
+        expect(html).toContain(UNAVAILABLE);
+        expect(html).not.toContain('Continue with EZiL ID');
+        expect(html).not.toContain('/auth/auth0/login');
+        expectNoOtherSignIn(html);
     });
-    it('sanitises the Auth0 link destination', async () => {
-        vi.stubEnv('AUTH0_CLIENT_ID', 'client'); vi.stubEnv('AUTH0_SECRET_ID', 'secret');
-        const html = await render({ returnUrl: '//evil.example' });
-        expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fcomputers"');
-        expect(html).not.toContain('evil.example');
+
+    it('a route that found EZiL ID disabled gets the same honest message', async () => {
+        const html = await render({ error: 'auth0_disabled' });
+        expect(html).toContain(UNAVAILABLE);
+        expect(html.match(/role="alert"/g)).toHaveLength(1);
     });
 });

@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -34,8 +34,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8').replace(/\r\n/g, '\n');
 
 const actions = read('./actions.ts');
-const form = read('./login-form.tsx');
 const callback = read('../auth/callback/route.ts');
+const auth0Login = read('../auth/auth0/login/route.ts');
+const auth0Callback = read('../auth/auth0/callback/route.ts');
 const osPage = read('../os/page.tsx');
 const loginPage = read('./page.tsx');
 const pricingPage = read('../(marketing)/pricing/page.tsx');
@@ -70,10 +71,19 @@ describe('the sign-in path lands on a DOCUMENT load', () => {
         expect(functionBody(actions, 'signInWithPassword')).toMatch(/return \{ redirectTo: returnUrl \}/);
     });
 
-    it('and the form performs that navigation as a real document load', () => {
-        expect(code(form)).toMatch(/window\.location\.assign\(result\.redirectTo\)/);
-        // Not the router: `router.push` reproduces the exact defect.
-        expect(code(form)).not.toMatch(/useRouter|router\.(push|replace)/);
+    it('and the one sign-in action is a plain link into a route handler, never a soft navigation', () => {
+        // "Continue with EZiL ID" is an <a>; the browser follows the route
+        // handlers' 302s as document loads. Not a <Link>, not a server action.
+        expect(code(loginPage)).toMatch(/<a className="ezil-lock-google" href=\{`\/auth\/auth0\/login\?/);
+        expect(code(loginPage)).not.toMatch(/<Link[^>]*auth0/);
+        expect(code(loginPage)).not.toMatch(/useRouter|router\.(push|replace)|'use client'/);
+        for (const route of [auth0Login, auth0Callback]) {
+            expect(route).toMatch(/export async function GET\(/);
+            expect(route).toMatch(/NextResponse\.redirect\(/);
+            expect(code(route)).not.toMatch(/'use server'/);
+            expect(code(route)).not.toMatch(/from 'next\/navigation'/);
+        }
+        expect(auth0Callback).toMatch(/safeReturnUrl\(/);
     });
 
     it('the destination is narrowed to a same-origin path before it is returned', () => {
@@ -119,7 +129,7 @@ describe('/os checks its own arrival, because senders are a convention', () => {
         // should be a deliberate act, so this fails first.
         const clientOsLink = /<Link[^>]*href=["'{]*\/os["'}]/;
         expect(clientOsLink.test('<Link href="/os">Open</Link>')).toBe(true);
-        for (const [name, source] of Object.entries({ form, callback, osPage, actions, loginPage, pricingPage, marketingLayout, marketingHome, rootPage })) {
+        for (const [name, source] of Object.entries({ callback, auth0Login, auth0Callback, osPage, actions, loginPage, pricingPage, marketingLayout, marketingHome, rootPage })) {
             expect(code(source), name).not.toMatch(clientOsLink);
         }
     });
@@ -219,14 +229,69 @@ describe('there is no password self-signup in the app', () => {
         expect(actions).toMatch(/export async function signInWithGoogle\(/);
     });
 
-    it('the form has no sign-up mode, toggle or new-password branch', () => {
-        const body = code(form);
+    it('the login page has no sign-up mode, toggle or new-password branch', () => {
+        const body = code(loginPage);
         expect(body).not.toMatch(/'sign-up'/);
         expect(body).not.toMatch(/setMode|Create account|Create one/);
         expect(body).not.toMatch(/new-password/);
         expect(body).not.toMatch(/minLength/);
-        // Positive control: the sign-in form itself survived the deletion.
-        expect(body).toMatch(/signInWithPassword/);
-        expect(body).toMatch(/Continue with Google/);
+        // Positive control: the page itself was read, and still signs in.
+        expect(body).toMatch(/Continue with EZiL ID/);
+    });
+});
+
+/**
+ * 🔴 EZiL ID IS THE ONLY SIGN-IN THE UI OFFERS.
+ *
+ * Production signs in through EZiL ID (Auth0 at id.ezil.work,
+ * `/auth/auth0/*`) only. Supabase-hosted Google OAuth, email and password,
+ * magic links and password reset are not offered on any page. The server
+ * handlers they used (`./actions.ts`, `/auth/callback`, `/auth/confirm`) stay
+ * for now; this sweep is about what a person can click.
+ *
+ * Like the sign-up sweep above, it reads every component under `app/src`
+ * rather than a fixed list, because the failure it guards is a NEW surface
+ * bringing a second way in back.
+ */
+const OTHER_SIGN_IN = [
+    /Continue with Google|Sign in with Google|get started with Google/i,
+    /type=(?:"password"|'password'|\{['"]password['"]\})/,
+    /\bsignInWith(?:Google|Password|OAuth|Otp|IdToken)\b/,
+    /\bresetPasswordForEmail\b|updateUser\(\s*\{\s*password/,
+    /\/login\?method=email/,
+];
+
+describe('there is no sign-in UI other than EZiL ID', () => {
+    it('the patterns recognise what they are looking for', () => {
+        // Positive control for each pattern, so a typo cannot pass silently.
+        const samples = ['<span>Continue with Google</span>', '<input type="password" />',
+            "import { signInWithGoogle } from './actions';", 'await supabase.auth.updateUser({ password });',
+            "href: '/login?method=email'"];
+        samples.forEach((sample, index) => expect(sample).toMatch(OTHER_SIGN_IN[index]));
+    });
+
+    it('🔴 no component under app/src renders another sign-in option', () => {
+        const offenders: string[] = [];
+        const scanned: string[] = [];
+        for (const file of sourceFilesUnder(APP_SRC)) {
+            // Components, plus the marketing copy that feeds their links.
+            if (!file.endsWith('.tsx') && !/pricing-content\.ts$/.test(file)) continue;
+            const name = path.relative(APP_SRC, file).split(path.sep).join('/');
+            scanned.push(name);
+            const source = code(readFileSync(file, 'utf8'));
+            for (const pattern of OTHER_SIGN_IN) {
+                if (pattern.test(source)) offenders.push(`${name}: ${pattern}`);
+            }
+        }
+        // Positive control: the walk reached the surfaces that used to offer them.
+        expect(scanned.length).toBeGreaterThan(20);
+        expect(scanned).toEqual(expect.arrayContaining(['app/login/page.tsx', 'app/auth/invited/page.tsx', 'app/(marketing)/pricing/pricing-content.ts']));
+        expect(offenders).toEqual([]);
+    });
+
+    it('the deleted Google and email/password form stays deleted', () => {
+        expect(existsSync(path.resolve(here, './login-form.tsx'))).toBe(false);
+        // Positive control: the page beside it is really there.
+        expect(existsSync(path.resolve(here, './page.tsx'))).toBe(true);
     });
 });
