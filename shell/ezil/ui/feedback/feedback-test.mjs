@@ -392,6 +392,40 @@ try {
             kept.map(entry => entry.clientRequestId), 'only the newest 10 are sent, oldest first');
         assert.equal(stored(outboxKey), null);
     });
+    await check('boot resumes the outbox with no home-screen chip: queued sends go once; `online` and bfcache restore stay watched', async () => {
+        // Drop the chip mounted above (and its `online` listener): boot no longer mounts one.
+        window.dispatchEvent(new window.Event('ezil:teardown'));
+        assert.equal(document.querySelector('.ezil-feedback-chip'), null);
+        open(); const template = payload(); close();
+        const queue = description => {
+            const clientRequestId = crypto.randomUUID();
+            return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId, description }) };
+        };
+        const first = queue('Queued before a reload');
+        window.localStorage.setItem(outboxKey, JSON.stringify([first]));
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        let count = calls.length;
+        feedback.resume_feedback_outbox(); feedback.resume_feedback_outbox();
+        await until(() => stored(outboxKey) === null);
+        assert.deepEqual(calls.slice(count).map(c => c.body), [first.body], 'sent once, byte for byte');
+        assert.equal(document.querySelector('.ezil-feedback-chip'), null, 'Feedback lives in Settings: no chip is mounted');
+        count = calls.length;
+        const later = queue('Queued while offline');
+        window.localStorage.setItem(outboxKey, JSON.stringify([later]));
+        window.dispatchEvent(new window.Event('online'));
+        await until(() => stored(outboxKey) === null);
+        const restored = queue('Queued before the page was cached');
+        window.localStorage.setItem(outboxKey, JSON.stringify([restored]));
+        window.dispatchEvent(new window.PageTransitionEvent('pageshow', { persisted: false }));
+        await tick();
+        assert.notEqual(stored(outboxKey), null, 'an ordinary pageshow is not a restore');
+        window.dispatchEvent(new window.PageTransitionEvent('pageshow', { persisted: true }));
+        await until(() => stored(outboxKey) === null);
+        assert.deepEqual(calls.slice(count).map(c => c.body), [later.body, restored.body]);
+        flushing = false;
+    });
     await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
         open(); setDescription('Half-written report'); change('diagnostics', true);
         form().elements.category.value = 'idea';
