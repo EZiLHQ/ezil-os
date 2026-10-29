@@ -94,7 +94,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             const retry = !!(runningLong || observation.stage === 'failed_reopened'
                 || (state.kind === 'failed' && attention && !observation.manualAttention));
             const meta = !at ? '' : at.long && !runningLong ? `${OPENING_COPY.long} · ${at.elapsedText}` : at.elapsedText;
-            const dev = [observation.next, observation.updated ? `Last recorded update: ${observation.updated}` : ''].filter(Boolean).join(' ');
+            const dev = observation.updated ? `Last recorded update: ${observation.updated}` : '';
             surface.paint({
                 status: observation.title,
                 body: runningLong ? OPENING_COPY.runningLong : [observation.body, observation.bytes, dev].filter(Boolean).join(' · '),
